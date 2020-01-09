@@ -28,13 +28,15 @@ if __name__ == '__main__':
                             'G:\\CVA\\{0}\\{1}'], uat=True)
 
     cx = AdaptivContext()
-    for rundate in [x for x in sorted(os.listdir(cva_path[:-8])) if x>'2019-11-20'
-                    and os.path.isdir(cva_path[:-8]+os.sep+x) ]:
-        
-        cx.parse_json(cva_path.format(rundate, 'MarketData.json'))
+    for rundate in [x for x in sorted(os.listdir(cva_path[:-8])) \
+                    if x > '2019-11-20' and os.path.isdir(cva_path[:-8] + os.sep + x)]:
+
+        if os.path.isfile(cva_path.format(rundate, 'MarketDataCal.json')):
+            cx.parse_json(cva_path.format(rundate, 'MarketDataCal.json'))
+        else:
+            cx.parse_json(cva_path.format(rundate, 'MarketData.json'))
+
         cx.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
         cx.bootstrap()
         cx.write_marketdata_json(cva_path.format(rundate, 'MarketDataCal.json'))
         cx.write_market_file(cva_path.format(rundate, 'MarketDataCal.dat'))
-
-

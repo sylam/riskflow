@@ -191,37 +191,35 @@ class TimeGrid(object):
         self.mtm_dates = MTM_dates
         self.date_lookup = dict([(x, i) for i, x in enumerate(sorted(MTM_dates))])
 
+    def calc_time_grid(self, time_in_days):
+        dvt = np.concatenate(([1], np.diff(self.scen_time_grid), [1]))
+        scen_index = self.scen_time_grid.searchsorted(time_in_days, side='right')
+        index = (scen_index - 1).clip(0, self.scen_time_grid.size - 1)
+        alpha = ((time_in_days - self.scen_time_grid[index]) / dvt[scen_index]).clip(0, 1)
+        return np.dstack([alpha, time_in_days, index])[0]
+
     def set_base_date(self, base_date, delta=None):
         # leave the grids in terms of the number of days - note that it's possible to have the scenario_dates
         # the same as the mtm_dates (for more accurate margin period of risk on collateralized netting sets)
         self.mtm_time_grid = np.array([(x - base_date).days for x in sorted(self.mtm_dates)])
         self.scen_time_grid = np.array([(x - base_date).days for x in sorted(self.scenario_dates)])
 
-        # deal with the case that we need a very fine time_grid but don't want to generate full scenarios
-        if delta is None:
-            self.time_grid_years = self.scen_time_grid / utils.DAYS_IN_YEAR
-        else:
-            delta_grid = np.arange(0, self.scen_time_grid.max(), delta)
-            self.time_grid_years = np.union1d(self.scen_time_grid, delta_grid) / utils.DAYS_IN_YEAR
-
-        # calculate the MTM/Scenario grid differential - used later for instruments to price off of
-        time_grid, time_grid_index = [], []
-        for i, t in enumerate(self.mtm_time_grid):
-            prev_scen_index = self.scen_time_grid[self.scen_time_grid <= t].size - 1
-            time_grid_index.append(prev_scen_index)
-            # order here is prior, then mtm_time then scenario_delta time
-            scenario_grid_delta = (self.scen_time_grid[prev_scen_index + 1] - self.scen_time_grid[
-                prev_scen_index]) if self.scen_time_grid.size > prev_scen_index + 1 else 1.0
-            time_grid.append([(t - self.scen_time_grid[prev_scen_index]) / scenario_grid_delta, t, 0.0])
-
         self.base_time_grid = set([self.date_lookup[x] for x in self.base_MTM_dates])
-        self.time_grid = np.array(time_grid)
-        # now put the time_grid_index inside the timegrid
-        self.time_grid[:, utils.TIME_GRID_ScenarioPriorIndex] = np.array(time_grid_index)
+        self.time_grid = self.calc_time_grid(self.mtm_time_grid)
+
         # store the scenario time_grid
         self.scenario_grid = np.zeros((self.scen_time_grid.size, 3))
         self.scenario_grid[:, utils.TIME_GRID_MTM] = self.scen_time_grid
         self.scenario_grid[:, utils.TIME_GRID_ScenarioPriorIndex] = np.arange(self.scen_time_grid.size)
+
+        # deal with the case that we need a very fine time_grid - note we do this after calculating the
+        # scenario_grid as setting a non-null delta is a way to generate scenarios without calculating the
+        # whole risk factor
+        if delta is not None:
+            delta_grid = np.arange(0, self.scen_time_grid.max(), delta)
+            self.scen_time_grid = np.union1d(self.scen_time_grid, delta_grid)
+
+        self.time_grid_years = self.scen_time_grid / utils.DAYS_IN_YEAR
 
     def get_scenario_offset(self, days_from_base):
         prev_scen_index = self.scen_time_grid[self.scen_time_grid <= days_from_base].size - 1
@@ -322,29 +320,46 @@ class Calculation(object):
             name_size, pad_size = tenors[factor_name].shape
             padding = 3 - pad_size
             indices = np.pad(tenors[factor_name], [[0, 0], [0, padding]], 'constant')
-            self.gradient_index[name] = indices
+            self.gradient_index[name] = (indices, pad_size)
 
-    def gradients_as_df(self, grad, header='Gradient'):
+    def gradients_as_df(self, grad, header='Gradient', display_val=False):
         if isinstance(grad, dict):
+            # get the factor values from all_factors if necessary
+            factor_values = {utils.check_scope_name(k): v.factor if hasattr(v, 'factor') else v
+                             for k, v in self.all_factors.items()} if display_val else {}
             hessian_index = ([], [])
-            rate, tenor, values = [], [], []
+            factor, rate, tenor, values = [], [], [], []
             for k, v in grad.items():
                 # first derivative
                 name = k.name[:-2]
-                factor = name.split('/')[-1]
                 non_zero = np.where(v)[0]
+                grad_index, index_len = self.gradient_index[name]
                 hessian_index[0].append([name] * v.shape[0])
-                hessian_index[1].append(self.gradient_index[name])
+                hessian_index[1].append(grad_index)
                 values.append(v[non_zero])
                 rate.append([name] * non_zero.size)
-                tenor.append(self.gradient_index[name][non_zero])
+                tenor.append(grad_index[non_zero])
+                # store the actual factor value if required
+                if display_val:
+                    rate_name = name.split('/')[-1]
+                    if rate_name in factor_values:
+                        rate_non_zero = grad_index[non_zero][:, :index_len].astype(np.float64)
+                        factor.append(factor_values[rate_name].current_value(rate_non_zero).flatten())
+                    else:
+                        sub_rate, param = rate_name.rsplit('.', 1)
+                        factor.append(factor_values[sub_rate].current_value()[param].flatten())
 
             tenors = np.vstack(tenor)
             self.hessian_index = (np.hstack(hessian_index[0]), np.vstack(hessian_index[1]))
-            df = pd.DataFrame({'Rate': np.hstack(rate), 'Tenor': tenors[:, 0],
-                               'Tenor2': tenors[:, 1], 'Tenor3': tenors[:, 2], header:
-                                   np.hstack(values)}).set_index(
-                ['Rate', 'Tenor', 'Tenor2', 'Tenor3']).sort_index(level=[0, 1, 2, 3])
+
+            data = {'Rate': np.hstack(rate), 'Tenor': tenors[:, 0], 'Tenor2': tenors[:, 1],
+                    'Tenor3': tenors[:, 2], header: np.hstack(values)}
+            index = ['Rate', 'Tenor', 'Tenor2', 'Tenor3']
+
+            if display_val:
+                data['Value'] = np.hstack(factor)
+
+            df = pd.DataFrame(data).set_index(index).sort_index(level=[0, 1, 2, 3])
         else:
             # second derivative
             multi_index = []

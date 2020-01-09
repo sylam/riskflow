@@ -1,19 +1,19 @@
 #########################################################################
-# Copyright (C) 2016-2017  Shuaib Osman (sosman@investec.co.za)
-# This file is part of Crstal.
+# Copyright (C) 2016-2019  Shuaib Osman (sosman@investec.co.za)
+# This file is part of RiskFlow.
 #
-# Crstal is free software: you can redistribute it and/or modify
+# RiskFlow is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # any later version.
 #
-# Crstal is distributed in the hope that it will be useful,
+# RiskFlow is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with Crstal.  If not, see <http://www.gnu.org/licenses/>.
+# along with RiskFlow.  If not, see <http://www.gnu.org/licenses/>.
 #########################################################################
 
 """
@@ -148,7 +148,7 @@ def create_market_swaps(base_date, time_grid, curve_index, atm_surface, curve_fa
 
         float_cash = utils.generate_float_cashflows(
             base_date, time_grid, float_pay_dates, 1.0, None, None,
-            instrument['Floating_Frequency'], instrument['Floating_Frequency'],
+            instrument['Floating_Frequency'], pd.DateOffset(month=0),
             utils.get_day_count(instrument['Day_Count']), 0.0)
 
         K, pvbp = float_cash.get_par_swap_rate(base_date, curve_factor)
@@ -223,7 +223,7 @@ class ScipyLeastsqOptimizerInterface(object):
     @@minimize
     """
 
-    def __init__(self, loss, var_to_bounds, **optimizer_kwargs):
+    def __init__(self, loss, var_to_bounds, var_list, **optimizer_kwargs):
 
         def fwd_gradients(ys, xs, d_xs):
             """ Forward-mode pushforward analogous to the pullback defined by tf.gradients.
@@ -235,7 +235,7 @@ class ScipyLeastsqOptimizerInterface(object):
             return tf.gradients(g, v, grad_ys=d_xs)
 
         self._loss = tf.stack(loss)
-        self._vars = variables.trainable_variables()
+        self._vars = var_list
         packed_bounds = None
         if var_to_bounds is not None:
             left_packed_bounds = []
@@ -453,10 +453,10 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
             # SciPy's L-BFGS-B Fortran implementation requires gradients as doubles.
             loss, gradient = loss_grad_func(x)
             return loss, gradient.astype('float64')
-        
+
         def print_fun(x, f, accepted):
             print("at minimum %.4f accepted %d" % (f, int(accepted)))
-            if f<0.1:
+            if f < 0.1:
                 return True
 
         optimizer_kwargs = dict(optimizer_kwargs.items())
@@ -475,7 +475,7 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
 
         import scipy.optimize
         result = scipy.optimize.basinhopping(
-            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=200, T=0.25,
+            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=100, T=0.25,
             accept_test=accept_test, callback=print_fun, take_step=take_step)
 
         message_lines = [
@@ -536,11 +536,8 @@ class InterestRateJacobian(object):
                     except:
                         logging.warning('Unable to calculate the Jacobian for {0} - skipping'.format(market_price))
                         continue
-                    # not really necessary - need to clean this up - TODO!
-                    distinct_tenors = OrderedDict()
-                    utils.distinct_tenors(distinct_tenors, ir_factor, ir_curve)
                     # calculate a reverse lookup for the tenors and store the daycount code
-                    all_tenors = utils.update_tenors(base_date, {}, {ir_factor: ir_curve}, distinct_tenors)
+                    all_tenors = utils.update_tenors(base_date, {ir_factor: ir_curve})
                     # calculate the curve index - need to clean this up - TODO!!!
                     curve_index = [instruments.calc_factor_index(ir_factor, {ir_factor: 0}, {}, all_tenors)]
                     benchmarks = OrderedDict()
@@ -615,6 +612,28 @@ class InterestRateJacobian(object):
 
 
 class GBMTSImpliedParameters(object):
+    documentation = (
+        'FX and Equity',
+        ['For Risk Neutral simulation, an integrated curve $\\bar{\\sigma}(t)$ needs to be specified and is',
+         'interpreted as the average volatility at time $t$. This is typically obtained from the corresponding',
+         'ATM volatility. This is then used to construct a new variance curve $V(t)$ which is defined as',
+         '$V(0)=0, V(t_i)=\\bar{\\sigma}(t_i)^2 t_i$ and $V(t)=\\bar{\\sigma}(t_n)^2 t$ for $t>t_n$ where',
+         '$t_1,...,t_n$ are discrete points on the ATM volatility curve.',
+         '',
+         'Points on the curve that imply a decrease in variance (i.e. $V(t_i)<V(t_{i-1})$) are adjusted to',
+         '$V(t_i)=\\bar\\sigma(t_i)^2t_i=V(t_{i-1})$. This curve is then used to construct *instantaneous* curves',
+         'that are then input to the corresponding stochastic process.',
+         '',
+         'The relationship between integrated $F(t)=\\int_0^t f_1(s)f_2(s)ds$ and instantaneous curves $f_1, f_2$',
+         'where the instantaneous curves are defined on discrete points $P={t_0,t_1,..,t_n}$ with $t_0=0$ is defined',
+         'on $P$ by Simpson\'s rule:',
+         '',
+         '$$F(t_i)=F(t_{i-1})+\\frac{t_i-t_{i-1}}{6}\\Big(f(t_i)+4f(frac{t_i+t_{i-1}}{2})+f(t_i)\\Big)$$',
+         '',
+         'and $f(t)=f_1(t)f_2(t)$. Integrated curves are flat extrapolated and linearly interpolated.'
+        ]
+    )
+
     def __init__(self, param, prec=np.float32):
         self.prec = prec
         self.param = param
@@ -630,7 +649,7 @@ class GBMTSImpliedParameters(object):
                 # get the vol surface
                 vol_factor = utils.Factor('FXVol', utils.check_rate_name(
                     implied_params['instrument']['Asset_Price_Volatility']))
-                
+
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
                     fxvol = riskfactors.construct_factor(vol_factor, price_factors)
@@ -645,29 +664,29 @@ class GBMTSImpliedParameters(object):
                 # store the output
                 price_param = utils.Factor('GBMTSImpliedParameters', market_factor.name)
                 model_param = utils.Factor('GBMAssetPriceTSModelImplied', market_factor.name)
-                
-                if fxvol.expiry.size>1:
-                    dt = np.diff(np.append(0,fxvol.expiry))
-                    var = fxvol.expiry*np.array(atm_vol)**2
+
+                if fxvol.expiry.size > 1:
+                    dt = np.diff(np.append(0, fxvol.expiry))
+                    var = fxvol.expiry * np.array(atm_vol) ** 2
                     sig = atm_vol[:1]
                     vol = atm_vol[:1]
                     var_tm1 = var[0]
                     fixed_variance = False
-                    
-                    for var_t, delta_t, t_i in zip(var[1:], dt[1:]/3.0, fxvol.expiry[1:]):
-                        M = var_tm1+delta_t*(sig[-1]**2)
-                        if var_t<M:
-                            fixed_variance = True                            
+
+                    for var_t, delta_t, t_i in zip(var[1:], dt[1:] / 3.0, fxvol.expiry[1:]):
+                        M = var_tm1 + delta_t * (sig[-1] ** 2)
+                        if var_t < M:
+                            fixed_variance = True
                             var_t = M
-                            
+
                         a = delta_t
-                        b = sig[-1]*delta_t
-                        c = M-var_t
-                        
-                        sig.append( (-b+np.sqrt(b*b-4.0*a*c))/(2.0*a) )
-                        vol.append( np.sqrt( var_t/t_i ) )
+                        b = sig[-1] * delta_t
+                        c = M - var_t
+
+                        sig.append((-b + np.sqrt(b * b - 4.0 * a * c)) / (2.0 * a))
+                        vol.append(np.sqrt(var_t / t_i))
                         var_tm1 = var_t
-                        
+
                     if fixed_variance:
                         logging.warning('Fixed declining variance for {0}'.format(market_price))
                 else:
@@ -718,64 +737,54 @@ class RiskNeutralInterestRateModel(object):
             simulation_batch=self.batch_size)
         # setup the variables
         implied_var = {}
-        with tf.device('/cpu:0'):
-            # the curve is treated as constant here - no placeholders
-            stoch_var = tf.constant(process.factor.current_value(), dtype=self.prec)
-            # store variables on the cpu
-            with tf.name_scope("Implied_Input"):
-                for param_name, param_value in implied_obj.current_value().items():
-                    factor_name = utils.Factor(
-                        implied_obj.__class__.__name__, ir_factor.name + (param_name,))
-                    tf_variable = tf.get_variable(
-                        name=utils.check_scope_name(factor_name),
-                        initializer=self.unconstrain(param_name, param_value.astype(self.prec)),
-                        dtype=self.prec)
-                    implied_var[param_name] = self.constrain(param_name, tf_variable)
+        # the curve is treated as constant here - no placeholders
+        stoch_var = tf.constant(process.factor.current_value(), dtype=self.prec)
+        # store variables on the cpu
+        with tf.name_scope("Implied_Input"):
+            for param_name, param_value in implied_obj.current_value().items():
+                factor_name = utils.Factor(
+                    implied_obj.__class__.__name__, ir_factor.name + (param_name,))
+                tf_variable = tf.get_variable(
+                    name=utils.check_scope_name(factor_name),
+                    initializer=self.unconstrain(param_name, param_value.astype(self.prec)),
+                    dtype=self.prec)
+                implied_var[param_name] = self.constrain(param_name, tf_variable)
 
-            # now setup the calc - on the cpu
-            process.precalculate(base_date, time_grid, stoch_var, shared_mem, 0, implied_tensor=implied_var)
-            # we need stochastic deflation
+        # now setup the calc - on the cpu
+        process.precalculate(base_date, time_grid, stoch_var, shared_mem, 0, implied_tensor=implied_var)
 
-            # def calc_stoch_deflator(self, time_grid, curve_index, shared):
+        # needed to interpolate the zero curve
+        delta_scen_t = np.diff(time_grid.scen_time_grid).reshape(-1, 1).astype(self.prec)
 
-            # cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])
-            # tensor = utils.TensorBlock(curve_index, [cached_tensor], [interpolation_params], time_grid)
-            # self.deflation_drift = tensor.gather_weighted_curve(shared, self.stoch_dt * utils.DAYS_IN_YEAR,
-            #                                                        multiply_by_time=False)
+        for batch_index in range(self.num_batches):
+            # load up the batch
+            batch_sample = sample[batch_index].T.reshape(
+                numfactors, time_grid.time_grid_years.size, -1).astype(self.prec)
+            # simulate the price factor - only need the curve at the mtm time points
+            shared_mem.t_Scenario_Buffer[0] = process.generate(shared_mem, batch_sample)
+            # get the discount factors
+            Dfs = utils.calc_time_grid_curve_rate(
+                curve_index, time_grid.calc_time_grid(time_grid.scen_time_grid[:-1]),
+                shared_mem, delta_scen_t, multiply_by_time=True)
+            # get the index in the deflation factor just prior to the given grid
+            deflation = Dfs.reduce_deflate(time_grid.mtm_time_grid, shared_mem)
+            # go over the instrument definitions and build the calibration
+            for swaption_name, market_data in market_swaps.items():
+                expiry = market_data.deal_data.Time_dep.mtm_time_grid[
+                    market_data.deal_data.Time_dep.deal_time_grid[0]]
+                DtT = deflation[expiry]
+                par_swap = pricing.pvfloatcashflowlist(
+                    shared_mem, time_grid, market_data.deal_data,
+                    pricing.pricer_float_cashflows, settle_cash=False)
+                sum_swaption = tf.reduce_sum(tf.nn.relu(DtT * par_swap))
+                if swaption_name in gpu_swaptions:
+                    gpu_swaptions[swaption_name] += sum_swaption
+                else:
+                    gpu_swaptions[swaption_name] = sum_swaption
 
-            # process.calc_stoch_deflator(time_grid, curve_index, shared_mem)
-                
-            # needed to interpolate the zero curve 
-            delta_scen_t = np.diff(time_grid.scen_time_grid).astype(self.prec)
-
-            with tf.device(self.gpu):
-                # run the batch
-                for batch_index in range(self.num_batches):
-                    # load up the batch
-                    batch_sample = sample[batch_index].T.reshape(
-                        numfactors, time_grid.time_grid_years.size,-1).astype(self.prec)
-                    # simulate the price factor
-                    shared_mem.t_Scenario_Buffer[0] = process.generate(shared_mem, batch_sample)
-                    # get the discount factors
-                    Dfs = utils.calc_time_grid_curve_rate(curve_index, time_grid, shared_mem)
-                    # go over the instrument definitions and build the calibration
-                    for swaption_name, market_data in market_swaps.items():
-                        expiry = market_data.deal_data.Time_dep.mtm_time_grid[
-                            market_data.deal_data.Time_dep.deal_time_grid[0]]
-                        scenario_index = time_grid.scen_time_grid.searchsorted(expiry, side='right')-1
-                        DtT = process.stoch_deflation[scenario_index]
-                        par_swap = pricing.pvfloatcashflowlist(
-                            shared_mem, time_grid, market_data.deal_data,
-                            pricing.pricer_float_cashflows, settle_cash=False)
-                        sum_swaption = tf.reduce_sum(tf.nn.relu(DtT*par_swap))
-                        if swaption_name in gpu_swaptions:
-                            gpu_swaptions[swaption_name] += sum_swaption
-                        else:
-                            gpu_swaptions[swaption_name] = sum_swaption
-
-            calibrated_swaptions = {k: v/(self.batch_size*self.num_batches) for k, v in gpu_swaptions.items()}
-            error = {k: swap.weight * resid(100.0 * (
-                    calibrated_swaptions[k] - swap.price)) for k, swap in market_swaps.items()}
+        calibrated_swaptions = {k: v / (self.batch_size * self.num_batches) for k, v in gpu_swaptions.items()}
+        error = {k: swap.weight * resid(100.0 * (
+                calibrated_swaptions[k] - swap.price)) for k, swap in market_swaps.items()}
 
         return implied_var, error, calibrated_swaptions, market_swaps, benchmarks
 
@@ -799,8 +808,8 @@ class RiskNeutralInterestRateModel(object):
                     continue
 
                 # if market_factor.name[0]!='ZAR-SWAP':
-                #if market_factor.name[0] not in ['ZAR-SWAP','ZAR-JIBAR-3M']:#, 'USD-LIBOR-3M','USD-MASTER']:
-                if market_factor.name[0] not in ['ZAR-JIBAR-3M']:#,'USD-LIBOR-3M','USD-MASTER']:
+                if market_factor.name[0] not in ['ZAR-SWAP','ZAR-JIBAR-3M', 'USD-LIBOR-3M', 'USD-MASTER']:
+                # if market_factor.name[0] not in ['ZAR-JIBAR-3M']:  # ,'USD-LIBOR-3M','USD-MASTER']:
                     continue
 
                 # calc the atm vol
@@ -821,7 +830,6 @@ class RiskNeutralInterestRateModel(object):
                 time_grid.set_base_date(base_date, delta=10)
 
                 # tenor guess - add all the extra dates till the first expiry (should help with accuracy)
-                swaption_expiries = [(x - base_date).days / utils.DAYS_IN_YEAR for x in sorted(mtm_dates)]
                 implied_obj, process = self.implied_process(price_factors, price_models, ir_curve, rate)
 
                 # setup the tensorflow calc
@@ -830,16 +838,13 @@ class RiskNeutralInterestRateModel(object):
                     # calculate the error
                     loss, optimizers, implied_var, calibrated_swaptions, market_swaptions, benchmarks = self.calc_loss(
                         implied_params, base_date, time_grid, process, implied_obj, ir_factor, atm_surface)
-                    # fetch the expiries for reporting
-                    expiry_names = {k: v.deal_data.Time_dep.mtm_time_grid[v.deal_data.Time_dep.deal_time_grid[-1]]
-                                    for k,v in market_swaptions.items()}
-                                    
+
                 if debug is not None:
-                    debug.deals['Deals']['Children']=[{'instrument':x} for x in benchmarks]
+                    debug.deals['Deals']['Children'] = [{'instrument': x} for x in benchmarks]
                     try:
-                        debug.write_trade_file (market_factor.name[0]+'.aap')
+                        debug.write_trade_file(market_factor.name[0] + '.aap')
                     except:
-                        logging.warning('Could not write output file {}'.format(market_factor.name[0]+'.aap'))
+                        logging.warning('Could not write output file {}'.format(market_factor.name[0] + '.aap'))
 
                 # config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=True)
                 config = tf.ConfigProto(allow_soft_placement=True)
@@ -853,22 +858,22 @@ class RiskNeutralInterestRateModel(object):
                     print('Before run', batch_loss, market_factor.name[0])
                     for k, v in sorted(vars.items()):
                         print(k, v)
-                        
+
                     sim_swaptions = sess.run(calibrated_swaptions)
                     for k, v in sorted(sim_swaptions.items()):
                         price = market_swaptions[k].price
                         print(k, 'market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
                             price, v, 100.0 * (price - sim_swaptions[k]) / price))
-                        
-                    # mimimize
+
+                    # minimize
                     soln = None
                     num_optimizers = len(optimizers)
-                    for op_loop in range(6):
-                        optimizers[op_loop%num_optimizers].minimize(sess)
+                    for op_loop in range(2):
+                        optimizers[op_loop % num_optimizers].minimize(sess)
                         batch_loss, vars = sess.run([loss, implied_var])
-                        
-                        if soln is None or batch_loss<soln[0]:
-                            soln = (batch_loss,vars)
+
+                        if soln is None or batch_loss < soln[0]:
+                            soln = (batch_loss, vars)
                             print('After run {}'.format(op_loop), batch_loss)
                             for k, v in sorted(vars.items()):
                                 print(k, v)
@@ -877,7 +882,7 @@ class RiskNeutralInterestRateModel(object):
                                 price = market_swaptions[k].price
                                 print(k, 'market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
                                     price, v, 100.0 * (price - sim_swaptions[k]) / price))
-                        
+
                     # save this
                     self.save_params(soln[1], price_factors, implied_obj, rate)
                     # record the time
@@ -903,21 +908,20 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
 
         losses = list(error.values())
         loss = tf.reduce_sum(losses)
-        
+
         loss_with_penatalties = loss + tf.nn.moments(
             implied_var['Yield_Volatility'][1:] - implied_var['Yield_Volatility'][:-1], axes=[0])[1]
 
-        with tf.device(self.gpu):
-            # standard tensorflow gradient descent based optimizer
-            # optimizer   = tf.train.AdamOptimizer(0.1).minimize(loss_with_penatalties)
-            if constrained:
-                var_to_bounds = {implied_var['Yield_Volatility']: (1e-3, 0.6),
-                                 implied_var['Reversion_Speed']: (1e-2, 1.8)}
-            else:
-                var_to_bounds = None
+        # standard tensorflow gradient descent based optimizer
+        # optimizer   = tf.train.AdamOptimizer(0.1).minimize(loss_with_penatalties)
+        if constrained:
+            var_to_bounds = {implied_var['Yield_Volatility']: (1e-3, 0.6),
+                             implied_var['Reversion_Speed']: (1e-2, 1.8)}
+        else:
+            var_to_bounds = None
 
-            # optimizer = ScipyLeastsqOptimizerInterface(losses, var_to_bounds={} if var_to_bounds is None else var_to_bounds )
-            optimizer = ScipyBasinOptimizerInterface(loss, var_to_bounds=var_to_bounds)
+        # optimizer = ScipyLeastsqOptimizerInterface(losses, var_to_bounds={} if var_to_bounds is None else var_to_bounds )
+        optimizer = ScipyBasinOptimizerInterface(loss, var_to_bounds=var_to_bounds)
 
         return loss, optimizer, implied_var, calibrated_swaptions, market_swaptions, benchmarks
 
@@ -941,8 +945,8 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
         # need to create a process and params as variables to pass to tf
         price_model = utils.Factor('PCAInterestRateModel', rate[1:])
         param_name = utils.check_tuple_name(price_model)
-        vol_tenors = np.array([0,1.5,3,6,12,24,48,84,120])/12.0
-        
+        vol_tenors = np.array([0, 1.5, 3, 6, 12, 24, 48, 84, 120]) / 12.0
+
         if param_name in price_factors:
             param = price_models[param_name]
 
@@ -957,7 +961,7 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
                 {'Quanto_FX_Volatility': None,
                  'Reversion_Speed': 1.0,
                  'Yield_Volatility': utils.Curve([], list(zip(vol_tenors, [0.1] * vol_tenors.size)))})
-            
+
         process = stochasticprocess.construct_process(
             price_model.type, ir_curve, price_models[utils.check_tuple_name(price_model)], implied_obj)
 
@@ -968,12 +972,22 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
         param_name = utils.check_tuple_name(
             utils.Factor(type='PCAInterestRateModel', name=rate[1:]))
         param = price_factors[param_name]
-        
+        vol_tenors = implied_obj.get_vol_tenors()
+
         param['Reversion_Speed'] = float(vars['Reversion_Speed'][0])
-        param['Yield_Volatility'].array=np.dstack((vol_tenors, vars['Yield_Volatility']))[0]
+        param['Yield_Volatility'].array = np.dstack((vol_tenors, vars['Yield_Volatility']))[0]
 
 
 class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
+    documentation = (
+        'Interest Rates',
+        ['',
+         '',
+         '$$F(t_i)=F(t_{i-1})+\\frac{t_i-t_{i-1}}{6}\\Big(f(t_i)+4f(frac{t_i+t_{i-1}}{2})+f(t_i)\\Big)$$',
+         '',
+         'and $f(t)=f_1(t)f_2(t)$. Integrated curves are flat extrapolated and linearly interpolated.'
+         ]
+    )
     def __init__(self, param, prec=np.float32):
         super(HullWhite2FactorModelParameters, self).__init__(param)
         self.market_factor_type = 'HullWhite2FactorInterestRateModelPrices'
@@ -981,7 +995,8 @@ class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
     def calc_sample(self, time_grid, numfactors=0):
         if numfactors != 2 or self.sample is None:
             self.sample = normalize(norm.ppf(hdsobol.gen_sobol_vectors(
-                self.batch_size * self.num_batches + 4000, time_grid.time_grid_years.size * numfactors))[3999:]).reshape(
+                self.batch_size * self.num_batches + 4000, time_grid.time_grid_years.size * numfactors))[
+                                    3999:]).reshape(
                 self.num_batches, self.batch_size, -1)
         return self.sample
 
@@ -994,15 +1009,15 @@ class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
                 implied_var['Correlation']: corr_bounds,
                 implied_var['Alpha_1']: alpha_bounds,
                 implied_var['Alpha_2']: alpha_bounds}
-        
+
         def split_param(x):
             corr = x[-1:]
             alpha = x[-3:-1]
             sigmas = x[:-3]
             return sigmas, alpha, corr
-        
+
         def make_basin_callbacks(step, sigma_min_max, alpha_min_max, corr_min_max):
-            
+
             def bounds_check(**kwargs):
                 x = kwargs["x_new"]
                 sigmas, alpha, corr = split_param(x)
@@ -1010,63 +1025,60 @@ class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
                 alpha_ok = (alpha > alpha_min_max[0]).all() and (alpha < alpha_min_max[1]).all()
                 corre_ok = (corr > corr_min_max[0]).all() and (corr < corr_min_max[1]).all()
                 return sigma_ok and alpha_ok and corre_ok
-            
+
             def basin_step(x):
                 sigmas, alpha, corr = split_param(x)
-                #update vars
-                sigmas = (sigmas+np.random.uniform(-0.08*step, 0.08*step, sigmas.size)).clip(*sigma_min_max)
-                alpha = (alpha+np.random.uniform(-1.5*step, 1.5*step, alpha.size)).clip(*alpha_min_max)
-                corr = (corr+np.random.uniform(-step, step, corr.size)).clip(*corr_min_max)
-                
+                # update vars
+                sigmas = (sigmas*np.exp(np.random.uniform(-step, step, sigmas.size))).clip(*sigma_min_max)
+                alpha = (alpha*np.exp(np.random.uniform(-step, step, alpha.size))).clip(*alpha_min_max)
+                corr = (corr + np.random.uniform(-step, step, corr.size)).clip(*corr_min_max)
+
                 return np.concatenate((sigmas, alpha, corr))
-            
+
             return bounds_check, basin_step
-        
-        
+
         # get the swaption error and market values
         implied_var_dict, error_dict, calibrated_swaptions, market_swaptions, benchmarks = self.calc_loss_on_ir_curve(
             implied_params, base_date, time_grid, process, implied_obj, ir_factor, atm_surface)
 
         error = OrderedDict(error_dict)
-        var_list = [implied_var_dict['Sigma_1'],implied_var_dict['Sigma_2'],
+        var_list = [implied_var_dict['Sigma_1'], implied_var_dict['Sigma_2'],
                     implied_var_dict['Alpha_1'], implied_var_dict['Alpha_2'],
                     implied_var_dict['Correlation']]
-        
+
         implied_var = OrderedDict(implied_var_dict)
         losses = list(error.values())
-        loss = tf.reduce_sum(losses)# +100.0*(
-            # tf.nn.moments(implied_var['Sigma_1'][1:]-implied_var['Sigma_1'][:-1],axes=[0])[1]+
-            # tf.nn.moments(implied_var['Sigma_2'][1:]-implied_var['Sigma_2'][:-1],axes=[0])[1])
+        loss = tf.reduce_sum(losses)
 
         sigma_bounds = (1e-4, 0.08)
-        alpha_bounds = (1e-4, 2.25)
-        corr_bounds  = (-.93, 0.93)
-        
+        alpha_bounds = (1e-4, 2.4)
+        corr_bounds = (-.92, 0.92)
+
         # slightly different bounds for the least squares calc
         lq_sigma_bounds = (1e-5, 0.085)
-        lq_alpha_bounds = (1e-5, 2.3)
-        lq_corr_bounds  = (-.94, 0.94)
-        
-        with tf.device(self.gpu):
-            # standard tensorflow gradient descent based optimizer
-            if constrained:
-                var_to_bounds = make_bounds(implied_var, sigma_bounds, corr_bounds, alpha_bounds)
-                var_to_bounds_lq = make_bounds(implied_var, lq_sigma_bounds, lq_corr_bounds, lq_alpha_bounds)
-            else:
-                var_to_bounds = None
-                var_to_bounds_lq = None
-                
-            bounds_ok, make_step = make_basin_callbacks(0.25, sigma_bounds, alpha_bounds, corr_bounds)
+        lq_alpha_bounds = (1e-5, 2.5)
+        lq_corr_bounds = (-.93, 0.93)
 
-            optimizers = [
-                ScipyBasinOptimizerInterface(
-                    loss, var_list = var_list,
-                    take_step = make_step,
-                    accept_test = bounds_ok,
-                    var_to_bounds=var_to_bounds)
-                ,ScipyLeastsqOptimizerInterface(
-                    losses, var_to_bounds=var_to_bounds_lq)
-                ]
+        # standard tensorflow gradient descent based optimizer
+        if constrained:
+            var_to_bounds = make_bounds(implied_var, sigma_bounds, corr_bounds, alpha_bounds)
+            var_to_bounds_lq = make_bounds(implied_var, lq_sigma_bounds, lq_corr_bounds, lq_alpha_bounds)
+        else:
+            var_to_bounds = None
+            var_to_bounds_lq = None
+
+        bounds_ok, make_step = make_basin_callbacks(0.25, sigma_bounds, alpha_bounds, corr_bounds)
+
+        optimizers = [
+            ScipyBasinOptimizerInterface(
+                loss, var_list=var_list,
+                take_step=make_step,
+                accept_test=bounds_ok,
+                var_to_bounds=var_to_bounds)
+            , ScipyLeastsqOptimizerInterface(
+                losses, var_list=var_list,
+                var_to_bounds=var_to_bounds_lq)
+        ]
 
         return loss, optimizers, implied_var, calibrated_swaptions, market_swaptions, benchmarks
 
@@ -1078,7 +1090,7 @@ class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
         elif param_name in ['Alpha_1', 'Alpha_2']:
             return 0.0001 + 2.45 * tf.nn.sigmoid(variable)
         elif param_name in ['Correlation']:
-            return 0.92*tf.nn.tanh(variable)
+            return 0.92 * tf.nn.tanh(variable)
         else:
             raise Exception('Variable not constrained')
 
@@ -1086,48 +1098,48 @@ class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
         if ident:
             return value
         elif param_name in ['Sigma_1', 'Sigma_2']:
-            return logit((value-0.0001) /0.07 )
+            return logit((value - 0.0001) / 0.07)
         elif param_name in ['Alpha_1', 'Alpha_2']:
-            return logit((value-0.0001) / 2.45 )
+            return logit((value - 0.0001) / 2.45)
         elif param_name in ['Correlation']:
-            return np.arctanh(value/0.92)
+            return np.arctanh(value / 0.92)
         else:
             raise Exception('Variable not constrained')
 
     def implied_process(self, price_factors, price_models, ir_curve, rate):
-        vol_tenors = np.array([0,1.5,3,6,12,24,48,84,120])/12.0
+        vol_tenors = np.array([0, 1, 2, 3, 6, 12, 24, 48, 84, 120]) / 12.0
         # construct an initial guess - need to read from params
         param_name = utils.check_tuple_name(
             utils.Factor(type='HullWhite2FactorModelParameters', name=rate[1:]))
-        
+
         # check if we need a quanto fx vol
         fx_factor = utils.Factor('GBMTSImpliedParameters', ir_curve.get_currency())
         ir_factor = utils.Factor('InterestRate', ir_curve.get_currency())
         fx_factor_name = utils.check_tuple_name(fx_factor)
         ir_factor_name = utils.check_tuple_name(ir_factor)
-        
+
         if fx_factor_name in price_factors:
             quanto_fx = price_factors[fx_factor_name]['Vol']
             correlation_name = 'Correlation.FxRate.{}/{}'.format('.'.join(
-                sorted(('USD',)+ir_curve.get_currency())), ir_factor_name)
+                sorted(('USD',) + ir_curve.get_currency())), ir_factor_name)
             # the correlation between fx and ir - needed to establish Quanto Correlation 1 and 2
-            C = price_factors.get(correlation_name,{'Value':0.0})['Value']
+            C = price_factors.get(correlation_name, {'Value': 0.0})['Value']
         else:
             C = None
             quanto_fx = None
-            
+
         if param_name in price_factors:
             param = price_factors[param_name]
             implied_obj = riskfactors.HullWhite2FactorModelParameters(
                 {'Quanto_FX_Volatility': quanto_fx,
                  'short_rate_fx_correlation': C,
-                 'Alpha_1': np.clip(param['Alpha_1'],1e-4, 2.25),
-                 'Alpha_2': np.clip(param['Alpha_2'],1e-4, 2.25),
+                 'Alpha_1': np.clip(param['Alpha_1'], 1e-4, 2.4),
+                 'Alpha_2': np.clip(param['Alpha_2'], 1e-4, 2.4),
                  'Correlation': np.clip(param['Correlation'], -0.95, 0.95),
                  'Sigma_1': utils.Curve([], list(zip(
-                     vol_tenors, np.interp(vol_tenors, *param['Sigma_1'].array.T).clip(1e-4+5e-5,0.08)))),
+                     vol_tenors, np.interp(vol_tenors, *param['Sigma_1'].array.T).clip(1e-4 + 5e-5, 0.08)))),
                  'Sigma_2': utils.Curve([], list(zip(
-                     vol_tenors, np.interp(vol_tenors, *param['Sigma_2'].array.T).clip(1e-4+5e-5,0.08))))})
+                     vol_tenors, np.interp(vol_tenors, *param['Sigma_2'].array.T).clip(1e-4 + 5e-5, 0.08))))})
         else:
             implied_obj = riskfactors.HullWhite2FactorModelParameters(
                 {'Quanto_FX_Volatility': quanto_fx,
@@ -1141,21 +1153,21 @@ class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
             ir_curve, {'Lambda_1': 0.0, 'Lambda_2': 0.0}, implied_obj)
 
         return implied_obj, process
-    
+
     def save_params(self, vars, price_factors, implied_obj, rate):
         param_name = utils.check_tuple_name(
             utils.Factor(type='HullWhite2FactorModelParameters', name=rate[1:]))
         param = price_factors[param_name]
-        
+
         param['Alpha_1'] = float(vars['Alpha_1'][0])
         param['Alpha_2'] = float(vars['Alpha_2'][0])
         param['Correlation'] = float(vars['Correlation'][0])
-        
+
         # grab the sigma tenors
         sig1_tenor, sig2_tenor = implied_obj.get_vol_tenors()
-        param['Sigma_1'].array=np.dstack((sig1_tenor,vars['Sigma_1']))[0]
-        param['Sigma_2'].array=np.dstack((sig2_tenor,vars['Sigma_2']))[0]
-        
+        param['Sigma_1'].array = np.dstack((sig1_tenor, vars['Sigma_1']))[0]
+        param['Sigma_2'].array = np.dstack((sig2_tenor, vars['Sigma_2']))[0]
+
         # grab the quanto fx correlations
         quanto_fx1, quanto_fx2 = implied_obj.get_quanto_correlation(
             vars['Correlation'], [vars['Sigma_1'], vars['Sigma_2']])

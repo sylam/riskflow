@@ -46,11 +46,11 @@ def set_collateral(cx, Agreement_Currency, Opening_Balance, Received_Threshold=0
     )
 
 
-def load_market_data(rundate, path, setup_funding=False, cva_default=True):
+def load_market_data(rundate, path, json_name='MarketData.json', setup_funding=False, cva_default=True):
     from adaptiv import AdaptivContext
 
     context = AdaptivContext()
-    context.parse_json(os.path.join(path, rundate, 'MarketData.json'))
+    context.parse_json(os.path.join(path, rundate, json_name))
     context.parse_calendar_file(os.path.join(path, 'calendars.cal'))
 
     context.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
@@ -90,7 +90,7 @@ def run_cmc(context, rundate, Currency='ZAR', CVA=True, FVA=False, CollVA=False,
                          'Stochastic_Hazard': cva_sect['Stochastic_Hazard_Rates'],
                          'Counterparty': cva_sect['Counterparty'], 'Deflation': 'ZAR-SWAP',
                          # brave choices these . . .
-                         'Gradient': 'No', 'Hessian': 'No'},
+                         'Gradient': 'Yes', 'Hessian': 'No'},
                  'FVA': {'Funding_Interest_Curve': 'USD-LIBOR-3M.FUNDING',
                          'Risk_Free_Curve': 'USD-OIS',
                          'Counterparty': cva_sect['Counterparty'],
@@ -107,7 +107,6 @@ def run_cmc(context, rundate, Currency='ZAR', CVA=True, FVA=False, CollVA=False,
 
     calc = construct_calculation('Credit_Monte_Carlo', context)
     out = calc.execute(params_mc)
-
     exposure = out['Results']['mtm'].clip(0.0, np.inf)
     dates = np.array(sorted(calc.time_grid.mtm_dates))[
         calc.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
@@ -130,7 +129,7 @@ def bootstrap(path, rundate, reuse_cal=True):
         context.parse_json(os.path.join(path, rundate, 'MarketData.json'))
 
     context.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
-    context.parse_calendar_file(os.path.join('calendars.cal'))
+    context.parse_calendar_file(os.path.join(path,'calendars.cal'))
 
     context.bootstrap()
     context.write_marketdata_json(os.path.join(path, rundate, 'MarketDataCal.json'))
@@ -152,9 +151,9 @@ if __name__ == '__main__':
                     'G:\\Credit Quants\\CRSTAL\\{}'.format(folder),
                     'G:\\{}'.format(folder)], uat=False)
 
-    rundate = '2019-11-25'
-    cx = load_market_data(rundate, path)
+    rundate = '2019-12-31'
+    cx = load_market_data(rundate, path, json_name='MarketDataCal2.json')
+    # bootstrap(path, rundate, reuse_cal=True)
     params_bv = {'calc_name': ('test1',), 'Run_Date': rundate, 'Currency': 'ZAR', 'Greeks': 'No'}
     cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
-    calc, out, res = run_cmc(cx, rundate)
-
+    # calc, out, res = run_cmc(cx, rundate)

@@ -674,7 +674,7 @@ class HullWhite2FactorModelParameters(Factor1D):
             return [scale * (s1 + p * s2), scale * (p * s1 + s2)]
         else:
             return [
-                self.param['Quanto_FX_Correlation_1'], self.param['Quanto_FX_Correlation_2']]
+                self.param.get('Quanto_FX_Correlation_1', 0.0), self.param.get('Quanto_FX_Correlation_2', 0.0)]
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attribute"""
@@ -692,7 +692,9 @@ class HullWhite2FactorModelParameters(Factor1D):
                 'Alpha_2': zero,
                 'Correlation': zero,
                 'Sigma_1': sig1.reshape(-1, 1),
-                'Sigma_2': sig2.reshape(-1, 1)}
+                'Sigma_2': sig2.reshape(-1, 1),
+                'Quanto_FX_Correlation_1': zero,
+                'Quanto_FX_Correlation_2': zero}
 
     def current_value(self, tenors=None, offset=0.0):
         """Returns the parameters of the HW2 factor model as a dictionary"""
@@ -728,6 +730,9 @@ class PCAMixedFactorModelParameters(Factor1D):
     def get_tenor_indices(self):
         return {'Reversion_Speed': np.array([[0.0]]),
                 'Yield_Volatility': self.param['Yield_Volatility'].array[:, 0].reshape(-1, 1)}
+
+    def get_vol_tenor(self):
+        return self.param['Yield_Volatility'].array[:, 0]
 
     def current_value(self, tenors=None, offset=0.0):
         """Returns the parameters of the mixed factor model as a dictionary"""

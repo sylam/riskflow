@@ -115,23 +115,32 @@ class GBMAssetPriceTSModelImplied(object):
         'allows this would be to modify the volatility $\\sigma(t)$ and $\\mu(t)$ to be functions of time $t$.',
         'This can be specified as follows:',
         '',
-        '$$ \\frac{dS(t)}{S(t)} = (r(t)-q(t)) dt + \\sigma(t) dW(t)$$',
+        '$$ \\frac{dS(t)}{S(t)} = (r(t)-q(t)-v(t)\\sigma(t)\\rho) dt + \\sigma(t) dW(t)$$',
         '',
-        'Note that no Quanto effects are captured (these effects would be required should the asset currency be',
-        'different to the base Currency). Its final form is:',
+        'Note that no risk premium curve is captured. Its final form is:',
         '',
-        '$$ S(t+\\delta) = F(t,t+\\delta)exp \\Big( (-\\frac{1}{2}(V(t+\\delta)) - V(t)) + \\sqrt{V(t+\\delta) - V(t)}Z  \\Big) $$',
+        '$$ S(t+\\delta) = F(t,t+\\delta)exp \\Big(\\rho(C(t+\\delta)-C(t)) -\\frac{1}{2}(V(t+\\delta)) - V(t))\
+         + \\sqrt{V(t+\\delta) - V(t)}Z  \\Big) $$',
         '',
         'Where:',
         '',
         '- $\\sigma(t)$ is the volatility of the asset at time $t$',
+        '- $v(t)$ is the *Quanto FX Volatility* of the asset at time $t$. $\\rho$ is then the *Quanto FX Correlation*',
         '- $V(t) = \\int_{0}^{t} \\sigma(s)^2 ds$',
+        '- $C(t) = \\int_{0}^{t} v(s)\\sigma(s) ds$',
         '- $r$ is the interest rate in the asset currency',
         '- $q$ is the yield on the asset (If S is a foreign exchange rate, q is the foreign interest rate)',
         '- $F(t,t+\\delta)$ is the forward asset price at time t',
         '- $S$ is the spot price of the asset',
         '- $Z$ is a sample from the standard normal distribution',
-        '- $\\delta$ is the increment in timestep between samples'])
+        '- $\\delta$ is the increment in timestep between samples',
+        '',
+        'In the case that the $S(t)$ represents an FX rate, this can be further simplified to:',
+        '',
+        '$$S(t)=S(0)\\beta(t)exp\\Big(\\frac{1}{2}\\bar\\sigma(t)^2t+\\int_0^t\\sigma(s)dW(s)\\Big)$$',
+        '',
+        'Here $C(t)=\\bar\\sigma(t)^2t, \\beta(t)=exp\\Big(\\int_0^t(r(s)-q(s))ds\\Big), \\rho=-1 and v(t)=\\sigma(t)$'
+    ])
 
     def __init__(self, factor, param, implied_factor=None):
         self.factor = factor
@@ -292,8 +301,7 @@ class HullWhite2FactorImpliedInterestRateModel(object):
         self.param = param
         self.implied = implied_factor
         self.clip = clip
-        self.stoch_index = None
-        self.stoch_deflation = None
+        self.grid_index = None
         self.BtT = None
         self.C = None
         self.f1 = None
@@ -454,18 +462,12 @@ class HullWhite2FactorImpliedInterestRateModel(object):
         # needed for factor calcs later
         self.F1 = tf.reshape(self.C[0, 0], [-1, 1])
         self.F2 = tf.expand_dims(self.C[1], axis=2)
-        drift = self.fwd_curve + 0.5 * tf.cast(AtT, shared.precision)
 
-        # check if we need to setup the calc for stochastic deflation
-        if time_grid.time_grid_years.size != time_grid.scen_time_grid.size:
-            self.stoch_index = time_grid.time_grid_years.searchsorted(time_grid.scen_time_grid / utils.DAYS_IN_YEAR)
-            self.drift = tf.expand_dims(tf.gather(drift, self.stoch_index), 2)
-            self.stoch_drift = drift
-            self.stoch_dt = np.diff(time_grid.time_grid_years)
-            self.Bdt = [tf.cast((1.0 - tf.exp(-alpha[i] * self.stoch_dt.reshape(-1, 1))) / alpha[i],
-                                shared.precision) for i in range(2)]
-        else:
-            self.drift = tf.expand_dims(drift, 2)
+        # store the grid points used if necessary
+        if len(time_grid.scenario_grid)!=time_grid.time_grid_years.size:
+            self.grid_index = time_grid.scen_time_grid.searchsorted(time_grid.scenario_grid[:,utils.TIME_GRID_MTM])
+            
+        self.drift = tf.expand_dims(self.fwd_curve + 0.5 * tf.cast(AtT, shared.precision), 2)
 
         if hasattr(shared, 't_random_numbers'):
             # only run this if we have random numbers
@@ -477,17 +479,23 @@ class HullWhite2FactorImpliedInterestRateModel(object):
         cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])
         tensor = utils.TensorBlock(curve_index, [cached_tensor], [interpolation_params], time_grid)
         self.deflation_drift = tensor.gather_weighted_curve(shared, self.stoch_dt * utils.DAYS_IN_YEAR,
-                                                           multiply_by_time=False)
+                                                            multiply_by_time=False)
 
-    def calc_points(self, indices, points, shared, multiply_by_time=True):
+    def calc_points(self, rate, points, time_grid, shared, multiply_by_time=True):
         ''' Much slower way to evaluate points at time t - but more accurate and memory efficient'''
-        BtT = [(1.0 - tf.exp(-self.alpha[i] * points.reshape(-1, 1))) / self.alpha[i] for i in range(2)]
-        drift = tf.expand_dims(tf.gather(self.drift, indices), 2)
-        f1 = tf.gather(self.f1, indices)
-        f2 = tf.gather(self.f2, indices)
+        t = rate[utils.FACTOR_INDEX_Daycount](points)
+        BtT = [tf.expand_dims((1.0 - tf.exp(-self.alpha[i] * t)),2) / self.alpha[i] for i in range(2)]
+        drift_at_grid = utils.gather_scenario_interp(self.drift, time_grid, shared)
+        drift = utils.interpolate_curve(drift_at_grid, rate, None, points, 0)
+        f1 = utils.gather_scenario_interp(self.f1, time_grid, shared)
+        f2 = utils.gather_scenario_interp(self.f2, time_grid, shared)
         stoch_component = BtT[0] * f1 + BtT[1] * f2
-        return (drift + stoch_component) / (
-            self.factor.get_tenor().astype(shared.precision).reshape(-1, 1))
+        fwd_curve = drift + stoch_component
+        
+        if multiply_by_time:
+            return fwd_curve 
+        else:
+            return fwd_curve/t
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         pass
@@ -508,24 +516,19 @@ class HullWhite2FactorImpliedInterestRateModel(object):
 
         with tf.name_scope(self.__class__.__name__):
             # check if we need deflators
-            if self.stoch_index is not None:
-                f1 = tf.gather(self.f1, self.stoch_index)
-                f2 = tf.gather(self.f2, self.stoch_index)
-                stoch_component = self.BtT[0] * f1 + self.BtT[1] * f2
-
-                # calculate the deflation
-                deflation_component = self.Bdt[0] * tf.squeeze(
-                    self.f1[:-1], axis=1) + self.Bdt[1] * tf.squeeze(self.f2[:-1], axis=1)
-
-                stoch_deflation = self.deflation_drift + deflation_component
-
-                # we now have a very good approximation for the stochastic deflator
-                self.D0T = tf.exp(-tf.cumsum(stoch_deflation, axis=0))
-                self.stoch_deflation = tf.unstack(tf.gather(self.D0T, self.stoch_index - 1))
+            if self.grid_index is not None:
+                # only generate curves for the given grid
+                f1 = tf.gather(self.f1, self.grid_index)
+                f2 = tf.gather(self.f2, self.grid_index)
+                drift = tf.gather(self.drift, self.grid_index)
             else:
-                stoch_component = self.BtT[0] * self.f1 + self.BtT[1] * self.f2
+                f1 = self.f1
+                f2 = self.f2
+                drift = self.drift
 
-            return (self.drift + stoch_component) / (
+            # generate curves based on 
+            stoch_component = self.BtT[0] * f1 + self.BtT[1] * f2
+            return (drift + stoch_component) / (
                 self.factor.get_tenor().astype(shared_mem.precision).reshape(-1, 1))
 
 
