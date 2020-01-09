@@ -981,8 +981,13 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
 class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
     documentation = (
         'Interest Rates',
-        ['',
+        ['A set of parameters $\\sigma_1, \\sigma_2, \\alpha_1, \\alpha_2, \\rho$ are estimated from ATM',
+         'swaption volatilities. Swaption volatilities are preferred to caplets to better estimate $\\rho$.'
+         'Although assuming that $\\sigma_1, \\sigma_2$ are constant makes the calibration of this model',
+         'considerably easier, in general, $\\sigma_1, \\sigma_2$ should be allowed a piecewise linear term',
+         'structure dependent on the underlying swaptions.',
          '',
+         'This can then be solved via brute-force monte carlo through tensorflow.'
          '$$F(t_i)=F(t_{i-1})+\\frac{t_i-t_{i-1}}{6}\\Big(f(t_i)+4f(frac{t_i+t_{i-1}}{2})+f(t_i)\\Big)$$',
          '',
          'and $f(t)=f_1(t)f_2(t)$. Integrated curves are flat extrapolated and linearly interpolated.'

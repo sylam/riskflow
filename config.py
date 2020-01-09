@@ -1,19 +1,19 @@
 #########################################################################
 # Copyright (C) 2016-2017  Shuaib Osman (sosman@investec.co.za)
-# This file is part of Crstal.
+# This file is part of RiskFlow.
 #
-# Crstal is free software: you can redistribute it and/or modify
+# RiskFlow is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # any later version.
 #
-# Crstal is distributed in the hope that it will be useful,
+# RiskFlow is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with Crstal.  If not, see <http://www.gnu.org/licenses/>.
+# along with RiskFlow.  If not, see <http://www.gnu.org/licenses/>.
 #########################################################################
 
 # import standard libraries
@@ -200,18 +200,20 @@ class Context(object):
         self.params = {
             'System Parameters':
                 {'Base_Currency': 'USD',
+                 'Base_Date': '',
                  'Correlations_Healing_Method': 'Eigenvalue_Raising'
                  },
             'Model Configuration': ModelParams(),
             'Price Factors': {},
             'Price Models': {},
             'Correlations': {},
-            'Market Prices': {}
+            'Market Prices': {},
+            'Valuation Configuration': {},
+            'Bootstrapper Configuration': {}
         }  # type: Dict[str, Union[ModelParams, Dict[Any, Any]]]
 
         # make sure that there are no default calibration mappings
         self.calibration_process_map = {}
-
         self.gridparser = get_grid_grammar()
 
     def parse_grid(self, run_date, max_date, grid, past_max_date=False):
