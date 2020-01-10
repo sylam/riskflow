@@ -301,7 +301,7 @@ class Context(object):
 
         return {'present': model_factor, 'absent': remaining_factor}
 
-    def bootstrap(self):
+    def bootstrap(self, num_jobs=None):
         # need to implement ordered dicts in the params obj - TODO
         for bootstrapper_name, params in sorted(self.params['Bootstrapper Configuration'].items()):
             # need parsers here - but for now, can just use the name to know what to do
@@ -315,7 +315,6 @@ class Context(object):
                                    self.params['Price Models'],
                                    self.params['Price Factors'],
                                    self.params['Market Prices'],
-                                   self.parse_grid,
                                    self.holidays,
                                    debug=self)
 

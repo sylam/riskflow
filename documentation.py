@@ -878,7 +878,7 @@ class ConstructMarkdown(Elaboration):
               ' - a surface point $p_i$',
               '',
               'The points should satisfy $p_1<p_2<...<p_n$ and the process of bootstrapping results in a price',
-              'factor $S$ such that $V_i(S, Q_i)=0$ for all $i=1,..,n$.'
+              'factor $S$ such that $V_i(S, Q_i)=0$ for all $i=1,..,n$.',
               ''
               ]),
             ('FX and Equity', ['']),

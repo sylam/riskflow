@@ -505,7 +505,7 @@ class InterestRateJacobian(object):
         self.param = param
         self.batch_size = 1
 
-    def bootstrap(self, sys_params, price_models, price_factors, market_prices, grid, calendars, debug=None):
+    def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
 
         def fwd_gradients(ys, xs, d_xs):
             """ Forward-mode pushforward analogous to the pullback defined by tf.gradients.
@@ -628,17 +628,17 @@ class GBMTSImpliedParameters(object):
          'where the instantaneous curves are defined on discrete points $P={t_0,t_1,..,t_n}$ with $t_0=0$ is defined',
          'on $P$ by Simpson\'s rule:',
          '',
-         '$$F(t_i)=F(t_{i-1})+\\frac{t_i-t_{i-1}}{6}\\Big(f(t_i)+4f(frac{t_i+t_{i-1}}{2})+f(t_i)\\Big)$$',
+         '$$F(t_i)=F(t_{i-1})+\\frac{t_i-t_{i-1}}{6}\\Big(f(t_i)+4f(\\frac{t_i+t_{i-1}}{2})+f(t_i)\\Big)$$',
          '',
          'and $f(t)=f_1(t)f_2(t)$. Integrated curves are flat extrapolated and linearly interpolated.'
-        ]
+         ]
     )
 
     def __init__(self, param, prec=np.float32):
         self.prec = prec
         self.param = param
 
-    def bootstrap(self, sys_params, price_models, price_factors, market_prices, grid, calendars, debug=None):
+    def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
         '''
         Checks for Declining variance in the ATM vols of the relevant price factor and corrects accordingly.
         '''
@@ -788,7 +788,7 @@ class RiskNeutralInterestRateModel(object):
 
         return implied_var, error, calibrated_swaptions, market_swaps, benchmarks
 
-    def bootstrap(self, sys_params, price_models, price_factors, market_prices, grid, calendars, debug=None):
+    def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
         base_date = sys_params['Base_Date']
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
@@ -808,8 +808,8 @@ class RiskNeutralInterestRateModel(object):
                     continue
 
                 # if market_factor.name[0]!='ZAR-SWAP':
-                if market_factor.name[0] not in ['ZAR-SWAP','ZAR-JIBAR-3M', 'USD-LIBOR-3M', 'USD-MASTER']:
-                # if market_factor.name[0] not in ['ZAR-JIBAR-3M']:  # ,'USD-LIBOR-3M','USD-MASTER']:
+                if market_factor.name[0] not in ['ZAR-SWAP', 'ZAR-JIBAR-3M', 'USD-LIBOR-3M', 'USD-MASTER']:
+                    # if market_factor.name[0] not in ['ZAR-JIBAR-3M']:  # ,'USD-LIBOR-3M','USD-MASTER']:
                     continue
 
                 # calc the atm vol
@@ -823,10 +823,9 @@ class RiskNeutralInterestRateModel(object):
                 # set of dates for the calibration
                 mtm_dates = set(
                     [base_date + x['Start'] for x in implied_params['instrument']['Instrument_Definitions']])
-                # scenario_dates = grid(base_date, max(mtm_dates), '0d 1w(1w) 3m(1m) 5y(2m)')
 
                 time_grid = TimeGrid(mtm_dates, mtm_dates, mtm_dates)
-                # add a delta of 10 days to the time_grid_years (without changeing the scenario grid
+                # add a delta of 10 days to the time_grid_years (without changing the scenario grid
                 time_grid.set_base_date(base_date, delta=10)
 
                 # tenor guess - add all the extra dates till the first expiry (should help with accuracy)
@@ -987,12 +986,49 @@ class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
          'considerably easier, in general, $\\sigma_1, \\sigma_2$ should be allowed a piecewise linear term',
          'structure dependent on the underlying swaptions.',
          '',
-         'This can then be solved via brute-force monte carlo through tensorflow.'
-         '$$F(t_i)=F(t_{i-1})+\\frac{t_i-t_{i-1}}{6}\\Big(f(t_i)+4f(frac{t_i+t_{i-1}}{2})+f(t_i)\\Big)$$',
+         'For a set of $J$ ATM swaptions, we need to minimize:',
          '',
-         'and $f(t)=f_1(t)f_2(t)$. Integrated curves are flat extrapolated and linearly interpolated.'
+         '$$E=\\sum_{j\\in J} \\omega_j (V_j(\\sigma_1, \\sigma_2, \\alpha_1, \\alpha_2, \\rho)-V_j)^2$$',
+         '',
+         'Where $V_j(\\sigma_1, \\sigma_2, \\alpha_1, \\alpha_2, \\rho)$ is the price of the $j^{th}$ swaption',
+         'under the model, $V_j$ is the market value of the $j^{th}$ swaption and $ \\omega_j$ is the corresponding',
+         'weight. The market value is calculated using the standard pricing functions',
+         '',
+         'To find a good minimum of the model value, basin hopping as implemented [here](https://docs.scipy.org/doc\
+/scipy/reference/generated/scipy.optimize.basinhopping.html) as well as',
+         'least squares [optimization](https://docs.scipy.org/doc/scipy/reference/generated/\
+scipy.optimize.leastsq.html) are used.',
+         '',
+         'The error $E$ is algorithmically differentiated and then solved via brute-force monte carlo',
+         'using tensorflow and scipy.',
+         '',
+         'If the currency of the interest rate is not the same as the base currency, then a quanto correction needs',
+         'to be made. Assume $C$ is the value of the interest rate/FX correlation price factor (can be estimated from',
+         'historical data), then the FX rate follows:',
+         '',
+         '$$d(log X)(t)=(r_0(t)-r(t)-\\frac{1}{2}v(t)^2)dt+v(t)dW(t)$$',
+         '',
+         'with $r(t)$ the short rate and $r_0(t)$ the short rate in base currency. The short rate with a quanto',
+         'correction is:',
+         '',
+         '$$dr(t)=r_T(0,t)dt+\\sum_{i=1}^2 (\\theta_i(t)-\\alpha_i x_i(t)- \\bar\\rho_i\\sigma_i v(t))dt+\\sigma_i dW_i(t)$$',
+         '',
+         'where $W_1(t),W_2(t)$ and $W(t)$ are standard Wiener processes under the rate currency\'s risk neutral measure',
+         'and $r_T(t,T)$ is the partial derivative of the instantaneous forward rate r(t,T) with respect to the maturity.',
+         'date $T$.'
+         '',
+         'Define:',
+         '$$F(u,v)=\\frac{\\sigma_1u+\\sigma_2v}{\\sqrt{\\sigma_1^2+\\sigma_2^2+2\\rho\\sigma_1\\sigma_2}}$$',
+         '',
+         'Then $\\bar\\rho_1, \\bar\\rho_2$ are assigned:',
+         '',
+         '$$\\bar\\rho_1=F(1,\\rho)C$$',
+         '$$\\bar\\rho_2=F(\\rho,1)C$$',
+         '',
+         'This is simply assumed to work'
          ]
     )
+
     def __init__(self, param, prec=np.float32):
         super(HullWhite2FactorModelParameters, self).__init__(param)
         self.market_factor_type = 'HullWhite2FactorInterestRateModelPrices'
@@ -1034,8 +1070,8 @@ class HullWhite2FactorModelParameters(RiskNeutralInterestRateModel):
             def basin_step(x):
                 sigmas, alpha, corr = split_param(x)
                 # update vars
-                sigmas = (sigmas*np.exp(np.random.uniform(-step, step, sigmas.size))).clip(*sigma_min_max)
-                alpha = (alpha*np.exp(np.random.uniform(-step, step, alpha.size))).clip(*alpha_min_max)
+                sigmas = (sigmas * np.exp(np.random.uniform(-step, step, sigmas.size))).clip(*sigma_min_max)
+                alpha = (alpha * np.exp(np.random.uniform(-step, step, alpha.size))).clip(*alpha_min_max)
                 corr = (corr + np.random.uniform(-step, step, corr.size)).clip(*corr_min_max)
 
                 return np.concatenate((sigmas, alpha, corr))
