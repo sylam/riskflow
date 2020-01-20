@@ -2363,7 +2363,7 @@ class ConstructMarkdown(Elaboration):
 
 
 if __name__ == '__main__':
-    ''' Documentation is generated for mkdocs (https://www.mkdocs.org/). Run mkdocs serv in the 
+    '''Documentation is generated for mkdocs (https://www.mkdocs.org/). Run mkdocs serv in the 
     correct folder to serve the documentation (or build it for static distribution). 
     Please note that python-markdown-math needs to be installed for this to work - can be obtained via PyPI
     (pip install python-markdown-math)'''

@@ -50,7 +50,7 @@ def merge_profiles(id, merge_data, rundate, outputdir):
     pd.concat(pivots, axis=0, join='outer').to_csv(filename)
     return ('Merge', filename)
 
-   
+
 class JOB(object):
     def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log,
                  time_grid='0d 2d 1w(1w) 3m(1m) 2y(3m)'):
@@ -108,7 +108,7 @@ class PFE(JOB):
     def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log):
         super(PFE, self).__init__(cx, rundate, arena_path, outputdir, netting_set, stats, log)
         # set the OIS cashflow flag to speed up prime linked swaps
-        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size']=1
+        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
 
     def valid(self):
         if not self.cx.deals['Deals']['Children'][0]['Children']:
@@ -123,7 +123,7 @@ class PFE(JOB):
 
         instruments_in_file = ', '.join(deals)
         # turn on dynamic scenarios (more accurate)
-        self.params['Dynamic_Scenario_Dates']='Yes'
+        self.params['Dynamic_Scenario_Dates'] = 'Yes'
         recon_file = self.arena_path.format(self.rundate, self.netting_set[:-4] + 'csv')
 
         if os.path.isfile(recon_file):
@@ -164,7 +164,7 @@ class CVA(JOB):
         # load up a calendar (for theta)
         self.business_day = cx.holidays['Johannesburg']['businessday']
         # set the OIS cashflow flag to speed up prime linked swaps
-        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size']=1
+        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
 
     def valid(self):
         if not self.cx.deals['Deals']['Children'][0]['Children']:
@@ -174,12 +174,12 @@ class CVA(JOB):
 
     def run_calc(self, calc):
         from calculation import construct_calculation
-        
-        filename = 'CVA_'+self.params['Run_Date']+'_'+self.cx.deals['Attributes']['Reference']+'.csv'
+
+        filename = 'CVA_' + self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
         self.params['CVA'] = {'Deflation': self.cx.deals['Calculation']['Deflation_Interest_Rate']}
         # turn on dynamic scenarios (more accurate)
-        self.params['Dynamic_Scenario_Dates']='Yes'
-        
+        self.params['Dynamic_Scenario_Dates'] = 'Yes'
+
         # load up CVA calc params
         if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
             self.logger(self.netting_set, 'is collateralized')
@@ -197,28 +197,28 @@ class CVA(JOB):
         self.params['CVA']['Counterparty'] = cva_sect['Counterparty']
         self.params['CVA']['Deflate_Stochastically'] = cva_sect['Deflate_Stochastically']
         self.params['CVA']['Stochastic_Hazard'] = cva_sect['Stochastic_Hazard_Rates']
-        
+
         # work out the next business day
         next_day = self.business_day.rollforward(
-            pd.Timestamp(self.params['Run_Date'])+pd.offsets.Day(1)).strftime('%Y-%m-%d')
-        
-        if os.path.isfile( self.outputdir + os.sep + filename ):
+            pd.Timestamp(self.params['Run_Date']) + pd.offsets.Day(1)).strftime('%Y-%m-%d')
+
+        if os.path.isfile(self.outputdir + os.sep + filename):
             self.logger(self.netting_set, 'Warning: skipping CVA gradient calc as file already exists')
-            self.params['CVA']['Gradient']='No'
-            out = calc.execute(self.params)            
+            self.params['CVA']['Gradient'] = 'No'
+            out = calc.execute(self.params)
             stats = out['Stats']
             # store the CVA as part of the stats
-            out['Stats'].update({'CVA':out['Results']['cva'], 'Currency': self.params['Currency']})
+            out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
             # now calc theta
-            self.params.update({'Run_Date':next_day})
+            self.params.update({'Run_Date': next_day})
             calc = construct_calculation('Credit_Monte_Carlo', self.cx)
             theta = calc.execute(self.params)
-            out['Stats'].update({'CVA_Theta':theta['Results']['cva']})
+            out['Stats'].update({'CVA_Theta': theta['Results']['cva']})
             # store cva
             self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
         else:
-            self.params['CVA']['Gradient']='Yes'
-            att = 0            
+            self.params['CVA']['Gradient'] = 'Yes'
+            att = 0
             while att <= 3:
                 try:
                     out = calc.execute(self.params)
@@ -234,22 +234,21 @@ class CVA(JOB):
                     self.logger(self.netting_set, 'Halving memory to {0} and Doubling Batches to {1}'.format(
                         self.params['Batch_Size'], self.params['Simulation_Batches']))
 
-                    
-                    # create a new calculation    
+                    # create a new calculation
                     calc = construct_calculation('Credit_Monte_Carlo', self.cx)
                 else:
                     stats = out['Stats']
                     grad_cva = calc.gradients_as_df(out['Results']['grad_cva']).rename(
-                        columns={'Gradient':self.cx.deals['Attributes']['Reference']})
+                        columns={'Gradient': self.cx.deals['Attributes']['Reference']})
                     # store the CVA as part of the stats
-                    out['Stats'].update({'CVA':out['Results']['cva'], 'Currency': self.params['Currency']})
+                    out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
                     # write the grad
                     grad_cva.to_csv(self.outputdir + os.sep + filename)
                     # now calc theta
-                    self.params.update({'Run_Date':next_day, 'Gradient':'No'})
+                    self.params.update({'Run_Date': next_day, 'Gradient': 'No'})
                     calc = construct_calculation('Credit_Monte_Carlo', self.cx)
                     theta = calc.execute(self.params)
-                    out['Stats'].update({'CVA_Theta':theta['Results']['cva']})
+                    out['Stats'].update({'CVA_Theta': theta['Results']['cva']})
                     # store it
                     self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
 
@@ -259,16 +258,16 @@ class COLLVA(JOB):
         self.rundate = rundate
         self.arena_path = arena_path
         self.outputdir = outputdir
-        self.netting_set = os.path.splitext(netting_set)[0]+'.json'
+        self.netting_set = os.path.splitext(netting_set)[0] + '.json'
         self.stats = stats
         self.logger = log
         self.params = {'calc_name': ('cmc', 'calc1'),
                        'Time_grid': '0d 2d 1w(1w) 1m(1m) 3m(3m) 1y(1y)',
                        'Run_Date': rundate, 'Currency': 'ZAR', 'Random_Seed': 5126,
-                       'Calc_Scenarios': 'No',  'Dynamic_Scenario_Dates':'Yes',
+                       'Calc_Scenarios': 'No', 'Dynamic_Scenario_Dates': 'Yes',
                        'Debug': 'No', 'NoModel': 'Constant', 'Partition': 'None',
                        'Generate_Slideshow': 'No', 'PFE_Recon_File': ''}
-        
+
         from adaptiv import AdaptivContext
         self.cx = AdaptivContext()
         old_cx = AdaptivContext()
@@ -287,41 +286,47 @@ class COLLVA(JOB):
         # get the balance currency
         self.balance_currency = self.ns.get('Balance_Currency', self.agreement_currency)
         # set the OIS cashflow flag to speed up prime linked swaps
-        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size']=1
+        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
         from utils import Curve
         # change the currency
-        self.params['Currency']=self.agreement_currency
+        self.params['Currency'] = self.agreement_currency
+
         def makeflatcurve(curr, bps, tenor=30):
-            return {'Currency':curr, 'Curve':Curve([],[[0,bps*0.01*0.01],[tenor,bps*0.01*0.01]]), 'Day_Count':'ACT_365',
+            return {'Currency': curr, 'Curve': Curve([], [[0, bps * 0.01 * 0.01], [tenor, bps * 0.01 * 0.01]]),
+                    'Day_Count': 'ACT_365',
                     'Property_Aliases': None, 'Sub_Type': 'None'}
-        
-        if self.agreement_currency=='ZAR':
-            self.cx.params['Price Factors']['InterestRate.ZAR-SWAP.OIS'] = makeflatcurve('ZAR',-15)
+
+        if self.agreement_currency == 'ZAR':
+            self.cx.params['Price Factors']['InterestRate.ZAR-SWAP.OIS'] = makeflatcurve('ZAR', -15)
             self.cx.params['Price Factors']['InterestRate.ZAR-SWAP.FUNDING'] = makeflatcurve('ZAR', 10)
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0]['Collateral_Rate']='ZAR-SWAP.OIS'
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0]['Funding_Rate']='ZAR-SWAP.FUNDING'
+            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0][
+                'Collateral_Rate'] = 'ZAR-SWAP.OIS'
+            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0][
+                'Funding_Rate'] = 'ZAR-SWAP.FUNDING'
         else:
             self.cx.params['Price Factors']['InterestRate.USD-LIBOR-3M.FUNDING'] = makeflatcurve('USD', 65)
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0]['Collateral_Rate']='USD-OIS'
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0]['Funding_Rate']='USD-LIBOR-3M.FUNDING'
-        
+            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0][
+                'Collateral_Rate'] = 'USD-OIS'
+            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0][
+                'Funding_Rate'] = 'USD-LIBOR-3M.FUNDING'
+
     def valid(self):
         if not self.cx.deals['Deals']['Children'][0]['Children'] or self.cx.deals[
-            'Deals']['Children'][0]['instrument'].field.get('Collateralized','False')=='False':
+            'Deals']['Children'][0]['instrument'].field.get('Collateralized', 'False') == 'False':
             return False
         else:
             return True
 
     def run_calc(self, calc):
-        filename = 'COLLVA_'+self.params['Run_Date']+'_'+self.crb_default+'.csv'
-        
-        if os.path.isfile( self.outputdir + os.sep + filename ):
+        filename = 'COLLVA_' + self.params['Run_Date'] + '_' + self.crb_default + '.csv'
+
+        if os.path.isfile(self.outputdir + os.sep + filename):
             self.logger(self.netting_set, 'Warning: skipping COLLVA calc as file already exists')
         else:
             self.params['CollVA'] = {'Gradient': 'Yes'}
-                
+
             # make sure the margin period of risk is 10 business days (approx 12 calendar days)
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Liquidation_Period']=12.0
+            self.cx.deals['Deals']['Children'][0]['instrument'].field['Liquidation_Period'] = 12.0
             self.params['Simulation_Batches'] = 20
             self.params['Batch_Size'] = 256
 
@@ -332,14 +337,14 @@ class COLLVA(JOB):
                 exc_type, exc_value, exc_traceback = sys.exc_info()
                 traceback.print_exception(exc_type, exc_value, exc_traceback,
                                           limit=2, file=sys.stdout)
-                
+
                 self.logger(self.netting_set, 'Exception: ' + str(e.args))
             else:
                 stats = out['Stats']
                 grad_collva = calc.gradients_as_df(out['Results']['grad_collva']).rename(
-                    columns={'Gradient':self.cx.deals['Attributes']['Reference']})
+                    columns={'Gradient': self.cx.deals['Attributes']['Reference']})
                 # store the CollVA as part of the stats
-                out['Stats'].update({'CollVA':out['Results']['collva'], 'Currency': self.params['Currency']})
+                out['Stats'].update({'CollVA': out['Results']['collva'], 'Currency': self.params['Currency']})
                 grad_collva.to_csv(self.outputdir + os.sep + filename)
                 self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
                 # log the netting set
@@ -351,16 +356,16 @@ class CVADEFAULT(JOB):
         self.rundate = rundate
         self.arena_path = arena_path
         self.outputdir = outputdir
-        self.netting_set = os.path.splitext(netting_set)[0]+'.json'
+        self.netting_set = os.path.splitext(netting_set)[0] + '.json'
         self.stats = stats
         self.logger = log
         self.params = {'calc_name': ('cmc', 'calc1'),
                        'Time_grid': '0d 2d 1w(1w) 1m(1m) 3m(3m) 1y(1y)',
                        'Run_Date': rundate, 'Currency': 'ZAR', 'Random_Seed': 5126,
-                       'Calc_Scenarios': 'No',  'Dynamic_Scenario_Dates':'Yes',
+                       'Calc_Scenarios': 'No', 'Dynamic_Scenario_Dates': 'Yes',
                        'Debug': 'No', 'NoModel': 'Constant', 'Partition': 'None',
                        'Generate_Slideshow': 'No', 'PFE_Recon_File': ''}
-        
+
         from adaptiv import AdaptivContext
         self.cx = AdaptivContext()
         old_cx = AdaptivContext()
@@ -379,12 +384,15 @@ class CVADEFAULT(JOB):
         # get the balance currency
         self.balance_currency = self.ns.get('Balance_Currency', self.agreement_currency)
         # set the OIS cashflow flag to speed up prime linked swaps
-        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size']=1
+        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
         from utils import Curve
         # set the survival curve to a default value
         self.crb_default = self.cx.deals['Attributes']['Reference']
-        self.cx.params['Price Factors'].setdefault('SurvivalProb.'+self.crb_default, {'Recovery_Rate': 0.5, 'Curve': Curve(
-            [], [[0.0, 0.0],[.5, .01], [1, .02], [3, .07], [5, .15], [10, .35], [20, .71]]), 'Property_Aliases': None})        
+        self.cx.params['Price Factors'].setdefault('SurvivalProb.' + self.crb_default,
+                                                   {'Recovery_Rate': 0.5, 'Curve': Curve(
+                                                       [],
+                                                       [[0.0, 0.0], [.5, .01], [1, .02], [3, .07], [5, .15], [10, .35],
+                                                        [20, .71]]), 'Property_Aliases': None})
 
     def valid(self):
         if not self.cx.deals['Deals']['Children'][0]['Children']:
@@ -393,18 +401,18 @@ class CVADEFAULT(JOB):
             return True
 
     def run_calc(self, calc):
-        filename = 'CVA_'+self.params['Run_Date']+'_'+self.crb_default+'.csv'
-        
-        if os.path.isfile( self.outputdir + os.sep + filename ):
+        filename = 'CVA_' + self.params['Run_Date'] + '_' + self.crb_default + '.csv'
+
+        if os.path.isfile(self.outputdir + os.sep + filename):
             self.logger(self.netting_set, 'Warning: skipping CVA calc as file already exists')
         else:
-            self.params['CVA'] = {'Deflation': self.cx.deals['Calculation'].get('Deflation_Interest_Rate','ZAR-SWAP'),
+            self.params['CVA'] = {'Deflation': self.cx.deals['Calculation'].get('Deflation_Interest_Rate', 'ZAR-SWAP'),
                                   'Gradient': 'Yes'}
 
             if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
                 self.logger(self.netting_set, 'is collateralized')
                 # make sure the margin period of risk is 10 business days (approx 12 calendar days)
-                self.cx.deals['Deals']['Children'][0]['instrument'].field['Liquidation_Period']=12.0
+                self.cx.deals['Deals']['Children'][0]['instrument'].field['Liquidation_Period'] = 12.0
                 self.params['Simulation_Batches'] = 20
                 self.params['Batch_Size'] = 256
             else:
@@ -413,7 +421,8 @@ class CVADEFAULT(JOB):
                 self.logger(self.netting_set, 'is uncollateralized')
 
             # get the calculation parameters for CVA
-            default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No', 'Counterparty': self.crb_default}
+            default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No',
+                           'Counterparty': self.crb_default}
             cva_sect = self.cx.deals.get('Calculation', {'Credit_Valuation_Adjustment': default_cva}).get(
                 'Credit_Valuation_Adjustment', default_cva)
 
@@ -422,25 +431,25 @@ class CVADEFAULT(JOB):
             self.params['CVA']['Deflate_Stochastically'] = cva_sect['Deflate_Stochastically']
             self.params['CVA']['Stochastic_Hazard'] = cva_sect['Stochastic_Hazard_Rates']
             # now adjust the survival curve - need intervals of .25 years
-            sc=self.cx.params['Price Factors']['SurvivalProb.'+cva_sect['Counterparty']]['Curve'].array.copy()
+            sc = self.cx.params['Price Factors']['SurvivalProb.' + cva_sect['Counterparty']]['Curve'].array.copy()
             tenors = np.arange(0, sc[-1][0], .25)
-            self.cx.params['Price Factors']['SurvivalProb.'+cva_sect['Counterparty']]['Curve'].array = np.array(
-                list(zip(tenors, np.interp(tenors, sc[:,0], sc[:,1]))))
-            
+            self.cx.params['Price Factors']['SurvivalProb.' + cva_sect['Counterparty']]['Curve'].array = np.array(
+                list(zip(tenors, np.interp(tenors, sc[:, 0], sc[:, 1]))))
+
             try:
                 out = calc.execute(self.params)
             except Exception as e:
                 exc_type, exc_value, exc_traceback = sys.exc_info()
                 traceback.print_exception(exc_type, exc_value, exc_traceback,
                                           limit=2, file=sys.stdout)
-                
+
                 self.logger(self.netting_set, 'Exception: ' + str(e.args))
             else:
                 stats = out['Stats']
                 grad_cva = calc.gradients_as_df(out['Results']['grad_cva']).rename(
-                    columns={'Gradient':self.cx.deals['Attributes']['Reference']})
+                    columns={'Gradient': self.cx.deals['Attributes']['Reference']})
                 # store the CVA as part of the stats
-                out['Stats'].update({'CVA':out['Results']['cva'], 'Currency': self.params['Currency']})
+                out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
                 grad_cva.to_csv(self.outputdir + os.sep + filename)
                 self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
                 # log the netting set
@@ -452,16 +461,16 @@ class FVADEFAULT(JOB):
         self.rundate = rundate
         self.arena_path = arena_path
         self.outputdir = outputdir
-        self.netting_set = os.path.splitext(netting_set)[0]+'.json'
+        self.netting_set = os.path.splitext(netting_set)[0] + '.json'
         self.stats = stats
         self.logger = log
         self.params = {'calc_name': ('cmc', 'calc1'),
                        'Time_grid': '0d 2d 1w(1w) 1m(1m) 3m(3m) 1y(1y)',
                        'Run_Date': rundate, 'Currency': 'USD', 'Random_Seed': 5126,
-                       'Calc_Scenarios': 'No',  'Dynamic_Scenario_Dates':'Yes',
+                       'Calc_Scenarios': 'No', 'Dynamic_Scenario_Dates': 'Yes',
                        'Debug': 'No', 'NoModel': 'Constant', 'Partition': 'None',
                        'Generate_Slideshow': 'No', 'PFE_Recon_File': ''}
-        
+
         from adaptiv import AdaptivContext
         self.cx = AdaptivContext()
         old_cx = AdaptivContext()
@@ -480,23 +489,28 @@ class FVADEFAULT(JOB):
         # get the balance currency
         self.balance_currency = self.ns.get('Balance_Currency', self.agreement_currency)
         # set the OIS cashflow flag to speed up prime linked swaps
-        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size']=1
+        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
         from utils import Curve
-        
-        def makeflatcurve(curr, bps, tenor=30):
-            return {'Currency':curr, 'Curve':Curve([],[[0,bps*0.01*0.01],[tenor,bps*0.01*0.01]]), 'Day_Count':'ACT_365',
-                    'Property_Aliases': None, 'Sub_Type': 'None'}    
 
-        # set the survival curve to a default value
+        def makeflatcurve(curr, bps, tenor=30):
+            return {'Currency': curr, 'Curve': Curve([], [[0, bps * 0.01 * 0.01], [tenor, bps * 0.01 * 0.01]]),
+                    'Day_Count': 'ACT_365',
+                    'Property_Aliases': None, 'Sub_Type': 'None'}
+
+            # set the survival curve to a default value
+
         self.crb_default = self.cx.deals['Attributes']['Reference']
         # set up funding curves - ??? 
         # self.cx.params['Price Factors']['InterestRate.ZAR-SWAP.OIS'] = makeflatcurve('ZAR',-15)
         # self.cx.params['Price Factors']['InterestRate.ZAR-SWAP.FUNDING'] = makeflatcurve('ZAR', 10)
-        
+
         self.cx.params['Price Factors']['InterestRate.USD-LIBOR-3M.FUNDING'] = makeflatcurve('USD', 65)
-        
-        self.cx.params['Price Factors'].setdefault('SurvivalProb.'+self.crb_default, {'Recovery_Rate': 0.5, 'Curve': Curve(
-            [], [[0.0, 0.0],[.5, .01], [1, .02], [3, .07], [5, .15], [10, .35], [20, .71], [30, 1.0]]), 'Property_Aliases': None})
+
+        self.cx.params['Price Factors'].setdefault('SurvivalProb.' + self.crb_default,
+                                                   {'Recovery_Rate': 0.5, 'Curve': Curve(
+                                                       [],
+                                                       [[0.0, 0.0], [.5, .01], [1, .02], [3, .07], [5, .15], [10, .35],
+                                                        [20, .71], [30, 1.0]]), 'Property_Aliases': None})
 
     def valid(self):
         if not self.cx.deals['Deals']['Children'][0]['Children']:
@@ -505,16 +519,16 @@ class FVADEFAULT(JOB):
             return True
 
     def run_calc(self, calc):
-        filename = 'FVA_'+self.params['Run_Date']+'_'+self.crb_default+'.csv'
-        
-        if os.path.isfile( self.outputdir + os.sep + filename ):
+        filename = 'FVA_' + self.params['Run_Date'] + '_' + self.crb_default + '.csv'
+
+        if os.path.isfile(self.outputdir + os.sep + filename):
             self.logger(self.netting_set, 'Warning: skipping FVA calc as file already exists')
         else:
             self.params['FVA'] = {'Funding_Interest_Curve': 'USD-LIBOR-3M.FUNDING',
                                   'Risk_Free_Curve': 'USD-OIS',
                                   'Stochastic_Funding': 'Yes', 'Counterparty': self.crb_default, 'Gradient': 'Yes'}
-            
-            if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized','False') != 'True':
+
+            if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized', 'False') != 'True':
                 # only calc FVA for uncollateralized counterparties
                 self.params['Simulation_Batches'] = 10
                 self.params['Batch_Size'] = 512
@@ -531,10 +545,10 @@ class FVADEFAULT(JOB):
                     stats = out['Stats']
                     if 'grad_fva' in out['Results']:
                         grad_fva = calc.gradients_as_df(out['Results']['grad_fva']).rename(
-                            columns={'Gradient':self.cx.deals['Attributes']['Reference']})
+                            columns={'Gradient': self.cx.deals['Attributes']['Reference']})
                         grad_fva.to_csv(self.outputdir + os.sep + filename)
                     # store the FVA as part of the stats
-                    out['Stats'].update({'FVA':out['Results']['fva'], 'Currency': self.params['Currency']})
+                    out['Stats'].update({'FVA': out['Results']['fva'], 'Currency': self.params['Currency']})
                     self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
                     # log the netting set
                     self.logger(self.netting_set, 'FVA calc complete')
@@ -545,18 +559,18 @@ class CVAVega(JOB):
         self.rundate = rundate
         self.arena_path = arena_path
         self.outputdir = outputdir
-        self.netting_set = os.path.splitext(netting_set)[0]+'.json'
+        self.netting_set = os.path.splitext(netting_set)[0] + '.json'
         self.stats = stats
-        self.logger = log        
+        self.logger = log
         self.params = {'calc_name': ('cmc', 'calc1'),
                        'Time_grid': '0d 2d 1w(1w) 3m(1m) 2y(3m)', 'Run_Date': rundate,
                        'Currency': 'ZAR', 'Random_Seed': 5126,
-                       'Calc_Scenarios': 'No', 
-                       'Dynamic_Scenario_Dates':'Yes',
+                       'Calc_Scenarios': 'No',
+                       'Dynamic_Scenario_Dates': 'Yes',
                        'Debug': 'No', 'NoModel': 'Constant',
                        'Partition': 'None', 'Generate_Slideshow': 'No',
                        'PFE_Recon_File': ''}
-        
+
         from adaptiv import AdaptivContext
         self.cx = AdaptivContext()
         self.cx.parse_json(arena_path.format(rundate, 'MarketDataCVA.json'))
@@ -564,10 +578,10 @@ class CVAVega(JOB):
         self.noshift.parse_json(arena_path.format(rundate, 'MarketDataNoShift.json'))
         self.shift = AdaptivContext()
         self.shift.parse_json(arena_path.format(rundate, 'MarketDataShift.json'))
-        
+
         # update the cva data with the arena data
         self.cx.params['Price Factors'].update(self.noshift.params['Price Factors'])
-        
+
         self.cx.parse_json(self.arena_path.format(self.rundate, self.netting_set))
         # get the netting set
         self.ns = self.cx.deals['Deals']['Children'][0]['instrument'].field
@@ -576,12 +590,15 @@ class CVAVega(JOB):
         # get the balance currency
         self.balance_currency = self.ns.get('Balance_Currency', self.agreement_currency)
         # set the OIS cashflow flag to speed up prime linked swaps
-        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size']=1
+        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
         from utils import Curve
         # set the survival curve to a default value
         self.crb_default = self.cx.deals['Attributes']['Reference']
-        self.cx.params['Price Factors'].setdefault('SurvivalProb.'+self.crb_default, {'Recovery_Rate': 0.5, 'Curve': Curve(
-            [], [[0.0, 0.0],[.5, .01], [1, .02], [3, .07], [5, .15], [10, .35], [20, .71]]), 'Property_Aliases': None})
+        self.cx.params['Price Factors'].setdefault('SurvivalProb.' + self.crb_default,
+                                                   {'Recovery_Rate': 0.5, 'Curve': Curve(
+                                                       [],
+                                                       [[0.0, 0.0], [.5, .01], [1, .02], [3, .07], [5, .15], [10, .35],
+                                                        [20, .71]]), 'Property_Aliases': None})
 
     def valid(self):
         if not self.cx.deals['Deals']['Children'][0]['Children']:
@@ -591,8 +608,8 @@ class CVAVega(JOB):
 
     def run_calc(self, calc):
         from calculation import construct_calculation
-        
-        self.params['CVA'] = {'Deflation': self.cx.deals['Calculation'].get('Deflation_Interest_Rate','ZAR-SWAP'),
+
+        self.params['CVA'] = {'Deflation': self.cx.deals['Calculation'].get('Deflation_Interest_Rate', 'ZAR-SWAP'),
                               'Gradient': 'No'}
 
         if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
@@ -605,7 +622,8 @@ class CVAVega(JOB):
             self.logger(self.netting_set, 'is uncollateralized')
 
         # get the calculation parameters for CVA
-        default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No', 'Counterparty': self.crb_default}
+        default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No',
+                       'Counterparty': self.crb_default}
         cva_sect = self.cx.deals.get('Calculation', {'Credit_Valuation_Adjustment': default_cva}).get(
             'Credit_Valuation_Adjustment', default_cva)
 
@@ -613,7 +631,7 @@ class CVAVega(JOB):
         self.params['CVA']['Counterparty'] = cva_sect['Counterparty']
         self.params['CVA']['Deflate_Stochastically'] = cva_sect['Deflate_Stochastically']
         self.params['CVA']['Stochastic_Hazard'] = cva_sect['Stochastic_Hazard_Rates']
-        
+
         try:
             out = calc.execute(self.params)
             self.cx.params['Price Factors'].update(self.shift.params['Price Factors'])
@@ -623,16 +641,16 @@ class CVAVega(JOB):
             exc_type, exc_value, exc_traceback = sys.exc_info()
             traceback.print_exception(exc_type, exc_value, exc_traceback,
                                       limit=2, file=sys.stdout)
-            
+
             self.logger(self.netting_set, 'Exception: ' + str(e.args))
         else:
             stats = out['Stats']
-            stats.update({'CVA':out['Results']['cva'], 'CVA_Shift':outshift['Results']['cva'],
+            stats.update({'CVA': out['Results']['cva'], 'CVA_Shift': outshift['Results']['cva'],
                           'Currency': self.params['Currency']})
             self.stats.setdefault('Stats', {})[self.netting_set] = stats
             # log the netting set
             self.logger(self.netting_set, 'CVA calc complete NoShift:{}, Shift:{}'.format(
-                out['Results']['cva'], outshift['Results']['cva']) )
+                out['Results']['cva'], outshift['Results']['cva']))
 
 
 class BaseVal(JOB):
@@ -644,7 +662,7 @@ class BaseVal(JOB):
         self.stats = stats
         self.logger = log
         self.business_day = cx.holidays['Johannesburg']['businessday']
-        self.netting_set = os.path.splitext(netting_set)[0]+'.json'
+        self.netting_set = os.path.splitext(netting_set)[0] + '.json'
         cx.parse_json(arena_path.format(rundate, self.netting_set))
         self.params = {'calc_name': ('cmc', 'calc1'), 'Run_Date': rundate}
 
@@ -657,24 +675,24 @@ class BaseVal(JOB):
     def run_calc(self, calc):
         # needed for theta
         next_day = self.business_day.rollforward(
-            pd.Timestamp(self.params['Run_Date'])+pd.offsets.Day(1)).strftime('%Y-%m-%d')
+            pd.Timestamp(self.params['Run_Date']) + pd.offsets.Day(1)).strftime('%Y-%m-%d')
         ending = self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
         filename = 'BaseVal_' + ending
         filename_theta = 'BaseVal_Theta_' + ending
         filename_greeks = 'BaseVal_Delta_' + ending
         filename_greeks_second = 'BaseVal_Gamma_' + ending
-        
+
         if os.path.isfile(self.outputdir + os.sep + filename):
             self.logger(self.netting_set, 'Warning: skipping BaseVal calc as file already exists')
         else:
             # should be loaded correctly
             from calculation import construct_calculation
             calc = construct_calculation('Base_Revaluation', self.cx, prec=np.float64)
-            self.params.update({'Currency': 'ZAR', 'Greeks':'No'})
+            self.params.update({'Currency': 'ZAR', 'Greeks': 'No'})
             base_val = calc.execute(self.params)
             base_val['Results']['mtm'].to_csv(self.outputdir + os.sep + filename)
             try:
-                self.params.update({'Run_Date':next_day , 'Greeks':'Yes'})
+                self.params.update({'Run_Date': next_day, 'Greeks': 'Yes'})
                 calc = construct_calculation('Base_Revaluation', self.cx, prec=np.float64)
                 out = calc.execute(self.params)
             except Exception as e:
@@ -689,7 +707,6 @@ class BaseVal(JOB):
 
 
 def work(id, lock, queue, results, job, rundate, arena_path, calendar, outputdir):
-
     def log(netting_set, msg):
         lock.acquire()
         print('JOB %s: ' % id)
@@ -753,7 +770,7 @@ class Manager:
         arena_path = input_path + os.sep + '{0}' + os.sep + '{1}'
         print("starting {0} workers in {1}".format(self.NUMBER_OF_PROCESSES, input_path))
         self.workers = [Process(target=work, args=(
-        i, self.lock, self.queue, self.results, job, rundate, arena_path, calendar, outputdir))
+            i, self.lock, self.queue, self.results, job, rundate, arena_path, calendar, outputdir))
                         for i in range(self.NUMBER_OF_PROCESSES)]
         for w in self.workers:
             w.start()
@@ -797,7 +814,7 @@ if __name__ == '__main__':
             isinstance(cls, type) and hasattr(cls, 'valid') and cls.__name__ != 'JOB']
     # setup the arguments
     parser = argparse.ArgumentParser(description='Run a riskflow batch on a directory of .json netting sets.')
-    parser.add_argument('num_jobs', type=int, help='the number of gpu\'s to use (if available) else processors')
+    parser.add_argument('num_jobs', type=int, help='the number of gpu\'s to use (if available) else cpu\'s')
     parser.add_argument('job', type=str, help='the job name', choices=jobs)
     parser.add_argument('rundate', type=str, help='batch rundate')
     parser.add_argument('input_path', type=str,

@@ -20,6 +20,7 @@
 import json
 import calendar
 import operator
+import itertools
 import logging
 
 # import parsing libraries
@@ -63,7 +64,7 @@ def get_grid_grammar():
         return DateOffset(**ofs)
 
     def push_date_grid(strg, loc, toks):
-        return toks[0][0] if len(toks) == 1 else utils.Offsets(toks.asList(), grid=True)
+        return toks[0][0] if len(toks) == 1 else utils.Offsets(toks.asList())
 
     lpar = Literal("(").suppress()
     rpar = Literal(")").suppress()
@@ -301,7 +302,11 @@ class Context(object):
 
         return {'present': model_factor, 'absent': remaining_factor}
 
-    def bootstrap(self, num_jobs=None):
+    def bootstrap(self):
+        """
+        Runs all the bootstrappers - this happens in one process with debugging on by default. For multiprocessing
+        bootstrapping, call the construct_bootstrapper method directly
+        """
         # need to implement ordered dicts in the params obj - TODO
         for bootstrapper_name, params in sorted(self.params['Bootstrapper Configuration'].items()):
             # need parsers here - but for now, can just use the name to know what to do
@@ -310,7 +315,8 @@ class Context(object):
             except:
                 logging.warning('Cannot execute Bootstrapper for {0} - skipping'.format(bootstrapper_name))
                 continue
-            # run the bootstrapper on the market prices and store them with the price factors
+
+            # run the bootstrapper on the market prices and store them in the price factors/price models
             bootstrapper.bootstrap(self.params['System Parameters'],
                                    self.params['Price Models'],
                                    self.params['Price Factors'],

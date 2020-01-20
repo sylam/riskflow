@@ -45,7 +45,6 @@ from tensorflow.contrib.opt import ExternalOptimizerInterface
 
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
-from tensorflow.python.ops import variables
 from tensorflow.python.platform import tf_logging as logging
 
 from scipy.stats import norm
@@ -61,8 +60,6 @@ market_swap_class = namedtuple('market_swap', 'deal_data price weight pvbp')
 date_desc = {'years': 'Y', 'months': 'M', 'days': 'D'}
 # date formatter
 date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwds.items()])
-
-constrained = True
 
 
 def create_float_cashflows(base_date, cashflow_obj, frequency):
@@ -264,14 +261,14 @@ class ScipyLeastsqOptimizerInterface(object):
         ]
 
         time_now = time.clock()
-        print('Calculating jacobian')
+        logging.info('Calculating jacobian')
         # loss_grads = [tf.gradients(resid, self._vars) for resid in loss]
         self.jvp = fwd_gradients(self._loss, self._vars, self._dummy_jac_vec)
 
-        print('Done Calculating jacobian')
+        logging.info('Done Calculating jacobian')
 
         # record the time
-        print('This took', time.clock() - time_now, 'seconds.')
+        logging.info('This took', time.clock() - time_now, 'seconds.')
         equalities_grads = []
         inequalities_grads = []
 
@@ -358,7 +355,7 @@ class ScipyLeastsqOptimizerInterface(object):
             return np.array([grad(x)[0].astype('float64') for grad in grad_func]).T
 
         def print_fun(x, f, accepted):
-            print("at minimum %.4f accepted %d" % (f, int(accepted)))
+            logging.info("at minimum %.4f accepted %d" % (f, int(accepted)))
 
         minimize_kwargs = {
             'jac': True,
@@ -455,7 +452,7 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
             return loss, gradient.astype('float64')
 
         def print_fun(x, f, accepted):
-            print("at minimum %.4f accepted %d" % (f, int(accepted)))
+            logging.info("at minimum %.4f accepted %d" % (f, int(accepted)))
             if f < 0.1:
                 return True
 
@@ -739,16 +736,15 @@ class RiskNeutralInterestRateModel(object):
         implied_var = {}
         # the curve is treated as constant here - no placeholders
         stoch_var = tf.constant(process.factor.current_value(), dtype=self.prec)
-        # store variables on the cpu
         with tf.name_scope("Implied_Input"):
             for param_name, param_value in implied_obj.current_value().items():
                 factor_name = utils.Factor(
                     implied_obj.__class__.__name__, ir_factor.name + (param_name,))
                 tf_variable = tf.get_variable(
                     name=utils.check_scope_name(factor_name),
-                    initializer=self.unconstrain(param_name, param_value.astype(self.prec)),
+                    initializer=param_value.astype(self.prec),
                     dtype=self.prec)
-                implied_var[param_name] = self.constrain(param_name, tf_variable)
+                implied_var[param_name] = tf_variable
 
         # now setup the calc - on the cpu
         process.precalculate(base_date, time_grid, stoch_var, shared_mem, 0, implied_tensor=implied_var)
@@ -807,10 +803,8 @@ class RiskNeutralInterestRateModel(object):
                     logging.warning('Unable to bootstrap {0} - skipping'.format(market_price))
                     continue
 
-                # if market_factor.name[0]!='ZAR-SWAP':
-                if market_factor.name[0] not in ['ZAR-SWAP', 'ZAR-JIBAR-3M', 'USD-LIBOR-3M', 'USD-MASTER']:
-                    # if market_factor.name[0] not in ['ZAR-JIBAR-3M']:  # ,'USD-LIBOR-3M','USD-MASTER']:
-                    continue
+                # if market_factor.name[0] not in ['ZAR-SWAP', 'ZAR-JIBAR-3M', 'USD-LIBOR-3M', 'USD-MASTER']:
+                #    continue
 
                 # calc the atm vol
                 mn_ix = np.searchsorted(swaptionvol.moneyness, 0.0)
@@ -845,7 +839,6 @@ class RiskNeutralInterestRateModel(object):
                     except:
                         logging.warning('Could not write output file {}'.format(market_factor.name[0] + '.aap'))
 
-                # config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=True)
                 config = tf.ConfigProto(allow_soft_placement=True)
 
                 with tf.Session(graph=graph, config=config) as sess:
@@ -854,14 +847,14 @@ class RiskNeutralInterestRateModel(object):
                     # check the time
                     time_now = time.clock()
                     batch_loss, vars = sess.run([loss, implied_var])
-                    print('Before run', batch_loss, market_factor.name[0])
+                    logging.info('Before run', batch_loss, market_factor.name[0])
                     for k, v in sorted(vars.items()):
-                        print(k, v)
+                        logging.info(k, v)
 
                     sim_swaptions = sess.run(calibrated_swaptions)
                     for k, v in sorted(sim_swaptions.items()):
                         price = market_swaptions[k].price
-                        print(k, 'market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
+                        logging.info(k, 'market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
                             price, v, 100.0 * (price - sim_swaptions[k]) / price))
 
                     # minimize
@@ -873,19 +866,19 @@ class RiskNeutralInterestRateModel(object):
 
                         if soln is None or batch_loss < soln[0]:
                             soln = (batch_loss, vars)
-                            print('After run {}'.format(op_loop), batch_loss)
+                            logging.info('After run {}'.format(op_loop), batch_loss)
                             for k, v in sorted(vars.items()):
-                                print(k, v)
+                                logging.info(k, v)
                             sim_swaptions = sess.run(calibrated_swaptions)
                             for k, v in sorted(sim_swaptions.items()):
                                 price = market_swaptions[k].price
-                                print(k, 'market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
+                                logging.info(k, 'market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
                                     price, v, 100.0 * (price - sim_swaptions[k]) / price))
 
                     # save this
                     self.save_params(soln[1], price_factors, implied_obj, rate)
                     # record the time
-                    print('This took', time.clock() - time_now, 'seconds.')
+                    logging.info('This took', time.clock() - time_now, 'seconds.')
 
 
 class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
@@ -911,34 +904,14 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
         loss_with_penatalties = loss + tf.nn.moments(
             implied_var['Yield_Volatility'][1:] - implied_var['Yield_Volatility'][:-1], axes=[0])[1]
 
-        # standard tensorflow gradient descent based optimizer
-        # optimizer   = tf.train.AdamOptimizer(0.1).minimize(loss_with_penatalties)
-        if constrained:
-            var_to_bounds = {implied_var['Yield_Volatility']: (1e-3, 0.6),
-                             implied_var['Reversion_Speed']: (1e-2, 1.8)}
-        else:
-            var_to_bounds = None
+        var_to_bounds = {implied_var['Yield_Volatility']: (1e-3, 0.6),
+                         implied_var['Reversion_Speed']: (1e-2, 1.8)}
+
 
         # optimizer = ScipyLeastsqOptimizerInterface(losses, var_to_bounds={} if var_to_bounds is None else var_to_bounds )
         optimizer = ScipyBasinOptimizerInterface(loss, var_to_bounds=var_to_bounds)
 
         return loss, optimizer, implied_var, calibrated_swaptions, market_swaptions, benchmarks
-
-    def constrain(self, param_name, variable):
-        if param_name == 'Yield_Volatility':
-            return 0.6 * tf.nn.sigmoid(variable)
-        elif param_name == 'Reversion_Speed':
-            return 1.8 * tf.nn.sigmoid(variable)
-        else:
-            raise Exception('Variable not constrained')
-
-    def unconstrain(self, param_name, value):
-        if param_name == 'Yield_Volatility':
-            return logit(value / 0.6)
-        elif param_name == 'Reversion_Speed':
-            return logit(value / 1.8)
-        else:
-            raise Exception('Variable not constrained')
 
     def implied_process(self, price_factors, price_models, ir_curve, rate):
         # need to create a process and params as variables to pass to tf
@@ -1101,12 +1074,9 @@ scipy.optimize.leastsq.html) are used.',
         lq_corr_bounds = (-.93, 0.93)
 
         # standard tensorflow gradient descent based optimizer
-        if constrained:
-            var_to_bounds = make_bounds(implied_var, sigma_bounds, corr_bounds, alpha_bounds)
-            var_to_bounds_lq = make_bounds(implied_var, lq_sigma_bounds, lq_corr_bounds, lq_alpha_bounds)
-        else:
-            var_to_bounds = None
-            var_to_bounds_lq = None
+
+        var_to_bounds = make_bounds(implied_var, sigma_bounds, corr_bounds, alpha_bounds)
+        var_to_bounds_lq = make_bounds(implied_var, lq_sigma_bounds, lq_corr_bounds, lq_alpha_bounds)
 
         bounds_ok, make_step = make_basin_callbacks(0.25, sigma_bounds, alpha_bounds, corr_bounds)
 
@@ -1122,30 +1092,6 @@ scipy.optimize.leastsq.html) are used.',
         ]
 
         return loss, optimizers, implied_var, calibrated_swaptions, market_swaptions, benchmarks
-
-    def constrain(self, param_name, variable, ident=constrained):
-        if ident:
-            return variable
-        elif param_name in ['Sigma_1', 'Sigma_2']:
-            return 0.0001 + 0.07 * tf.nn.sigmoid(variable)
-        elif param_name in ['Alpha_1', 'Alpha_2']:
-            return 0.0001 + 2.45 * tf.nn.sigmoid(variable)
-        elif param_name in ['Correlation']:
-            return 0.92 * tf.nn.tanh(variable)
-        else:
-            raise Exception('Variable not constrained')
-
-    def unconstrain(self, param_name, value, ident=constrained):
-        if ident:
-            return value
-        elif param_name in ['Sigma_1', 'Sigma_2']:
-            return logit((value - 0.0001) / 0.07)
-        elif param_name in ['Alpha_1', 'Alpha_2']:
-            return logit((value - 0.0001) / 2.45)
-        elif param_name in ['Correlation']:
-            return np.arctanh(value / 0.92)
-        else:
-            raise Exception('Variable not constrained')
 
     def implied_process(self, price_factors, price_models, ir_curve, rate):
         vol_tenors = np.array([0, 1, 2, 3, 6, 12, 24, 48, 84, 120]) / 12.0
