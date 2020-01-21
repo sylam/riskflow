@@ -1,4 +1,5 @@
 import os
+import logging
 import itertools
 import pandas as pd
 
@@ -11,13 +12,19 @@ def getpath(pathlist, uat=False):
             return os.path.join(path, 'UAT') if uat else path
 
 
-def work(job_id, lock, queue, errors,
-         price_factors, price_models, sys_params, holidays):
-
+def work(job_id, queue, errors, price_factors,
+         price_models, sys_params, holidays):
     # set the visible GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = str(job_id)
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+    # log to file
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)-8s %(message)s',
+                        datefmt='%m-%d %H:%M',
+                        filename='bootstrap_{}.log'.format(job_id),
+                        filemode='w')
 
     from bootstrappers import construct_bootstrapper
 
@@ -44,7 +51,6 @@ class Parent(object):
     def __init__(self, num_jobs):
         self.queue = Queue()
         self.errors = Queue()
-        self.lock = Lock()
         self.manager = Manager()
         self.NUMBER_OF_PROCESSES = num_jobs
         self.cx = None
@@ -54,6 +60,9 @@ class Parent(object):
         os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
         # set the log level for the parent
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        # set the logger
+        logging.basicConfig(level=logging.INFO,
+                            datefmt='%m-%d %H:%M')
 
         from adaptiv import AdaptivContext
 
@@ -76,10 +85,10 @@ class Parent(object):
         sys_params = self.manager.dict(self.cx.params['System Parameters'])
         holidays = self.manager.dict(self.cx.holidays)
 
-        print("starting {0} workers in {1}".format(self.NUMBER_OF_PROCESSES, input_path))
+        logging.info("starting {0} workers in {1}".format(self.NUMBER_OF_PROCESSES, input_path))
         self.workers = [Process(target=work, args=(
-            i, self.lock, self.queue, self.errors, price_factors,
-            price_models, sys_params, holidays)) for i in range(self.NUMBER_OF_PROCESSES)]
+            i, self.queue, self.errors, price_factors, price_models, sys_params, holidays)) for i in
+                        range(self.NUMBER_OF_PROCESSES)]
 
         for w in self.workers:
             w.start()
@@ -105,13 +114,15 @@ class Parent(object):
             # fetch and print the results
             for i in range(status_required):
                 child_status = self.errors.get()
-                self.lock.acquire()
-                print('Parent: {}'.format(child_status))
-                self.lock.release()
+                logging.info('Parent: {}'.format(child_status))
 
         for i in range(self.NUMBER_OF_PROCESSES):
             # tell the children it's over
             self.queue.put(None)
+
+        # store the results back in the parent context
+        self.cx.params['Price Factors'] = price_factors.copy()
+        self.cx.params['Price Models'] = price_models.copy()
 
         # finish up
         self.stop(rundate, input_path)
@@ -121,10 +132,11 @@ class Parent(object):
         for i in range(self.NUMBER_OF_PROCESSES):
             self.workers[i].join()
 
+        # close the queue
+        self.queue.close()
+
         # write out the data
-        self.lock.acquire()
-        print('Parent: All done - saving data')
-        self.lock.release()
+        logging.info('Parent: All done - saving data')
 
         self.cx.write_marketdata_json(os.path.join(input_path, rundate, 'MarketDataCal.json'))
         self.cx.write_market_file(os.path.join(input_path, rundate, 'MarketDataCal.dat'))
@@ -152,7 +164,7 @@ if __name__ == '__main__':
     # cx = AdaptivContext()
 
     for rundate in [x for x in sorted(os.listdir(cva_path)) \
-                    if x > '2020-01-05' and os.path.isdir(os.path.join(cva_path, x)) and x < '2020-01-18']:
+                    if '2020-01-15' < x < '2020-01-18' and os.path.isdir(os.path.join(cva_path, x))]:
         Parent(4).start(rundate, cva_path, os.path.join(cva_path, 'calendars.cal'))
 
         # if os.path.isfile(cva_path.format(rundate, 'MarketDataCal.json')):

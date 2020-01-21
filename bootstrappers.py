@@ -264,11 +264,9 @@ class ScipyLeastsqOptimizerInterface(object):
         logging.info('Calculating jacobian')
         # loss_grads = [tf.gradients(resid, self._vars) for resid in loss]
         self.jvp = fwd_gradients(self._loss, self._vars, self._dummy_jac_vec)
-
         logging.info('Done Calculating jacobian')
-
         # record the time
-        logging.info('This took', time.clock() - time_now, 'seconds.')
+        logging.info('This took {} seconds'.format(time.clock() - time_now))
         equalities_grads = []
         inequalities_grads = []
 
@@ -354,16 +352,6 @@ class ScipyLeastsqOptimizerInterface(object):
         def grad_func_wrapper(x):
             return np.array([grad(x)[0].astype('float64') for grad in grad_func]).T
 
-        def print_fun(x, f, accepted):
-            logging.info("at minimum %.4f accepted %d" % (f, int(accepted)))
-
-        minimize_kwargs = {
-            'jac': True,
-            'callback': step_callback,
-            'constraints': [],
-            'bounds': packed_bounds,
-        }
-
         import scipy.optimize
         if packed_bounds is not None:
             result = scipy.optimize.least_squares(loss_func_wrapper, initial_val,
@@ -374,21 +362,17 @@ class ScipyLeastsqOptimizerInterface(object):
 
         message_lines = [
             'Optimization terminated with:',
-            '  Message: %s',
-            '  Objective function value: %f',
+            '  Message: {}'.format(result.message),
+            '  Objective function value: {}'.format(result.fun),
         ]
-
-        message_args = [result.message, result.fun]
 
         if hasattr(result, 'nit'):
             # Some optimization methods might not provide information such as nit and
             # nfev in the return. Logs only available information.
-            message_lines.append('  Number of iterations: %d')
-            message_args.append(result.nit)
+            message_lines.append('  Number of iterations: {}'.format(result.nit))
         if hasattr(result, 'nfev'):
-            message_lines.append('  Number of functions evaluations: %d')
-            message_args.append(result.nfev)
-        logging.info('\n'.join(message_lines), *message_args)
+            message_lines.append('  Number of functions evaluations: {}'.format(result.nfev))
+        logging.info('\n'.join(message_lines))
 
         return result['x']
 
@@ -477,21 +461,17 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
 
         message_lines = [
             'Optimization terminated with:',
-            '  Message: %s',
-            '  Objective function value: %f',
+            '  Message: {}'.format(result.message),
+            '  Objective function value: {}'.format(result.fun),
         ]
-
-        message_args = [result.message, result.fun]
 
         if hasattr(result, 'nit'):
             # Some optimization methods might not provide information such as nit and
             # nfev in the return. Logs only available information.
-            message_lines.append('  Number of iterations: %d')
-            message_args.append(result.nit)
+            message_lines.append('  Number of iterations: {}'.format(result.nit))
         if hasattr(result, 'nfev'):
-            message_lines.append('  Number of functions evaluations: %d')
-            message_args.append(result.nfev)
-        logging.info('\n'.join(message_lines), *message_args)
+            message_lines.append('  Number of functions evaluations: {}'.format(result.nfev))
+        logging.info('\n'.join(message_lines))
 
         return result['x']
 
@@ -803,9 +783,6 @@ class RiskNeutralInterestRateModel(object):
                     logging.warning('Unable to bootstrap {0} - skipping'.format(market_price))
                     continue
 
-                # if market_factor.name[0] not in ['ZAR-SWAP', 'ZAR-JIBAR-3M', 'USD-LIBOR-3M', 'USD-MASTER']:
-                #    continue
-
                 # calc the atm vol
                 mn_ix = np.searchsorted(swaptionvol.moneyness, 0.0)
                 atm_vol = np.array([np.interp(1, swaptionvol.moneyness[mn_ix - 1:mn_ix + 1], y)
@@ -847,38 +824,39 @@ class RiskNeutralInterestRateModel(object):
                     # check the time
                     time_now = time.clock()
                     batch_loss, vars = sess.run([loss, implied_var])
-                    logging.info('Before run', batch_loss, market_factor.name[0])
+                    logging.info('{} - Batch loss {}'.format(market_factor.name[0], batch_loss))
                     for k, v in sorted(vars.items()):
-                        logging.info(k, v)
+                        logging.info('{} - {}'.format(k, v))
 
                     sim_swaptions = sess.run(calibrated_swaptions)
                     for k, v in sorted(sim_swaptions.items()):
                         price = market_swaptions[k].price
-                        logging.info(k, 'market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
-                            price, v, 100.0 * (price - sim_swaptions[k]) / price))
+                        logging.debug('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
+                            k, price, v, 100.0 * (price - sim_swaptions[k]) / price))
 
                     # minimize
-                    soln = None
+                    soln = (batch_loss, vars)
                     num_optimizers = len(optimizers)
-                    for op_loop in range(2):
-                        optimizers[op_loop % num_optimizers].minimize(sess)
-                        batch_loss, vars = sess.run([loss, implied_var])
+                    if soln is None:
+                        for op_loop in range(2):
+                            optimizers[op_loop % num_optimizers].minimize(sess)
+                            batch_loss, vars = sess.run([loss, implied_var])
 
-                        if soln is None or batch_loss < soln[0]:
-                            soln = (batch_loss, vars)
-                            logging.info('After run {}'.format(op_loop), batch_loss)
-                            for k, v in sorted(vars.items()):
-                                logging.info(k, v)
-                            sim_swaptions = sess.run(calibrated_swaptions)
-                            for k, v in sorted(sim_swaptions.items()):
-                                price = market_swaptions[k].price
-                                logging.info(k, 'market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
-                                    price, v, 100.0 * (price - sim_swaptions[k]) / price))
+                            if soln is None or batch_loss < soln[0]:
+                                soln = (batch_loss, vars)
+                                logging.info('After run {} - Batch loss {}'.format(op_loop, batch_loss))
+                                for k, v in sorted(vars.items()):
+                                    logging.info('{} - {}'.format(k, v))
+                                sim_swaptions = sess.run(calibrated_swaptions)
+                                for k, v in sorted(sim_swaptions.items()):
+                                    price = market_swaptions[k].price
+                                    logging.info('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
+                                        k, price, v, 100.0 * (price - sim_swaptions[k]) / price))
 
                     # save this
                     self.save_params(soln[1], price_factors, implied_obj, rate)
                     # record the time
-                    logging.info('This took', time.clock() - time_now, 'seconds.')
+                    logging.info('This took {} seconds.'.format(time.clock() - time_now))
 
 
 class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
@@ -906,7 +884,6 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
 
         var_to_bounds = {implied_var['Yield_Volatility']: (1e-3, 0.6),
                          implied_var['Reversion_Speed']: (1e-2, 1.8)}
-
 
         # optimizer = ScipyLeastsqOptimizerInterface(losses, var_to_bounds={} if var_to_bounds is None else var_to_bounds )
         optimizer = ScipyBasinOptimizerInterface(loss, var_to_bounds=var_to_bounds)
@@ -1031,7 +1008,6 @@ scipy.optimize.leastsq.html) are used.',
             return sigmas, alpha, corr
 
         def make_basin_callbacks(step, sigma_min_max, alpha_min_max, corr_min_max):
-
             def bounds_check(**kwargs):
                 x = kwargs["x_new"]
                 sigmas, alpha, corr = split_param(x)

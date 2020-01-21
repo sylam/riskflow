@@ -52,17 +52,17 @@ def merge_profiles(id, merge_data, rundate, outputdir):
 
 
 class JOB(object):
-    def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log,
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log,
                  time_grid='0d 2d 1w(1w) 3m(1m) 2y(3m)'):
         self.cx = cx
         self.rundate = rundate
-        self.arena_path = arena_path
+        self.input_path = input_path
         self.outputdir = outputdir
         self.netting_set = netting_set
         self.stats = stats
         self.logger = log
         # load trade
-        self.cx.parse_json(self.arena_path.format(self.rundate, self.netting_set))
+        self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
         # default cmc parameters - note - fix this to load up all the parameters from cx.deals['Calculation']
         self.params = {'calc_name': ('cmc', 'calc1'),
                        'Time_grid': time_grid,
@@ -105,8 +105,8 @@ class JOB(object):
 
 
 class PFE(JOB):
-    def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log):
-        super(PFE, self).__init__(cx, rundate, arena_path, outputdir, netting_set, stats, log)
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
+        super(PFE, self).__init__(cx, rundate, input_path, outputdir, netting_set, stats, log)
         # set the OIS cashflow flag to speed up prime linked swaps
         self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
 
@@ -124,7 +124,7 @@ class PFE(JOB):
         instruments_in_file = ', '.join(deals)
         # turn on dynamic scenarios (more accurate)
         self.params['Dynamic_Scenario_Dates'] = 'Yes'
-        recon_file = self.arena_path.format(self.rundate, self.netting_set[:-4] + 'csv')
+        recon_file = os.path.join(self.input_path, self.rundate, self.netting_set[:-4] + 'csv')
 
         if os.path.isfile(recon_file):
             # load up the file to compare to - csv
@@ -159,8 +159,8 @@ class PFE(JOB):
 
 
 class CVA(JOB):
-    def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log):
-        super(CVA, self).__init__(cx, rundate, arena_path, outputdir, netting_set, stats, log)
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
+        super(CVA, self).__init__(cx, rundate, input_path, outputdir, netting_set, stats, log)
         # load up a calendar (for theta)
         self.business_day = cx.holidays['Johannesburg']['businessday']
         # set the OIS cashflow flag to speed up prime linked swaps
@@ -254,9 +254,9 @@ class CVA(JOB):
 
 
 class COLLVA(JOB):
-    def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log):
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
         self.rundate = rundate
-        self.arena_path = arena_path
+        self.input_path = input_path
         self.outputdir = outputdir
         self.netting_set = os.path.splitext(netting_set)[0] + '.json'
         self.stats = stats
@@ -272,13 +272,13 @@ class COLLVA(JOB):
         self.cx = AdaptivContext()
         old_cx = AdaptivContext()
         # load marketdata
-        old_cx.parse_json(arena_path.format(rundate, 'MarketData.json'))
+        old_cx.parse_json(os.path.join(self.input_path, rundate, 'MarketData.json'))
         # load up the CVA marketdata file
-        self.cx.parse_json(arena_path.format(rundate, 'MarketDataCVA.json'))
+        self.cx.parse_json(os.path.join(self.input_path, rundate, 'MarketDataCVA.json'))
         # update the cva data with the arena data
         self.cx.params['Price Factors'].update(old_cx.params['Price Factors'])
         # load trade
-        self.cx.parse_json(self.arena_path.format(self.rundate, self.netting_set))
+        self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
         # get the netting set
         self.ns = self.cx.deals['Deals']['Children'][0]['instrument'].field
         # get the agreement currency
@@ -330,7 +330,6 @@ class COLLVA(JOB):
             self.params['Simulation_Batches'] = 20
             self.params['Batch_Size'] = 256
 
-            # now adjust the survival curve - need intervals of .25 years
             try:
                 out = calc.execute(self.params)
             except Exception as e:
@@ -352,9 +351,9 @@ class COLLVA(JOB):
 
 
 class CVADEFAULT(JOB):
-    def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log):
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
         self.rundate = rundate
-        self.arena_path = arena_path
+        self.input_path = input_path
         self.outputdir = outputdir
         self.netting_set = os.path.splitext(netting_set)[0] + '.json'
         self.stats = stats
@@ -370,13 +369,13 @@ class CVADEFAULT(JOB):
         self.cx = AdaptivContext()
         old_cx = AdaptivContext()
         # load marketdata
-        old_cx.parse_json(arena_path.format(rundate, 'MarketData.json'))
+        old_cx.parse_json(os.path.join(self.input_path, rundate, 'MarketData.json'))
         # load up the CVA marketdata file
-        self.cx.parse_json(arena_path.format(rundate, 'MarketDataCVA.json'))
+        self.cx.parse_json(os.path.join(self.input_path, rundate, 'MarketDataCVA.json'))
         # update the cva data with the arena data
         self.cx.params['Price Factors'].update(old_cx.params['Price Factors'])
         # load trade
-        self.cx.parse_json(self.arena_path.format(self.rundate, self.netting_set))
+        self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
         # get the netting set
         self.ns = self.cx.deals['Deals']['Children'][0]['instrument'].field
         # get the agreement currency
@@ -457,9 +456,9 @@ class CVADEFAULT(JOB):
 
 
 class FVADEFAULT(JOB):
-    def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log):
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
         self.rundate = rundate
-        self.arena_path = arena_path
+        self.input_path = input_path
         self.outputdir = outputdir
         self.netting_set = os.path.splitext(netting_set)[0] + '.json'
         self.stats = stats
@@ -475,13 +474,13 @@ class FVADEFAULT(JOB):
         self.cx = AdaptivContext()
         old_cx = AdaptivContext()
         # load marketdata
-        old_cx.parse_json(arena_path.format(rundate, 'MarketData.json'))
+        old_cx.parse_json(os.path.join(self.input_path, rundate, 'MarketData.json'))
         # load up the CVA marketdata file
-        self.cx.parse_json(arena_path.format(rundate, 'MarketDataCVA.json'))
+        self.cx.parse_json(os.path.join(self.input_path, rundate, 'MarketDataCVA.json'))
         # update the cva data with the arena data
         self.cx.params['Price Factors'].update(old_cx.params['Price Factors'])
         # load trade
-        self.cx.parse_json(self.arena_path.format(self.rundate, self.netting_set))
+        self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
         # get the netting set
         self.ns = self.cx.deals['Deals']['Children'][0]['instrument'].field
         # get the agreement currency
@@ -555,9 +554,9 @@ class FVADEFAULT(JOB):
 
 
 class CVAVega(JOB):
-    def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log):
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
         self.rundate = rundate
-        self.arena_path = arena_path
+        self.input_path = input_path
         self.outputdir = outputdir
         self.netting_set = os.path.splitext(netting_set)[0] + '.json'
         self.stats = stats
@@ -573,16 +572,16 @@ class CVAVega(JOB):
 
         from adaptiv import AdaptivContext
         self.cx = AdaptivContext()
-        self.cx.parse_json(arena_path.format(rundate, 'MarketDataCVA.json'))
+        self.cx.parse_json(os.path.join(self.input_path, rundate, 'MarketDataCVA.json'))
         self.noshift = AdaptivContext()
-        self.noshift.parse_json(arena_path.format(rundate, 'MarketDataNoShift.json'))
+        self.noshift.parse_json(os.path.join(self.input_path, rundate, 'MarketDataNoShift.json'))
         self.shift = AdaptivContext()
-        self.shift.parse_json(arena_path.format(rundate, 'MarketDataShift.json'))
+        self.shift.parse_json(os.path.join(self.input_path, rundate, 'MarketDataShift.json'))
 
         # update the cva data with the arena data
         self.cx.params['Price Factors'].update(self.noshift.params['Price Factors'])
 
-        self.cx.parse_json(self.arena_path.format(self.rundate, self.netting_set))
+        self.cx.parse_json(os.path.join(self.input_path, rundate, self.netting_set))
         # get the netting set
         self.ns = self.cx.deals['Deals']['Children'][0]['instrument'].field
         # get the agreement currency
@@ -654,16 +653,16 @@ class CVAVega(JOB):
 
 
 class BaseVal(JOB):
-    def __init__(self, cx, rundate, arena_path, outputdir, netting_set, stats, log):
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
         self.cx = cx
         self.rundate = rundate
-        self.arena_path = arena_path
+        self.input_path = input_path
         self.outputdir = outputdir
         self.stats = stats
         self.logger = log
         self.business_day = cx.holidays['Johannesburg']['businessday']
         self.netting_set = os.path.splitext(netting_set)[0] + '.json'
-        cx.parse_json(arena_path.format(rundate, self.netting_set))
+        cx.parse_json(os.path.join(self.input_path, rundate, self.netting_set))
         self.params = {'calc_name': ('cmc', 'calc1'), 'Run_Date': rundate}
 
     def valid(self):
@@ -706,7 +705,7 @@ class BaseVal(JOB):
                 out['Results']['Greeks_Second'].to_csv(self.outputdir + os.sep + filename_greeks_second)
 
 
-def work(id, lock, queue, results, job, rundate, arena_path, calendar, outputdir):
+def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir):
     def log(netting_set, msg):
         lock.acquire()
         print('JOB %s: ' % id)
@@ -726,7 +725,7 @@ def work(id, lock, queue, results, job, rundate, arena_path, calendar, outputdir
     # load calendars
     cx.parse_calendar_file(calendar)
     # load marketdata
-    cx.parse_json(arena_path.format(rundate, 'MarketData.json'))
+    cx.parse_json(os.path.join(input_path, rundate, 'MarketData.json'))
 
     # log results
     logs = {}
@@ -737,7 +736,7 @@ def work(id, lock, queue, results, job, rundate, arena_path, calendar, outputdir
         if task is None:
             break
 
-        obj = globals().get(job)(cx, rundate, arena_path, outputdir, task, logs, log)
+        obj = globals().get(job)(cx, rundate, input_path, outputdir, task, logs, log)
         obj.perform_calc()
 
     # empty the queue
@@ -767,33 +766,36 @@ class Manager:
         self.NUMBER_OF_PROCESSES = num_jobs
 
     def start(self, job, rundate, input_path, calendar, outputdir, wildcard='CrB*.json'):
-        arena_path = input_path + os.sep + '{0}' + os.sep + '{1}'
         print("starting {0} workers in {1}".format(self.NUMBER_OF_PROCESSES, input_path))
         self.workers = [Process(target=work, args=(
-            i, self.lock, self.queue, self.results, job, rundate, arena_path, calendar, outputdir))
+            i, self.lock, self.queue, self.results, job, rundate, input_path, calendar, outputdir))
                         for i in range(self.NUMBER_OF_PROCESSES)]
         for w in self.workers:
             w.start()
 
-        self.serve(rundate, arena_path, wildcard)
+        self.serve(rundate, input_path, wildcard)
         self.stop(rundate, job)
 
-    def serve(self, rundate, arena_path, wildcard):
+    def serve(self, rundate, input_path, wildcard):
         crbs = map(lambda x: os.path.split(x)[-1],
-                   sorted(glob.glob(arena_path.format(rundate, wildcard)), key=os.path.getsize)[::-1])
+                   sorted(glob.glob(os.path.join(input_path, rundate, wildcard)), key=os.path.getsize)[::-1])
+
         for netting_set in crbs:
             self.queue.put(netting_set)
 
     def stop(self, rundate, job):
         self.queue.put(None)
-        for i in range(self.NUMBER_OF_PROCESSES):
-            self.workers[i].join()
-        self.queue.close()
 
         # now collate the results
         post_processing = []
         for i in range(self.NUMBER_OF_PROCESSES):
             post_processing.append(self.results.get())
+
+        for i in range(self.NUMBER_OF_PROCESSES):
+            self.workers[i].join()
+
+        # close the queue
+        self.queue.close()
 
         post_results = {'Stats': [], 'CSA': [], 'Merge': []}
         for output in post_processing:
