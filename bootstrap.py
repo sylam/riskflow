@@ -62,6 +62,7 @@ class Parent(object):
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
         # set the logger
         logging.basicConfig(level=logging.INFO,
+                            format='%(asctime)s %(levelname)-8s %(message)s',
                             datefmt='%m-%d %H:%M')
 
         from adaptiv import AdaptivContext
@@ -98,12 +99,13 @@ class Parent(object):
             # get the market price id and any options for bootstrapping
             market_price, _, *options = params.split(',', 2)
             # get the market prices for this bootstrapper
-            market_prices = {k: v for k, v in self.cx.params['Market Prices'].items() if k.startswith(market_price)}
+            market_prices = list({k: v for k, v in self.cx.params['Market Prices'].items() if
+                                  k.startswith(market_price)}.items())
             # number of return statuses needed
             status_required = 0
             for job_num in range(self.NUMBER_OF_PROCESSES):
                 job_prices = dict(itertools.compress(
-                    market_prices.items(),
+                    market_prices,
                     [i % self.NUMBER_OF_PROCESSES == job_num for i in range(len(market_prices))]))
 
                 # only put data on the queue if there's work to do
@@ -164,7 +166,7 @@ if __name__ == '__main__':
     # cx = AdaptivContext()
 
     for rundate in [x for x in sorted(os.listdir(cva_path)) \
-                    if '2020-01-15' < x < '2020-01-18' and os.path.isdir(os.path.join(cva_path, x))]:
+                    if '2020-01-15' < x < '2020-01-22' and os.path.isdir(os.path.join(cva_path, x))]:
         Parent(4).start(rundate, cva_path, os.path.join(cva_path, 'calendars.cal'))
 
         # if os.path.isfile(cva_path.format(rundate, 'MarketDataCal.json')):

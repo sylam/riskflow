@@ -1208,7 +1208,6 @@ class Base_Revaluation(Calculation):
         self.__refresh_shared_mem(params['Currency'], params.get('Greeks', 'No') == 'Yes')
 
         # calculate a reverse lookup for the tenors and store the daycount code
-        # self.all_tenors = utils.update_tenors(self.base_date, {}, self.static_factors, distinct_tenors)
         self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
 
         # store the state info
@@ -1306,7 +1305,6 @@ class Base_Revaluation(Calculation):
         # load any tag titles
         tag_titles = self.config.deals['Attributes'].get('Tag_Titles', '').split(',')
         # setup the config
-        # config = tf.ConfigProto(device_count = {'GPU': 0})
         config = tf.ConfigProto(allow_soft_placement=True)
 
         with tf.Session(graph=self.graph, config=config) as sess:
@@ -1336,7 +1334,7 @@ class Base_Revaluation(Calculation):
         self.graph = tf.Graph()
         # store the params
         self.params = params
-        # set the precision in the utils module - Nasty hack - TODO
+        # set the precision in the utils module - Nasty hack - Need to fix this - TODO
         utils.Default_Precision = self.prec
         # build the TF graph
         with self.graph.as_default() as g:

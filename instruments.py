@@ -1039,8 +1039,7 @@ class MtMCrossCurrencySwapDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Pay_Currency'] = utils.check_rate_name(self.field['Pay_Currency'])
+        field = {'Pay_Currency': utils.check_rate_name(self.field['Pay_Currency'])}
         field['Pay_Discount_Rate'] = utils.check_rate_name(self.field['Pay_Discount_Rate']) if self.field[
             'Pay_Discount_Rate'] else field['Pay_Currency']
         field['Pay_Interest_Rate'] = utils.check_rate_name(self.field['Pay_Interest_Rate']) if self.field[
@@ -1121,26 +1120,24 @@ class FXNonDeliverableForward(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Buy_Currency'] = utils.check_rate_name(self.field['Buy_Currency'])
-        field['Sell_Currency'] = utils.check_rate_name(self.field['Sell_Currency'])
-        field['Settlement_Currency'] = utils.check_rate_name(self.field['Settlement_Currency'])
+        field = {'Buy_Currency': utils.check_rate_name(self.field['Buy_Currency']),
+                 'Sell_Currency': utils.check_rate_name(self.field['Sell_Currency']),
+                 'Settlement_Currency': utils.check_rate_name(self.field['Settlement_Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Settlement_Currency']
 
-        field_index = {}
-        field_index['BuyFX'] = get_fx_and_zero_rate_factor(field['Buy_Currency'], static_offsets,
-                                                           stochastic_offsets, all_tenors, all_factors)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['SellFX'] = get_fx_and_zero_rate_factor(field['Sell_Currency'], static_offsets,
-                                                            stochastic_offsets, all_tenors, all_factors)
-        field_index['SettleFX'] = get_fx_and_zero_rate_factor(field['Settlement_Currency'], static_offsets,
-                                                              stochastic_offsets, all_tenors, all_factors)
+        field_index = {'BuyFX': get_fx_and_zero_rate_factor(field['Buy_Currency'], static_offsets,
+                                                            stochastic_offsets, all_tenors, all_factors),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'SellFX': get_fx_and_zero_rate_factor(field['Sell_Currency'], static_offsets,
+                                                             stochastic_offsets, all_tenors, all_factors),
+                       'SettleFX': get_fx_and_zero_rate_factor(field['Settlement_Currency'], static_offsets,
+                                                               stochastic_offsets, all_tenors, all_factors),
+                       'Maturity': (self.field['Settlement_Date'] - base_date).days,
+                       'Local_Currency': '{0}.{1}'.format(self.field['Buy_Currency'], self.field['Sell_Currency'])}
 
-        field_index['Maturity'] = (self.field['Settlement_Date'] - base_date).days
         # needed for reporting
-        field_index['Local_Currency'] = '{0}.{1}'.format(self.field['Buy_Currency'], self.field['Sell_Currency'])
 
         return field_index
 
@@ -1202,24 +1199,21 @@ class FXSwapDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['NearBuyFarSell_Currency'] = utils.check_rate_name(self.field['Near_Buy_Far_Sell_Ccy'])
-        field['NearBuyFarSell_DiscountRate'] = utils.check_rate_name(self.field['Near_Buy_Far_Sell_Discount_Rate'])
+        field = {'NearBuyFarSell_Currency': utils.check_rate_name(self.field['Near_Buy_Far_Sell_Ccy']),
+                 'NearBuyFarSell_DiscountRate': utils.check_rate_name(self.field['Near_Buy_Far_Sell_Discount_Rate']),
+                 'NearSellFarBuy_Currency': utils.check_rate_name(self.field['Near_Sell_Far_Buy_Ccy']),
+                 'NearSellFarBuy_DiscountRate': utils.check_rate_name(self.field['Near_Sell_Far_Buy_Discount_Rate'])}
 
-        field['NearSellFarBuy_Currency'] = utils.check_rate_name(self.field['Near_Sell_Far_Buy_Ccy'])
-        field['NearSellFarBuy_DiscountRate'] = utils.check_rate_name(self.field['Near_Sell_Far_Buy_Discount_Rate'])
-
-        field_index = {}
-        field_index['NearBuyFX'] = get_fxrate_factor(field['NearBuyFarSell_Currency'], static_offsets,
-                                                     stochastic_offsets)
-        field_index['NearBuyDiscount'] = get_discount_factor(field['NearBuyFarSell_DiscountRate'], static_offsets,
-                                                             stochastic_offsets, all_tenors, all_factors)
-        field_index['NearSellFX'] = get_fxrate_factor(field['NearSellFarBuy_Currency'], static_offsets,
-                                                      stochastic_offsets)
-        field_index['NearSellDiscount'] = get_discount_factor(field['NearSellFarBuy_DiscountRate'], static_offsets,
-                                                              stochastic_offsets, all_tenors, all_factors)
-        field_index['Maturity'] = (self.field['Far_Settlement_Date'] - base_date).days
-        field_index['Near_Maturity'] = (self.field['Near_Settlement_Date'] - base_date).days
+        field_index = {'NearBuyFX': get_fxrate_factor(field['NearBuyFarSell_Currency'], static_offsets,
+                                                      stochastic_offsets),
+                       'NearBuyDiscount': get_discount_factor(field['NearBuyFarSell_DiscountRate'], static_offsets,
+                                                              stochastic_offsets, all_tenors, all_factors),
+                       'NearSellFX': get_fxrate_factor(field['NearSellFarBuy_Currency'], static_offsets,
+                                                       stochastic_offsets),
+                       'NearSellDiscount': get_discount_factor(field['NearSellFarBuy_DiscountRate'], static_offsets,
+                                                               stochastic_offsets, all_tenors, all_factors),
+                       'Maturity': (self.field['Far_Settlement_Date'] - base_date).days,
+                       'Near_Maturity': (self.field['Near_Settlement_Date'] - base_date).days}
 
         return field_index
 
@@ -1311,23 +1305,22 @@ class FXForwardDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Buy_Currency'] = utils.check_rate_name(self.field['Buy_Currency'])
+        field = {'Buy_Currency': utils.check_rate_name(self.field['Buy_Currency'])}
         field['Buy_Discount_Rate'] = utils.check_rate_name(self.field['Buy_Discount_Rate']) if self.field[
             'Buy_Discount_Rate'] else field['Buy_Currency']
         field['Sell_Currency'] = utils.check_rate_name(self.field['Sell_Currency'])
         field['Sell_Discount_Rate'] = utils.check_rate_name(self.field['Sell_Discount_Rate']) if self.field[
             'Sell_Discount_Rate'] else field['Buy_Currency']
 
-        field_index = {}
-        field_index['BuyFX'] = get_fxrate_factor(field['Buy_Currency'], static_offsets, stochastic_offsets)
-        field_index['BuyDiscount'] = get_discount_factor(field['Buy_Discount_Rate'], static_offsets, stochastic_offsets,
-                                                         all_tenors, all_factors)
-        field_index['SellFX'] = get_fxrate_factor(field['Sell_Currency'], static_offsets, stochastic_offsets)
-        field_index['SellDiscount'] = get_discount_factor(field['Sell_Discount_Rate'], static_offsets,
+        field_index = {'BuyFX': get_fxrate_factor(field['Buy_Currency'], static_offsets, stochastic_offsets),
+                       'BuyDiscount': get_discount_factor(field['Buy_Discount_Rate'], static_offsets,
                                                           stochastic_offsets,
-                                                          all_tenors, all_factors)
-        field_index['Maturity'] = (self.field['Settlement_Date'] - base_date).days
+                                                          all_tenors, all_factors),
+                       'SellFX': get_fxrate_factor(field['Sell_Currency'], static_offsets, stochastic_offsets),
+                       'SellDiscount': get_discount_factor(field['Sell_Discount_Rate'], static_offsets,
+                                                           stochastic_offsets,
+                                                           all_tenors, all_factors),
+                       'Maturity': (self.field['Settlement_Date'] - base_date).days}
 
         return field_index
 
@@ -1385,8 +1378,7 @@ class SwapInterestDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Interest_Rate'] = utils.check_rate_name(self.field['Interest_Rate']) if self.field['Interest_Rate'] else \
@@ -1475,8 +1467,7 @@ class CFFixedInterestListDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
 
@@ -1515,20 +1506,17 @@ class CFFixedListDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
 
-        field_index = {}
-        field_index['SettleCurrency'] = self.field['Currency']
-        field_index['Currency'] = get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Cashflows'] = utils.make_simple_fixed_cashflows(base_date,
-                                                                     1 if self.field['Buy_Sell'] == 'Buy' else -1,
-                                                                     self.field['Cashflows'])
+        field_index = {'SettleCurrency': self.field['Currency'], 'Currency': get_fx_and_zero_rate_factor(
+            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Cashflows': utils.make_simple_fixed_cashflows(base_date,
+                                                                      1 if self.field['Buy_Sell'] == 'Buy' else -1,
+                                                                      self.field['Cashflows'])}
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
@@ -1551,19 +1539,17 @@ class FixedCashflowDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
 
-        field_index = {}
-        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Payment_Date'] = (self.field['Payment_Date'] - base_date).days
+        field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Payment_Date': (self.field['Payment_Date'] - base_date).days,
+                       'Local_Currency': self.field['Currency']}
 
         # needed for reporting
-        field_index['Local_Currency'] = self.field['Currency']
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
@@ -1611,23 +1597,19 @@ class CFFloatingInterestListDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Forecast_Rate'] = utils.check_rate_name(self.field['Forecast_Rate']) if self.field['Forecast_Rate'] else \
             field['Discount_Rate']
 
-        field_index = {}
-        field_index['SettleCurrency'] = self.field['Currency']
-        field_index['Forward'] = get_interest_factor(field['Forecast_Rate'], static_offsets, stochastic_offsets,
-                                                     all_tenors)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-
-        field_index['VolSurface'] = np.zeros(1, dtype=np.int32)
-        field_index['Currency'] = get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+        field_index = {'SettleCurrency': self.field['Currency'],
+                       'Forward': get_interest_factor(field['Forecast_Rate'], static_offsets, stochastic_offsets,
+                                                      all_tenors),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'VolSurface': np.zeros(1, dtype=np.int32), 'Currency': get_fx_and_zero_rate_factor(
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)}
 
         float_cashflows = utils.make_float_cashflows(
             base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, self.field['Cashflows'])
@@ -1703,20 +1685,18 @@ class YieldInflationCashflowListDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Index'] = utils.check_rate_name(self.field['Index'])
         field['PriceIndex'] = utils.check_rate_name(get_inflation_index_name(field['Index'], all_factors))
 
-        field_index = {}
-        field_index['ForecastIndex'] = get_inflation_factor(field['Index'], static_offsets, stochastic_offsets,
-                                                            all_tenors)
-        field_index['PriceIndex'] = get_price_index_factor(field['PriceIndex'], static_offsets, stochastic_offsets)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
+        field_index = {'ForecastIndex': get_inflation_factor(field['Index'], static_offsets, stochastic_offsets,
+                                                             all_tenors),
+                       'PriceIndex': get_price_index_factor(field['PriceIndex'], static_offsets, stochastic_offsets),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)}
 
         inflation_factor, index_factor = get_inflation_index_objects(field['Index'], field['PriceIndex'], all_factors)
         field_index['IndexMethod'] = utils.CASHFLOW_IndexMethodLookup[inflation_factor.get_reference_name()]
@@ -1778,8 +1758,7 @@ class CapDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Forecast_Rate'] = utils.check_rate_name(self.field['Forecast_Rate']) if self.field['Forecast_Rate'] else \
@@ -1857,8 +1836,7 @@ class FloorDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Forecast_Rate'] = utils.check_rate_name(self.field['Forecast_Rate']) if self.field['Forecast_Rate'] else \
@@ -1991,25 +1969,23 @@ class SwaptionDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Forecast_Rate'] = utils.check_rate_name(self.field['Forecast_Rate']) if self.field['Forecast_Rate'] else \
             field['Discount_Rate']
         field['Forecast_Rate_Volatility'] = utils.check_rate_name(self.field['Forecast_Rate_Volatility'])
 
-        field_index = {}
-        field_index['SettleCurrency'] = self.field['Currency']
-        field_index['Forward'] = get_interest_factor(field['Forecast_Rate'], static_offsets, stochastic_offsets,
-                                                     all_tenors)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
+        field_index = {'SettleCurrency': self.field['Currency'],
+                       'Forward': get_interest_factor(field['Forecast_Rate'], static_offsets, stochastic_offsets,
+                                                      all_tenors),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'VolSurface': get_interest_vol_factor(field['Forecast_Rate_Volatility'], pd.DateOffset(years=2),
+                                                             static_offsets, stochastic_offsets, all_tenors),
+                       'Expiry': (self.field['Option_Expiry_Date'] - base_date).days}
         # hard coding a tenor of 2 years to force using an interest yield vol price factor.
-        field_index['VolSurface'] = get_interest_vol_factor(field['Forecast_Rate_Volatility'], pd.DateOffset(years=2),
-                                                            static_offsets, stochastic_offsets, all_tenors)
-        field_index['Expiry'] = (self.field['Option_Expiry_Date'] - base_date).days
 
         # need to check defaults
         Principal = self.field.get('Principal', 1000000.0)
@@ -2164,31 +2140,28 @@ class FXDiscreteExplicitAsianOption(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Underlying_Currency'] = utils.check_rate_name(self.field['Underlying_Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
 
-        field_index = {}
-        field_index['Currency'] = get_fx_and_zero_rate_factor(field['Currency'], static_offsets, stochastic_offsets,
-                                                              all_tenors, all_factors)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Underlying_Currency'] = get_fx_and_zero_rate_factor(field['Underlying_Currency'], static_offsets,
-                                                                         stochastic_offsets, all_tenors, all_factors)
-        field_index['FX_Volatility'] = get_fx_vol_factor(field['FX_Volatility'], static_offsets,
-                                                         stochastic_offsets, all_tenors)
-
-        field_index['Expiry'] = (self.field['Expiry_Date'] - base_date).days
-        field_index['Invert_Moneyness'] = 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0
+        field_index = {'Currency': get_fx_and_zero_rate_factor(field['Currency'], static_offsets, stochastic_offsets,
+                                                               all_tenors, all_factors),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Underlying_Currency': get_fx_and_zero_rate_factor(field['Underlying_Currency'], static_offsets,
+                                                                          stochastic_offsets, all_tenors, all_factors),
+                       'FX_Volatility': get_fx_vol_factor(field['FX_Volatility'], static_offsets,
+                                                          stochastic_offsets, all_tenors),
+                       'Expiry': (self.field['Expiry_Date'] - base_date).days,
+                       'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
+                       'Samples': utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data']),
+                       'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])}
 
         # map the past fixings
-        field_index['Samples'] = utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data'])
 
         # needed for reporting
-        field_index['Local_Currency'] = '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
@@ -2314,29 +2287,26 @@ class EquityDiscreteExplicitAsianOption(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Equity'] = utils.check_rate_name(self.field['Equity'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
 
-        field_index = {}
-        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Equity'] = get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets)
-
-        field_index['Equity_Zero'] = get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                 all_tenors, all_factors)
-        field_index['Dividend_Yield'] = get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                 all_tenors)
-        field_index['Equity_Volatility'] = get_equity_price_vol_factor(field['Equity_Volatility'], static_offsets,
-                                                                       stochastic_offsets, all_tenors)
-        field_index['Expiry'] = (self.field['Expiry_Date'] - base_date).days
+        field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+                       'Equity_Zero': get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
+                                                                  all_tenors, all_factors),
+                       'Dividend_Yield': get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
+                                                                  all_tenors),
+                       'Equity_Volatility': get_equity_price_vol_factor(field['Equity_Volatility'], static_offsets,
+                                                                        stochastic_offsets, all_tenors),
+                       'Expiry': (self.field['Expiry_Date'] - base_date).days,
+                       'Samples': utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data'])}
 
         # map the past fixings
-        field_index['Samples'] = utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data'])
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
@@ -2452,25 +2422,23 @@ class EquityOptionDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Equity'] = utils.check_rate_name(self.field['Equity'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
 
-        field_index = {}
-        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Equity'] = get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets)
-        field_index['Equity_Zero'] = get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                 all_tenors, all_factors)
-        field_index['Dividend_Yield'] = get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                 all_tenors)
-        field_index['Equity_Volatility'] = get_equity_price_vol_factor(field['Equity_Volatility'], static_offsets,
-                                                                       stochastic_offsets, all_tenors)
-        field_index['Expiry'] = (self.field['Expiry_Date'] - base_date).days
+        field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+                       'Equity_Zero': get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
+                                                                  all_tenors, all_factors),
+                       'Dividend_Yield': get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
+                                                                  all_tenors),
+                       'Equity_Volatility': get_equity_price_vol_factor(field['Equity_Volatility'], static_offsets,
+                                                                        stochastic_offsets, all_tenors),
+                       'Expiry': (self.field['Expiry_Date'] - base_date).days}
 
         return field_index
 
@@ -2542,30 +2510,28 @@ class EquityBarrierOption(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Equity'] = utils.check_rate_name(self.field['Equity'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
 
-        field_index = {}
-        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Equity'] = get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets)
-        field_index['Equity_Zero'] = get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                 all_tenors, all_factors)
-        field_index['Dividend_Yield'] = get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                 all_tenors)
-        field_index['Volatility'] = get_equity_price_vol_factor(field['Equity_Volatility'], static_offsets,
-                                                                stochastic_offsets, all_tenors)
+        field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+                       'Equity_Zero': get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
+                                                                  all_tenors, all_factors),
+                       'Dividend_Yield': get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
+                                                                  all_tenors),
+                       'Volatility': get_equity_price_vol_factor(field['Equity_Volatility'], static_offsets,
+                                                                 stochastic_offsets, all_tenors),
+                       'Barrier_Monitoring': 0.5826 * np.sqrt(
+                           (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0),
+                       'Expiry': (self.field['Expiry_Date'] - base_date).days}
 
         # discrete barrier monitoring requires adjusting the barrier by 0.58
         # ( -(scipy.special.zetac(0.5)+1)/np.sqrt(2.0*np.pi) ) * sqrt (monitoring freq)
-        field_index['Barrier_Monitoring'] = 0.5826 * np.sqrt(
-            (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0)
-        field_index['Expiry'] = (self.field['Expiry_Date'] - base_date).days
 
         return field_index
 
@@ -2589,23 +2555,21 @@ class EquityForwardDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Equity'] = utils.check_rate_name(self.field['Equity'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         # field['Equity_Volatility']		= utils.check_rate_name(self.field['Equity_Volatility'])
 
-        field_index = {}
-        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Equity'] = get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets)
-        field_index['Equity_Zero'] = get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                 all_tenors, all_factors)
-        field_index['Dividend_Yield'] = get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                 all_tenors)
-        field_index['Expiry'] = (self.field['Maturity_Date'] - base_date).days
+        field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+                       'Equity_Zero': get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
+                                                                  all_tenors, all_factors),
+                       'Dividend_Yield': get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
+                                                                  all_tenors),
+                       'Expiry': (self.field['Maturity_Date'] - base_date).days}
 
         return field_index
 
@@ -2658,9 +2622,8 @@ class EquitySwapletListDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Equity'] = utils.check_rate_name(self.field['Equity'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
         field['Equity_Currency'] = utils.check_rate_name(self.field['Equity_Currency'])
@@ -2719,9 +2682,8 @@ class EquitySwapLeg(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Equity'] = utils.check_rate_name(self.field['Equity'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency'])
@@ -2759,10 +2721,9 @@ class EquitySwapLeg(Deal):
             }]
         }
 
-        field_index = {}
+        field_index = {'PrincipleNotShares': 1 if self.field['Principal_Fixed_Variable'] == 'Principal' else 0,
+                       'SettleCurrency': self.field['Currency']}
 
-        field_index['PrincipleNotShares'] = 1 if self.field['Principal_Fixed_Variable'] == 'Principal' else 0
-        field_index['SettleCurrency'] = self.field['Currency']
         self.isQuanto = field['Payoff_Currency'] != field['Currency']
 
         if self.isQuanto:
@@ -2834,29 +2795,27 @@ class FXOneTouchOption(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Underlying_Currency'] = utils.check_rate_name(self.field['Underlying_Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
 
-        field_index = {}
-        field_index['Currency'] = get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['Discount'] = get_discount_factor(
-            field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['Underlying_Currency'] = get_fx_and_zero_rate_factor(
-            field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['Volatility'] = get_fx_vol_factor(
-            field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors)
-        field_index['Expiry'] = (self.field['Expiry_Date'] - base_date).days
-        field_index['Invert_Moneyness'] = 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0
+        field_index = {'Currency': get_fx_and_zero_rate_factor(
+            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Underlying_Currency': get_fx_and_zero_rate_factor(
+                field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Volatility': get_fx_vol_factor(
+                field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Expiry': (self.field['Expiry_Date'] - base_date).days,
+            'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
+            'Barrier_Monitoring': 0.5826 * np.sqrt(
+                (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0),
+            'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])}
         # adjustment for discrete barrier monitoring
-        field_index['Barrier_Monitoring'] = 0.5826 * np.sqrt(
-            (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0)
         # needed for reporting
-        field_index['Local_Currency'] = '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
 
         return field_index
 
@@ -2898,32 +2857,30 @@ class FXBarrierOption(Deal):
                 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Underlying_Currency'] = utils.check_rate_name(self.field['Underlying_Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
 
-        field_index = {}
-        field_index['Currency'] = get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['Discount'] = get_discount_factor(
-            field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['Underlying_Currency'] = get_fx_and_zero_rate_factor(
-            field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['Volatility'] = get_fx_vol_factor(
-            field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors)
+        field_index = {'Currency': get_fx_and_zero_rate_factor(
+            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Underlying_Currency': get_fx_and_zero_rate_factor(
+                field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Volatility': get_fx_vol_factor(
+                field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Barrier_Monitoring': 0.5826 * np.sqrt(
+                (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0),
+            'Expiry': (self.field['Expiry_Date'] - base_date).days,
+            'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
+            'settlement_currency': 1.0,
+            'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])}
 
         # discrete barrier monitoring requires adjusting the barrier by 0.58
         # ( -(scipy.special.zetac(0.5)+1)/np.sqrt(2.0*np.pi) ) * sqrt (monitoring freq)
-        field_index['Barrier_Monitoring'] = 0.5826 * np.sqrt(
-            (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0)
-        field_index['Expiry'] = (self.field['Expiry_Date'] - base_date).days
-        field_index['Invert_Moneyness'] = 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0
-        field_index['settlement_currency'] = 1.0
         # needed for reporting
-        field_index['Local_Currency'] = '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
 
         return field_index
 
@@ -2949,27 +2906,25 @@ class FXOptionDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
-        field['Underlying_Currency'] = utils.check_rate_name(self.field['Underlying_Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
 
-        field_index = {}
-        field_index['Currency'] = get_fx_and_zero_rate_factor(field['Currency'], static_offsets, stochastic_offsets,
-                                                              all_tenors, all_factors)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Underlying_Currency'] = get_fx_and_zero_rate_factor(
-            field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['FX_Volatility'] = get_fx_vol_factor(field['FX_Volatility'], static_offsets, stochastic_offsets,
-                                                         all_tenors)
-        field_index['Expiry'] = (self.field['Expiry_Date'] - base_date).days
-        field_index['Invert_Moneyness'] = 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0
+        field_index = {'Currency': get_fx_and_zero_rate_factor(field['Currency'], static_offsets, stochastic_offsets,
+                                                               all_tenors, all_factors),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Underlying_Currency': get_fx_and_zero_rate_factor(
+                           field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'FX_Volatility': get_fx_vol_factor(field['FX_Volatility'], static_offsets, stochastic_offsets,
+                                                          all_tenors),
+                       'Expiry': (self.field['Expiry_Date'] - base_date).days,
+                       'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
+                       'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])}
 
         # needed for reporting
-        field_index['Local_Currency'] = '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
 
         return field_index
 
@@ -3054,18 +3009,16 @@ class DealDefaultSwap(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Name'] = utils.check_rate_name(self.field['Name'])
 
-        field_index = {}
-        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Name'] = get_survival_factor(field['Name'], static_offsets, stochastic_offsets, all_tenors)
-        field_index['Recovery_Rate'] = get_recovery_rate(field['Name'], all_factors)
+        field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Name': get_survival_factor(field['Name'], static_offsets, stochastic_offsets, all_tenors),
+                       'Recovery_Rate': get_recovery_rate(field['Name'], all_factors)}
 
         pay_rate = self.field['Pay_Rate'] / 100.0 if isinstance(self.field['Pay_Rate'], float) else self.field[
             'Pay_Rate'].amount
@@ -3099,8 +3052,7 @@ class FRADeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Interest_Rate'] = utils.check_rate_name(self.field['Interest_Rate']) if self.field['Interest_Rate'] else \
@@ -3109,17 +3061,13 @@ class FRADeal(Deal):
         field['Use_Known_Rate'] = self.field.get('Use_Known_Rate', 'No')
         field['Known_Rate'] = self.field.get('Known_Rate', 0.0)
 
-        field_index = {}
-        field_index['Currency'] = get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Forward'] = get_interest_factor(field['Interest_Rate'], static_offsets, stochastic_offsets,
-                                                     all_tenors)
-        field_index['Daycount'] = utils.get_day_count(self.field['Day_Count'])
-
-        field_index['CompoundingMethod'] = 'None'
-        field_index['SettleCurrency'] = self.field['Currency']
+        field_index = {'Currency': get_fx_and_zero_rate_factor(
+            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                            all_tenors, all_factors),
+            'Forward': get_interest_factor(field['Interest_Rate'], static_offsets, stochastic_offsets,
+                                           all_tenors), 'Daycount': utils.get_day_count(self.field['Day_Count']),
+            'CompoundingMethod': 'None', 'SettleCurrency': self.field['Currency']}
 
         Accrual_fraction = utils.get_day_count_accrual(
             base_date, (self.field['Maturity_Date'] - self.field['Effective_Date']).days, field_index['Daycount'])
@@ -3180,8 +3128,7 @@ class FloatingEnergyDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Sampling_Type'] = utils.check_rate_name(self.field['Sampling_Type'])
@@ -3238,20 +3185,17 @@ class FixedEnergyDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
 
-        field_index = {}
-        field_index['SettleCurrency'] = self.field['Currency']
-        field_index['Currency'] = get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors, all_factors)
-        field_index['Cashflows'] = utils.make_energy_fixed_cashflows(base_date, -1.0
-        if self.field['Payer_Receiver'] == 'Payer' else 1.0,
-                                                                     self.field['Payments'])
+        field_index = {'SettleCurrency': self.field['Currency'], 'Currency': get_fx_and_zero_rate_factor(
+            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
+                                                       all_tenors, all_factors),
+                       'Cashflows': utils.make_energy_fixed_cashflows(base_date, -1.0
+                       if self.field['Payer_Receiver'] == 'Payer' else 1.0,
+                                                                      self.field['Payments'])}
 
         return field_index
 
@@ -3293,8 +3237,7 @@ class EnergySingleOption(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {}
-        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+        field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['Sampling_Type'] = utils.check_rate_name(self.field['Sampling_Type'])

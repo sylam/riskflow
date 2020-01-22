@@ -188,7 +188,7 @@ class Context(object):
     offset_lookup = {'M': 'months', 'D': 'days', 'Y': 'years', 'W': 'weeks'}
     reverse_offset = {'months': 'M', 'days': 'D', 'years': 'Y', 'weeks': 'W'}
 
-    def __init__(self):
+    def __init__(self, base_currency='USD'):
         self.deals = {'Deals': {'Children': []}}
         self.calibrations = {'CalibrationConfig': {'MarketDataArchiveFile': {}, 'Calibrations': []}}
         self.calendars = ElementTree(Element('', tag='Calendars'))
@@ -200,7 +200,7 @@ class Context(object):
         self.version = None
         self.params = {
             'System Parameters':
-                {'Base_Currency': 'USD',
+                {'Base_Currency': base_currency,
                  'Base_Date': '',
                  'Correlations_Healing_Method': 'Eigenvalue_Raising'
                  },
