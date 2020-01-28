@@ -365,7 +365,7 @@ class ScipyLeastsqOptimizerInterface(object):
             message_lines.append('  Number of iterations: {}'.format(result.nit))
         if hasattr(result, 'nfev'):
             message_lines.append('  Number of functions evaluations: {}'.format(result.nfev))
-        logging.info('\n'.join(message_lines))
+        logging.debug('\n'.join(message_lines))
 
         return result['x']
 
@@ -429,7 +429,7 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
             return loss, gradient.astype('float64')
 
         def print_fun(x, f, accepted):
-            logging.info("at minimum %.4f accepted %d" % (f, int(accepted)))
+            logging.debug("at minimum %.4f accepted %d" % (f, int(accepted)))
             if f < 0.1:
                 return True
 
@@ -449,7 +449,7 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
 
         import scipy.optimize
         result = scipy.optimize.basinhopping(
-            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=100, T=0.25,
+            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=200, T=0.25,
             accept_test=accept_test, callback=print_fun, take_step=take_step)
 
         message_lines = [
@@ -464,7 +464,7 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
             message_lines.append('  Number of iterations: {}'.format(result.nit))
         if hasattr(result, 'nfev'):
             message_lines.append('  Number of functions evaluations: {}'.format(result.nfev))
-        logging.info('\n'.join(message_lines))
+        logging.debug('\n'.join(message_lines))
 
         return result['x']
 
@@ -663,8 +663,9 @@ class GBMTSImpliedParameters(object):
                     vol = atm_vol
 
                 price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
-                    [('Quanto_FX_Volatility', None),
+                    [('Property_Aliases', None),
                      ('Vol', utils.Curve(['Integrated'], list(zip(fxvol.expiry, vol)))),
+                     ('Quanto_FX_Volatility', None),
                      ('Quanto_FX_Correlation', 0.0)])
                 price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
 
@@ -771,6 +772,9 @@ class RiskNeutralInterestRateModel(object):
                 try:
                     swaptionvol = riskfactors.construct_factor(vol_factor, price_factors)
                     ir_curve = riskfactors.construct_factor(ir_factor, price_factors)
+                except KeyError as k:
+                    logging.warning('Missing price factor {} - Unable to bootstrap {}'.format(k.args, market_price))
+                    continue
                 except Exception:
                     logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
                     continue
@@ -830,21 +834,21 @@ class RiskNeutralInterestRateModel(object):
                     # minimize
                     soln = None
                     num_optimizers = len(optimizers)
-                    if soln is None:
-                        for op_loop in range(2):
-                            optimizers[op_loop % num_optimizers].minimize(sess)
-                            batch_loss, vars = sess.run([loss, implied_var])
+                    for op_loop in range(2*num_optimizers):
+                        optimizers[op_loop % num_optimizers].minimize(sess)
+                        batch_loss, vars = sess.run([loss, implied_var])
 
-                            if soln is None or batch_loss < soln[0]:
-                                soln = (batch_loss, vars)
-                                logging.info('After run {} - Batch loss {}'.format(op_loop, batch_loss))
-                                for k, v in sorted(vars.items()):
-                                    logging.info('{} - {}'.format(k, v))
-                                sim_swaptions = sess.run(calibrated_swaptions)
-                                for k, v in sorted(sim_swaptions.items()):
-                                    price = market_swaptions[k].price
-                                    logging.info('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
-                                        k, price, v, 100.0 * (price - sim_swaptions[k]) / price))
+                        if soln is None or batch_loss < soln[0]:
+                            soln = (batch_loss, vars)
+                            logging.info('{} - run {} - Batch loss {}'.format(
+                                market_factor.name[0], op_loop, batch_loss))
+                            for k, v in sorted(vars.items()):
+                                logging.info('{} - {}'.format(k, v))
+                            sim_swaptions = sess.run(calibrated_swaptions)
+                            for k, v in sorted(sim_swaptions.items()):
+                                price = market_swaptions[k].price
+                                logging.info('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
+                                    k, price, v, 100.0 * (price - sim_swaptions[k]) / price))
 
                     # save this
                     self.save_params(soln[1], price_factors, implied_obj, rate)
@@ -1122,12 +1126,15 @@ scipy.optimize.leastsq.html) are used.',
         quanto_fx1, quanto_fx2 = implied_obj.get_quanto_correlation(
             vars['Correlation'], [vars['Sigma_1'], vars['Sigma_2']])
 
-        param = {'Alpha_1': float(vars['Alpha_1'][0]), 'Alpha_2': float(vars['Alpha_2'][0]),
-                 'Correlation': float(vars['Correlation'][0]),
+        param = {'Property_Aliases': None,
+                 'Quanto_FX_Volatility': implied_obj.param['Quanto_FX_Volatility'],
+                 'Alpha_1': float(vars['Alpha_1'][0]),
                  'Sigma_1': utils.Curve([], list(zip(sig1_tenor, vars['Sigma_1']))),
+                 'Quanto_FX_Correlation_1': quanto_fx1,
+                 'Alpha_2': float(vars['Alpha_2'][0]),
                  'Sigma_2': utils.Curve([], list(zip(sig2_tenor, vars['Sigma_2']))),
-                 'Quanto_FX_Correlation_1': quanto_fx1, 'Quanto_FX_Correlation_2': quanto_fx2,
-                 'Quanto_FX_Volatility': implied_obj.param['Quanto_FX_Volatility']}
+                 'Quanto_FX_Correlation_2': quanto_fx2,
+                 'Correlation': float(vars['Correlation'][0])}
 
         price_factors[param_name] = param
 

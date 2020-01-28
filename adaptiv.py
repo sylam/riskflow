@@ -561,6 +561,7 @@ class AdaptivContext(Context):
         correl = (namedId + comma + namedId + comma + fnumber).setParseAction(pushCorrel)
 
         header = aa_format + equals + restOfLine
+        system = (~lapar + ident + equals + (date | ident | integer | null).leaveWhitespace()).setParseAction(pushIdent)
         todo = (~lapar + ident + equals + restOfLine).setParseAction(pushKeyVal)
         param = (~lapar + ident + equals + ident + Optional(comma + delimitedList(assign)) + Optional(
             eol)).setParseAction(pushParam)
@@ -569,7 +570,8 @@ class AdaptivContext(Context):
         modelcfg = (~lapar + ident + equals + ident + Optional(where + rule)).setParseAction(pushMdlCfg)
 
         section = ((correl_sec + ZeroOrMore(correl)) |
-                   ((sys_param | bootstrap) + ZeroOrMore(todo)) |
+                   (sys_param + OneOrMore(system)) |
+                   (bootstrap + ZeroOrMore(todo)) |
                    (valuation + OneOrMore(param)) |
                    ((model_cfg | factor_int) + ZeroOrMore(modelcfg)) |
                    ((price_fac | price_mod | market_p) + ZeroOrMore(line))).setParseAction(pushSection)

@@ -80,7 +80,7 @@ def run_cmc(context, rundate, Currency='ZAR', CVA=True, FVA=False, CollVA=False,
         'Credit_Valuation_Adjustment', default_cva)
 
     params_mc = {'calc_name': ('test1',), 'Time_grid': time_grid, 'Run_Date': rundate,
-                 'Currency': Currency, 'Simulation_Batches': 10, 'Batch_Size': 64 * 8, 'Random_Seed': 8312,
+                 'Currency': Currency, 'Simulation_Batches': 20, 'Batch_Size': 64 * 4, 'Random_Seed': 8312,
                  'Calc_Scenarios': 'No', 'Generate_Cashflows': 'No', 'Partition': 'None',
                  'Generate_Slideshow': 'No', 'PFE_Recon_File': '', 'Dynamic_Scenario_Dates': 'Yes',
                  # 'Debug': 'G:\\Credit Quants\\CRSTAL\\riskflow\\logs', 'NoModel': 'Constant',
@@ -90,7 +90,7 @@ def run_cmc(context, rundate, Currency='ZAR', CVA=True, FVA=False, CollVA=False,
                          'Stochastic_Hazard': cva_sect['Stochastic_Hazard_Rates'],
                          'Counterparty': cva_sect['Counterparty'], 'Deflation': 'ZAR-SWAP',
                          # brave choices these . . .
-                         'Gradient': 'Yes', 'Hessian': 'No'},
+                         'Gradient': 'No', 'Hessian': 'No'},
                  'FVA': {'Funding_Interest_Curve': 'USD-LIBOR-3M.FUNDING',
                          'Risk_Free_Curve': 'USD-OIS',
                          'Counterparty': cva_sect['Counterparty'],

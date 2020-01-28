@@ -53,9 +53,11 @@ class Parent(object):
         self.errors = Queue()
         self.manager = Manager()
         self.NUMBER_OF_PROCESSES = num_jobs
+        self.path = None
         self.cx = None
+        self.daily = False
 
-    def start(self, rundate, input_path, calendar):
+    def start(self, rundate, input_path, calendar, outfile='CVAMarketDataCal'):
         # disable gpus
         os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
         # set the log level for the parent
@@ -71,14 +73,27 @@ class Parent(object):
         self.cx = AdaptivContext()
         # load calendars
         self.cx.parse_calendar_file(calendar)
+        # store the path
+        self.path = input_path
         # load marketdata
-        if os.path.isfile(os.path.join(input_path, rundate, 'MarketDataCal.json')):
-            self.cx.parse_json(os.path.join(input_path, rundate, 'MarketDataCal.json'))
+        if rundate is None:
+            self.daily = True
+            self.path = os.path.split(input_path)[0]
+            self.outfile = outfile
+            self.cx.parse_json(input_path)
+            rundate = pd.Timestamp.now().strftime('%Y-%m-%d')
+        elif os.path.isfile(os.path.join(self.path, rundate, 'MarketDataCal.json')):
+            self.cx.parse_json(os.path.join(self.path, rundate, 'MarketDataCal.json'))
+        elif os.path.isfile(os.path.join(self.path, rundate, 'MarketData.json')):
+            self.cx.parse_json(os.path.join(self.path, rundate, 'MarketData.json'))
         else:
-            self.cx.parse_json(os.path.join(input_path, rundate, 'MarketData.json'))
+            logging.error('Cannot find market data for rundate {}'.format(rundate))
+            return
 
-        # load the rundate
-        self.cx.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
+        # update the rundate if necessary
+        if self.cx.params['System Parameters']['Base_Date'] is None:
+            logging.info('Setting  rundate {}'.format(rundate))
+            self.cx.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
 
         # load the params
         price_factors = self.manager.dict(self.cx.params['Price Factors'])
@@ -127,9 +142,9 @@ class Parent(object):
         self.cx.params['Price Models'] = price_models.copy()
 
         # finish up
-        self.stop(rundate, input_path)
+        self.stop(rundate)
 
-    def stop(self, rundate, input_path):
+    def stop(self, rundate):
         # join the children to this process
         for i in range(self.NUMBER_OF_PROCESSES):
             self.workers[i].join()
@@ -140,41 +155,42 @@ class Parent(object):
         # write out the data
         logging.info('Parent: All done - saving data')
 
-        self.cx.write_marketdata_json(os.path.join(input_path, rundate, 'MarketDataCal.json'))
-        self.cx.write_market_file(os.path.join(input_path, rundate, 'MarketDataCal.dat'))
+        if self.daily:
+            self.cx.write_marketdata_json(os.path.join(self.path, self.outfile+'.json'))
+            self.cx.write_market_file(os.path.join(self.path, self.outfile+'.dat'))
+        else:
+            self.cx.write_marketdata_json(os.path.join(self.path, rundate, 'MarketDataCal.json'))
+            self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
 
 
 if __name__ == '__main__':
-    # import matplotlib
+    import argparse
 
-    # matplotlib.use('Qt4Agg')
-    # import matplotlib.pyplot as plt
-    # from adaptiv import AdaptivContext
+    parser = argparse.ArgumentParser(description='Bootstrap xVA risk neutral Calibration.')
+    parser.add_argument('num_jobs', type=int, help='number of processes to run in parallel')
+    parser.add_argument('task', type=str, help='the task name', choices=['Historical', 'Daily'])
 
-    # plt.interactive(True)
-    # make pandas pretty print
-    # pd.options.display.float_format = '{:,.5f}'.format
+    hist = parser.add_argument_group('Historical', 'options for bootstrapping past data')
+    hist.add_argument('-i', '--input_path', type=str, help='root directory containing rundates with marketdata')
+    hist.add_argument('-s', '--start', type=str, help='start rundate')
+    hist.add_argument('-e', '--end', type=str, help='end rundate')
 
-    cva_path = getpath(['E:\\Data\\crstal\\CVA',
-                        'G:\\Credit Quants\\CRSTAL\\CVA',
-                        'G:\\CVA'])
+    market = parser.add_argument_group('Daily', 'options daily calibration of a single marketdata file')
+    market.add_argument('-m', '--market_file', type=str, help='marketdata.json filename and path')
+    market.add_argument('-o', '--output_file', type=str, help='output adaptiv filename (uses the path of the '
+                                                              'market_file) - do not include the extention .dat')
 
-    cva_path_uat = getpath(['E:\\Data\\crstal\\CVA',
-                            'G:\\Credit Quants\\CRSTAL\\CVA',
-                            'G:\\CVA'], uat=True)
-
-    # cx = AdaptivContext()
-
-    for rundate in [x for x in sorted(os.listdir(cva_path)) \
-                    if '2020-01-15' < x < '2020-01-22' and os.path.isdir(os.path.join(cva_path, x))]:
-        Parent(4).start(rundate, cva_path, os.path.join(cva_path, 'calendars.cal'))
-
-        # if os.path.isfile(cva_path.format(rundate, 'MarketDataCal.json')):
-        #     cx.parse_json(cva_path.format(rundate, 'MarketDataCal.json'))
-        # else:
-        #     cx.parse_json(cva_path.format(rundate, 'MarketData.json'))
-
-        # cx.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
-        # cx.bootstrap()
-        # cx.write_marketdata_json(cva_path.format(rundate, 'MarketDataCal.json'))
-        # cx.write_market_file(cva_path.format(rundate, 'MarketDataCal.dat'))
+    # get the arguments
+    args = parser.parse_args()
+    # parse the files
+    if args.task == 'Historical':
+        for rundate in [x for x in sorted(os.listdir(args.input_path)) \
+                        if args.start < x < args.end and os.path.isdir(os.path.join(args.input_path, x))]:
+            Parent(args.num_jobs).start(rundate, args.input_path, os.path.join(args.input_path, 'calendars.cal'))
+    elif args.task == 'Daily':
+        calendar = os.path.join(
+            os.path.split(args.market_file)[0], 'Calendars.cal')
+        Parent(args.num_jobs).start(None, args.market_file, os.path.join(
+            os.path.split(args.market_file)[0], 'Calendars.cal'), outfile=args.output_file)
+    else:
+        logging.error('Invalid Job - aborting')
