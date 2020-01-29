@@ -1,6 +1,6 @@
 import os
 import utils
-import importlib
+import logging
 import numpy as np
 import pandas as pd
 
@@ -80,7 +80,7 @@ def run_cmc(context, rundate, Currency='ZAR', CVA=True, FVA=False, CollVA=False,
         'Credit_Valuation_Adjustment', default_cva)
 
     params_mc = {'calc_name': ('test1',), 'Time_grid': time_grid, 'Run_Date': rundate,
-                 'Currency': Currency, 'Simulation_Batches': 20, 'Batch_Size': 64 * 4, 'Random_Seed': 8312,
+                 'Currency': Currency, 'Simulation_Batches': 10, 'Batch_Size': 64 * 8, 'Random_Seed': 8312,
                  'Calc_Scenarios': 'No', 'Generate_Cashflows': 'No', 'Partition': 'None',
                  'Generate_Slideshow': 'No', 'PFE_Recon_File': '', 'Dynamic_Scenario_Dates': 'Yes',
                  # 'Debug': 'G:\\Credit Quants\\CRSTAL\\riskflow\\logs', 'NoModel': 'Constant',
@@ -131,6 +131,10 @@ def bootstrap(path, rundate, reuse_cal=True):
     context.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
     context.parse_calendar_file(os.path.join(path,'calendars.cal'))
 
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)-8s %(message)s',
+                        datefmt='%m-%d %H:%M')
+
     context.bootstrap()
     context.write_marketdata_json(os.path.join(path, rundate, 'MarketDataCal.json'))
     context.write_market_file(os.path.join(path, rundate, 'MarketDataCal.dat'))
@@ -151,9 +155,17 @@ if __name__ == '__main__':
                     'G:\\Credit Quants\\CRSTAL\\{}'.format(folder),
                     'G:\\{}'.format(folder)], uat=False)
 
-    rundate = '2019-12-31'
-    cx = load_market_data(rundate, path, json_name='MarketDataCal2.json')
-    # bootstrap(path, rundate, reuse_cal=True)
-    params_bv = {'calc_name': ('test1',), 'Run_Date': rundate, 'Currency': 'ZAR', 'Greeks': 'No'}
-    cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
-    # calc, out, res = run_cmc(cx, rundate)
+    rundate = '2020-01-28'
+
+    # set the visible GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    # set the log level
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+    bootstrap(path, rundate)
+    if False:
+        cx = load_market_data(rundate, path, json_name='MarketData.json')
+        # bootstrap(path, rundate, reuse_cal=True)
+        params_bv = {'calc_name': ('test1',), 'Run_Date': rundate, 'Currency': 'ZAR', 'Greeks': 'No'}
+        cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        # calc, out, res = run_cmc(cx, rundate)

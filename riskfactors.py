@@ -215,12 +215,13 @@ class Factor3D(object):
             surface = self.param['Surface'].array[self.param['Surface'].array[:, self.TENOR_INDEX] == tenor]
             for x in self.expiry:
                 exp_surface = surface[surface[:, self.EXPIRY_INDEX] == x]
+                if not exp_surface.any():
+                    expiries = np.unique(surface[:, self.EXPIRY_INDEX])
+                    nearest_expiry = expiries[expiries.searchsorted(x).clip(0, expiries.size-1)]
+                    exp_surface = surface[surface[:, self.EXPIRY_INDEX] == nearest_expiry]
                 sigma = exp_surface[:, 3]
                 mns = exp_surface[:, self.MONEYNESS_INDEX]
-                if sigma.any():
-                    vol = np.interp(self.moneyness, mns, sigma)
-                else:
-                    vol = np.ones_like(self.moneyness) * 0.0001
+                vol = np.interp(self.moneyness, mns, sigma)
                 vols.append(vol)
 
         return np.array(vols)

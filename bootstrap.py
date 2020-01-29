@@ -12,7 +12,7 @@ def getpath(pathlist, uat=False):
             return os.path.join(path, 'UAT') if uat else path
 
 
-def work(job_id, queue, errors, price_factors,
+def work(job_id, queue, result, price_factors,
          price_models, sys_params, holidays):
     # set the visible GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = str(job_id)
@@ -28,29 +28,33 @@ def work(job_id, queue, errors, price_factors,
 
     from bootstrappers import construct_bootstrapper
 
+    bootstrappers = {}
+
     # perform the bootstrapping
     while True:
         task = queue.get()
-        if task is None:
+        if task is not None:
+            bootstrapper_name, params, job_price = task
+        else:
+            queue.put(None)
             break
-        else:
-            bootstrapper_name, params, job_prices = task
-
         try:
-            bootstrapper = construct_bootstrapper(bootstrapper_name, params)
-            bootstrapper.bootstrap(sys_params, price_models, price_factors, job_prices, holidays)
+            if bootstrapper_name not in bootstrappers:
+                bootstrappers[bootstrapper_name] = construct_bootstrapper(bootstrapper_name, params)
+            bootstrapper = bootstrappers[bootstrapper_name]
+            name = list(job_price.keys())[0]
+            bootstrapper.bootstrap(sys_params, price_models, price_factors, job_price, holidays)
+
         except Exception as e:
-            error = 'Cannot execute Bootstrapper for {0} - {1}'.format(bootstrapper_name, e.args)
-            errors.put(error)
+            result.put('Cannot execute Bootstrapper for {0} - {1}'.format(name, e.args))
         else:
-            # run the bootstrapper on the market prices and store them in the price factors/price models
-            errors.put('{}: {} Ok'.format(bootstrapper_name, job_id))
+            result.put('{} - Job {} Ok'.format(name, job_id))
 
 
 class Parent(object):
     def __init__(self, num_jobs):
         self.queue = Queue()
-        self.errors = Queue()
+        self.result = Queue()
         self.manager = Manager()
         self.NUMBER_OF_PROCESSES = num_jobs
         self.path = None
@@ -103,7 +107,7 @@ class Parent(object):
 
         logging.info("starting {0} workers in {1}".format(self.NUMBER_OF_PROCESSES, input_path))
         self.workers = [Process(target=work, args=(
-            i, self.queue, self.errors, price_factors, price_models, sys_params, holidays)) for i in
+            i, self.queue, self.result, price_factors, price_models, sys_params, holidays)) for i in
                         range(self.NUMBER_OF_PROCESSES)]
 
         for w in self.workers:
@@ -114,29 +118,19 @@ class Parent(object):
             # get the market price id and any options for bootstrapping
             market_price, _, *options = params.split(',', 2)
             # get the market prices for this bootstrapper
-            market_prices = list({k: v for k, v in self.cx.params['Market Prices'].items() if
-                                  k.startswith(market_price)}.items())
+            market_prices = {k: v for k, v in self.cx.params['Market Prices'].items() if
+                             k.startswith(market_price)}
             # number of return statuses needed
             status_required = 0
-            for job_num in range(self.NUMBER_OF_PROCESSES):
-                job_prices = dict(itertools.compress(
-                    market_prices,
-                    [i % self.NUMBER_OF_PROCESSES == job_num for i in range(len(market_prices))]))
+            for market_price in market_prices.keys():
+                status_required += 1
+                self.queue.put((bootstrapper_name, options, {market_price: market_prices[market_price]}))
 
-                # only put data on the queue if there's work to do
-                if job_prices:
-                    self.queue.put((bootstrapper_name, options, job_prices))
-                    status_required += 1
-
-            # fetch and print the results
             for i in range(status_required):
-                child_status = self.errors.get()
-                logging.info('Parent: {}'.format(child_status))
+                logging.info(self.result.get())
 
-        for i in range(self.NUMBER_OF_PROCESSES):
-            # tell the children it's over
-            self.queue.put(None)
-
+        # tell the children it's over
+        self.queue.put(None)
         # store the results back in the parent context
         self.cx.params['Price Factors'] = price_factors.copy()
         self.cx.params['Price Models'] = price_models.copy()
@@ -145,19 +139,20 @@ class Parent(object):
         self.stop(rundate)
 
     def stop(self, rundate):
+        # close the queues
+        self.queue.close()
+        self.result.close()
+
         # join the children to this process
         for i in range(self.NUMBER_OF_PROCESSES):
             self.workers[i].join()
-
-        # close the queue
-        self.queue.close()
 
         # write out the data
         logging.info('Parent: All done - saving data')
 
         if self.daily:
-            self.cx.write_marketdata_json(os.path.join(self.path, self.outfile+'.json'))
-            self.cx.write_market_file(os.path.join(self.path, self.outfile+'.dat'))
+            self.cx.write_marketdata_json(os.path.join(self.path, self.outfile + '.json'))
+            self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
         else:
             self.cx.write_marketdata_json(os.path.join(self.path, rundate, 'MarketDataCal.json'))
             self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))

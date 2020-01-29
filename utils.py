@@ -690,10 +690,11 @@ def norm_cdf(x):
 
 def black_european_option_price(F, X, r, vol, tenor, buyOrSell, callOrPut):
     stddev = vol * np.sqrt(tenor)
+    sign = 1.0 if (F > 0.0 and X > 0.0) else -1.0
     d1 = (np.log(F / X) + 0.5 * stddev * stddev) / stddev
     d2 = d1 - stddev
-    return buyOrSell * callOrPut * (F * scipy.stats.norm.cdf(callOrPut * d1) -
-                                    X * scipy.stats.norm.cdf(callOrPut * d2)) * np.exp(-r * tenor)
+    return buyOrSell * callOrPut * (F * scipy.stats.norm.cdf(callOrPut * sign * d1) -
+                                    X * scipy.stats.norm.cdf(callOrPut * sign * d2)) * np.exp(-r * tenor)
 
 
 def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):

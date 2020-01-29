@@ -56,7 +56,7 @@ curve_calibration_class = namedtuple('shared_mem', 't_Buffer \
 curve_jacobian_class = namedtuple('shared_mem', 't_Buffer t_Static_Buffer \
                                 precision riskneutral simulation_batch')
 
-market_swap_class = namedtuple('market_swap', 'deal_data price weight pvbp')
+market_swap_class = namedtuple('market_swap', 'deal_data price weight')
 date_desc = {'years': 'Y', 'months': 'M', 'days': 'D'}
 # date formatter
 date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwds.items()])
@@ -162,8 +162,7 @@ def create_market_swaps(base_date, time_grid, curve_index, atm_surface, curve_fa
         all_deals[swaption_name] = market_swap_class(
             deal_data=deal_data,
             price=pvbp * utils.black_european_option_price(K, K, 0.0, vol, expiry, 1.0, 1.0),
-            weight=instrument['Weight'],
-            pvbp=np.exp(-expiry * curve_factor.current_value(expiry)))
+            weight=instrument['Weight'])
 
         # store the benchmark
         if rate is not None:
@@ -751,7 +750,7 @@ class RiskNeutralInterestRateModel(object):
 
         calibrated_swaptions = {k: v / (self.batch_size * self.num_batches) for k, v in tensor_swaptions.items()}
         error = {k: swap.weight * resid(100.0 * (
-                calibrated_swaptions[k] - swap.price)) for k, swap in market_swaps.items()}
+                calibrated_swaptions[k] - swap.price)/calibrated_swaptions[k]) for k, swap in market_swaps.items()}
 
         return implied_var, error, calibrated_swaptions, market_swaps, benchmarks
 
