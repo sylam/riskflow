@@ -82,7 +82,7 @@ def run_cmc(context, rundate, Currency='ZAR', CVA=True, FVA=False, CollVA=False,
     params_mc = {'calc_name': ('test1',), 'Time_grid': time_grid, 'Run_Date': rundate,
                  'Currency': Currency, 'Simulation_Batches': 10, 'Batch_Size': 64 * 8, 'Random_Seed': 8312,
                  'Calc_Scenarios': 'No', 'Generate_Cashflows': 'No', 'Partition': 'None',
-                 'Generate_Slideshow': 'No', 'PFE_Recon_File': '', 'Dynamic_Scenario_Dates': 'Yes',
+                 'Generate_Slideshow': 'No', 'PFE_Recon_File': '', 'Dynamic_Scenario_Dates': 'No',
                  # 'Debug': 'G:\\Credit Quants\\CRSTAL\\riskflow\\logs', 'NoModel': 'Constant',
                  'Debug': 'No',
                  # 'NoModel':'RiskNeutral',
@@ -155,17 +155,30 @@ if __name__ == '__main__':
                     'G:\\Credit Quants\\CRSTAL\\{}'.format(folder),
                     'G:\\{}'.format(folder)], uat=False)
 
-    rundate = '2020-01-28'
+    rundate = '2020-01-29'
 
     # set the visible GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = '0'
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-    bootstrap(path, rundate)
-    if False:
+
+    # bootstrap(path, rundate)
+    if True:
         cx = load_market_data(rundate, path, json_name='MarketData.json')
+        cx_new = load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
         # bootstrap(path, rundate, reuse_cal=True)
+
+        for factor in [x for x in cx_new.params['Price Factors'].keys()
+            if x.startswith('HullWhite2FactorModelParameters')]:
+            # override it
+            cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
+
         params_bv = {'calc_name': ('test1',), 'Run_Date': rundate, 'Currency': 'ZAR', 'Greeks': 'No'}
         cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        from calculation import construct_calculation
+
+        # calc = construct_calculation('Base_Revaluation', cx)
+        calc, out, res = run_cmc(cx, rundate)
+
         # calc, out, res = run_cmc(cx, rundate)

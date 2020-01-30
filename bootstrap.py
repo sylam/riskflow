@@ -1,15 +1,10 @@
 import os
+import glob
+import shutil
 import logging
-import itertools
 import pandas as pd
 
-from multiprocessing import Process, Queue, Lock, Manager
-
-
-def getpath(pathlist, uat=False):
-    for path in pathlist:
-        if os.path.isdir(path):
-            return os.path.join(path, 'UAT') if uat else path
+from multiprocessing import Process, Queue, Manager
 
 
 def work(job_id, queue, result, price_factors,
@@ -39,10 +34,10 @@ def work(job_id, queue, result, price_factors,
             queue.put(None)
             break
         try:
+            name = list(job_price.keys())[0]
             if bootstrapper_name not in bootstrappers:
                 bootstrappers[bootstrapper_name] = construct_bootstrapper(bootstrapper_name, params)
             bootstrapper = bootstrappers[bootstrapper_name]
-            name = list(job_price.keys())[0]
             bootstrapper.bootstrap(sys_params, price_models, price_factors, job_price, holidays)
 
         except Exception as e:
@@ -134,11 +129,7 @@ class Parent(object):
         # store the results back in the parent context
         self.cx.params['Price Factors'] = price_factors.copy()
         self.cx.params['Price Models'] = price_models.copy()
-
         # finish up
-        self.stop(rundate)
-
-    def stop(self, rundate):
         # close the queues
         self.queue.close()
         self.result.close()
@@ -151,11 +142,20 @@ class Parent(object):
         logging.info('Parent: All done - saving data')
 
         if self.daily:
+            # write out the calibrated data
             self.cx.write_marketdata_json(os.path.join(self.path, self.outfile + '.json'))
             self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
+            logfilename = os.path.join(self.path, self.outfile + '.log')
         else:
             self.cx.write_marketdata_json(os.path.join(self.path, rundate, 'MarketDataCal.json'))
             self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
+            logfilename = os.path.join(self.path, rundate, 'MarketDataCal.log')
+
+        # copy the logs across
+        with open(logfilename, 'wb') as wfd:
+            for f in glob.glob('bootstrap*.log'):
+                with open(f, 'rb') as fd:
+                    shutil.copyfileobj(fd, wfd)
 
 
 if __name__ == '__main__':
@@ -179,7 +179,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     # parse the files
     if args.task == 'Historical':
-        for rundate in [x for x in sorted(os.listdir(args.input_path)) \
+        for rundate in [x for x in sorted(os.listdir(args.input_path))
                         if args.start < x < args.end and os.path.isdir(os.path.join(args.input_path, x))]:
             Parent(args.num_jobs).start(rundate, args.input_path, os.path.join(args.input_path, 'calendars.cal'))
     elif args.task == 'Daily':
