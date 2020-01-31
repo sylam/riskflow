@@ -3,6 +3,13 @@ import utils
 import logging
 import numpy as np
 import pandas as pd
+import collections.abc
+
+
+def update_dict(d, u):
+    for k, v in u.items():
+        d[k] = update_dict(d.get(k, {}), v) if isinstance(v, collections.abc.Mapping) else v
+    return d
 
 
 def diag_ir(out, calc, factor, tenor_point, aa=None):
@@ -70,25 +77,44 @@ def load_market_data(rundate, path, json_name='MarketData.json', setup_funding=F
     return context
 
 
-def run_cmc(context, rundate, Currency='ZAR', CVA=True, FVA=False, CollVA=False,
-            time_grid = '0d 2d 1w(1w) 3m(1m) 2y(3m)'):
-
+def run_baseval(context, overrides=None):
     from calculation import construct_calculation
+    calc_params = context.deals['Calculation']
+
+    rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
+    params_bv = {'calc_name': ('test1',), 'Run_Date': rundate,
+                 'Currency': calc_params['Currency'], 'Greeks': 'No'}
+
+    if overrides is not None:
+        update_dict(params_bv, overrides)
+
+    calc = construct_calculation('Base_Revaluation', cx, prec=np.float64)
+    out = calc.execute(params_bv)
+    return calc, out
+
+
+def run_cmc(context, overrides=None, prec=np.float32, CVA=True, FVA=False, CollVA=False):
+    from calculation import construct_calculation
+    calc_params = context.deals['Calculation']
+
+    rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
+    time_grid = str(calc_params['Base_Time_Grid'])
 
     default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No', 'Counterparty': 'DEFAULT'}
     cva_sect = context.deals.get('Calculation', {'Credit_Valuation_Adjustment': default_cva}).get(
         'Credit_Valuation_Adjustment', default_cva)
 
     params_mc = {'calc_name': ('test1',), 'Time_grid': time_grid, 'Run_Date': rundate,
-                 'Currency': Currency, 'Simulation_Batches': 10, 'Batch_Size': 64 * 8, 'Random_Seed': 8312,
-                 'Calc_Scenarios': 'No', 'Generate_Cashflows': 'No', 'Partition': 'None',
+                 'Currency': calc_params['Currency'], 'Simulation_Batches': 10, 'Batch_Size': 64 * 8,
+                 'Random_Seed': 8312, 'Calc_Scenarios': 'No', 'Generate_Cashflows': 'No', 'Partition': 'None',
                  'Generate_Slideshow': 'No', 'PFE_Recon_File': '', 'Dynamic_Scenario_Dates': 'No',
+                 'Deflation_Interest_Rate': calc_params['Deflation_Interest_Rate'],
                  # 'Debug': 'G:\\Credit Quants\\CRSTAL\\riskflow\\logs', 'NoModel': 'Constant',
                  'Debug': 'No',
                  # 'NoModel':'RiskNeutral',
                  'CVA': {'Deflate_Stochastically': cva_sect['Deflate_Stochastically'],
                          'Stochastic_Hazard': cva_sect['Stochastic_Hazard_Rates'],
-                         'Counterparty': cva_sect['Counterparty'], 'Deflation': 'ZAR-SWAP',
+                         'Counterparty': cva_sect['Counterparty'],
                          # brave choices these . . .
                          'Gradient': 'No', 'Hessian': 'No'},
                  'FVA': {'Funding_Interest_Curve': 'USD-LIBOR-3M.FUNDING',
@@ -98,6 +124,9 @@ def run_cmc(context, rundate, Currency='ZAR', CVA=True, FVA=False, CollVA=False,
                  'CollVA': {'Gradient': 'Yes'}
                  }
 
+    if overrides is not None:
+        update_dict(params_mc, overrides)
+
     if not CVA:
         del params_mc['CVA']
     if not FVA:
@@ -105,7 +134,7 @@ def run_cmc(context, rundate, Currency='ZAR', CVA=True, FVA=False, CollVA=False,
     if not CollVA:
         del params_mc['CollVA']
 
-    calc = construct_calculation('Credit_Monte_Carlo', context)
+    calc = construct_calculation('Credit_Monte_Carlo', context, prec=prec)
     out = calc.execute(params_mc)
     exposure = out['Results']['mtm'].clip(0.0, np.inf)
     dates = np.array(sorted(calc.time_grid.mtm_dates))[
@@ -129,7 +158,7 @@ def bootstrap(path, rundate, reuse_cal=True):
         context.parse_json(os.path.join(path, rundate, 'MarketData.json'))
 
     context.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
-    context.parse_calendar_file(os.path.join(path,'calendars.cal'))
+    context.parse_calendar_file(os.path.join(path, 'calendars.cal'))
 
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-8s %(message)s',
@@ -162,23 +191,20 @@ if __name__ == '__main__':
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-
     # bootstrap(path, rundate)
-    if True:
-        cx = load_market_data(rundate, path, json_name='MarketData.json')
-        cx_new = load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
-        # bootstrap(path, rundate, reuse_cal=True)
+    cx = load_market_data(rundate, path, json_name='MarketData.json')
+    cx_new = load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
+    # bootstrap(path, rundate, reuse_cal=True)
 
-        for factor in [x for x in cx_new.params['Price Factors'].keys()
-            if x.startswith('HullWhite2FactorModelParameters')]:
-            # override it
-            cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
+    for factor in [x for x in cx_new.params['Price Factors'].keys()
+                   if x.startswith('2_HullWhite2FactorModelParameters')]:
+        # override it
+        cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
 
-        params_bv = {'calc_name': ('test1',), 'Run_Date': rundate, 'Currency': 'ZAR', 'Greeks': 'No'}
-        cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
-        from calculation import construct_calculation
+    cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
 
-        # calc = construct_calculation('Base_Revaluation', cx)
-        calc, out, res = run_cmc(cx, rundate)
+    calc, out, res = run_cmc(cx, overrides={'Calc_Scenarios': 'No',
+                                            'Simulation_Batches': 10,
+                                            'CVA': {'Gradient': 'Yes'}}, prec=np.float32)
 
-        # calc, out, res = run_cmc(cx, rundate)
+    # calc, out, res = run_cmc(cx, rundate)

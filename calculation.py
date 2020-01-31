@@ -1054,8 +1054,8 @@ class Credit_Monte_Carlo(Calculation):
                             self.tensors['fva'], self.all_var).grad
 
             if 'CVA' in params:
-                discount = get_interest_factor(utils.check_rate_name(params['CVA']['Deflation']), self.static_ofs,
-                                               self.stoch_ofs, self.all_tenors)
+                discount = get_interest_factor(utils.check_rate_name(params['Deflation_Interest_Rate']),
+                                               self.static_ofs, self.stoch_ofs, self.all_tenors)
                 survival = get_survival_factor(utils.check_rate_name(params['CVA']['Counterparty']),
                                                self.static_ofs,
                                                self.stoch_ofs, self.all_tenors)

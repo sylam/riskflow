@@ -434,21 +434,22 @@ class HullWhite2FactorImpliedInterestRateModel(object):
         c22 = tf.pad(CtT[3][1:] - CtT[3][:-1], [[1, 0]], constant_values=CtT[3][0])
 
         # make sure it's ok
-        c11_ok = c11 > 0.0
-        c22_ok = c22 > 0.0
-        c12_ok = (c12 * c12) < (c11 * c22)
+        c11_ok = tf.cast(c11 > 0.0, tf.float64)
+        c22_ok = tf.cast(c22 > 0.0, tf.float64)
+        c12_ok = tf.cast((c12 * c12) < (c11 * c22), tf.float64)
 
         # fudge factors to prevent underflow
         epsilon = tf.ones_like(c11, dtype=tf.float64) * 1e-12
         zero = tf.zeros_like(c11, dtype=tf.float64)
 
         # calc the covariance matrix
-        C11 = tf.where(c11_ok, c11, epsilon)
-        C22 = tf.where(c22_ok, c22, epsilon)
-        C12 = tf.where(c12_ok, c12, zero)
-        L = tf.stack([tf.where(c11_ok, tf.sqrt(C11), zero), zero,
-                      tf.where(c11_ok, C12 / tf.sqrt(C11), zero),
-                      tf.where(c12_ok, tf.sqrt(C22 - (C12 * C12) / C11), zero)])
+        C11 = c11_ok * c11 + (1.0 - c11_ok) * epsilon
+        C22 = c22_ok * c22 + (1.0 - c22_ok) * epsilon
+        C12 = c12_ok * c12
+
+        L = tf.stack([c11_ok * tf.sqrt(C11), zero,
+                      c11_ok * (C12 / tf.sqrt(C11)),
+                      c12_ok * tf.sqrt(C22 - (C12 * C12) / C11)])
 
         # get the correlation through time - this will break if the cholesky is not Positive definite
         self.C = tf.cast(tf.reshape(L, [2, 2, -1]), shared.precision)
@@ -464,9 +465,9 @@ class HullWhite2FactorImpliedInterestRateModel(object):
         self.F2 = tf.expand_dims(self.C[1], axis=2)
 
         # store the grid points used if necessary
-        if len(time_grid.scenario_grid)!=time_grid.time_grid_years.size:
-            self.grid_index = time_grid.scen_time_grid.searchsorted(time_grid.scenario_grid[:,utils.TIME_GRID_MTM])
-            
+        if len(time_grid.scenario_grid) != time_grid.time_grid_years.size:
+            self.grid_index = time_grid.scen_time_grid.searchsorted(time_grid.scenario_grid[:, utils.TIME_GRID_MTM])
+
         self.drift = tf.expand_dims(self.fwd_curve + 0.5 * tf.cast(AtT, shared.precision), 2)
 
         if hasattr(shared, 't_random_numbers'):
@@ -482,20 +483,20 @@ class HullWhite2FactorImpliedInterestRateModel(object):
                                                             multiply_by_time=False)
 
     def calc_points(self, rate, points, time_grid, shared, multiply_by_time=True):
-        ''' Much slower way to evaluate points at time t - but more accurate and memory efficient'''
+        """ Much slower way to evaluate points at time t - but more accurate and memory efficient"""
         t = rate[utils.FACTOR_INDEX_Daycount](points)
-        BtT = [tf.expand_dims((1.0 - tf.exp(-self.alpha[i] * t)),2) / self.alpha[i] for i in range(2)]
+        BtT = [tf.expand_dims((1.0 - tf.exp(-self.alpha[i] * t)), 2) / self.alpha[i] for i in range(2)]
         drift_at_grid = utils.gather_scenario_interp(self.drift, time_grid, shared)
         drift = utils.interpolate_curve(drift_at_grid, rate, None, points, 0)
         f1 = utils.gather_scenario_interp(self.f1, time_grid, shared)
         f2 = utils.gather_scenario_interp(self.f2, time_grid, shared)
         stoch_component = BtT[0] * f1 + BtT[1] * f2
         fwd_curve = drift + stoch_component
-        
+
         if multiply_by_time:
-            return fwd_curve 
+            return fwd_curve
         else:
-            return fwd_curve/t
+            return fwd_curve / t
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         pass

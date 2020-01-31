@@ -505,7 +505,7 @@ class Context(object):
 
                     # sort out dates and calendars
                     instrument.reset(self.holidays)
-                    
+
                     if calc_dates:
                         instrument.finalize_dates(self.parse_grid, base_date, base_MTM_dates, node_children,
                                                   node_resets, node_settlements)
@@ -519,7 +519,7 @@ class Context(object):
                 else:
                     # sort out dates and calendars
                     instrument.reset(self.holidays)
-                    
+
                     if calc_dates:
                         instrument.finalize_dates(self.parse_grid, base_date, base_MTM_dates, None, resets,
                                                   settlement_currencies)
@@ -527,6 +527,14 @@ class Context(object):
                     get_price_factors(price_factors, factor_tenors, instrument)
 
             return children, resets, settlement_currencies
+
+        def add_interest_rate(curve_name):
+            interest_rate_factor = utils.Factor(
+                'InterestRate', utils.check_rate_name(curve_name))
+
+            dependent_factors.update(get_rates(interest_rate_factor, {}))
+            for sub_factor in utils.traverse_dependents(interest_rate_factor, dependent_factors):
+                dependent_factor_tenors[sub_factor] = reset_dates
 
         # derived fields are fields that embed other risk factors
         dependant_fields = {'FxRate': [('Interest_Rate', 'InterestRate')],
@@ -603,24 +611,18 @@ class Context(object):
                 )
             # check if we need to fetch curve data for FVA
             if options.get('FVA'):
-                funding_rate_factor = utils.Factor(
-                    'InterestRate', utils.check_rate_name(options['FVA']['Funding_Interest_Curve']))
-                risk_free_rate_factor = utils.Factor(
-                    'InterestRate', utils.check_rate_name(options['FVA']['Risk_Free_Curve']))
-                
-                dependent_factors.update(get_rates(funding_rate_factor, {}))
-                for sub_factor in utils.traverse_dependents(funding_rate_factor, dependent_factors):
-                    dependent_factor_tenors[sub_factor] = reset_dates
-                
-                dependent_factors.update(get_rates(risk_free_rate_factor, {}))
-                for sub_factor in utils.traverse_dependents(risk_free_rate_factor, dependent_factors):
-                    dependent_factor_tenors[sub_factor] = reset_dates
-                
+                # add curves
+                add_interest_rate(options['FVA']['Funding_Interest_Curve'])
+                add_interest_rate(options['FVA']['Risk_Free_Curve'])
+
                 # need to weight the FVA by the survival prob of the counterparty (if defined)
                 if 'Counterparty' in options['FVA']:
                     dependent_factors.update(get_rates(
                         utils.Factor('SurvivalProb', utils.check_rate_name(options['FVA']['Counterparty'])), {})
                     )
+            # Check deflation
+            if options.get('Deflation_Interest_Rate'):
+                add_interest_rate(options['Deflation_Interest_Rate'])
 
             # update the linked factor max tenors
             missing_tenors = {}
@@ -629,14 +631,14 @@ class Context(object):
                     missing_tenors.setdefault(linked_factor, set()).update(v)
 
             # make sure the base currency is always first
-            for k,v in dependent_factors.items():
-                if k.type=='FxRate' and k!=base_factor and base_factor not in v:
+            for k, v in dependent_factors.items():
+                if k.type == 'FxRate' and k != base_factor and base_factor not in v:
                     v.append(base_factor)
-                    
+
             # now sort the factors taking any factor dependencies into account
             sorted_factors = utils.topological_sort(dependent_factors)
             # merge missing tenors
-            for k,v in missing_tenors.items():
+            for k, v in missing_tenors.items():
                 dependent_factor_tenors.setdefault(k, set()).update(v)
             # now get the last tenor for each factor
             dependent_factors = {k: max(dependent_factor_tenors.get(k, reset_dates)) for k in sorted_factors}
