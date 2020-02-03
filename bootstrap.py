@@ -54,6 +54,7 @@ class Parent(object):
         self.NUMBER_OF_PROCESSES = num_jobs
         self.path = None
         self.cx = None
+        self.ref = None
         self.daily = False
 
     def start(self, rundate, input_path, calendar, outfile='CVAMarketDataCal'):
@@ -80,6 +81,16 @@ class Parent(object):
             self.path = os.path.split(input_path)[0]
             self.outfile = outfile
             self.cx.parse_json(input_path)
+            # load up the old file if present
+            old_output_name = os.path.join(self.path, outfile + '.json')
+            if os.path.isfile(old_output_name):
+                self.ref = AdaptivContext()
+                self.ref.parse_json(old_output_name)
+                params_to_bootstrap = self.cx.params['Bootstrapper Configuration'].keys()
+                for factor in [x for x in self.ref.params['Price Factors'].keys()
+                               if x.split('.', 1)[0] in params_to_bootstrap]:
+                    # override it
+                    self.cx.params['Price Factors'][factor] = self.ref.params['Price Factors'][factor]
             rundate = pd.Timestamp.now().strftime('%Y-%m-%d')
         elif os.path.isfile(os.path.join(self.path, rundate, 'MarketDataCal.json')):
             self.cx.parse_json(os.path.join(self.path, rundate, 'MarketDataCal.json'))
@@ -170,7 +181,7 @@ if __name__ == '__main__':
     hist.add_argument('-s', '--start', type=str, help='start rundate')
     hist.add_argument('-e', '--end', type=str, help='end rundate')
 
-    market = parser.add_argument_group('Daily', 'options daily calibration of a single marketdata file')
+    market = parser.add_argument_group('Daily', 'options for calibration of a single marketdata file')
     market.add_argument('-m', '--market_file', type=str, help='marketdata.json filename and path')
     market.add_argument('-o', '--output_file', type=str, help='output adaptiv filename (uses the path of the '
                                                               'market_file) - do not include the extention .dat')
