@@ -65,9 +65,10 @@ class JOB(object):
         self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
         # default cmc parameters - note - fix this to load up all the parameters from cx.deals['Calculation']
         self.params = {'calc_name': ('cmc', 'calc1'),
-                       'Time_grid': time_grid,
-                       'Run_Date': rundate,
+                       'Time_grid': str(self.cx.deals['Calculation']['Base_Time_Grid']),
+                       'Run_Date': self.cx.deals['Calculation']['Base_Date'].strftime('%Y-%m-%d'),
                        'Currency': self.cx.deals['Calculation']['Currency'],
+                       'Deflation_Interest_Rate': self.cx.deals['Calculation']['Deflation_Interest_Rate'],
                        'Simulation_Batches': 10,
                        'Batch_Size': 512,
                        'Random_Seed': 5126,
@@ -176,16 +177,16 @@ class CVA(JOB):
         from calculation import construct_calculation
 
         filename = 'CVA_' + self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
-        self.params['CVA'] = {'Deflation': self.cx.deals['Calculation']['Deflation_Interest_Rate']}
-        # turn on dynamic scenarios (more accurate)
-        self.params['Dynamic_Scenario_Dates'] = 'Yes'
 
         # load up CVA calc params
         if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
             self.logger(self.netting_set, 'is collateralized')
+            # turn on dynamic scenarios (more accurate)
+            self.params['Dynamic_Scenario_Dates'] = 'Yes'
             self.params['Simulation_Batches'] = 20
             self.params['Batch_Size'] = 256
         else:
+            self.params['Dynamic_Scenario_Dates'] = 'No'
             self.params['Simulation_Batches'] = 10
             self.params['Batch_Size'] = 512
             self.logger(self.netting_set, 'is uncollateralized')
@@ -194,9 +195,9 @@ class CVA(JOB):
         cva_sect = self.cx.deals['Calculation']['Credit_Valuation_Adjustment']
 
         # update the params
-        self.params['CVA']['Counterparty'] = cva_sect['Counterparty']
-        self.params['CVA']['Deflate_Stochastically'] = cva_sect['Deflate_Stochastically']
-        self.params['CVA']['Stochastic_Hazard'] = cva_sect['Stochastic_Hazard_Rates']
+        self.params['CVA'] = {'Counterparty': cva_sect['Counterparty'],
+                              'Deflate_Stochastically': cva_sect['Deflate_Stochastically'],
+                              'Stochastic_Hazard': cva_sect['Stochastic_Hazard_Rates']}
 
         # work out the next business day
         next_day = self.business_day.rollforward(
@@ -727,6 +728,15 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
     # load marketdata
     cx.parse_json(os.path.join(input_path, rundate, 'MarketData.json'))
 
+    if os.path.isfile(os.path.join(input_path, rundate, 'CVAMarketData_Calibrated_New.json')):
+        cx_new = AdaptivContext()
+        cx_new.parse_json(os.path.join(input_path, rundate, 'CVAMarketData_Calibrated_New.json'))
+        log("Parent", "Overriding Calibration")
+        for factor in [x for x in cx_new.params['Price Factors'].keys()
+                       if x.startswith('HullWhite2FactorModelParameters')]:
+            # override it
+            cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
+
     # log results
     logs = {}
 
@@ -758,7 +768,7 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
     results.put(result)
 
 
-class Manager:
+class Parent:
     def __init__(self, num_jobs):
         self.queue = Queue()
         self.results = Queue()
@@ -770,20 +780,18 @@ class Manager:
         self.workers = [Process(target=work, args=(
             i, self.lock, self.queue, self.results, job, rundate, input_path, calendar, outputdir))
                         for i in range(self.NUMBER_OF_PROCESSES)]
+
+        # start all children
         for w in self.workers:
             w.start()
 
-        self.serve(rundate, input_path, wildcard)
-        self.stop(rundate, job)
-
-    def serve(self, rundate, input_path, wildcard):
         crbs = map(lambda x: os.path.split(x)[-1],
                    sorted(glob.glob(os.path.join(input_path, rundate, wildcard)), key=os.path.getsize)[::-1])
 
+        # load the crbs on the queue
         for netting_set in crbs:
             self.queue.put(netting_set)
 
-    def stop(self, rundate, job):
         self.queue.put(None)
 
         # now collate the results
@@ -791,11 +799,13 @@ class Manager:
         for i in range(self.NUMBER_OF_PROCESSES):
             post_processing.append(self.results.get())
 
-        for i in range(self.NUMBER_OF_PROCESSES):
-            self.workers[i].join()
-
         # close the queue
         self.queue.close()
+        self.results.close()
+
+        # join to this proces
+        for i in range(self.NUMBER_OF_PROCESSES):
+            self.workers[i].join()
 
         post_results = {'Stats': [], 'CSA': [], 'Merge': []}
         for output in post_processing:
@@ -829,5 +839,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # print args.rundate, args.input_path, args.calendar_file, args.output_path
-    Manager(args.num_jobs).start(args.job, args.rundate, args.input_path, args.calendar_file, args.output_path,
-                                 args.filename)
+    Parent(args.num_jobs).start(args.job, args.rundate, args.input_path, args.calendar_file, args.output_path,
+                                args.filename)

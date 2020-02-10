@@ -774,7 +774,6 @@ def update_tenors(base_date, all_factors):
 
         if factor.type in OneDimensionalFactors:
             tenor_points = risk_factor.get_tenor()
-            tenor_delta = np.diff(tenor_points)
             # linear interpolation by default
             tenor_data = tenor_diff(tenor_points)
 

@@ -120,7 +120,7 @@ def run_cmc(context, overrides=None, prec=np.float32, CVA=True, FVA=False, CollV
                  'FVA': {'Funding_Interest_Curve': 'USD-LIBOR-3M.FUNDING',
                          'Risk_Free_Curve': 'USD-OIS',
                          'Counterparty': cva_sect['Counterparty'],
-                         'Stochastic_Funding': 'Yes', },
+                         'Stochastic_Funding': 'Yes'},
                  'CollVA': {'Gradient': 'Yes'}
                  }
 
@@ -187,7 +187,7 @@ if __name__ == '__main__':
     rundate = '2020-01-29'
 
     # set the visible GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
@@ -197,7 +197,7 @@ if __name__ == '__main__':
     # bootstrap(path, rundate, reuse_cal=True)
 
     for factor in [x for x in cx_new.params['Price Factors'].keys()
-                   if x.startswith('2_HullWhite2FactorModelParameters')]:
+                   if x.startswith('HullWhite2FactorModelParameters')]:
         # override it
         cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
 
@@ -205,6 +205,6 @@ if __name__ == '__main__':
 
     calc, out, res = run_cmc(cx, overrides={'Calc_Scenarios': 'No',
                                             'Simulation_Batches': 10,
-                                            'CVA': {'Gradient': 'Yes'}}, prec=np.float32)
+                                            'CVA': {'Gradient': 'No'}}, prec=np.float32)
 
     # calc, out, res = run_cmc(cx, rundate)

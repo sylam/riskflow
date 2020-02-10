@@ -32,7 +32,7 @@ from instruments import get_fx_zero_rate_factor
 
 
 class GBMAssetPriceModel(object):
-    """The Geometric Brownian Motion Stochastic Process - defines the python interface and the low level cuda code"""
+    """The Geometric Brownian Motion Stochastic Process"""
 
     documentation = (
         'Asset Pricing', ['The spot price of an equity or FX rate can be modelled as Geometric Brownian Motion (GBM).',
@@ -107,8 +107,7 @@ class GBMAssetPriceCalibration(object):
 
 
 class GBMAssetPriceTSModelImplied(object):
-    """The Geometric Brownian Motion Stochastic Process with implied drift and vol
-    defines the python interface and the low level cuda code"""
+    """The Geometric Brownian Motion Stochastic Process with implied drift and vol"""
 
     documentation = ('Asset Pricing', [
         'GBM with constant drift and vol may not be suited to model risk-neutral asset prices. A generalization that',
@@ -192,8 +191,7 @@ class GBMAssetPriceTSModelImplied(object):
 
 
 class GBMPriceIndexModel(object):
-    """The Geometric Brownian Motion Stochastic Process for Price Indices - can contain adjustments for seasonality
-    defines the python interface and the low level cuda code"""
+    """The Geometric Brownian Motion Stochastic Process for Price Indices - can contain adjustments for seasonality"""
 
     documentation = ('Inflation',
                      ['The model is specified as follows:',
@@ -261,6 +259,8 @@ class GBMPriceIndexCalibration(object):
 
 
 class HullWhite2FactorImpliedInterestRateModel(object):
+    """Hull white 2 factor implied interest rate model for risk neutral simulation of yield curves"""
+
     documentation = (
         'Interest Rates',
         ['This is a generalization of the 1 factor Hull White model. There are 2 correlated risk ',

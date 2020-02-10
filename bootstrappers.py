@@ -750,7 +750,7 @@ class RiskNeutralInterestRateModel(object):
 
         calibrated_swaptions = {k: v / (self.batch_size * self.num_batches) for k, v in tensor_swaptions.items()}
         error = {k: swap.weight * resid(100.0 * (
-                calibrated_swaptions[k] - swap.price)/calibrated_swaptions[k]) for k, swap in market_swaps.items()}
+                swap.price/calibrated_swaptions[k] - 1.0)) for k, swap in market_swaps.items()}
 
         return implied_var, error, calibrated_swaptions, market_swaps, benchmarks
 
@@ -1039,16 +1039,14 @@ scipy.optimize.leastsq.html) are used.',
         losses = list(error.values())
         loss = tf.reduce_sum(losses)
 
-        sigma_bounds = (1e-4, 0.08)
+        sigma_bounds = (1e-4, 0.09)
         alpha_bounds = (1e-4, 2.4)
         corr_bounds = (-.92, 0.92)
 
         # slightly different bounds for the least squares calc
-        lq_sigma_bounds = (1e-5, 0.085)
+        lq_sigma_bounds = (1e-5, 0.095)
         lq_alpha_bounds = (1e-5, 2.5)
         lq_corr_bounds = (-.93, 0.93)
-
-        # standard tensorflow gradient descent based optimizer
 
         var_to_bounds = make_bounds(implied_var, sigma_bounds, corr_bounds, alpha_bounds)
         var_to_bounds_lq = make_bounds(implied_var, lq_sigma_bounds, lq_corr_bounds, lq_alpha_bounds)
@@ -1082,10 +1080,15 @@ scipy.optimize.leastsq.html) are used.',
 
         if fx_factor_name in price_factors:
             quanto_fx = price_factors[fx_factor_name]['Vol']
-            correlation_name = 'Correlation.FxRate.{}/{}'.format('.'.join(
-                sorted((base_currency,) + ir_curve.get_currency())), ir_factor_name)
+            curr_pair = sorted((base_currency,) + ir_curve.get_currency())
+            correlation_name = 'Correlation.FxRate.{}/{}'.format('.'.join(curr_pair), ir_factor_name)
+            # check if the quote is against the base currency
+            sign = 1.0
+            if curr_pair[0] == base_currency:
+                sign = -1.0
+                logging.info('Reversing Correlation as {} is quoted against the base currency'.format(correlation_name))
             # the correlation between fx and ir - needed to establish Quanto Correlation 1 and 2
-            C = price_factors.get(correlation_name, {'Value': 0.0})['Value']
+            C = sign*price_factors.get(correlation_name, {'Value': 0.0})['Value']
         else:
             C = None
             quanto_fx = None
@@ -1099,9 +1102,9 @@ scipy.optimize.leastsq.html) are used.',
                  'Alpha_2': np.clip(param['Alpha_2'], 1e-4, 2.4),
                  'Correlation': np.clip(param['Correlation'], -0.95, 0.95),
                  'Sigma_1': utils.Curve([], list(zip(
-                     vol_tenors, np.interp(vol_tenors, *param['Sigma_1'].array.T).clip(1e-4 + 5e-5, 0.08)))),
+                     vol_tenors, np.interp(vol_tenors, *param['Sigma_1'].array.T).clip(1e-4 + 5e-5, 0.09)))),
                  'Sigma_2': utils.Curve([], list(zip(
-                     vol_tenors, np.interp(vol_tenors, *param['Sigma_2'].array.T).clip(1e-4 + 5e-5, 0.08))))})
+                     vol_tenors, np.interp(vol_tenors, *param['Sigma_2'].array.T).clip(1e-4 + 5e-5, 0.09))))})
         else:
             implied_obj = riskfactors.HullWhite2FactorModelParameters(
                 {'Quanto_FX_Volatility': quanto_fx,

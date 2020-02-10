@@ -2159,9 +2159,6 @@ class FXDiscreteExplicitAsianOption(Deal):
                        'Samples': utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data']),
                        'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])}
 
-        # map the past fixings
-
-        # needed for reporting
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
