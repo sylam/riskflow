@@ -412,11 +412,14 @@ class TensorCashFlows(TensorSchedule):
         """Used to calculate the par swap rate for these cashflows given an interest rate curve"""
         Dt = ir_curve.get_day_count_accrual(base_date, self.schedule[:, CASHFLOW_INDEX_Pay_Day])
         D = np.exp(-ir_curve.current_value(Dt) * Dt) * self.schedule[:, CASHFLOW_INDEX_Year_Frac]
-        T = ir_curve.get_day_count_accrual(base_date, self.Resets.schedule[:, RESET_INDEX_End_Day])
-        t = ir_curve.get_day_count_accrual(base_date, self.Resets.schedule[:, RESET_INDEX_Start_Day])
-        a = self.Resets.schedule[:, RESET_INDEX_Accrual]
-        r = (np.exp(ir_curve.current_value(T) * T - ir_curve.current_value(t) * t) - 1.0) / a
-        return (D * r).sum() / D.sum(), D.sum()
+        if self.Resets is not None:
+            T = ir_curve.get_day_count_accrual(base_date, self.Resets.schedule[:, RESET_INDEX_End_Day])
+            t = ir_curve.get_day_count_accrual(base_date, self.Resets.schedule[:, RESET_INDEX_Start_Day])
+            a = self.Resets.schedule[:, RESET_INDEX_Accrual]
+            r = (np.exp(ir_curve.current_value(T) * T - ir_curve.current_value(t) * t) - 1.0) / a
+            return (D * r).sum() / D.sum(), D.sum()
+        else:
+            return D.sum()
 
     def insert_cashflow(self, cashflow):
         """Inserts a cashflow at the beginning of the cashflow schedule - useful to model a fixed payment at the

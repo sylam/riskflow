@@ -61,6 +61,9 @@ date_desc = {'years': 'Y', 'months': 'M', 'days': 'D'}
 # date formatter
 date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwds.items()])
 
+# HARDCODED Currency list for shifted lognormal
+shifted_lognormal = {'CHF': 2.0, 'JPY': 1.0, 'EUR': 3.0}
+
 
 def create_float_cashflows(base_date, cashflow_obj, frequency):
     cashflows = []
@@ -136,16 +139,34 @@ def create_market_swaps(base_date, time_grid, curve_index, atm_surface, curve_fa
         float_pay_dates = instruments.generate_dates_backward(
             maturity, effective, instrument['Floating_Frequency'])
 
-        if instrument['Fixed_Frequency'] != instrument['Floating_Frequency']:
-            raise Exception('Fixed_Frequency not equal to Floating_Frequency - Not supported')
-
         float_cash = utils.generate_float_cashflows(
             base_date, time_grid, float_pay_dates, 1.0, None, None,
             instrument['Floating_Frequency'], pd.DateOffset(month=0),
             utils.get_day_count(instrument['Day_Count']), 0.0)
 
         K, pvbp = float_cash.get_par_swap_rate(base_date, curve_factor)
-        float_cash.set_fixed_amount(-K)
+
+        if instrument['Fixed_Frequency'] != instrument['Floating_Frequency']:
+            fixed_pay_dates = instruments.generate_dates_backward(
+                maturity, effective, instrument['Fixed_Frequency'])
+            fixed_cash = utils.generate_fixed_cashflows(
+                base_date, fixed_pay_dates, 1.0, None, utils.get_day_count(instrument['Day_Count']), 0.0)
+            pv_float = K * pvbp
+            pvbp = fixed_cash.get_par_swap_rate(base_date, curve_factor)
+            K = pv_float / pvbp
+            fixed_cash.set_fixed_amount(K)
+            fixed_indices = float_cash[:, utils.CASHFLOW_INDEX_Pay_Day].searchsorted(
+                fixed_cash[:, utils.CASHFLOW_INDEX_Pay_Day])
+
+            if not (float_cash[fixed_indices, utils.CASHFLOW_INDEX_Pay_Day] ==
+                    fixed_cash[:, utils.CASHFLOW_INDEX_Pay_Day]).all():
+                raise Exception('Float leg and Fixed legs do not coincide')
+
+            # set the float leg fixed amount
+            float_cash.schedule[fixed_indices, utils.CASHFLOW_INDEX_FixedAmt] =\
+                -fixed_cash[:, utils.CASHFLOW_INDEX_FixedAmt]
+        else:
+            float_cash.set_fixed_amount(-K)
 
         # get the atm vol
         if instrument['Market_Volatility'].amount:
@@ -158,10 +179,13 @@ def create_market_swaps(base_date, time_grid, curve_index, atm_surface, curve_fa
                                          'Discount': curve_index, 'CompoundingMethod': 'None'},
             Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, time_index), Calc_res=None)
 
+        # HARDCODING !!!! - PLEASE FIX - TODO!!!
+        shift_parameter = shifted_lognormal.get(curve_factor.get_currency()[0], 0.0) / 100.0
+        shifted_strike = K + shift_parameter
         # store this
         all_deals[swaption_name] = market_swap_class(
             deal_data=deal_data,
-            price=pvbp * utils.black_european_option_price(K, K, 0.0, vol, expiry, 1.0, 1.0),
+            price=pvbp * utils.black_european_option_price(shifted_strike, shifted_strike, 0.0, vol, expiry, 1.0, 1.0),
             weight=instrument['Weight'])
 
         # store the benchmark
@@ -750,7 +774,7 @@ class RiskNeutralInterestRateModel(object):
 
         calibrated_swaptions = {k: v / (self.batch_size * self.num_batches) for k, v in tensor_swaptions.items()}
         error = {k: swap.weight * resid(100.0 * (
-                swap.price/calibrated_swaptions[k] - 1.0)) for k, swap in market_swaps.items()}
+                swap.price / calibrated_swaptions[k] - 1.0)) for k, swap in market_swaps.items()}
 
         return implied_var, error, calibrated_swaptions, market_swaps, benchmarks
 
@@ -833,7 +857,7 @@ class RiskNeutralInterestRateModel(object):
                     # minimize
                     soln = None
                     num_optimizers = len(optimizers)
-                    for op_loop in range(2*num_optimizers):
+                    for op_loop in range(2 * num_optimizers):
                         optimizers[op_loop % num_optimizers].minimize(sess)
                         batch_loss, vars = sess.run([loss, implied_var])
 
@@ -1088,7 +1112,7 @@ scipy.optimize.leastsq.html) are used.',
                 sign = -1.0
                 logging.info('Reversing Correlation as {} is quoted against the base currency'.format(correlation_name))
             # the correlation between fx and ir - needed to establish Quanto Correlation 1 and 2
-            C = sign*price_factors.get(correlation_name, {'Value': 0.0})['Value']
+            C = sign * price_factors.get(correlation_name, {'Value': 0.0})['Value']
         else:
             C = None
             quanto_fx = None
