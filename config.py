@@ -191,7 +191,7 @@ class Context(object):
     def __init__(self, base_currency='USD'):
         self.deals = {'Deals': {'Children': []}}
         self.calibrations = {'CalibrationConfig': {'MarketDataArchiveFile': {}, 'Calibrations': []}}
-        self.calendars = ElementTree(Element('', tag='Calendars'))
+        self.calendars = ElementTree(Element('Calendars'))
         self.holidays = {}
         self.archive = None
         self.archive_columns = {}
@@ -223,7 +223,8 @@ class Context(object):
         Dates are capped at max_date (but may include the next date after if past_max_date is True)
         """
 
-        offsets = self.gridparser.parseString(grid)[0].data
+        parsed_grid = self.gridparser.parseString(grid)[0]
+        offsets = parsed_grid.data if isinstance(parsed_grid, utils.Offsets) else [[parsed_grid]]
         fixed_dates = [(run_date + code[0], code[1] if len(code) > 1 else None) for code in offsets] + \
                       [(Timestamp.max, None)]
         dates = set()

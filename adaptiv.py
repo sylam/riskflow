@@ -402,7 +402,7 @@ class AdaptivContext(Context):
             return toks[0], entry
 
         def pushParam(strg, loc, toks):
-            entry = OrderedDict({'Valuation', toks[1]})
+            entry = OrderedDict([('Valuation',toks[1])])
             for k, v in toks[2:]:
                 entry[k] = v
             return toks[0], entry

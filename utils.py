@@ -25,7 +25,6 @@ import scipy.stats
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-import scipy.integrate
 
 # For dealing with excel dates and dataframes
 excel_offset = pd.Timestamp('1899-12-30 00:00:00')
@@ -674,17 +673,6 @@ def hermite_interpolation(tenors, rates):
     gi = calc_gi(tenors, rates, ri)
     ci = calc_ci(tenors, rates, ri)
     return gi, ci
-
-
-def cumulative_integration(f, grid):
-    # Simple function to return cumulative integrals of the form Int(f, 0, grid) where grid is a vector
-    lv = []
-    last, lastG = 0, 0
-    for g in grid:
-        lval, x = scipy.integrate.quad(f, lastG, g)
-        last, lastG = last + lval, g
-        lv.append(last)
-    return np.array(lv)
 
 
 def norm_cdf(x):

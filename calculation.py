@@ -216,7 +216,8 @@ class TimeGrid(object):
         # scenario_grid as setting a non-null delta is a way to generate scenarios without calculating the
         # whole risk factor
         if delta is not None:
-            delta_grid = np.arange(0, self.scen_time_grid.max(), delta)
+            delta_days, delta_tenors = delta
+            delta_grid = np.union1d(np.arange(0, self.scen_time_grid.max(), delta_days), delta_tenors)
             self.scen_time_grid = np.union1d(self.scen_time_grid, delta_grid)
 
         self.time_grid_years = self.scen_time_grid / utils.DAYS_IN_YEAR

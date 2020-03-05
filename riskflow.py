@@ -152,8 +152,8 @@ def bootstrap(path, rundate, reuse_cal=True):
 
     context = AdaptivContext()
 
-    if reuse_cal and os.path.isfile(os.path.join(path, rundate, 'MarketDataCal.json')):
-        context.parse_json(os.path.join(path, rundate, 'MarketDataCal.json'))
+    if reuse_cal and os.path.isfile(os.path.join(path, rundate, 'CVAMarketData.json')):
+        context.parse_json(os.path.join(path, rundate, 'CVAMarketData.json'))
     else:
         context.parse_json(os.path.join(path, rundate, 'MarketData.json'))
 
@@ -172,7 +172,7 @@ def bootstrap(path, rundate, reuse_cal=True):
 if __name__ == '__main__':
     import matplotlib
 
-    matplotlib.use('Qt4Agg')
+    # matplotlib.use('Qt4Agg')
     import matplotlib.pyplot as plt
 
     plt.interactive(True)
@@ -184,27 +184,35 @@ if __name__ == '__main__':
                     'G:\\Credit Quants\\CRSTAL\\{}'.format(folder),
                     'G:\\{}'.format(folder)], uat=False)
 
-    rundate = '2020-01-29'
+    rundate = '2020-02-28'
 
     # set the visible GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-    # bootstrap(path, rundate)
-    cx = load_market_data(rundate, path, json_name='MarketData.json')
-    cx_new = load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
-    # bootstrap(path, rundate, reuse_cal=True)
+    bootstrap(path, rundate, reuse_cal=True)
 
-    for factor in [x for x in cx_new.params['Price Factors'].keys()
-                   if x.startswith('HullWhite2FactorModelParameters')]:
-        # override it
-        cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
+    if 0:
+        cx = load_market_data(rundate, path, json_name='MarketData.json')
+        cx_new = load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
 
-    cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        for factor in [x for x in cx_new.params['Price Factors'].keys()
+                       if x.startswith('HullWhite2FactorModelParameters')]:
+            # override it
+            cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
 
-    calc, out, res = run_cmc(cx, overrides={'Calc_Scenarios': 'No',
-                                            'Simulation_Batches': 10,
-                                            'CVA': {'Gradient': 'No'}}, prec=np.float32)
+        cx.parse_json(os.path.join(path, rundate, 'CrB_Afgri_Operations__Pty__Limited_ISDA.json'))
 
-    # calc, out, res = run_cmc(cx, rundate)
+        if 1:
+            calc, out, res = run_cmc(cx, overrides={'Calc_Scenarios': 'No',
+                                                    'Dynamic_Scenario_Dates': 'No',
+                                                    'Run_Date':'2020-03-02',
+                                                    # 'Time_grid':'1m 5m 1362d',
+                                                    'Batch_Size': 64*4,
+                                                    'Simulation_Batches': 20,
+                                                    'CVA': {'Gradient': 'No'}}, prec=np.float32)
+
+            # calc, out, res = run_cmc(cx, rundate)
+        else:
+            calc, out = run_baseval(cx)

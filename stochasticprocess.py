@@ -31,6 +31,78 @@ import tensorflow as tf
 from instruments import get_fx_zero_rate_factor
 
 
+def piecewise_linear(t, tenor, values, shared):
+    if isinstance(values, np.ndarray):
+        # no tensorflow needed - don't even bother caching
+        dt = np.diff(t)
+        interp = np.interp(t, tenor, values)
+        return dt, interp[:-1], np.diff(interp) / dt
+    else:
+        key_code = ('piecewise_linear', values.name, tuple(t))
+
+    if key_code not in shared.t_Buffer:
+        # linear interpolation of the vols at vol_tenor to the grid t
+        dt = np.diff(t)
+        interp = utils.interpolate_tensor(t, tenor, values)
+        grad = (interp[1:] - interp[:-1]) / dt
+        shared.t_Buffer[key_code] = (dt, interp[:-1], grad)
+
+    # interpolated vol
+    return shared.t_Buffer[key_code]
+
+
+def integrate_piecewise_linear(fn_norm, shared, time_grid, tenor1, val1, tenor2=None, val2=None):
+    t = np.union1d(0.0, time_grid)
+    np_only = isinstance(val1, np.ndarray)
+    max_time = time_grid.max()
+    fn, norm = fn_norm
+    integration_points = np.union1d(t, tenor1[:tenor1.searchsorted(max_time)])
+
+    if val2 is not None:
+        integration_points = np.union1d(integration_points, tenor2[:tenor2.searchsorted(max_time)])
+        _, interp_val1, m1 = piecewise_linear(integration_points, tenor1, val1, shared)
+        dt, interp_val2, m2 = piecewise_linear(integration_points, tenor2, val2, shared)
+        np_only = np_only and isinstance(val2, np.ndarray)
+        int_fn = fn(integration_points[:-1], interp_val1, interp_val2, dt, m1, m2)
+    else:
+        dt, interp_val, m = piecewise_linear(integration_points, tenor1, val1, shared)
+        int_fn = fn(integration_points[:-1], interp_val, dt, m)
+
+    if np_only:
+        integral = np.pad(np.cumsum(int_fn) / norm, [1, 0], 'constant')
+        return integral[integration_points.searchsorted(time_grid)]
+    else:
+        integral = tf.pad(tf.cumsum(int_fn) / norm, [[1, 0]])
+        if (integration_points.size == time_grid.size) and (integration_points == time_grid).all():
+            return integral
+        else:
+            # warning - this comes at a cost - it's better to avoid gathers
+            return tf.gather(integral, integration_points.searchsorted(time_grid))
+
+
+# Hull white analytic integrals for 1 and 2 factor models (assuming piecewise linear vols)
+
+def hw_calc_H(a, exp):
+    # sympy.simplify(sympy.integrate(sympy.exp(a * s) * (v + m * (s - t)), (s, t, t + dt)))
+    # leave the division till later and simplify
+    def H(t, v, dt, m):
+        return (-a * v + m) * exp(a * t) + (a * m * dt + a * v - m) * exp(a * (dt + t))
+
+    return H, a * a
+
+
+def hw_calc_IJK(a, exp):
+    # sympy.simplify(sympy.integrate(sympy.exp(a*s)*(vi+mi*(s-t))*(vj+mj*(s-t)), (s,t,t+dt)))
+    # leave the division till later and simplify
+    def IJK(t, vi, vj, dt, mi, mj):
+        a2, dt2, mi_mj, mj_vi_p_mi_vj, vi_vj = a * a, dt * dt, mi * mj, mj * vi + mi * vj, vi * vj
+
+        return ((a2 * (dt2 * mi_mj + dt * mj_vi_p_mi_vj + vi_vj) + 2 * mi_mj * (1 - a * dt) - a * mj_vi_p_mi_vj)
+                * exp(a * dt) - a2 * vi_vj + a * mj_vi_p_mi_vj - 2 * mi_mj) * exp(a * t)
+
+    return IJK, a ** 3
+
+
 class GBMAssetPriceModel(object):
     """The Geometric Brownian Motion Stochastic Process"""
 
@@ -151,8 +223,11 @@ class GBMAssetPriceTSModelImplied(object):
         return 1
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        def calc_vol(t, v, dt, m):
+            return dt * (dt ** 2 * m ** 2 / 3 + dt * m * v + v ** 2)
+
         vols = self.implied.param['Vol'].array
-        self.V = utils.cumulative_integration(lambda s: np.interp(s, *vols.T) ** 2, time_grid.time_grid_years)
+        self.V = integrate_piecewise_linear((calc_vol, 1.0), shared, time_grid.time_grid_years, vols[:, 0], vols[:, 1])
         # calc the incremental vol
         delta_V = np.insert(np.diff(self.V), 0, 0).reshape(-1, 1).astype(shared.precision)
         self.delta_scen_t = np.insert(
@@ -312,69 +387,6 @@ class HullWhite2FactorImpliedInterestRateModel(object):
         return 2
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-
-        def interpolate_vol(t, vols, vols_tenor):
-
-            if isinstance(vols, np.ndarray):
-                # no tensorflow needed - don't even bother caching
-                dt = np.diff(t)
-                interp = np.interp(t, vols_tenor, vols)
-                return dt, interp[:-1], np.diff(interp) / dt
-            else:
-                key_code = ('Hull_White', vols.name, tuple(t))
-
-            if key_code not in shared.t_Buffer:
-                # linear interpolation of the vols at vol_tenor to the grid t
-                dt = np.diff(t)
-                interp = utils.interpolate_tensor(t, vols_tenor, vols)
-                grad = (interp[1:] - interp[:-1]) / dt
-                shared.t_Buffer[key_code] = (dt, interp[:-1], grad)
-
-            # interpolated vol
-            return shared.t_Buffer[key_code]
-
-        def calc_H(time_grid, a, vols, vols_tenor):
-            # obtained via sympy.simplify(sympy.integrate(sympy.exp(a*s)*(v+m*(s-t)), (s,t,t+dt)))
-            # and leaving out the division by a**2 until later
-
-            H = lambda a, t, v, dt, m: ((-a * v + m) * tf.exp(a * t) +
-                                        (-a * m * t + a * m * (dt + t) + a * v - m) * tf.exp(a * (dt + t)))
-
-            t = np.union1d(0.0, time_grid)
-
-            # interpolated vol
-            dt, interp_vol, m = interpolate_vol(t, vols, vols_tenor)
-            integral = tf.cumsum(H(a, t[:-1], interp_vol, dt, m)) / a ** 2
-
-            if 0.0 in time_grid:
-                return tf.pad(integral, [[1, 0]])
-            else:
-                return integral
-
-        def calc_IJK(time_grid, a, volsi, volsj, volsi_tenor, volsj_tenor):
-
-            def IJK(a, t, vi, vj, dt, mi, mj):
-                # sympy.simplify(sympy.integrate(sympy.exp(a*s)*(vi+mi*(s-t))*(vj+mj*(s-t)), (s,t,t+dt)))
-                # and leaving the division by a**3 until later (and rearranging terms)
-
-                a2, dt2, mi_mj, mj_vi, mi_vj, vi_vj = a * a, dt * dt, mi * mj, mj * vi, mi * vj, vi * vj
-
-                return ((a2 * (
-                        dt2 * mi_mj + dt * mi_vj + dt * mj_vi + vi_vj) - 2 * a * dt * mi_mj + 2 * mi_mj - a * mi_vj
-                         - a * mj_vi) * tf.exp(a * dt) - a2 * vi_vj + a * mi_vj + a * mj_vi - 2 * mi_mj) * tf.exp(a * t)
-
-            t = np.union1d(0.0, time_grid)
-
-            dt, interp_volsi, mi = interpolate_vol(t, volsi, volsi_tenor)
-            dt, interp_volsj, mj = interpolate_vol(t, volsj, volsj_tenor)
-
-            integral = tf.cumsum(IJK(a, t[:-1], interp_volsi, interp_volsj, dt, mi, mj)) / a ** 3
-
-            if 0.0 in time_grid:
-                return tf.pad(integral, [[1, 0]])
-            else:
-                return integral
-
         # get the factor's tenor points
         factor_tenor = self.factor.get_tenor()
 
@@ -400,13 +412,16 @@ class HullWhite2FactorImpliedInterestRateModel(object):
             quantofx = np.zeros((1, 2))
             quantofxcorr = [0.0, 0.0]
 
-        H = [calc_H(time_grid.time_grid_years, alpha[i], vols[i], vols_tenor[i]) for i in range(2)]
-        I = [[calc_IJK(time_grid.time_grid_years, alpha[i], vols[i], vols[j], vols_tenor[i], vols_tenor[j])
+        H = [integrate_piecewise_linear(hw_calc_H(alpha[i], tf.exp), shared, time_grid.time_grid_years,
+                                        vols_tenor[i], vols[i]) for i in range(2)]
+        I = [[integrate_piecewise_linear(hw_calc_IJK(alpha[i], tf.exp), shared, time_grid.time_grid_years,
+                                         vols_tenor[i], vols[i], vols_tenor[j], vols[j])
               for j in range(2)] for i in range(2)]
-        J = [[calc_IJK(time_grid.time_grid_years, alpha[i] + alpha[j], vols[i], vols[j], vols_tenor[i], vols_tenor[j])
+        J = [[integrate_piecewise_linear(hw_calc_IJK(alpha[i] + alpha[j], tf.exp), shared, time_grid.time_grid_years,
+                                         vols_tenor[i], vols[i], vols_tenor[j], vols[j])
               for j in range(2)] for i in range(2)]
-        K = [calc_IJK(time_grid.time_grid_years, alpha[i], vols[i], quantofx[:, 1], vols_tenor[i], quantofx[:, 0])
-             for i in range(2)]
+        K = [integrate_piecewise_linear(hw_calc_IJK(alpha[i], tf.exp), shared, time_grid.time_grid_years,
+                                        vols_tenor[i], vols[i], quantofx[:, 0], quantofx[:, 1]) for i in range(2)]
 
         # now calculate the At
         AtT = tf.zeros([time_grid.time_grid_years.size, factor_tenor.size], tf.float64)
@@ -597,25 +612,14 @@ class HullWhite1FactorInterestRateModel(object):
         vols = self.param['Sigma'].array
 
         # calculate known functions
-        if len(vols) == 1:
-            const_vol = vols[0][1]
-            tmp = (1.0 / alpha) * (np.exp(alpha * time_grid.time_grid_years) - 1.0)
-            self.H = const_vol * tmp
-            self.I = const_vol * const_vol * tmp
-            self.J = const_vol * const_vol * (1.0 / (2.0 * alpha)) * (
-                    np.exp(2.0 * alpha * time_grid.time_grid_years) - 1.0)
-            self.K = const_vol * utils.cumulative_integration(lambda s: np.exp(alpha * s) * np.interp(s, *quantofx.T),
-                                                              time_grid.time_grid_years)
-        else:
-            self.H = utils.cumulative_integration(lambda s: np.exp(alpha * s) * np.interp(s, *vols.T),
-                                                  time_grid.time_grid_years)
-            self.I = utils.cumulative_integration(lambda s: np.exp(alpha * s) * (np.interp(s, *vols.T) ** 2),
-                                                  time_grid.time_grid_years)
-            self.J = utils.cumulative_integration(lambda s: np.exp(2.0 * alpha * s) * (np.interp(s, *vols.T) ** 2),
-                                                  time_grid.time_grid_years)
-            self.K = utils.cumulative_integration(
-                lambda s: np.exp(alpha * s) * np.interp(s, *vols.T) * np.interp(s, *quantofx.T),
-                time_grid.time_grid_years)
+        self.H = integrate_piecewise_linear(hw_calc_H(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0],
+                                            vols[:, 1])
+        self.I = integrate_piecewise_linear(hw_calc_IJK(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0],
+                                            vols[:, 1], vols[:, 0], vols[:, 1])
+        self.J = integrate_piecewise_linear(hw_calc_IJK(2.0 * alpha, np.exp), shared, time_grid.time_grid_years,
+                                            vols[:, 0], vols[:, 1], vols[:, 0], vols[:, 1])
+        self.K = integrate_piecewise_linear(hw_calc_IJK(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0],
+                                            vols[:, 1], quantofx[:, 0], quantofx[:, 1])
 
         # Now precalculate the A and B matrices
         BtT = (1.0 - np.exp(-alpha * factor_tenor)) / alpha
@@ -628,9 +632,6 @@ class HullWhite1FactorInterestRateModel(object):
         delta_HtT = np.hstack(
             (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.H)))
         delta_var = np.diff(np.exp(-2.0 * alpha * time_grid.time_grid_years) * self.J)
-
-        # now force any negative/zero vars to be the smallest +ve one - this is a hack - should just fix the integrals
-        delta_var[delta_var <= 0.0] = delta_var[delta_var > 0].min()
         delta_vol = np.sqrt(np.hstack((0.0, delta_var)))
 
         self.AtT = AtT.astype(shared.precision)

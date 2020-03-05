@@ -814,13 +814,15 @@ class RiskNeutralInterestRateModel(object):
                 mtm_dates = set(
                     [base_date + x['Start'] for x in implied_params['instrument']['Instrument_Definitions']])
 
+                # grab the implied process
+                implied_obj, process, vol_tenors = self.implied_process(
+                    base_currency, price_factors, price_models, ir_curve, rate)
+
+                # setup the time grid
                 time_grid = TimeGrid(mtm_dates, mtm_dates, mtm_dates)
                 # add a delta of 10 days to the time_grid_years (without changing the scenario grid
                 # this is needed for stochastically deflating the exposure later on
-                time_grid.set_base_date(base_date, delta=10)
-
-                # grab the implied process
-                implied_obj, process = self.implied_process(base_currency, price_factors, price_models, ir_curve, rate)
+                time_grid.set_base_date(base_date, delta=(10, vol_tenors*utils.DAYS_IN_YEAR))
 
                 # setup the tensorflow calc
                 graph = tf.Graph()
@@ -934,7 +936,7 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
         process = stochasticprocess.construct_process(
             price_model.type, ir_curve, price_models[utils.check_tuple_name(price_model)], implied_obj)
 
-        return implied_obj, process
+        return implied_obj, process, vol_tenors
 
     def save_params(self, vars, price_factors, implied_obj, rate):
         # construct an initial guess - need to read from params
@@ -1141,7 +1143,7 @@ scipy.optimize.leastsq.html) are used.',
         process = stochasticprocess.HullWhite2FactorImpliedInterestRateModel(
             ir_curve, {'Lambda_1': 0.0, 'Lambda_2': 0.0}, implied_obj)
 
-        return implied_obj, process
+        return implied_obj, process, vol_tenors
 
     def save_params(self, vars, price_factors, implied_obj, rate):
         param_name = utils.check_tuple_name(
