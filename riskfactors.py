@@ -764,11 +764,34 @@ class EquityPriceVol(Factor2D):
 class InterestYieldVol(Factor3D):
     field_desc = ('Interest Rates',
                   ['- **Surface**: *Curve* object consisting of (moneyness, expiry, tenor, volatility) quads. Flat',
-                   'extrapolated and linearly interpolated. All Floats.'
+                   'extrapolated and linearly interpolated. All Floats.',
+                   '- **Property_Aliases**: list of key value pairs specifying additional options e.g. Specification',
+                   'of a shifted black scholes value via BlackScholesDisplacedShiftValue'
                    ])
 
     def __init__(self, param):
         super(InterestYieldVol, self).__init__(param)
+        self.atm_surface = None
+
+    @property
+    def BlackScholesDisplacedShiftValue(self):
+        shift_value = 0.0
+        Property_Aliases = self.param.get('Property_Aliases')
+        if Property_Aliases is not None:
+            for property_alias in Property_Aliases:
+                if 'BlackScholesDisplacedShiftValue' in property_alias:
+                    return property_alias['BlackScholesDisplacedShiftValue']
+        return shift_value
+
+    @property
+    def ATM(self):
+        if self.atm_surface is None:
+            mn_ix = np.searchsorted(self.moneyness, 0.0)
+            atm_vol = np.array([np.interp(1.0, self.moneyness[mn_ix - 1:mn_ix + 1], y)
+                                for y in self.get_vols()[:, mn_ix - 1:mn_ix + 1]])
+            self.atm_surface = RectBivariateSpline(
+                self.tenor, self.expiry, atm_vol.reshape(self.tenor.size, self.expiry.size))
+        return self.atm_surface
 
 
 class InterestRateVol(Factor3D):

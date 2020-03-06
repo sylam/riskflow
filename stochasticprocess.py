@@ -73,7 +73,7 @@ def integrate_piecewise_linear(fn_norm, shared, time_grid, tenor1, val1, tenor2=
         return integral[integration_points.searchsorted(time_grid)]
     else:
         integral = tf.pad(tf.cumsum(int_fn) / norm, [[1, 0]])
-        if (integration_points.size == time_grid.size) and (integration_points == time_grid).all():
+        if integration_points.size == time_grid.size:
             return integral
         else:
             # warning - this comes at a cost - it's better to avoid gathers

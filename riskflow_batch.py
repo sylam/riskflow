@@ -159,9 +159,9 @@ class PFE(JOB):
             self.logger(self.netting_set, 'Error: could not find Adaptiv Output')
 
 
-class CVA(JOB):
+class CVA_GRAD(JOB):
     def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
-        super(CVA, self).__init__(cx, rundate, input_path, outputdir, netting_set, stats, log)
+        super(CVA_GRAD, self).__init__(cx, rundate, input_path, outputdir, netting_set, stats, log)
         # load up a calendar (for theta)
         self.business_day = cx.holidays['Johannesburg']['businessday']
         # set the OIS cashflow flag to speed up prime linked swaps
@@ -202,8 +202,8 @@ class CVA(JOB):
         # work out the next business day
         next_day = self.business_day.rollforward(
             pd.Timestamp(self.params['Run_Date']) + pd.offsets.Day(1)).strftime('%Y-%m-%d')
-
-        if os.path.isfile(self.outputdir + os.sep + filename):
+        
+        if os.path.isfile( os.path.join(self.outputdir, 'Greeks', filename) ):
             self.logger(self.netting_set, 'Warning: skipping CVA gradient calc as file already exists')
             self.params['CVA']['Gradient'] = 'No'
             out = calc.execute(self.params)
@@ -243,8 +243,8 @@ class CVA(JOB):
                         columns={'Gradient': self.cx.deals['Attributes']['Reference']})
                     # store the CVA as part of the stats
                     out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
-                    # write the grad
-                    grad_cva.to_csv(self.outputdir + os.sep + filename)
+                    # write the grad                    
+                    grad_cva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
                     # now calc theta
                     self.params.update({'Run_Date': next_day, 'Gradient': 'No'})
                     calc = construct_calculation('Credit_Monte_Carlo', self.cx)
@@ -252,6 +252,70 @@ class CVA(JOB):
                     out['Stats'].update({'CVA_Theta': theta['Results']['cva']})
                     # store it
                     self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
+
+
+class CVA(JOB):
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
+        super(CVA, self).__init__(cx, rundate, input_path, outputdir, netting_set, stats, log)
+        # load up a calendar (for theta)
+        self.business_day = cx.holidays['Johannesburg']['businessday']
+        # set the OIS cashflow flag to speed up prime linked swaps
+        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
+
+    def valid(self):
+        if not self.cx.deals['Deals']['Children'][0]['Children']:
+            return False
+        else:
+            return True
+
+    def run_calc(self, calc):
+        from calculation import construct_calculation
+
+        # load up CVA calc params
+        if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
+            self.logger(self.netting_set, 'is collateralized')
+            # turn on dynamic scenarios (more accurate)
+            self.params['Dynamic_Scenario_Dates'] = 'Yes'
+            self.params['Simulation_Batches'] = 20
+            self.params['Batch_Size'] = 256
+        else:
+            self.params['Dynamic_Scenario_Dates'] = 'No'
+            self.params['Simulation_Batches'] = 10
+            self.params['Batch_Size'] = 512
+            self.logger(self.netting_set, 'is uncollateralized')
+
+        # get the calculation parameters for CVA
+        cva_sect = self.cx.deals['Calculation']['Credit_Valuation_Adjustment']
+
+        # update the params
+        self.params['CVA'] = {'Counterparty': cva_sect['Counterparty'],
+                              'Deflate_Stochastically': cva_sect['Deflate_Stochastically'],
+                              'Stochastic_Hazard': cva_sect['Stochastic_Hazard_Rates'],
+                              'Gradient': 'No'}
+        att = 0
+        while att <= 3:
+            try:
+                out = calc.execute(self.params)
+                att = 10
+            except Exception as e:
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                traceback.print_exception(exc_type, exc_value, exc_traceback,
+                                          limit=2, file=sys.stdout)
+                att += 1
+                self.params['Simulation_Batches'] *= 2
+                self.params['Batch_Size'] //= 2
+                self.logger(self.netting_set, 'Exception: ' + str(e.args))
+                self.logger(self.netting_set, 'Halving memory to {0} and Doubling Batches to {1}'.format(
+                    self.params['Batch_Size'], self.params['Simulation_Batches']))
+
+                # create a new calculation
+                calc = construct_calculation('Credit_Monte_Carlo', self.cx)
+            else:
+                stats = out['Stats']
+                # store the CVA as part of the stats
+                out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
+                # store it
+                self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
 
 
 class COLLVA(JOB):
@@ -321,7 +385,7 @@ class COLLVA(JOB):
     def run_calc(self, calc):
         filename = 'COLLVA_' + self.params['Run_Date'] + '_' + self.crb_default + '.csv'
 
-        if os.path.isfile(self.outputdir + os.sep + filename):
+        if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping COLLVA calc as file already exists')
         else:
             self.params['CollVA'] = {'Gradient': 'Yes'}
@@ -345,7 +409,7 @@ class COLLVA(JOB):
                     columns={'Gradient': self.cx.deals['Attributes']['Reference']})
                 # store the CollVA as part of the stats
                 out['Stats'].update({'CollVA': out['Results']['collva'], 'Currency': self.params['Currency']})
-                grad_collva.to_csv(self.outputdir + os.sep + filename)
+                grad_collva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
                 self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
                 # log the netting set
                 self.logger(self.netting_set, 'CollVA calc complete')
@@ -403,7 +467,7 @@ class CVADEFAULT(JOB):
     def run_calc(self, calc):
         filename = 'CVA_' + self.params['Run_Date'] + '_' + self.crb_default + '.csv'
 
-        if os.path.isfile(self.outputdir + os.sep + filename):
+        if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping CVA calc as file already exists')
         else:
             self.params['CVA'] = {'Deflation': self.cx.deals['Calculation'].get('Deflation_Interest_Rate', 'ZAR-SWAP'),
@@ -450,7 +514,7 @@ class CVADEFAULT(JOB):
                     columns={'Gradient': self.cx.deals['Attributes']['Reference']})
                 # store the CVA as part of the stats
                 out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
-                grad_cva.to_csv(self.outputdir + os.sep + filename)
+                grad_cva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
                 self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
                 # log the netting set
                 self.logger(self.netting_set, 'CVA calc complete')
@@ -521,7 +585,7 @@ class FVADEFAULT(JOB):
     def run_calc(self, calc):
         filename = 'FVA_' + self.params['Run_Date'] + '_' + self.crb_default + '.csv'
 
-        if os.path.isfile(self.outputdir + os.sep + filename):
+        if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping FVA calc as file already exists')
         else:
             self.params['FVA'] = {'Funding_Interest_Curve': 'USD-LIBOR-3M.FUNDING',
@@ -546,7 +610,7 @@ class FVADEFAULT(JOB):
                     if 'grad_fva' in out['Results']:
                         grad_fva = calc.gradients_as_df(out['Results']['grad_fva']).rename(
                             columns={'Gradient': self.cx.deals['Attributes']['Reference']})
-                        grad_fva.to_csv(self.outputdir + os.sep + filename)
+                        grad_fva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
                     # store the FVA as part of the stats
                     out['Stats'].update({'FVA': out['Results']['fva'], 'Currency': self.params['Currency']})
                     self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
@@ -682,7 +746,7 @@ class BaseVal(JOB):
         filename_greeks = 'BaseVal_Delta_' + ending
         filename_greeks_second = 'BaseVal_Gamma_' + ending
 
-        if os.path.isfile(self.outputdir + os.sep + filename):
+        if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping BaseVal calc as file already exists')
         else:
             # should be loaded correctly
@@ -690,7 +754,7 @@ class BaseVal(JOB):
             calc = construct_calculation('Base_Revaluation', self.cx, prec=np.float64)
             self.params.update({'Currency': 'ZAR', 'Greeks': 'No'})
             base_val = calc.execute(self.params)
-            base_val['Results']['mtm'].to_csv(self.outputdir + os.sep + filename)
+            base_val['Results']['mtm'].to_csv(os.path.join(self.outputdir, 'Greeks', filename))
             try:
                 self.params.update({'Run_Date': next_day, 'Greeks': 'Yes'})
                 calc = construct_calculation('Base_Revaluation', self.cx, prec=np.float64)
@@ -701,9 +765,9 @@ class BaseVal(JOB):
                 self.logger(self.netting_set, 'Failed to baseval')
             else:
                 self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
-                out['Results']['mtm'].to_csv(self.outputdir + os.sep + filename_theta)
-                out['Results']['Greeks_First'].to_csv(self.outputdir + os.sep + filename_greeks)
-                out['Results']['Greeks_Second'].to_csv(self.outputdir + os.sep + filename_greeks_second)
+                out['Results']['mtm'].to_csv(os.path.join(self.outputdir, 'Greeks', filename_theta))
+                out['Results']['Greeks_First'].to_csv(os.path.join(self.outputdir, 'Greeks', filename_greeks))
+                out['Results']['Greeks_Second'].to_csv(os.path.join(self.outputdir, 'Greeks', filename_greeks_second))
 
 
 def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir):
@@ -755,14 +819,14 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
     result = []
 
     # write out the logs
-    stats_file = '{0}_Stats_{1}_JOB_{2}.csv'.format(job, rundate, id)
     if 'Stats' in logs:
+        stats_file = os.path.join(outputdir, 'Stats', '{0}_Stats_{1}_JOB_{2}.csv'.format(job, rundate, id))
         pd.DataFrame(data=logs['Stats']).T.to_csv(stats_file)
         result.append(('Stats', stats_file))
     if 'Merge' in logs:
         result.append(merge_profiles(id, logs['Merge'], rundate, outputdir))
     if 'CSA' in logs:
-        csa_file = '{0}_{1}_CSA_JOB_{2}.csv'.format(job, rundate, id)
+        csa_file = os.path.join(outputdir, 'CSA', '{0}_{1}_CSA_JOB_{2}.csv'.format(job, rundate, id))
         pd.DataFrame(logs['CSA']).T.to_csv(csa_file)
         result.append(('CSA', csa_file))
     results.put(result)
@@ -816,7 +880,8 @@ class Parent:
         # write out the combined data
         for k, v in post_results.items():
             if v:
-                pd.concat(v).to_csv('{0}_{1}_{2}_Total.csv'.format(job, k, rundate))
+                out_path = os.path.join(outputdir, k, '{0}_{1}_{2}_Total.csv'.format(job, k, rundate))
+                pd.concat(v).to_csv(out_path)
 
 
 if __name__ == '__main__':

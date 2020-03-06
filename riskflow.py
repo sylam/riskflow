@@ -207,7 +207,7 @@ if __name__ == '__main__':
         if 1:
             calc, out, res = run_cmc(cx, overrides={'Calc_Scenarios': 'No',
                                                     'Dynamic_Scenario_Dates': 'No',
-                                                    'Run_Date':'2020-03-02',
+                                                    'Run_Date':'2020-02-28',
                                                     # 'Time_grid':'1m 5m 1362d',
                                                     'Batch_Size': 64*4,
                                                     'Simulation_Batches': 20,

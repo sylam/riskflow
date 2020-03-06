@@ -61,9 +61,6 @@ date_desc = {'years': 'Y', 'months': 'M', 'days': 'D'}
 # date formatter
 date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwds.items()])
 
-# HARDCODED Currency list for shifted lognormal
-shifted_lognormal = {'CHF': 2.0, 'JPY': 1.0, 'EUR': 3.0}
-
 
 def create_float_cashflows(base_date, cashflow_obj, frequency):
     cashflows = []
@@ -119,12 +116,14 @@ def atm_depo(base_date, curve_factor, time_grid, maturity, daycount):
     return fixed_cash
 
 
-def create_market_swaps(base_date, time_grid, curve_index, atm_surface, curve_factor,
+def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_factor,
                         instrument_definitions, rate=None):
     # store these benchmark swap definitions if necessary
     benchmarks = []
     # store the benchmark instruments
     all_deals = {}
+    # cater for shifted lognormal vols
+    shift_parameter = vol_surface.BlackScholesDisplacedShiftValue / 100.0
     for instrument in instrument_definitions:
         # setup the instrument
         effective = base_date + instrument['Start']
@@ -172,15 +171,13 @@ def create_market_swaps(base_date, time_grid, curve_index, atm_surface, curve_fa
         if instrument['Market_Volatility'].amount:
             vol = instrument['Market_Volatility'].amount
         else:
-            vol = atm_surface(tenor, expiry)[0][0]
+            vol = vol_surface.ATM(tenor, expiry)[0][0]
 
         deal_data = utils.DealDataType(
             Instrument=None, Factor_dep={'Cashflows': float_cash, 'Forward': curve_index,
                                          'Discount': curve_index, 'CompoundingMethod': 'None'},
             Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, time_index), Calc_res=None)
 
-        # HARDCODING !!!! - PLEASE FIX - TODO!!!
-        shift_parameter = shifted_lognormal.get(curve_factor.get_currency()[0], 0.0) / 100.0
         shifted_strike = K + shift_parameter
         # store this
         all_deals[swaption_name] = market_swap_class(
@@ -472,7 +469,7 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
 
         import scipy.optimize
         result = scipy.optimize.basinhopping(
-            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=200, T=0.25,
+            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=100, T=2.5,
             accept_test=accept_test, callback=print_fun, take_step=take_step)
 
         message_lines = [
@@ -704,14 +701,14 @@ class RiskNeutralInterestRateModel(object):
         utils.Default_Precision = prec
 
     def calc_loss_on_ir_curve(self, implied_params, base_date, time_grid, process,
-                              implied_obj, ir_factor, atm_surface, resid=tf.square, debug=None):
+                              implied_obj, ir_factor, vol_surface, resid=tf.square, debug=None):
         # calculate a reverse lookup for the tenors and store the daycount code
         all_tenors = utils.update_tenors(base_date, {ir_factor: process})
         # calculate the curve index - need to clean this up - TODO!!!
         curve_index = [instruments.calc_factor_index(ir_factor, {}, {ir_factor: 0}, all_tenors)]
         # calc the market swap rates and instrument_definitions    
         market_swaps, benchmarks = create_market_swaps(
-            base_date, time_grid, curve_index, atm_surface, process.factor,
+            base_date, time_grid, curve_index, vol_surface, process.factor,
             implied_params['instrument']['Instrument_Definitions'], ir_factor.name)
         # number of random factors to use
         numfactors = process.num_factors()
@@ -802,14 +799,6 @@ class RiskNeutralInterestRateModel(object):
                     logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
                     continue
 
-                # calc the atm vol
-                mn_ix = np.searchsorted(swaptionvol.moneyness, 0.0)
-                atm_vol = np.array([np.interp(1, swaptionvol.moneyness[mn_ix - 1:mn_ix + 1], y)
-                                    for y in swaptionvol.get_vols()[:, mn_ix - 1:mn_ix + 1]])
-                atm_surface = scipy.interpolate.RectBivariateSpline(
-                    swaptionvol.tenor, swaptionvol.expiry,
-                    atm_vol.reshape(swaptionvol.tenor.size, swaptionvol.expiry.size))
-
                 # set of dates for the calibration
                 mtm_dates = set(
                     [base_date + x['Start'] for x in implied_params['instrument']['Instrument_Definitions']])
@@ -829,7 +818,7 @@ class RiskNeutralInterestRateModel(object):
                 with graph.as_default():
                     # calculate the error
                     loss, optimizers, implied_var, calibrated_swaptions, market_swaptions, benchmarks = self.calc_loss(
-                        implied_params, base_date, time_grid, process, implied_obj, ir_factor, atm_surface)
+                        implied_params, base_date, time_grid, process, implied_obj, ir_factor, swaptionvol)
 
                 if debug is not None:
                     debug.deals['Deals']['Children'] = [{'instrument': x} for x in benchmarks]
@@ -893,10 +882,10 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
                 self.num_batches, self.batch_size, -1)
         return self.sample
 
-    def calc_loss(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, atm_surface):
+    def calc_loss(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):
         # get the swaption error and market values
         implied_var, error, calibrated_swaptions, market_swaptions, benchmarks = self.calc_loss_on_ir_curve(
-            implied_params, base_date, time_grid, process, implied_obj, ir_factor, atm_surface)
+            implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface)
 
         losses = list(error.values())
         loss = tf.reduce_sum(losses)
@@ -1016,7 +1005,7 @@ scipy.optimize.leastsq.html) are used.',
                 self.num_batches, self.batch_size, -1)
         return self.sample
 
-    def calc_loss(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, atm_surface):
+    def calc_loss(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):
 
         def make_bounds(implied_var, sigma_bounds, corr_bounds, alpha_bounds):
             return {
@@ -1054,7 +1043,7 @@ scipy.optimize.leastsq.html) are used.',
 
         # get the swaption error and market values
         implied_var_dict, error_dict, calibrated_swaptions, market_swaptions, benchmarks = self.calc_loss_on_ir_curve(
-            implied_params, base_date, time_grid, process, implied_obj, ir_factor, atm_surface)
+            implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface)
 
         error = OrderedDict(error_dict)
         var_list = [implied_var_dict['Sigma_1'], implied_var_dict['Sigma_2'],
