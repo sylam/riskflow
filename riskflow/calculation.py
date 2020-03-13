@@ -810,7 +810,7 @@ class Credit_Monte_Carlo(Calculation):
 
         if calc_greeks:
             implied_vars = list(itertools.chain(*[x.values() for x in self.implied_var]))
-            self.all_var = implied_vars #self.stoch_var + self.static_var + implied_vars
+            self.all_var = self.stoch_var + self.static_var + implied_vars
             # build our index                 
             self.make_factor_index(self.all_var)
 
@@ -848,7 +848,6 @@ class Credit_Monte_Carlo(Calculation):
         # record the performance stats
         self.calc_stats['Tensor_Execution_Time'] = time.clock()
 
-        # config = tf.ConfigProto(device_count = {'GPU': 0})
         config = tf.ConfigProto(allow_soft_placement=True)
 
         # clear the output

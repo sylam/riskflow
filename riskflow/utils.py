@@ -884,10 +884,10 @@ def calc_discount_rate(block, tenors_in_days, shared, multiply_by_time=True):
 
 
 def calc_spot_forward(curve, T, time_grid, shared, only_diag):
-    '''
+    """
     Function for calculating the forward price of FX or EQ rates taking
     into account risk neutrality for static curves
-    '''
+    """
     curve_grid = calc_time_grid_curve_rate(curve, time_grid, shared)
     T_t = T - time_grid[:, TIME_GRID_MTM].reshape(-1, 1)
     weights = np.diag(T_t).reshape(-1, 1) if only_diag else T_t

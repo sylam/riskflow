@@ -17,31 +17,26 @@
 ########################################################################
 
 
+import calendar
 # import standard libraries
 import json
-import calendar
-import operator
-import itertools
 import logging
-
-# import parsing libraries
-from typing import Dict, Any, Union
-
-from pyparsing import Literal, Word, nums, OneOrMore, delimitedList, oneOf, Optional, Group
-from xml.etree.ElementTree import ElementTree, Element
-from functools import reduce
-
+import operator
 # useful types
 from collections import OrderedDict
+from functools import reduce
+# import parsing libraries
+from typing import Dict, Any, Union
+from xml.etree.ElementTree import ElementTree, Element
 
-# dependent libs
-import pandas as pd
 import numpy as np
+import pandas as pd
+from pyparsing import Literal, Word, nums, OneOrMore, delimitedList, oneOf, Optional, Group
 
-# import crstal libraries
+# import libraries
 from riskflow import utils
-from riskflow.instruments import construct_instrument, Deal
 from riskflow.bootstrappers import construct_bootstrapper
+from riskflow.instruments import construct_instrument, Deal
 from riskflow.stochasticprocess import construct_calibration_config, construct_process
 
 # define datetime routines

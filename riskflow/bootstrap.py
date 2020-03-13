@@ -215,8 +215,7 @@ def main():
     elif args.task == 'Daily':
         calendar = os.path.join(
             os.path.split(args.market_file)[0], 'Calendars.cal')
-        Parent(args.num_jobs).start(None, args.market_file, os.path.join(
-            os.path.split(args.market_file)[0], 'Calendars.cal'), outfile=args.output_file)
+        Parent(args.num_jobs).start(None, args.market_file, calendar, outfile=args.output_file)
     else:
         logging.error('Invalid Job - aborting')
 

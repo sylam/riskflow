@@ -868,7 +868,8 @@ class PCAInterestRateModel(object):
         ['The parameters of the model are:',
          '- a volatility curve $\\sigma_\\tau$ for each tenor $\\tau$ of the zero curve $r_\\tau$',
          '- a mean reversion parameter $\\alpha$',
-         '- eigenvalues $\\lambda_1,\\lambda_2,..,\\lambda_m$ and corresponding eigenvectors $Q_1(\\tau),Q_2(\\tau),...,Q_m(\\tau)$',
+         '- eigenvalues $\\lambda_1,\\lambda_2,..,\\lambda_m$ and corresponding eigenvectors $Q_1(\\tau),Q_2(\\tau),'
+         '...,Q_m(\\tau)$',
          '- optionally a historical yield curve $\\Theta(\\tau)$ for the long run mean of $r_\\tau$',
          '',
          'The stochastic process for the rate at each tenor on the interest rate curve is specified as:',
@@ -885,11 +886,13 @@ class PCAInterestRateModel(object):
          '',
          'Final form of the model is',
          '',
-         '$$ r_\\tau(t) = R_\\tau(t) exp \\Big( -\\frac{1}{2} \\sigma_\\tau^2 (\\frac{1-e^{-2 \\alpha t}}{2 \\alpha}) + \\sigma_\\tau \\sum_{k=1}^{3} B_k(\\tau) Y_k(t) \\Big)$$',
+         '$$ r_\\tau(t) = R_\\tau(t) exp \\Big( -\\frac{1}{2} \\sigma_\\tau^2 (\\frac{1-e^{-2 \\alpha t}}{2 \\alpha}) '
+         '+ \\sigma_\\tau \\sum_{k=1}^{3} B_k(\\tau) Y_k(t) \\Big)$$',
          '',
          'Where:',
          '',
-         '- $r_\\tau(t)$ is the zero rate with a tenor $\\tau$  at time $t$  ($t = 0$ denotes the current rate at tenor $\\tau$)',
+         '- $r_\\tau(t)$ is the zero rate with a tenor $\\tau$  at time $t$  ($t = 0$ denotes the current rate at '
+         'tenor $\\tau$)',
          '- $\\alpha$ is the mean reversion level of zero rates',
          '- $Y_k(t)$ is the OU process associated with Principle component $k$',
          '',

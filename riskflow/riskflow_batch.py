@@ -28,50 +28,8 @@ from collections import defaultdict
 from multiprocessing import Process, Queue, Lock
 
 
-class CustomJsonEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.ndarray):
-            return_value = {'.array': obj.tolist()}
-        return return_value
-
-
-def CustomJsonDecoder(dct):
-    if '.array' in dct:
-        return np.array(dct['.array'])
-    return dct
-
-
-def merge_profiles(id, merge_data, rundate, outputdir):
-    pivots = []
-
-    # remove any existing totals
-    for prev_totals in glob.glob(outputdir + os.sep + 'Tagged_{}_Total_{}.csv'.format(rundate, id)):
-        os.remove(prev_totals)
-
-    pivot_labels = ['Reference', 'Acquirer', 'Portfolio', 'Instrument', 'SalesTeam']
-    if 'Factor' in merge_data.values()[0]:
-        pivot_labels.insert(1, merge_data.values()[0]['Factor'])
-
-    for name, data in merge_data.items():
-        # details for indexing
-        profile = pd.read_csv(
-            outputdir + os.sep + 'Tagged_{0}_{1}_{2}_{3}.csv'.format(rundate, data['currency'], data['csa'], name))
-        position = pd.pivot_table(profile, values=profile.columns[4 + len(data):].tolist(), index=pivot_labels,
-                                  aggfunc=np.sum)
-        position['Netting'] = name
-        position['CSA'] = data['csa']
-        position['Currency'] = data['currency']
-        pivots.append(position)
-
-    # write it out
-    filename = outputdir + os.sep + 'Tagged_{}_Total_{}.csv'.format(rundate, id)
-    pd.concat(pivots, axis=0, join='outer').to_csv(filename)
-    return ('Merge', filename)
-
-
 class JOB(object):
-    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log,
-                 time_grid='0d 2d 1w(1w) 3m(1m) 2y(3m)'):
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
         self.cx = cx
         self.rundate = rundate
         self.input_path = input_path
@@ -841,8 +799,6 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
         stats_file = os.path.join(outputdir, 'Stats', '{0}_Stats_{1}_JOB_{2}.csv'.format(job, rundate, id))
         pd.DataFrame(data=logs['Stats']).T.to_csv(stats_file)
         result.append(('Stats', stats_file))
-    if 'Merge' in logs:
-        result.append(merge_profiles(id, logs['Merge'], rundate, outputdir))
     if 'CSA' in logs:
         csa_file = os.path.join(outputdir, 'CSA', '{0}_{1}_CSA_JOB_{2}.csv'.format(job, rundate, id))
         pd.DataFrame(logs['CSA']).T.to_csv(csa_file)
@@ -885,11 +841,11 @@ class Parent:
         self.queue.close()
         self.results.close()
 
-        # join to this proces
+        # join to this process
         for i in range(self.NUMBER_OF_PROCESSES):
             self.workers[i].join()
 
-        post_results = {'Stats': [], 'CSA': [], 'Merge': []}
+        post_results = {'Stats': [], 'CSA': []}
         for output in post_processing:
             data = dict(output)
             for k, v in data.items():
@@ -912,8 +868,8 @@ def main():
     parser.add_argument('num_jobs', type=int, help='the number of gpu\'s to use (if available) else cpu\'s')
     parser.add_argument('job', type=str, help='the job name', choices=jobs)
     parser.add_argument('rundate', type=str, help='batch rundate')
-    parser.add_argument('input_path', type=str,
-                        help='directory containing the input files (note that the rundate is assumed to be a directory within)')
+    parser.add_argument('input_path', type=str, help='directory containing the input files (note that the rundate is '
+                                                     'assumed to be a directory within)')
     parser.add_argument('calendar_file', type=str, help='calendar file to use')
     parser.add_argument('output_path', type=str, help='output directory')
     parser.add_argument('filename', type=str, help='filename(s) in input_path to run - wildcards allowed')
@@ -921,7 +877,6 @@ def main():
     # get the arguments
     args = parser.parse_args()
 
-    # print args.rundate, args.input_path, args.calendar_file, args.output_path
     Parent(args.num_jobs).start(args.job, args.rundate, args.input_path, args.calendar_file, args.output_path,
                                 args.filename)
 

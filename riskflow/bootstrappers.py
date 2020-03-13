@@ -19,22 +19,15 @@
 
 # import standard libraries
 import time
-import logging
 from collections import OrderedDict, namedtuple
 
 # third party stuff
-import riskflow.hdsobol as hdsobol
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import scipy.interpolate
 
 # Internal modules
-import riskflow.utils as utils
-import riskflow.pricing as pricing
-import riskflow.instruments as instruments
-import riskflow.riskfactors as riskfactors
-import riskflow.stochasticprocess as stochasticprocess
+from riskflow import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
 
 # misc functions/classes
 from riskflow.calculation import TimeGrid
