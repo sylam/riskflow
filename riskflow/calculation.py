@@ -671,12 +671,13 @@ class Credit_Monte_Carlo(Calculation):
         self.update_correlation()
         # check if we need gradients for any xVA
         greeks = np.any([params[x].get('Gradient', 'No') == 'Yes' for x in params.keys() if x.endswith('VA')])
+        sensitivities = params.get('Gradient_Variables', 'All')
 
         # setup the device and allocate memory
         self.__refresh_shared_mem(params['Random_Seed'],
                                   params.get('NoModel', 'Constant'),
                                   params['Currency'],
-                                  calc_greeks=greeks)
+                                  calc_greeks=sensitivities if greeks else None)
 
         # calculate a reverse lookup for the tenors and store the daycount code
         self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
@@ -791,7 +792,7 @@ class Credit_Monte_Carlo(Calculation):
             # set the cholesky decomp
             self.cholesky = tf.cholesky(self.input_correlation)
 
-    def __refresh_shared_mem(self, seed, nomodel, reporting_currency, calc_greeks=False, debug_batch_size=128):
+    def __refresh_shared_mem(self, seed, nomodel, reporting_currency, calc_greeks=None, debug_batch_size=128):
         # setup the Feed dictionary - the inputs needed to evaluate the graph
         feed = {self.input_correlation: self.correlation_matrix}
         feed.update(dict(zip(self.stoch_var, self.stoch_values)))
@@ -807,10 +808,15 @@ class Credit_Monte_Carlo(Calculation):
         else:
             cashflow_size = self.batch_size
 
-        if calc_greeks:
+        if calc_greeks is not None:
             implied_vars = list(itertools.chain(*[x.values() for x in self.implied_var]))
-            self.all_var = self.stoch_var + self.static_var + implied_vars
-            # build our index                 
+            if calc_greeks == 'Implied':
+                self.all_var = implied_vars
+            elif calc_greeks == 'Factors':
+                self.all_var = self.stoch_var + self.static_var
+            else:
+                self.all_var = implied_vars + self.stoch_var + self.static_var
+            # build our index
             self.make_factor_index(self.all_var)
 
         # Now apply that cholesky to our random numbers.
