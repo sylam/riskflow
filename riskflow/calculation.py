@@ -293,8 +293,6 @@ class Calculation(object):
         # the deal structure
         self.netting_sets = None
 
-        # generate slides from calculation?
-        self.documentation = documentation.NoElaboration()
         # what's the name of this calculation?
         self.name = 'Unnamed'
         # performance and admin feedback
@@ -923,7 +921,7 @@ class Credit_Monte_Carlo(Calculation):
         # get the rundate
         base_date = pd.Timestamp(params['Run_Date'])
         # check if we need to produce a slideshow (i.e. documentation)
-        if params['Generate_Slideshow'] == 'Yes':
+        if params.get('Generate_Slideshow','No') == 'Yes':
             # we need to generate scenarios to draw pictures . . .
             params['Calc_Scenarios'] = 'Yes'
             # check if we need to compare the results to an externally produced result
@@ -932,10 +930,10 @@ class Credit_Monte_Carlo(Calculation):
             # set the name of this calculation
             self.name = params['calc_name'][0]
             # create some slides
-            self.documentation = documentation.Elaboration(self.name)
+            # self.documentation = documentation.Elaboration(self.name)
         else:
             compare_output = ''
-            self.documentation = documentation.NoElaboration()
+            # self.documentation = documentation.NoElaboration()
 
         # Define the base and scenario grids
         self.input_time_grid = params['Time_grid']

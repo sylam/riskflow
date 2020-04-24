@@ -17,10 +17,13 @@
 ########################################################################
 
 import calendar
+import functools
 from functools import reduce
 from collections import namedtuple, OrderedDict
 
 import logging
+from itertools import zip_longest
+
 import scipy.stats
 import pandas as pd
 import numpy as np
@@ -323,15 +326,6 @@ class TensorSchedule(object):
         self.cache = None
         self.dtype = None
 
-    def known_resets(self, num_scenarios, index=RESET_INDEX_Value,
-                     filter_index=RESET_INDEX_Reset_Day, include_today=False):
-        filter_fn = (lambda x: x <= 0.0) if include_today else (lambda x: x < 0.0)
-        try:
-            return [tf.fill([1, num_scenarios], x[index].astype(Default_Precision))
-                    for x in self.schedule if filter_fn(x[filter_index])]
-        except:
-            print('asd')
-
     def __getitem__(self, x):
         return self.schedule[x]
 
@@ -371,11 +365,12 @@ class TensorResets(TensorSchedule):
         # Assign the offsets directly to the resets
         self.schedule[:, RESET_INDEX_Scenario] = self.offsets
 
-    def split_resets(self, reset_offset, t):
-        all_resets = self.schedule[reset_offset:]
-        future_resets = all_resets[all_resets[:, RESET_INDEX_Reset_Day] >= t]
-        past_resets = all_resets[all_resets[:, RESET_INDEX_Reset_Day] < t] if reset_offset else np.array([])
-        return past_resets, future_resets
+    def known_resets(self, num_scenarios, index=RESET_INDEX_Value,
+                     filter_index=RESET_INDEX_Reset_Day, include_today=False):
+        # simple reset function
+        filter_fn = (lambda x: x <= 0.0) if include_today else (lambda x: x < 0.0)
+        return [tf.fill([1, num_scenarios], x[index].astype(Default_Precision))
+                for x in self.schedule if filter_fn(x[filter_index])]
 
     def split_block_resets(self, reset_offset, t, date_offset=0):
         all_resets = self.schedule[reset_offset:]
@@ -388,24 +383,107 @@ class TensorResets(TensorSchedule):
                                time_grid[:, TIME_GRID_MTM]).astype(np.int64)
 
 
+class FloatTensorResets(TensorSchedule):
+    def __init__(self, schedule, offsets):
+        super(FloatTensorResets, self).__init__(schedule, offsets)
+        # Assign the offsets directly to the resets
+        self.schedule[:, RESET_INDEX_Scenario] = self.offsets
+        # split all resets between known (-1) or simulated (>=0)
+        self.known_simulated = self.offsets.clip(-1, 0)
+        # all known and simulated resets are stacked here
+        self.all_resets = None
+        self.stack_index = []
+
+    def known_resets(self, num_scenarios, index=RESET_INDEX_Value, filter_index=RESET_INDEX_Reset_Day):
+        known_resets = []
+        groups = np.where(np.diff(np.concatenate(([0], self.known_simulated, [0]))))[0].reshape(-1, 2)
+        for group in groups:
+            known_resets.append([tf.fill([1, num_scenarios], x[index].astype(Default_Precision))
+                                 for x in self.schedule[group[0]: group[1]] if x[filter_index] < 0.0])
+        return known_resets
+
+    def stack(self, known_resets, reset_values, fillvalue):
+        self.all_resets = [
+            tf.squeeze(tf.concat([tf.stack(known), simulated], axis=0), axis=1) for known, simulated in zip_longest(
+                known_resets, reset_values, fillvalue=fillvalue)]
+        self.stack_index = np.cumsum(np.append([0], [x.shape[0].value for x in self.all_resets]))
+
+    def sim_resets(self, max_time, filter_index=RESET_INDEX_Reset_Day):
+        sim_resets = []
+        groups = np.where(np.diff(np.concatenate(([-1], self.known_simulated, [-1]))))[0].reshape(-1, 2)
+        for group in groups:
+            sim_group = self.schedule[group[0]:group[1]]
+            within_horizon = sim_group[sim_group[:, filter_index] <= max_time]
+            if within_horizon.any():
+                sim_resets.append(within_horizon)
+        return sim_resets
+
+    def raw_sim_resets(self, max_time, filter_index=RESET_INDEX_Reset_Day):
+        return self.schedule[(self.offsets > -1) & (self.schedule[:, filter_index] <= max_time)]
+
+    def split_block_resets(self, reset_offset, t, date_offset=0):
+        all_resets = self.schedule[reset_offset:]
+        reset_days = all_resets[:, RESET_INDEX_Reset_Day] - date_offset
+        reset_groups = np.append(
+            np.where(np.diff(np.concatenate(([-np.inf], reset_days, [np.inf]))) < 0)[0], reset_days.size)
+
+        # only bring in relevant past resets
+        if reset_offset:
+            old_index_offset = self.stack_index.searchsorted(reset_offset, side='right')
+            old_reset_index = reset_offset - self.stack_index[old_index_offset - 1]
+            old_resets = [self.all_resets[old_index_offset - 1][old_reset_index:]
+                          if old_reset_index else self.all_resets[old_index_offset - 1]] + \
+                         self.all_resets[old_index_offset:]
+        else:
+            old_resets = self.all_resets
+
+        reset_blocks = []
+        future_resets = []
+        start_index = 0
+
+        for end_index in reset_groups:
+            reset_blocks.append(all_resets[start_index:end_index])
+            future_reset = np.searchsorted(reset_days[start_index:end_index], t)
+            future_resets.append(future_reset)
+            start_index = end_index
+
+        if len(future_resets) > 1:
+            # multiple reset groups
+            reset_state = [np.unique(future_reset, return_counts=True) for future_reset in future_resets]
+            if functools.reduce(lambda x, y: x.size == y.size and (x == y).all(), [x[1] for x in reset_state]):
+                # can be compressed
+                return reset_state[0][1], (old_resets, reset_blocks, [x[0] for x in reset_state])
+            else:
+                # do not compress
+                return np.ones_like(t, dtype=np.int64), (old_resets, reset_blocks, future_resets)
+        else:
+            # Just one reset group - compress it
+            reset_offset, reset_counts = np.unique(future_resets[0], return_counts=True)
+            return reset_counts, (old_resets, reset_blocks, [reset_offset])
+
+
 class TensorCashFlows(TensorSchedule):
     def __init__(self, schedule, offsets):
         # check which cashflows are settlements (as opposed to accumulations)
         for cashflow, next_cashflow, cash_ofs in zip(schedule[:-1], schedule[1:], offsets[:-1]):
             if (next_cashflow[CASHFLOW_INDEX_Pay_Day] != cashflow[CASHFLOW_INDEX_Pay_Day]) or (
                     cashflow[CASHFLOW_INDEX_FixedAmt] != 0):
-                cash_ofs[2] = 1
+                cash_ofs[CASHFLOW_OFFSET_Settle] = 1
 
         # last cashflow always settles (if it's not marked as such) otherwise, it's a forward
-        if offsets[-1][2] == 0:
-            offsets[-1][2] = 1
+        if offsets[-1][CASHFLOW_OFFSET_Settle] == 0:
+            offsets[-1][CASHFLOW_OFFSET_Settle] = 1
 
+        # Add Resets field
+        self.Resets = None
         # call superclass
         super(TensorCashFlows, self).__init__(schedule, offsets)
-        self.Resets = None
 
-        # store the days needed to access curves
-        self.payment_days = np.unique(self.schedule[:, CASHFLOW_INDEX_Pay_Day])
+    def known_fx_resets(self, num_scenarios, index=CASHFLOW_INDEX_FXResetValue,
+                        filter_index=CASHFLOW_INDEX_Start_Day):
+
+        return [tf.fill([1, num_scenarios], x[index].astype(Default_Precision))
+                for x in self.schedule if x[filter_index] < 0.0]
 
     def get_par_swap_rate(self, base_date, ir_curve):
         """Used to calculate the par swap rate for these cashflows given an interest rate curve"""
@@ -438,8 +516,8 @@ class TensorCashFlows(TensorSchedule):
             reference_date + pd.offsets.Day(last_cashflow[CASHFLOW_INDEX_End_Day]),
             last_cashflow[CASHFLOW_INDEX_End_Day] - last_cashflow[CASHFLOW_INDEX_Start_Day] + 1, daycount_code)
 
-    def set_resets(self, schedule, offsets):
-        self.Resets = TensorResets(schedule, offsets)
+    def set_resets(self, schedule, offsets, isFloat=False):
+        self.Resets = FloatTensorResets(schedule, offsets) if isFloat else TensorResets(schedule, offsets)
 
     def overwrite_rate(self, attribute_index, value):
         """
@@ -1794,7 +1872,7 @@ def generate_float_cashflows(reference_date, time_grid, reset_dates, nominal, am
         all_resets.extend(r)
 
     cashflows = TensorCashFlows(cashflow_schedule, cashflow_reset_offsets)
-    cashflows.set_resets(all_resets, reset_scenario_offsets)
+    cashflows.set_resets(all_resets, reset_scenario_offsets, isFloat=True)
 
     return cashflows
 
@@ -2140,7 +2218,7 @@ def make_float_cashflows(reference_date, time_grid, position, cashflows):
             all_resets.extend(r)
 
     cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
-    cashflows.set_resets(all_resets, reset_scenario_offsets)
+    cashflows.set_resets(all_resets, reset_scenario_offsets, isFloat=True)
 
     return cashflows
 

@@ -17,10 +17,14 @@
 ########################################################################
 
 
+from collections import OrderedDict
+
 # specific modules
+from itertools import zip_longest
+
 import numpy as np
 import tensorflow as tf
-from collections import OrderedDict
+
 from riskflow import utils
 
 # useful constants
@@ -46,6 +50,7 @@ class SensitivitiesEstimator(object):
         params: List of model parameters (list of tensor(s))
 
     """
+
     def __init__(self, value, params):
         """
         Args:
@@ -54,7 +59,7 @@ class SensitivitiesEstimator(object):
         """
         self.cost = value
         self.grad = OrderedDict([(
-        var, tf.convert_to_tensor(grad)) for grad, var in zip(
+            var, tf.convert_to_tensor(grad)) for grad, var in zip(
             tf.gradients(value, params, aggregation_method=tf.AggregationMethod.EXPERIMENTAL_ACCUMULATE_N),
             params) if grad is not None])
         self.params = list(self.grad.keys())
@@ -103,7 +108,7 @@ class SensitivitiesEstimator(object):
         return H_op
 
 
-def greeks(shared, deal_data, mtm):    
+def greeks(shared, deal_data, mtm):
     greeks_calc = SensitivitiesEstimator(mtm, shared.calc_greeks)
     deal_data.Calc_res['Greeks_First'] = greeks_calc.grad
     # use this only when all the vols and curves are sparsely represented (check greeks_calc.P)
@@ -488,19 +493,17 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
     # first precalc all past resets
     resets = factor_dep['Cashflows'].Resets
     known_resets = resets.known_resets(shared.simulation_batch)
-    sim_resets = resets.schedule[(resets.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
-                                 (resets.schedule[:, utils.RESET_INDEX_Reset_Day] <=
-                                  deal_time[:, utils.TIME_GRID_MTM].max())]
+    sim_resets = resets.sim_resets(deal_time[:, utils.TIME_GRID_MTM].max())
+
     if mtm_currency:
+        # get the ungrouped resets
+        raw_sim_resets = resets.raw_sim_resets(deal_time[:, utils.TIME_GRID_MTM].max())
         # precalc the FX forwards
         sim_fx_forward = utils.calc_fx_forward(
-            mtm_currency, factor_dep['Currency'],
-            sim_resets[:, utils.RESET_INDEX_Start_Day], sim_resets[:, :utils.RESET_INDEX_Scenario + 1],
-            shared, only_diag=True)
+            mtm_currency, factor_dep['Currency'], raw_sim_resets[:, utils.RESET_INDEX_Start_Day],
+            raw_sim_resets[:, :utils.RESET_INDEX_Scenario + 1], shared, only_diag=True)
 
-        known_fx = factor_dep['Cashflows'].known_resets(
-            shared.simulation_batch, index=utils.CASHFLOW_INDEX_FXResetValue,
-            filter_index=utils.CASHFLOW_INDEX_Start_Day)
+        known_fx = factor_dep['Cashflows'].known_fx_resets(shared.simulation_batch)
 
         # fetch fx rates - note that there is a slight difference between this and the spot fx rate
         old_fx_rates = tf.squeeze(
@@ -510,28 +513,29 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
 
     forwards = utils.calc_time_grid_curve_rate(factor_dep['Forward'], deal_time, shared)
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
-    old_resets = utils.calc_time_grid_curve_rate(factor_dep['Forward'],
-                                                 sim_resets[:, :utils.RESET_INDEX_Scenario + 1],
-                                                 shared)
+    # simulated resets
+    reset_values = []
+    # fillers for tensorflow
+    zeros = {}
 
-    delta_start = (sim_resets[:, utils.RESET_INDEX_Start_Day] -
-                   sim_resets[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
-    delta_end = (sim_resets[:, utils.RESET_INDEX_End_Day] -
-                 sim_resets[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
+    for sim_group in sim_resets:
+        old_resets = utils.calc_time_grid_curve_rate(factor_dep['Forward'],
+                                                     sim_group[:, :utils.RESET_INDEX_Scenario + 1],
+                                                     shared)
 
-    reset_weights = (sim_resets[:, utils.RESET_INDEX_Weight] /
-                     sim_resets[:, utils.RESET_INDEX_Accrual]).reshape(-1, 1, 1)
+        delta_start = (sim_group[:, utils.RESET_INDEX_Start_Day] -
+                       sim_group[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
+        delta_end = (sim_group[:, utils.RESET_INDEX_End_Day] -
+                     sim_group[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
 
-    reset_values = tf.expm1(old_resets.gather_weighted_curve(
-        shared, delta_end, delta_start)) * reset_weights \
-        if sim_resets.any() else tf.zeros([0, 1, shared.simulation_batch],
-                                          dtype=shared.precision)
+        reset_weights = (sim_group[:, utils.RESET_INDEX_Weight] /
+                         sim_group[:, utils.RESET_INDEX_Accrual]).reshape(-1, 1, 1)
 
-    # fetch all fixed resets 
-    old_resets = tf.squeeze(
-        tf.concat([tf.stack(known_resets), reset_values]
-                  if known_resets
-                  else reset_values, axis=0), axis=1)
+        reset_values.append(tf.expm1(old_resets.gather_weighted_curve(shared, delta_end, delta_start)) * reset_weights)
+
+    # stack all resets
+    resets.stack(known_resets, reset_values, fillvalue=tf.zeros(
+        [0, 1, shared.simulation_batch], dtype=shared.precision))
 
     cash_start_idx = factor_dep['Cashflows'].get_cashflow_start_index(deal_time)
     start_index, start_counts = np.unique(cash_start_idx, return_counts=True)
@@ -541,8 +545,8 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
 
         cashflows = factor_dep['Cashflows'].merged()[start_index[index]:]
 
-        cash_pmts, cash_index, cash_counts = np.unique(cashflows[:, utils.CASHFLOW_INDEX_Pay_Day],
-                                                       return_index=True, return_counts=True)
+        cash_pmts, cash_index, cash_counts = np.unique(
+            cashflows[:, utils.CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
 
         reset_offset = factor_dep['Cashflows'].offsets[start_index[index]][1]
         pmts_offset = cash_index + (cash_counts - 1)
@@ -550,35 +554,33 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
         time_ofs = 0
         time_block = discount_block.time_grid[:, utils.TIME_GRID_MTM]
         future_pmts = cash_pmts.reshape(1, -1) - time_block.reshape(-1, 1)
-        reset_block = resets.schedule[reset_offset:]
-        reset_ofs, reset_count = np.unique(resets.split_block_resets(
-            reset_offset, time_block), return_counts=True)
+        discount_rates = utils.calc_discount_rate(discount_block, future_pmts, shared)
+        reset_count, reset_state = resets.split_block_resets(reset_offset, time_block)
 
-        # discount rates
-        discount_rates = utils.calc_discount_rate(discount_block,
-                                                  future_pmts, shared)
-
-        # do we need to split the forward block further? 
+        # do we need to split the forward block further?
         forward_blocks = forward_block.split_counts(
             reset_count, shared) if len(reset_count) > 1 else [forward_block]
 
         # empty list for payments
         payments = []
 
-        for offset, size, forward_rates in zip(*[reset_ofs, reset_count, forward_blocks]):
+        for reset_index, (size, forward_rates) in enumerate(zip(*[reset_count, forward_blocks])):
             time_slice = time_block[time_ofs:time_ofs + size].reshape(-1, 1)
-            future_starts = reset_block[offset:, utils.RESET_INDEX_Start_Day] - time_slice
-            future_ends = reset_block[offset:, utils.RESET_INDEX_End_Day] - time_slice
-            future_weights = (reset_block[offset:, utils.RESET_INDEX_Weight]
-                              / reset_block[offset:, utils.RESET_INDEX_Accrual]).reshape(1, -1, 1)
-            future_resets = tf.expm1(forward_rates.gather_weighted_curve(
-                shared, future_ends, future_starts)) * future_weights
+            zero = zeros.setdefault(size, tf.zeros([size, 0, shared.simulation_batch], dtype=shared.precision))
+            all_resets = zero
+            for old_resets, reset_block, reset_offsets in zip_longest(*reset_state, fillvalue=None):
+                offset = reset_offsets[reset_index]
+                future_starts = reset_block[offset:, utils.RESET_INDEX_Start_Day] - time_slice
+                future_ends = reset_block[offset:, utils.RESET_INDEX_End_Day] - time_slice
+                future_weights = (reset_block[offset:, utils.RESET_INDEX_Weight]
+                                  / reset_block[offset:, utils.RESET_INDEX_Accrual]).reshape(1, -1, 1)
+                future_resets = tf.expm1(forward_rates.gather_weighted_curve(
+                    shared, future_ends, future_starts)) * future_weights
 
-            # now deal with past resets
-            past_resets = tf.tile(
-                tf.expand_dims(old_resets[reset_offset:reset_offset + offset], axis=0)
-                , [size, 1, 1])
-            all_resets = tf.concat([past_resets, future_resets], axis=1)
+                # now deal with past resets
+                past_resets = zero if old_resets is None else tf.tile(
+                    tf.expand_dims(old_resets[:offset], axis=0), [size, 1, 1])
+                all_resets = tf.concat([all_resets, past_resets, future_resets], axis=1)
 
             # handle cashflows that don't pay interest (e.g. bullets)
             if cashflows[:, utils.CASHFLOW_INDEX_NumResets].all():
@@ -610,35 +612,40 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
             # now we can price the cashflows
             all_int, all_margin = cashflow_pricer(all_resets, reset_cashflows, factor_dep, time_slice, shared)
 
-            # check if there are a different number of resets per cashflow 
-            if (cash_counts.min() != cash_counts.max()):
-                interest = tf.pad(all_int, [[0, 0], [0, 1], [0, 0]])
-                nominal = np.append(reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal], 0.0)
-                margin = np.append(all_margin, 0.0)
+            # handle the common case of no compounding:
+            if mtm_currency is None and factor_dep['CompoundingMethod'] == 'None':
+                split_nominals = np.split(reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal], cash_index[1:])
+                split_interest = tf.split(all_int, cash_counts, axis=1)
+                total = tf.stack([tf.reduce_sum(nominals.reshape(1, -1, 1) * interest, axis=1)
+                                  for nominals, interest in zip(split_nominals, split_interest)], axis=1)
             else:
-                interest = all_int
-                margin = all_margin
-                nominal = reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal]
-
-            default_offst = np.ones(cash_index.size, dtype=np.int32) * (interest.shape[1].value - 1)
-            total = 0.0
-
-            for i in range(cash_counts.max()):
-                offst = default_offst.copy()
-                offst[cash_counts > i] = i + cash_index[cash_counts > i]
-                int_i = tf.gather(interest, offst, axis=1)
-
-                if mtm_currency:
-                    total += int_i * Pi + (Pi - Pi_1)
-                elif factor_dep['CompoundingMethod'] == 'None':
-                    total += nominal[offst].reshape(1, -1, 1) * int_i
-                elif factor_dep['CompoundingMethod'] == 'Include_Margin':
-                    total += (total + nominal[offst].reshape(1, -1, 1)) * int_i
-                elif factor_dep['CompoundingMethod'] == 'Flat':
-                    total += (int_i * nominal[offst].reshape(1, -1, 1)) + total * (
-                            int_i - margin[offst].reshape(1, -1, 1))
+                # check if there are a different number of resets per cashflow
+                if (cash_counts.min() != cash_counts.max()):
+                    interest = tf.pad(all_int, [[0, 0], [0, 1], [0, 0]])
+                    nominal = np.append(reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal], 0.0)
+                    margin = np.append(all_margin, 0.0)
                 else:
-                    raise Exception('Floating cashflow list method not implemented')
+                    interest = all_int
+                    margin = all_margin
+                    nominal = reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal]
+
+                default_offst = np.ones(cash_index.size, dtype=np.int32) * (interest.shape[1].value - 1)
+                total = 0.0
+
+                for i in range(cash_counts.max()):
+                    offst = default_offst.copy()
+                    offst[cash_counts > i] = i + cash_index[cash_counts > i]
+                    int_i = tf.gather(interest, offst, axis=1)
+
+                    if mtm_currency:
+                        total += int_i * Pi + (Pi - Pi_1)
+                    elif factor_dep['CompoundingMethod'] == 'Include_Margin':
+                        total += (total + nominal[offst].reshape(1, -1, 1)) * int_i
+                    elif factor_dep['CompoundingMethod'] == 'Flat':
+                        total += (int_i * nominal[offst].reshape(1, -1, 1)) + total * (
+                                int_i - margin[offst].reshape(1, -1, 1))
+                    else:
+                        raise Exception('Floating cashflow list method not implemented')
 
             payments.append(total + cashflows[pmts_offset, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1))
 
@@ -812,16 +819,15 @@ def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
         last_pub_block = last_pub_blocks[index]
         cashflows = factor_dep['Cashflows'].schedule[start_index[index]:]
 
-        cash_pmts, cash_index, cash_counts = np.unique(cashflows[:, utils.CASHFLOW_INDEX_Pay_Day],
-                                                       return_index=True, return_counts=True)
+        cash_pmts, cash_index, cash_counts = np.unique(
+            cashflows[:, utils.CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
 
         # payment times            
         time_block = discount_block.time_grid[:, utils.TIME_GRID_MTM]
         future_pmts = cash_pmts.reshape(1, -1) - time_block.reshape(-1, 1)
 
         # discount rates
-        discount_rates = utils.calc_discount_rate(discount_block,
-                                                  future_pmts, shared)
+        discount_rates = utils.calc_discount_rate(discount_block, future_pmts, shared)
 
         cash_base_index_vals = factor_dep['Cashflows'].offsets[start_index[index]:, utils.CASHFLOW_OFFSET_BaseReference]
         all_base_index_vals = get_index_val(cash_base_index_vals, factor_dep['Base_Resets'].schedule, all_base_resets,
@@ -829,25 +835,28 @@ def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
         cash_final_index_vals = factor_dep['Cashflows'].offsets[start_index[index]:,
                                 utils.CASHFLOW_OFFSET_FinalReference]
         all_final_index_vals = get_index_val(cash_final_index_vals, factor_dep['Final_Resets'].schedule,
-                                             all_final_resets,
-                                             resets_per_cf, start_index[index])
+                                             all_final_resets, resets_per_cf, start_index[index])
 
         # empty list for payments
-        interest = (
-                cashflows[:, utils.CASHFLOW_INDEX_FixedRate] * cashflows[:, utils.CASHFLOW_INDEX_Year_Frac]). \
-            reshape(1, -1, 1)
+        interest = (cashflows[:, utils.CASHFLOW_INDEX_FixedRate] *
+                    cashflows[:, utils.CASHFLOW_INDEX_Year_Frac]).reshape(1, -1, 1)
         growth = cashflows[:, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1) * (
                 all_final_index_vals / all_base_index_vals)
-        payment = cashflows[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1) * growth * interest
-        payments = None
+        payment_all = cashflows[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1) * growth * interest
 
-        for i in range(cash_counts.min()):
-            offst = cash_index + i
+        if cash_counts.min() != cash_counts.max():
+            payment = tf.pad(payment_all, [[0, 0], [0, 1], [0, 0]])
+        else:
+            payment = payment_all
+
+        payments = 0.0
+        default_offst = np.ones(cash_index.size, dtype=np.int32) * (payment.shape[1].value - 1)
+
+        for i in range(cash_counts.max()):
+            offst = default_offst.copy()
+            offst[cash_counts > i] = i + cash_index[cash_counts > i]
             int_i = tf.cast(tf.gather(payment, offst, axis=1), shared.precision)
-            if payments is None:
-                payments = int_i
-            else:
-                payments += int_i
+            payments += int_i
 
         # add it to the list
         mtm_list.append(tf.reduce_sum(payments * discount_rates, axis=1))
@@ -1063,9 +1072,9 @@ def pvequitycashflows(shared, time_grid, deal_data):
                                                   sim_samples[:, :utils.RESET_INDEX_Scenario + 1],
                                                   shared)
     # fetch all fixed resets
-    if past_samples.shape[1].value!=shared.simulation_batch:
+    if past_samples.shape[1].value != shared.simulation_batch:
         past_samples = tf.tile(past_samples, [1, shared.simulation_batch])
-    
+
     all_samples = tf.concat(
         [tf.concat(known_sample, axis=0), past_samples], axis=0) if known_sample else past_samples
 
@@ -1281,10 +1290,8 @@ def pveqbarrieroption(shared, time_grid, deal_data):
     nominal = deal_data.Instrument.field['Units']
     payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Currency']]
 
-    eq_zer_curve = utils.calc_time_grid_curve_rate(
-        deal_data.Factor_dep['Equity_Zero'], deal_time[:-1], shared)
-    eq_div_curve = utils.calc_time_grid_curve_rate(
-        deal_data.Factor_dep['Dividend_Yield'], deal_time[:-1], shared)
+    eq_zer_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Equity_Zero'], deal_time[:-1], shared)
+    eq_div_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Dividend_Yield'], deal_time[:-1], shared)
 
     spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
 
@@ -1294,13 +1301,11 @@ def pveqbarrieroption(shared, time_grid, deal_data):
     else:
         tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
 
-    b = tf.squeeze(eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1),
-                                               multiply_by_time=False) -
-                   eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1),
-                                               multiply_by_time=False), axis=1)
+    b = tf.squeeze(
+        eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
+        eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
-    fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency,
-                                 deal_time, shared)
+    fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
 
     pv = pvbarrieroption(
         shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency,

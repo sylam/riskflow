@@ -82,7 +82,7 @@ def load_market_data(rundate, path, json_name='MarketData.json', cva_default=Tru
     :param cva_default: loads a survival curve with recovery 50% (useful for testing)
     :return: a context object with the data and calendars loaded
     """
-    from riskflow.config import Context
+    from riskflow.adaptiv import AdaptivContext as Context
 
     context = Context()
     context.parse_json(os.path.join(path, rundate, json_name))
@@ -108,7 +108,9 @@ def run_baseval(context, overrides=None):
     :return: a tuple containing the calculation object and the output dictionary
     """
     from riskflow.calculation import construct_calculation
-    calc_params = context.deals['Calculation']
+    calc_params = context.deals.get('Calculation',
+                                    {'Base_Date': context.params['System Parameters']['Base_Date'],
+                                     'Currency': 'ZAR'})
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     params_bv = {'calc_name': ('baseval',), 'Run_Date': rundate,
@@ -134,7 +136,11 @@ def run_cmc(context, overrides=None, prec=np.float32, CVA=True, FVA=False, CollV
     :return: a tuple containing the calculation object, output dictionary and exposure profile
     """
     from riskflow.calculation import construct_calculation
-    calc_params = context.deals['Calculation']
+    calc_params = context.deals.get('Calculation',
+                                    {'Base_Date': context.params['System Parameters']['Base_Date'],
+                                     'Base_Time_Grid': '0d 2d 1w(1w) 1m(1m) 3m(3m)',
+                                     'Deflation_Interest_Rate': 'ZAR-SWAP',
+                                     'Currency': 'ZAR'})
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     time_grid = str(calc_params['Base_Time_Grid'])

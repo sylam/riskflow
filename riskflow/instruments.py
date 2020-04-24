@@ -2031,9 +2031,9 @@ class SwaptionDeal(Deal):
             field_index['FloatStartIndex'] = np.zeros(1, dtype=np.int32)
 
         # might want to change this
-        field_index['Underlying_Swap_maturity'] = utils.get_day_count_accrual(base_date, (
-                self.field['Swap_Maturity_Date'] - self.field['Swap_Effective_Date']).days,
-                                                                              utils.get_day_count(Index_Day_Count))
+        field_index['Underlying_Swap_maturity'] = utils.get_day_count_accrual(
+            base_date, (self.field['Swap_Maturity_Date'] - self.field['Swap_Effective_Date']).days,
+            utils.get_day_count(Index_Day_Count))
 
         return field_index
 
@@ -2053,17 +2053,17 @@ class SwaptionDeal(Deal):
                                      deal_time, shared)
 
         delta = 1.0 if self.field['Payer_Receiver'] == 'Payer' else -1.0
-        pvbp = -delta * pricing.pvfixedcashflows(shared, time_grid, child_map['CFFixedInterestListDeal'],
-                                                 ignore_fixed_rate=True, settle_cash=False)
-        vfixed = -delta * pricing.pvfixedcashflows(shared, time_grid, child_map['CFFixedInterestListDeal'],
-                                                   ignore_fixed_rate=False, settle_cash=False)
+        pvbp = -delta * pricing.pvfixedcashflows(
+            shared, time_grid, child_map['CFFixedInterestListDeal'], ignore_fixed_rate=True, settle_cash=False)
+        vfixed = -delta * pricing.pvfixedcashflows(
+            shared, time_grid, child_map['CFFixedInterestListDeal'], ignore_fixed_rate=False, settle_cash=False)
         vfloat = delta * pricing.pvfloatcashflowlist(shared, time_grid, child_map['CFFloatingInterestListDeal'],
                                                      pricing.pricer_float_cashflows, settle_cash=False)
         if child_map['CFFloatingInterestListDeal'].Factor_dep['Cashflows'].schedule[:,
            utils.CASHFLOW_INDEX_FloatMargin].any():
             # note that the margin index is the same as the fixed rate index - so this should pv the margin amounts
-            vmargin = delta * pricing.pvfixedcashflows(shared, time_grid, child_map['CFFloatingInterestListDeal'],
-                                                       ignore_fixed_rate=False, settle_cash=False)
+            vmargin = delta * pricing.pvfixedcashflows(
+                shared, time_grid, child_map['CFFloatingInterestListDeal'], ignore_fixed_rate=False, settle_cash=False)
         else:
             vmargin = 0.0
 
