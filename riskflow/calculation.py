@@ -40,7 +40,7 @@ from riskflow.instruments import get_fxrate_factor, get_recovery_rate, get_inter
 # import the hessian function
 from riskflow.pricing import SensitivitiesEstimator
 # import the documentation and utils modules
-from riskflow import utils, documentation
+from riskflow import utils
 
 
 class InstrumentExpired(Exception):
@@ -345,7 +345,8 @@ class Calculation(object):
                         factor.append(factor_values[rate_name].current_value(rate_non_zero).flatten())
                     else:
                         sub_rate, param = rate_name.rsplit('.', 1)
-                        factor.append(factor_values[sub_rate].current_value()[param].flatten())
+                        sub_rate_non_zero = grad_index[non_zero].shape[0]
+                        factor.append(factor_values[sub_rate].current_value()[param].flatten()[:sub_rate_non_zero])
 
             tenors = np.vstack(tenor)
             self.hessian_index = (np.hstack(hessian_index[0]), np.vstack(hessian_index[1]))
@@ -924,16 +925,8 @@ class Credit_Monte_Carlo(Calculation):
         if params.get('Generate_Slideshow','No') == 'Yes':
             # we need to generate scenarios to draw pictures . . .
             params['Calc_Scenarios'] = 'Yes'
-            # check if we need to compare the results to an externally produced result
-            compare_output = pd.read_csv(params['PFE_Recon_File'], index_col=0, parse_dates=True) \
-                if params['PFE_Recon_File'] else None
             # set the name of this calculation
             self.name = params['calc_name'][0]
-            # create some slides
-            # self.documentation = documentation.Elaboration(self.name)
-        else:
-            compare_output = ''
-            # self.documentation = documentation.NoElaboration()
 
         # Define the base and scenario grids
         self.input_time_grid = params['Time_grid']
