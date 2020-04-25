@@ -847,11 +847,11 @@ def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
         payment_all = cashflows[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1) * growth * interest
 
         # reduce if any counts are duplicated
-        if cash_counts[cash_counts > 1].any():
-            payments = tf.stack([tf.reduce_sum(payment, axis=1) for payment in tf.split(
-                payment_all, cash_counts, axis=1)], axis=1)
-        else:
+        if (cash_counts == 1).all():
             payments = payment_all
+        else:
+            payments = tf.stack(
+                [tf.reduce_sum(payment, axis=1) for payment in tf.split(payment_all, cash_counts, axis=1)], axis=1)
 
         # add it to the list
         mtm_list.append(tf.reduce_sum(payments * discount_rates, axis=1))
