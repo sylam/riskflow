@@ -615,8 +615,11 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
             # handle the common case of no compounding:
             if mtm_currency is None and factor_dep['CompoundingMethod'] == 'None':
                 interest = all_int * reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1)
-                split_interest = tf.split(interest, cash_counts, axis=1)
-                total = tf.stack([tf.reduce_sum(i, axis=1) for i in split_interest], axis=1)
+                if cash_counts[cash_counts > 1].any():
+                    split_interest = tf.split(interest, cash_counts, axis=1)
+                    total = tf.stack([tf.reduce_sum(i, axis=1) for i in split_interest], axis=1)
+                else:
+                    total = interest
             else:
                 # check if there are a different number of resets per cashflow
                 if (cash_counts.min() != cash_counts.max()):
