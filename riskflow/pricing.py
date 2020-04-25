@@ -614,10 +614,9 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
 
             # handle the common case of no compounding:
             if mtm_currency is None and factor_dep['CompoundingMethod'] == 'None':
-                split_nominals = np.split(reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal], cash_index[1:])
-                split_interest = tf.split(all_int, cash_counts, axis=1)
-                total = tf.stack([tf.reduce_sum(nominals.reshape(1, -1, 1) * interest, axis=1)
-                                  for nominals, interest in zip(split_nominals, split_interest)], axis=1)
+                interest = all_int * reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1)
+                split_interest = tf.split(interest, cash_counts, axis=1)
+                total = tf.stack([tf.reduce_sum(i, axis=1) for i in split_interest], axis=1)
             else:
                 # check if there are a different number of resets per cashflow
                 if (cash_counts.min() != cash_counts.max()):
@@ -844,19 +843,12 @@ def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
                 all_final_index_vals / all_base_index_vals)
         payment_all = cashflows[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1) * growth * interest
 
-        if cash_counts.min() != cash_counts.max():
-            payment = tf.pad(payment_all, [[0, 0], [0, 1], [0, 0]])
+        # reduce if any counts are duplicated
+        if cash_counts[cash_counts > 1].any():
+            payments = tf.stack([tf.reduce_sum(payment, axis=1) for payment in tf.split(
+                payment_all, cash_counts, axis=1)], axis=1)
         else:
-            payment = payment_all
-
-        payments = 0.0
-        default_offst = np.ones(cash_index.size, dtype=np.int32) * (payment.shape[1].value - 1)
-
-        for i in range(cash_counts.max()):
-            offst = default_offst.copy()
-            offst[cash_counts > i] = i + cash_index[cash_counts > i]
-            int_i = tf.cast(tf.gather(payment, offst, axis=1), shared.precision)
-            payments += int_i
+            payments = payment_all
 
         # add it to the list
         mtm_list.append(tf.reduce_sum(payments * discount_rates, axis=1))

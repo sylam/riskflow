@@ -530,9 +530,10 @@ class TensorCashFlows(TensorSchedule):
     def add_mtm_payments(self, base_date, principal_exchange, effective_date, day_count):
         ''' MTM CCIRS's only need a zero marker for the nominal should the effective date be in the future '''
         if (principal_exchange in ['Start_Maturity', 'Start']) and base_date <= effective_date:
-            self.insert_cashflow(
-                make_cashflow(base_date, effective_date, effective_date, effective_date, 0.0, get_day_count(day_count),
-                              0.0, 0.0))
+            dummy_cashflow = make_cashflow(
+                base_date, base_date-pd.offsets.Day(1), effective_date,
+                effective_date, 0.0, get_day_count(day_count), 0.0, 0.0)
+            self.insert_cashflow(dummy_cashflow)
 
     def add_fixed_payments(self, base_date, principal_exchange, effective_date, day_count, principal):
         ''' Regular CCIRS's might need to exchange principle at the start and end '''
