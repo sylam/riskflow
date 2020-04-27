@@ -2331,7 +2331,7 @@ def compress_no_compounding(cashflows, groupsize):
                 cashflow_reset_offsets.extend(cashflows.offsets[index:index + num_cf].tolist())
 
         approx_cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
-        approx_cashflows.set_resets(all_resets, reset_scenario_offsets)
+        approx_cashflows.set_resets(all_resets, reset_scenario_offsets, isFloat=True)
         logging.warning('Cashflows reduced from {} resets to {} resets'.format(cashflows.Resets.count(),
                                                                                approx_cashflows.Resets.count()))
         return approx_cashflows
