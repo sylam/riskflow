@@ -585,7 +585,7 @@ class NettingCollateralSet(Deal):
 
             # add more valuation nodes
             node_resets.update(node_additions)
-            
+
             # finally let the children know about the new grid
             final_grid = np.array(sorted(node_resets))
             for child in node_children:
@@ -593,7 +593,7 @@ class NettingCollateralSet(Deal):
                     child.finalize_dates(parser, base_date, grid, node_children, node_resets, node_settlements)
                 else:
                     child_expiry = max(child.get_reval_dates())
-                    child.add_reval_dates( set(final_grid[:final_grid.searchsorted(child_expiry)]) )
+                    child.add_reval_dates(set(final_grid[:final_grid.searchsorted(child_expiry)]))
         else:
             for child in node_children:
                 child.add_reval_date_offset(1)
@@ -2501,7 +2501,7 @@ class EquityBarrierOption(Deal):
             else:
                 for curr, cash_flow in self.settlement_currencies.items():
                     last_pmt = max(cash_flow)
-                    delta = set([x for x in grid if x<last_pmt])
+                    delta = set([x for x in grid if x < last_pmt])
                     self.settlement_currencies[curr].update(delta)
                     self.reval_dates.update(delta)
 
@@ -2659,6 +2659,7 @@ class EquitySwapletListDeal(Deal):
 class EquitySwapLeg(Deal):
     # dependent price factors for this instrument
     factor_fields = {'Currency': ['FxRate'],
+                     'Payoff_Currency': ['FxRate'],
                      'Equity_Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity': ['EquityPrice', 'DividendRate']}
@@ -2679,10 +2680,12 @@ class EquitySwapLeg(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {'Currency': utils.check_rate_name(self.field['Currency']),
-                 'Equity': utils.check_rate_name(self.field['Equity'])}
-        field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
-            field['Currency']
+        field = {
+            'Currency': utils.check_rate_name(self.field['Currency']),
+            'Equity': utils.check_rate_name(self.field['Equity'])
+        }
+        field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] \
+            else field['Currency']
         field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency'])
 
         # Implicitly we assume that units is the number of shares (Principle is 0) and that Dividend Timing is
@@ -2695,10 +2698,19 @@ class EquitySwapLeg(Deal):
             self.field['Known_Dividends'] else 0.0
 
         # sometimes the equity price is listed but in the past - need to check for this
-        if self.field['Equity_Known_Prices'] and start_prices == (None, None):
-            earlier_dates = [x for x in self.field['Equity_Known_Prices'].data.keys() if
-                             x < self.field['Effective_Date']]
-            start_prices = self.field['Equity_Known_Prices'].data[max(earlier_dates)] if earlier_dates else (None, None)
+        if self.field['Equity_Known_Prices']:
+            if start_prices == (None, None):
+                earlier_dates = [x for x in self.field['Equity_Known_Prices'].data.keys() if
+                                 x < self.field['Effective_Date']]
+                start_prices = self.field['Equity_Known_Prices'].data[
+                    max(earlier_dates)] if earlier_dates else (None, None)
+            # if the end price is not provided, use the current spot price as a proxy
+            if end_prices == (None, None):
+                current_price = all_factors.get(utils.Factor('EquityPrice', field['Equity'])).current_value()[0]
+                fx_reset = 1.0 if field['Currency'] == field['Payoff_Currency'] else all_factors.get(
+                    utils.Factor('FxRate', field['Currency'])).current_value()[0] / all_factors.get(
+                    utils.Factor('FxRate', field['Payoff_Currency'])).current_value()[0]
+                end_prices = [current_price, fx_reset]
 
         field['cashflow'] = {'Items':
             [{
@@ -2773,7 +2785,7 @@ class FXOneTouchOption(Deal):
                 # this is called if the grid is fully defined i.e. a set of dates
                 for curr, cash_flow in self.settlement_currencies.items():
                     last_pmt = max(cash_flow)
-                    delta = set([x for x in grid if x<last_pmt])
+                    delta = set([x for x in grid if x < last_pmt])
                     self.settlement_currencies[curr].update(delta)
                     self.reval_dates.update(delta)
 
@@ -2848,10 +2860,10 @@ class FXBarrierOption(Deal):
                 # this is called if the grid is fully defined i.e. a set of dates
                 for curr, cash_flow in self.settlement_currencies.items():
                     last_pmt = max(cash_flow)
-                    delta = set([x for x in grid if x<last_pmt])
+                    delta = set([x for x in grid if x < last_pmt])
                     self.settlement_currencies[curr].update(delta)
                     self.reval_dates.update(delta)
-                
+
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
@@ -2997,7 +3009,7 @@ class DealDefaultSwap(Deal):
     def reset(self, calendars):
         super(DealDefaultSwap, self).reset()
         bus_day = calendars.get(self.field['Calendars'], {'businessday': pd.offsets.Day(1)})['businessday']
-        if list(self.field['Pay_Frequency'].kwds.values())==[0]:
+        if list(self.field['Pay_Frequency'].kwds.values()) == [0]:
             self.resetdates = pd.DatetimeIndex([self.field['Effective_Date'], self.field['Maturity_Date']])
         else:
             self.resetdates = generate_dates_backward(
