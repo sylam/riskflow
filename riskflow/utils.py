@@ -480,10 +480,12 @@ class TensorCashFlows(TensorSchedule):
         super(TensorCashFlows, self).__init__(schedule, offsets)
 
     def known_fx_resets(self, num_scenarios, index=CASHFLOW_INDEX_FXResetValue,
-                        filter_index=CASHFLOW_INDEX_Start_Day):
+                        filter_index=RESET_INDEX_Reset_Day):
 
+        # note that we use the RESET_INDEX_Reset_Day for determining known FX resets
+        # we only use CASHFLOW_INDEX_FXResetDate for future FX Resets - it's a little confusing
         return [tf.fill([1, num_scenarios], x[index].astype(Default_Precision))
-                for x in self.schedule if x[filter_index] < 0.0]
+                for x, r in zip(self.schedule, self.Resets.schedule) if r[filter_index] < 0.0]
 
     def get_par_swap_rate(self, base_date, ir_curve):
         """Used to calculate the par swap rate for these cashflows given an interest rate curve"""
