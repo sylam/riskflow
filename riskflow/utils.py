@@ -382,6 +382,12 @@ class TensorResets(TensorSchedule):
         return np.searchsorted(self.schedule[:, RESET_INDEX_Reset_Day] - offset,
                                time_grid[:, TIME_GRID_MTM]).astype(np.int64)
 
+    def split_groups(self, group_size):
+        groups = []
+        for i in range(group_size):
+            groups.append(TensorResets(self.schedule[i::group_size], self.offsets[i::group_size]))
+        return groups
+
 
 class FloatTensorResets(TensorSchedule):
     def __init__(self, schedule, offsets):
@@ -2015,7 +2021,7 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
                 # only add a reset if its in the past
                 r.append([Time_Grid, Reset_Day, -1, Start_Day, 0, Weight,
                           cashflow['Known_' + reset + '_Price'] if Start_Day <= 0 else 0.0,
-                          cashflow['Known_' + reset + 'FX_Rate'] if Start_Day <= 0 else 0.0])
+                          cashflow['Known_' + reset + '_FX_Rate'] if Start_Day <= 0 else 0.0])
                 reset_scenario_offsets.append(Scenario)
 
             d = []

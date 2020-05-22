@@ -312,7 +312,8 @@ class Deal(object):
         return pricing.interpolate(mtm, shared, time_grid, deal_data)
 
     def generate(self, shared, time_grid, deal_data):
-        raise Exception('generate in class {0} not implemented yet'.format(self.__class__.__name__))
+        raise Exception('generate in class {} not implemented yet for deal {}'.format(
+            self.__class__.__name__, deal_data.Instrument.field.get('Reference')))
 
 
 class NettingCollateralSet(Deal):
@@ -2720,9 +2721,9 @@ class EquitySwapLeg(Deal):
                 'Start_Multiplier': 1.0,
                 'End_Multiplier': 1.0,
                 'Known_Start_Price': start_prices[0],
-                'Known_StartFX_Rate': start_prices[1],
+                'Known_Start_FX_Rate': start_prices[1],
                 'Known_End_Price': end_prices[0],
-                'Known_EndFX_Rate': end_prices[1],
+                'Known_End_FX_Rate': end_prices[1],
                 'Known_Dividend_Sum': start_dividend_sum,
                 'Dividend_Multiplier': 1.0 if self.field['Include_Dividends'] == 'Yes' else 0.0,
                 'Amount': self.field['Units']
