@@ -539,7 +539,7 @@ class TensorCashFlows(TensorSchedule):
         ''' MTM CCIRS's only need a zero marker for the nominal should the effective date be in the future '''
         if (principal_exchange in ['Start_Maturity', 'Start']) and base_date <= effective_date:
             dummy_cashflow = make_cashflow(
-                base_date, base_date-pd.offsets.Day(1), effective_date,
+                base_date, base_date - pd.offsets.Day(1), effective_date,
                 effective_date, 0.0, get_day_count(day_count), 0.0, 0.0)
             self.insert_cashflow(dummy_cashflow)
 
@@ -1911,14 +1911,12 @@ def make_fixed_cashflows(reference_date, position, cashflows, settlement_date):
     cash = []
     reset_offsets = []
 
-    for cashflow in cashflows['Items']:
+    for cashflow in sorted(cashflows['Items'], key=lambda x: x['Payment_Date']):
         rate = cashflow['Rate'] if isinstance(cashflow['Rate'], float) else cashflow['Rate'].amount
         if cashflow['Payment_Date'] >= reference_date and (
                 (cashflow['Payment_Date'] >= settlement_date) if settlement_date else True):
-            Accrual_Start_Date = cashflow['Accrual_Start_Date'] if cashflow['Accrual_Start_Date'] else cashflow[
-                'Payment_Date']
-            Accrual_End_Date = cashflow['Accrual_End_Date'] if cashflow['Accrual_End_Date'] else cashflow[
-                'Payment_Date']
+            Accrual_Start_Date = cashflow.get('Accrual_Start_Date', cashflow['Payment_Date'])
+            Accrual_End_Date = cashflow.get('Accrual_End_Date', cashflow['Payment_Date'])
             cash.append([(Accrual_Start_Date - reference_date).days, (Accrual_End_Date - reference_date).days,
                          (cashflow['Payment_Date'] - reference_date).days,
                          cashflow['Accrual_Year_Fraction'], position * cashflow['Notional'],
@@ -1955,7 +1953,7 @@ def make_simple_fixed_cashflows(reference_date, position, cashflows):
     Generates a vector of fixed cashflows from a data source only looking at the actual fixed value.
     """
     cash = OrderedDict()
-    for cashflow in cashflows['Items']:
+    for cashflow in sorted(cashflows['Items'], key=lambda x: x['Payment_Date']):
         if cashflow['Payment_Date'] >= reference_date:
             tenor = (cashflow['Payment_Date'] - reference_date).days
             if tenor in cash:
@@ -1975,7 +1973,7 @@ def make_energy_fixed_cashflows(reference_date, position, cashflows):
     Generates a vector of fixed cashflows from a data source only looking at the actual fixed value.
     """
     cash = []
-    for cashflow in cashflows['Items']:
+    for cashflow in sorted(cashflows['Items'], key=lambda x: x['Payment_Date']):
         if cashflow['Payment_Date'] >= reference_date:
             cash.append(
                 [(cashflow['Payment_Date'] - reference_date).days, (cashflow['Payment_Date'] - reference_date).days,
@@ -2001,12 +1999,12 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
     divi_scenario_offsets = []
     dividend_sample_frq = pd.DateOffset(months=1)
 
-    for cashflow in cashflows['Items']:
+    for cashflow in sorted(cashflows['Items'], key=lambda x: (x['Payment_Date'], x['End_Date'], x['Start_Date'])):
         if cashflow['Payment_Date'] >= base_date:
             cash.append([(cashflow['Start_Date'] - base_date).days, (cashflow['End_Date'] - base_date).days,
-                         (cashflow['Payment_Date'] - base_date).days,
-                         cashflow['Start_Multiplier'], cashflow['End_Multiplier'], position * cashflow['Amount'],
-                         cashflow['Dividend_Multiplier'], 0.0, 0.0])
+                         (cashflow['Payment_Date'] - base_date).days, cashflow.get('Start_Multiplier', 1.0),
+                         cashflow.get('End_Multiplier', 1.0), position * cashflow['Amount'],
+                         cashflow.get('Dividend_Multiplier', 1.0), 0.0, 0.0])
 
             r = []
             for reset in ['Start', 'End']:
@@ -2020,8 +2018,8 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
 
                 # only add a reset if its in the past
                 r.append([Time_Grid, Reset_Day, -1, Start_Day, 0, Weight,
-                          cashflow['Known_' + reset + '_Price'] if Start_Day <= 0 else 0.0,
-                          cashflow['Known_' + reset + '_FX_Rate'] if Start_Day <= 0 else 0.0])
+                          cashflow.get('Known_' + reset + '_Price') if Start_Day <= 0 else 0.0,
+                          cashflow.get('Known_' + reset + '_FX_Rate', 0.0) if Start_Day <= 0 else 0.0])
                 reset_scenario_offsets.append(Scenario)
 
             d = []
@@ -2118,7 +2116,7 @@ def make_index_cashflows(base_date, time_grid, position, cashflows, price_index,
     final_resets = []
     final_scenario_offsets = []
 
-    for cashflow in cashflows['Items']:
+    for cashflow in sorted(cashflows['Items'], key=lambda x: x['Payment_Date']):
         if cashflow['Payment_Date'] >= base_date and (
                 (cashflow['Payment_Date'] >= settlement_date) if settlement_date else True):
             Pay_Date = (cashflow['Payment_Date'] - base_date).days
@@ -2190,7 +2188,9 @@ def make_float_cashflows(reference_date, time_grid, position, cashflows):
     cashflow_reset_offsets = []
     reset_scenario_offsets = []
 
-    for cashflow in cashflows['Items']:
+    for cashflow in sorted(
+            cashflows['Items'], key=lambda x: (x['Payment_Date'], x['Accrual_End_Date'], x['Accrual_Start_Date'])):
+
         if cashflow['Payment_Date'] >= reference_date:
             # potential FX resets
             fx_reset_date = (cashflow.get('FX_Reset_Date') - reference_date).days \
@@ -2244,7 +2244,7 @@ def make_energy_cashflows(reference_date, time_grid, position, cashflows, refere
     reset_scenario_offsets = []
     forward_calendar_bday = calendars.get(forwardsample.get_holiday_calendar(), {'businessday': 'B'})['businessday']
 
-    for cashflow in cashflows['Items']:
+    for cashflow in sorted(cashflows['Items'], key=lambda x: (x['Payment_Date'], x['Period_End'], x['Period_Start'])):
         if cashflow['Payment_Date'] >= reference_date:
             cash.append(
                 [(cashflow['Period_Start'] - reference_date).days, (cashflow['Period_End'] - reference_date).days,
