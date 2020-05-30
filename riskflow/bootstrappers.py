@@ -149,6 +149,7 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
 
             if not (float_cash[fixed_indices, utils.CASHFLOW_INDEX_Pay_Day] ==
                     fixed_cash[:, utils.CASHFLOW_INDEX_Pay_Day]).all():
+                logging.error('Float leg and Fixed legs do not coincide')
                 raise Exception('Float leg and Fixed legs do not coincide')
 
             # set the float leg fixed amount

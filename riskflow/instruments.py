@@ -36,22 +36,26 @@ def adjust_date(bus_day, modified, date):
     return bus_day.rollback(date) if (modified and adj_date.month != date.month) else adj_date
 
 
-def generate_dates_backward(end_date, start_date, period, bus_day=None, clip=True, modified=False):
+def generate_dates_backward(end_date, start_date, date_offset, bus_day=None, clip=True, modified=False):
     i, new_date = 1, end_date
     dates = [adjust_date(bus_day, modified, new_date)]
+    date_kwds = date_offset.kwds.items()
     while new_date > start_date:
-        new_date = max(start_date, end_date - i * period) if clip else end_date - i * period
+        period = pd.DateOffset(**{k: i * v for k, v in date_kwds})
+        new_date = max(start_date, end_date - period) if clip else end_date - period
         dates.append(adjust_date(bus_day, modified, new_date))
         i += 1
     dates.reverse()
     return pd.DatetimeIndex(dates)
 
 
-def generate_dates_forward(end_date, start_date, period, bus_day=None, clip=True, modified=False):
+def generate_dates_forward(end_date, start_date, date_offset, bus_day=None, clip=True, modified=False):
     i, new_date = 1, start_date
     dates = [adjust_date(bus_day, modified, new_date)]
+    date_kwds = date_offset.kwds.items()
     while new_date < end_date:
-        new_date = min(end_date, start_date + i * period) if clip else start_date + i * period
+        period = pd.DateOffset(**{k: i * v for k, v in date_kwds})
+        new_date = min(end_date, start_date + period) if clip else start_date + period
         dates.append(adjust_date(bus_day, modified, new_date))
         i += 1
     return pd.DatetimeIndex(dates)
