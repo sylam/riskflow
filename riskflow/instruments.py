@@ -2602,6 +2602,40 @@ class EquityForwardDeal(Deal):
         return cash * discount_rates * fx_rep
 
 
+class EquityDeal(Deal):
+    factor_fields = {'Currency': ['FxRate'],
+                     'Equity': ['EquityPrice']}
+
+    documentation = ('FX and Equity', ['Described [here](Definitions#forwards)'])
+
+    def __init__(self, params, valuation_options):
+        super(EquityDeal, self).__init__(params, valuation_options)
+
+    def reset(self, calendars):
+        super(EquityDeal, self).reset()
+        self.add_reval_dates({self.field['Investment_Horizon']}, self.field['Currency'])
+
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
+
+        field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+                       'Expiry': (self.field['Investment_Horizon'] - base_date).days}
+        # TODO - Add more detail for dividend payments etc.
+        return field_index
+
+    def generate(self, shared, time_grid, deal_data):
+        factor_dep = deal_data.Factor_dep
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        spot = utils.calc_time_grid_spot_rate(factor_dep['Equity'], deal_time, shared)
+        fx_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
+        nominal = (1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0) * self.field['Units']
+        cash = nominal * spot
+        return cash * fx_rep
+
+
 class EquitySwapletListDeal(Deal):
     # dependent price factors for this instrument
     factor_fields = {'Currency': ['FxRate'],
