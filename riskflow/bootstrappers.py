@@ -441,7 +441,7 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
 
         def print_fun(x, f, accepted):
             logging.debug("at minimum %.4f accepted %d" % (f, int(accepted)))
-            if f < 0.1:
+            if f < 100.0:
                 return True
 
         optimizer_kwargs = dict(optimizer_kwargs.items())
@@ -460,7 +460,7 @@ class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
 
         import scipy.optimize
         result = scipy.optimize.basinhopping(
-            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=100, T=2.5,
+            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=100, T=25.0,
             accept_test=accept_test, callback=print_fun, take_step=take_step)
 
         message_lines = [
@@ -826,6 +826,8 @@ class RiskNeutralInterestRateModel(object):
                     # check the time
                     time_now = time.clock()
                     batch_loss, vars = sess.run([loss, implied_var])
+                    # initialize the soln with the current values
+                    soln = (batch_loss, vars)
                     logging.info('{} - Batch loss {}'.format(market_factor.name[0], batch_loss))
                     for k, v in sorted(vars.items()):
                         logging.info('{} - {}'.format(k, v))
@@ -837,13 +839,12 @@ class RiskNeutralInterestRateModel(object):
                             k, price, v, 100.0 * (price - sim_swaptions[k]) / price))
 
                     # minimize
-                    soln = None
                     num_optimizers = len(optimizers)
                     for op_loop in range(2 * num_optimizers):
                         optimizers[op_loop % num_optimizers].minimize(sess)
                         batch_loss, vars = sess.run([loss, implied_var])
 
-                        if soln is None or batch_loss < soln[0]:
+                        if batch_loss < soln[0]:
                             soln = (batch_loss, vars)
                             logging.info('{} - run {} - Batch loss {}'.format(
                                 market_factor.name[0], op_loop, batch_loss))
@@ -1047,17 +1048,17 @@ scipy.optimize.leastsq.html) are used.',
 
         sigma_bounds = (1e-4, 0.09)
         alpha_bounds = (1e-4, 2.4)
-        corr_bounds = (-.92, 0.92)
+        corr_bounds = (-.93, 0.93)
 
         # slightly different bounds for the least squares calc
         lq_sigma_bounds = (1e-5, 0.095)
-        lq_alpha_bounds = (1e-5, 2.5)
-        lq_corr_bounds = (-.93, 0.93)
+        lq_alpha_bounds = (5.5e-5, 2.5)
+        lq_corr_bounds = (-.94, 0.94)
 
         var_to_bounds = make_bounds(implied_var, sigma_bounds, corr_bounds, alpha_bounds)
         var_to_bounds_lq = make_bounds(implied_var, lq_sigma_bounds, lq_corr_bounds, lq_alpha_bounds)
 
-        bounds_ok, make_step = make_basin_callbacks(0.25, sigma_bounds, alpha_bounds, corr_bounds)
+        bounds_ok, make_step = make_basin_callbacks(0.125, sigma_bounds, alpha_bounds, corr_bounds)
 
         optimizers = [
             ScipyBasinOptimizerInterface(
@@ -1073,7 +1074,7 @@ scipy.optimize.leastsq.html) are used.',
         return loss, optimizers, implied_var, calibrated_swaptions, market_swaptions, benchmarks
 
     def implied_process(self, base_currency, price_factors, price_models, ir_curve, rate):
-        vol_tenors = np.array([0, 1, 2, 3, 6, 12, 24, 48, 84, 120]) / 12.0
+        vol_tenors = np.array([0, 1, 3, 6, 12, 24, 48, 72, 96, 120]) / 12.0
         # construct an initial guess - need to read from params
         param_name = utils.check_tuple_name(
             utils.Factor(type='HullWhite2FactorModelParameters', name=rate[1:]))
