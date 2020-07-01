@@ -507,9 +507,7 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
 
         # fetch fx rates - note that there is a slight difference between this and the spot fx rate
         old_fx_rates = tf.squeeze(
-            tf.concat([tf.stack(known_fx), sim_fx_forward]
-                      if known_fx
-                      else sim_fx_forward, axis=0), axis=1)
+            tf.concat([tf.stack(known_fx), sim_fx_forward] if known_fx else sim_fx_forward, axis=0), axis=1)
 
     forwards = utils.calc_time_grid_curve_rate(factor_dep['Forward'], deal_time, shared)
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
@@ -517,9 +515,8 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
     reset_values = []
 
     for sim_group in sim_resets:
-        old_resets = utils.calc_time_grid_curve_rate(factor_dep['Forward'],
-                                                     sim_group[:, :utils.RESET_INDEX_Scenario + 1],
-                                                     shared)
+        old_resets = utils.calc_time_grid_curve_rate(
+            factor_dep['Forward'], sim_group[:, :utils.RESET_INDEX_Scenario + 1], shared)
 
         delta_start = (sim_group[:, utils.RESET_INDEX_Start_Day] -
                        sim_group[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
@@ -776,14 +773,13 @@ def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
     def get_index_val(cash_index_vals, schedule, sim_schedule, resets_per_cf, offset):
         if cash_index_vals[cash_index_vals < 0].any():
             num_known = cash_index_vals[cash_index_vals > 0].size
-            known_indices = tf.tile(
-                cash_index_vals[cash_index_vals > 0].reshape(1, -1, 1).astype(shared.precision),
-                (last_pub_block.shape[0], 1, shared.simulation_batch))
             reset_offset = resets_per_cf * (offset + num_known)
             if num_known:
+                known_indices = tf.tile(
+                    cash_index_vals[cash_index_vals > 0].reshape(1, -1, 1).astype(shared.precision),
+                    (last_pub_block.shape[0], 1, shared.simulation_batch))
                 return tf.concat(
-                    [known_indices,
-                     calc_index(schedule[reset_offset:], sim_schedule[reset_offset:])], axis=1)
+                    [known_indices, calc_index(schedule[reset_offset:], sim_schedule[reset_offset:])], axis=1)
             else:
                 return calc_index(schedule[reset_offset:], sim_schedule[reset_offset:])
         else:

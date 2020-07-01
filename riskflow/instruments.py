@@ -71,6 +71,16 @@ def calc_factor_index(field, static_offsets, stochastic_offsets, all_tenors={}):
         raise Exception('Cannot find {}'.format(utils.check_tuple_name(field)))
 
 
+def calc_factor_value(field, static_offsets, stochastic_offsets, all_factors):
+    """Utility function to determine if a factor is static or stochastic and returns its offset in the scenario block"""
+    if static_offsets.get(field) is not None:
+        return all_factors[field].current_value()
+    elif stochastic_offsets.get(field) is not None:
+        return all_factors[field].factor.current_value()
+    else:
+        raise Exception('Cannot find value for {}'.format(utils.check_tuple_name(field)))
+
+
 def get_recovery_rate(name, all_factors):
     """Read the Recovery Rate on a Survival Probability Price Factor"""
     survival_prob = all_factors.get(utils.Factor('SurvivalProb', name))
@@ -109,6 +119,12 @@ def get_fxrate_factor(fieldname, static_offsets, stochastic_offsets):
     """Read the index of the FX rate price factor"""
     return [calc_factor_index(utils.Factor('FxRate', fieldname),
                               static_offsets, stochastic_offsets)]
+
+
+def get_fxrate_spot(fieldname, static_offsets, stochastic_offsets, all_factors):
+    """Read the spot of the FX rate price factor"""
+    return calc_factor_value(
+        utils.Factor('FxRate', fieldname), static_offsets, stochastic_offsets, all_factors)[0]
 
 
 def get_forwardprice_sampling(fieldname, all_factors):
@@ -156,6 +172,12 @@ def get_equity_rate_factor(fieldname, static_offsets, stochastic_offsets):
     """Read the index of the Equity rate price factor"""
     return [calc_factor_index(utils.Factor('EquityPrice', fieldname),
                               static_offsets, stochastic_offsets)]
+
+
+def get_equity_spot(fieldname, static_offsets, stochastic_offsets, all_factors):
+    """Read the spot of the FX rate price factor"""
+    return calc_factor_value(
+        utils.Factor('EquityPrice', fieldname), static_offsets, stochastic_offsets, all_factors)[0]
 
 
 def get_equity_currency_factor(fieldname, static_offsets, stochastic_offsets, all_factors):
@@ -541,6 +563,7 @@ class NettingCollateralSet(Deal):
         if self.field.get('Collateralized', 'False') == 'True':
             # update each child element with extra reval dates
             for child in node_children:
+                #child.add_reval_dates({max(child.get_reval_dates())+pd.offsets.Day(1)})
                 child.add_reval_date_offset(1)
                 settle_liquid = {self.field['Settlement_Period'],
                                  self.field['Settlement_Period'] + self.field['Liquidation_Period']}
@@ -622,18 +645,16 @@ class NettingCollateralSet(Deal):
             field['Balance_Currency'] = utils.check_rate_name(self.field['Balance_Currency']) if self.field[
                 'Balance_Currency'] else field['Agreement_Currency']
 
-            field_index['Agreement_Currency'] = get_fxrate_factor(field['Agreement_Currency'], static_offsets,
-                                                                  stochastic_offsets)
-            field_index['Balance_Currency'] = get_fxrate_factor(field['Balance_Currency'], static_offsets,
-                                                                stochastic_offsets)
+            field_index['Agreement_Currency'] = get_fxrate_factor(
+                field['Agreement_Currency'], static_offsets, stochastic_offsets)
+            field_index['Balance_Currency'] = get_fxrate_factor(
+                field['Balance_Currency'], static_offsets, stochastic_offsets)
 
             # get the settlement currencies loaded
             field_index['Settlement_Currencies'] = OrderedDict()
             for currency in time_grid.CurrencyMap.keys():
-                field_index['Settlement_Currencies'].setdefault(currency,
-                                                                get_fxrate_factor(utils.check_rate_name(currency),
-                                                                                  static_offsets,
-                                                                                  stochastic_offsets))
+                field_index['Settlement_Currencies'].setdefault(
+                    currency, get_fxrate_factor(utils.check_rate_name(currency), static_offsets, stochastic_offsets))
 
             # handle equity collateral
             collateral_defined = False
@@ -2745,10 +2766,11 @@ class EquitySwapLeg(Deal):
                     max(earlier_dates)] if earlier_dates else (None, None)
             # if the end price is not provided, use the current spot price as a proxy
             if end_prices == (None, None):
-                current_price = all_factors.get(utils.Factor('EquityPrice', field['Equity'])).current_value()[0]
-                fx_reset = 1.0 if field['Currency'] == field['Payoff_Currency'] else all_factors.get(
-                    utils.Factor('FxRate', field['Currency'])).current_value()[0] / all_factors.get(
-                    utils.Factor('FxRate', field['Payoff_Currency'])).current_value()[0]
+                current_price = get_equity_spot(field['Equity'], static_offsets, stochastic_offsets, all_factors)
+                fx_reset = 1.0 if field['Currency'] == field['Payoff_Currency'] else get_fxrate_spot(
+                    field['Currency'], static_offsets, stochastic_offsets, all_factors) / get_fxrate_spot(
+                    field['Payoff_Currency'], static_offsets, stochastic_offsets, all_factors)
+
                 end_prices = [current_price, fx_reset]
 
         field['cashflow'] = {'Items':

@@ -988,6 +988,9 @@ scipy.optimize.leastsq.html) are used.',
     def __init__(self, param, prec=np.float32):
         super(HullWhite2FactorModelParameters, self).__init__(param)
         self.market_factor_type = 'HullWhite2FactorInterestRateModelPrices'
+        self.sigma_bounds = (1e-5, 0.09)
+        self.alpha_bounds = (1e-5, 2.4)
+        self.corr_bounds = (-.95, 0.95)
 
     def calc_sample(self, time_grid, numfactors=0):
         if numfactors != 2 or self.sample is None:
@@ -1046,19 +1049,8 @@ scipy.optimize.leastsq.html) are used.',
         losses = list(error.values())
         loss = tf.reduce_sum(losses)
 
-        sigma_bounds = (1e-4, 0.09)
-        alpha_bounds = (1e-4, 2.4)
-        corr_bounds = (-.93, 0.93)
-
-        # slightly different bounds for the least squares calc
-        lq_sigma_bounds = (1e-5, 0.095)
-        lq_alpha_bounds = (5.5e-5, 2.5)
-        lq_corr_bounds = (-.94, 0.94)
-
-        var_to_bounds = make_bounds(implied_var, sigma_bounds, corr_bounds, alpha_bounds)
-        var_to_bounds_lq = make_bounds(implied_var, lq_sigma_bounds, lq_corr_bounds, lq_alpha_bounds)
-
-        bounds_ok, make_step = make_basin_callbacks(0.125, sigma_bounds, alpha_bounds, corr_bounds)
+        var_to_bounds = make_bounds(implied_var, self.sigma_bounds, self.corr_bounds, self.alpha_bounds)
+        bounds_ok, make_step = make_basin_callbacks(0.125, self.sigma_bounds, self.alpha_bounds, self.corr_bounds)
 
         optimizers = [
             ScipyBasinOptimizerInterface(
@@ -1068,7 +1060,7 @@ scipy.optimize.leastsq.html) are used.',
                 var_to_bounds=var_to_bounds)
             , ScipyLeastsqOptimizerInterface(
                 losses, var_list=var_list,
-                var_to_bounds=var_to_bounds_lq)
+                var_to_bounds=var_to_bounds)
         ]
 
         return loss, optimizers, implied_var, calibrated_swaptions, market_swaptions, benchmarks
@@ -1105,13 +1097,13 @@ scipy.optimize.leastsq.html) are used.',
             implied_obj = riskfactors.HullWhite2FactorModelParameters(
                 {'Quanto_FX_Volatility': quanto_fx,
                  'short_rate_fx_correlation': C,
-                 'Alpha_1': np.clip(param['Alpha_1'], 1e-4, 2.4),
-                 'Alpha_2': np.clip(param['Alpha_2'], 1e-4, 2.4),
-                 'Correlation': np.clip(param['Correlation'], -0.95, 0.95),
+                 'Alpha_1': np.clip(param['Alpha_1'], *self.alpha_bounds),
+                 'Alpha_2': np.clip(param['Alpha_2'], *self.alpha_bounds),
+                 'Correlation': np.clip(param['Correlation'], *self.corr_bounds),
                  'Sigma_1': utils.Curve([], list(zip(
-                     vol_tenors, np.interp(vol_tenors, *param['Sigma_1'].array.T).clip(1e-4 + 5e-5, 0.09)))),
+                     vol_tenors, np.interp(vol_tenors, *param['Sigma_1'].array.T).clip(*self.sigma_bounds)))),
                  'Sigma_2': utils.Curve([], list(zip(
-                     vol_tenors, np.interp(vol_tenors, *param['Sigma_2'].array.T).clip(1e-4 + 5e-5, 0.09))))})
+                     vol_tenors, np.interp(vol_tenors, *param['Sigma_2'].array.T).clip(*self.sigma_bounds))))})
         else:
             implied_obj = riskfactors.HullWhite2FactorModelParameters(
                 {'Quanto_FX_Volatility': quanto_fx,
