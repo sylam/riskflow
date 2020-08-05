@@ -100,7 +100,7 @@ def load_market_data(rundate, path, json_name='MarketData.json', cva_default=Tru
     return context
 
 
-def run_baseval(context, overrides=None):
+def run_baseval(context, prec, device, overrides=None):
     """
     Runs a base valuation calculation on the provided context
     :param context: a Context object
@@ -119,12 +119,12 @@ def run_baseval(context, overrides=None):
     if overrides is not None:
         update_dict(params_bv, overrides)
 
-    calc = construct_calculation('Base_Revaluation', context, prec=np.float64)
+    calc = construct_calculation('Base_Revaluation', context, device=device, prec=prec)
     out = calc.execute(params_bv)
     return calc, out
 
 
-def run_cmc(context, overrides=None, prec=np.float32, CVA=True, FVA=False, CollVA=False):
+def run_cmc(context, prec, device, overrides=None, CVA=True, FVA=False, CollVA=False):
     """
     Runs a credit monte carlo calculation on the provided context
     :param context: a Context object
@@ -160,9 +160,8 @@ def run_cmc(context, overrides=None, prec=np.float32, CVA=True, FVA=False, CollV
                          'Counterparty': cva_sect['Counterparty'],
                          # brave choices these . . .
                          'Gradient': 'No', 'Hessian': 'No'},
-                 'FVA': {'Funding_Interest_Curve': 'USD-LIBOR-3M.FUNDING',
-                         'Risk_Free_Curve': 'USD-OIS',
-                         'Counterparty': cva_sect['Counterparty'],
+                 'FVA': {'Funding_Interest_Curve': 'ZAR-SWAP.FUNDING',
+                         'Risk_Free_Curve': 'ZAR-SWAP.OIS',
                          'Stochastic_Funding': 'Yes'},
                  'CollVA': {'Gradient': 'Yes'}
                  }
@@ -177,7 +176,7 @@ def run_cmc(context, overrides=None, prec=np.float32, CVA=True, FVA=False, CollV
     if not CollVA:
         del params_mc['CollVA']
 
-    calc = construct_calculation('Credit_Monte_Carlo', context, prec=prec)
+    calc = construct_calculation('Credit_Monte_Carlo', context, device=device, prec=prec)
     out = calc.execute(params_mc)
     exposure = out['Results']['mtm'].clip(0.0, np.inf)
     dates = np.array(sorted(calc.time_grid.mtm_dates))[

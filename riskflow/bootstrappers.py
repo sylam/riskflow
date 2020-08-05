@@ -19,26 +19,27 @@
 
 # import standard libraries
 import time
+import logging
 from collections import OrderedDict, namedtuple
 
 # third party stuff
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+# import tensorflow as tf
 
 # Internal modules
 from riskflow import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
 
 # misc functions/classes
 from riskflow.calculation import TimeGrid
-from tensorflow.contrib.opt import ExternalOptimizerInterface
+# from tensorflow.contrib.opt import ExternalOptimizerInterface
 
-from tensorflow.python.framework import ops
-from tensorflow.python.ops import array_ops
-from tensorflow.python.platform import tf_logging as logging
+# from tensorflow.python.framework import ops
+# from tensorflow.python.ops import array_ops
+# from tensorflow.python.platform import tf_logging as logging
 
 from scipy.stats import norm
-from tensorflow.python.client import device_lib
+# from tensorflow.python.client import device_lib
 
 curve_calibration_class = namedtuple('shared_mem', 't_Buffer \
                         t_Scenario_Buffer precision simulation_batch')
@@ -423,7 +424,8 @@ class ScipyLeastsqOptimizerInterface(object):
                 for tensor in tensors]
 
 
-class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
+#class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
+class ScipyBasinOptimizerInterface(object):
     """Wrapper allowing `scipy.optimize.basinhopping` to operate a `tf.Session`.
     Implemented exactly the same as ScipyOptimizerInterface
     """
@@ -692,7 +694,7 @@ class RiskNeutralInterestRateModel(object):
         utils.Default_Precision = prec
 
     def calc_loss_on_ir_curve(self, implied_params, base_date, time_grid, process,
-                              implied_obj, ir_factor, vol_surface, resid=tf.square, debug=None):
+                              implied_obj, ir_factor, vol_surface, resid=lambda x:x*x, debug=None):
         # calculate a reverse lookup for the tenors and store the daycount code
         all_tenors = utils.update_tenors(base_date, {ir_factor: process})
         # calculate the curve index - need to clean this up - TODO!!!

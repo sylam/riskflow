@@ -28,7 +28,8 @@ from riskflow import utils, pricing
 # specific modules
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+import torch
+import torch.nn.functional as F
 
 
 def adjust_date(bus_day, modified, date):
@@ -332,7 +333,7 @@ class Deal(object):
         return self.settlement_currencies
 
     def calculate(self, shared, time_grid, deal_data):
-        # generate the theo iprice
+        # generate the theo price
         mtm = self.generate(shared, time_grid, deal_data)
         # interpolate it
         return pricing.interpolate(mtm, shared, time_grid, deal_data)
@@ -1172,20 +1173,18 @@ class FXNonDeliverableForward(Deal):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
 
-        buy_forward = utils.calc_fx_forward(factor_dep['BuyFX'], factor_dep['SettleFX'],
-                                            factor_dep['Maturity'], deal_time, shared)
-        sell_forward = utils.calc_fx_forward(factor_dep['SellFX'], factor_dep['SettleFX'],
-                                             factor_dep['Maturity'], deal_time, shared)
-        FX_rep = utils.calc_fx_cross(factor_dep['SettleFX'][0], shared.Report_Currency,
-                                     deal_time, shared)
+        buy_forward = utils.calc_fx_forward(
+            factor_dep['BuyFX'], factor_dep['SettleFX'], factor_dep['Maturity'], deal_time, shared)
+        sell_forward = utils.calc_fx_forward(
+            factor_dep['SellFX'], factor_dep['SettleFX'], factor_dep['Maturity'], deal_time, shared)
+        FX_rep = utils.calc_fx_cross(
+            factor_dep['SettleFX'][0], shared.Report_Currency, deal_time, shared)
 
-        discount_rates = tf.squeeze(
-            utils.calc_discount_rate(discount,
-                                     (factor_dep['Maturity'] -
-                                      deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1),
-                                     shared),
-            axis=1
-        )
+        discount_rates = torch.squeeze(
+            utils.calc_discount_rate(
+                discount,
+                (factor_dep['Maturity'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1), shared),
+            axis=1)
 
         cash = (buy_forward * self.field['Buy_Amount'] - sell_forward * self.field['Sell_Amount'])
 

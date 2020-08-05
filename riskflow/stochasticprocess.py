@@ -23,7 +23,8 @@ from collections import OrderedDict
 # 3rd party libraries
 import numpy as np
 import scipy.interpolate
-import tensorflow as tf
+import torch
+import torch.nn.functional as F
 
 # Internal modules
 from riskflow import utils
@@ -32,25 +33,31 @@ from riskflow.instruments import get_fx_zero_rate_factor
 
 def piecewise_linear(t, tenor, values, shared):
     if isinstance(values, np.ndarray):
-        # no tensorflow needed - don't even bother caching
+        # no tensors needed - don't even bother caching
         dt = np.diff(t)
         interp = np.interp(t, tenor, values)
         return dt, interp[:-1], np.diff(interp) / dt
     else:
-        key_code = ('piecewise_linear', values.name, tuple(t))
+        key_code = ('piecewise_linear', id(values), tuple(t))
 
-    if key_code not in shared.t_Buffer:
+    if key_code not in shared.t_PreCalc:
         # linear interpolation of the vols at vol_tenor to the grid t
-        dt = np.diff(t)
+        dt = values.new(np.diff(t))
         interp = utils.interpolate_tensor(t, tenor, values)
         grad = (interp[1:] - interp[:-1]) / dt
-        shared.t_Buffer[key_code] = (dt, interp[:-1], grad)
+        shared.t_PreCalc[key_code] = (dt, interp[:-1], grad)
 
     # interpolated vol
-    return shared.t_Buffer[key_code]
+    return shared.t_PreCalc[key_code]
 
 
 def integrate_piecewise_linear(fn_norm, shared, time_grid, tenor1, val1, tenor2=None, val2=None):
+
+    def final_integration_points(only_np, int_points, interp_value):
+        # return all but last point and make a tensor if necessary
+        return int_points[:-1] if only_np else shared.t_PreCalc.setdefault(
+            ('integration', tuple(int_points[:-1])), interp_value.new(int_points[:-1]))
+
     t = np.union1d(0.0, time_grid)
     np_only = isinstance(val1, np.ndarray)
     max_time = time_grid.max()
@@ -62,21 +69,22 @@ def integrate_piecewise_linear(fn_norm, shared, time_grid, tenor1, val1, tenor2=
         _, interp_val1, m1 = piecewise_linear(integration_points, tenor1, val1, shared)
         dt, interp_val2, m2 = piecewise_linear(integration_points, tenor2, val2, shared)
         np_only = np_only and isinstance(val2, np.ndarray)
-        int_fn = fn(integration_points[:-1], interp_val1, interp_val2, dt, m1, m2)
+        t_integration_points = final_integration_points(np_only, integration_points, interp_val1)
+        int_fn = fn(t_integration_points, interp_val1, interp_val2, dt, m1, m2)
     else:
         dt, interp_val, m = piecewise_linear(integration_points, tenor1, val1, shared)
-        int_fn = fn(integration_points[:-1], interp_val, dt, m)
+        t_integration_points = final_integration_points(np_only, integration_points, interp_val)
+        int_fn = fn(t_integration_points, interp_val, dt, m)
 
     if np_only:
         integral = np.pad(np.cumsum(int_fn) / norm, [1, 0], 'constant')
         return integral[integration_points.searchsorted(time_grid)]
     else:
-        integral = tf.pad(tf.cumsum(int_fn) / norm, [[1, 0]])
+        integral = F.pad(torch.cumsum(int_fn, dim=0) / norm, (1, 0))
         if integration_points.size == time_grid.size:
             return integral
         else:
-            # warning - this comes at a cost - it's better to avoid gathers
-            return tf.gather(integral, integration_points.searchsorted(time_grid))
+            return integral[integration_points.searchsorted(time_grid)]
 
 
 # Hull white analytic integrals for 1 and 2 factor models (assuming piecewise linear vols)
@@ -132,17 +140,18 @@ class GBMAssetPriceModel(object):
         return 1
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
         dt = np.diff(np.hstack(([0], time_grid.time_grid_years)))
         var = self.param['Vol'] * self.param['Vol'] * dt
-        drift = shared.precision(self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1)
-        vol = shared.precision(np.sqrt(var)).reshape(-1, 1)
+        self.drift = torch.tensor((self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1),
+                                  device=shared.device, dtype=shared.precision)
+        self.vol = torch.tensor((np.sqrt(var)).reshape(-1, 1), device=shared.device, dtype=shared.precision)
 
         # store a reference to the current tensor
         self.spot = tensor
-
-        with tf.name_scope(self.__class__.__name__):
-            self.f1 = tf.cumsum(drift + vol * shared.t_random_numbers[
-                                              process_ofs, :time_grid.scen_time_grid.size], axis=0, name='F1')
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         pass
@@ -157,8 +166,9 @@ class GBMAssetPriceModel(object):
         return 'LognormalDiffusionProcess', [()]
 
     def generate(self, shared_mem):
-        with tf.name_scope(self.__class__.__name__):
-            return self.spot * tf.exp(self.f1)
+        f1 = (self.drift + self.vol *
+              shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]).cumsum(axis=0)
+        return self.spot * torch.exp(f1)
 
 
 class GBMAssetPriceCalibration(object):
@@ -225,26 +235,26 @@ class GBMAssetPriceTSModelImplied(object):
         def calc_vol(t, v, dt, m):
             return dt * (dt ** 2 * m ** 2 / 3 + dt * m * v + v ** 2)
 
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+        # calc vols
         vols = self.implied.param['Vol'].array
-        self.V = integrate_piecewise_linear((calc_vol, 1.0), shared, time_grid.time_grid_years, vols[:, 0], vols[:, 1])
+        self.V = tensor.new(integrate_piecewise_linear(
+            (calc_vol, 1.0), shared, time_grid.time_grid_years, vols[:, 0], vols[:, 1]))
         # calc the incremental vol
-        delta_V = np.insert(np.diff(self.V), 0, 0).reshape(-1, 1).astype(shared.precision)
-        self.delta_scen_t = np.insert(
-            np.diff(time_grid.scen_time_grid), 0, 0).reshape(-1, 1).astype(shared.precision)
+        self.delta_vol = F.pad(torch.sqrt(self.V[1:] - self.V[:-1]), (1, 0)).reshape(-1, 1)
+        self.delta_scen_t = np.insert(np.diff(time_grid.scen_time_grid), 0, 0).reshape(-1, 1)
         # store a reference to the current tensor
         self.spot = tensor
         # store the scenario grid
         self.scen_grid = time_grid.scenario_grid
 
-        with tf.name_scope(self.__class__.__name__):
-            self.f1 = tf.cumsum(tf.sqrt(delta_V) * shared.t_random_numbers[
-                                                   process_ofs, :time_grid.scen_time_grid.size], axis=0, name='F1')
-
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         # this is valid for FX factors only - can change this to equities etc. by changing the get_XXX_factor
         # function below
-        self.r_t = get_fx_zero_rate_factor(self.factor.get_domestic_currency(None), static_ofs, stoch_ofs,
-                                           all_tenors, all_factors)
+        self.r_t = get_fx_zero_rate_factor(
+            self.factor.get_domestic_currency(None), static_ofs, stoch_ofs, all_tenors, all_factors)
         self.q_t = get_fx_zero_rate_factor(factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
 
     @property
@@ -252,16 +262,18 @@ class GBMAssetPriceTSModelImplied(object):
         return 'LognormalDiffusionProcess', [()]
 
     def generate(self, shared_mem):
-        with tf.name_scope(self.__class__.__name__):
-            rt = utils.calc_time_grid_curve_rate(self.r_t, self.scen_grid, shared_mem)
-            qt = utils.calc_time_grid_curve_rate(self.q_t, self.scen_grid, shared_mem)
+        f1 = torch.cumsum(
+            self.delta_vol * shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], axis=0)
 
-            rt_rates = rt.gather_weighted_curve(shared_mem, self.delta_scen_t)
-            qt_rates = qt.gather_weighted_curve(shared_mem, self.delta_scen_t)
+        rt = utils.calc_time_grid_curve_rate(self.r_t, self.scen_grid, shared_mem)
+        qt = utils.calc_time_grid_curve_rate(self.q_t, self.scen_grid, shared_mem)
 
-            drift = tf.cumsum(tf.squeeze(rt_rates - qt_rates, axis=1), axis=0)
+        rt_rates = rt.gather_weighted_curve(shared_mem, self.delta_scen_t)
+        qt_rates = qt.gather_weighted_curve(shared_mem, self.delta_scen_t)
 
-            return self.spot * tf.exp(drift - 0.5 * self.V.reshape(-1, 1) + self.f1)
+        drift = torch.cumsum(torch.squeeze(rt_rates - qt_rates, axis=1), axis=0)
+
+        return self.spot * torch.exp(drift - 0.5 * self.V.reshape(-1, 1) + f1)
 
 
 class GBMPriceIndexModel(object):
@@ -387,114 +399,98 @@ class HullWhite2FactorImpliedInterestRateModel(object):
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         # get the factor's tenor points
-        factor_tenor = self.factor.get_tenor()
-
-        # store the forward curve    
+        self.factor_tenor = tensor.new(self.factor.get_tenor().reshape(-1, 1))
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+        # store the forward curve
         self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid, shared, ref_date)
-
-        # calculate known functions 
-        alpha = [tf.cast(tf.clip_by_value(implied_tensor['Alpha_1'][0], self.clip[0], self.clip[1]), tf.float64),
-                 tf.cast(tf.clip_by_value(implied_tensor['Alpha_2'][0], self.clip[0], self.clip[1]), tf.float64)]
+        # calculate known functions
+        alpha = [implied_tensor['Alpha_1'][0].type(torch.float64),
+                 implied_tensor['Alpha_2'][0].type(torch.float64)]
         lam = [self.param['Lambda_1'], self.param['Lambda_2']]
-        corr = tf.cast(implied_tensor['Correlation'], tf.float64)
-        vols = [
-            tf.cast(implied_tensor['Sigma_1'], tf.float64, name='Cast.' + implied_tensor['Sigma_1'].name.split(':')[0]),
-            tf.cast(implied_tensor['Sigma_2'], tf.float64, name='Cast.' + implied_tensor['Sigma_2'].name.split(':')[0])]
+        corr = implied_tensor['Correlation'].type(torch.float64)
+        vols = [implied_tensor['Sigma_1'].type(torch.float64),
+                implied_tensor['Sigma_2'].type(torch.float64)]
         vols_tenor = [self.implied.param['Sigma_1'].array[:, 0],
                       self.implied.param['Sigma_2'].array[:, 0]]
 
+        H = [integrate_piecewise_linear(hw_calc_H(alpha[i], torch.exp), shared, time_grid.time_grid_years,
+                                        vols_tenor[i], vols[i]) for i in range(2)]
+        I = [[integrate_piecewise_linear(hw_calc_IJK(alpha[i], torch.exp), shared, time_grid.time_grid_years,
+                                         vols_tenor[i], vols[i], vols_tenor[j], vols[j])
+              for j in range(2)] for i in range(2)]
+        J = [[integrate_piecewise_linear(hw_calc_IJK(alpha[i] + alpha[j], torch.exp), shared, time_grid.time_grid_years,
+                                         vols_tenor[i], vols[i], vols_tenor[j], vols[j])
+              for j in range(2)] for i in range(2)]
+
         # Check if the curve is not the same as the base currency
-        if self.implied.param['Quanto_FX_Volatility']:
+        if self.implied.param['Quanto_FX_Volatility'] and self.implied.param['Quanto_FX_Volatility'].array.any():
             quantofx = self.implied.param['Quanto_FX_Volatility'].array
             quantofxcorr = self.implied.get_quanto_correlation(corr, vols)
+            t_quanto_vol = tensor.new_tensor(quantofx[:, 1], dtype=torch.float64)
+            K = [integrate_piecewise_linear(hw_calc_IJK(alpha[i], torch.exp), shared, time_grid.time_grid_years,
+                                            vols_tenor[i], vols[i], quantofx[:, 0], t_quanto_vol) for i in range(2)]
         else:
             quantofx = np.zeros((1, 2))
             quantofxcorr = [0.0, 0.0]
+            K = [corr.new_zeros(time_grid.time_grid_years.size) for i in range(2)]
 
-        H = [integrate_piecewise_linear(hw_calc_H(alpha[i], tf.exp), shared, time_grid.time_grid_years,
-                                        vols_tenor[i], vols[i]) for i in range(2)]
-        I = [[integrate_piecewise_linear(hw_calc_IJK(alpha[i], tf.exp), shared, time_grid.time_grid_years,
-                                         vols_tenor[i], vols[i], vols_tenor[j], vols[j])
-              for j in range(2)] for i in range(2)]
-        J = [[integrate_piecewise_linear(hw_calc_IJK(alpha[i] + alpha[j], tf.exp), shared, time_grid.time_grid_years,
-                                         vols_tenor[i], vols[i], vols_tenor[j], vols[j])
-              for j in range(2)] for i in range(2)]
-        K = [integrate_piecewise_linear(hw_calc_IJK(alpha[i], tf.exp), shared, time_grid.time_grid_years,
-                                        vols_tenor[i], vols[i], quantofx[:, 0], quantofx[:, 1]) for i in range(2)]
-
+        # flatten the tenor
+        factor_tenor = tensor.new_tensor(self.factor.get_tenor(), dtype=torch.float64)
         # now calculate the At
-        AtT = tf.zeros([time_grid.time_grid_years.size, factor_tenor.size], tf.float64)
-        BtT = [(1.0 - tf.exp(-alpha[i] * factor_tenor)) / alpha[i] for i in range(2)]
+        AtT = tensor.new_zeros([time_grid.time_grid_years.size, self.factor_tenor.size()[0]])
+        BtT = [(1.0 - torch.exp(-alpha[i] * factor_tenor)) / alpha[i] for i in range(2)]
         CtT = []
         rho = [[1.0, corr], [corr, 1.0]]
-        t = time_grid.time_grid_years.reshape(-1, 1)
+        t = tensor.new(time_grid.time_grid_years.reshape(-1, 1))
 
         for i, j in itertools.product(range(2), range(2)):
-            first_part = tf.exp(-(alpha[i] + alpha[j]) * t) * tf.reshape(J[i][j], (-1, 1))
-            second_part = tf.exp(-alpha[i] * t) * tf.reshape(I[i][j], (-1, 1)) - first_part
-            third_part = tf.exp(-alpha[j] * t) * tf.reshape(I[j][i], (-1, 1)) - first_part
+            first_part = torch.exp(-(alpha[i] + alpha[j]) * t) * J[i][j].reshape(-1, 1)
+            second_part = torch.exp(-alpha[i] * t) * I[i][j].reshape(-1, 1) - first_part
+            third_part = torch.exp(-alpha[j] * t) * I[j][i].reshape(-1, 1) - first_part
 
             # get the covariance
             CtT.append(rho[i][j] * J[i][j])
 
             # all together now
-            AtT += rho[i][j] * tf.matmul(
-                tf.concat([first_part, second_part, third_part], axis=1),
-                tf.stack([BtT[j] * BtT[i], BtT[i] / alpha[j], BtT[j] / alpha[i]]))
+            AtT += rho[i][j] * torch.matmul(
+                torch.cat([first_part, second_part, third_part], axis=1),
+                torch.stack([BtT[j] * BtT[i], BtT[i] / alpha[j], BtT[j] / alpha[i]]))
 
-        # calculate the Covariance matrix
-        c11 = tf.pad(CtT[0][1:] - CtT[0][:-1], [[1, 0]], constant_values=CtT[0][0])
-        c12 = tf.pad(CtT[1][1:] - CtT[1][:-1], [[1, 0]], constant_values=CtT[1][0])
-        c22 = tf.pad(CtT[3][1:] - CtT[3][:-1], [[1, 0]], constant_values=CtT[3][0])
+        # get the correlation through time
+        cholesky = [tensor.new_zeros((2, 2), dtype=torch.float64)]
+        t_CtT = torch.stack(CtT).t()
 
-        # make sure it's ok
-        c11_ok = tf.cast(c11 > 0.0, tf.float64)
-        c22_ok = tf.cast(c22 > 0.0, tf.float64)
-        c12_ok = tf.cast((c12 * c12) < (c11 * c22), tf.float64)
+        for C in (t_CtT[1:] - t_CtT[:-1]):
+            decomp = torch.cholesky(C.reshape(2, 2))
+            cholesky.append(decomp)
 
-        # fudge factors to prevent underflow
-        epsilon = tf.ones_like(c11, dtype=tf.float64) * 1e-12
-        zero = tf.zeros_like(c11, dtype=tf.float64)
+        # this will break if the cholesky is not Positive definite
+        C = torch.stack(cholesky)
 
-        # calc the covariance matrix
-        C11 = c11_ok * c11 + (1.0 - c11_ok) * epsilon
-        C22 = c22_ok * c22 + (1.0 - c22_ok) * epsilon
-        C12 = c12_ok * c12
-
-        L = tf.stack([c11_ok * tf.sqrt(C11), zero,
-                      c11_ok * (C12 / tf.sqrt(C11)),
-                      c12_ok * tf.sqrt(C22 - (C12 * C12) / C11)])
-
-        # get the correlation through time - this will break if the cholesky is not Positive definite
-        self.C = tf.cast(tf.reshape(L, [2, 2, -1]), shared.precision)
         # intermediate results
-        self.BtT = [tf.cast(tf.reshape(Bi, (-1, 1)), shared.precision) for Bi in BtT]
-        self.YtT = [tf.cast(tf.exp(-alpha[i] * t), shared.precision) for i in range(2)]
-        self.KtT = [tf.cast(quantofxcorr[i] * tf.reshape(K[i], (-1, 1)), shared.precision) for i in range(2)]
-        self.HtT = [tf.cast(lam[i] * tf.reshape(H[i], (-1, 1)), shared.precision) for i in range(2)]
-        self.alpha = [tf.cast(alpha[i], shared.precision) for i in range(2)]
+        self.BtT = [Bi.type(shared.precision).reshape(-1, 1) for Bi in BtT]
+        self.YtT = [torch.exp(-alpha[i] * t).type(shared.precision) for i in range(2)]
+        self.KtT = [(quantofxcorr[i] * K[i].reshape(-1, 1)).type(shared.precision) for i in range(2)]
+        self.HtT = [(lam[i] * H[i].reshape(-1, 1)).type(shared.precision) for i in range(2)]
+        self.alpha = [alpha[i].type(shared.precision) for i in range(2)]
 
         # needed for factor calcs later
-        self.F1 = tf.reshape(self.C[0, 0], [-1, 1])
-        self.F2 = tf.expand_dims(self.C[1], axis=2)
+        self.F1 = C[:, 0, 0].reshape(-1, 1).type(shared.precision)
+        self.F2 = C[:, 1].t().unsqueeze(axis=2).type(shared.precision)
 
         # store the grid points used if necessary
         if len(time_grid.scenario_grid) != time_grid.time_grid_years.size:
             self.grid_index = time_grid.scen_time_grid.searchsorted(time_grid.scenario_grid[:, utils.TIME_GRID_MTM])
 
-        self.drift = tf.expand_dims(self.fwd_curve + 0.5 * tf.cast(AtT, shared.precision), 2)
-
-        if hasattr(shared, 't_random_numbers'):
-            # only run this if we have random numbers
-            with tf.name_scope(self.__class__.__name__):
-                self.calc_factors(shared.t_random_numbers[process_ofs, :time_grid.scen_time_grid.size],
-                                  shared.t_random_numbers[process_ofs:process_ofs + 2, :time_grid.scen_time_grid.size])
+        self.drift = torch.unsqueeze(self.fwd_curve + 0.5 * AtT.type(shared.precision), 2)
 
     def calc_stoch_deflator(self, time_grid, curve_index, shared):
         cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])
         tensor = utils.TensorBlock(curve_index, [cached_tensor], [interpolation_params], time_grid)
-        self.deflation_drift = tensor.gather_weighted_curve(shared, self.stoch_dt * utils.DAYS_IN_YEAR,
-                                                            multiply_by_time=False)
+        self.deflation_drift = tensor.gather_weighted_curve(
+            shared, self.stoch_dt * utils.DAYS_IN_YEAR, multiply_by_time=False)
 
     def calc_points(self, rate, points, time_grid, shared, multiply_by_time=True):
         """ Much slower way to evaluate points at time t - but more accurate and memory efficient"""
@@ -516,10 +512,10 @@ class HullWhite2FactorImpliedInterestRateModel(object):
         pass
 
     def calc_factors(self, factor1, factor1and2):
-        self.f1 = tf.expand_dims((tf.cumsum(factor1 * self.F1, axis=0, name='F1')
-                                  - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
-        self.f2 = tf.expand_dims((tf.cumsum(tf.reduce_sum(factor1and2 * self.F2, axis=0), axis=0, name='F2')
-                                  - self.KtT[1] + self.HtT[1]) * self.YtT[1], axis=1)
+        self.f1 = torch.unsqueeze((torch.cumsum(factor1 * self.F1, axis=0)
+                                   - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
+        self.f2 = torch.unsqueeze((torch.cumsum(torch.sum(factor1and2 * self.F2, axis=0), axis=0)
+                                   - self.KtT[1] + self.HtT[1]) * self.YtT[1], axis=1)
 
     @property
     def correlation_name(self):
@@ -528,23 +524,25 @@ class HullWhite2FactorImpliedInterestRateModel(object):
     def generate(self, shared_mem, random_sample=None):
         if random_sample is not None:
             self.calc_factors(random_sample[0], random_sample[:2])
+        else:
+            self.calc_factors(
+                shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
+                shared_mem.t_random_numbers[self.z_offset:self.z_offset + 2, :self.scenario_horizon])
 
-        with tf.name_scope(self.__class__.__name__):
-            # check if we need deflators
-            if self.grid_index is not None:
-                # only generate curves for the given grid
-                f1 = tf.gather(self.f1, self.grid_index)
-                f2 = tf.gather(self.f2, self.grid_index)
-                drift = tf.gather(self.drift, self.grid_index)
-            else:
-                f1 = self.f1
-                f2 = self.f2
-                drift = self.drift
+        # check if we need deflators
+        if self.grid_index is not None:
+            # only generate curves for the given grid
+            f1 = tf.gather(self.f1, self.grid_index)
+            f2 = tf.gather(self.f2, self.grid_index)
+            drift = tf.gather(self.drift, self.grid_index)
+        else:
+            f1 = self.f1
+            f2 = self.f2
+            drift = self.drift
 
-            # generate curves based on 
-            stoch_component = self.BtT[0] * f1 + self.BtT[1] * f2
-            return (drift + stoch_component) / (
-                self.factor.get_tenor().astype(shared_mem.precision).reshape(-1, 1))
+        # generate curves based on
+        stoch_component = self.BtT[0] * f1 + self.BtT[1] * f2
+        return (drift + stoch_component) / self.factor_tenor
 
 
 class HullWhite1FactorInterestRateModel(object):
@@ -599,6 +597,10 @@ class HullWhite1FactorInterestRateModel(object):
         factor_tenor = self.factor.get_tenor()
         alpha = self.param['Alpha']
 
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
         # store the forward curve    
         self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid, shared, ref_date)
 
@@ -627,22 +629,26 @@ class HullWhite1FactorInterestRateModel(object):
                         zip(self.I, self.J, time_grid.time_grid_years)])
 
         # get the deltas
-        delta_KtT = np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.K)))
-        delta_HtT = np.hstack(
-            (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.H)))
-        delta_var = np.diff(np.exp(-2.0 * alpha * time_grid.time_grid_years) * self.J)
+        self.delta_KtT = torch.tensor(
+            np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.K))),
+            dtype=shared.precision, device=shared.device)
 
+        self.delta_HtT = torch.tensor(np.hstack(
+            (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.H))),
+            dtype=shared.precision, device=shared.device)
+
+        delta_var = np.diff(np.exp(-2.0 * alpha * time_grid.time_grid_years) * self.J)
         if delta_var.size:
             # needed for numerical stability
             delta_var[delta_var <= 0.0] = delta_var[delta_var > 0.0].min()
-        delta_vol = np.sqrt(np.hstack((0.0, delta_var)))
+        self.delta_vol = torch.tensor(np.sqrt(np.hstack((0.0, delta_var))).reshape(-1, 1),
+                                      dtype=shared.precision, device=shared.device)
 
-        self.AtT = AtT.astype(shared.precision)
-        self.BtT = BtT.astype(shared.precision)
-
-        with tf.name_scope(self.__class__.__name__):
-            self.f1 = tf.cumsum(shared.t_random_numbers[process_ofs, :time_grid.scen_time_grid.size] *
-                                delta_vol.reshape(-1, 1) - delta_KtT[0] + delta_HtT[0], axis=0, name='F1')
+        self.AtT = torch.tensor(AtT, dtype=shared.precision, device=shared.device)
+        self.BtT = torch.tensor(BtT.reshape(-1, 1), dtype=shared.precision, device=shared.device)
+        self.fwd_component = torch.unsqueeze(self.fwd_curve + 0.5 * self.AtT, 2)
+        self.factor_tenor = torch.tensor(
+            factor_tenor.reshape(-1, 1), dtype=shared.precision, device=shared.device)
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         pass
@@ -652,11 +658,11 @@ class HullWhite1FactorInterestRateModel(object):
         return 'HWInterestRate', [('F1',)]
 
     def generate(self, shared_mem):
-        with tf.name_scope(self.__class__.__name__):
-            stoch_component = self.BtT.reshape(-1, 1) * tf.expand_dims(self.f1, 1)
-            fwd_component = tf.expand_dims(self.fwd_curve + 0.5 * self.AtT, 2)
-            return (fwd_component + stoch_component) / (
-                self.factor.get_tenor().astype(shared_mem.precision).reshape(-1, 1))
+        f1 = (shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon] *
+              self.delta_vol - self.delta_KtT[0] + self.delta_HtT[0]).cumsum(axis=0)
+
+        stoch_component = self.BtT * torch.unsqueeze(f1, dim=1)
+        return (self.fwd_component + stoch_component) / self.factor_tenor
 
 
 class HWInterestRateCalibration(object):
@@ -849,8 +855,8 @@ class CSForwardPriceCalibration(object):
 
     def calibrate(self, data_frame, num_business_days=252.0):
         tenor = np.array([(x.split(',')[1]) for x in data_frame.columns], dtype=np.float64)
-        stats, correlation, delta = utils.calc_statistics(data_frame, method='Log', num_business_days=num_business_days,
-                                                          max_alpha=5.0)
+        stats, correlation, delta = utils.calc_statistics(
+            data_frame, method='Log', num_business_days=num_business_days, max_alpha=5.0)
         alpha = stats['Mean Reversion Speed'].values[0]
         sigma = stats['Reversion Volatility'].values[0]
         mu = stats['Drift'].values[0] + 0.5 * (stats['Volatility'].values[0]) ** 2
@@ -931,6 +937,10 @@ class PCAInterestRateModel(object):
         # ensures that tenors used are the same as the price factor
         factor_tenor = self.factor.get_tenor()
 
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
         # rescale and precalculate the eigenvectors
         evecs, evals = np.zeros((factor_tenor.size, self.num_factors())), []
         for index, eigen_data in enumerate(self.param['Eigenvectors']):
@@ -943,27 +953,18 @@ class PCAInterestRateModel(object):
         B = evecs.dot(np.diag(np.sqrt(evals)))
         B /= np.linalg.norm(B, axis=1).reshape(-1, 1)
 
-        if implied_tensor is not None:
-            vols = implied_tensor['Yield_Volatility']
-            self.vols = utils.interpolate_tensor(factor_tenor, self.param['Yield_Volatility'].array[:, 0], vols)
-            alpha = implied_tensor['Reversion_Speed']
-            var = tf.exp(-2.0 * alpha * time_grid.time_grid_years) / (2.0 * alpha)
-            self.vol_adj = -tf.concat([[0.0], var[1:] - var[:-1]], axis=0)
-            self.delta_vol = tf.reshape(self.vols, (1, -1, 1)) * tf.reshape(tf.sqrt(self.vol_adj), (-1, 1, 1))
-            self.drift = tf.expand_dims(
-                -0.5 * tf.expand_dims(self.vols * self.vols, axis=0) *
-                tf.expand_dims(self.vol_adj, axis=1), axis=2)
-        else:
-            self.vols = np.interp(factor_tenor, *self.param['Yield_Volatility'].array.T)
-            alpha = self.param['Reversion_Speed']
-            self.vol_adj = -np.append([0], np.diff(
-                np.exp(-2.0 * alpha * time_grid.time_grid_years) / (2.0 * alpha)))
-            self.delta_vol = self.vols.reshape(1, -1, 1) * np.sqrt(self.vol_adj).reshape(-1, 1, 1)
-            self.drift = np.expand_dims(
-                -0.5 * ((self.vols * self.vols).reshape(1, -1)) * self.vol_adj.reshape(-1, 1), axis=2)
+        self.vols = np.interp(factor_tenor, *self.param['Yield_Volatility'].array.T)
+        alpha = self.param['Reversion_Speed']
+        self.vol_adj = -np.append([0], np.diff(
+            np.exp(-2.0 * alpha * time_grid.time_grid_years) / (2.0 * alpha)))
+        self.delta_vol = torch.tensor(self.vols.reshape(1, -1, 1) * np.sqrt(self.vol_adj).reshape(-1, 1, 1),
+                                      dtype=shared.precision, device=shared.device)
+        self.drift = torch.tensor(np.expand_dims(
+            -0.5 * ((self.vols * self.vols).reshape(1, -1)) * self.vol_adj.reshape(-1, 1), axis=2),
+            dtype=shared.precision, device=shared.device)
 
-        # normalize the eigenvectors, precalculate the vols and the historical_Yield
-        self.evecs = B.T
+        # normalize the eigenvectors
+        self.evecs = torch.tensor(B.T[:, np.newaxis, :, np.newaxis], dtype=shared.precision, device=shared.device)
 
         # also need to pre-calculate the forward curves at time_grid given and pass that to the cuda kernel
         if self.param['Rate_Drift_Model'] == 'Drift_To_Blend':
@@ -975,40 +976,35 @@ class PCAInterestRateModel(object):
             omega = hist_mean(self.factor.tenors)
             # TODO - convert the code below to tensorflow
 
-        ##            self.fwd_curve = np.array(
+        ##            fwd_curve = np.array(
         ##                [curve_t0 * np.exp(-alpha * self.factor.get_day_count_accrual(ref_date, t)) + omega *
         ##                 (1.0 - np.exp(-alpha * self.factor.get_day_count_accrual(ref_date, t)))
         ##                 for t in time_grid.scen_time_grid])
+
         else:
             # calculate the forward curve across time
-            self.fwd_curve = utils.calc_curve_forwards(
-                self.factor, tensor, time_grid, shared, ref_date) / self.factor.tenors.reshape(1, -1)
+            fwd_curve = utils.calc_curve_forwards(
+                self.factor, tensor, time_grid, shared, ref_date) / torch.tensor(
+                factor_tenor.reshape(1, -1), dtype=shared.precision, device=shared.device)
 
-        if hasattr(shared, 't_random_numbers'):
-            # only run this if we have random numbers
-            with tf.name_scope(self.__class__.__name__):
-                self.calc_factors(shared.t_random_numbers[
-                                  process_ofs:process_ofs + self.num_factors(), :time_grid.scen_time_grid.size])
+        self.fwd_component = torch.unsqueeze(fwd_curve, dim=2)
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         pass
 
     def calc_factors(self, factors):
-        pc_portion = tf.reduce_sum(tf.expand_dims(factors, axis=2) *
-                                   self.evecs[:, np.newaxis, :, np.newaxis], axis=0) * self.delta_vol
-        self.stoch = tf.cumsum(self.drift + pc_portion, axis=0, name='PCA')
+        pc_portion = (torch.unsqueeze(factors, dim=2) * self.evecs).sum(axis=0) * self.delta_vol
+        self.stoch = (self.drift + pc_portion).cumsum(axis=0)
 
     @property
     def correlation_name(self):
         return 'InterestRateOUProcess', [('PC{}'.format(x),) for x in range(1, self.num_factors() + 1)]
 
-    def generate(self, shared_mem, random_sample=None):
-        if random_sample is not None:
-            self.calc_factors(random_sample)
+    def generate(self, shared_mem):
+        self.calc_factors(shared_mem.t_random_numbers[
+                          self.z_offset:self.z_offset + self.num_factors(), :self.scenario_horizon])
 
-        with tf.name_scope(self.__class__.__name__):
-            fwd_component = tf.expand_dims(self.fwd_curve, 2)
-            return fwd_component * tf.exp(self.stoch)
+        return self.fwd_component * torch.exp(self.stoch)
 
 
 class PCAInterestRateCalibration(object):
