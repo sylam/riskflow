@@ -22,7 +22,6 @@ __all__ = ['version_info', '__version__', '__author__', '__license__', 'makeflat
            'set_collateral', 'load_market_data', 'run_baseval', 'run_cmc']
 
 import os
-import torch
 import numpy as np
 import pandas as pd
 import collections.abc
@@ -101,10 +100,9 @@ def load_market_data(rundate, path, json_name='MarketData.json', cva_default=Tru
     return context
 
 
-def run_baseval(context, prec=torch.float64, overrides=None):
+def run_baseval(context, prec, device, overrides=None):
     """
     Runs a base valuation calculation on the provided context
-    :param prec:
     :param context: a Context object
     :param overrides: a dictionary of overrides to replace the context's  calculation parameters
     :return: a tuple containing the calculation object and the output dictionary
@@ -113,9 +111,6 @@ def run_baseval(context, prec=torch.float64, overrides=None):
     calc_params = context.deals.get('Calculation',
                                     {'Base_Date': context.params['System Parameters']['Base_Date'],
                                      'Currency': 'ZAR'})
-
-    # check if the gpu is available
-    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     params_bv = {'calc_name': ('baseval',), 'Run_Date': rundate,
@@ -129,7 +124,7 @@ def run_baseval(context, prec=torch.float64, overrides=None):
     return calc, out
 
 
-def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, CollVA=False, LegacyFVA=False):
+def run_cmc(context, prec, device, overrides=None, CVA=True, FVA=False, CollVA=False):
     """
     Runs a credit monte carlo calculation on the provided context
     :param context: a Context object
@@ -146,9 +141,6 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
                                      'Base_Time_Grid': '0d 2d 1w(1w) 1m(1m) 3m(3m)',
                                      'Deflation_Interest_Rate': 'ZAR-SWAP',
                                      'Currency': 'ZAR'})
-
-    # check if the gpu is available
-    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     time_grid = str(calc_params['Base_Time_Grid'])
@@ -171,7 +163,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
                  'FVA': {'Funding_Interest_Curve': 'ZAR-SWAP.FUNDING',
                          'Risk_Free_Curve': 'ZAR-SWAP.OIS',
                          'Stochastic_Funding': 'Yes'},
-                 'CollVA': {'Gradient': 'No'}
+                 'CollVA': {'Gradient': 'Yes'}
                  }
 
     if overrides is not None:
@@ -185,14 +177,11 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         del params_mc['CollVA']
 
     calc = construct_calculation('Credit_Monte_Carlo', context, device=device, prec=prec)
-    if LegacyFVA:
-        return calc, params_mc
-    else:
-        out = calc.execute(params_mc)
-        exposure = out['Results']['mtm'].clip(0.0, np.inf)
-        dates = np.array(sorted(calc.time_grid.mtm_dates))[
-            calc.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
+    out = calc.execute(params_mc)
+    exposure = out['Results']['mtm'].clip(0.0, np.inf)
+    dates = np.array(sorted(calc.time_grid.mtm_dates))[
+        calc.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
 
-        res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(exposure, 95, axis=1)}, index=dates)
+    res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(exposure, 95, axis=1)}, index=dates)
 
-        return calc, out, res
+    return calc, out, res

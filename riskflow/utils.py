@@ -27,7 +27,9 @@ from itertools import zip_longest
 import scipy.stats
 import pandas as pd
 import numpy as np
-import tensorflow as tf
+
+import torch
+import torch.nn.functional as F
 
 # For dealing with excel dates and dataframes
 excel_offset = pd.Timestamp('1899-12-30 00:00:00')
@@ -179,7 +181,7 @@ DimensionLessFactors = ['DiscountRate', 'ReferenceVol', 'Correlation']
 OneDimensionalFactors = ['InterestRate', 'InflationRate', 'DividendRate', 'SurvivalProb', 'ForwardPrice']
 TwoDimensionalFactors = ['FXVol', 'EquityPriceVol']
 ThreeDimensionalFactors = ['InterestRateVol', 'InterestYieldVol', 'ForwardPriceVol']
-ImpliedFactors = ['HullWhite2FactorModelParameters', 'GBMAssetPriceTSModelParameters', 'PCAMixedFactorModelParameters']
+ImpliedFactors = ['HullWhite2FactorModelParameters', 'GBMTSImpliedParameters', 'PCAMixedFactorModelParameters']
 
 # weekends and weekdays
 WeekendMap = {'Friday and Saturday': 'Sun Mon Tue Wed Thu',
@@ -324,7 +326,9 @@ class TensorSchedule(object):
         self.schedule = np.array(schedule)
         self.offsets = np.array(offsets)
         self.cache = None
+        self.float = None
         self.dtype = None
+        self.device = None
 
     def __getitem__(self, x):
         return self.schedule[x]
@@ -332,10 +336,15 @@ class TensorSchedule(object):
     def count(self):
         return self.schedule.shape[0]
 
-    def merged(self):
-        if self.cache is None:
-            self.cache = np.concatenate((self.schedule, self.offsets), axis=1)
-        return self.cache
+    def merged(self, device, dtype, index=0):
+        if self.dtype is None or dtype != self.dtype:
+            # return a tensor and a numpy array
+            self.dtype = dtype
+            self.device = device
+            self.float = np.float32 if dtype == torch.float32 else np.float64
+            merged = np.concatenate((self.schedule, self.offsets), axis=1)
+            self.cache = (torch.tensor(merged, device=device, dtype=dtype), merged)
+        return self.cache[0][index:], self.cache[1][index:]
 
 
 class DealTimeDependencies(object):
@@ -345,6 +354,8 @@ class DealTimeDependencies(object):
                                  mtm_time_grid[deal_time_grid[:-1]]), [1]))
         self.interp = mtm_time_grid[mtm_time_grid <= mtm_time_grid[deal_time_grid[-1]]]
         self.deal_time_grid = deal_time_grid
+        # store the indices for linear interpolation
+        self.update_indices()
 
     def assign(self, time_dependencies):
         # only assign up to the max of this set of dependencies
@@ -353,6 +364,15 @@ class DealTimeDependencies(object):
         self.delta = time_dependencies.delta[query]
         self.deal_time_grid = time_dependencies.deal_time_grid[query]
         self.interp = self.mtm_time_grid[self.mtm_time_grid <= self.mtm_time_grid[expiry]]
+        # store the indices for linear interpolation
+        self.update_indices()
+
+    def update_indices(self):
+        self.index = np.searchsorted(self.deal_time_grid, np.arange(self.interp.size), side='right') - 1
+        self.index_next = (self.index + 1).clip(0, self.deal_time_grid.size - 1)
+        self.alpha = (np.array((self.interp - self.interp[self.deal_time_grid[self.index]]) /
+                               self.delta[self.index]).reshape(-1, 1))
+        self.t_alpha = None
 
     def fetch_index_by_day(self, days):
         return self.interp.searchsorted(days)
@@ -400,36 +420,49 @@ class FloatTensorResets(TensorSchedule):
         self.all_resets = None
         self.stack_index = []
 
-    def known_resets(self, num_scenarios, index=RESET_INDEX_Value, filter_index=RESET_INDEX_Reset_Day):
-        known_resets = []
-        groups = np.where(np.diff(np.concatenate(([0], self.known_simulated, [0]))))[0].reshape(-1, 2)
-        for group in groups:
-            known_resets.append([tf.fill([1, num_scenarios], x[index].astype(Default_Precision))
-                                 for x in self.schedule[group[0]: group[1]] if x[filter_index] < 0.0])
-        return known_resets
+    def known_resets(self, num_scenarios):
+        if self.cache.get(('known_resets', num_scenarios)) is None:
+            known_resets = []
+            groups = np.where(np.diff(np.concatenate(([0], self.known_simulated, [0]))))[0].reshape(-1, 2)
+            for group in groups:
+                known_resets.append([torch.full((1, num_scenarios), x[RESET_INDEX_Value],
+                                                device=self.device, dtype=self.dtype)
+                                     for x in self.schedule[group[0]: group[1]] if x[RESET_INDEX_Reset_Day] < 0.0])
+            self.cache[('known_resets', num_scenarios)] = known_resets
+        return self.cache[('known_resets', num_scenarios)]
 
     def stack(self, known_resets, reset_values, fillvalue):
         self.all_resets = [
-            tf.squeeze(tf.concat([tf.stack(known), simulated], axis=0), axis=1) for known, simulated in zip_longest(
-                known_resets, reset_values, fillvalue=fillvalue)]
-        self.stack_index = np.cumsum(np.append([0], [x.shape[0].value for x in self.all_resets]))
+            torch.squeeze(torch.cat([
+                fillvalue if known is fillvalue else torch.stack(known), simulated], axis=0), axis=1)
+            for known, simulated in zip_longest(known_resets, reset_values, fillvalue=fillvalue)]
+        self.stack_index = np.cumsum(np.append([0], [x.shape[0] for x in self.all_resets]))
 
-    def sim_resets(self, max_time, filter_index=RESET_INDEX_Reset_Day):
-        sim_resets = []
-        groups = np.where(np.diff(np.concatenate(([-1], self.known_simulated, [-1]))))[0].reshape(-1, 2)
-        for group in groups:
-            sim_group = self.schedule[group[0]:group[1]]
-            within_horizon = sim_group[sim_group[:, filter_index] <= max_time]
-            if within_horizon.any():
-                sim_resets.append(within_horizon)
-        return sim_resets
+    def sim_resets(self, max_time):
+        if self.cache.get(('sim_resets', max_time)) is None:
+            # cache the weights
+            self.cache['weights'] = torch.tensor(
+                self.schedule[:, RESET_INDEX_Weight] / self.schedule[:, RESET_INDEX_Accrual],
+                dtype=self.dtype, device=self.device)
+
+            sim_resets = []
+            sim_weights = []
+            groups = np.where(np.diff(np.concatenate(([-1], self.known_simulated, [-1]))))[0].reshape(-1, 2)
+            for group in groups:
+                sim_group = self.schedule[group[0]:group[1]]
+                within_horizon = np.where(sim_group[:, RESET_INDEX_Reset_Day] <= max_time)[0]
+                if within_horizon.size:
+                    sim_resets.append(sim_group[within_horizon])
+                    sim_weights.append(self.cache['weights'][within_horizon])
+
+            self.cache[('sim_resets', max_time)] = (sim_resets, sim_weights)
+        return self.cache[('sim_resets', max_time)]
 
     def raw_sim_resets(self, max_time, filter_index=RESET_INDEX_Reset_Day):
         return self.schedule[(self.offsets > -1) & (self.schedule[:, filter_index] <= max_time)]
 
     def split_block_resets(self, reset_offset, t, date_offset=0):
-        all_resets = self.schedule[reset_offset:]
-        reset_days = all_resets[:, RESET_INDEX_Reset_Day] - date_offset
+        reset_days = self.schedule[reset_offset:, RESET_INDEX_Reset_Day] - date_offset
         reset_groups = np.append(
             np.where(np.diff(np.concatenate(([-np.inf], reset_days, [np.inf]))) < 0)[0], reset_days.size)
 
@@ -444,11 +477,13 @@ class FloatTensorResets(TensorSchedule):
             old_resets = self.all_resets
 
         reset_blocks = []
+        reset_weights = []
         future_resets = []
         start_index = 0
 
         for end_index in reset_groups:
-            reset_blocks.append(all_resets[start_index:end_index])
+            reset_blocks.append(self.schedule[reset_offset + start_index:reset_offset + end_index])
+            reset_weights.append(self.cache['weights'][reset_offset + start_index:reset_offset + end_index])
             future_reset = np.searchsorted(reset_days[start_index:end_index], t)
             future_resets.append(future_reset)
             start_index = end_index
@@ -458,14 +493,14 @@ class FloatTensorResets(TensorSchedule):
             reset_state = [np.unique(future_reset, return_counts=True) for future_reset in future_resets]
             if functools.reduce(lambda x, y: x.size == y.size and (x == y).all(), [x[1] for x in reset_state]):
                 # can be compressed
-                return reset_state[0][1], (old_resets, reset_blocks, [x[0] for x in reset_state])
+                return reset_state[0][1], (old_resets, reset_blocks, reset_weights, [x[0] for x in reset_state])
             else:
                 # do not compress
-                return np.ones_like(t, dtype=np.int64), (old_resets, reset_blocks, future_resets)
+                return np.ones_like(t, dtype=np.int64), (old_resets, reset_blocks, reset_weights, future_resets)
         else:
             # Just one reset group - compress it
             reset_offset, reset_counts = np.unique(future_resets[0], return_counts=True)
-            return reset_counts, (old_resets, reset_blocks, [reset_offset])
+            return reset_counts, (old_resets, reset_blocks, reset_weights, [reset_offset])
 
 
 class TensorCashFlows(TensorSchedule):
@@ -484,6 +519,14 @@ class TensorCashFlows(TensorSchedule):
         self.Resets = None
         # call superclass
         super(TensorCashFlows, self).__init__(schedule, offsets)
+
+    def get_resets(self, device, dtype):
+        if self.Resets.dtype is None or self.Resets.dtype != dtype:
+            self.Resets.float = np.float32 if dtype == torch.float32 else np.float64
+            self.Resets.dtype = dtype
+            self.Resets.device = device
+            self.Resets.cache = {}
+        return self.Resets
 
     def known_fx_resets(self, num_scenarios, index=CASHFLOW_INDEX_FXResetValue,
                         filter_index=RESET_INDEX_Reset_Day):
@@ -563,7 +606,7 @@ class TensorCashFlows(TensorSchedule):
 
 
 def split_tensor(tensor, counts):
-    return tf.split(tensor, counts) if tensor.shape[0] == counts.sum() else [tensor] * counts.size
+    return torch.split(tensor, tuple(counts)) if tensor.shape[0] == counts.sum() else [tensor] * counts.size
 
 
 def non_zero(tensor):
@@ -575,11 +618,6 @@ def non_zero(tensor):
         return tensor
 
 
-def calc_hermite_curve(t_a, g, c, curve_t0, curve_t1):
-    one_minus_ta = (1.0 - t_a)
-    return curve_t0 * one_minus_ta + t_a * (curve_t1 + one_minus_ta * (g + t_a * c))
-
-
 def interpolate_curve_indices(all_tenor_points, curve_component, time_factor=1.0):
     # will only work if all_tenor_points is 2 dimensional
     tenor, delta, curvetype = curve_component[FACTOR_INDEX_Tenor_Index][:3]
@@ -587,7 +625,7 @@ def interpolate_curve_indices(all_tenor_points, curve_component, time_factor=1.0
     max_tenor_index = max(tenor.size - 1, 0)
 
     a, i1, w1, i2, w2 = [], [], [], [], []
-    for time_index, tenor_points in enumerate(all_tenor_points):
+    for tenor_points in all_tenor_points:
         tenor_points_in_years = daycount(tenor_points)
         index = np.clip(
             np.searchsorted(tenor, tenor_points_in_years, side='right') - 1,
@@ -604,9 +642,8 @@ def interpolate_curve_indices(all_tenor_points, curve_component, time_factor=1.0
 
         time_modifier = time_factor * tenor_points_in_years if time_factor else 1.0
 
-        t = np.ones_like(index) * time_index
-        i1.append(np.dstack((t, index))[-1])
-        i2.append(np.dstack((t, index_next))[-1])
+        i1.append(index)
+        i2.append(index_next)
         a.append(alpha)
         w1.append((1.0 - alpha) * time_modifier)
         w2.append(alpha * time_modifier)
@@ -620,10 +657,11 @@ def interpolate_curve(curve_tensor, curve_component, curve_interp, points, time_
     a, i1, w1, i2, w2 = interpolate_curve_indices(
         points, curve_component, time_factor)
 
-    if not curve_component[FACTOR_INDEX_Stoch]:
-        # flatten the indices
-        i1[:, :, 0] *= 0
-        i2[:, :, 0] *= 0
+    time_size, point_size = points.shape
+    if curve_component[FACTOR_INDEX_Stoch]:
+        time_index = np.tile(np.arange(time_size).reshape(-1, 1), point_size)
+    else:
+        time_index = np.zeros((time_size, point_size), dtype=np.int64)
 
     if curve_component[FACTOR_INDEX_Tenor_Index][2].startswith('Hermite'):
         g, c = curve_interp
@@ -641,8 +679,9 @@ def interpolate_curve(curve_tensor, curve_component, curve_interp, points, time_
         interp_val = val * mult if mult is not None else val
     else:
         # default to linear
-        interp_val = tf.gather_nd(curve_tensor, i1) * w1 + (
-            tf.gather_nd(curve_tensor, i2) * w2 if w2.any() else 0.0)
+        t_w1 = curve_tensor.new(w1)
+        interp_val = curve_tensor[time_index, i1] * t_w1 + (
+            curve_tensor[time_index, i2] * curve_tensor.new(w2) if w2.any() else 0.0)
 
     return interp_val
 
@@ -670,7 +709,7 @@ class TensorBlock(object):
                     tuple(counts))
 
         if key_code not in shared.t_Buffer:
-            if isinstance(self.tensor, tf.Tensor):
+            if isinstance(self.tensor, torch.Tensor):
                 rate_tensor = split_tensor(self.tensor, counts)
                 interp_tensor = None
             else:
@@ -911,20 +950,19 @@ def interpolate_tensor(t, tenor, rate_tensor):
     tenor_index = tenor.searchsorted(t, side='right')
     index = (tenor_index - 1).clip(0, tenor.size - 1)
     index_next = tenor_index.clip(0, tenor.size - 1)
-    alpha = ((t - tenor[index]) / dvt[tenor_index]).clip(0, 1)
-    return (1 - alpha) * tf.gather(rate_tensor, index) + alpha * tf.gather(rate_tensor, index_next)
+    alpha = rate_tensor.new(((t - tenor[index]) / dvt[tenor_index]).clip(0, 1))
+    return rate_tensor[index] * (1 - alpha) + rate_tensor[index_next] * alpha
 
 
 # indexing ops manipulating large tensors
 def gather_interp_matrix(mtm, deal_time_dep, shared):
-    index = np.searchsorted(deal_time_dep.deal_time_grid,
-                            np.arange(deal_time_dep.interp.size), side='right') - 1
-    alpha = np.array((deal_time_dep.interp -
-                      deal_time_dep.interp[deal_time_dep.deal_time_grid[index]])
-                     / deal_time_dep.delta[index]).reshape(-1, 1)
-    index_next = (index + 1).clip(0, deal_time_dep.deal_time_grid.size - 1)
-    return (tf.gather(mtm, index) * (1 - alpha) + alpha * tf.gather(mtm, index_next)) \
-        if alpha.any() else tf.gather(mtm, index)
+    if deal_time_dep.alpha.any():
+        if deal_time_dep.t_alpha is None:
+            deal_time_dep.t_alpha = mtm.new(deal_time_dep.alpha)
+        return mtm[deal_time_dep.index] * (1 - deal_time_dep.t_alpha) + \
+               mtm[deal_time_dep.index_next] * deal_time_dep.t_alpha
+    else:
+        return mtm[deal_time_dep.index]
 
 
 def gather_scenario_interp(tensor, time_grid, shared):
@@ -932,16 +970,18 @@ def gather_scenario_interp(tensor, time_grid, shared):
     index = time_grid[:, TIME_GRID_ScenarioPriorIndex].astype(np.int64)
     alpha_shape = tuple([-1] + [1] * (len(tensor.shape) - 1))
     alpha = time_grid[:, TIME_GRID_PriorScenarioDelta].reshape(alpha_shape)
-    index_next = (index + 1).clip(0, tensor.shape[0].value - 1)
-
-    return (tf.gather(tensor, index) * (1 - alpha) + tf.gather(tensor, index_next) * alpha) \
-        if alpha.any() else tf.gather(tensor, index)
+    if alpha.any():
+        alpha = tensor.new(alpha)
+        index_next = (index + 1).clip(0, tensor.shape[0] - 1)
+        return tensor[index] * (1 - alpha) + tensor[index_next] * alpha
+    else:
+        return tensor[index]
 
 
 def split_counts(rates, counts, shared):
     splits = []
     for rate in rates:
-        if isinstance(rate, tf.Tensor):
+        if isinstance(rate, torch.Tensor):
             splits.append(split_tensor(rate, counts))
         else:
             splits.append(rate.split_counts(counts, shared))
@@ -956,10 +996,9 @@ def calc_fx_cross(rate1, rate2, time_grid, shared):
             shared.t_Buffer[key_code] = calc_time_grid_spot_rate(
                 rate1, time_grid, shared) / calc_time_grid_spot_rate(
                 rate2, time_grid, shared)
-
-        return shared.t_Buffer[key_code]
     else:
-        return tf.constant([[1.0]], dtype=shared.precision)
+        shared.t_Buffer[key_code] = torch.ones([1, 1], dtype=shared.precision, device=shared.device)
+    return shared.t_Buffer[key_code]
 
 
 def calc_discount_rate(block, tenors_in_days, shared, multiply_by_time=True):
@@ -968,8 +1007,8 @@ def calc_discount_rate(block, tenors_in_days, shared, multiply_by_time=True):
                 tenors_in_days.shape, tuple(tenors_in_days.ravel()))
 
     if key_code not in shared.t_Buffer:
-        discount_rates = tf.exp(-block.gather_weighted_curve(shared, tenors_in_days,
-                                                             multiply_by_time=multiply_by_time))
+        discount_rates = torch.exp(-block.gather_weighted_curve(
+            shared, tenors_in_days, multiply_by_time=multiply_by_time))
         shared.t_Buffer[key_code] = discount_rates
 
     return shared.t_Buffer[key_code]
@@ -1052,9 +1091,8 @@ def calc_fx_forward(local, other, T, time_grid, shared, only_diag=False):
     key_code = ('fxforward', local[0][0], other[0][0], only_diag,
                 T if T_scalar else tuple(T),
                 tuple(time_grid[:, TIME_GRID_MTM]))
-
-    if local[0] != other[0]:
-        if key_code not in shared.t_Buffer:
+    if key_code not in shared.t_Buffer:
+        if local[0] != other[0]:
             T_t = T - time_grid[:, TIME_GRID_MTM].reshape(-1, 1)
             fx_spot = calc_fx_cross(local[0], other[0], time_grid, shared)
 
@@ -1062,18 +1100,18 @@ def calc_fx_forward(local, other, T, time_grid, shared, only_diag=False):
                 weights = np.diag(T_t).reshape(-1, 1) if only_diag else T_t
                 repo_local = calc_time_grid_curve_rate(local[1], time_grid, shared)
                 repo_other = calc_time_grid_curve_rate(other[1], time_grid, shared)
-                drift = tf.exp(repo_other.gather_weighted_curve(shared, weights) -
-                               repo_local.gather_weighted_curve(shared, weights))
+                drift = torch.exp(
+                    repo_other.gather_weighted_curve(shared, weights) -
+                    repo_local.gather_weighted_curve(shared, weights))
             else:
-                drift = tf.ones([time_grid.shape[0], 1 if only_diag else T_t.size, 1],
-                                dtype=shared.precision)
+                drift = fx_spot.new_ones([time_grid.shape[0], 1 if only_diag else T_t.size, 1])
 
-            shared.t_Buffer[key_code] = fx_spot * tf.squeeze(drift, axis=1) \
-                if T_scalar else tf.expand_dims(fx_spot, axis=1) * drift
+            shared.t_Buffer[key_code] = fx_spot * torch.squeeze(drift, axis=1) \
+                if T_scalar else torch.unsqueeze(fx_spot, axis=1) * drift
+        else:
+            shared.t_Buffer[key_code] = torch.ones([1, 1], dtype=shared.precision, device=shared.device)
 
-        return shared.t_Buffer[key_code]
-    else:
-        return tf.constant([[1.0]], dtype=shared.precision)
+    return shared.t_Buffer[key_code]
 
 
 def gather_flat_surface(flat_surface, code, expiry, shared, calc_std):
@@ -1391,7 +1429,7 @@ def hermite_interpolation_tensor(t, rate_tensor):
 
 def cache_interpolation(shared, curve_component, tensor):
     key_code = (curve_component[FACTOR_INDEX_Tenor_Index][2], curve_component[:2],
-                tuple(tensor.shape.as_list()))
+                tuple(tensor.shape))
 
     if key_code not in shared.t_Buffer:
 
@@ -1417,58 +1455,55 @@ def calc_time_grid_curve_rate(code, time_grid, shared, points=None, multiply_by_
     key_code = ('curve', code_hash, time_hash, points_hash, multiply_by_time)
 
     if key_code not in shared.t_Buffer:
-        with tf.name_scope(None):
-            value, interp = [], []
+        value, interp = [], []
 
-            for rate in code:
-                rate_code = ('curve_factor', rate[:2], time_hash, points_hash, multiply_by_time)
-                interp_scenario = rate[FACTOR_INDEX_Tenor_Index][2] != 'Linear' or points is None
+        for rate in code:
+            rate_code = ('curve_factor', rate[:2], time_hash, points_hash, multiply_by_time)
+            interp_scenario = rate[FACTOR_INDEX_Tenor_Index][2] != 'Linear' or points is None
 
-                # if points are defined, calculate directly - otherwise interpolate from
-                # the scenario and static buffers
-                if interp_scenario:
-                    # check if the curve factors are already available
-                    if rate_code not in shared.t_Buffer:
-                        if rate[FACTOR_INDEX_Stoch]:
-                            tensor = shared.t_Scenario_Buffer[rate[FACTOR_INDEX_Offset]]
-                            with tf.name_scope(check_tensor_name(tensor.name, 'curve')):
-                                cached_tensor, interpolation_params = cache_interpolation(
-                                    shared, rate, tensor)
-                                spread = gather_scenario_interp(cached_tensor, time_grid, shared)
+            # if points are defined, calculate directly - otherwise interpolate from
+            # the scenario and static buffers
+            if interp_scenario:
+                # check if the curve factors are already available
+                if rate_code not in shared.t_Buffer:
+                    if rate[FACTOR_INDEX_Stoch]:
+                        tensor = shared.t_Scenario_Buffer[rate[FACTOR_INDEX_Offset]]
+                        cached_tensor, interpolation_params = cache_interpolation(
+                            shared, rate, tensor)
+                        spread = gather_scenario_interp(cached_tensor, time_grid, shared)
+                    else:
+                        tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
+                        spread, interpolation_params = cache_interpolation(
+                            shared, rate, tensor.reshape(1, -1, 1))
+
+                    # cache interpolation if necessary
+                    interp_interp = [gather_scenario_interp(params, time_grid, shared)
+                                     for params in interpolation_params] \
+                        if interpolation_params is not None else None
+
+                    # store it
+                    shared.t_Buffer[rate_code] = (spread, interp_interp)
+            else:
+                if rate_code not in shared.t_Buffer:
+                    # if points are defined, calculate directly - otherwise interpolate from
+                    # the scenario and static buffers
+                    if rate[FACTOR_INDEX_Stoch]:
+                        spread = rate[FACTOR_INDEX_Process].calc_points(
+                            rate, points, time_grid, shared, multiply_by_time)
+                    else:
+                        tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
+                        if shared.riskneutral:
+                            spread = interpolate_risk_neutral(
+                                points, tensor, rate, None, time_grid, multiply_by_time)
                         else:
-                            tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
-                            with tf.name_scope(check_tensor_name(tensor.name, 'curve')):
-                                spread, interpolation_params = cache_interpolation(
-                                    shared, rate, tf.reshape(tensor, (1, -1, 1)))
+                            spread = interpolate_curve(tensor, rate, None, points, multiply_by_time)
 
-                        # cache interpolation if necessary
-                        interp_interp = [gather_scenario_interp(params, time_grid, shared)
-                                         for params in interpolation_params] \
-                            if interpolation_params is not None else None
+                    # store it
+                    shared.t_Buffer[rate_code] = (spread, None)
 
-                        # store it
-                        shared.t_Buffer[rate_code] = (spread, interp_interp)
-                else:
-                    if rate_code not in shared.t_Buffer:
-                        # if points are defined, calculate directly - otherwise interpolate from
-                        # the scenario and static buffers
-                        if rate[FACTOR_INDEX_Stoch]:
-                            spread = rate[FACTOR_INDEX_Process].calc_points(rate, points, time_grid, shared,
-                                                                            multiply_by_time)
-                        else:
-                            tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
-                            if shared.riskneutral:
-                                spread = interpolate_risk_neutral(points, tensor, rate, None, time_grid,
-                                                                  multiply_by_time)
-                            else:
-                                spread = interpolate_curve(tensor, rate, None, points, multiply_by_time)
-
-                        # store it
-                        shared.t_Buffer[rate_code] = (spread, None)
-
-                # append the curve and its (possible) interpolation parameters
-                value.append(shared.t_Buffer[rate_code][0])
-                interp.append(shared.t_Buffer[rate_code][1])
+            # append the curve and its (possible) interpolation parameters
+            value.append(shared.t_Buffer[rate_code][0])
+            interp.append(shared.t_Buffer[rate_code][1])
 
             shared.t_Buffer[key_code] = TensorBlock(code=code, tensor=value,
                                                     interp=interp, time_grid=time_grid)
@@ -1480,22 +1515,19 @@ def calc_time_grid_spot_rate(rate, time_grid, shared):
     key_code = ('spot', tuple(rate[0][:2]), tuple(time_grid[:, TIME_GRID_MTM]))
 
     if key_code not in shared.t_Buffer:
-        with tf.name_scope(None):
-            if rate[0][FACTOR_INDEX_Stoch]:
-                tensor = shared.t_Scenario_Buffer[rate[0][FACTOR_INDEX_Offset]]
-                with tf.name_scope(check_tensor_name(tensor.name, 'spot')):
-                    value = gather_scenario_interp(tensor, time_grid, shared)
-            else:
-                tensor = shared.t_Static_Buffer[rate[0][FACTOR_INDEX_Offset]]
-                with tf.name_scope(check_tensor_name(tensor.name, 'spot')):
-                    value = tf.reshape(tensor, (1, -1))
+        if rate[0][FACTOR_INDEX_Stoch]:
+            tensor = shared.t_Scenario_Buffer[rate[0][FACTOR_INDEX_Offset]]
+            value = gather_scenario_interp(tensor, time_grid, shared)
+        else:
+            tensor = shared.t_Static_Buffer[rate[0][FACTOR_INDEX_Offset]]
+            value = tensor.reshape(1, -1)
 
-            shared.t_Buffer[key_code] = value
+        shared.t_Buffer[key_code] = value
 
     return shared.t_Buffer[key_code]
 
 
-def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
+def calc_curve_forwards(factor, tensor, time_grid, shared, ref_date, mul_time=True):
     factor_tenor = factor.get_tenor()
 
     tnr, tnr_d = factor_tenor, np.hstack((np.diff(factor_tenor), [1]))
@@ -1503,46 +1535,66 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
 
     # calculate the tenors and indices used for lookups
     ten_t1 = np.array([np.clip(
-        np.searchsorted(factor_tenor, t, side='right') - 1, 0, max_dim) for t in time_grid_years])
+        np.searchsorted(factor_tenor,
+                        factor.get_day_count_accrual(ref_date, t),
+                        side='right') - 1,
+        0, max_dim) for t in time_grid.scen_time_grid])
 
     ten_t = np.array([np.clip(
-        np.searchsorted(factor_tenor, factor_tenor + t, side='right') - 1, 0, max_dim) for t in time_grid_years])
+        np.searchsorted(factor_tenor,
+                        factor_tenor + factor.get_day_count_accrual(ref_date, t),
+                        side='right') - 1,
+        0, max_dim) for t in time_grid.scen_time_grid])
 
     ten_t1_next = np.clip(ten_t1 + 1, 0, max_dim)
     ten_t_next = np.clip(ten_t + 1, 0, max_dim)
 
-    ten_tv = np.clip(np.array([factor_tenor + t for t in time_grid_years]), 0, factor_tenor.max())
+    ten_tv = np.clip(np.array(
+        [factor_tenor + factor.get_day_count_accrual(ref_date, t)
+         for t in time_grid.scen_time_grid])
+        , 0, factor_tenor.max())
 
-    alpha_1 = (ten_tv - tnr[ten_t]) / tnr_d[ten_t]
-    alpha_2 = (time_grid_years - tnr[ten_t1]).clip(0, np.inf) / tnr_d[ten_t1]
+    alpha_1 = tensor.new((ten_tv - tnr[ten_t]) / tnr_d[ten_t])
+    alpha_2 = tensor.new((time_grid.time_grid_years - tnr[ten_t1]).clip(0, np.inf) / tnr_d[ten_t1])
+    # make tensor indices
+    ten_t_next = tensor.new_tensor(ten_t_next, dtype=torch.int64)
+    ten_t = tensor.new_tensor(ten_t, dtype=torch.int64)
+    ten_t1_next = tensor.new_tensor(ten_t1_next, dtype=torch.int64)
+    ten_t1 = tensor.new_tensor(ten_t1, dtype=torch.int64)
 
     if factor.interpolation[0].startswith('Hermite'):
         t = tnr.reshape(1, -1, 1)
-        time_tenor_tenor = time_grid_years.reshape(-1, 1) + tnr
-        norm = (time_tenor_tenor if mul_time else 1.0, time_grid_years if mul_time else 1.0)
-
         if factor.interpolation[0] == 'HermiteRT':
             mod = tf.reshape(tensor, [1, -1, 1]) * t
-            norm = (norm[0] / time_tenor_tenor.clip(tnr.min(), tnr.max()),
-                    norm[1] / time_grid_years.clip(tnr.min(), tnr.max()))
+            norm = None
         else:
             mod = tf.reshape(tensor, [1, -1, 1])
+            norm = (ten_tv, time_grid.time_grid_years) if mul_time else (1.0, 1.0)
 
         g, c = [tf.squeeze(x) for x in hermite_interpolation_tensor(t, mod)]
         sq = tf.squeeze(mod)
 
-        val = calc_hermite_curve(
-            alpha_1, tf.gather(g, ten_t), tf.gather(c, ten_t), tf.gather(sq, ten_t), tf.gather(sq, ten_t_next))
-        val_t = calc_hermite_curve(
-            alpha_2, tf.gather(g, ten_t1), tf.gather(c, ten_t1), tf.gather(sq, ten_t1), tf.gather(sq, ten_t1_next))
+        val = tf.gather(sq, ten_t) * (1.0 - alpha_1) + tf.gather(sq, ten_t_next) * alpha_1 + \
+              alpha_1 * (1.0 - alpha_1) * tf.gather(g, ten_t) + \
+              alpha_1 * alpha_1 * (1.0 - alpha_1) * tf.gather(c, ten_t)
 
-        return val * norm[0] - tf.reshape(val_t * norm[1], [-1, 1])
+        val_t = tf.gather(sq, ten_t1) * (1.0 - alpha_2) + tf.gather(sq, ten_t1_next) * alpha_2 + \
+                alpha_2 * (1.0 - alpha_2) * tf.gather(g, ten_t1) + \
+                alpha_2 * alpha_2 * (1.0 - alpha_2) * tf.gather(c, ten_t1)
+
+        if norm is None:
+            return val - tf.reshape(val_t, [-1, 1])
+        else:
+            return val * norm[0] - tf.reshape(val_t * norm[1], [-1, 1])
     else:
-        fwd1 = alpha_1 * tf.gather(tensor, ten_t_next) + (1 - alpha_1) * tf.gather(tensor, ten_t)
-        fwd2 = alpha_2 * tf.gather(tensor, ten_t1_next) + (1 - alpha_2) * tf.gather(tensor, ten_t1)
+        fwd1 = alpha_1 * tensor.take(ten_t_next) + (1 - alpha_1) * tensor.take(ten_t)
+        fwd2 = alpha_2 * tensor.take(ten_t1_next) + (1 - alpha_2) * tensor.take(ten_t1)
 
         if mul_time:
-            return fwd1 * time_tenor_tenor - (fwd2 * time_grid_years).reshape(-1, 1)
+            time_tenor_tenor = tensor.new(time_grid.time_grid_years.reshape(-1, 1) + tnr)
+            time_grid_tensor = tensor.new(time_grid.time_grid_years)
+
+            return fwd1 * time_tenor_tenor - (fwd2 * time_grid_tensor).reshape(-1, 1)
         else:
             return fwd1 - fwd2.reshape(-1, 1)
 
@@ -1908,12 +1960,8 @@ def make_fixed_cashflows(reference_date, position, cashflows, settlement_date):
         rate = cashflow['Rate'] if isinstance(cashflow['Rate'], float) else cashflow['Rate'].amount
         if cashflow['Payment_Date'] >= reference_date and (
                 (cashflow['Payment_Date'] >= settlement_date) if settlement_date else True):
-            # check the accrual dates - if none set it to the payment date
-            Accrual_Start_Date = cashflow['Accrual_Start_Date'] if cashflow[
-                'Accrual_Start_Date'] else cashflow['Payment_Date']
-            Accrual_End_Date = cashflow['Accrual_End_Date'] if cashflow[
-                'Accrual_End_Date'] else cashflow['Payment_Date']
-
+            Accrual_Start_Date = cashflow.get('Accrual_Start_Date', cashflow['Payment_Date'])
+            Accrual_End_Date = cashflow.get('Accrual_End_Date', cashflow['Payment_Date'])
             cash.append([(Accrual_Start_Date - reference_date).days, (Accrual_End_Date - reference_date).days,
                          (cashflow['Payment_Date'] - reference_date).days,
                          cashflow['Accrual_Year_Fraction'], position * cashflow['Notional'],

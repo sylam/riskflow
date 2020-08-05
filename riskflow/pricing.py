@@ -23,9 +23,11 @@ from collections import OrderedDict
 from itertools import zip_longest
 
 import numpy as np
-import tensorflow as tf
+import scipy as sp
+import torch
+import torch.nn.functional as F
 
-from . import utils
+from riskflow import utils
 
 # useful constants
 BARRIER_UP = -1.0
@@ -51,21 +53,81 @@ class SensitivitiesEstimator(object):
 
     """
 
-    def __init__(self, value, params):
+    def __init__(self, value, params, create_graph=False):
         """
         Args:
             cost: Cost function output (tensor)
             params: List of model parameters (list of tensor(s))
         """
-        self.cost = value
-        self.grad = OrderedDict([(
-            var, tf.convert_to_tensor(grad)) for grad, var in zip(
-            tf.gradients(value, params, aggregation_method=tf.AggregationMethod.EXPERIMENTAL_ACCUMULATE_N),
-            params) if grad is not None])
-        self.params = list(self.grad.keys())
-        self.P = self.flatten(self.params).get_shape().as_list()[0]
+        # run the backward pass
+        value.backward(retain_graph=True, create_graph=create_graph)
+        # store associated gradients
+        self.params = OrderedDict([(key, tensor) for key, tensor in params if tensor.grad is not None])
+        self.grad = OrderedDict([(key, tensor.grad) for key, tensor in self.params.items()])
+        self.flat_grad = self.flatten(list(self.grad.values()))
+        self.device = self.flat_grad.device
+        self.dtype = self.flat_grad.dtype
+        self.list_param = list(self.params.values())
+        self.P = len(self.flat_grad)
 
-    def flatten(self, params):
+    def report_grad(self):
+        return OrderedDict([(utils.check_scope_name(factor),
+                             tensor.cpu().detach().numpy()) for factor, tensor in self.grad.items()])
+
+    def report_hessian(self, approx_eigenval=None, allow_unused=False):
+
+        def calc_Hv(x):
+            X = self.flat_grad.new(x.T)
+            f = [self.get_Hv_op(v) for v in X]
+            return torch.stack(f).cpu().detach().numpy().T.astype(np.float64)
+
+        if approx_eigenval is not None:
+            small_eval, small_evec = SensitivitiesEstimator.eigenvalues(
+                calc_Hv, np.random.randn(self.P, approx_eigenval), maxiter=50, largest=False)
+            big_eval, big_evec = SensitivitiesEstimator.eigenvalues(
+                calc_Hv, np.random.randn(self.P, approx_eigenval), maxiter=50, largest=True)
+            # now approximate the hessian using the eigenvalues and eigenvectors
+            dominant_lamda = np.diag(np.concatenate([big_eval, small_eval[::-1]]))
+            dominant_vecs = np.hstack([big_evec, small_evec[::-1]])
+            return dominant_vecs.dot(dominant_lamda).dot(dominant_vecs.T)
+
+        else:
+            h_op = self.get_H_op(allow_unused)
+            hessian = np.zeros((self.P, self.P))
+
+            # store it in a matrix
+            j = 0
+            for row in h_op:
+                v, _ = row.shape
+                hessian[j:j + v, j:] = row
+                j += v
+
+            # zero out the lower indices
+            hessian[np.tril_indices(self.P, k=-1)] = 0.0
+            return hessian + np.triu(hessian, k=1).T
+
+        #else:
+        #    I = torch.eye(self.P, self.P, device=self.device, dtype=self.dtype)
+        #    return torch.stack([self.get_Hv_op(v) for v in I]).cpu().detach().numpy()
+
+    def get_Hv_op(self, v):
+        """
+        Implements a Hessian vector product estimator Hv op defined as the
+        matrix multiplication of the Hessian matrix H with the vector v.
+
+        Args:
+            v: Vector to multiply with Hessian (tensor)
+
+        Returns:
+            Hv_op: Hessian vector product op (tensor)
+        """
+        hv = self.flatten(torch.autograd.grad(
+            self.flat_grad, self.list_param, grad_outputs=v, only_inputs=True, retain_graph=True))
+
+        return hv
+
+    @staticmethod
+    def flatten(params):
         """
         Flattens the list of tensor(s) into a 1D tensor
         
@@ -75,25 +137,244 @@ class SensitivitiesEstimator(object):
         Returns:
             A flattened 1D tensor
         """
-        return tf.concat([tf.reshape(_params, [-1]) for _params in params], axis=0)
+        return torch.cat([_params.reshape(-1) for _params in params], axis=0)
 
-    def get_Hv_op(self, v):
-        """ 
-        Implements a Hessian vector product estimator Hv op defined as the 
-        matrix multiplication of the Hessian matrix H with the vector v.
-    
-        Args:      
-            v: Vector to multiply with Hessian (tensor)
-        
-        Returns:
-            Hv_op: Hessian vector product op (tensor)
+    @staticmethod
+    def _b_orthonormalize(blockVectorV, blockVectorBV=None, retInvR=False):
+        """B-orthonormalize the given block vector using Cholesky."""
+        normalization = blockVectorV.max(axis=0) + np.finfo(blockVectorV.dtype).eps
+        blockVectorV = blockVectorV / normalization
+        if blockVectorBV is None:
+            blockVectorBV = blockVectorV  # Shared data!!!
+        else:
+            blockVectorBV = blockVectorBV / normalization
+        VBV = np.matmul(blockVectorV.T.conj(), blockVectorBV)
+        try:
+            # VBV is a Cholesky factor from now on...
+            VBV = sp.linalg.cholesky(VBV, overwrite_a=True)
+            VBV = sp.linalg.inv(VBV, overwrite_a=True)
+            blockVectorV = np.matmul(blockVectorV, VBV)
+            blockVectorBV = None
+        except sp.linalg.LinAlgError:
+            blockVectorV = None
+            blockVectorBV = None
+
+        if retInvR:
+            return blockVectorV, blockVectorBV, VBV, normalization
+        else:
+            return blockVectorV, blockVectorBV
+
+    @staticmethod
+    def _get_indx(_lambda, num, largest):
+        """Get `num` indices into `_lambda` depending on `largest` option."""
+        ii = np.argsort(_lambda)
+        if largest:
+            ii = ii[:-num - 1:-1]
+        else:
+            ii = ii[:num]
+        return ii
+
+    @staticmethod
+    def _as2d(ar):
         """
-        cost_gradient = self.flatten(self.grad.values())
-        vprod = tf.multiply(cost_gradient, tf.stop_gradient(v))
-        Hv_op = self.flatten(tf.gradients(vprod, self.params))
-        return Hv_op
+        If the input array is 2D return it, if it is 1D, append a dimension,
+        making it a column vector.
+        """
+        if ar.ndim == 2:
+            return ar
+        else:  # Assume 1!
+            aux = np.array(ar, copy=False)
+            aux.shape = (ar.shape[0], 1)
+            return aux
 
-    def get_H_op(self, prec):
+    @staticmethod
+    def eigenvalues(A, X, maxiter=None, largest=False):
+        # copied almost verbatum from scipy's lobpcg (modified to interface with torch's tensors)
+        blockVectorX = X
+        residualTolerance = None
+        if maxiter is None:
+            maxiter = 20
+
+        n, sizeX = blockVectorX.shape
+
+        if (residualTolerance is None) or (residualTolerance <= 0.0):
+            residualTolerance = np.sqrt(1e-15) * n
+
+        # B-orthonormalize X.
+        blockVectorX, blockVectorBX = SensitivitiesEstimator._b_orthonormalize(blockVectorX)
+        ##
+        # Compute the initial Ritz vectors: solve the eigenproblem.
+        blockVectorAX = A(blockVectorX)
+        gramXAX = np.dot(blockVectorX.T.conj(), blockVectorAX)
+        _lambda, eigBlockVector = sp.linalg.eigh(gramXAX, check_finite=False)
+        ii = SensitivitiesEstimator._get_indx(_lambda, sizeX, largest)
+        _lambda = _lambda[ii]
+        eigBlockVector = np.asarray(eigBlockVector[:, ii])
+        blockVectorX = np.dot(blockVectorX, eigBlockVector)
+        blockVectorAX = np.dot(blockVectorAX, eigBlockVector)
+
+        ##
+        # Active index set.
+        activeMask = np.ones((sizeX,), dtype=bool)
+        lambdaHistory = [_lambda]
+        residualNormsHistory = []
+        previousBlockSize = sizeX
+        ident = np.eye(sizeX, dtype=blockVectorAX.dtype)
+        ident0 = np.eye(sizeX, dtype=blockVectorAX.dtype)
+        ##
+
+        # Main iteration loop.
+        blockVectorP = None  # set during iteration
+        blockVectorAP = None
+        iterationNumber = -1
+        restart = True
+        explicitGramFlag = False
+        while iterationNumber < maxiter:
+            iterationNumber += 1
+
+            aux = blockVectorX * _lambda[np.newaxis, :]
+            blockVectorR = blockVectorAX - aux
+            aux = np.sum(blockVectorR.conj() * blockVectorR, 0)
+            residualNorms = np.sqrt(aux)
+            residualNormsHistory.append(residualNorms)
+            ii = np.where(residualNorms > residualTolerance, True, False)
+            activeMask = activeMask & ii
+
+            currentBlockSize = activeMask.sum()
+            if currentBlockSize != previousBlockSize:
+                previousBlockSize = currentBlockSize
+                ident = np.eye(currentBlockSize, dtype=blockVectorAX.dtype)
+            if currentBlockSize == 0:
+                break
+
+            activeBlockVectorR = SensitivitiesEstimator._as2d(blockVectorR[:, activeMask])
+            if iterationNumber > 0:
+                activeBlockVectorP = SensitivitiesEstimator._as2d(blockVectorP[:, activeMask])
+                activeBlockVectorAP = SensitivitiesEstimator._as2d(blockVectorAP[:, activeMask])
+
+            activeBlockVectorR = activeBlockVectorR - np.matmul(
+                blockVectorX, np.matmul(blockVectorX.T.conj(), activeBlockVectorR))
+
+            ##
+            # B-orthonormalize the preconditioned residuals.
+            aux = SensitivitiesEstimator._b_orthonormalize(activeBlockVectorR)
+            activeBlockVectorR, activeBlockVectorBR = aux
+            activeBlockVectorAR = A(activeBlockVectorR)
+            if iterationNumber > 0:
+                aux = SensitivitiesEstimator._b_orthonormalize(activeBlockVectorP, retInvR=True)
+                activeBlockVectorP, _, invR, normal = aux
+
+                # Function _b_orthonormalize returns None if Cholesky fails
+                if activeBlockVectorP is not None:
+                    activeBlockVectorAP = activeBlockVectorAP / normal
+                    activeBlockVectorAP = np.dot(activeBlockVectorAP, invR)
+                    restart = False
+                else:
+                    restart = True
+            ##
+            # Perform the Rayleigh Ritz Procedure:
+            # Compute symmetric Gram matrices:
+            if activeBlockVectorAR.dtype == 'float32':
+                myeps = 1
+            elif activeBlockVectorR.dtype == 'float32':
+                myeps = 1e-4
+            else:
+                myeps = 1e-8
+            if residualNorms.max() > myeps and not explicitGramFlag:
+                explicitGramFlag = False
+            else:
+                # Once explicitGramFlag, forever explicitGramFlag.
+                explicitGramFlag = True
+
+            # Shared memory assingments to simplify the code
+            blockVectorBX = blockVectorX
+            activeBlockVectorBR = activeBlockVectorR
+            if not restart:
+                activeBlockVectorBP = activeBlockVectorP
+
+            # Common submatrices:
+            gramXAR = np.dot(blockVectorX.T.conj(), activeBlockVectorAR)
+            gramRAR = np.dot(activeBlockVectorR.T.conj(), activeBlockVectorAR)
+            if explicitGramFlag:
+                gramRAR = (gramRAR + gramRAR.T.conj()) / 2
+                gramXAX = np.dot(blockVectorX.T.conj(), blockVectorAX)
+                gramXAX = (gramXAX + gramXAX.T.conj()) / 2
+                gramXBX = np.dot(blockVectorX.T.conj(), blockVectorBX)
+                gramRBR = np.dot(activeBlockVectorR.T.conj(), activeBlockVectorBR)
+                gramXBR = np.dot(blockVectorX.T.conj(), activeBlockVectorBR)
+            else:
+                gramXAX = np.diag(_lambda)
+                gramXBX = ident0
+                gramRBR = ident
+                gramXBR = np.zeros((sizeX, currentBlockSize), dtype=blockVectorAX.dtype)
+
+            if not restart:
+                gramXAP = np.dot(blockVectorX.T.conj(), activeBlockVectorAP)
+                gramRAP = np.dot(activeBlockVectorR.T.conj(), activeBlockVectorAP)
+                gramPAP = np.dot(activeBlockVectorP.T.conj(), activeBlockVectorAP)
+                gramXBP = np.dot(blockVectorX.T.conj(), activeBlockVectorBP)
+                gramRBP = np.dot(activeBlockVectorR.T.conj(), activeBlockVectorBP)
+                if explicitGramFlag:
+                    gramPAP = (gramPAP + gramPAP.T.conj()) / 2
+                    gramPBP = np.dot(activeBlockVectorP.T.conj(),
+                                     activeBlockVectorBP)
+                else:
+                    gramPBP = ident
+
+                gramA = np.bmat([[gramXAX, gramXAR, gramXAP],
+                                 [gramXAR.T.conj(), gramRAR, gramRAP],
+                                 [gramXAP.T.conj(), gramRAP.T.conj(), gramPAP]])
+
+                gramB = np.bmat([[gramXBX, gramXBR, gramXBP],
+                                 [gramXBR.T.conj(), gramRBR, gramRBP],
+                                 [gramXBP.T.conj(), gramRBP.T.conj(), gramPBP]])
+
+                try:
+                    _lambda, eigBlockVector = sp.linalg.eigh(gramA, gramB, check_finite=False)
+                except sp.linalg.LinAlgError:
+                    # try again after dropping the direction vectors P from RR
+                    restart = True
+
+            if restart:
+                gramA = np.bmat([[gramXAX, gramXAR],
+                                 [gramXAR.T.conj(), gramRAR]])
+                gramB = np.bmat([[gramXBX, gramXBR],
+                                 [gramXBR.T.conj(), gramRBR]])
+
+                try:
+                    _lambda, eigBlockVector = sp.linalg.eigh(gramA, gramB, check_finite=False)
+                except sp.linalg.LinAlgError:
+                    raise ValueError('eigh has failed in lobpcg iterations')
+
+            ii = SensitivitiesEstimator._get_indx(_lambda, sizeX, largest)
+
+            _lambda = _lambda[ii]
+            eigBlockVector = eigBlockVector[:, ii]
+            lambdaHistory.append(_lambda)
+
+            # Compute Ritz vectors.
+            if not restart:
+                eigBlockVectorX = eigBlockVector[:sizeX]
+                eigBlockVectorR = eigBlockVector[sizeX:sizeX + currentBlockSize]
+                eigBlockVectorP = eigBlockVector[sizeX + currentBlockSize:]
+                pp = np.dot(activeBlockVectorR, eigBlockVectorR)
+                pp += np.dot(activeBlockVectorP, eigBlockVectorP)
+                app = np.dot(activeBlockVectorAR, eigBlockVectorR)
+                app += np.dot(activeBlockVectorAP, eigBlockVectorP)
+            else:
+                eigBlockVectorX = eigBlockVector[:sizeX]
+                eigBlockVectorR = eigBlockVector[sizeX:]
+                pp = np.dot(activeBlockVectorR, eigBlockVectorR)
+                app = np.dot(activeBlockVectorAR, eigBlockVectorR)
+
+            blockVectorX = np.dot(blockVectorX, eigBlockVectorX) + pp
+            blockVectorAX = np.dot(blockVectorAX, eigBlockVectorX) + app
+            blockVectorP, blockVectorAP = pp, app
+
+        print(iterationNumber)
+        return _lambda, blockVectorX
+
+    def get_H_op(self, allow_unused):
         """ 
         Implements a full Hessian estimator op by forming p Hessian vector 
         products using HessianEstimator.get_Hv_op(v) for all v's in R^P
@@ -104,15 +385,38 @@ class SensitivitiesEstimator(object):
         Returns:
             H_op: Hessian matrix op (tensor)
         """
-        H_op = tf.map_fn(self.get_Hv_op, tf.eye(self.P, self.P, dtype=prec), dtype=prec)
-        return H_op
+
+        glist = self.grad.values()
+        plist = self.list_param
+        e = {l: torch.eye(l, dtype=self.dtype, device=self.device) for l in set([len(g) for g in glist])}
+        if allow_unused:
+            z = {l: torch.zeros(l, dtype=self.dtype, device=self.device) for l in set([len(p) for p in plist])}
+
+        hessian = []
+
+        for i, g in enumerate(glist):
+            g_size = len(g)
+            row = []
+            for block in [torch.autograd.grad(
+                    g, plist[i:], grad_outputs=x, only_inputs=True,
+                    allow_unused=allow_unused, retain_graph=True) for x in e[g_size]]:
+
+                if allow_unused:
+                    row.append(torch.cat([b if b is not None else z[len(p)] for b, p in zip(block, plist[i:])]))
+                else:
+                    row.append(torch.cat(block))
+
+            hessian.append(torch.stack(row).cpu().detach().numpy())
+
+        return hessian
 
 
 def greeks(shared, deal_data, mtm):
-    greeks_calc = SensitivitiesEstimator(mtm, shared.calc_greeks)
-    deal_data.Calc_res['Greeks_First'] = greeks_calc.grad
+    greeks_calc = SensitivitiesEstimator(mtm, shared.calc_greeks, create_graph=shared.gamma)
+    deal_data.Calc_res['Greeks_First'] = greeks_calc.report_grad()
     # use this only when all the vols and curves are sparsely represented (check greeks_calc.P)
-    # deal_data.Calc_res['Greeks_Second'] = greeks_calc.get_H_op(shared.precision)
+    if shared.gamma:
+        deal_data.Calc_res['Greeks_Second'] = greeks_calc.report_hessian(allow_unused=True)
 
 
 def interpolate(mtm, shared, time_grid, deal_data):
@@ -123,12 +427,12 @@ def interpolate(mtm, shared, time_grid, deal_data):
     # check if we want to store the mtm value for this instrument
     if deal_data.Calc_res is not None:
         deal_data.Calc_res['Value'] = mtm
-        if shared.calc_greeks is not None:
-            greeks(shared, deal_data, mtm)
+        # if shared.calc_greeks is not None:
+        #    greeks(shared, deal_data, mtm)
 
     if time_grid.mtm_time_grid.size > 1:
         # pad it with zeros and return
-        return tf.pad(mtm, [[0, time_grid.mtm_time_grid.size - deal_data.Time_dep.interp.size], [0, 0]])
+        return F.pad(mtm, (0, 0, 0, time_grid.mtm_time_grid.size - deal_data.Time_dep.interp.size))
     else:
         return mtm
 
@@ -435,8 +739,8 @@ def pvonetouchoption(shared, time_grid, deal_data, nominal,
 
 
 def pricer_float_cashflows(all_resets, cashflows, factor_dep, time_slice, shared):
-    margin = cashflows[:, utils.CASHFLOW_INDEX_FloatMargin] * cashflows[:, utils.CASHFLOW_INDEX_Year_Frac]
-    all_int = cashflows[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * all_resets + margin.reshape(1, -1, 1)
+    margin = (cashflows[:, utils.CASHFLOW_INDEX_FloatMargin] * cashflows[:, utils.CASHFLOW_INDEX_Year_Frac])
+    all_int = all_resets * cashflows[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) + margin.reshape(1, -1, 1)
 
     return all_int, margin
 
@@ -491,9 +795,9 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
 
     # first precalc all past resets
-    resets = factor_dep['Cashflows'].Resets
+    resets = factor_dep['Cashflows'].get_resets(shared.device, shared.precision)
     known_resets = resets.known_resets(shared.simulation_batch)
-    sim_resets = resets.sim_resets(deal_time[:, utils.TIME_GRID_MTM].max())
+    sim_resets, sim_weights = resets.sim_resets(deal_time[:, utils.TIME_GRID_MTM].max())
 
     if mtm_currency:
         # get the ungrouped resets
@@ -514,7 +818,7 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
     # simulated resets
     reset_values = []
 
-    for sim_group in sim_resets:
+    for sim_group, sim_weight in zip(sim_resets, sim_weights):
         old_resets = utils.calc_time_grid_curve_rate(
             factor_dep['Forward'], sim_group[:, :utils.RESET_INDEX_Scenario + 1], shared)
 
@@ -523,14 +827,14 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
         delta_end = (sim_group[:, utils.RESET_INDEX_End_Day] -
                      sim_group[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
 
-        reset_weights = (sim_group[:, utils.RESET_INDEX_Weight] /
-                         sim_group[:, utils.RESET_INDEX_Accrual]).reshape(-1, 1, 1)
+        reset_weights = sim_weight.reshape(-1, 1, 1)
 
-        reset_values.append(tf.expm1(old_resets.gather_weighted_curve(shared, delta_end, delta_start)) * reset_weights)
+        reset_values.append(torch.expm1(
+            old_resets.gather_weighted_curve(shared, delta_end, delta_start)) * reset_weights)
 
     # stack all resets
-    resets.stack(known_resets, reset_values, fillvalue=tf.zeros(
-        [0, 1, shared.simulation_batch], dtype=shared.precision))
+    resets.stack(known_resets, reset_values, fillvalue=torch.zeros(
+        (0, 1, shared.simulation_batch), device=shared.device, dtype=shared.precision))
 
     cash_start_idx = factor_dep['Cashflows'].get_cashflow_start_index(deal_time)
     start_index, start_counts = np.unique(cash_start_idx, return_counts=True)
@@ -538,7 +842,8 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
     for index, (forward_block, discount_block) in enumerate(utils.split_counts(
             [forwards, discounts], start_counts, shared)):
 
-        cashflows = factor_dep['Cashflows'].merged()[start_index[index]:]
+        # t_cash is the tensor representing the numpy array cashflows (we need both representations)
+        t_cash, cashflows = factor_dep['Cashflows'].merged(shared.device, shared.precision, start_index[index])
 
         cash_pmts, cash_index, cash_counts = np.unique(
             cashflows[:, utils.CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
@@ -562,31 +867,29 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
         for reset_index, (size, forward_rates) in enumerate(zip(*[reset_count, forward_blocks])):
             time_slice = time_block[time_ofs:time_ofs + size].reshape(-1, 1)
             all_resets = None
-            for old_resets, reset_block, reset_offsets in zip_longest(*reset_state, fillvalue=None):
+            for old_resets, reset_block, reset_weights, reset_offsets in zip_longest(*reset_state, fillvalue=None):
                 offset = reset_offsets[reset_index]
                 future_starts = reset_block[offset:, utils.RESET_INDEX_Start_Day] - time_slice
                 future_ends = reset_block[offset:, utils.RESET_INDEX_End_Day] - time_slice
-                future_weights = (reset_block[offset:, utils.RESET_INDEX_Weight]
-                                  / reset_block[offset:, utils.RESET_INDEX_Accrual]).reshape(1, -1, 1)
-                future_resets = tf.expm1(forward_rates.gather_weighted_curve(
+                future_weights = reset_weights[offset:].reshape(1, -1, 1)
+                future_resets = torch.expm1(forward_rates.gather_weighted_curve(
                     shared, future_ends, future_starts)) * future_weights
 
                 # now deal with past resets
                 if all_resets is None:
-                    all_resets = future_resets if old_resets is None else tf.concat(
-                        [tf.tile(tf.expand_dims(old_resets[:offset], axis=0), [size, 1, 1]),
-                         future_resets], axis=1)
+                    all_resets = future_resets if old_resets is None else torch.cat(
+                        [old_resets[:offset].expand(size, -1, -1), future_resets], axis=1)
                 else:
-                    all_resets = tf.concat([all_resets, future_resets], axis=1) if old_resets is None else tf.concat(
-                        [all_resets, tf.tile(tf.expand_dims(old_resets[:offset], axis=0), [size, 1, 1]),
-                         future_resets], axis=1)
+                    all_resets = torch.cat(
+                        [all_resets, future_resets], axis=1) if old_resets is None else torch.concat(
+                        [all_resets, old_resets[:offset].expand(size, -1, -1), future_resets], axis=1)
 
             # handle cashflows that don't pay interest (e.g. bullets)
             if cashflows[:, utils.CASHFLOW_INDEX_NumResets].all():
-                reset_cashflows = cashflows
+                reset_cashflows = t_cash
             else:
                 reset_cash_index = np.where(cashflows[:, utils.CASHFLOW_INDEX_NumResets])[0]
-                reset_cashflows = cashflows[reset_cash_index]
+                reset_cashflows = t_cash[reset_cash_index]
                 cash_counts *= (cashflows[:, utils.CASHFLOW_INDEX_NumResets] >= 1).astype(np.int32)
                 cash_index = reset_cash_index.searchsorted(cash_index)
 
@@ -630,37 +933,37 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
                     margin = all_margin
                     nominal = reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal]
 
-                default_offst = np.ones(cash_index.size, dtype=np.int32) * (interest.shape[1].value - 1)
+                default_offst = np.ones(cash_index.size, dtype=np.int32) * (interest.shape[1] - 1)
                 total = 0.0
 
                 for i in range(cash_counts.max()):
                     offst = default_offst.copy()
                     offst[cash_counts > i] = i + cash_index[cash_counts > i]
-                    int_i = tf.gather(interest, offst, axis=1)
+                    int_i = interest[:, offst]
 
                     if mtm_currency:
                         total += int_i * Pi + (Pi - Pi_1)
                     elif factor_dep['CompoundingMethod'] == 'Include_Margin':
-                        total += (total + nominal[offst].reshape(1, -1, 1)) * int_i
+                        total += int_i * (total + nominal[offst].reshape(1, -1, 1))
                     elif factor_dep['CompoundingMethod'] == 'Flat':
                         total += (int_i * nominal[offst].reshape(1, -1, 1)) + total * (
                                 int_i - margin[offst].reshape(1, -1, 1))
                     else:
                         raise Exception('Floating cashflow list method not implemented')
 
-            payments.append(total + cashflows[pmts_offset, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1))
+            payments.append(total + t_cash[pmts_offset, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1))
 
         # now finish the payments
-        all_payments = tf.concat(payments, axis=0) if len(payments) > 1 else payments[0]
+        all_payments = torch.cat(payments, axis=0) if len(payments) > 1 else payments[0]
 
         # settle any cashflows
         if settle_cash:
-            cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(time_grid.mtm_time_grid, cash_pmts[0]),
-                        all_payments[-1][0])
+            cash_settle(shared, factor_dep['SettleCurrency'],
+                        np.searchsorted(time_grid.mtm_time_grid, cash_pmts[0]), all_payments[-1][0])
         # add it to the list
-        mtm_list.append(tf.reduce_sum(all_payments * discount_rates, axis=1))
+        mtm_list.append(torch.sum(all_payments * discount_rates, axis=1))
 
-    return tf.concat(mtm_list, axis=0, name='mtm')
+    return torch.cat(mtm_list, axis=0)
 
 
 def pvfixedcashflows(shared, time_grid, deal_data, ignore_fixed_rate=False, settle_cash=True):
@@ -675,53 +978,56 @@ def pvfixedcashflows(shared, time_grid, deal_data, ignore_fixed_rate=False, sett
     start_index, counts = np.unique(cash_start_idx, return_counts=True)
 
     for index, [discount_block] in enumerate(utils.split_counts([discounts], counts, shared)):
-        cashflows = factor_dep['Cashflows'].schedule[start_index[index]:]
+        t_cash, cashflows = factor_dep['Cashflows'].merged(shared.device, shared.precision, start_index[index])
 
-        cash_pmts, cash_index, cash_counts = np.unique(cashflows[:, utils.CASHFLOW_INDEX_Pay_Day],
-                                                       return_index=True, return_counts=True)
+        cash_pmts, cash_index, cash_counts = np.unique(
+            cashflows[:, utils.CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
         # payment times            
         time_block = discount_block.time_grid[:, utils.TIME_GRID_MTM]
         future_pmts = cash_pmts.reshape(1, -1) - time_block.reshape(-1, 1)
 
         # discount rates
-        discount_rates = utils.calc_discount_rate(discount_block,
-                                                  future_pmts, shared)
+        discount_rates = utils.calc_discount_rate(discount_block, future_pmts, shared)
         # is this a forward?
         if settlement_amt:
-            settlement = settlement_amt * tf.squeeze(utils.calc_discount_rate(
-                discount_block,
-                (factor_dep['Settlement_Date'] - time_block).reshape(-1, 1), shared), axis=1)
+            settlement = settlement_amt * torch.squeeze(utils.calc_discount_rate(discount_block, (
+                    factor_dep['Settlement_Date'] - time_block).reshape(-1, 1), shared), axis=1)
         else:
             settlement = 0.0
 
         # empty list for payments
         all_int = (1.0 if ignore_fixed_rate else
                    cashflows[:, utils.CASHFLOW_INDEX_FixedRate]) * cashflows[:, utils.CASHFLOW_INDEX_Year_Frac]
-        payments = np.zeros_like(cash_index, dtype=shared.precision)
 
-        if cash_counts.min() != cash_counts.max():
-            interest = np.append(all_int, 0.0)
-            nominal = np.append(cashflows[:, utils.CASHFLOW_INDEX_Nominal], 0.0)
-            fixed_amt = np.append(cashflows[:, utils.CASHFLOW_INDEX_FixedAmt], 0.0)
-        else:
-            interest = all_int
-            nominal = cashflows[:, utils.CASHFLOW_INDEX_Nominal]
-            fixed_amt = cashflows[:, utils.CASHFLOW_INDEX_FixedAmt]
+        if factor_dep.get(('Payments', index)) is None:
+            payments = np.zeros_like(cash_index, dtype=shared.float)
 
-        default_offst = np.ones(cash_index.size, dtype=np.int32) * (interest.size - 1)
-
-        for i in range(cash_counts.max()):
-            offst = default_offst.copy()
-            offst[cash_counts > i] = i + cash_index[cash_counts > i]
-            int_i = interest[offst]
-
-            if factor_dep.get('Compounding', False):
-                payments += (payments + nominal[offst]) * int_i + fixed_amt[offst]
+            if cash_counts.min() != cash_counts.max():
+                interest = np.append(all_int, 0.0)
+                nominal = np.append(cashflows[:, utils.CASHFLOW_INDEX_Nominal], 0.0)
+                fixed_amt = np.append(cashflows[:, utils.CASHFLOW_INDEX_FixedAmt], 0.0)
             else:
-                payments += int_i * nominal[offst] + fixed_amt[offst]
+                interest = all_int
+                nominal = cashflows[:, utils.CASHFLOW_INDEX_Nominal]
+                fixed_amt = cashflows[:, utils.CASHFLOW_INDEX_FixedAmt]
 
+            default_offst = np.ones(cash_index.size, dtype=np.int32) * (interest.size - 1)
+
+            for i in range(cash_counts.max()):
+                offst = default_offst.copy()
+                offst[cash_counts > i] = i + cash_index[cash_counts > i]
+                int_i = interest[offst]
+
+                if factor_dep.get('Compounding', False):
+                    payments += (payments + nominal[offst]) * int_i + fixed_amt[offst]
+                else:
+                    payments += int_i * nominal[offst] + fixed_amt[offst]
+
+            # cache this payment tensor
+            factor_dep[('Payments', index)] = torch.tensor(payments, dtype=shared.precision, device=shared.device)
         # add to the mtm               
-        mtm_list.append(tf.reduce_sum(payments.reshape(1, -1, 1) * discount_rates, axis=1) - settlement)
+        mtm_list.append(torch.sum(
+            discount_rates * factor_dep[('Payments', index)].reshape(1, -1, 1), axis=1) - settlement)
 
         # settle any cashflows
         if settle_cash:
@@ -732,9 +1038,9 @@ def pvfixedcashflows(shared, time_grid, deal_data, ignore_fixed_rate=False, sett
             else:
                 cash_settle(shared, factor_dep['SettleCurrency'],
                             np.searchsorted(time_grid.mtm_time_grid, cash_pmts[0]),
-                            payments[0])
+                            factor_dep[('Payments', index)][0])
 
-    return tf.concat(mtm_list, axis=0, name='mtm')
+    return torch.cat(mtm_list, axis=0)
 
 
 def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
@@ -1184,7 +1490,7 @@ def pvfixedleg(shared, time_grid, deal_data):
     FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
                                  deal_time, shared)
 
-    mtm = FX_rep * pvfixedcashflows(shared, time_grid, deal_data)
+    mtm = pvfixedcashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
 
@@ -1194,7 +1500,7 @@ def pvenergyleg(shared, time_grid, deal_data):
     FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency,
                                  deal_time, shared)
 
-    mtm = FX_rep * pvenergycashflows(shared, time_grid, deal_data)
+    mtm = pvenergycashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
 
@@ -1203,10 +1509,24 @@ def pvfloatleg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
                                  deal_time, shared)
-    model = deal_data.Factor_dep.get('Model', pricer_float_cashflows)
-    mtm = pvfloatcashflowlist(shared, time_grid, deal_data, model) * FX_rep
+
+    mtm = pvfloatcashflowlist(shared, time_grid, deal_data, pricer_float_cashflows) * FX_rep
 
     return mtm
+
+
+def pvcapleg(shared, time_grid, deal_data):
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
+                                 deal_time, shared)
+    return pvfloatcashflowlist(shared, time_grid, deal_data, pricer_cap) * FX_rep
+
+
+def pvfloorleg(shared, time_grid, deal_data):
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
+                                 deal_time, shared)
+    return pvfloatcashflowlist(shared, time_grid, deal_data, pricer_floor) * FX_rep
 
 
 def pvindexleg(shared, time_grid, deal_data):
@@ -1214,7 +1534,7 @@ def pvindexleg(shared, time_grid, deal_data):
     FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency,
                                  deal_time, shared)
 
-    mtm = FX_rep * pvindexcashflows(shared, time_grid, deal_data)
+    mtm = pvindexcashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
 
@@ -1223,7 +1543,7 @@ def pvcdsleg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency,
                                  deal_time, shared)
-    mtm = FX_rep * pvcreditcashflows(shared, time_grid, deal_data)
+    mtm = pvcreditcashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
 
@@ -1233,7 +1553,7 @@ def pvequityleg(shared, time_grid, deal_data):
     FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency,
                                  deal_time, shared)
 
-    mtm = FX_rep * pvequitycashflows(shared, time_grid, deal_data)
+    mtm = pvequitycashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
 
@@ -1241,7 +1561,7 @@ def pvequityleg(shared, time_grid, deal_data):
 def pvfxbarrieroption(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     nominal = deal_data.Instrument.field['Underlying_Amount']
-    payoff_currency = deal_data.Instrument.payoff_ccy
+    payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
 
     curr_curve = utils.calc_time_grid_curve_rate(
         deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
@@ -1267,7 +1587,7 @@ def pvfxbarrieroption(shared, time_grid, deal_data):
         shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency,
         invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
 
-    mtm = fx_rep * pv
+    mtm = pv * fx_rep
 
     return mtm
 
@@ -1298,7 +1618,7 @@ def pveqbarrieroption(shared, time_grid, deal_data):
         shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency,
         invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
 
-    mtm = fx_rep * pv
+    mtm = pv * fx_rep
 
     return mtm
 
@@ -1306,7 +1626,7 @@ def pveqbarrieroption(shared, time_grid, deal_data):
 def pvfxonetouch(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     nominal = deal_data.Instrument.field['Cash_Payoff']
-    payoff_currency = deal_data.Instrument.payoff_ccy
+    payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
     fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0],
                                  shared.Report_Currency, deal_time, shared)
 
@@ -1331,6 +1651,6 @@ def pvfxonetouch(shared, time_grid, deal_data):
         shared, time_grid, deal_data, nominal,
         spot, b, tau, payoff_currency, invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
 
-    mtm = fx_rep * pv
+    mtm = pv * fx_rep
 
     return mtm
