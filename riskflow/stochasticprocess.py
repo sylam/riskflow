@@ -31,6 +31,12 @@ from riskflow import utils
 from riskflow.instruments import get_fx_zero_rate_factor
 
 
+class ProcessModifiedException(Exception):
+    def __init__(self, message, indices):
+        self.message = message
+        self.indices = indices
+
+
 def piecewise_linear(t, tenor, values, shared):
     if isinstance(values, np.ndarray):
         # no tensors needed - don't even bother caching
@@ -387,6 +393,7 @@ class HullWhite2FactorImpliedInterestRateModel(object):
         self.param = param
         self.implied = implied_factor
         self.clip = clip
+        self.cholesky_ok = True
         self.grid_index = None
         self.BtT = None
         self.C = None
@@ -458,16 +465,27 @@ class HullWhite2FactorImpliedInterestRateModel(object):
                 torch.cat([first_part, second_part, third_part], axis=1),
                 torch.stack([BtT[j] * BtT[i], BtT[i] / alpha[j], BtT[j] / alpha[i]]))
 
-        # get the correlation through time
-        cholesky = [tensor.new_zeros((2, 2), dtype=torch.float64)]
-        t_CtT = torch.stack(CtT).t()
+        t_CtT = torch.stack(CtT).T
+        # get the change in variance
+        delta_CtT = t_CtT[1:] - t_CtT[:-1]
+        # check if the entire cholesky is +ve definite
+        if (delta_CtT[:, 0] * delta_CtT[:, 3] > delta_CtT[:, 1] * delta_CtT[:, 2]).all():
+            # get the correlation through time
+            C = F.pad(torch.cholesky(delta_CtT.reshape(-1, 2, 2)), (0, 0, 0, 0, 1, 0))
+        else:
+            # need to fix the cholesky and record where we fixed it
+            cholesky = [tensor.new_zeros((2, 2), dtype=torch.float64)]
+            indices_fixed = []
+            for i, C in enumerate(t_CtT[1:] - t_CtT[:-1]):
+                if C[1]*C[2] < C[0]*C[3]:
+                    cholesky.append(torch.cholesky(C.reshape(2, 2)))
+                else:
+                    indices_fixed.append(i)
+                    cholesky.append(cholesky[-1])
 
-        for C in (t_CtT[1:] - t_CtT[:-1]):
-            decomp = torch.cholesky(C.reshape(2, 2))
-            cholesky.append(decomp)
-
-        # this will break if the cholesky is not Positive definite
-        C = torch.stack(cholesky)
+            # the cholesky was broken
+            self.cholesky_ok = False
+            C = torch.stack(cholesky)
 
         # intermediate results
         self.BtT = [Bi.type(shared.precision).reshape(-1, 1) for Bi in BtT]
@@ -485,6 +503,9 @@ class HullWhite2FactorImpliedInterestRateModel(object):
             self.grid_index = time_grid.scen_time_grid.searchsorted(time_grid.scenario_grid[:, utils.TIME_GRID_MTM])
 
         self.drift = torch.unsqueeze(self.fwd_curve + 0.5 * AtT.type(shared.precision), 2)
+
+        if not self.cholesky_ok:
+            raise ProcessModifiedException('Cholesky Decomp Failed', indices=indices_fixed)
 
     def calc_stoch_deflator(self, time_grid, curve_index, shared):
         cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])

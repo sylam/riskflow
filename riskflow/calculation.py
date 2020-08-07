@@ -19,7 +19,6 @@
 
 # import standard libraries
 
-import os
 import time
 import logging
 import itertools
@@ -32,7 +31,7 @@ from collections import OrderedDict, namedtuple, defaultdict
 # import the risk factors (also known as price factors)
 from riskflow.riskfactors import construct_factor
 # import the stochastic processes
-from riskflow.stochasticprocess import construct_process
+from riskflow.stochasticprocess import construct_process, ProcessModifiedException
 # import the currency/curve lookup factors 
 from riskflow.instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
 # import the hessian function
@@ -703,13 +702,14 @@ class Credit_Monte_Carlo(Calculation):
                 implied_index = self.implied_ofs.get(key, -1)
                 implied_tensor = {k.name[-1]: v for k, v in self.implied_var[implied_index].items()} \
                     if implied_index > -1 else None
-
-                value.precalculate(
-                    base_date, ScenarioTimeGrid(
-                        dependent_factors[key], self.time_grid, base_date),
-                    self.stoch_var[self.stoch_ofs[key]][1],
-                    shared_mem, self.process_ofs[key],
-                    implied_tensor=implied_tensor)
+                try:
+                    value.precalculate(
+                        base_date, ScenarioTimeGrid(dependent_factors[key], self.time_grid, base_date),
+                        self.stoch_var[self.stoch_ofs[key]][1], shared_mem, self.process_ofs[key],
+                        implied_tensor=implied_tensor)
+                except ProcessModifiedException as e:
+                    logging.warning('Implied factor {} has been modified ({}) at indices {}'.format(
+                        utils.check_scope_name(key), e.message, e.indices))
 
         # now check if any of the stochastic processes depend on other processes
         for key, value in self.stoch_factors.items():
@@ -893,6 +893,7 @@ class Credit_Monte_Carlo(Calculation):
         self.calc_stats['Tensor_Execution_Time'] = time.clock()
 
         for run in range(self.params['Simulation_Batches']):
+            start_run = time.clock()
             # need to refresh random numbers and zero out buffers
             shared_mem.reset(self.num_factors, self.time_grid)
 
@@ -1042,6 +1043,8 @@ class Credit_Monte_Carlo(Calculation):
                         if hessian:
                             # calculate the hessian matrix - warning - make sure you have enough memory
                             output['grad_cva_hessian'] = sensitivity.report_hessian()
+
+            print('Run {} in {:.3f} s'.format(run, time.clock()-start_run))
 
             # store all output tensors
             for k, v in tensors.items():

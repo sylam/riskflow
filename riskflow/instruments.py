@@ -525,12 +525,11 @@ class NettingCollateralSet(Deal):
         super(NettingCollateralSet, self).__init__(params, valuation_options)
         self.path_dependent = True
         self.calendar = None
-        self.options = valuation_options
-        self.options.update(
-            {'Cash_Settlement_Risk': utils.CASH_SETTLEMENT_Received_Only,
-             'Forward_Looking_Closeout': False,
-             'Use_Optimal_Collateral': False,
-             'Exclude_Paid_Today': False})
+        self.options = {'Cash_Settlement_Risk': utils.CASH_SETTLEMENT_Received_Only,
+                        'Forward_Looking_Closeout': False,
+                        'Use_Optimal_Collateral': False,
+                        'Exclude_Paid_Today': False}
+        self.options.update(valuation_options)
 
         # make sure collateral default parameters are defined
         self.field.setdefault('Settlement_Period', 0)
@@ -564,12 +563,14 @@ class NettingCollateralSet(Deal):
         if self.field.get('Collateralized', 'False') == 'True':
             # update each child element with extra reval dates
             for child in node_children:
-                #child.add_reval_dates({max(child.get_reval_dates())+pd.offsets.Day(1)})
-                child.add_reval_date_offset(1)
+                child.add_reval_dates({max(child.get_reval_dates()) + pd.offsets.Day(1)})
+                # child.add_reval_date_offset(1)
                 settle_liquid = {self.field['Settlement_Period'],
                                  self.field['Settlement_Period'] + self.field['Liquidation_Period']}
                 child.add_reval_date_offset(settle_liquid, relative_to_settlement=False)
                 node_resets.update(child.get_reval_dates())
+                # add an offset for this instrument
+                child.add_reval_date_offset(1)
 
             # Load the time grid
             grid_dates = parser(base_date, max(node_resets), grid)
@@ -810,26 +811,31 @@ class NettingCollateralSet(Deal):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
 
         if self.field.get('Collateralized', 'False') == 'True' and hasattr(shared, 't_Credit'):
-            C_base = tf.zeros_like(accum, dtype=shared.precision)
+            C_base = 0.0
 
             for curr, fx_factor in factor_dep['Settlement_Currencies'].items():
                 Ci = []
                 T = sorted(shared.t_Cashflows[curr].keys())
                 for index, pad in enumerate(np.diff([-1] + T + [time_grid.time_grid.shape[0]]) - 1):
                     if index < len(T):
-                        cashflow_at_index = tf.expand_dims(shared.t_Cashflows[curr][T[index]], axis=0)
-                        Ci.append(tf.pad(cashflow_at_index, [[pad, 0], [0, 0]]))
+                        cashflow_at_index = torch.unsqueeze(shared.t_Cashflows[curr][T[index]], axis=0)
+                        Ci.append(F.pad(cashflow_at_index, (0, 0, pad, 0)))
 
-                base_Ci = tf.concat(Ci, axis=0)
+                base_Ci = torch.cat(Ci, axis=0)
                 # pad the last bit
-                C_base += tf.pad(utils.calc_time_grid_spot_rate(
-                    fx_factor, time_grid.time_grid[:-pad], shared) * base_Ci, [[0, pad], [0, 0]])
+                C_base += F.pad(utils.calc_time_grid_spot_rate(
+                    fx_factor, time_grid.time_grid[:-pad], shared) * base_Ci, (0, 0, 0, pad))
 
-            Cf_Rec = tf.cumsum(tf.nn.relu(C_base), axis=0, exclusive=not self.options['Exclude_Paid_Today'])
-            Cf_Pay = tf.cumsum(tf.nn.relu(-C_base), axis=0, exclusive=not self.options['Exclude_Paid_Today'])
+            if not self.options['Exclude_Paid_Today']:
+                C_block = C_base[:-1]
+                Cf_Rec = F.pad(torch.cumsum(torch.relu(C_block), axis=0), (0, 0, 1, 0))
+                Cf_Pay = F.pad(torch.cumsum(torch.relu(-C_block), axis=0), (0, 0, 1, 0))
+            else:
+                Cf_Rec = torch.cumsum(torch.relu(C_base), axis=0)
+                Cf_Pay = torch.cumsum(torch.relu(-C_base), axis=0)
 
             # calc collateral values
-            St = tf.zeros_like(accum)
+            St = torch.zeros_like(accum, dtype=shared.precision, device=shared.device)
 
             for cash_col in factor_dep['Cash_Collateral']:
                 St += (1.0 - cash_col.Haircut) * cash_col.Amount * utils.calc_time_grid_spot_rate(
@@ -839,7 +845,7 @@ class NettingCollateralSet(Deal):
                 bond = pricing.pvfixedcashflows(shared, time_grid, bond_col.Collateral, settle_cash=False)
                 padding = time_grid.time_grid.shape[0] - bond.shape[0].value
                 St += (1.0 - bond_col.Haircut) * utils.calc_time_grid_spot_rate(
-                    bond_col.Currency, time_grid.time_grid, shared) * tf.pad(bond, [[0, padding], [0, 0]])
+                    bond_col.Currency, time_grid.time_grid, shared) * F.pad(bond, (0, 0, 0, padding))
 
             for equity_col in factor_dep['Equity_Collateral']:
                 St += (1.0 - equity_col.Haircut) * equity_col.Amount * utils.calc_time_grid_spot_rate(
@@ -854,16 +860,16 @@ class NettingCollateralSet(Deal):
             min_received = self.field['Credit_Support_Amounts']['Minimum_Received'].value()
             min_posted = self.field['Credit_Support_Amounts']['Minimum_Posted'].value()
 
-            if self.options['Exclude_Paid_Today']:
-                mtm_today_adj = tf.concat([tf.reshape(Cf_Rec[0], (1, -1)), Cf_Rec[1:] - Cf_Rec[:-1]], axis=0) - \
-                                tf.concat([tf.reshape(Cf_Pay[0], (1, -1)), Cf_Pay[1:] - Cf_Rec[:-1]], axis=0)
-            else:
-                mtm_today_adj = tf.zeros_like(accum, dtype=shared.precision)
+            Vt = accum * fx_base
 
-            Vt = accum * fx_base - mtm_today_adj
+            if self.options['Exclude_Paid_Today']:
+                mtm_today_adj = torch.cat([Cf_Rec[0].reshape(1, -1), Cf_Rec[1:] - Cf_Rec[:-1]], axis=0) - \
+                                torch.cat([Cf_Pay[0].reshape(1, -1), Cf_Pay[1:] - Cf_Rec[:-1]], axis=0)
+                Vt -= mtm_today_adj
+
             At = factor_dep['Independent_Amount'] * fx_agreement + \
-                 (Vt - H) * tf.cast(Vt > H, dtype=shared.precision) + \
-                 (Vt - G) * tf.cast(Vt < G, dtype=shared.precision)
+                 (Vt - H) * (Vt > H).type(shared.precision) + \
+                 (Vt - G) * (Vt < G).type(shared.precision)
 
             Bt = self.field['Opening_Balance'] * utils.calc_time_grid_spot_rate(
                 factor_dep['Balance_Currency'], np.array([[0, 0, 0]]), shared) / St[0]
@@ -876,60 +882,62 @@ class NettingCollateralSet(Deal):
 
             if factor_dep['call_mask'].all():
                 # daily collateral
-                Sim_Bt = tf.scan(lambda a, x: tf.where(
-                    tf.logical_or(a <= x[0], a >= x[1]), x[2], a),
-                                 [Mr[1:], Mp[1:], Bt_new[1:]], initializer=Bt[0],
-                                 swap_memory=True, back_prop=True)
-
+                Sim_Bt = [Bt[0]]
+                for mr, mp, bt in zip(Mr[1:], Mp[1:], Bt_new[1:]):
+                    mask = ((Sim_Bt[-1] < mr) | (Sim_Bt[-1] > mp)).type(shared.precision)
+                    Sim_Bt.append(bt * mask + Sim_Bt[-1] * (1 - mask))
             else:
                 # collateral according to call_mask
-                Sim_Bt = tf.scan(lambda a, x: tf.where(
-                    tf.logical_and(x[3], tf.logical_or(
-                        a <= x[0], a >= x[1])), x[2], a),
-                                 [Mr[1:], Mp[1:], Bt_new[1:], factor_dep['call_mask'][1:].astype(np.bool)],
-                                 initializer=Bt[0], swap_memory=True, back_prop=True)
+                Sim_Bt = [Bt[0]]
+                Call_mask = factor_dep['call_mask'][1:].astype(np.bool)
+                for mr, mp, bt, cm in zip(Mr[1:], Mp[1:], Bt_new[1:], Call_mask[1:]):
+                    if cm:
+                        mask = ((Sim_Bt[-1] < mr) | (Sim_Bt[-1] > mp)).type(shared.precision)
+                        Sim_Bt.append(bt * mask + Sim_Bt[-1] * (1 - mask))
+                    else:
+                        Sim_Bt.append(Sim_Bt[-1])
 
-            Bt = tf.concat([Bt, Sim_Bt], axis=0)
+            Bt = torch.stack(Sim_Bt)
 
             # now calculate the collateral account and Net exposure
             fx_base = utils.calc_time_grid_spot_rate(shared.Report_Currency, deal_time, shared)
 
-            if self.options['Exclude_Paid_Today']:
-                mtm_today_adj = tf.gather(Cf_Rec, factor_dep['Te']) - tf.pad(
-                    tf.gather(Cf_Rec, factor_dep['Te'][1:] - 1), [[1, 0], [0, 0]]) - \
-                                tf.gather(Cf_Pay, factor_dep['Te']) - tf.pad(
-                    tf.gather(Cf_Pay, factor_dep['Te'][1:] - 1), [[1, 0], [0, 0]])
-            else:
-                mtm_today_adj = tf.zeros_like(fx_base)
+            Vte = accum[factor_dep['Te']] * fx_base
 
-            Vte = tf.gather(accum, factor_dep['Te']) * fx_base - mtm_today_adj
+            if self.options['Exclude_Paid_Today']:
+                mtm_today_adj = (Cf_Rec[factor_dep['Te']] - F.pad(
+                    Cf_Rec[factor_dep['Te'][1:] - 1], (0, 0, 1, 0))) - (
+                    Cf_Pay[factor_dep['Te']] - F.pad(
+                    Cf_Pay[factor_dep['Te'][1:] - 1], (0, 0, 1, 0)))
+
+                Vte -= mtm_today_adj
 
             if self.options['Cash_Settlement_Risk'] == utils.CASH_SETTLEMENT_Received_Only:
-                C_ts_te = (tf.gather(Cf_Rec, factor_dep['Te']) - tf.gather(Cf_Rec, factor_dep['Ts'])) - \
-                          (tf.gather(Cf_Pay, factor_dep['Te']) - tf.gather(Cf_Pay, factor_dep['Ts']))
+                C_ts_te = (Cf_Rec[factor_dep['Te']] - Cf_Rec[factor_dep['Ts']]) - \
+                          (Cf_Pay[factor_dep['Te']] - Cf_Pay[factor_dep['Ts']])
             elif self.options['Cash_Settlement_Risk'] == utils.CASH_SETTLEMENT_Paid_Only:
-                C_ts_te = (tf.gather(Cf_Rec, factor_dep['Te']) - tf.gather(Cf_Rec, factor_dep['Tl'])) - \
-                          (tf.gather(Cf_Pay, factor_dep['Te']) - tf.gather(Cf_Pay, factor_dep['Tl']))
+                C_ts_te = (Cf_Rec[factor_dep['Te']] - Cf_Rec[factor_dep['Tl']]) - \
+                          (Cf_Pay[factor_dep['Te']] - Cf_Pay[factor_dep['Tl']])
             else:
-                C_ts_te = (tf.gather(Cf_Rec, factor_dep['Te']) - tf.gather(Cf_Rec, factor_dep['Ts'])) - \
-                          (tf.gather(Cf_Pay, factor_dep['Te']) - tf.gather(Cf_Pay, factor_dep['Tl']))
+                C_ts_te = (Cf_Rec[factor_dep['Te']] - Cf_Rec[factor_dep['Ts']]) - \
+                          (Cf_Pay[factor_dep['Te']] - Cf_Pay[factor_dep['Tl']])
 
             # note that this should be the minimum Bt from factor_dep['Ts'] to factor_dep['Tl']
-            Ste = tf.gather(St, factor_dep['Te'])
-            Bte = tf.gather(Bt, factor_dep['Te'])
+            Ste = St[factor_dep['Te']]
+            Bte = Bt[factor_dep['Te']]
             # Go from time Ts one step at a time and keep track of the minimum
             base_i = factor_dep['Ts'][:-1]
             # work out how many step from time Ts to time Tl
             delta_T = factor_dep['Tl'][:-1] - base_i
-            min_Bt = tf.gather(Bt, base_i)
+            min_Bt = Bt[base_i]
             b_index = np.zeros_like(delta_T)
 
             for i in range(delta_T.max() if delta_T.size else 0):
                 b_index[delta_T > i] = i + 1
-                min_Bt = tf.minimum(min_Bt, tf.gather(Bt, base_i + b_index))
+                min_Bt = torch.min(min_Bt, Bt[base_i + b_index])
 
             # zero out the last row
-            min_Bt = tf.pad(min_Bt, [[0, 1], [0, 0]])
+            min_Bt = F.pad(min_Bt, (0, 0, 0, 1))
 
             # Store results
             shared.t_Credit['Gross MTM'] = Vte
@@ -948,13 +956,13 @@ class NettingCollateralSet(Deal):
                 discount_funding = utils.calc_time_grid_curve_rate(cash_col.Funding_Rate, deal_time, shared)
                 discount_collateral = utils.calc_time_grid_curve_rate(cash_col.Collateral_Rate, deal_time, shared)
 
-                Dc_over_f_tT_m1 = tf.expm1(
-                    tf.squeeze(discount_funding.gather_weighted_curve(shared, delta_scen_t) -
-                               discount_collateral.gather_weighted_curve(shared, delta_scen_t), axis=1)
+                Dc_over_f_tT_m1 = torch.expm1(
+                    torch.squeeze(discount_funding.gather_weighted_curve(shared, delta_scen_t) -
+                    discount_collateral.gather_weighted_curve(shared, delta_scen_t), axis=1)
                 )
 
-                Dc0_T = tf.exp(
-                    -tf.squeeze(discount_collateral.gather_weighted_curve(
+                Dc0_T = torch.exp(
+                    -torch.squeeze(discount_collateral.gather_weighted_curve(
                         shared, mtm_grid.reshape(1, -1)), axis=0))
 
                 shared.t_Credit['Funding'] = (shared.t_Credit['Collateral'] * cash_base *

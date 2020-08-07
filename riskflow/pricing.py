@@ -106,10 +106,6 @@ class SensitivitiesEstimator(object):
             hessian[np.tril_indices(self.P, k=-1)] = 0.0
             return hessian + np.triu(hessian, k=1).T
 
-        #else:
-        #    I = torch.eye(self.P, self.P, device=self.device, dtype=self.dtype)
-        #    return torch.stack([self.get_Hv_op(v) for v in I]).cpu().detach().numpy()
-
     def get_Hv_op(self, v):
         """
         Implements a Hessian vector product estimator Hv op defined as the
@@ -376,7 +372,7 @@ class SensitivitiesEstimator(object):
 
     def get_H_op(self, allow_unused):
         """ 
-        Implements a full Hessian estimator op by forming p Hessian vector 
+        Implements a Hessian estimator op by forming p Hessian vector
         products using HessianEstimator.get_Hv_op(v) for all v's in R^P
         
         Args:
@@ -810,8 +806,8 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
         known_fx = factor_dep['Cashflows'].known_fx_resets(shared.simulation_batch)
 
         # fetch fx rates - note that there is a slight difference between this and the spot fx rate
-        old_fx_rates = tf.squeeze(
-            tf.concat([tf.stack(known_fx), sim_fx_forward] if known_fx else sim_fx_forward, axis=0), axis=1)
+        old_fx_rates = torch.cat([torch.stack(known_fx), sim_fx_forward]
+                                 if known_fx else sim_fx_forward, axis=0).squeeze(axis=1)
 
     forwards = utils.calc_time_grid_curve_rate(factor_dep['Forward'], deal_time, shared)
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
@@ -900,14 +896,12 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
                     cashflows[offset:, utils.CASHFLOW_INDEX_FXResetDate],
                     discount_block.time_grid[time_ofs:time_ofs + size], shared)
 
-                past_fx_resets = tf.tile(
-                    tf.expand_dims(old_fx_rates[reset_offset:reset_offset + offset], axis=0)
-                    , [size, 1, 1])
-                all_fx_resets = tf.concat([past_fx_resets, future_fx_resets], axis=1)
+                past_fx_resets = old_fx_rates[reset_offset:reset_offset + offset].expand(size, -1, -1)
+                all_fx_resets = torch.cat([past_fx_resets, future_fx_resets], axis=1)
 
                 # calculate the Nominal in the correct currency
-                Pi = all_fx_resets * cashflows[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1)
-                Pi_1 = tf.pad(Pi[:, 1:, :], [[0, 0], [0, 1], [0, 0]])
+                Pi = all_fx_resets * t_cash[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1)
+                Pi_1 = F.pad(Pi[:, 1:, :], (0, 0, 0, 1, 0, 0))
 
             time_ofs += size
 
@@ -925,7 +919,7 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
             else:
                 # check if there are a different number of resets per cashflow
                 if cash_counts.min() != cash_counts.max():
-                    interest = tf.pad(all_int, [[0, 0], [0, 1], [0, 0]])
+                    interest = F.pad(all_int, (0, 0, 0, 1, 0, 0))
                     nominal = np.append(reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal], 0.0)
                     margin = np.append(all_margin, 0.0)
                 else:
@@ -1342,20 +1336,15 @@ def pvequitycashflows(shared, time_grid, deal_data):
     cash, divis = factor_dep['Flows']
 
     # needed for grouping 
-    cash_start_idx = np.searchsorted(cash.schedule[:, utils.CASHFLOW_INDEX_Start_Day],
-                                     deal_time[:, utils.TIME_GRID_MTM], side='right')
-    cash_end_idx = np.searchsorted(cash.schedule[:, utils.CASHFLOW_INDEX_End_Day],
-                                   deal_time[:, utils.TIME_GRID_MTM], side='right')
+    cash_start_idx = np.searchsorted(
+        cash.schedule[:, utils.CASHFLOW_INDEX_Start_Day], deal_time[:, utils.TIME_GRID_MTM], side='right')
+    cash_end_idx = np.searchsorted(
+        cash.schedule[:, utils.CASHFLOW_INDEX_End_Day], deal_time[:, utils.TIME_GRID_MTM], side='right')
     cash_pay_idx = cash.get_cashflow_start_index(deal_time)
-
-    # would prefer to use np.unique here but it does not seem to work with tuples  
-    all_idx = OrderedDict()
-    for idx in zip(cash_start_idx, cash_end_idx, cash_pay_idx):
-        all_idx[idx] = all_idx.setdefault(idx, 0) + 1
 
     # first precalc all past resets
     all_samples = []
-    for samples in cash.Resets.split_groups(2):
+    for samples in cash.get_resets(shared.device, shared.precision).split_groups(2):
         known_sample = samples.known_resets(shared.simulation_batch, include_today=True)
         sim_samples = samples.schedule[
             (samples.schedule[:, utils.RESET_INDEX_Value] == 0.0) &
@@ -1365,11 +1354,11 @@ def pvequitycashflows(shared, time_grid, deal_data):
             factor_dep['Equity'], sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
 
         # fetch all fixed resets
-        if past_samples.shape[1].value != shared.simulation_batch:
-            past_samples = tf.tile(past_samples, [1, shared.simulation_batch])
+        if past_samples.shape[1] != shared.simulation_batch:
+            past_samples = past_samples.expand(-1, shared.simulation_batch)
 
-        all_samples.append(tf.concat(
-            [tf.concat(known_sample, axis=0), past_samples], axis=0) if known_sample else past_samples)
+        all_samples.append(torch.cat(
+            [torch.cat(known_sample, axis=0), past_samples], axis=0) if known_sample else past_samples)
 
     # now calculate the dividends
     div_samples = divis.Resets
@@ -1381,11 +1370,14 @@ def pvequitycashflows(shared, time_grid, deal_data):
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
     repo_discounts = utils.calc_time_grid_curve_rate(factor_dep['Equity_Zero'], deal_time, shared)
 
-    cashflows = cash.schedule
-    all_index, all_counts = zip(*all_idx.items())
+    #cashflows = cash.schedule
+    t_cash, cashflows = cash.merged(shared.device, shared.precision)
+    # all_index, all_counts = zip(*all_idx.items())
+    all_index, all_counts = np.unique(list(
+        zip(cash_start_idx, cash_end_idx, cash_pay_idx)), axis=0, return_counts=True)
 
     for index, (discount_block, repo_block, eq_block) in enumerate(
-            utils.split_counts([discounts, repo_discounts, eq_spot], np.array(all_counts), shared)):
+            utils.split_counts([discounts, repo_discounts, eq_spot], all_counts, shared)):
 
         start_idx, end_idx, pay_idx = all_index[index]
 
@@ -1399,14 +1391,14 @@ def pvequitycashflows(shared, time_grid, deal_data):
 
         # need equity forwards for start and end cashflows
         if pay_idx < end_idx:
-            St0 = tf.expand_dims(all_samples[0][pay_idx:end_idx], 0)
-            St1 = tf.expand_dims(all_samples[1][pay_idx:end_idx], 0)
+            St0 = torch.unsqueeze(all_samples[0][pay_idx:end_idx], 0)
+            St1 = torch.unsqueeze(all_samples[1][pay_idx:end_idx], 0)
 
             Ht0_t1 = 0 * h_t0_t1[pay_idx]
-            units = cashflows[pay_idx:end_idx, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1)
-            end_mult = cashflows[pay_idx:end_idx, utils.CASHFLOW_INDEX_End_Mult].reshape(1, -1, 1)
-            div_mult = cashflows[pay_idx:end_idx, utils.CASHFLOW_INDEX_Dividend_Mult].reshape(1, -1, 1)
-            start_mult = cashflows[pay_idx:end_idx, utils.CASHFLOW_INDEX_Start_Mult].reshape(1, -1, 1)
+            units = t_cash[pay_idx:end_idx, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1)
+            end_mult = t_cash[pay_idx:end_idx, utils.CASHFLOW_INDEX_End_Mult].reshape(1, -1, 1)
+            div_mult = t_cash[pay_idx:end_idx, utils.CASHFLOW_INDEX_Dividend_Mult].reshape(1, -1, 1)
+            start_mult = t_cash[pay_idx:end_idx, utils.CASHFLOW_INDEX_Start_Mult].reshape(1, -1, 1)
             payoff = (end_mult * St1 - start_mult * St0 + div_mult * Ht0_t1)
 
             payment = payoff * units
@@ -1418,7 +1410,7 @@ def pvequitycashflows(shared, time_grid, deal_data):
             # settle cashflow if necessary
             cash_settle(shared, factor_dep['SettleCurrency'],
                         np.searchsorted(time_grid.mtm_time_grid, cashflow_pay[0][0]),
-                        tf.reduce_sum(payment, axis=1)[0])
+                        torch.sum(payment, axis=1)[0])
 
         if end_idx < start_idx:
             cashflow_end = cashflows[end_idx, utils.CASHFLOW_INDEX_End_Day].reshape(1, -1)
@@ -1429,17 +1421,17 @@ def pvequitycashflows(shared, time_grid, deal_data):
 
             discount_end = utils.calc_discount_rate(repo_block, future_end, shared)
 
-            St0 = tf.expand_dims(all_samples[0][end_idx:start_idx], 0)
+            St0 = torch.unsqueeze(all_samples[0][end_idx:start_idx], axis=0)
             Ht0_t = utils.calc_realized_dividends(
                 factor_dep['Equity'], factor_dep['Equity_Zero'], factor_dep['Dividend_Yield'],
                 utils.calc_dividend_samples(time_block[0], time_block[-1], time_grid), shared)
 
-            units = cashflows[end_idx:start_idx, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1)
-            end_mult = cashflows[end_idx:start_idx, utils.CASHFLOW_INDEX_End_Mult].reshape(1, -1, 1)
-            div_mult = cashflows[end_idx:start_idx, utils.CASHFLOW_INDEX_Dividend_Mult].reshape(1, -1, 1)
-            start_mult = cashflows[end_idx:start_idx, utils.CASHFLOW_INDEX_Start_Mult].reshape(1, -1, 1)
+            units = t_cash[end_idx:start_idx, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1)
+            end_mult = t_cash[end_idx:start_idx, utils.CASHFLOW_INDEX_End_Mult].reshape(1, -1, 1)
+            div_mult = t_cash[end_idx:start_idx, utils.CASHFLOW_INDEX_Dividend_Mult].reshape(1, -1, 1)
+            start_mult = t_cash[end_idx:start_idx, utils.CASHFLOW_INDEX_Start_Mult].reshape(1, -1, 1)
 
-            payoff = (end_mult - div_mult) * forward_end + div_mult * tf.expand_dims(
+            payoff = (end_mult - div_mult) * forward_end + div_mult * torch.unsqueeze(
                 eq_block + Ht0_t, axis=1) / discount_end - start_mult * St0
 
             if factor_dep['PrincipleNotShares']:
@@ -1468,10 +1460,10 @@ def pvequitycashflows(shared, time_grid, deal_data):
                 factor1 = forward_end
                 factor2 = forward_start
 
-            units = cashflows[start_idx:, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1)
-            end_mult = cashflows[start_idx:, utils.CASHFLOW_INDEX_End_Mult].reshape(1, -1, 1)
-            div_mult = cashflows[start_idx:, utils.CASHFLOW_INDEX_Dividend_Mult].reshape(1, -1, 1)
-            start_mult = cashflows[start_idx:, utils.CASHFLOW_INDEX_Start_Mult].reshape(1, -1, 1)
+            units = t_cash[start_idx:, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1)
+            end_mult = t_cash[start_idx:, utils.CASHFLOW_INDEX_End_Mult].reshape(1, -1, 1)
+            div_mult = t_cash[start_idx:, utils.CASHFLOW_INDEX_Dividend_Mult].reshape(1, -1, 1)
+            start_mult = t_cash[start_idx:, utils.CASHFLOW_INDEX_Start_Mult].reshape(1, -1, 1)
 
             payoff = (end_mult - div_mult) * factor1 + (
                     div_mult * (discount_start / discount_end) - start_mult) * factor2
@@ -1479,10 +1471,10 @@ def pvequitycashflows(shared, time_grid, deal_data):
             payoffs.append(payoff * units)
 
         # now finish the payments
-        payments = tf.concat(payoffs, axis=1) if len(payoffs) > 1 else payoffs[0]
-        mtm_list.append(tf.reduce_sum(payments * discount_rates, axis=1))
+        payments = torch.cat(payoffs, axis=1) if len(payoffs) > 1 else payoffs[0]
+        mtm_list.append(torch.sum(payments * discount_rates, axis=1))
 
-    return tf.concat(mtm_list, axis=0, name='mtm')
+    return torch.cat(mtm_list, axis=0)
 
 
 def pvfixedleg(shared, time_grid, deal_data):
