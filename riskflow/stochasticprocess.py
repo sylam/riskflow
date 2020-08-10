@@ -152,9 +152,9 @@ class GBMAssetPriceModel(object):
 
         dt = np.diff(np.hstack(([0], time_grid.time_grid_years)))
         var = self.param['Vol'] * self.param['Vol'] * dt
-        self.drift = torch.tensor((self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1),
-                                  device=shared.device, dtype=shared.precision)
-        self.vol = torch.tensor((np.sqrt(var)).reshape(-1, 1), device=shared.device, dtype=shared.precision)
+        # store params in tensors
+        self.drift = tensor.new((self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1))
+        self.vol = tensor.new((np.sqrt(var)).reshape(-1, 1))
 
         # store a reference to the current tensor
         self.spot = tensor
@@ -184,7 +184,8 @@ class GBMAssetPriceCalibration(object):
         self.num_factors = 1
 
     def calibrate(self, data_frame, num_business_days=252.0, vol_cuttoff=0.5, drift_cuttoff=0.1):
-        stats, correlation, delta = utils.calc_statistics(data_frame, method='Log', num_business_days=num_business_days)
+        stats, correlation, delta = utils.calc_statistics(
+            data_frame, method='Log', num_business_days=num_business_days)
         mu = (stats['Drift'] + 0.5 * (stats['Volatility'] ** 2)).values[0]
         sigma = stats['Volatility'].values[0]
 
@@ -309,20 +310,23 @@ class GBMPriceIndexModel(object):
         return 1
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-        scenario_time_grid = np.array([(x - self.factor.param['Last_Period_Start']).days for x in
-                                       self.factor.get_last_publication_dates(ref_date,
-                                                                              time_grid.scen_time_grid.tolist())],
-                                      dtype=np.float64)
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        # calculate the correct scenario grid
+        scenario_time_grid = np.array(
+            [(x - self.factor.param['Last_Period_Start']).days
+             for x in self.factor.get_last_publication_dates(ref_date, time_grid.scen_time_grid.tolist())],
+            dtype=np.float64)
+        # record the horizon
+        self.scenario_horizon = scenario_time_grid.size
+
         dt = np.diff(np.hstack(([0], scenario_time_grid / utils.DAYS_IN_YEAR)))
         var = self.param['Vol'] * self.param['Vol'] * dt
-        drift = shared.precision(self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1)
-        vol = shared.precision(np.sqrt(var)).reshape(-1, 1)
+        self.drift = tensor.new(self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1)
+        self.vol = tensor.new(np.sqrt(var)).reshape(-1, 1)
 
         # store a reference to the current tensor
         self.spot = tensor
-
-        with tf.name_scope(self.__class__.__name__):
-            self.f1 = tf.cumsum(drift + vol * shared.t_random_numbers[process_ofs, :dt.size], axis=0, name='F1')
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         pass
@@ -332,8 +336,9 @@ class GBMPriceIndexModel(object):
         return 'LognormalDiffusionProcess', [()]
 
     def generate(self, shared_mem):
-        with tf.name_scope(self.__class__.__name__):
-            return self.spot * tf.exp(self.f1)
+        f1 = torch.cumsum(self.drift + self.vol *
+                          shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], axis=0)
+        return self.spot * torch.exp(f1)
 
 
 class GBMPriceIndexCalibration(object):
@@ -834,7 +839,11 @@ class CSForwardPriceModel(object):
         return mu, np.sqrt(var)
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-        self.initial_curve = tf.reshape(tensor, [1, -1, 1])
+        self.initial_curve = tensor.reshape(1, -1, 1)
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+        #  rebase the dates
         excel_offset = (ref_date - utils.excel_offset).days
         self.base_date_excel = excel_offset
         excel_date_time_grid = time_grid.scen_time_grid + excel_offset
@@ -851,21 +860,21 @@ class CSForwardPriceModel(object):
         var = np.square(self.param['Sigma']) * np.exp(-2.0 * self.param['Alpha'] * tenors) * var_adj
         # get the vol
         vol = np.sqrt(np.diff(np.insert(var, 0, 0, axis=0), axis=0))
-
-        with tf.name_scope(self.__class__.__name__):
-            drift = np.expand_dims(self.param['Drift'] * dt.cumsum(axis=0) - 0.5 * var, axis=2)
-            z_portion = tf.expand_dims(
-                shared.t_random_numbers[process_ofs, :time_grid.scen_time_grid.size],
-                axis=1) * np.expand_dims(vol, axis=2)
-            self.stoch = drift + tf.cumsum(z_portion, axis=0, name='CS')
+        self.vol = tensor.new(np.expand_dims(vol, axis=2))
+        self.drift = tensor.new(np.expand_dims(self.param['Drift'] * dt.cumsum(axis=0) - 0.5 * var, axis=2))
 
     @property
     def correlation_name(self):
         return 'ClewlowStricklandProcess', [()]
 
     def generate(self, shared_mem):
-        with tf.name_scope(self.__class__.__name__):
-            return self.initial_curve * tf.exp(self.stoch)
+        z_portion = torch.unsqueeze(
+            shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
+            axis=1) * self.vol
+
+        stoch = self.drift + torch.cumsum(z_portion, axis=0)
+
+        return self.initial_curve * torch.exp(stoch)
 
 
 class CSForwardPriceCalibration(object):

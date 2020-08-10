@@ -542,7 +542,7 @@ class InterestRateJacobian(object):
                                 Instrument=None, Factor_dep={'Cashflows': fixed_cash, 'Discount': curve_index},
                                 Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, [0]), Calc_res=None)
                             fmt_fn = str if isinstance(child['quote']['Descriptor'], str) else date_fmt
-                            benchmarks['Deposit_' + fmt_fn(child['quote']['Descriptor'])] = pricing.pvfixedcashflows(
+                            benchmarks['Deposit_' + fmt_fn(child['quote']['Descriptor'])] = pricing.pv_fixed_cashflows(
                                 shared_mem, time_grid, deal_data, settle_cash=False)
                         elif child['quote']['DealType'] == 'FRADeal':
                             float_cash, K, pvbp = atm_swap(
@@ -555,7 +555,7 @@ class InterestRateJacobian(object):
                                 Instrument=None, Factor_dep={'Cashflows': float_cash, 'Forward': curve_index,
                                                              'Discount': curve_index, 'CompoundingMethod': 'None'},
                                 Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, [0]), Calc_res=None)
-                            benchmarks['FRA_' + str(child['quote']['Descriptor'])] = pricing.pvfloatcashflowlist(
+                            benchmarks['FRA_' + str(child['quote']['Descriptor'])] = pricing.pv_float_cashflow_list(
                                 shared_mem, time_grid, deal_data, pricing.pricer_float_cashflows, settle_cash=False)
                         elif child['quote']['DealType'] == 'SwapInterestDeal':
                             float_cash, K, pvbp = atm_swap(
@@ -568,7 +568,7 @@ class InterestRateJacobian(object):
                                 Instrument=None, Factor_dep={'Cashflows': float_cash, 'Forward': curve_index,
                                                              'Discount': curve_index, 'CompoundingMethod': 'None'},
                                 Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, [0]), Calc_res=None)
-                            benchmarks['Swap_' + date_fmt(child['quote']['Descriptor'])] = pricing.pvfloatcashflowlist(
+                            benchmarks['Swap_' + date_fmt(child['quote']['Descriptor'])] = pricing.pv_float_cashflow_list(
                                 shared_mem, time_grid, deal_data, pricing.pricer_float_cashflows, settle_cash=False)
                         else:
                             raise Exception('quote type not supported')
@@ -753,7 +753,7 @@ class RiskNeutralInterestRateModel(object):
                 expiry = market_data.deal_data.Time_dep.mtm_time_grid[
                     market_data.deal_data.Time_dep.deal_time_grid[0]]
                 DtT = deflation[expiry]
-                par_swap = pricing.pvfloatcashflowlist(
+                par_swap = pricing.pv_float_cashflow_list(
                     shared_mem, time_grid, market_data.deal_data,
                     pricing.pricer_float_cashflows, settle_cash=False)
                 sum_swaption = tf.reduce_sum(tf.nn.relu(DtT * par_swap))
