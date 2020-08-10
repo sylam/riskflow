@@ -92,15 +92,14 @@ class DealStructure(object):
             try:
                 self.dependencies.append(
                     utils.DealDataType(Instrument=deal,
-                                       Factor_dep=deal.calc_dependencies(base_date, static_offsets,
-                                                                         stochastic_offsets,
-                                                                         all_factors, all_tenors,
-                                                                         time_grid, calendars),
+                                       Factor_dep=deal.calc_dependencies(
+                                           base_date, static_offsets, stochastic_offsets,
+                                           all_factors, all_tenors, time_grid, calendars),
                                        Time_dep=deal_time_dep,
                                        Calc_res=OrderedDict() if self.deal_level_mtm else None))
             except Exception as e:
-                logging.error('{0}.{1} {2} - Skipped'.format(deal.field['Object'],
-                                                             deal.field.get('Reference', '?'), e.args))
+                logging.error('{0}.{1} {2} - Skipped'.format(
+                    deal.field['Object'], deal.field.get('Reference', '?'), e.args))
 
     def add_structure_to_structure(self, struct, base_date, static_offsets, stochastic_offsets,
                                    all_factors, all_tenors, time_grid, calendars):
@@ -110,18 +109,16 @@ class DealStructure(object):
             if struct_time_dep is not None:
                 struct.obj = utils.DealDataType(
                     Instrument=struct.obj.Instrument,
-                    Factor_dep=struct.obj.Instrument.calc_dependencies(base_date,
-                                                                       static_offsets,
-                                                                       stochastic_offsets,
-                                                                       all_factors, all_tenors,
-                                                                       time_grid, calendars),
+                    Factor_dep=struct.obj.Instrument.calc_dependencies(
+                        base_date, static_offsets, stochastic_offsets,
+                        all_factors, all_tenors, time_grid, calendars),
                     Time_dep=struct_time_dep,
                     Calc_res=OrderedDict() if self.deal_level_mtm else None)
             # Structure object representing a netted set of cashflows
             self.sub_structures.append(struct)
         except Exception as e:
-            logging.error('{0}.{1} {2} - Skipped'.format(struct.obj.Instrument.field['Object'],
-                                                         struct.obj.Instrument.field.get('Reference', '?'), e.args))
+            logging.error('{0}.{1} {2} - Skipped'.format(
+                struct.obj.Instrument.field['Object'], struct.obj.Instrument.field.get('Reference', '?'), e.args))
 
     def build_partitions(self):
         # sort the data by the tags
@@ -1205,9 +1202,6 @@ class Base_Revaluation(Calculation):
 
             return block, greeks
 
-        # record the cuda execution stats
-        self.calc_stats['Tensor_Execution_Time'] = time.clock()
-
         # clear the output
         self.output = {}
         # load any tag titles
@@ -1224,8 +1218,6 @@ class Base_Revaluation(Calculation):
             else:
                 raise Exception('Unknown Greek requested', greek_name)
             self.output.setdefault(greek_name, summary)
-
-        self.calc_stats['Tensor_Execution_Time'] = time.clock() - self.calc_stats['Tensor_Execution_Time']
 
         return self.output
 
@@ -1262,7 +1254,10 @@ class Base_Revaluation(Calculation):
         ns_obj.Instrument.field.setdefault('Reference', self.config.deals['Attributes']['Reference'])
 
         if shared_mem.calc_greeks is not None:
+            # record the cuda execution stats
+            self.calc_stats['Greek_Execution_Time'] = time.clock()
             pricing.greeks(shared_mem, ns_obj, mtm)
+            self.calc_stats['Greek_Execution_Time'] = time.clock() - self.calc_stats['Greek_Execution_Time']
 
         # return a dictionary of output
         return {'Netting': self.netting_sets, 'Stats': self.calc_stats, 'Results': self.report()}
