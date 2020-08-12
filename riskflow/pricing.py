@@ -853,6 +853,129 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal,
     return mtm
 
 
+def pv_energy_option(shared, time_grid, deal_data, nominal):
+    mtm_list = []
+    factor_dep = deal_data.Factor_dep
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    # discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+    daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
+
+    # first precalc all past resets
+    samples = factor_dep['Cashflow'].get_resets(shared.device, shared.precision)
+    known_samples = samples.known_resets(shared.simulation_batch)
+    start_idx = samples.get_start_index(deal_time)
+    sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+                                   (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
+                                    deal_time[:, utils.TIME_GRID_MTM].max())]
+    fx_spot = utils.calc_fx_cross(factor_dep['ForwardFX'][0],
+                                  factor_dep['CashFX'][0], sim_samples, shared)
+    fx_rep = utils.calc_fx_cross(factor_dep['Payoff_Currency'], shared.Report_Currency,
+                                 deal_time, shared)
+    all_samples = utils.calc_time_grid_curve_rate(factor_dep['ForwardPrice'], sim_samples, shared)
+
+    sample_values = all_samples.gather_weighted_curve(
+        shared, sim_samples[:, utils.RESET_INDEX_End_Day, np.newaxis] if sim_samples.size else np.zeros((1, 1)),
+        multiply_by_time=False) * torch.unsqueeze(fx_spot, axis=1)
+
+    past_samples = torch.squeeze(
+        torch.cat([torch.stack(known_samples), sample_values], axis=0)
+        if known_samples else sample_values, axis=1)
+
+    forwards = utils.calc_time_grid_curve_rate(factor_dep['ForwardPrice'], deal_time, shared)
+    discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+    # need the tensor and numpy data
+    dual_samples = samples.dual()
+    start_index, start_counts = np.unique(start_idx, return_counts=True)
+
+    for index, (forward_block, discount_block) in enumerate(utils.split_counts(
+            [forwards, discounts], start_counts, shared)):
+
+        t_block = discount_block.time_grid
+        tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM].reshape(-1, 1)
+
+        sample_t = dual_samples[start_index[index]:]
+        average = torch.sum(
+            past_samples[:start_index[index]] *
+            dual_samples.tn[:start_index[index], utils.RESET_INDEX_Weight].reshape(-1, 1),
+            axis=0)
+
+        if sample_t.np.any():
+            sample_ts = np.tile(
+                sample_t.np[np.newaxis, :, utils.RESET_INDEX_End_Day],
+                [t_block.shape[0], 1])
+            weight_t = sample_t.tn[:, utils.RESET_INDEX_Weight].reshape(1, -1, 1)
+
+            future_resets = forward_block.gather_weighted_curve(
+                shared, sample_ts, multiply_by_time=False)
+
+            forwardfx = utils.calc_fx_forward(
+                factor_dep['ForwardFX'], factor_dep['CashFX'],
+                sample_t.np[:, utils.RESET_INDEX_Start_Day], t_block, shared)
+
+            sample_ft = weight_t * future_resets * forwardfx
+
+            # needed for vol lookup
+            sample_block = daycount_fn(
+                sample_t.np[:, utils.RESET_INDEX_Start_Day].reshape(1, -1))
+
+            delivery_block = daycount_fn(
+                sample_t.np[:, utils.RESET_INDEX_End_Day] - factor_dep['Basedate']
+            ).reshape(1, -1)
+
+            sample_tenor = daycount_fn(
+                sample_t.np[:, utils.RESET_INDEX_Start_Day].reshape(1, -1)
+                - t_block[:, utils.TIME_GRID_MTM, np.newaxis])
+
+            M1 = torch.sum(sample_ft, axis=1)
+            strike_bar = factor_dep['Strike'] - average
+            forward_p = M1 + average
+            moneyness = M1 / strike_bar
+            ref_vols = utils.calc_delivery_time_grid_vol_rate(
+                factor_dep['ReferenceVol'], moneyness, sample_block,
+                delivery_block, t_block, shared)
+
+            vol2 = ref_vols * ref_vols
+
+            # Note - need to allow for compo deals
+            if 'FXCompoVol' in factor_dep:
+                fx_vols = torch.unsqueeze(
+                    utils.calc_time_grid_vol_rate(
+                        factor_dep['FXCompoVol'], vol2.new_ones(1),
+                        sample_block.reshape(-1), shared),
+                    axis=0)
+                vol2 += fx_vols * fx_vols + 2.0 * fx_vols * ref_vols * factor_dep['ImpliedCorrelation'][0]
+
+            product_t = sample_ft * torch.exp(
+                vol2.new(np.expand_dims(sample_tenor, axis=2)) * vol2)
+
+            # do an exclusive cumsum on axis=1
+            sum_t = F.pad(torch.cumsum(product_t[:, :-1], axis=1), [0, 0, 1, 0, 0, 0])
+            M2 = torch.sum(sample_ft * (product_t + 2.0 * sum_t), axis=1)
+            MM = torch.log(M2) - 2.0 * torch.log(M1)
+            # trick to allow the gradients to be defined
+            MM_ok = MM.clamp(min=1e-5)
+            vol_t = torch.sqrt(MM_ok)
+            theo_price = utils.black_european_option(
+                forward_p, factor_dep['Strike'], vol_t, 1.0,
+                factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
+        else:
+            forward_p = average.reshape(1, -1)
+            theo_price = factor_dep['Buy_Sell'] * torch.relu(factor_dep['Option_Type'] * (
+                    forward_p - factor_dep['Strike']))
+
+        discount_rates = torch.squeeze(
+            utils.calc_discount_rate(discount_block, tenor_block, shared), axis=1)
+
+        cash = nominal * theo_price
+        mtm_list.append(cash * discount_rates)
+
+    # potential cashflows
+    cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], cash[-1])
+    # mtm in reporting currency
+    mtm = fx_rep * torch.cat(mtm_list, axis=0)
+
+    return mtm
+
 def pricer_float_cashflows(all_resets, t_cash, shared):
     margin = (t_cash[:, utils.CASHFLOW_INDEX_FloatMargin] * t_cash[:, utils.CASHFLOW_INDEX_Year_Frac])
     all_int = all_resets * t_cash[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) + margin.reshape(1, -1, 1)

@@ -906,15 +906,19 @@ class Credit_Monte_Carlo(Calculation):
 
             # now calculate all the valuation adjustments (if necessary)
             if 'CollVA' in params and 'Funding' in shared_mem.t_Credit:
-                with tf.name_scope('CollVA'):
-                    tensors['collva_t'] = tf.reduce_mean(shared_mem.t_Credit['Funding'], axis=1)
-                    tensors['collateral'] = shared_mem.t_Credit['Collateral']
-                    tensors['collva'] = torch.sum(tensors['collva_t'])
 
-                    if params['CollVA'].get('Gradient', 'No') == 'Yes':
-                        # calculate all the derivatives of collva
-                        tensors['grad_collva'] = SensitivitiesEstimator(
-                            tensors['collva'], self.all_var).report_grad()
+                tensors['collva_t'] = torch.mean(shared_mem.t_Credit['Funding'], axis=1)
+                tensors['collateral'] = shared_mem.t_Credit['Collateral']
+                tensors['collva'] = torch.sum(tensors['collva_t'])
+
+                if params['CollVA'].get('Gradient', 'No') == 'Yes':
+                    # calculate all the derivatives of fva
+                    sensitivity = SensitivitiesEstimator(tensors['collva'], self.all_var)
+
+                    if final_run:
+                        output['grad_collva'] = sensitivity.report_grad()
+                        # store the size of the Gradient
+                        self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
             if 'FVA' in params:
                 time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
@@ -966,8 +970,13 @@ class Credit_Monte_Carlo(Calculation):
 
                 if params['FVA'].get('Gradient', 'No') == 'Yes':
                     # calculate all the derivatives of fva
-                    tensors['grad_fva'] = SensitivitiesEstimator(
-                        tensors['fva'], self.all_var).report_grad()
+                    sensitivity = SensitivitiesEstimator(tensors['fva'], self.all_var)
+
+                    if final_run:
+                        output['grad_fva'] = sensitivity.report_grad()
+                        # store the size of the Gradient
+                        self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
+
 
             if 'CVA' in params:
                 discount = get_interest_factor(utils.check_rate_name(params['Deflation_Interest_Rate']),

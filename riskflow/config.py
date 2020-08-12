@@ -299,7 +299,7 @@ class Context(object):
 
         return {'present': model_factor, 'absent': remaining_factor}
 
-    def bootstrap(self):
+    def bootstrap(self, device):
         """
         Runs all the bootstrappers - this happens in one process with debugging on by default. For multiprocessing
         bootstrapping, call the construct_bootstrapper method directly
@@ -308,7 +308,7 @@ class Context(object):
         for bootstrapper_name, params in sorted(self.params['Bootstrapper Configuration'].items()):
             # need parsers here - but for now, can just use the name to know what to do
             try:
-                bootstrapper = construct_bootstrapper(bootstrapper_name, params)
+                bootstrapper = construct_bootstrapper(bootstrapper_name, params, device)
             except:
                 logging.warning('Cannot execute Bootstrapper for {0} - skipping'.format(bootstrapper_name))
                 continue

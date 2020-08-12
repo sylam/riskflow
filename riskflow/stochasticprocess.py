@@ -477,6 +477,8 @@ class HullWhite2FactorImpliedInterestRateModel(object):
         if (delta_CtT[:, 0] * delta_CtT[:, 3] > delta_CtT[:, 1] * delta_CtT[:, 2]).all():
             # get the correlation through time
             C = F.pad(torch.cholesky(delta_CtT.reshape(-1, 2, 2)), (0, 0, 0, 0, 1, 0))
+            # all good
+            self.cholesky_ok = True
         else:
             # need to fix the cholesky and record where we fixed it
             cholesky = [tensor.new_zeros((2, 2), dtype=torch.float64)]
@@ -509,8 +511,8 @@ class HullWhite2FactorImpliedInterestRateModel(object):
 
         self.drift = torch.unsqueeze(self.fwd_curve + 0.5 * AtT.type(shared.precision), 2)
 
-        if not self.cholesky_ok:
-            raise ProcessModifiedException('Cholesky Decomp Failed', indices=indices_fixed)
+        #if not self.cholesky_ok:
+            #raise ProcessModifiedException('Cholesky Decomp Failed', indices=indices_fixed)
 
     def calc_stoch_deflator(self, time_grid, curve_index, shared):
         cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])
@@ -520,12 +522,12 @@ class HullWhite2FactorImpliedInterestRateModel(object):
 
     def calc_points(self, rate, points, time_grid, shared, multiply_by_time=True):
         """ Much slower way to evaluate points at time t - but more accurate and memory efficient"""
-        t = rate[utils.FACTOR_INDEX_Daycount](points)
-        BtT = [tf.expand_dims((1.0 - tf.exp(-self.alpha[i] * t)), 2) / self.alpha[i] for i in range(2)]
+        t = self.drift.new(rate[utils.FACTOR_INDEX_Daycount](points))
+        BtT = [torch.unsqueeze((1.0 - torch.exp(-self.alpha[i] * t)), axis=2) / self.alpha[i] for i in range(2)]
         drift_at_grid = utils.gather_scenario_interp(self.drift, time_grid, shared)
-        drift = utils.interpolate_curve(drift_at_grid, rate, None, points, 0)
-        f1 = utils.gather_scenario_interp(self.f1, time_grid, shared)
-        f2 = utils.gather_scenario_interp(self.f2, time_grid, shared)
+        drift = drift_at_grid.interpolate_curve(rate, points, 0)
+        f1 = utils.gather_scenario_interp(self.f1, time_grid, shared, as_curve_tensor=False)
+        f2 = utils.gather_scenario_interp(self.f2, time_grid, shared, as_curve_tensor=False)
         stoch_component = BtT[0] * f1 + BtT[1] * f2
         fwd_curve = drift + stoch_component
 
@@ -547,20 +549,17 @@ class HullWhite2FactorImpliedInterestRateModel(object):
     def correlation_name(self):
         return 'HWImpliedInterestRate', [('F1',), ('F2',)]
 
-    def generate(self, shared_mem, random_sample=None):
-        if random_sample is not None:
-            self.calc_factors(random_sample[0], random_sample[:2])
-        else:
-            self.calc_factors(
-                shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
-                shared_mem.t_random_numbers[self.z_offset:self.z_offset + 2, :self.scenario_horizon])
+    def generate(self, shared_mem):
+        self.calc_factors(
+            shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
+            shared_mem.t_random_numbers[self.z_offset:self.z_offset + 2, :self.scenario_horizon])
 
         # check if we need deflators
         if self.grid_index is not None:
             # only generate curves for the given grid
-            f1 = tf.gather(self.f1, self.grid_index)
-            f2 = tf.gather(self.f2, self.grid_index)
-            drift = tf.gather(self.drift, self.grid_index)
+            f1 = self.f1[self.grid_index]
+            f2 = self.f2[self.grid_index]
+            drift = self.drift[self.grid_index]
         else:
             f1 = self.f1
             f2 = self.f2

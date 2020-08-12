@@ -859,10 +859,10 @@ class TensorBlock(object):
         temp_curve = 0
         for curve_tensor in self.curve_tensors:
             temp_curve += curve_tensor
-        DtT = tf.exp(-tf.cumsum(temp_curve, axis=0))
+        DtT = torch.exp(-torch.cumsum(temp_curve, axis=0))
         # we need the index just prior - note this needs to be checked in the calling code
         indices = self.time_grid[:, TIME_GRID_MTM].searchsorted(time_points) - 1
-        return {t: tf.gather(DtT, index) for t, index in zip(time_points, indices)}
+        return {t: DtT[index] for t, index in zip(time_points, indices)}
 
 
 # dataframe manipulation
@@ -917,7 +917,7 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
     if isinstance(tenor, float):
         guard = (vol > 0.0) & (X > 0.0)
         stddev = vol.clamp(min=1e-5) * np.sqrt(tenor)
-        strike = X.clamp(min=1e-5)
+        strike = min(X, 1e-5) if isinstance(X, float) else X.clamp(min=1e-5)
     else:
         guard = vol.new_tensor(tenor > 0.0, dtype=torch.bool)
         tau = np.sqrt(tenor.clip(0.0, np.inf))
@@ -1413,8 +1413,8 @@ def calc_delivery_time_grid_vol_rate(code, moneyness, expiry, delivery, time_gri
                 0, expiry_index[0].size - 1)
             index_expiry_p1 = np.clip(index_expiry + 1, 0, expiry_index[0].size - 1)
 
-            alpha_exp = np.clip((expiry - expiry_index[0][index_expiry]) /
-                                expiry_index[1][index_expiry], 0, 1.0)
+            alpha_exp = vol_spread.new(
+                np.clip((expiry - expiry_index[0][index_expiry]) / expiry_index[1][index_expiry], 0, 1.0))
 
             # get the delivery index per expiry
             index_del_00 = [[np.clip(np.searchsorted(
@@ -1431,15 +1431,15 @@ def calc_delivery_time_grid_vol_rate(code, moneyness, expiry, delivery, time_gri
                 for x in np.dstack((index_del_10, index_expiry_p1))]
 
             # get the interpolation factors
-            alpha_del_0 = np.vstack(
+            alpha_del_0 = vol_spread.new(np.vstack(
                 [[np.clip((y[1] - delivery_index[int(y[2])][0][int(y[0])])
                           / delivery_index[int(y[2])][1][int(y[0])], 0, 1.0)
-                  for y in x] for x in np.dstack((index_del_00, delivery, index_expiry))])
+                  for y in x] for x in np.dstack((index_del_00, delivery, index_expiry))]))
 
-            alpha_del_1 = np.vstack(
+            alpha_del_1 = vol_spread.new(np.vstack(
                 [[np.clip((y[1] - delivery_index[int(y[2])][0][int(y[0])])
                           / delivery_index[int(y[2])][1][int(y[0])], 0, 1.0)
-                  for y in x] for x in np.dstack((index_del_10, delivery, index_expiry_p1))])
+                  for y in x] for x in np.dstack((index_del_10, delivery, index_expiry_p1))]))
 
             delivery_slice_size = np.array([x[0].size for x in delivery_index])
             delivery_slice_index = vol_index + np.append(0, delivery_slice_size.cumsum())
@@ -1450,38 +1450,37 @@ def calc_delivery_time_grid_vol_rate(code, moneyness, expiry, delivery, time_gri
             index_11 = delivery_slice_index[index_expiry_p1] + np.vstack(index_del_11)
 
             moneyness_slice.append(
-                (1.0 - alpha_exp) * (1.0 - alpha_del_0) * tf.gather(vol_spread, index_00) +
-                (1.0 - alpha_exp) * alpha_del_0 * tf.gather(vol_spread, index_01) +
-                alpha_exp * (1.0 - alpha_del_1) * tf.gather(vol_spread, index_10) +
-                alpha_exp * alpha_del_1 * tf.gather(vol_spread, index_11))
+                (1.0 - alpha_exp) * (1.0 - alpha_del_0) * vol_spread[index_00] +
+                (1.0 - alpha_exp) * alpha_del_0 * vol_spread[index_01] +
+                alpha_exp * (1.0 - alpha_del_1) * vol_spread[index_10] +
+                alpha_exp * alpha_del_1 * vol_spread[index_11])
 
-        shared.t_Buffer[key_code] = tf.stack(moneyness_slice)
+        shared.t_Buffer[key_code] = torch.stack(moneyness_slice)
 
     surface = shared.t_Buffer[key_code]
 
-    clipped_moneyness = tf.clip_by_value(moneyness,
-                                         money_index[0].min(),
-                                         money_index[0].max())
+    clipped_moneyness = torch.clamp(moneyness, min=money_index[0].min(), max=money_index[0].max())
 
-    flat_moneyness = tf.reshape(clipped_moneyness, (-1, 1))
-    cmp = tf.cast(flat_moneyness >= np.append(money_index[0], [np.inf]), dtype=tf.int32)
-    index = tf.argmin(cmp[:, 1:] - cmp[:, :-1], axis=1, output_type=tf.int32)
-    alpha = (tf.squeeze(flat_moneyness) -
-             tf.gather(money_index[0].astype(shared.precision), index)
-             ) / tf.gather(money_index[1].astype(shared.precision), index)
+    flat_moneyness = clipped_moneyness.reshape(-1, 1)
+    # move the moneyness to a tensor
+    money_index_t = moneyness.new(np.append(money_index[0], [np.inf]))
+    money_index_d = moneyness.new(np.append(money_index[1], [1.0]))
 
-    tenor_surface = tf.reshape(tf.transpose(surface, [1, 0, 2]), [-1, surface.shape[2]])
-    vol_index = tf.reshape(index, (-1, shared.simulation_batch))
-    vol_alpha = tf.reshape(alpha, (-1, shared.simulation_batch, 1))
+    cmp = (flat_moneyness >= money_index_t).type(torch.int32)
+    index = (cmp[:, 1:] - cmp[:, :-1]).argmin(axis=1)
+    alpha = (torch.squeeze(flat_moneyness) - money_index_t[index]) / money_index_d[index]
 
-    surface_offset = (np.arange(surface.shape[1].value) *
-                      surface.shape[0].value).reshape(-1, 1)
+    tenor_surface = surface.transpose(0, 1).reshape(-1, surface.shape[2])
+    vol_index = index.reshape(-1, shared.simulation_batch)
+    vol_index_next = torch.clamp(vol_index+1, max=money_index[0].size - 1)
+    vol_alpha = alpha.reshape(-1, shared.simulation_batch, 1)
 
-    vols = tf.gather(tenor_surface, vol_index + surface_offset) * (1.0 - vol_alpha) + \
-           tf.gather(tenor_surface, tf.clip_by_value(
-               vol_index + 1, 0, money_index[0].size - 1) + surface_offset) * vol_alpha
+    surface_offset = index.new((np.arange(surface.shape[1]) * surface.shape[0]).reshape(-1, 1))
 
-    return tf.transpose(vols, [0, 2, 1])
+    vols = tenor_surface[vol_index + surface_offset] * (1.0 - vol_alpha) + \
+           tenor_surface[vol_index_next + surface_offset] * vol_alpha
+
+    return vols.transpose(1, 2)
 
 
 def hermite_interpolation_tensor(t, rate_tensor):
@@ -1609,7 +1608,7 @@ def calc_time_grid_curve_rate(code, time_grid, shared, points=None, multiply_by_
                             spread = interpolate_curve(tensor, rate, None, points, multiply_by_time)
 
                     # store it
-                    shared.t_Buffer[rate_code] = (spread, None)
+                    shared.t_Buffer[rate_code] = spread
 
             # append the curve and its (possible) interpolation parameters
             value.append(shared.t_Buffer[rate_code])
