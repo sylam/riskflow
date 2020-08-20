@@ -687,13 +687,18 @@ class Credit_Monte_Carlo(Calculation):
             if key.type not in utils.DimensionLessFactors:
                 with tf.name_scope(utils.check_scope_name(key)):
                     implied_index = self.implied_ofs.get(key, -1)
+                    if implied_index > -1:
+                        implied_tensor = self.implied_var[implied_index]
+                        value.link_references(implied_tensor, self.implied_var, self.implied_ofs)
+                    else:
+                        implied_tensor = None
 
                     value.precalculate(
                         base_date, ScenarioTimeGrid(
                             dependent_factors[key], self.time_grid, base_date),
                         self.stoch_var[self.stoch_ofs[key]],
                         self.shared_mem, self.process_ofs[key],
-                        implied_tensor=self.implied_var[implied_index] if implied_index > -1 else None)
+                        implied_tensor=implied_tensor)
 
         # now check if any of the stochastic processes depend on other processes
         for key, value in self.stoch_factors.items():

@@ -665,7 +665,7 @@ class HullWhite2FactorModelParameters(Factor1D):
     def get_quanto_correlation(self, corr, vols):
         C = self.get_instantaneous_correlation()
         if C is not None:
-            s1, s2, p = vols[0][0], vols[1][0], corr[0]
+            s1, s2, p = vols[0][-1], vols[1][-1], corr[0]
             scale = C / (s1 ** 2 + s2 ** 2 + 2.0 * p * s1 * s2) ** .5
             return [scale * (s1 + p * s2), scale * (p * s1 + s2)]
         else:
