@@ -19,31 +19,38 @@
 
 # import standard libraries
 
+import os
 import time
 import logging
 import itertools
 import pandas as pd
 import numpy as np
-import torch
+import tensorflow as tf
 
+# needed to list available devices
+from tensorflow.python.client import device_lib
 # load up some useful data types
 from collections import OrderedDict, namedtuple, defaultdict
 # import the risk factors (also known as price factors)
-from .riskfactors import construct_factor
+from riskflow.riskfactors import construct_factor
 # import the stochastic processes
-from .stochasticprocess import construct_process
+from riskflow.stochasticprocess import construct_process
 # import the currency/curve lookup factors 
-from .instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
+from riskflow.instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
 # import the hessian function
-from .pricing import SensitivitiesEstimator
+from riskflow.pricing import SensitivitiesEstimator
 # import the documentation and utils modules
-from . import utils, pricing
+from riskflow import utils
+
+
+class InstrumentExpired(Exception):
+    def __init__(self, message):
+        self.message = message
 
 
 class Aggregation(object):
     def __init__(self, name):
         self.field = {'Reference': name}
-        self.accum_dependencies = True
 
 
 class DealStructure(object):
@@ -59,19 +66,18 @@ class DealStructure(object):
         # Do we want to store each deal level MTM explicitly?
         self.deal_level_mtm = deal_level_mtm
 
-    @staticmethod
-    def calc_time_dependency(base_date, deal, time_grid):
+    def calc_time_dependency(self, base_date, deal, time_grid):
         # calculate the additional (dynamic) dates that this instrument needs to be evaluated at
         deal_time_dep = None
         try:
             reval_dates = deal.get_reval_dates(clip_expiry=True)
             if len(time_grid.scenario_dates) == 1:
                 if len(reval_dates) > 0 and max(reval_dates) < base_date:
-                    raise utils.InstrumentExpired(deal.field.get('Reference', 'Unknown Instrument Reference'))
+                    raise InstrumentExpired(deal.field.get('Reference', 'Unknown Instrument Reference'))
                 deal_time_dep = time_grid.calc_deal_grid({base_date})
             else:
                 deal_time_dep = time_grid.calc_deal_grid(reval_dates)
-        except utils.InstrumentExpired as e:
+        except InstrumentExpired as e:
             logging.warning('skipping expired deal {0}'.format(e.args))
 
         return deal_time_dep
@@ -88,14 +94,15 @@ class DealStructure(object):
             try:
                 self.dependencies.append(
                     utils.DealDataType(Instrument=deal,
-                                       Factor_dep=deal.calc_dependencies(
-                                           base_date, static_offsets, stochastic_offsets,
-                                           all_factors, all_tenors, time_grid, calendars),
+                                       Factor_dep=deal.calc_dependencies(base_date, static_offsets,
+                                                                         stochastic_offsets,
+                                                                         all_factors, all_tenors,
+                                                                         time_grid, calendars),
                                        Time_dep=deal_time_dep,
                                        Calc_res=OrderedDict() if self.deal_level_mtm else None))
             except Exception as e:
-                logging.error('{0}.{1} {2} - Skipped'.format(
-                    deal.field['Object'], deal.field.get('Reference', '?'), e.args))
+                logging.error('{0}.{1} {2} - Skipped'.format(deal.field['Object'],
+                                                             deal.field.get('Reference', '?'), e.args))
 
     def add_structure_to_structure(self, struct, base_date, static_offsets, stochastic_offsets,
                                    all_factors, all_tenors, time_grid, calendars):
@@ -105,16 +112,18 @@ class DealStructure(object):
             if struct_time_dep is not None:
                 struct.obj = utils.DealDataType(
                     Instrument=struct.obj.Instrument,
-                    Factor_dep=struct.obj.Instrument.calc_dependencies(
-                        base_date, static_offsets, stochastic_offsets,
-                        all_factors, all_tenors, time_grid, calendars),
+                    Factor_dep=struct.obj.Instrument.calc_dependencies(base_date,
+                                                                       static_offsets,
+                                                                       stochastic_offsets,
+                                                                       all_factors, all_tenors,
+                                                                       time_grid, calendars),
                     Time_dep=struct_time_dep,
                     Calc_res=OrderedDict() if self.deal_level_mtm else None)
             # Structure object representing a netted set of cashflows
             self.sub_structures.append(struct)
         except Exception as e:
-            logging.error('{0}.{1} {2} - Skipped'.format(
-                struct.obj.Instrument.field['Object'], struct.obj.Instrument.field.get('Reference', '?'), e.args))
+            logging.error('{0}.{1} {2} - Skipped'.format(struct.obj.Instrument.field['Object'],
+                                                         struct.obj.Instrument.field.get('Reference', '?'), e.args))
 
     def build_partitions(self):
         # sort the data by the tags
@@ -131,23 +140,27 @@ class DealStructure(object):
         Resolves the Structure
         """
 
-        accum = 0.0
+        accum = None
 
         if self.sub_structures:
             # process sub structures
             for structure in self.sub_structures:
                 struct = structure.resolve_structure(shared, time_grid)
-                accum += struct
+                accum = struct if accum is None else accum + struct
 
         if self.dependencies and self.obj.Instrument.accum_dependencies:
             # accumulate the mtm's
             deal_tensors = 0.0
 
             for deal_data in self.dependencies:
-                mtm = deal_data.Instrument.calculate(shared, time_grid, deal_data)
-                deal_tensors += mtm
+                deal_ref = utils.Factor('Deal', (deal_data.Instrument.field.get('Reference', 'Unknown'),))
 
-            accum += deal_tensors
+                with tf.name_scope(utils.check_scope_name(deal_ref)):
+                    mtm = deal_data.Instrument.calculate(shared, time_grid, deal_data)
+                    deal_tensors += mtm
+
+            netting = deal_tensors
+            accum = netting if accum is None else accum + netting
 
         # postprocessing code for working out the mtm of all deals, collateralization etc..
         if hasattr(self.obj.Instrument, 'post_process'):
@@ -166,17 +179,99 @@ class ScenarioTimeGrid(object):
         self.scenario_grid = global_time_grid.scenario_grid[:offset]
 
 
+class TimeGrid(object):
+    def __init__(self, scenario_dates, MTM_dates, base_MTM_dates):
+        self.scenario_dates = scenario_dates
+        self.base_MTM_dates = base_MTM_dates
+        self.CurrencyMap = {}
+        self.set_mtm_dates(MTM_dates)
+
+    def set_mtm_dates(self, MTM_dates):
+        self.mtm_dates = MTM_dates
+        self.date_lookup = dict([(x, i) for i, x in enumerate(sorted(MTM_dates))])
+
+    def calc_time_grid(self, time_in_days):
+        dvt = np.concatenate(([1], np.diff(self.scen_time_grid), [1]))
+        scen_index = self.scen_time_grid.searchsorted(time_in_days, side='right')
+        index = (scen_index - 1).clip(0, self.scen_time_grid.size - 1)
+        alpha = ((time_in_days - self.scen_time_grid[index]) / dvt[scen_index]).clip(0, 1)
+        return np.dstack([alpha, time_in_days, index])[0]
+
+    def set_base_date(self, base_date, delta=None):
+        # leave the grids in terms of the number of days - note that it's possible to have the scenario_dates
+        # the same as the mtm_dates (for more accurate margin period of risk on collateralized netting sets)
+        self.mtm_time_grid = np.array([(x - base_date).days for x in sorted(self.mtm_dates)])
+        self.scen_time_grid = np.array([(x - base_date).days for x in sorted(self.scenario_dates)])
+
+        self.base_time_grid = set([self.date_lookup[x] for x in self.base_MTM_dates])
+        self.time_grid = self.calc_time_grid(self.mtm_time_grid)
+
+        # store the scenario time_grid
+        self.scenario_grid = np.zeros((self.scen_time_grid.size, 3))
+        self.scenario_grid[:, utils.TIME_GRID_MTM] = self.scen_time_grid
+        self.scenario_grid[:, utils.TIME_GRID_ScenarioPriorIndex] = np.arange(self.scen_time_grid.size)
+
+        # deal with the case that we need a very fine time_grid - note we do this after calculating the
+        # scenario_grid as setting a non-null delta is a way to generate scenarios without calculating the
+        # whole risk factor
+        if delta is not None:
+            delta_days, delta_tenors = delta
+            delta_grid = np.union1d(np.arange(0, self.scen_time_grid.max(), delta_days), delta_tenors)
+            self.scen_time_grid = np.union1d(self.scen_time_grid, delta_grid)
+
+        self.time_grid_years = self.scen_time_grid / utils.DAYS_IN_YEAR
+
+    def get_scenario_offset(self, days_from_base):
+        prev_scen_index = self.scen_time_grid[self.scen_time_grid <= days_from_base].size - 1
+        scenario_grid_delta = np.float64(
+            (self.scen_time_grid[prev_scen_index + 1] - self.scen_time_grid[prev_scen_index]) if (
+                    self.scen_time_grid.size > 1 and self.scen_time_grid.size > prev_scen_index + 1) else 1.0)
+        return (days_from_base - self.scen_time_grid[prev_scen_index]) / scenario_grid_delta, prev_scen_index
+
+    def set_currency_settlement(self, currencies):
+        self.CurrencyMap = {}
+        for currency, dates in currencies.items():
+            settlement_dates = sorted([self.date_lookup[x] for x in dates if x in self.date_lookup])
+            if settlement_dates:
+                currency_lookup = np.zeros(self.mtm_time_grid.size, dtype=np.int32) - 1
+                currency_lookup[settlement_dates] = np.arange(len(settlement_dates))
+                self.CurrencyMap.setdefault(currency, currency_lookup)
+
+    def calc_deal_grid(self, dates):
+        try:
+            dynamic_dates = self.base_time_grid.union([self.date_lookup[x] for x in dates])
+        except KeyError as e:
+            # if there is at least one reset date in the set of dates, then return it, else the deal has expired
+            r = [self.date_lookup[x] for x in dates if x in self.date_lookup]
+            if r:
+                dynamic_dates = self.base_time_grid.union(r)
+            else:
+                if max(dates) < min(self.date_lookup.keys()):
+                    raise InstrumentExpired(e)
+
+                # include this instrument but don't bother pricing it through time
+                return utils.DealTimeDependencies(self.mtm_time_grid, np.array([0]))
+
+        # now construct the full deal grid 
+        deal_time_grid = np.array(sorted(dynamic_dates))
+        # find the last dynamic date - should be the expiry date
+        expiry = self.date_lookup[max(dates)]
+        # calculate the interpolation points etc.
+        return utils.DealTimeDependencies(self.mtm_time_grid, deal_time_grid[deal_time_grid <= expiry])
+
+
 class Calculation(object):
 
-    def __init__(self, config, prec=torch.float32, device=torch.device('cpu')):
+    def __init__(self, config, prec=np.float32):
         """
-        Construct a new calculation - all calculations must setup their own tensors.
+        Construct a new calculation - all calculations must setup the GPU ( by setting the precision )
+        and by specifying a configuration (market data + porfolio)
         """
 
         self.config = config
-        self.dtype = prec
+        self.prec = prec
         self.time_grid = None
-        self.device = device
+        self.shared_mem = None
 
         # the risk factor data
         self.static_factors = OrderedDict()
@@ -189,6 +284,7 @@ class Calculation(object):
         # these are used for implied calibration        
         self.implied_ofs = OrderedDict()
 
+        self.dependent_factors = None
         self.base_date = None
 
         self.tenor_size = None
@@ -205,8 +301,9 @@ class Calculation(object):
         self.params = {}
         # Index for the gradients of this calculation (if requested)
         self.gradient_index = None
-        # output of calc stored here
-        self.output = {}
+
+    def feed(self, **args):
+        pass
 
     def execute(self, params):
         pass
@@ -215,12 +312,13 @@ class Calculation(object):
         # need to match the indices back
         tenors = utils.get_tenors(self.all_factors)
         self.gradient_index = {}
-        for name, var in tensors:
-            factor_name = utils.check_scope_name(name)
+        for var in tensors:
+            name = var.name[:-2]
+            factor_name = name.split('/')[-1]
             name_size, pad_size = tenors[factor_name].shape
             padding = 3 - pad_size
             indices = np.pad(tenors[factor_name], [[0, 0], [0, padding]], 'constant')
-            self.gradient_index[factor_name] = (indices, pad_size)
+            self.gradient_index[name] = (indices, pad_size)
 
     def gradients_as_df(self, grad, header='Gradient', display_val=False):
         if isinstance(grad, dict):
@@ -229,8 +327,9 @@ class Calculation(object):
                              for k, v in self.all_factors.items()} if display_val else {}
             hessian_index = ([], [])
             factor, rate, tenor, values = [], [], [], []
-            for name, v in grad.items():
+            for k, v in grad.items():
                 # first derivative
+                name = k.name[:-2]
                 non_zero = np.where(v)[0]
                 grad_index, index_len = self.gradient_index[name]
                 hessian_index[0].append([name] * v.shape[0])
@@ -240,16 +339,14 @@ class Calculation(object):
                 tenor.append(grad_index[non_zero])
                 # store the actual factor value if required
                 if display_val:
-                    if name in factor_values:
+                    rate_name = name.split('/')[-1]
+                    if rate_name in factor_values:
                         rate_non_zero = grad_index[non_zero][:, :index_len].astype(np.float64)
-                        factor_val = factor_values[name].current_value(rate_non_zero).flatten()
+                        factor.append(factor_values[rate_name].current_value(rate_non_zero).flatten())
                     else:
-                        sub_rate, param = name.rsplit('.', 1)
+                        sub_rate, param = rate_name.rsplit('.', 1)
                         sub_rate_non_zero = grad_index[non_zero].shape[0]
-                        factor_val = factor_values[sub_rate].current_value()[param].flatten()[:sub_rate_non_zero]
-
-                    if factor_val.size == non_zero.size:
-                        factor.append(factor_val)
+                        factor.append(factor_values[sub_rate].current_value()[param].flatten()[:sub_rate_non_zero])
 
             tenors = np.vstack(tenor)
             self.hessian_index = (np.hstack(hessian_index[0]), np.vstack(hessian_index[1]))
@@ -277,10 +374,8 @@ class Calculation(object):
                 multi_index.append(pd.MultiIndex.from_arrays(m_index))
 
             values = grad[grad.any(axis=1)][:, grad.any(axis=0)]
-            # sort both axis
-            df = pd.DataFrame(values, index=multi_index[0], columns=multi_index[1]).sort_index(
-                level=[0, 1, 2, 3], axis=0).sort_index(level=[0, 1, 2, 3], axis=1)
-
+            df = pd.DataFrame(values, index=multi_index[0],
+                              columns=multi_index[1]).sort_index(level=[0, 1, 2, 3], axis=0)
         return df
 
     def set_deal_structures(self, deals, output, num_scenarios, batch_size, tagging=None, deal_level_mtm=False):
@@ -309,35 +404,6 @@ class Calculation(object):
         # check if we need to partition this structure
         if partitioning:
             output.build_partitions()
-
-
-class CMC_State(utils.Calculation_State):
-    def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, one,
-                 report_currency, nomodel='Constant'):
-        super(CMC_State, self).__init__(static_buffer, one, report_currency, nomodel)
-        # these are tensors
-        self.t_PreCalc = {}
-        self.t_cholesky = cholesky
-        self.t_random_numbers = None
-        self.t_Scenario_Buffer = [None] * num_stoch_factors
-        self.t_Credit = {}
-        # these are shared parameter states
-        self.simulation_batch = batch_size
-
-    def reset(self, num_factors, time_grid: utils.TimeGrid):
-        # update the random numbers
-        self.t_random_numbers = torch.matmul(
-            self.t_cholesky, torch.randn(num_factors, self.simulation_batch * time_grid.scen_time_grid.size,
-                                         dtype=self.one.dtype, device=self.one.device)).reshape(
-            num_factors, time_grid.scen_time_grid.size, -1)
-
-        # reset the cashflows
-        self.t_Cashflows = {k: {t_i: self.one.new_zeros(self.simulation_batch)
-                                for t_i in np.where(v >= 0)[0]} for k, v in time_grid.CurrencyMap.items()}
-
-        # clear the buffers
-        self.t_Buffer.clear()
-        self.t_Credit.clear()
 
 
 class Credit_Monte_Carlo(Calculation):
@@ -475,19 +541,32 @@ class Credit_Monte_Carlo(Calculation):
 
     def __init__(self, config, **kwargs):
         super(Credit_Monte_Carlo, self).__init__(config, **kwargs)
+        self.cholesky = None
+        self.stochastic_factors = None
         self.reset_dates = None
         self.settlement_currencies = None
+
+        # global variables to store the state of the graph between calculations
+        self.shared_mem_class = namedtuple('shared_mem', 't_Buffer t_random_numbers \
+                                                        t_Scenario_Buffer t_Static_Buffer t_Cashflows \
+                                                        t_Feed_dict t_Credit gpus riskneutral precision \
+                                                        simulation_batch Report_Currency')
+
         # used to store the Scenarios (if requested)
         self.Scenarios = {}
         # used to store any jacobian matrices
         self.jacobians = {}
+        # used to store the resulting tensors of the calculation
+        self.tensors = OrderedDict()
         # implied factors
         self.implied_factors = OrderedDict()
         # we represent the calc as a combination of static, stochastic and implied parameters
+        self.stoch_values = []
         self.stoch_var = []
+        self.static_values = []
         self.static_var = []
         self.implied_var = []
-
+        self.implied_values = []
         # potentially store the full list of variables
         self.all_var = None
 
@@ -508,15 +587,11 @@ class Credit_Monte_Carlo(Calculation):
         self.stoch_factors.clear()
 
         for price_model, price_factor in stochastic_factors.items():
-            factor_obj = construct_factor(
-                price_factor, self.config.params['Price Factors'],
-                self.config.params['Price Factor Interpolation'])
+            factor_obj = construct_factor(price_factor, self.config.params['Price Factors'])
             implied_factor = implied_factors.get(price_model)
             try:
                 if implied_factor:
-                    implied_obj = construct_factor(
-                        implied_factor, self.config.params['Price Factors'],
-                        self.config.params['Price Factor Interpolation'])
+                    implied_obj = construct_factor(implied_factor, self.config.params['Price Factors'])
                     self.implied_factors[implied_factor] = implied_obj
                 else:
                     implied_obj = None
@@ -528,21 +603,19 @@ class Credit_Monte_Carlo(Calculation):
                 proxy_factor = utils.Factor(implied_factor.type, ('EUR-MASTER',))
                 self.config.params['Price Factors'][utils.check_tuple_name(implied_factor)] = \
                     self.config.params['Price Factors'][utils.check_tuple_name(proxy_factor)]
-                implied_obj = construct_factor(
-                    implied_factor, self.config.params['Price Factors'],
-                    self.config.params['Price Factor Interpolation'])
+                implied_obj = construct_factor(implied_factor, self.config.params['Price Factors'])
 
-            self.stoch_factors[price_factor] = construct_process(
-                price_model.type, factor_obj,
-                self.config.params['Price Models'][utils.check_tuple_name(price_model)], implied_obj)
+            self.stoch_factors[price_factor] = construct_process(price_model.type,
+                                                                 factor_obj,
+                                                                 self.config.params['Price Models']
+                                                                 [utils.check_tuple_name(price_model)],
+                                                                 implied_obj)
 
         self.static_factors = OrderedDict()
         for price_factor in set(dependent_factors).difference(stochastic_factors.values()):
             try:
                 self.static_factors.setdefault(
-                    price_factor, construct_factor(
-                        price_factor, self.config.params['Price Factors'],
-                        self.config.params['Price Factor Interpolation']))
+                    price_factor, construct_factor(price_factor, self.config.params['Price Factors']))
             except KeyError as e:
                 logging.warning('Price Factor {0} missing in market data file - skipping'.format(e.args))
 
@@ -553,61 +626,58 @@ class Credit_Monte_Carlo(Calculation):
 
         # get the tenor offset (if any)
         tenor_offset = params.get('Tenor_Offset', 0.0)
-        # check if we need gradients for any xVA
-        greeks = bool(np.any([params[x].get('Gradient', 'No') == 'Yes' for x in params.keys() if x.endswith('VA')]))
-        sensitivities = params.get('Gradient_Variables', 'All')
 
         # now get the stochastic risk factors ready - these will be generated from the price models
+        with tf.name_scope("Stochastic_Input"):
+            for key, value in self.stoch_factors.items():
+                if key.type not in utils.DimensionLessFactors:
+                    # check if there are any implied factors linked here
+                    with tf.name_scope("Implied/"):
+                        if hasattr(value, 'implied'):
+                            vals, vars = [], OrderedDict()
+                            self.implied_ofs.setdefault(key, len(self.implied_var))
+                            for param_name, param_value in value.implied.current_value().items():
+                                factor_name = utils.Factor(value.implied.__class__.__name__,
+                                                           key.name + (param_name,))
+                                vals.append(param_value)
+                                vars[param_name] = tf.placeholder(self.prec, shape=len(param_value),
+                                                                  name=utils.check_scope_name(factor_name))
+                            self.implied_values.append(vals)
+                            self.implied_var.append(vars)
 
-        for key, value in self.stoch_factors.items():
-            if key.type not in utils.DimensionLessFactors:
-                # check if there are any implied factors linked here
-                if hasattr(value, 'implied'):
-                    vars = OrderedDict()
-                    calc_grad = greeks and sensitivities in ['All', 'Implied']
-                    self.implied_ofs.setdefault(key, len(self.implied_var))
-                    for param_name, param_value in value.implied.current_value().items():
-                        factor_name = utils.Factor(value.implied.__class__.__name__, key.name + (param_name,))
-                        vars[factor_name] = torch.tensor(
-                            param_value, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
-                    self.implied_var.append(vars)
-
-                # check the daycount for the tenor_offset
-                if tenor_offset:
-                    factor_tenor_offset = utils.get_day_count_accrual(
-                        base_date, tenor_offset, value.factor.get_day_count() if hasattr(
-                            value.factor, 'get_day_count') else utils.DAYCOUNT_ACT365)
-                else:
-                    factor_tenor_offset = 0.0
-
-                # record the offset of this risk factor
-                self.stoch_ofs.setdefault(key, len(self.stoch_var))
-                current_val = value.factor.current_value(offset=factor_tenor_offset)
-                calc_grad = greeks and sensitivities in ['All', 'Factors']
-                self.stoch_var.append((key, torch.tensor(
-                    current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
+                    # record the offset of this risk factor
+                    self.stoch_ofs.setdefault(key, len(self.stoch_var))
+                    current_val = value.factor.current_value(offset=tenor_offset)
+                    self.stoch_values.append(current_val)
+                    self.stoch_var.append(
+                        tf.placeholder(self.prec,
+                                       shape=len(current_val),
+                                       name=utils.check_scope_name(key)))
 
         # and then get the the static risk factors ready - these will just be looked up
-        for key, value in self.static_factors.items():
-            if key.type not in utils.DimensionLessFactors:
-                # check the daycount for the tenor_offset
-                if tenor_offset:
-                    factor_tenor_offset = utils.get_day_count_accrual(
-                        base_date, tenor_offset, value.get_day_count() if hasattr(
-                            value, 'get_day_count') else utils.DAYCOUNT_ACT365)
-                else:
-                    factor_tenor_offset = 0.0
-                # record the offset of this risk factor
-                self.static_ofs.setdefault(key, len(self.static_var))
-                current_val = value.current_value(offset=factor_tenor_offset)
-                calc_grad = greeks and sensitivities in ['All', 'Factors']
-                self.static_var.append((key, torch.tensor(
-                    current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
+        with tf.name_scope("Static_Input"):
+            for key, value in self.static_factors.items():
+                if key.type not in utils.DimensionLessFactors:
+                    # record the offset of this risk factor
+                    self.static_ofs.setdefault(key, len(self.static_var))
+                    current_val = value.current_value(offset=tenor_offset)
+                    self.static_values.append(current_val)
+                    self.static_var.append(
+                        tf.placeholder(self.prec,
+                                       shape=len(current_val),
+                                       name=utils.check_scope_name(key)))
+
+        # update the correlations
+        self.update_correlation()
+        # check if we need gradients for any xVA
+        greeks = np.any([params[x].get('Gradient', 'No') == 'Yes' for x in params.keys() if x.endswith('VA')])
+        sensitivities = params.get('Gradient_Variables', 'All')
 
         # setup the device and allocate memory
-        shared_mem = self.__init_shared_mem(
-            params['Random_Seed'], params.get('NoModel', 'Constant'),
-            params['Currency'], calc_greeks=sensitivities if greeks else None)
+        self.__refresh_shared_mem(params['Random_Seed'],
+                                  params.get('NoModel', 'Constant'),
+                                  params['Currency'],
+                                  calc_greeks=sensitivities if greeks else None)
 
         # calculate a reverse lookup for the tenors and store the daycount code
         self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
@@ -615,18 +685,20 @@ class Credit_Monte_Carlo(Calculation):
         # now initialize all stochastic factors
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
-                implied_index = self.implied_ofs.get(key, -1)
-                if implied_index > -1:
-                    implied_tensor = {k.name[-1]: v for k, v in self.implied_var[implied_index].items()}
-                    value.link_references(implied_tensor, self.implied_var, self.implied_ofs)
-                else:
-                    implied_tensor = None
-                value.precalculate(
-                    base_date, ScenarioTimeGrid(dependent_factors[key], self.time_grid, base_date),
-                    self.stoch_var[self.stoch_ofs[key]][1], shared_mem, self.process_ofs[key],
-                    implied_tensor=implied_tensor)
-                if not value.params_ok:
-                    logging.warning('Stochastic factor {} has been modified'.format(utils.check_scope_name(key)))
+                with tf.name_scope(utils.check_scope_name(key)):
+                    implied_index = self.implied_ofs.get(key, -1)
+                    if implied_index > -1:
+                        implied_tensor = self.implied_var[implied_index]
+                        value.link_references(implied_tensor, self.implied_var, self.implied_ofs)
+                    else:
+                        implied_tensor = None
+
+                    value.precalculate(
+                        base_date, ScenarioTimeGrid(
+                            dependent_factors[key], self.time_grid, base_date),
+                        self.stoch_var[self.stoch_ofs[key]],
+                        self.shared_mem, self.process_ofs[key],
+                        implied_tensor=implied_tensor)
 
         # now check if any of the stochastic processes depend on other processes
         for key, value in self.stoch_factors.items():
@@ -634,7 +706,8 @@ class Credit_Monte_Carlo(Calculation):
                 # precalculate any values for the stochastic process
                 value.calc_references(key, self.static_ofs, self.stoch_ofs, self.all_tenors, self.all_factors)
 
-        return shared_mem
+        # store the state info
+        self.dependent_factors, self.stochastic_factors = dependent_factors, stochastic_factors
 
     def update_time_grid(self, base_date, reset_dates, settlement_currencies, dynamic_scenario_dates=False):
         # work out the scenario and dynamic dates
@@ -644,11 +717,11 @@ class Credit_Monte_Carlo(Calculation):
         if dynamic_scenario_dates:
             scenario_dates = mtm_dates
         else:
-            scenario_dates = self.config.parse_grid(
-                base_date, max(dynamic_dates), self.input_time_grid, past_max_date=True)
+            scenario_dates = self.config.parse_grid(base_date, max(dynamic_dates), self.input_time_grid,
+                                                    past_max_date=True)
 
         # setup the scenario and base time grids
-        self.time_grid = utils.TimeGrid(scenario_dates, mtm_dates, base_mtm_dates)
+        self.time_grid = TimeGrid(scenario_dates, mtm_dates, base_mtm_dates)
         self.base_date = base_date
         self.reset_dates = reset_dates
         self.time_grid.set_base_date(base_date)
@@ -657,58 +730,9 @@ class Credit_Monte_Carlo(Calculation):
         self.time_grid.set_currency_settlement(settlement_currencies)
         self.settlement_currencies = settlement_currencies
 
-    def calc_individual_FVA(self, params, spreads, discount_curves):
-
-        def calc_approx_fva(exp_mtm, time_grid, spread, delta_t, collateral):
-            return np.sum([spread[s] * mtm * np.exp(-(t / 365.0) * collateral.current_value(t / 365.0)) for mtm, s, t in
-                           zip(exp_mtm, delta_t, time_grid)])
-
-        def report(deal, num_scenario, num_tags):
-            empty = ','.join(['None'] * num_tags)
-            tags = deal.Instrument.field.get('Tags', empty)
-            expiry = max(deal.Instrument.get_reval_dates()).strftime('%Y-%m-%d')
-            return [deal.Instrument.field['Reference'], expiry] + (tags if isinstance(tags, list) else [empty])[
-                0].split(',') + [np.sum(deal.Calc_res['MTM'], axis=0) / num_scenario]
-
-        # Ask for deal level mtm's
-        params['DealLevel'] = True
-        tag_headings = self.config.deals['Attributes'].get('Tag_Titles', '').split(',')
-        base_results = self.execute(params)
-        deals = base_results['Netting'].sub_structures[0].dependencies + [
-            y.obj for y in base_results['Netting'].sub_structures[0].sub_structures]
-        mtms = [report(x, self.numscenarios, len(tag_headings)) for x in deals]
-        time_grid = base_results['Netting'].sub_structures[0].obj.Time_dep.deal_time_grid
-        days = self.time_grid.time_grid[:, 1][time_grid]
-        funding = construct_factor(utils.Factor('InterestRate', (discount_curves['funding'],)),
-                                   self.config.params['Price Factors'],
-                                   self.config.params['Price Factor Interpolation'])
-        collateral = construct_factor(utils.Factor('InterestRate', (discount_curves['collateral'],)),
-                                      self.config.params['Price Factors'],
-                                      self.config.params['Price Factor Interpolation'])
-        delta_t = np.diff(days)
-        all_spread = {k: {} for k in spreads.keys()}
-
-        for k, v in all_spread.items():
-            funding_spread = 0.0001 * spreads[k].get('funding', 0.0)
-            collateral_spread = 0.0001 * spreads[k].get('collateral', 0.0)
-            for s in np.unique(delta_t):
-                v[s] = np.exp((s / 365.0) * ((funding.current_value(s / 365.0) + funding_spread) - (
-                        collateral.current_value(s / 365.0) + collateral_spread))) - 1.0
-
-        results = []
-        output = sorted(all_spread.items())
-
-        for mtm in mtms:
-            results.append(
-                mtm[:-1] + [mtm[-1][0]] + [
-                    calc_approx_fva(mtm[-1], days, spread, delta_t, collateral) for name, spread in output])
-
-        return pd.DataFrame(
-            results, columns=['Reference', 'Expiry'] + tag_headings + ['MTM'] + [x[0] for x in output])
-
-    def get_cholesky_decomp(self):
+    def update_correlation(self):
         # create the correlation matrix
-        correlation_matrix = np.eye(self.num_factors, dtype=np.float64)
+        correlation_matrix = np.eye(self.num_factors, dtype=self.prec)
 
         # prepare the correlation matrix (and the offsets of each stochastic process)
         correlation_factors = []
@@ -732,9 +756,7 @@ class Credit_Monte_Carlo(Calculation):
                 correlation_matrix[index2, index1] = rho
 
         # need to do cholesky
-        raw_eigval, raw_eigvec = np.linalg.eig(correlation_matrix)
-        # only take the real part
-        eigval, eigvec = np.real(raw_eigval), np.real(raw_eigvec)
+        eigval, eigvec = np.linalg.eig(correlation_matrix.astype(np.float64))
         if not (eigval > 1e-8).all():
             # matrix not positive definite - find a close positive definite matrix
             if self.config.params['System Parameters']['Correlations_Healing_Method'] == 'Eigenvalue_Raising':
@@ -768,19 +790,31 @@ class Credit_Monte_Carlo(Calculation):
 
             correlation_matrix = new_correlation_matrix
 
-        correlation_matrix = torch.tensor(
-            correlation_matrix, device=self.device, dtype=self.dtype, requires_grad=False)
-        # return the cholesky decomp
-        return torch.linalg.cholesky(correlation_matrix)
+        self.correlation_matrix = correlation_matrix
+        with tf.name_scope("Correlation_Input"):
+            self.input_correlation = tf.placeholder(self.prec, shape=correlation_matrix.shape,
+                                                    name='correlation_matrix')
+            # set the cholesky decomp
+            self.cholesky = tf.cholesky(self.input_correlation)
 
-    def __init_shared_mem(self, seed, nomodel, reporting_currency, calc_greeks=None):
-        # set the random seed
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
+    def __refresh_shared_mem(self, seed, nomodel, reporting_currency, calc_greeks=None, debug_batch_size=128):
+        # setup the Feed dictionary - the inputs needed to evaluate the graph
+        feed = {self.input_correlation: self.correlation_matrix}
+        feed.update(dict(zip(self.stoch_var, self.stoch_values)))
+        feed.update(dict(zip(self.static_var, self.static_values)))
+        feed.update(
+            dict(zip(itertools.chain(*[x.values() for x in self.implied_var]),
+                     itertools.chain(*self.implied_values))))
+        if not isinstance(self.batch_size, int):
+            feed.update({self.batch_size: debug_batch_size})
+            # this makes a difference in tensorflow's internals for some reason
+            # might be possible to remove this once fixed
+            cashflow_size = [self.batch_size]
+        else:
+            cashflow_size = self.batch_size
 
-        # check if we need to report gradients
         if calc_greeks is not None:
-            implied_vars = list(itertools.chain(*[x.items() for x in self.implied_var]))
+            implied_vars = list(itertools.chain(*[x.values() for x in self.implied_var]))
             if calc_greeks == 'Implied':
                 self.all_var = implied_vars
             elif calc_greeks == 'Factors':
@@ -790,15 +824,88 @@ class Credit_Monte_Carlo(Calculation):
             # build our index
             self.make_factor_index(self.all_var)
 
-        # Now create a shared state with the cholesky decomp
-        shared_mem = CMC_State(
-            self.get_cholesky_decomp(), len(self.stoch_factors), [x[-1] for x in self.static_var], self.batch_size,
-            torch.ones([1, 1], dtype=self.dtype, device=self.device),
-            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs))
+        # Now apply that cholesky to our random numbers.
+        # There may be a better way to do this as the cholesky is lower triangular
 
-        return shared_mem
+        with tf.name_scope('Setup'):
+            self.shared_mem = self.shared_mem_class(
+                t_Buffer={},
+                t_random_numbers=tf.reshape(
+                    tf.matmul(
+                        self.cholesky,
+                        tf.random_normal(
+                            [self.num_factors, self.batch_size * self.time_grid.scen_time_grid.size],
+                            seed=seed, dtype=self.prec),
+                    ),
+                    (self.num_factors, self.time_grid.scen_time_grid.size, -1), name='d_random_numbers'),
+                t_Scenario_Buffer=[None] * len(self.stoch_factors),
+                t_Static_Buffer=self.static_var,
+                t_Cashflows={k: {t_i: tf.zeros(cashflow_size, dtype=self.prec) for t_i in np.where(v >= 0)[0]}
+                             for k, v in self.time_grid.CurrencyMap.items()},
+                t_Feed_dict=feed,
+                t_Credit={},
+                gpus=[x.name for x in device_lib.list_local_devices() if x.device_type == 'GPU'],
+                riskneutral=nomodel == 'RiskNeutral',
+                precision=self.prec,
+                simulation_batch=self.batch_size,
+                Report_Currency=get_fxrate_factor(utils.check_rate_name(reporting_currency),
+                                                  self.static_ofs, self.stoch_ofs)
+            )
 
-    def report(self, output):
+    def feed(self, batch_size, correlation=None, stoch_vars={}, static_vars={},
+             options=None, run_meta=None, writer=None):
+
+        # record the performance stats
+        self.calc_stats['Tensor_Execution_Time'] = time.clock()
+
+        config = tf.ConfigProto(allow_soft_placement=True)
+
+        # clear the output
+        self.output = {}
+        # update the feed
+        feed = self.shared_mem.t_Feed_dict.copy()
+        # copy the static params
+        feed.update({self.graph.get_tensor_by_name('Static_Input/{0}:0'.format(k)): v for
+                     k, v in static_vars.items()})
+        # copy the stoch params
+        feed.update({self.graph.get_tensor_by_name('Stochastic_Input/{0}:0'.format(k)): v for
+                     k, v in stoch_vars.items()})
+        # update the correlation if necessary
+        if correlation is not None:
+            # note - I don't check if the new matrix is positive definite - this will break if it is
+            feed.update({self.input_correlation: correlation})
+
+        # change the batch size
+        if not isinstance(self.batch_size, int):
+            feed[self.batch_size] = batch_size
+
+        with tf.Session(graph=self.graph, config=config) as sess:
+            output = defaultdict(list)
+            tensors = list(self.tensors.values())
+            for run in range(self.params['Simulation_Batches']):
+                # get the output tensors
+                for k, v in zip(self.tensors.keys(), sess.run(tensors, feed_dict=feed,
+                                                              options=options, run_metadata=run_meta)):
+                    output[k].append(v)
+
+                # fetch cashflows if necessary
+                if self.params.get('Generate_Cashflows', 'No') == 'Yes':
+                    dates = np.array(sorted(self.time_grid.mtm_dates))
+                    for currency, values in self.shared_mem.t_Cashflows.items():
+                        curr = sess.run(values, feed_dict=feed, options=options, run_metadata=run_meta)
+                        cash_index = dates[sorted(curr.keys())]
+                        output.setdefault('cashflows', {}).setdefault(currency, []).append(
+                            pd.DataFrame([v for _, v in sorted(curr.items())], index=cash_index))
+
+                # add any scenarios if necessary
+                if self.params.get('Calc_Scenarios', 'No') == 'Yes':
+                    for key, value in self.stoch_factors.items():
+                        output.setdefault('scenarios', {}).setdefault(key, []).append(
+                            sess.run(self.shared_mem.t_Scenario_Buffer[self.stoch_ofs[key]],
+                                     feed_dict=feed, options=options, run_metadata=run_meta))
+                if writer:
+                    writer.add_run_metadata(run_meta, 'run {}'.format(run), run)
+
         for result, data in output.items():
             if result == 'scenarios':
                 self.output.setdefault('scenarios', {k: np.concatenate(v, axis=-1) for k, v in data.items()})
@@ -809,41 +916,24 @@ class Credit_Monte_Carlo(Calculation):
             elif result == 'collva_t':
                 self.output.setdefault(result, np.array(data, dtype=np.float64).mean(axis=0))
             elif result in ['grad_cva', 'grad_collva', 'grad_fva']:
-                grad = {}
-                for k, v in data.items():
-                    grad[k] = v.astype(np.float64) / self.params['Simulation_Batches']
-                self.output.setdefault(result, self.gradients_as_df(grad, display_val=True))
+                grad = dict.fromkeys(data[0].keys())
+                for k in grad.keys():
+                    values = np.array([v[k].astype(np.float64) for v in data])
+                    grad[k] = np.mean(values, axis=0)
+                self.output.setdefault(result, grad)
             elif result in ['grad_cva_hessian']:
-                self.output.setdefault(result, self.gradients_as_df(
-                    data.astype(np.float64) / self.params['Simulation_Batches']))
+                self.output.setdefault(result, np.stack(data).astype(np.float64).mean(axis=0))
             else:
                 self.output.setdefault(result, np.concatenate(data, axis=-1).astype(np.float64))
 
-        # now check for jacobians
-        # reverse_lookup = {v: k for k, v in self.implied_ofs.items()}
-        # jacobians = {}
-        # for index, (k, v) in enumerate(self.implied_factors.items()):
-        #     jac_factor = utils.Factor(k.type + 'Jacobian', k.name)
-        #     if utils.check_tuple_name(jac_factor) in self.config.params['Price Factors']:
-        #         jacobian = construct_factor(jac_factor, self.config.params['Price Factors'])
-        #         currency = self.all_factors[reverse_lookup[index]].factor.get_currency()
-        #         for res, value in self.output.items():
-        #             if res.startswith('grad'):
-        #                 jacobians.setdefault(res, {}).setdefault(
-        #                     k, jacobian.calculate_components(k, value, currency))
-
-        # merge and report
-        # for grad_xva, jac_xva in jacobians.items():
-        #     self.output['implied_'+grad_xva[5:]] = pd.concat([v.set_index(pd.MultiIndex.from_tuples([
-        #         (utils.check_scope_name(k), x) for x in v.index])) for k, v in jac_xva.items()])
-
+        self.calc_stats['Tensor_Execution_Time'] = time.clock() - self.calc_stats['Tensor_Execution_Time']
         return self.output
 
-    def execute(self, params):
+    def execute(self, params, feedgraph=True):
         # get the rundate
         base_date = pd.Timestamp(params['Run_Date'])
         # check if we need to produce a slideshow (i.e. documentation)
-        if params.get('Generate_Slideshow', 'No') == 'Yes':
+        if params.get('Generate_Slideshow','No') == 'Yes':
             # we need to generate scenarios to draw pictures . . .
             params['Calc_Scenarios'] = 'Yes'
             # set the name of this calculation
@@ -853,60 +943,58 @@ class Credit_Monte_Carlo(Calculation):
         self.input_time_grid = params['Time_grid']
         self.numscenarios = params['Batch_Size'] * params['Simulation_Batches']
 
-        # store the params
+        # reset the default graph
+        tf.reset_default_graph()
+        # create a TF graph to represent this calculation
+        self.graph = tf.Graph()
+        # set the precision in the utils module - Nasty hack - TODO
+        utils.Default_Precision = self.prec
+        # store the params                
         self.params = params
+        # Dynamic Batch?
+        dynamic = params.get('Dynamic', 'No') == 'Yes'
+        # build the TF graph
+        with self.graph.as_default() as g:
+            self.batch_size = tf.placeholder(tf.int32, shape=[], name='Batch_Size') if dynamic else params['Batch_Size']
+            self.calc_stats['Factor_Setup_Time'] = time.clock()
+            self.update_factors(params, base_date)
 
-        self.batch_size = params['Batch_Size']
-        self.calc_stats['Factor_Setup_Time'] = time.monotonic()
-        # update the factors and obtain shared state
-        shared_mem = self.update_factors(params, base_date)
-        # record the setup time
-        self.calc_stats['Factor_Setup_Time'] = time.monotonic() - self.calc_stats['Factor_Setup_Time']
-        # setup the all instruments
-        self.calc_stats['Deal_Setup_Time'] = time.monotonic()
-        self.netting_sets = DealStructure(Aggregation('root'))
-        self.set_deal_structures(
-            self.config.deals['Deals']['Children'], self.netting_sets, self.numscenarios,
-            params['Batch_Size'], tagging=None, deal_level_mtm=params.get('DealLevel', False))
-        # record the (pure python) dependency setup time
-        self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']
-        # clear the output
-        output = defaultdict(list)
-        # reset the tensors - used for storing simulation data
-        tensors = {}
-        # record how long it took to run the calc (python + pytorch)
-        self.calc_stats['Tensor_Execution_Time'] = time.monotonic()
+            # record the setup time
+            self.calc_stats['Factor_Setup_Time'] = time.clock() - self.calc_stats['Factor_Setup_Time']
 
-        for run in range(self.params['Simulation_Batches']):
-            start_run = time.monotonic()
-            # need to refresh random numbers and zero out buffers
-            shared_mem.reset(self.num_factors, self.time_grid)
+            # now that the memory is setup, all python objects have had a chance to sync with the device
+            # (in terms of indices, offsets etc.)
+            self.calc_stats['Deal_Setup_Time'] = time.clock()
+            self.netting_sets = DealStructure(Aggregation('root'))
+            self.set_deal_structures(self.config.deals['Deals']['Children'], self.netting_sets, self.numscenarios,
+                                     params['Batch_Size'], tagging=None,
+                                     deal_level_mtm=params.get('DealLevel', False))
+
+            # record the (pure python) dependency setup time
+            self.calc_stats['Deal_Setup_Time'] = time.clock() - self.calc_stats['Deal_Setup_Time']
+
+            # record how long it took to build the graph
+            self.calc_stats['Graph_Setup_Time'] = time.clock()
 
             # simulate the price factors
             for key, value in self.stoch_factors.items():
-                shared_mem.t_Scenario_Buffer[self.stoch_ofs[key]] = value.generate(shared_mem)
+                with tf.name_scope(utils.check_scope_name(key)):
+                    self.shared_mem.t_Scenario_Buffer[self.stoch_ofs[key]] = value.generate(self.shared_mem)
 
             # construct the valuations
-            tensors['mtm'] = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
-
-            # is this the final run?
-            final_run = run == self.params['Simulation_Batches'] - 1
+            self.tensors['mtm'] = self.netting_sets.resolve_structure(self.shared_mem, self.time_grid)
 
             # now calculate all the valuation adjustments (if necessary)
-            if 'CollVA' in params and 'Funding' in shared_mem.t_Credit:
+            if 'CollVA' in params and 'Funding' in self.shared_mem.t_Credit:
+                with tf.name_scope('CollVA'):
+                    self.tensors['collva_t'] = tf.reduce_mean(self.shared_mem.t_Credit['Funding'], axis=1)
+                    self.tensors['collva'] = tf.reduce_sum(self.tensors['collva_t'])
+                    self.tensors['collateral'] = self.shared_mem.t_Credit['Collateral']
 
-                tensors['collva_t'] = torch.mean(shared_mem.t_Credit['Funding'], axis=1)
-                tensors['collateral'] = shared_mem.t_Credit['Collateral']
-                tensors['collva'] = torch.sum(tensors['collva_t'])
-
-                if params['CollVA'].get('Gradient', 'No') == 'Yes':
-                    # calculate all the derivatives of fva
-                    sensitivity = SensitivitiesEstimator(tensors['collva'], self.all_var)
-
-                    if final_run:
-                        output['grad_collva'] = sensitivity.report_grad()
-                        # store the size of the Gradient
-                        self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
+                    if params['CollVA'].get('Gradient', 'No') == 'Yes':
+                        # calculate all the derivatives of collva
+                        self.tensors['grad_collva'] = SensitivitiesEstimator(
+                            self.tensors['collva'], self.all_var).grad
 
             if 'FVA' in params:
                 time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
@@ -919,164 +1007,137 @@ class Credit_Monte_Carlo(Calculation):
 
                 if 'Counterparty' in params['FVA']:
                     survival = get_survival_factor(utils.check_rate_name(params['FVA']['Counterparty']),
-                                                   self.static_ofs, self.stoch_ofs, self.all_tenors)
-                    surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), shared_mem)
-                    St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
-                        shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), axis=0)
+                                                   self.static_ofs,
+                                                   self.stoch_ofs, self.all_tenors)
+                    surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), self.shared_mem)
+                    St_T = tf.squeeze(tf.exp(-surv.gather_weighted_curve(
+                        self.shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), axis=0)
                 else:
-                    St_T = torch.ones((1, 1), dtype=self.dtype, device=self.device)
+                    St_T = tf.constant([[1.0]], self.prec)
 
-                deflation = utils.calc_time_grid_curve_rate(riskfree, np.zeros((1, 3)), shared_mem)
-                DF_rf = torch.squeeze(torch.exp(-deflation.gather_weighted_curve(
-                    shared_mem, mtm_grid.reshape(1, -1))), axis=0)
+                with tf.name_scope('FVA'):
+                    deflation = utils.calc_time_grid_curve_rate(riskfree, np.zeros((1, 3)), self.shared_mem)
+                    DF_rf = tf.squeeze(tf.exp(-deflation.gather_weighted_curve(
+                        self.shared_mem, mtm_grid.reshape(1, -1))), axis=0)
 
-                if params['FVA'].get('Stochastic_Funding', 'No') == 'Yes':
-                    Vk_plus_ti = torch.relu(tensors['mtm'] * DF_rf)
-                    Vk_minus_ti = torch.relu(-tensors['mtm'] * DF_rf)
-                    Vk_star_ti_p = (Vk_plus_ti[1:] + Vk_plus_ti[:-1]) / 2
-                    Vk_star_ti_m = (Vk_minus_ti[1:] + Vk_minus_ti[:-1]) / 2
+                    if params['FVA'].get('Stochastic_Funding', 'No') == 'Yes':
+                        Vk_plus_ti = tf.nn.relu(self.tensors['mtm'] * DF_rf)
+                        Vk_minus_ti = tf.nn.relu(-self.tensors['mtm'] * DF_rf)
+                        Vk_star_ti_p = (Vk_plus_ti[1:] + Vk_plus_ti[:1]) / 2
+                        Vk_star_ti_m = (Vk_minus_ti[1:] + Vk_minus_ti[:1]) / 2
 
-                    delta_scen_t = np.hstack((0.0, np.diff(mtm_grid))).reshape(-1, 1)
+                        delta_scen_t = np.hstack((0.0, np.diff(mtm_grid))).astype(self.prec).reshape(-1, 1)
 
-                    discount_fund = utils.calc_time_grid_curve_rate(
-                        funding, self.time_grid.time_grid[time_grid], shared_mem)
-                    discount_rf = utils.calc_time_grid_curve_rate(
-                        riskfree, self.time_grid.time_grid[time_grid], shared_mem)
+                        discount_fund = utils.calc_time_grid_curve_rate(funding,
+                                                                        self.time_grid.time_grid[time_grid],
+                                                                        self.shared_mem)
+                        discount_rf = utils.calc_time_grid_curve_rate(riskfree, self.time_grid.time_grid[time_grid],
+                                                                      self.shared_mem)
 
-                    delta_fund_rf = torch.squeeze(
-                        torch.exp(discount_fund.gather_weighted_curve(shared_mem, delta_scen_t)) -
-                        torch.exp(discount_rf.gather_weighted_curve(shared_mem, delta_scen_t)), axis=1) * St_T
+                        delta_fund_rf = tf.squeeze(
+                            tf.exp(discount_fund.gather_weighted_curve(self.shared_mem, delta_scen_t)) -
+                            tf.exp(discount_rf.gather_weighted_curve(self.shared_mem, delta_scen_t)), axis=1) * St_T
 
-                    FCA_t = torch.sum(delta_fund_rf[1:] * Vk_star_ti_p, axis=0)
-                    FCA = torch.mean(FCA_t)
-                    FBA_t = torch.sum(delta_fund_rf[1:] * Vk_star_ti_m, axis=0)
-                    FBA = torch.mean(FBA_t)
-                else:
-                    pass
+                        FCA_t = tf.reduce_mean(delta_fund_rf[1:] * Vk_star_ti_p, axis=1)
+                        FCA = tf.reduce_sum(FCA_t)
+                        FBA_t = tf.reduce_mean(delta_fund_rf[1:] * Vk_star_ti_m, axis=1)
+                        FBA = tf.reduce_sum(FBA_t)
+                    else:
+                        pass
 
-                tensors['fva'] = FCA - FBA
+                    self.tensors['fva'] = FCA - FBA
 
-                if params['FVA'].get('Gradient', 'No') == 'Yes':
-                    # calculate all the derivatives of fva
-                    sensitivity = SensitivitiesEstimator(tensors['fva'], self.all_var)
-
-                    if final_run:
-                        output['grad_fva'] = sensitivity.report_grad()
-                        # store the size of the Gradient
-                        self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
+                    if params['FVA'].get('Gradient', 'No') == 'Yes':
+                        # calculate all the derivatives of fva
+                        self.tensors['grad_fva'] = SensitivitiesEstimator(
+                            self.tensors['fva'], self.all_var).grad
 
             if 'CVA' in params:
-                discount = get_interest_factor\
-                    (utils.check_rate_name(params['Deflation_Interest_Rate']),
-                     self.static_ofs, self.stoch_ofs, self.all_tenors)
-                survival = get_survival_factor(
-                    utils.check_rate_name(params['CVA']['Counterparty']),
-                    self.static_ofs, self.stoch_ofs, self.all_tenors)
-                recovery = get_recovery_rate(
-                    utils.check_rate_name(params['CVA']['Counterparty']), self.all_factors)
+                discount = get_interest_factor(utils.check_rate_name(params['Deflation_Interest_Rate']),
+                                               self.static_ofs, self.stoch_ofs, self.all_tenors)
+                survival = get_survival_factor(utils.check_rate_name(params['CVA']['Counterparty']),
+                                               self.static_ofs,
+                                               self.stoch_ofs, self.all_tenors)
+                recovery = get_recovery_rate(utils.check_rate_name(params['CVA']['Counterparty']), self.all_factors)
                 # only looks at the first netting set - should be fine . . .
                 time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
 
                 # Calculates unilateral CVA with or without stochastic deflation.
-                mtm_grid = self.time_grid.mtm_time_grid[time_grid]
-                delta_scen_t = np.hstack((0.0, np.diff(mtm_grid)))
+                with tf.name_scope('CVA'):
+                    mtm_grid = self.time_grid.mtm_time_grid[time_grid]
+                    delta_scen_t = np.hstack((0.0, np.diff(mtm_grid))).astype(self.prec)
 
-                if params['CVA']['Deflate_Stochastically'] == 'Yes':
-                    zero = utils.calc_time_grid_curve_rate(
-                        discount, self.time_grid.time_grid[time_grid], shared_mem)
-                    Dt_T = torch.exp(-torch.squeeze(zero.gather_weighted_curve(
-                        shared_mem, delta_scen_t.reshape(-1, 1))).cumsum(axis=0))
-                else:
-                    zero = utils.calc_time_grid_curve_rate(discount, np.zeros((1, 3)), shared_mem)
-                    Dt_T = torch.squeeze(torch.exp(
-                        -zero.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1))), axis=0)
+                    if params['CVA']['Deflate_Stochastically'] == 'Yes':
+                        zero = utils.calc_time_grid_curve_rate(discount, self.time_grid.time_grid[time_grid],
+                                                               self.shared_mem)
+                        Dt_T = tf.exp(-tf.cumsum(tf.squeeze(zero.gather_weighted_curve(
+                            self.shared_mem, delta_scen_t.reshape(-1, 1))), axis=0))
+                    else:
+                        zero = utils.calc_time_grid_curve_rate(discount, np.zeros((1, 3)), self.shared_mem)
+                        Dt_T = tf.squeeze(tf.exp(-zero.gather_weighted_curve(
+                            self.shared_mem, mtm_grid.reshape(1, -1))), axis=0)
 
-                pv_exposure = torch.relu(tensors['mtm'] * Dt_T)
+                    pv_exposure = tf.nn.relu(self.tensors['mtm'] * Dt_T)
 
-                if params['CVA']['Stochastic_Hazard'] == 'Yes':
-                    surv = utils.calc_time_grid_curve_rate(
-                        survival, self.time_grid.time_grid[time_grid], shared_mem)
-                    St_T = torch.exp(-torch.cumsum(torch.squeeze(surv.gather_weighted_curve(
-                        shared_mem, delta_scen_t.reshape(-1, 1), multiply_by_time=False), axis=1),
-                        axis=0))
-                else:
-                    surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), shared_mem)
-                    St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
-                        shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), axis=0)
+                    if params['CVA']['Stochastic_Hazard'] == 'Yes':
+                        surv = utils.calc_time_grid_curve_rate(survival, self.time_grid.time_grid[time_grid],
+                                                               self.shared_mem)
+                        St_T = tf.exp(-tf.cumsum(tf.squeeze(surv.gather_weighted_curve(
+                            self.shared_mem, delta_scen_t.reshape(-1, 1), multiply_by_time=False), axis=1),
+                            axis=0))
+                    else:
+                        surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), self.shared_mem)
+                        St_T = tf.squeeze(tf.exp(-surv.gather_weighted_curve(
+                            self.shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), axis=0)
 
-                prob = St_T[:-1] - St_T[1:]
-                tensors['cva'] = (1.0 - recovery) * (
-                        0.5 * (pv_exposure[1:] + pv_exposure[:-1]) * prob).mean(axis=1).sum()
+                    prob = St_T[:-1] - St_T[1:]
 
-                if params['CVA'].get('Gradient', 'No') == 'Yes':
-                    # potentially fetch ir jacobian matrices for base curves
-                    base_ir_curves = [x for x in self.stoch_ofs.keys() if
-                                      x.type == 'InterestRate' and len(x.name) == 1]
-                    self.jacobians = {}
-                    for ir_factor in base_ir_curves:
-                        jacobian_factor = utils.Factor('InterestRateJacobian', ir_factor.name)
-                        ir_curve = self.stoch_factors[utils.Factor('InterestRate', ir_factor.name)].factor
-                        var_name = 'Stochastic_Input/{0}:0'.format(utils.check_tuple_name(ir_factor))
-                        try:
-                            jac = construct_factor(
-                                jacobian_factor, self.config.params['Price Factors'],
-                                self.config.params['Price Factor Interpolation'])
-                            jac.update(ir_curve)
-                            self.jacobians[var_name] = jac.current_value()
-                            logging.info('jacobian present for {0} - will attempt inverse bootstrap'.format(
-                                utils.check_tuple_name(ir_factor)))
-                        except KeyError as e:
-                            pass
+                    self.tensors['cva'] = (1.0 - recovery) * tf.reduce_sum(
+                        tf.reduce_mean(0.5 * (pv_exposure[1:] + pv_exposure[:-1]) * prob, axis=1), axis=0)
 
-                    # calculate all the derivatives of cva
-                    hessian = params['CVA'].get('Hessian', 'No') == 'Yes'
-                    sensitivity = SensitivitiesEstimator(
-                        tensors['cva'], self.all_var, create_graph=hessian)
+                    if params['CVA'].get('Gradient', 'No') == 'Yes':
+                        # potentially fetch ir jacobian matrices for base curves
+                        base_ir_curves = [x for x in self.stoch_ofs.keys() if
+                                          x.type == 'InterestRate' and len(x.name) == 1]
+                        self.jacobians = {}
+                        for ir_factor in base_ir_curves:
+                            jacobian_factor = utils.Factor('InterestRateJacobian', ir_factor.name)
+                            ir_curve = self.stoch_factors[utils.Factor('InterestRate', ir_factor.name)].factor
+                            var_name = 'Stochastic_Input/{0}:0'.format(utils.check_tuple_name(ir_factor))
+                            try:
+                                jac = construct_factor(jacobian_factor, self.config.params['Price Factors'])
+                                jac.update(ir_curve)
+                                self.jacobians[var_name] = jac.current_value()
+                                logging.info('jacobian present for {0} - will attempt inverse bootstrap'.format(
+                                    utils.check_tuple_name(ir_factor)))
+                            except KeyError as e:
+                                pass
 
-                    if final_run:
-                        output['grad_cva'] = sensitivity.report_grad()
+                        # calculate all the derivatives of cva
+                        sensitivity = SensitivitiesEstimator(self.tensors['cva'], self.all_var)
+                        self.tensors['grad_cva'] = sensitivity.grad
                         # store the size of the Gradient
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
+                        if params['CVA'].get('Hessian', 'No') == 'Yes':
+                            # calculate the hessian matrix - warning - this will probably kill your box
+                            self.tensors['grad_cva_hessian'] = sensitivity.get_H_op(self.prec)
 
-                        if hessian:
-                            # calculate the hessian matrix - warning - make sure you have enough memory
-                            output['grad_cva_hessian'] = sensitivity.report_hessian()
+            self.calc_stats['Graph_Setup_Time'] = time.clock() - self.calc_stats['Graph_Setup_Time']
 
-            # print('Run {} in {:.3f} s'.format(run, time.monotonic() - start_run))
-
-            # store all output tensors
-            for k, v in tensors.items():
-                output[k].append(v.cpu().detach().numpy())
-
-            # fetch cashflows if necessary
-            if self.params.get('Generate_Cashflows', 'No') == 'Yes':
-                dates = np.array(sorted(self.time_grid.mtm_dates))
-                for currency, values in shared_mem.t_Cashflows.items():
-                    cash_index = dates[sorted(values.keys())]
-                    output.setdefault('cashflows', {}).setdefault(currency, []).append(
-                        pd.DataFrame([v.cpu().detach().numpy() for _, v in sorted(values.items())],
-                                     index=cash_index))
-
-            # add any scenarios if necessary
-            if self.params.get('Calc_Scenarios', 'No') == 'Yes':
-                for key, value in self.stoch_factors.items():
-                    output.setdefault('scenarios', {}).setdefault(key, []).append(
-                        shared_mem.t_Scenario_Buffer[self.stoch_ofs[key]].cpu().detach().numpy())
-
-        self.calc_stats['Tensor_Execution_Time'] = time.monotonic() - self.calc_stats['Tensor_Execution_Time']
-
-        # store the results
         results = {'Netting': self.netting_sets, 'Stats': self.calc_stats, 'Jacobians': self.jacobians}
-        results['Results'] = self.report(output)
+
+        if params.get('Debug', 'No') != 'No' and os.path.isdir(params['Debug']):
+            # record the number of tensors used (lower is better) - this is an expensive op
+            self.calc_stats['Graph_Nodes'] = len(self.graph.as_graph_def().node)
+            run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+            run_metadata = tf.RunMetadata()
+            writer = tf.summary.FileWriter(params['Debug'], graph=self.graph)
+            results['Results'] = self.feed(params['Batch_Size'], options=run_options, run_meta=run_metadata,
+                                           writer=writer)
+        else:
+            results['Results'] = self.feed(params['Batch_Size']) if feedgraph else None
 
         return results
-
-
-class Base_Reval_State(utils.Calculation_State):
-    def __init__(self, static_buffer, one, report_currency, calc_greeks, gamma, nomodel='Constant'):
-        super(Base_Reval_State, self).__init__(static_buffer, one, report_currency, nomodel)
-        self.calc_greeks = calc_greeks
-        self.gamma = gamma
 
 
 class Base_Revaluation(Calculation):
@@ -1095,6 +1156,7 @@ class Base_Revaluation(Calculation):
 
     def __init__(self, config, **kwargs):
         super(Base_Revaluation, self).__init__(config, **kwargs)
+        self.dependent_factors = None
         self.base_date = None
 
         # Cuda related variables to store the state of the device between calculations
@@ -1117,60 +1179,80 @@ class Base_Revaluation(Calculation):
         self.static_factors = OrderedDict()
         for price_factor in dependent_factors:
             try:
-                self.static_factors.setdefault(
-                    price_factor, construct_factor(
-                        price_factor, self.config.params['Price Factors'],
-                        self.config.params['Price Factor Interpolation']))
+                self.static_factors.setdefault(price_factor,
+                                               construct_factor(
+                                                   price_factor,
+                                                   self.config.params['Price Factors']))
             except KeyError as e:
                 logging.warning('Price Factor {0} missing in market data file - skipping'.format(e.args))
 
         self.all_factors = self.static_factors
 
-        calc_grad = params.get('Greeks', 'No') != 'No'
-        # and then get the the static risk factors ready - these will just be looked up
-        for key, value in self.static_factors.items():
-            if key.type not in utils.DimensionLessFactors:
-                # record the offset of this risk factor
-                self.static_ofs.setdefault(key, len(self.static_var))
-                current_val = value.current_value()
-                self.static_var.append((key, torch.tensor(
-                    current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
+        # work out distinct tenor sets
+        # distinct_tenors = OrderedDict()
+        with tf.name_scope("Static_Input"):
+            for key, value in self.static_factors.items():
+                if key.type not in utils.DimensionLessFactors:
+                    # record the offset of this risk factor
+                    self.static_ofs.setdefault(key, len(self.static_var))
+                    # utils.distinct_tenors(distinct_tenors, key, value)
+                    current_val = value.current_value()
+                    self.static_values.append(current_val)
+                    self.static_var.append(
+                        tf.placeholder(self.prec,
+                                       shape=len(current_val),
+                                       name=utils.check_scope_name(key)))
 
         # setup the device and allocate memory
-        shared_mem = self.__init_shared_mem(params['Currency'], calc_grad)
+        self.__refresh_shared_mem(params['Currency'], params.get('Greeks', 'No') == 'Yes')
 
         # calculate a reverse lookup for the tenors and store the daycount code
         self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
 
-        return shared_mem
+        # store the state info
+        self.dependent_factors = dependent_factors
 
     def update_time_grid(self, base_date):
         # setup the scenario and base time grids
-        self.time_grid = utils.TimeGrid({base_date}, {base_date}, {base_date})
+        self.time_grid = TimeGrid({base_date}, {base_date}, {base_date})
         self.base_date = base_date
         self.time_grid.set_base_date(base_date)
 
-    def __init_shared_mem(self, reporting_currency, calc_greeks):
+    def __refresh_shared_mem(self, reporting_currency, calc_greeks):
 
+        # setup the Feed dictionary - the inputs needed to evaluate the graph
+        feed = dict(zip(self.static_var, self.static_values))
+        static_buffer = self.static_var
         # name of the base currency
-        base_currency = utils.Factor(
-            'FxRate', (self.config.params['System Parameters']['Base_Currency'],))
+        base_currency = 'Static_Input/FxRate.{}'.format(
+            self.config.params['System Parameters']['Base_Currency']),
 
         # now decide what we want to calculate greeks with respect to
         all_vars_concat = None
         if calc_greeks:
-            all_vars_concat = [x for x in self.static_var if x[0] != base_currency]
+            all_vars_concat = [x for x in self.static_var if not x.name.startswith(
+                base_currency)]
             self.make_factor_index(self.static_var)
 
         # allocate memory on the device
-        return Base_Reval_State(
-            [x[-1] for x in self.static_var], torch.ones([1, 1], dtype=self.dtype, device=self.device),
-            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, {}),
-            all_vars_concat, self.params['Greeks'] == 'All')
+        with tf.name_scope('Setup'):
+            self.shared_mem = self.shared_memClass(
+                t_Buffer={},
+                t_Static_Buffer=static_buffer,
+                t_Feed_dict=feed,
+                t_Cashflows=None,
+                calc_greeks=all_vars_concat,
+                gpus=[x.name for x in device_lib.list_local_devices() if x.device_type == 'GPU'],
+                riskneutral=False,
+                precision=self.prec,
+                simulation_batch=1,
+                Report_Currency=get_fxrate_factor(utils.check_rate_name(reporting_currency),
+                                                  self.static_ofs, {})
+            )
 
-    def report(self):
+    def feed(self, static_vars={}):
 
-        def check_prices(n, parent=[]):
+        def check_prices(sess, feed, n, parent=[]):
 
             def format_row(deal, data, val, greeks):
                 data['Deal Currency'] = deal.Factor_dep.get(
@@ -1179,10 +1261,10 @@ class Base_Revaluation(Calculation):
                     if k.startswith('Greeks'):
                         greeks.setdefault(k, []).append(
                             self.gradients_as_df(v, header=deal.Instrument.field.get('Reference')))
-                    elif k == 'Value':
+                    else:
                         data[k] = float(v)
                 # update any tags
-                if deal.Instrument.field.get('Tags'):
+                if deal.Instrument.field.get('Tags') is not None:
                     data.update(dict(zip(tag_titles, deal.Instrument.field['Tags'][0].split(','))))
 
             block = []
@@ -1190,16 +1272,16 @@ class Base_Revaluation(Calculation):
             for sub_struct in n.sub_structures:
                 data = OrderedDict(parent + [(field, sub_struct.obj.Instrument.field.get(field, 'Root'))
                                              for field in ['Reference', 'Object']])
-                format_row(sub_struct.obj, data, sub_struct.obj.Calc_res, greeks)
+                format_row(sub_struct.obj, data, sess.run(sub_struct.obj.Calc_res, feed), greeks)
                 block.append(data)
                 sub_block, sub_greeks = check_prices(
-                    sub_struct, [('Parent', data['Reference'])])
+                    sess, feed, sub_struct, parent + [('Parent' + str(len(parent)), data['Reference'])])
                 block.extend(sub_block)
                 # aggregate the sub structure greeks
                 for k, v in sub_greeks.items():
                     greeks.setdefault(k, []).extend(v)
 
-            valuations = [deal.Calc_res for deal in n.dependencies]
+            valuations = sess.run([deal.Calc_res for deal in n.dependencies], feed)
             for deal, val in zip(n.dependencies, valuations):
                 data = OrderedDict(parent + [(field, deal.Instrument.field.get(field, '?'))
                                              for field in ['Reference', 'Object']])
@@ -1208,11 +1290,24 @@ class Base_Revaluation(Calculation):
 
             return block, greeks
 
+        # update the feed
+        feed = self.shared_mem.t_Feed_dict.copy()
+        # copy the new params
+        feed.update({self.graph.get_tensor_by_name('Static_Input/{0}:0'.format(k)): v for
+                     k, v in static_vars.items()})
+
+        # record the cuda execution stats
+        self.calc_stats['Tensor_Execution_Time'] = time.clock()
+
         # clear the output
         self.output = {}
         # load any tag titles
         tag_titles = self.config.deals['Attributes'].get('Tag_Titles', '').split(',')
-        mtm, greeks = check_prices(self.netting_sets)
+        # setup the config
+        config = tf.ConfigProto(allow_soft_placement=True)
+
+        with tf.Session(graph=self.graph, config=config) as sess:
+            mtm, greeks = check_prices(sess, feed, self.netting_sets)
 
         self.output['mtm'] = pd.DataFrame(mtm)
         for greek_name, greek_val in greeks.items():
@@ -1225,43 +1320,44 @@ class Base_Revaluation(Calculation):
                 raise Exception('Unknown Greek requested', greek_name)
             self.output.setdefault(greek_name, summary)
 
+        self.calc_stats['Tensor_Execution_Time'] = time.clock() - self.calc_stats['Tensor_Execution_Time']
+
         return self.output
 
-    def execute(self, params):
+    def execute(self, params, feedgraph=True):
         # get the rundate
         base_date = pd.Timestamp(params['Run_Date'])
+        # reset the default graph
+        tf.reset_default_graph()
+        # create a TF graph to represent this calculation
+        self.graph = tf.Graph()
         # store the params
         self.params = params
-        # update the factors
-        shared_mem = self.update_factors(params, base_date)
+        # set the precision in the utils module - Nasty hack - Need to fix this - TODO
+        utils.Default_Precision = self.prec
+        # build the TF graph
+        with self.graph.as_default() as g:
+            self.update_factors(params, base_date)
 
-        self.calc_stats['Deal_Setup_Time'] = time.monotonic()
-        self.netting_sets = DealStructure(Aggregation('root'), deal_level_mtm=True)
-        self.set_deal_structures(
-            self.config.deals['Deals']['Children'], self.netting_sets, 1, 1, deal_level_mtm=True)
+            self.calc_stats['Deal_Setup_Time'] = time.clock()
+            self.netting_sets = DealStructure(Aggregation('root'), deal_level_mtm=True)
+            self.set_deal_structures(self.config.deals['Deals']['Children'], self.netting_sets, 1, 1,
+                                     deal_level_mtm=True)
 
-        # record the (pure python) dependency setup time
-        self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']
-        self.calc_stats['Graph_Setup_Time'] = time.monotonic()
+            # record the (pure python) dependency setup time
+            self.calc_stats['Deal_Setup_Time'] = time.clock() - self.calc_stats['Deal_Setup_Time']
 
-        # now ask the netting set to construct each deal - no looping required (just 1 timepoint)
-        mtm = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
-        # record the graph loading time
-        self.calc_stats['Graph_Setup_Time'] = time.monotonic() - self.calc_stats['Graph_Setup_Time']
-        # populate the mtm at the netting set
-        ns_obj = self.netting_sets.sub_structures[0].obj
-        ns_obj.Calc_res['Value'] = mtm
-        # make sure the netting set object has a reference and a mtm
-        ns_obj.Instrument.field.setdefault('Reference', self.config.deals['Attributes']['Reference'])
+            self.calc_stats['Graph_Setup_Time'] = time.clock()
 
-        if shared_mem.calc_greeks is not None:
-            # record the cuda execution stats
-            self.calc_stats['Greek_Execution_Time'] = time.monotonic()
-            pricing.greeks(shared_mem, ns_obj, mtm)
-            self.calc_stats['Greek_Execution_Time'] = time.monotonic() - self.calc_stats['Greek_Execution_Time']
+            # now ask the netting set to construct each deal - no looping required (just 1 timepoint)
+            mtm = self.netting_sets.resolve_structure(self.shared_mem, self.time_grid)
+
+            # record the graph loading time
+            self.calc_stats['Graph_Setup_Time'] = time.clock() - self.calc_stats['Graph_Setup_Time']
 
         # return a dictionary of output
-        return {'Netting': self.netting_sets, 'Stats': self.calc_stats, 'Results': self.report()}
+        return {'Netting': self.netting_sets, 'Stats': self.calc_stats,
+                'Results': self.feed() if feedgraph else None}
 
 
 def construct_calculation(calc_type, config, **kwargs):
