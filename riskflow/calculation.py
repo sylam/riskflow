@@ -31,7 +31,7 @@ from collections import OrderedDict, namedtuple, defaultdict
 # import the risk factors (also known as price factors)
 from riskflow.riskfactors import construct_factor
 # import the stochastic processes
-from riskflow.stochasticprocess import construct_process, ProcessModifiedException
+from riskflow.stochasticprocess import construct_process
 # import the currency/curve lookup factors 
 from riskflow.instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
 # import the hessian function
@@ -346,12 +346,11 @@ class Calculation(object):
                 tenor.append(grad_index[non_zero])
                 # store the actual factor value if required
                 if display_val:
-                    rate_name = name.split('/')[-1]
-                    if rate_name in factor_values:
+                    if name in factor_values:
                         rate_non_zero = grad_index[non_zero][:, :index_len].astype(np.float64)
-                        factor.append(factor_values[rate_name].current_value(rate_non_zero).flatten())
+                        factor.append(factor_values[name].current_value(rate_non_zero).flatten())
                     else:
-                        sub_rate, param = rate_name.rsplit('.', 1)
+                        sub_rate, param = name.rsplit('.', 1)
                         sub_rate_non_zero = grad_index[non_zero].shape[0]
                         factor.append(factor_values[sub_rate].current_value()[param].flatten()[:sub_rate_non_zero])
 
@@ -697,16 +696,17 @@ class Credit_Monte_Carlo(Calculation):
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 implied_index = self.implied_ofs.get(key, -1)
-                implied_tensor = {k.name[-1]: v for k, v in self.implied_var[implied_index].items()} \
-                    if implied_index > -1 else None
-                try:
-                    value.precalculate(
-                        base_date, ScenarioTimeGrid(dependent_factors[key], self.time_grid, base_date),
-                        self.stoch_var[self.stoch_ofs[key]][1], shared_mem, self.process_ofs[key],
-                        implied_tensor=implied_tensor)
-                except ProcessModifiedException as e:
-                    logging.warning('Implied factor {} has been modified ({}) at indices {}'.format(
-                        utils.check_scope_name(key), e.message, e.indices))
+                if implied_index > -1:
+                    implied_tensor = {k.name[-1]: v for k, v in self.implied_var[implied_index].items()}
+                    value.link_references(implied_tensor, self.implied_var, self.implied_ofs)
+                else:
+                    implied_tensor = None
+                value.precalculate(
+                    base_date, ScenarioTimeGrid(dependent_factors[key], self.time_grid, base_date),
+                    self.stoch_var[self.stoch_ofs[key]][1], shared_mem, self.process_ofs[key],
+                    implied_tensor=implied_tensor)
+                if not value.params_ok:
+                    logging.warning('Stochastic factor {} has been modified'.format(utils.check_scope_name(key)))
 
         # now check if any of the stochastic processes depend on other processes
         for key, value in self.stoch_factors.items():
@@ -841,7 +841,7 @@ class Credit_Monte_Carlo(Calculation):
                 grad = {}
                 for k, v in data.items():
                     grad[k] = v.astype(np.float64) / self.params['Simulation_Batches']
-                self.output.setdefault(result, grad)
+                self.output.setdefault(result, self.gradients_as_df(grad, display_val=True))
             elif result in ['grad_cva_hessian']:
                 self.output.setdefault(result, data.astype(np.float64) / self.params['Simulation_Batches'])
             else:

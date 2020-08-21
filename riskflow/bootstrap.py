@@ -39,10 +39,12 @@ def work(job_id, queue, result, price_factors,
                         datefmt='%m-%d %H:%M',
                         filename='bootstrap_{}.log'.format(job_id),
                         filemode='w')
-
+    import torch
     from riskflow.bootstrappers import construct_bootstrapper
 
     bootstrappers = {}
+    # set the gpu
+    gpudevice = torch.device("cuda:0")
 
     # perform the bootstrapping
     while True:
@@ -55,7 +57,7 @@ def work(job_id, queue, result, price_factors,
         try:
             name = list(job_price.keys())[0]
             if bootstrapper_name not in bootstrappers:
-                bootstrappers[bootstrapper_name] = construct_bootstrapper(bootstrapper_name, params)
+                bootstrappers[bootstrapper_name] = construct_bootstrapper(bootstrapper_name, params, device=gpudevice)
             bootstrapper = bootstrappers[bootstrapper_name]
             bootstrapper.bootstrap(sys_params, price_models, price_factors, job_price, holidays)
 
@@ -86,7 +88,7 @@ class Parent(object):
                             format='%(asctime)s %(levelname)-8s %(message)s',
                             datefmt='%m-%d %H:%M')
 
-        from riskflow.adaptiv import AdaptivContext
+        from adaptiv import AdaptivContext
 
         # create the context
         self.cx = AdaptivContext()
@@ -174,11 +176,11 @@ class Parent(object):
         if self.daily:
             # write out the calibrated data
             self.cx.write_marketdata_json(os.path.join(self.path, self.outfile + '.json'))
-            self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
+            # self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
             logfilename = os.path.join(self.path, self.outfile + '.log')
         else:
             self.cx.write_marketdata_json(os.path.join(self.path, rundate, 'MarketDataCal.json'))
-            self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
+            # self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
             logfilename = os.path.join(self.path, rundate, 'MarketDataCal.log')
 
         # copy the logs across
