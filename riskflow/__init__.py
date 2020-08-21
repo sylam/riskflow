@@ -124,7 +124,7 @@ def run_baseval(context, prec, device, overrides=None):
     return calc, out
 
 
-def run_cmc(context, prec, device, overrides=None, CVA=True, FVA=False, CollVA=False):
+def run_cmc(context, prec, device, overrides=None, CVA=False, FVA=False, CollVA=False):
     """
     Runs a credit monte carlo calculation on the provided context
     :param context: a Context object

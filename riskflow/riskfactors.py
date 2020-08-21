@@ -21,16 +21,10 @@ import itertools
 import numpy as np
 import pandas as pd
 
-from . import utils
+from riskflow import utils
 from collections import OrderedDict
 from scipy.interpolate import RectBivariateSpline
 
-# map the names of various factor interpolations to something simpler
-factor_interp_map = {
-    'CubicSplineCurveInterpolation': 'Hermite',
-    'LinearInterFlatExtrapCurveGetValue': 'Linear',
-    'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT'
-}
 
 class Factor0D(object):
     """Represents an instantaneous Rate (0D) risk factor"""
@@ -94,10 +88,10 @@ class Factor1D(object):
 
     def check_interpolation(self):
         if self.param.get('Interpolation') == 'HermiteRT':
-            g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1] * self.tenors)
+            g, c = utils.hermite_interpolation(self.tenors, self.current_value() * self.tenors)
             return ('HermiteRT', g, c)
         elif self.param.get('Interpolation') == 'Hermite':
-            g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1])
+            g, c = utils.hermite_interpolation(self.tenors, self.current_value())
             return ('Hermite', g, c)
         else:
             return ('Linear',)
@@ -106,18 +100,17 @@ class Factor1D(object):
         """Returns the value of the rate at each tenor point (if set) else returns what's
         stored in the Curve parameter"""
         bumped_val = self.param['Curve'].array[:, 1] + self.delta
-        # get the tenors - make sure it's in range
-        tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
-            self.tenors.min(), self.tenors.max())
+        # get the tenors
+        tenors = (np.array(tenor_index) if tenor_index is not None else self.tenors) + offset
 
         if self.interpolation[0] != 'Linear':
-            index = np.searchsorted(self.tenors, tenors, side='right') - 1
+            index = np.clip(np.searchsorted(self.tenors, tenors, side='right') - 1, 0, self.tenors.size - 1)
             index_next = np.clip(index + 1, 0, self.tenors.size - 1)
             dt = np.clip(self.tenors[index_next] - self.tenors[index], 1 / 365.0, np.inf)
             m = np.clip((tenors - self.tenors[index]) / dt, 0.0, 1.0)
             g, c = self.interpolation[1:]
-            rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' else (
-            bumped_val, 1.0)
+            rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' \
+                else (bumped_val, 1.0)
             val = rate[index] * (1.0 - m) + m * rate[index_next] + m * (
                     1.0 - m) * g[index] + m * m * (1.0 - m) * c[index]
             return val / denom
@@ -304,7 +297,7 @@ class PriceIndex(Factor0D):
     def __init__(self, param):
         super(PriceIndex, self).__init__(param)
         # the start date for excel's date offset
-        self.start_date = utils.excel_offset
+        self.start_date = pd.datetime(1899, 12, 30)
         # the offset to the latest index value
         self.last_period = self.param['Last_Period_Start'] - self.start_date
         self.latest_index = np.where(self.param['Index'].array[:, 0] >= self.last_period.days)[0]
@@ -638,13 +631,13 @@ class ReferencePrice(Factor1D):
             self.param['Fixing_Curve'].array[:, 1]
 
 
-class GBMAssetPriceTSModelParameters(Factor1D):
+class GBMTSImpliedParameters(Factor1D):
     """
     Represents the Bootstrapped TS implied parameters for a risk neutral process
     """
 
     def __init__(self, param):
-        super(GBMAssetPriceTSModelParameters, self).__init__(param)
+        super(GBMTSImpliedParameters, self).__init__(param)
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attribute"""
@@ -676,7 +669,8 @@ class HullWhite2FactorModelParameters(Factor1D):
             scale = C / (s1 ** 2 + s2 ** 2 + 2.0 * p * s1 * s2) ** .5
             return [scale * (s1 + p * s2), scale * (p * s1 + s2)]
         else:
-            return self.param.get('Quanto_FX_Correlation_1'), self.param.get('Quanto_FX_Correlation_2')
+            return [self.param.get('Quanto_FX_Correlation_1', 0.0),
+                    self.param.get('Quanto_FX_Correlation_2', 0.0)]
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attribute"""
@@ -698,7 +692,7 @@ class HullWhite2FactorModelParameters(Factor1D):
                 'Quanto_FX_Correlation_1': zero,
                 'Quanto_FX_Correlation_2': zero}
 
-    def current_value(self, tenors=None, offset=0.0, include_quanto=False):
+    def current_value(self, tenors=None, offset=0.0):
         """Returns the parameters of the HW2 factor model as a dictionary"""
 
         params = OrderedDict([('Alpha_1', np.array([self.param['Alpha_1']])),
@@ -707,14 +701,10 @@ class HullWhite2FactorModelParameters(Factor1D):
                               ('Sigma_1', self.param['Sigma_1'].array[:, 1]),
                               ('Sigma_2', self.param['Sigma_2'].array[:, 1])])
 
-        if self.get_instantaneous_correlation() is None and (
-                'Quanto_FX_Correlation_1' in self.param and 'Quanto_FX_Correlation_2' in self.param):
+        if self.get_instantaneous_correlation() is None:
             # needs to be looked up if there's not instantaneous correlation - otherwise it's calculated
-            params['Quanto_FX_Correlation_1'] = np.array([self.param['Quanto_FX_Correlation_1']])
-            params['Quanto_FX_Correlation_2'] = np.array([self.param['Quanto_FX_Correlation_2']])
-
-            if include_quanto:
-                params['Quanto_FX_Volatility'] = self.param['Quanto_FX_Volatility'].array[:, 1]
+            params['Quanto_FX_Correlation_1'] = np.array([self.param.get('Quanto_FX_Correlation_1')])
+            params['Quanto_FX_Correlation_2'] = np.array([self.param.get('Quanto_FX_Correlation_2')])
 
         return params
 
@@ -777,16 +767,6 @@ class InterestYieldVol(Factor3D):
     def __init__(self, param):
         super(InterestYieldVol, self).__init__(param)
         self.atm_surface = None
-        self.premiums = None
-
-    def set_premiums(self, df, currency):
-        if df is not None:
-            self.premiums = df[df['Currency'] == currency[0]]
-
-    def get_premium(self, expiry, tenor):
-        prem = self.premiums[(self.premiums['UnderlyingTenor'] == tenor) &
-                             (self.premiums['Expiry'] == expiry)]['Payer']
-        return prem.values[0] / 10000.0
 
     @property
     def BlackScholesDisplacedShiftValue(self):
@@ -884,15 +864,9 @@ class ForwardPriceVol(Factor3D):
         return self.sorted_vol[:, :3]
 
 
-def construct_factor(factor, price_factors, factor_interp):
-    # now lookup the params of the factor
-    price_factor = price_factors[utils.check_tuple_name(factor)]
-    # check the interpolation on interest Rates - can add more methods/price factors as desired
-    if factor.type == 'InterestRate':
-        interp_method = factor_interp.search(factor, price_factor, True)
-        price_factor['Interpolation'] = factor_interp_map.get(interp_method, 'Linear')
-
-    return globals().get(factor.type)(price_factor)
+def construct_factor(factor, price_factors):
+    # return the default factor 
+    return globals().get(factor.type)(price_factors[utils.check_tuple_name(factor)])
 
 
 if __name__ == '__main__':

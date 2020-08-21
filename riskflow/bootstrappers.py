@@ -25,24 +25,16 @@ from collections import OrderedDict, namedtuple
 # third party stuff
 import numpy as np
 import pandas as pd
-# import tensorflow as tf
+import torch
 
 # Internal modules
 from riskflow import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
 
 # misc functions/classes
-from riskflow.calculation import TimeGrid
-# from tensorflow.contrib.opt import ExternalOptimizerInterface
-
-# from tensorflow.python.framework import ops
-# from tensorflow.python.ops import array_ops
-# from tensorflow.python.platform import tf_logging as logging
+from riskflow.calculation import TimeGrid, Calculation_State
 
 from scipy.stats import norm
-# from tensorflow.python.client import device_lib
-
-curve_calibration_class = namedtuple('shared_mem', 't_Buffer \
-                        t_Scenario_Buffer precision simulation_batch')
+import scipy.optimize
 
 curve_jacobian_class = namedtuple('shared_mem', 't_Buffer t_Static_Buffer \
                                 precision riskneutral simulation_batch')
@@ -51,6 +43,43 @@ market_swap_class = namedtuple('market_swap', 'deal_data price weight')
 date_desc = {'years': 'Y', 'months': 'M', 'days': 'D'}
 # date formatter
 date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwds.items()])
+
+
+class RiskNeutralInterestRate_State(Calculation_State):
+    def __init__(self, batch_size, device, dtype, nomodel='Constant'):
+        super(RiskNeutralInterestRate_State, self).__init__(None, None, device, dtype, nomodel)
+        # these are tensors
+        self.t_PreCalc = {}
+        self.t_random_batch = None
+        self.batch_index = 0
+        self.t_Scenario_Buffer = [None]
+        # these are shared parameter states
+        self.simulation_batch = batch_size
+
+    @property
+    def t_random_numbers(self):
+        return self.t_random_batch[self.batch_index]
+
+    def reset(self, num_batches, numfactors, time_grid):
+        # clear the buffers
+        self.t_Buffer.clear()
+        self.t_PreCalc.clear()
+
+        if self.t_random_batch is None:
+            if time_grid.time_grid_years.size * numfactors < 1111:
+                self.sobol = torch.quasirandom.SobolEngine(
+                    dimension=time_grid.time_grid_years.size * numfactors, scramble=True, seed=1234)
+                sample = torch.distributions.Normal(0, 1).icdf(
+                    self.sobol.fast_forward(3000).draw(self.simulation_batch * num_batches)).reshape(
+                    num_batches, self.simulation_batch, -1)
+                self.t_random_batch = sample.transpose(1, 2).reshape(
+                    num_batches, numfactors, -1, self.simulation_batch).to(self.device)
+            else:
+                # this is old - fix TODO!
+                self.t_random_batch = normalize(norm.ppf(hdsobol.gen_sobol_vectors(
+                    self.simulation_batch * num_batches + 4000, time_grid.time_grid_years.size * numfactors))[
+                                                3999:]).reshape(
+                    self.batches, self.simulation_batch, -1)
 
 
 def create_float_cashflows(base_date, cashflow_obj, frequency):
@@ -154,7 +183,7 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
                 raise Exception('Float leg and Fixed legs do not coincide')
 
             # set the float leg fixed amount
-            float_cash.schedule[fixed_indices, utils.CASHFLOW_INDEX_FixedAmt] =\
+            float_cash.schedule[fixed_indices, utils.CASHFLOW_INDEX_FixedAmt] = \
                 -fixed_cash[:, utils.CASHFLOW_INDEX_FixedAmt]
         else:
             float_cash.set_fixed_amount(-K)
@@ -195,296 +224,10 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
     return all_deals, benchmarks
 
 
-def _get_shape_tuple(tensor):
-    return tuple(dim.value for dim in tensor.get_shape())
-
-
-def _prod(array):
-    prod = 1
-    for value in array:
-        prod *= value
-    return prod
-
-
-def _accumulate(list_):
-    total = 0
-    yield total
-    for x in list_:
-        total += x
-        yield total
-
-
-class ScipyLeastsqOptimizerInterface(object):
-    """Base class for interfaces with external optimization algorithms.
-
-    Subclass this and implement `_minimize` in order to wrap a new optimization
-    algorithm.
-
-    `ExternalOptimizerInterface` should not be instantiated directly; instead use
-    e.g. `ScipyOptimizerInterface`.
-
-    @@__init__
-
-    @@minimize
-    """
-
-    def __init__(self, loss, var_to_bounds, var_list, **optimizer_kwargs):
-
-        def fwd_gradients(ys, xs, d_xs):
-            """ Forward-mode pushforward analogous to the pullback defined by tf.gradients.
-                With tf.gradients, grad_ys is the vector being pulled back, and here d_xs is
-                the vector being pushed forward."""
-
-            v = self._dummy_ys_vec  # dummy variable
-            g = tf.concat([x for x in tf.gradients(ys, xs, grad_ys=v) if x is not None], axis=0)
-            return tf.gradients(g, v, grad_ys=d_xs)
-
-        self._loss = tf.stack(loss)
-        self._vars = var_list
-        packed_bounds = None
-        if var_to_bounds is not None:
-            left_packed_bounds = []
-            right_packed_bounds = []
-            for var in self._vars:
-                shape = var.get_shape().as_list()
-                bounds = (-np.infty, np.infty)
-                if var in var_to_bounds:
-                    bounds = var_to_bounds[var]
-                    left_packed_bounds.extend(list(np.broadcast_to(bounds[0], shape).flat))
-                    right_packed_bounds.extend(list(np.broadcast_to(bounds[1], shape).flat))
-            packed_bounds = list([left_packed_bounds, right_packed_bounds])
-        self._packed_bounds = packed_bounds
-
-        self._dummy_ys_vec = tf.placeholder_with_default(
-            np.ones(self._loss.get_shape()[0].value, dtype=np.float32), shape=self._loss.get_shape())
-        self._dummy_jac_vec = array_ops.placeholder(
-            self._vars[0].dtype, sum([_get_shape_tuple(x)[0] for x in self._vars]))
-
-        self._update_placeholders = [
-            array_ops.placeholder(var.dtype) for var in self._vars
-        ]
-        self._var_updates = [
-            var.assign(array_ops.reshape(placeholder, _get_shape_tuple(var)))
-            for var, placeholder in zip(self._vars, self._update_placeholders)
-        ]
-
-        time_now = time.clock()
-        logging.info('Calculating jacobian')
-        # loss_grads = [tf.gradients(resid, self._vars) for resid in loss]
-        self.jvp = fwd_gradients(self._loss, self._vars, self._dummy_jac_vec)
-        logging.info('Done Calculating jacobian')
-        # record the time
-        logging.info('This took {} seconds'.format(time.clock() - time_now))
-
-        self.optimizer_kwargs = optimizer_kwargs
-
-        self._packed_var = self._pack(self._vars)
-        self._packed_equality_grads = []
-        self._packed_inequality_grads = []
-        dims = [_prod(_get_shape_tuple(var)) for var in self._vars]
-        accumulated_dims = list(_accumulate(dims))
-        self._packing_slices = [
-            slice(start, end)
-            for start, end in zip(accumulated_dims[:-1], accumulated_dims[1:])
-        ]
-
-    def minimize(self, session=None, feed_dict=None, fetches=None,
-                 step_callback=None, loss_callback=None, **run_kwargs):
-        """Minimize a scalar `Tensor`.
-
-        Variables subject to optimization are updated in-place at the end of
-        optimization.
-
-        Note that this method does *not* just return a minimization `Op`, unlike
-        `Optimizer.minimize()`; instead it actually performs minimization by
-        executing commands to control a `Session`.
-
-        Args:
-          session: A `Session` instance.
-          feed_dict: A feed dict to be passed to calls to `session.run`.
-          fetches: A list of `Tensor`s to fetch and supply to `loss_callback`
-            as positional arguments.
-          step_callback: A function to be called at each optimization step;
-            arguments are the current values of all optimization variables
-            flattened into a single vector.
-          loss_callback: A function to be called every time the loss and gradients
-            are computed, with evaluated fetches supplied as positional arguments.
-          **run_kwargs: kwargs to pass to `session.run`.
-        """
-
-        session = session or ops.get_default_session()
-        feed_dict = feed_dict or {}
-        fetches = fetches or []
-
-        loss_callback = loss_callback or (lambda *fetches: None)
-        step_callback = step_callback or (lambda xk: None)
-
-        # Construct loss function and associated gradient.
-        loss_func = self._make_eval_func(self._loss, session,
-                                         feed_dict, fetches, loss_callback)
-        n = self._dummy_jac_vec.shape[0].value
-        grad_func = [self._make_eval_func(self.jvp, session,
-                                          {self._dummy_jac_vec: np.eye(n)[i]},
-                                          fetches, loss_callback)
-                     for i in range(n)]
-
-        # Get initial value from TF session.
-        initial_packed_var_val = session.run(self._packed_var)
-
-        # Perform minimization.
-        packed_var_val = self._minimize(
-            initial_val=initial_packed_var_val,
-            loss_func=loss_func, grad_func=grad_func,
-            packed_bounds=self._packed_bounds,
-            step_callback=step_callback,
-            optimizer_kwargs=self.optimizer_kwargs)
-        var_vals = [
-            packed_var_val[packing_slice] for packing_slice in self._packing_slices
-        ]
-
-        # Set optimization variables to their new values.
-        session.run(
-            self._var_updates,
-            feed_dict=dict(zip(self._update_placeholders, var_vals)),
-            **run_kwargs)
-
-    def _minimize(self, initial_val, loss_func, grad_func,
-                  packed_bounds, step_callback, optimizer_kwargs):
-
-        def loss_func_wrapper(x):
-            return loss_func(x)[0]
-
-        def grad_func_wrapper(x):
-            return np.array([grad(x)[0].astype('float64') for grad in grad_func]).T
-
-        import scipy.optimize
-        if packed_bounds is not None:
-            result = scipy.optimize.least_squares(loss_func_wrapper, initial_val,
-                                                  jac=grad_func_wrapper, bounds=packed_bounds)
-        else:
-            result = scipy.optimize.least_squares(loss_func_wrapper, initial_val,
-                                                  jac=grad_func_wrapper)
-
-        message_lines = [
-            'Optimization terminated with:',
-            '  Message: {}'.format(result.message),
-            '  Objective function value: {}'.format(result.fun),
-        ]
-
-        if hasattr(result, 'nit'):
-            # Some optimization methods might not provide information such as nit and
-            # nfev in the return. Logs only available information.
-            message_lines.append('  Number of iterations: {}'.format(result.nit))
-        if hasattr(result, 'nfev'):
-            message_lines.append('  Number of functions evaluations: {}'.format(result.nfev))
-        logging.debug('\n'.join(message_lines))
-
-        return result['x']
-
-    @classmethod
-    def _pack(cls, tensors):
-        """Pack a list of `Tensor`s into a single, flattened, rank-1 `Tensor`."""
-        if not tensors:
-            return None
-        elif len(tensors) == 1:
-            return array_ops.reshape(tensors[0], [-1])
-        else:
-            flattened = [array_ops.reshape(tensor, [-1]) for tensor in tensors]
-            return array_ops.concat(flattened, 0)
-
-    def _make_eval_func(self, tensors, session, feed_dict, fetches,
-                        callback=None):
-        """Construct a function that evaluates a `Tensor` or list of `Tensor`s."""
-        if not isinstance(tensors, list):
-            tensors = [tensors]
-        num_tensors = len(tensors)
-
-        def eval_func(x):
-            """Function to evaluate a `Tensor`."""
-            augmented_feed_dict = {
-                var: x[packing_slice].reshape(_get_shape_tuple(var))
-                for var, packing_slice in zip(self._vars, self._packing_slices)
-            }
-
-            augmented_feed_dict.update(feed_dict)
-            augmented_fetches = tensors + fetches
-
-            augmented_fetch_vals = session.run(augmented_fetches,
-                                               feed_dict=augmented_feed_dict)
-
-            if callable(callback):
-                callback(*augmented_fetch_vals[num_tensors:])
-
-            return augmented_fetch_vals[:num_tensors]
-
-        return eval_func
-
-    def _make_eval_funcs(self, tensors, session, feed_dict, fetches, callback=None):
-        return [self._make_eval_func(tensor, session, feed_dict, fetches, callback)
-                for tensor in tensors]
-
-
-#class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
-class ScipyBasinOptimizerInterface(object):
-    """Wrapper allowing `scipy.optimize.basinhopping` to operate a `tf.Session`.
-    Implemented exactly the same as ScipyOptimizerInterface
-    """
-
-    _DEFAULT_METHOD = 'L-BFGS-B'
-
-    def _minimize(self, initial_val, loss_grad_func, equality_funcs,
-                  equality_grad_funcs, inequality_funcs, inequality_grad_funcs,
-                  packed_bounds, step_callback, optimizer_kwargs):
-
-        def loss_grad_func_wrapper(x):
-            # SciPy's L-BFGS-B Fortran implementation requires gradients as doubles.
-            loss, gradient = loss_grad_func(x)
-            return loss, gradient.astype('float64')
-
-        def print_fun(x, f, accepted):
-            logging.debug("at minimum %.4f accepted %d" % (f, int(accepted)))
-            if f < 100.0:
-                return True
-
-        optimizer_kwargs = dict(optimizer_kwargs.items())
-        method = optimizer_kwargs.pop('method', self._DEFAULT_METHOD)
-        take_step = optimizer_kwargs.pop('take_step', None)
-        accept_test = optimizer_kwargs.pop('accept_test', None)
-
-        minimize_args = [loss_grad_func_wrapper, initial_val]
-        minimize_kwargs = {
-            'jac': True,
-            'callback': step_callback,
-            'method': method,
-            'constraints': [],
-            'bounds': packed_bounds,
-        }
-
-        import scipy.optimize
-        result = scipy.optimize.basinhopping(
-            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=100, T=25.0,
-            accept_test=accept_test, callback=print_fun, take_step=take_step)
-
-        message_lines = [
-            'Optimization terminated with:',
-            '  Message: {}'.format(result.message),
-            '  Objective function value: {}'.format(result.fun),
-        ]
-
-        if hasattr(result, 'nit'):
-            # Some optimization methods might not provide information such as nit and
-            # nfev in the return. Logs only available information.
-            message_lines.append('  Number of iterations: {}'.format(result.nit))
-        if hasattr(result, 'nfev'):
-            message_lines.append('  Number of functions evaluations: {}'.format(result.nfev))
-        logging.debug('\n'.join(message_lines))
-
-        return result['x']
-
-
 class InterestRateJacobian(object):
-    def __init__(self, param, prec=np.float32):
-        self.prec = prec
+    def __init__(self, param, device, dtype):
+        self.device = device
+        self.prec = dtype
         self.param = param
         self.batch_size = 1
 
@@ -568,7 +311,8 @@ class InterestRateJacobian(object):
                                 Instrument=None, Factor_dep={'Cashflows': float_cash, 'Forward': curve_index,
                                                              'Discount': curve_index, 'CompoundingMethod': 'None'},
                                 Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, [0]), Calc_res=None)
-                            benchmarks['Swap_' + date_fmt(child['quote']['Descriptor'])] = pricing.pv_float_cashflow_list(
+                            benchmarks[
+                                'Swap_' + date_fmt(child['quote']['Descriptor'])] = pricing.pv_float_cashflow_list(
                                 shared_mem, time_grid, deal_data, pricing.pricer_float_cashflows, settle_cash=False)
                         else:
                             raise Exception('quote type not supported')
@@ -617,8 +361,9 @@ class GBMTSImpliedParameters(object):
          ]
     )
 
-    def __init__(self, param, prec=np.float32):
-        self.prec = prec
+    def __init__(self, param, device, dtype):
+        self.device = device
+        self.prec = dtype
         self.param = param
 
     def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
@@ -632,7 +377,6 @@ class GBMTSImpliedParameters(object):
                 # get the vol surface
                 vol_factor = utils.Factor('FXVol', utils.check_rate_name(
                     implied_params['instrument']['Asset_Price_Volatility']))
-
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
                     fxvol = riskfactors.construct_factor(vol_factor, price_factors)
@@ -684,17 +428,57 @@ class GBMTSImpliedParameters(object):
 
 
 class RiskNeutralInterestRateModel(object):
-    def __init__(self, param, prec=np.float32):
+    def __init__(self, param, device, dtype):
         self.param = param
         self.num_batches = 1
         self.batch_size = 512 * 10
-        self.prec = prec
-        self.sample = None
+        self.device = device
+        self.prec = dtype
         # set the global precision - not ideal
-        utils.Default_Precision = prec
+        # utils.Default_Precision = prec
 
     def calc_loss_on_ir_curve(self, implied_params, base_date, time_grid, process,
-                              implied_obj, ir_factor, vol_surface, resid=lambda x:x*x, debug=None):
+                              implied_obj, ir_factor, vol_surface, resid=lambda x: x * x, debug=None):
+
+        def loss(implied_var):
+            # first, reset the shared_mem
+            shared_mem.reset(self.num_batches, numfactors, time_grid)
+            # now setup the calc
+            process.precalculate(base_date, time_grid, stoch_var, shared_mem, 0, implied_tensor=implied_var)
+            tensor_swaptions = {}
+            # needed to interpolate the zero curve
+            delta_scen_t = np.diff(time_grid.scen_time_grid).reshape(-1, 1)
+
+            for batch_index in range(self.num_batches):
+                # load up the batch
+                shared_mem.batch_index = batch_index
+                # simulate the price factor - only need the curve at the mtm time points
+                shared_mem.t_Scenario_Buffer[0] = process.generate(shared_mem)
+                # get the discount factors
+                Dfs = utils.calc_time_grid_curve_rate(
+                    curve_index, time_grid.calc_time_grid(time_grid.scen_time_grid[:-1]),
+                    shared_mem, delta_scen_t, multiply_by_time=True)
+                # get the index in the deflation factor just prior to the given grid
+                deflation = Dfs.reduce_deflate(time_grid.mtm_time_grid, shared_mem)
+                # go over the instrument definitions and build the calibration
+                for swaption_name, market_data in market_swaps.items():
+                    expiry = market_data.deal_data.Time_dep.mtm_time_grid[
+                        market_data.deal_data.Time_dep.deal_time_grid[0]]
+                    DtT = deflation[expiry]
+                    par_swap = pricing.pv_float_cashflow_list(
+                        shared_mem, time_grid, market_data.deal_data,
+                        pricing.pricer_float_cashflows, settle_cash=False)
+                    sum_swaption = torch.sum(torch.relu(DtT * par_swap))
+                    if swaption_name in tensor_swaptions:
+                        tensor_swaptions[swaption_name] += sum_swaption
+                    else:
+                        tensor_swaptions[swaption_name] = sum_swaption
+
+            calibrated_swaptions = {k: v / (self.batch_size * self.num_batches) for k, v in tensor_swaptions.items()}
+            errors = {k: swap.weight * resid(100.0 * (swap.price / calibrated_swaptions[k] - 1.0))
+                      for k, swap in market_swaps.items()}
+            return calibrated_swaptions, errors
+
         # calculate a reverse lookup for the tenors and store the daycount code
         all_tenors = utils.update_tenors(base_date, {ir_factor: process})
         # calculate the curve index - need to clean this up - TODO!!!
@@ -705,68 +489,18 @@ class RiskNeutralInterestRateModel(object):
             implied_params['instrument']['Instrument_Definitions'], ir_factor.name)
         # number of random factors to use
         numfactors = process.num_factors()
-        # random sample - use a sobol sequence skipping the first 4000 numbers
-        # need to check convergence and error - TODO
-        # also, this is in python - might want to use cffi to speed this up
-        sample = self.calc_sample(time_grid, numfactors)
-        tensor_swaptions = {}
         # setup a common context - we leave out the random numbers and pass it in explicitly below
-        shared_mem = curve_calibration_class(
-            t_Buffer={},
-            t_Scenario_Buffer=[None],
-            precision=self.prec,
-            simulation_batch=self.batch_size)
+        shared_mem = RiskNeutralInterestRate_State(self.batch_size, self.device, self.prec)
         # setup the variables
         implied_var = {}
-        # the curve is treated as constant here - no placeholders
-        stoch_var = tf.constant(process.factor.current_value(), dtype=self.prec)
-        with tf.name_scope("Implied_Input"):
-            for param_name, param_value in implied_obj.current_value().items():
-                factor_name = utils.Factor(
-                    implied_obj.__class__.__name__, ir_factor.name + (param_name,))
-                tf_variable = tf.get_variable(
-                    name=utils.check_scope_name(factor_name),
-                    initializer=param_value.astype(self.prec),
-                    dtype=self.prec)
-                implied_var[param_name] = tf_variable
+        # the curve is treated as constant here
+        stoch_var = torch.tensor(process.factor.current_value(), device=self.device, dtype=self.prec)
 
-        # now setup the calc
-        process.precalculate(base_date, time_grid, stoch_var, shared_mem, 0, implied_tensor=implied_var)
+        for param_name, param_value in implied_obj.current_value().items():
+            implied_var[param_name] = torch.tensor(
+                param_value, dtype=self.prec, device=self.device, requires_grad=True)
 
-        # needed to interpolate the zero curve
-        delta_scen_t = np.diff(time_grid.scen_time_grid).reshape(-1, 1).astype(self.prec)
-
-        for batch_index in range(self.num_batches):
-            # load up the batch
-            batch_sample = sample[batch_index].T.reshape(
-                numfactors, time_grid.time_grid_years.size, -1).astype(self.prec)
-            # simulate the price factor - only need the curve at the mtm time points
-            shared_mem.t_Scenario_Buffer[0] = process.generate(shared_mem, batch_sample)
-            # get the discount factors
-            Dfs = utils.calc_time_grid_curve_rate(
-                curve_index, time_grid.calc_time_grid(time_grid.scen_time_grid[:-1]),
-                shared_mem, delta_scen_t, multiply_by_time=True)
-            # get the index in the deflation factor just prior to the given grid
-            deflation = Dfs.reduce_deflate(time_grid.mtm_time_grid, shared_mem)
-            # go over the instrument definitions and build the calibration
-            for swaption_name, market_data in market_swaps.items():
-                expiry = market_data.deal_data.Time_dep.mtm_time_grid[
-                    market_data.deal_data.Time_dep.deal_time_grid[0]]
-                DtT = deflation[expiry]
-                par_swap = pricing.pv_float_cashflow_list(
-                    shared_mem, time_grid, market_data.deal_data,
-                    pricing.pricer_float_cashflows, settle_cash=False)
-                sum_swaption = tf.reduce_sum(tf.nn.relu(DtT * par_swap))
-                if swaption_name in tensor_swaptions:
-                    tensor_swaptions[swaption_name] += sum_swaption
-                else:
-                    tensor_swaptions[swaption_name] = sum_swaption
-
-        calibrated_swaptions = {k: v / (self.batch_size * self.num_batches) for k, v in tensor_swaptions.items()}
-        error = {k: swap.weight * resid(100.0 * (
-                swap.price / calibrated_swaptions[k] - 1.0)) for k, swap in market_swaps.items()}
-
-        return implied_var, error, calibrated_swaptions, market_swaps, benchmarks
+        return implied_var, loss, market_swaps, benchmarks
 
     def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
         base_date = sys_params['Base_Date']
@@ -804,14 +538,11 @@ class RiskNeutralInterestRateModel(object):
                 time_grid = TimeGrid(mtm_dates, mtm_dates, mtm_dates)
                 # add a delta of 10 days to the time_grid_years (without changing the scenario grid
                 # this is needed for stochastically deflating the exposure later on
-                time_grid.set_base_date(base_date, delta=(10, vol_tenors*utils.DAYS_IN_YEAR))
+                time_grid.set_base_date(base_date, delta=(10, vol_tenors * utils.DAYS_IN_YEAR))
 
-                # setup the tensorflow calc
-                graph = tf.Graph()
-                with graph.as_default():
-                    # calculate the error
-                    loss, optimizers, implied_var, calibrated_swaptions, market_swaptions, benchmarks = self.calc_loss(
-                        implied_params, base_date, time_grid, process, implied_obj, ir_factor, swaptionvol)
+                # calculate the error
+                loss_fn, optimizers, implied_var, market_swaptions, benchmarks = self.calc_loss(
+                    implied_params, base_date, time_grid, process, implied_obj, ir_factor, swaptionvol)
 
                 if debug is not None:
                     debug.deals['Deals']['Children'] = [{'instrument': x} for x in benchmarks]
@@ -820,53 +551,64 @@ class RiskNeutralInterestRateModel(object):
                     except Exception:
                         logging.error('Could not write output file {}'.format(market_factor.name[0] + '.aap'))
 
-                config = tf.ConfigProto(allow_soft_placement=True)
+                # check the time
+                time_now = time.clock()
+                calibrated_swaptions, errors = loss_fn(implied_var)
+                batch_loss = torch.stack(list(errors.values())).sum().cpu().detach().numpy()
+                vars = {k: v.cpu().detach().numpy() for k, v in implied_var.items()}
+                # initialize the soln with the current values
+                soln = (batch_loss, vars)
+                logging.info('{} - Batch loss {}'.format(market_factor.name[0], batch_loss))
+                for k, v in sorted(vars.items()):
+                    logging.info('{} - {}'.format(k, v))
 
-                with tf.Session(graph=graph, config=config) as sess:
-                    # init the variables
-                    sess.run(tf.global_variables_initializer())
-                    # check the time
-                    time_now = time.clock()
-                    batch_loss, vars = sess.run([loss, implied_var])
-                    # initialize the soln with the current values
-                    soln = (batch_loss, vars)
-                    logging.info('{} - Batch loss {}'.format(market_factor.name[0], batch_loss))
-                    for k, v in sorted(vars.items()):
-                        logging.info('{} - {}'.format(k, v))
+                for k, v in sorted(calibrated_swaptions.items()):
+                    value = v.cpu().detach().numpy()
+                    price = market_swaptions[k].price
+                    logging.debug('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
+                        k, price, value, 100.0 * (price - value) / price))
 
-                    sim_swaptions = sess.run(calibrated_swaptions)
-                    for k, v in sorted(sim_swaptions.items()):
-                        price = market_swaptions[k].price
-                        logging.debug('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
-                            k, price, v, 100.0 * (price - sim_swaptions[k]) / price))
+                # minimize
+                num_optimizers = len(optimizers)
+                for op_loop in range(2 * num_optimizers):
+                    optim = optimizers[op_loop % num_optimizers]
+                    if optim[0] == 'basin':
+                        result = scipy.optimize.basinhopping(
+                            optim[2], x0=optim[1], take_step=optim[3], accept_test=optim[4], T=5.0,
+                            minimizer_kwargs={"method": "L-BFGS-B", "jac": True, "bounds": optim[5]})
+                    elif optim[0] == 'leastsq':
+                        result = scipy.optimize.least_squares(
+                            optim[2], x0=optim[1], jac=optim[3], bounds=optim[4])
+                        if process.params_ok:
+                            price_param = utils.Factor('Jacobian'+implied_obj.__class__.__name__, market_factor.name)
+                            # store the jacobian
+                            price_factors[utils.check_tuple_name(price_param)] = utils.Curve([], result.jac)
 
-                    # minimize
-                    num_optimizers = len(optimizers)
-                    for op_loop in range(2 * num_optimizers):
-                        optimizers[op_loop % num_optimizers].minimize(sess)
-                        batch_loss, vars = sess.run([loss, implied_var])
+                    sim_swaptions, errors = loss_fn(implied_var)
+                    batch_loss = torch.stack(list(errors.values())).sum().cpu().detach().numpy()
+                    vars = {k: v.cpu().detach().numpy() for k, v in implied_var.items()}
 
-                        if batch_loss < soln[0]:
-                            soln = (batch_loss, vars)
-                            logging.info('{} - run {} - Batch loss {}'.format(
-                                market_factor.name[0], op_loop, batch_loss))
-                            for k, v in sorted(vars.items()):
-                                logging.info('{} - {}'.format(k, v))
-                            sim_swaptions = sess.run(calibrated_swaptions)
-                            for k, v in sorted(sim_swaptions.items()):
-                                price = market_swaptions[k].price
-                                logging.info('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
-                                    k, price, v, 100.0 * (price - sim_swaptions[k]) / price))
+                    if batch_loss < soln[0]:
+                        soln = (batch_loss, vars)
+                        logging.info('{} - run {} - Batch loss {}'.format(
+                            market_factor.name[0], op_loop, batch_loss))
+                        for k, v in sorted(vars.items()):
+                            logging.info('{} - {}'.format(k, v))
+                        for k, v in sorted(sim_swaptions.items()):
+                            value = v.cpu().detach().numpy()
+                            price = market_swaptions[k].price
+                            logging.info('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
+                                k, price, value, 100.0 * (price - value) / price))
 
-                    # save this
-                    self.save_params(soln[1], price_factors, implied_obj, rate)
-                    # record the time
-                    logging.info('This took {} seconds.'.format(time.clock() - time_now))
+                # save this
+                self.save_params(soln[1], price_factors, implied_obj, rate)
+                # record the time
+                logging.info('This took {} seconds.'.format(time.clock() - time_now))
 
 
 class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
-    def __init__(self, param, prec=np.float32):
-        super(PCAMixedFactorModelParameters, self).__init__(param)
+    def __init__(self, param, device, dtype):
+        super(PCAMixedFactorModelParameters, self).__init__(param, device, dtype)
         self.market_factor_type = 'HullWhite2FactorInterestRateModelPrices'
 
     def calc_sample(self, time_grid, numfactors=0):
@@ -882,7 +624,7 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
             implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface)
 
         losses = list(error.values())
-        loss = tf.reduce_sum(losses)
+        loss = torch.sum(losses)
 
         loss_with_penatalties = loss + tf.nn.moments(
             implied_var['Yield_Volatility'][1:] - implied_var['Yield_Volatility'][:-1], axes=[0])[1]
@@ -890,8 +632,8 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
         var_to_bounds = {implied_var['Yield_Volatility']: (1e-3, 0.6),
                          implied_var['Reversion_Speed']: (1e-2, 1.8)}
 
-        # optimizer = ScipyLeastsqOptimizerInterface(losses, var_to_bounds={} if var_to_bounds is None else var_to_bounds )
-        optimizer = ScipyBasinOptimizerInterface(loss, var_to_bounds=var_to_bounds)
+        # optimizer = ScipyBasinOptimizerInterface(loss, var_to_bounds=var_to_bounds)
+        optimizer = None
 
         return loss, optimizer, implied_var, calibrated_swaptions, market_swaptions, benchmarks
 
@@ -987,35 +729,19 @@ scipy.optimize.leastsq.html) are used.',
          ]
     )
 
-    def __init__(self, param, prec=np.float32):
-        super(HullWhite2FactorModelParameters, self).__init__(param)
+    def __init__(self, param, device, dtype):
+        super(HullWhite2FactorModelParameters, self).__init__(param, device, dtype)
         self.market_factor_type = 'HullWhite2FactorInterestRateModelPrices'
         self.sigma_bounds = (1e-5, 0.09)
         self.alpha_bounds = (1e-5, 2.4)
         self.corr_bounds = (-.95, 0.95)
 
-    def calc_sample(self, time_grid, numfactors=0):
-        if numfactors != 2 or self.sample is None:
-            self.sample = normalize(norm.ppf(hdsobol.gen_sobol_vectors(
-                self.batch_size * self.num_batches + 4000, time_grid.time_grid_years.size * numfactors))[
-                                    3999:]).reshape(
-                self.num_batches, self.batch_size, -1)
-        return self.sample
-
     def calc_loss(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):
 
-        def make_bounds(implied_var, sigma_bounds, corr_bounds, alpha_bounds):
-            return {
-                implied_var['Sigma_1']: sigma_bounds,
-                implied_var['Sigma_2']: sigma_bounds,
-                implied_var['Correlation']: corr_bounds,
-                implied_var['Alpha_1']: alpha_bounds,
-                implied_var['Alpha_2']: alpha_bounds}
-
         def split_param(x):
-            corr = x[-1:]
-            alpha = x[-3:-1]
-            sigmas = x[:-3]
+            corr = x[2:3]
+            alpha = x[:2]
+            sigmas = x[3:]
             return sigmas, alpha, corr
 
         def make_basin_callbacks(step, sigma_min_max, alpha_min_max, corr_min_max):
@@ -1025,7 +751,7 @@ scipy.optimize.leastsq.html) are used.',
                 sigma_ok = (sigmas > sigma_min_max[0]).all() and (sigmas < sigma_min_max[1]).all()
                 alpha_ok = (alpha > alpha_min_max[0]).all() and (alpha < alpha_min_max[1]).all()
                 corre_ok = (corr > corr_min_max[0]).all() and (corr < corr_min_max[1]).all()
-                return sigma_ok and alpha_ok and corre_ok
+                return sigma_ok and alpha_ok and corre_ok and process.params_ok
 
             def basin_step(x):
                 sigmas, alpha, corr = split_param(x)
@@ -1034,38 +760,83 @@ scipy.optimize.leastsq.html) are used.',
                 alpha = (alpha * np.exp(np.random.uniform(-step, step, alpha.size))).clip(*alpha_min_max)
                 corr = (corr + np.random.uniform(-step, step, corr.size)).clip(*corr_min_max)
 
-                return np.concatenate((sigmas, alpha, corr))
+                return np.concatenate((alpha, corr, sigmas))
 
             return bounds_check, basin_step
 
+        def make_basin_hopping_loss(loss_fn, implied_vars, device, with_grad=False):
+            # makes it possible to call the scipy basinhopper
+            def basin_hopper(x):
+                for tn_var, np_var in zip(implied_vars.values(), np.split(x, split_param)):
+                    tn_var.grad = None
+                    tn_var.data = torch.from_numpy(np_var).to(device)
+
+                try:
+                    _, error = loss_fn(implied_vars)
+                except Exception as e:
+                    print("Warning x ({}) - {}".format(x, e.args))
+                    return 100.0 * sum(len_vars), [100.0 * sum(len_vars)] * sum(len_vars)
+                else:
+                    total_loss = torch.sum(torch.stack(list(error.values())))
+                    if with_grad:
+                        total_loss.backward()
+                        grad = torch.cat([x.grad for x in implied_vars.values()]).cpu().detach().numpy()
+                        return total_loss.cpu().detach().numpy(), grad
+                    else:
+                        return total_loss.cpu().detach().numpy()
+
+            len_vars = [len(x) for x in implied_vars.values()]
+            split_param = np.cumsum(len_vars[:-1])
+            return basin_hopper
+
+        def make_least_squares_loss(loss_fn, implied_vars, device):
+            # makes it possible to call the scipy least squares algo
+            def calc_loss(x):
+                for tn_var, np_var in zip(implied_vars.values(), np.split(x, split_param)):
+                    tn_var.grad = None
+                    tn_var.data = torch.from_numpy(np_var).to(device)
+                _, error = loss_fn(implied_vars)
+                return torch.stack(list(error.values()))
+
+            def jacobian(x):
+                loss = calc_loss(x)
+                # full jacobian - takes a second or so
+                jac = torch.stack([torch.cat(torch.autograd.grad(
+                    loss, list(implied_vars.values()), x, retain_graph=True))
+                    for x in torch.eye(len(loss), device=device)])
+                return jac.cpu().numpy()
+
+            def least_squares(x):
+                return calc_loss(x).cpu().detach().numpy()
+
+            len_vars = [len(x) for x in implied_vars.values()]
+            split_param = np.cumsum(len_vars[:-1])
+            return least_squares, jacobian
+
         # get the swaption error and market values
-        implied_var_dict, error_dict, calibrated_swaptions, market_swaptions, benchmarks = self.calc_loss_on_ir_curve(
+        implied_var_dict, loss_fn, market_swaptions, benchmarks = self.calc_loss_on_ir_curve(
             implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface)
 
-        error = OrderedDict(error_dict)
-        var_list = [implied_var_dict['Sigma_1'], implied_var_dict['Sigma_2'],
-                    implied_var_dict['Alpha_1'], implied_var_dict['Alpha_2'],
-                    implied_var_dict['Correlation']]
+        bounds = []
+        for k, v in implied_var_dict.items():
+            if k.startswith('Alpha'):
+                bounds.append([self.alpha_bounds])
+            elif k == 'Correlation':
+                bounds.append([self.corr_bounds])
+            else:
+                bounds.append([self.sigma_bounds] * len(v))
 
-        implied_var = OrderedDict(implied_var_dict)
-        losses = list(error.values())
-        loss = tf.reduce_sum(losses)
-
-        var_to_bounds = make_bounds(implied_var, self.sigma_bounds, self.corr_bounds, self.alpha_bounds)
+        var_to_bounds = np.vstack(bounds)
         bounds_ok, make_step = make_basin_callbacks(0.125, self.sigma_bounds, self.alpha_bounds, self.corr_bounds)
 
-        optimizers = [
-            ScipyBasinOptimizerInterface(
-                loss, var_list=var_list,
-                take_step=make_step,
-                accept_test=bounds_ok,
-                var_to_bounds=var_to_bounds)
-            , ScipyLeastsqOptimizerInterface(
-                losses, var_list=var_list,
-                var_to_bounds=var_to_bounds)
-        ]
+        basin_hopper_fn_grad = make_basin_hopping_loss(loss_fn, implied_var_dict, self.device, True)
+        x0 = torch.cat(list(implied_var_dict.values())).cpu().detach().numpy()
+        lsq_fn, jacobian = make_least_squares_loss(loss_fn, implied_var_dict, self.device)
 
-        return loss, optimizers, implied_var, calibrated_swaptions, market_swaptions, benchmarks
+        optimizers = [('basin', x0, basin_hopper_fn_grad, make_step, bounds_ok, var_to_bounds),
+                      ('leastsq', x0, lsq_fn, jacobian, list(zip(*var_to_bounds)))]
+
+        return loss_fn, optimizers, implied_var_dict, market_swaptions, benchmarks
 
     def implied_process(self, base_currency, price_factors, price_models, ir_curve, rate):
         vol_tenors = np.array([0, 1, 3, 6, 12, 24, 48, 72, 96, 120]) / 12.0
@@ -1142,5 +913,5 @@ scipy.optimize.leastsq.html) are used.',
         price_factors[param_name] = param
 
 
-def construct_bootstrapper(btype, param):
-    return globals().get(btype)(param)
+def construct_bootstrapper(btype, param, device, dtype=torch.float32):
+    return globals().get(btype)(param, device, dtype)

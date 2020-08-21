@@ -19,7 +19,6 @@
 
 # import standard libraries
 
-import os
 import time
 import logging
 import itertools
@@ -347,12 +346,11 @@ class Calculation(object):
                 tenor.append(grad_index[non_zero])
                 # store the actual factor value if required
                 if display_val:
-                    rate_name = name.split('/')[-1]
-                    if rate_name in factor_values:
+                    if name in factor_values:
                         rate_non_zero = grad_index[non_zero][:, :index_len].astype(np.float64)
-                        factor.append(factor_values[rate_name].current_value(rate_non_zero).flatten())
+                        factor.append(factor_values[name].current_value(rate_non_zero).flatten())
                     else:
-                        sub_rate, param = rate_name.rsplit('.', 1)
+                        sub_rate, param = name.rsplit('.', 1)
                         sub_rate_non_zero = grad_index[non_zero].shape[0]
                         factor.append(factor_values[sub_rate].current_value()[param].flatten()[:sub_rate_non_zero])
 
@@ -698,15 +696,17 @@ class Credit_Monte_Carlo(Calculation):
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 implied_index = self.implied_ofs.get(key, -1)
-                implied_tensor = {k.name[-1]: v for k, v in self.implied_var[implied_index].items()} \
-                    if implied_index > -1 else None
-
+                if implied_index > -1:
+                    implied_tensor = {k.name[-1]: v for k, v in self.implied_var[implied_index].items()}
+                    value.link_references(implied_tensor, self.implied_var, self.implied_ofs)
+                else:
+                    implied_tensor = None
                 value.precalculate(
-                    base_date, ScenarioTimeGrid(
-                        dependent_factors[key], self.time_grid, base_date),
-                    self.stoch_var[self.stoch_ofs[key]][1],
-                    shared_mem, self.process_ofs[key],
+                    base_date, ScenarioTimeGrid(dependent_factors[key], self.time_grid, base_date),
+                    self.stoch_var[self.stoch_ofs[key]][1], shared_mem, self.process_ofs[key],
                     implied_tensor=implied_tensor)
+                if not value.params_ok:
+                    logging.warning('Stochastic factor {} has been modified'.format(utils.check_scope_name(key)))
 
         # now check if any of the stochastic processes depend on other processes
         for key, value in self.stoch_factors.items():
@@ -841,7 +841,7 @@ class Credit_Monte_Carlo(Calculation):
                 grad = {}
                 for k, v in data.items():
                     grad[k] = v.astype(np.float64) / self.params['Simulation_Batches']
-                self.output.setdefault(result, grad)
+                self.output.setdefault(result, self.gradients_as_df(grad, display_val=True))
             elif result in ['grad_cva_hessian']:
                 self.output.setdefault(result, data.astype(np.float64) / self.params['Simulation_Batches'])
             else:
@@ -890,6 +890,7 @@ class Credit_Monte_Carlo(Calculation):
         self.calc_stats['Tensor_Execution_Time'] = time.clock()
 
         for run in range(self.params['Simulation_Batches']):
+            start_run = time.clock()
             # need to refresh random numbers and zero out buffers
             shared_mem.reset(self.num_factors, self.time_grid)
 
@@ -905,15 +906,19 @@ class Credit_Monte_Carlo(Calculation):
 
             # now calculate all the valuation adjustments (if necessary)
             if 'CollVA' in params and 'Funding' in shared_mem.t_Credit:
-                with tf.name_scope('CollVA'):
-                    tensors['collva_t'] = tf.reduce_mean(shared_mem.t_Credit['Funding'], axis=1)
-                    tensors['collateral'] = shared_mem.t_Credit['Collateral']
-                    tensors['collva'] = torch.sum(tensors['collva_t'])
 
-                    if params['CollVA'].get('Gradient', 'No') == 'Yes':
-                        # calculate all the derivatives of collva
-                        tensors['grad_collva'] = SensitivitiesEstimator(
-                            tensors['collva'], self.all_var).report_grad()
+                tensors['collva_t'] = torch.mean(shared_mem.t_Credit['Funding'], axis=1)
+                tensors['collateral'] = shared_mem.t_Credit['Collateral']
+                tensors['collva'] = torch.sum(tensors['collva_t'])
+
+                if params['CollVA'].get('Gradient', 'No') == 'Yes':
+                    # calculate all the derivatives of fva
+                    sensitivity = SensitivitiesEstimator(tensors['collva'], self.all_var)
+
+                    if final_run:
+                        output['grad_collva'] = sensitivity.report_grad()
+                        # store the size of the Gradient
+                        self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
             if 'FVA' in params:
                 time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
@@ -965,8 +970,13 @@ class Credit_Monte_Carlo(Calculation):
 
                 if params['FVA'].get('Gradient', 'No') == 'Yes':
                     # calculate all the derivatives of fva
-                    tensors['grad_fva'] = SensitivitiesEstimator(
-                        tensors['fva'], self.all_var).report_grad()
+                    sensitivity = SensitivitiesEstimator(tensors['fva'], self.all_var)
+
+                    if final_run:
+                        output['grad_fva'] = sensitivity.report_grad()
+                        # store the size of the Gradient
+                        self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
+
 
             if 'CVA' in params:
                 discount = get_interest_factor(utils.check_rate_name(params['Deflation_Interest_Rate']),
@@ -1039,6 +1049,8 @@ class Credit_Monte_Carlo(Calculation):
                         if hessian:
                             # calculate the hessian matrix - warning - make sure you have enough memory
                             output['grad_cva_hessian'] = sensitivity.report_hessian()
+
+            print('Run {} in {:.3f} s'.format(run, time.clock()-start_run))
 
             # store all output tensors
             for k, v in tensors.items():

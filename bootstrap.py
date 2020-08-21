@@ -39,10 +39,12 @@ def work(job_id, queue, result, price_factors,
                         datefmt='%m-%d %H:%M',
                         filename='bootstrap_{}.log'.format(job_id),
                         filemode='w')
-
-    from .bootstrappers import construct_bootstrapper
+    import torch
+    from riskflow.bootstrappers import construct_bootstrapper
 
     bootstrappers = {}
+    # set the gpu
+    gpudevice = torch.device("cuda:0")
 
     # perform the bootstrapping
     while True:
@@ -55,7 +57,7 @@ def work(job_id, queue, result, price_factors,
         try:
             name = list(job_price.keys())[0]
             if bootstrapper_name not in bootstrappers:
-                bootstrappers[bootstrapper_name] = construct_bootstrapper(bootstrapper_name, params)
+                bootstrappers[bootstrapper_name] = construct_bootstrapper(bootstrapper_name, params, device=gpudevice)
             bootstrapper = bootstrappers[bootstrapper_name]
             bootstrapper.bootstrap(sys_params, price_models, price_factors, job_price, holidays)
 
@@ -76,7 +78,7 @@ class Parent(object):
         self.ref = None
         self.daily = False
 
-    def start(self, rundate, input_path, calendar, outfile='CVAMarketDataCal', premium_file=None):
+    def start(self, rundate, input_path, calendar, outfile='CVAMarketDataCal'):
         # disable gpus
         os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
         # set the log level for the parent
@@ -86,7 +88,7 @@ class Parent(object):
                             format='%(asctime)s %(levelname)-8s %(message)s',
                             datefmt='%m-%d %H:%M')
 
-        from .adaptiv import AdaptivContext
+        from adaptiv import AdaptivContext
 
         # create the context
         self.cx = AdaptivContext()
@@ -123,18 +125,6 @@ class Parent(object):
         if self.cx.params['System Parameters']['Base_Date'] is None:
             logging.info('Setting  rundate {}'.format(rundate))
             self.cx.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
-
-        if premium_file is not None:
-            while True:
-                logging.info('Watching for premium file in {}'.format(premium_file))
-                prem = glob.glob(os.path.join(premium_file, 'IR_Volatility_Swaption_{}*.csv'.format(rundate)))
-                if prem:
-                    break
-                else:
-                    os.sleep(5*60)
-
-            logging.info('Setting swaption premiums from {}'.format(prem[0]))
-            self.cx.params['System Parameters']['Swaption_Premiums'] = prem[0]
 
         # load the params
         price_factors = self.manager.dict(self.cx.params['Price Factors'])
@@ -186,11 +176,11 @@ class Parent(object):
         if self.daily:
             # write out the calibrated data
             self.cx.write_marketdata_json(os.path.join(self.path, self.outfile + '.json'))
-            self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
+            # self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
             logfilename = os.path.join(self.path, self.outfile + '.log')
         else:
             self.cx.write_marketdata_json(os.path.join(self.path, rundate, 'MarketDataCal.json'))
-            self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
+            # self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
             logfilename = os.path.join(self.path, rundate, 'MarketDataCal.log')
 
         # copy the logs across
@@ -205,7 +195,7 @@ def main():
 
     parser = argparse.ArgumentParser(description='Bootstrap xVA risk neutral Calibration.')
     parser.add_argument('num_jobs', type=int, help='number of processes to run in parallel')
-    parser.add_argument('task', type=str, help='the task name', choices=['Historical', 'Daily', 'CopyHW'])
+    parser.add_argument('task', type=str, help='the task name', choices=['Historical', 'Daily'])
 
     hist = parser.add_argument_group('Historical', 'options for bootstrapping past data')
     hist.add_argument('-i', '--input_path', type=str, help='root directory containing rundates with marketdata')
@@ -214,10 +204,8 @@ def main():
 
     market = parser.add_argument_group('Daily', 'options for calibration of a single marketdata file')
     market.add_argument('-m', '--market_file', type=str, help='marketdata.json filename and path')
-    market.add_argument('-p', '--premium_file', type=str, help='swaption premium csv filename and path', default=None)
     market.add_argument('-o', '--output_file', type=str, help='output adaptiv filename (uses the path of the '
                                                               'market_file) - do not include the extention .dat')
-    parser.add_argument_group('CopyHW', 'options for copying the HW2 factor model to non RF curves')
 
     # get the arguments
     args = parser.parse_args()
@@ -228,43 +216,8 @@ def main():
             Parent(args.num_jobs).start(rundate, args.input_path, os.path.join(args.input_path, 'calendars.cal'))
     elif args.task == 'Daily':
         calendar = os.path.join(
-            os.path.split(args.market_file)[0], 'calendars.cal')
-        Parent(args.num_jobs).start(
-            None, args.market_file, calendar, outfile=args.output_file, premium_file=args.premium_file)
-    elif args.task == 'CopyHW':
-        import numpy as np
-        from . import utils
-        from .riskfactors import construct_factor
-        from .adaptiv import AdaptivContext
-        from .bootstrappers import master_curve_list
-        # load the context
-        context = AdaptivContext()
-        context.parse_json(args.market_file)
-        # get the hw2factor params
-        hw2params = {c: context.params['Price Factors']['HullWhite2FactorModelParameters.{}'.format(x)]
-                     for c, x in master_curve_list.items()}
-        # get all ir_base curve names
-        ir_curves = {curve_name: construct_factor(
-            utils.Factor('InterestRate', (curve_name,)),
-            context.params['Price Factors'], context.params['Price Factor Interpolation']) for curve_name in np.unique(
-            [x.split('.')[1] for x in context.params['Price Factors'].keys() if x.startswith('InterestRate.')])}
-
-        for ir_curve_name, ir_curve in ir_curves.items():
-            ccy = ir_curve.get_currency()[0]
-            if ccy in master_curve_list:
-                context.params['Price Factors'][
-                    'HullWhite2FactorModelParameters.{}'.format(ir_curve_name)] = hw2params[ccy]
-        # write out the data
-        context.write_marketdata_json(args.market_file)
-        # remove any jacobians before we write out the .dat
-        jacobians = [i for i in context.params['Price Factors'].keys() if
-                     i.startswith('HullWhite2FactorModelParametersJacobian')]
-        for i in jacobians:
-            del context.params['Price Factors'][i]
-        # remove the Swaption_Premiums param if it exists
-        if 'Swaption_Premiums' in context.params['System Parameters']:
-            del context.params['System Parameters']['Swaption_Premiums']
-        context.write_market_file(args.market_file.replace('.json', '.dat'))
+            os.path.split(args.market_file)[0], 'Calendars.cal')
+        Parent(args.num_jobs).start(None, args.market_file, calendar, outfile=args.output_file)
     else:
         logging.error('Invalid Job - aborting')
 
