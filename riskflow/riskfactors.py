@@ -669,8 +669,7 @@ class HullWhite2FactorModelParameters(Factor1D):
             scale = C / (s1 ** 2 + s2 ** 2 + 2.0 * p * s1 * s2) ** .5
             return [scale * (s1 + p * s2), scale * (p * s1 + s2)]
         else:
-            return [self.param.get('Quanto_FX_Correlation_1', 0.0),
-                    self.param.get('Quanto_FX_Correlation_2', 0.0)]
+            return self.param.get('Quanto_FX_Correlation_1'), self.param.get('Quanto_FX_Correlation_2')
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attribute"""
@@ -692,7 +691,7 @@ class HullWhite2FactorModelParameters(Factor1D):
                 'Quanto_FX_Correlation_1': zero,
                 'Quanto_FX_Correlation_2': zero}
 
-    def current_value(self, tenors=None, offset=0.0):
+    def current_value(self, tenors=None, offset=0.0, include_quanto=False):
         """Returns the parameters of the HW2 factor model as a dictionary"""
 
         params = OrderedDict([('Alpha_1', np.array([self.param['Alpha_1']])),
@@ -701,10 +700,14 @@ class HullWhite2FactorModelParameters(Factor1D):
                               ('Sigma_1', self.param['Sigma_1'].array[:, 1]),
                               ('Sigma_2', self.param['Sigma_2'].array[:, 1])])
 
-        if self.get_instantaneous_correlation() is None:
+        if self.get_instantaneous_correlation() is None and (
+                'Quanto_FX_Correlation_1' in self.param and 'Quanto_FX_Correlation_2' in self.param):
             # needs to be looked up if there's not instantaneous correlation - otherwise it's calculated
-            params['Quanto_FX_Correlation_1'] = np.array([self.param.get('Quanto_FX_Correlation_1')])
-            params['Quanto_FX_Correlation_2'] = np.array([self.param.get('Quanto_FX_Correlation_2')])
+            params['Quanto_FX_Correlation_1'] = np.array([self.param['Quanto_FX_Correlation_1']])
+            params['Quanto_FX_Correlation_2'] = np.array([self.param['Quanto_FX_Correlation_2']])
+
+            if include_quanto:
+                params['Quanto_FX_Volatility'] = self.param['Quanto_FX_Volatility'].array[:, 1]
 
         return params
 

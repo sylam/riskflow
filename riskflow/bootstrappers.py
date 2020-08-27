@@ -30,9 +30,6 @@ import torch
 # Internal modules
 from riskflow import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
 
-# misc functions/classes
-from riskflow.calculation import TimeGrid, Calculation_State
-
 from scipy.stats import norm
 import scipy.optimize
 
@@ -45,7 +42,7 @@ date_desc = {'years': 'Y', 'months': 'M', 'days': 'D'}
 date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwds.items()])
 
 
-class RiskNeutralInterestRate_State(Calculation_State):
+class RiskNeutralInterestRate_State(utils.Calculation_State):
     def __init__(self, batch_size, device, dtype, nomodel='Constant'):
         super(RiskNeutralInterestRate_State, self).__init__(None, None, device, dtype, nomodel)
         # these are tensors
@@ -152,8 +149,8 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
         tenor = (maturity - effective).days / utils.DAYS_IN_YEAR
         expiry = exp_days / utils.DAYS_IN_YEAR
         time_index = np.searchsorted(time_grid.mtm_time_grid, [exp_days], side='right') - 1
-        swaption_name = 'Swap_{0:05.2f}_{1:02.0f}_{2}_{3}'.format(
-            expiry, tenor, date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
+        swaption_name = 'Swaption_{}_{}'.format(
+            date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
 
         float_pay_dates = instruments.generate_dates_backward(
             maturity, effective, instrument['Floating_Frequency'])
@@ -244,7 +241,7 @@ class InterestRateJacobian(object):
 
         base_date = sys_params['Base_Date']
         # do all of this at time 0        
-        time_grid = TimeGrid({base_date}, {base_date}, {base_date})
+        time_grid = utils.TimeGrid({base_date}, {base_date}, {base_date})
         time_grid.set_base_date(base_date)
         # now prepare for inverse bootstrap
         for market_price, implied_params in market_prices.items():
@@ -438,7 +435,7 @@ class RiskNeutralInterestRateModel(object):
         # utils.Default_Precision = prec
 
     def calc_loss_on_ir_curve(self, implied_params, base_date, time_grid, process,
-                              implied_obj, ir_factor, vol_surface, resid=lambda x: x * x, debug=None):
+                              implied_obj, ir_factor, vol_surface, resid=lambda x: x * x, jac=False):
 
         def loss(implied_var):
             # first, reset the shared_mem
@@ -493,14 +490,17 @@ class RiskNeutralInterestRateModel(object):
         shared_mem = RiskNeutralInterestRate_State(self.batch_size, self.device, self.prec)
         # setup the variables
         implied_var = {}
-        # the curve is treated as constant here
-        stoch_var = torch.tensor(process.factor.current_value(), device=self.device, dtype=self.prec)
+        stoch_var = torch.tensor(
+            process.factor.current_value(), device=self.device, dtype=self.prec, requires_grad=jac)
 
-        for param_name, param_value in implied_obj.current_value().items():
+        for param_name, param_value in implied_obj.current_value(include_quanto=jac).items():
             implied_var[param_name] = torch.tensor(
                 param_value, dtype=self.prec, device=self.device, requires_grad=True)
 
-        return implied_var, loss, market_swaps, benchmarks
+        if jac:
+            return stoch_var, implied_var, loss
+        else:
+            return implied_var, loss, market_swaps, benchmarks
 
     def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
         base_date = sys_params['Base_Date']
@@ -535,7 +535,7 @@ class RiskNeutralInterestRateModel(object):
                     base_currency, price_factors, price_models, ir_curve, rate)
 
                 # setup the time grid
-                time_grid = TimeGrid(mtm_dates, mtm_dates, mtm_dates)
+                time_grid = utils.TimeGrid(mtm_dates, mtm_dates, mtm_dates)
                 # add a delta of 10 days to the time_grid_years (without changing the scenario grid
                 # this is needed for stochastically deflating the exposure later on
                 time_grid.set_base_date(base_date, delta=(10, vol_tenors * utils.DAYS_IN_YEAR))
@@ -552,7 +552,7 @@ class RiskNeutralInterestRateModel(object):
                         logging.error('Could not write output file {}'.format(market_factor.name[0] + '.aap'))
 
                 # check the time
-                time_now = time.clock()
+                time_now = time.monotonic()
                 calibrated_swaptions, errors = loss_fn(implied_var)
                 batch_loss = torch.stack(list(errors.values())).sum().cpu().detach().numpy()
                 vars = {k: v.cpu().detach().numpy() for k, v in implied_var.items()}
@@ -569,41 +569,47 @@ class RiskNeutralInterestRateModel(object):
                         k, price, value, 100.0 * (price - value) / price))
 
                 # minimize
+                result = None
                 num_optimizers = len(optimizers)
                 for op_loop in range(2 * num_optimizers):
                     optim = optimizers[op_loop % num_optimizers]
+                    x0 = result['x'] if result is not None else optim[1]
                     if optim[0] == 'basin':
                         result = scipy.optimize.basinhopping(
-                            optim[2], x0=optim[1], take_step=optim[3], accept_test=optim[4], T=5.0,
+                            optim[2], x0=x0, take_step=optim[3], accept_test=optim[4], T=5.0,
                             minimizer_kwargs={"method": "L-BFGS-B", "jac": True, "bounds": optim[5]})
+                        batch_loss = float(optim[2](result['x'])[0])
                     elif optim[0] == 'leastsq':
                         result = scipy.optimize.least_squares(
-                            optim[2], x0=optim[1], jac=optim[3], bounds=optim[4])
-                        if process.params_ok:
-                            price_param = utils.Factor('Jacobian'+implied_obj.__class__.__name__, market_factor.name)
-                            # store the jacobian
-                            price_factors[utils.check_tuple_name(price_param)] = utils.Curve([], result.jac)
+                            optim[2], x0=x0, jac=optim[3], bounds=optim[4])
+                        batch_loss = optim[2](result['x']).sum()
 
-                    sim_swaptions, errors = loss_fn(implied_var)
-                    batch_loss = torch.stack(list(errors.values())).sum().cpu().detach().numpy()
-                    vars = {k: v.cpu().detach().numpy() for k, v in implied_var.items()}
-
-                    if batch_loss < soln[0]:
+                    if batch_loss < soln[0] and process.params_ok:
+                        sim_swaptions, errors = loss_fn(implied_var)
+                        vars = {k: v.cpu().detach().numpy() for k, v in implied_var.items()}
                         soln = (batch_loss, vars)
                         logging.info('{} - run {} - Batch loss {}'.format(
                             market_factor.name[0], op_loop, batch_loss))
                         for k, v in sorted(vars.items()):
                             logging.info('{} - {}'.format(k, v))
-                        for k, v in sorted(sim_swaptions.items()):
+                        for k, v in sim_swaptions.items():
                             value = v.cpu().detach().numpy()
                             price = market_swaptions[k].price
                             logging.info('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
                                 k, price, value, 100.0 * (price - value) / price))
 
                 # save this
-                self.save_params(soln[1], price_factors, implied_obj, rate)
+                final_implied_obj = self.save_params(soln[1], price_factors, implied_obj, rate)
+                # calculate the jacobians and final premiums
+                jacobians, premiums = self.calc_jacobians(
+                    implied_params, base_date, time_grid, process, final_implied_obj, ir_factor, swaptionvol)
+                price_param = utils.Factor(implied_obj.__class__.__name__ + 'Jacobian', market_factor.name)
+                price_factors[utils.check_tuple_name(price_param)] = jacobians
+                prem_param = utils.Factor(implied_obj.__class__.__name__ + 'Premiums', market_factor.name)
+                price_factors[utils.check_tuple_name(prem_param)] = premiums
+
                 # record the time
-                logging.info('This took {} seconds.'.format(time.clock() - time_now))
+                logging.info('This took {} seconds.'.format(time.monotonic() - time_now))
 
 
 class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
@@ -735,6 +741,38 @@ scipy.optimize.leastsq.html) are used.',
         self.sigma_bounds = (1e-5, 0.09)
         self.alpha_bounds = (1e-5, 2.4)
         self.corr_bounds = (-.95, 0.95)
+
+    def calc_jacobians(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):
+        # reset the stochastic process with the new implied factor
+        process.reset_implied_factor(implied_obj)
+        # get the swaption error and market values
+        stoch_var, implied_var_dict, loss_fn = self.calc_loss_on_ir_curve(
+            implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface, jac=True)
+
+        # run the loss function
+        jacobians = {}
+        premiums, errors = loss_fn(implied_var_dict)
+        # add the curve
+        implied_var_dict['Curve'] = stoch_var
+        for swaption_name, premium in premiums.items():
+            grad_swaption = torch.autograd.grad(
+                premium, list(implied_var_dict.values()), retain_graph=True)
+            var_names = list(implied_var_dict.keys())
+            for name, val in zip(var_names, grad_swaption):
+                value = val.cpu().numpy()
+                non_zero = np.where(value != 0.0)
+                if name == 'Curve':
+                    curve = utils.Curve([], list(zip(process.factor.get_tenor()[non_zero], value[non_zero])))
+                    jacobians.setdefault(swaption_name, {}).setdefault('Curve', curve)
+                elif name.startswith('Sigma') or name == 'Quanto_FX_Volatility':
+                    curve = utils.Curve([], list(zip(implied_obj.param[name].array[non_zero[0], 0], value[non_zero])))
+                    jacobians.setdefault(swaption_name, {}).setdefault(name, curve)
+                else:
+                    jacobians.setdefault(swaption_name, {}).setdefault(name, float(value[0]))
+
+        all_premiums = {k: float(v.cpu().detach().numpy()) for k, v in premiums.items()}
+
+        return jacobians, all_premiums
 
     def calc_loss(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):
 
@@ -896,21 +934,28 @@ scipy.optimize.leastsq.html) are used.',
             utils.Factor(type='HullWhite2FactorModelParameters', name=rate[1:]))
         # grab the sigma tenors
         sig1_tenor, sig2_tenor = implied_obj.get_vol_tenors()
+        # store the basic paramters
+        param = {'Property_Aliases': None,
+                 'Quanto_FX_Volatility': None,
+                 'Alpha_1': float(vars['Alpha_1'][0]),
+                 'Sigma_1': utils.Curve([], list(zip(sig1_tenor, vars['Sigma_1']))),
+                 'Alpha_2': float(vars['Alpha_2'][0]),
+                 'Sigma_2': utils.Curve([], list(zip(sig2_tenor, vars['Sigma_2']))),
+                 'Correlation': float(vars['Correlation'][0])}
+
         # grab the quanto fx correlations
         quanto_fx1, quanto_fx2 = implied_obj.get_quanto_correlation(
             vars['Correlation'], [vars['Sigma_1'], vars['Sigma_2']])
 
-        param = {'Property_Aliases': None,
-                 'Quanto_FX_Volatility': implied_obj.param['Quanto_FX_Volatility'],
-                 'Alpha_1': float(vars['Alpha_1'][0]),
-                 'Sigma_1': utils.Curve([], list(zip(sig1_tenor, vars['Sigma_1']))),
-                 'Quanto_FX_Correlation_1': quanto_fx1,
-                 'Alpha_2': float(vars['Alpha_2'][0]),
-                 'Sigma_2': utils.Curve([], list(zip(sig2_tenor, vars['Sigma_2']))),
-                 'Quanto_FX_Correlation_2': quanto_fx2,
-                 'Correlation': float(vars['Correlation'][0])}
+        if quanto_fx1 is not None and quanto_fx2 is not None:
+            param.update({
+                'Quanto_FX_Volatility': implied_obj.param['Quanto_FX_Volatility'],
+                'Quanto_FX_Correlation_1': quanto_fx1,
+                'Quanto_FX_Correlation_2': quanto_fx2})
 
         price_factors[param_name] = param
+        # return the final implied object
+        return riskfactors.HullWhite2FactorModelParameters(param)
 
 
 def construct_bootstrapper(btype, param, device, dtype=torch.float32):

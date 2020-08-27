@@ -34,9 +34,6 @@ import torch.nn.functional as F
 # For dealing with excel dates and dataframes
 excel_offset = pd.Timestamp('1899-12-30 00:00:00')
 
-# set the default precision for tf
-Default_Precision = np.float32
-
 
 def array_type(x): return np.array(x)
 
@@ -320,6 +317,28 @@ class DateEqualList:
             '%02d%s%04d' % (date.day, calendar.month_abbr[date.month], date.year), '='.join([str(y) for y in value]))
                                for date, value in self.data.items()]) + ']'
 
+
+class Calculation_State(object):
+    """
+    Note that all pricing functions depend on this class being correctly setup. All calculations
+    should inherit from this calculation state and extend accordingly
+    """
+
+    def __init__(self, static_buffer, report_currency, device, dtype, nomodel):
+        # these are tensors
+        self.t_Buffer = {}
+        self.t_Static_Buffer = static_buffer
+        # these are shared parameter states
+        self.device = device
+        self.precision = dtype
+        self.float = np.float32 if dtype == torch.float32 else np.float64
+        self.simulation_batch = 1
+        self.Report_Currency = report_currency
+        self.t_Cashflows = None
+        # these are shared parameter states
+        self.riskneutral = nomodel == 'RiskNeutral'
+
+
 # often we need a numpy array and it's tensor equivalent at the same time
 class DualArray:
     def __init__(self, tensor, ndarray):
@@ -402,6 +421,88 @@ class DealTimeDependencies(object):
 
     def fetch_index_by_day(self, days):
         return self.interp.searchsorted(days)
+
+
+# calculation time grid
+class TimeGrid(object):
+    def __init__(self, scenario_dates, MTM_dates, base_MTM_dates):
+        self.scenario_dates = scenario_dates
+        self.base_MTM_dates = base_MTM_dates
+        self.CurrencyMap = {}
+        self.set_mtm_dates(MTM_dates)
+
+    def set_mtm_dates(self, MTM_dates):
+        self.mtm_dates = MTM_dates
+        self.date_lookup = dict([(x, i) for i, x in enumerate(sorted(MTM_dates))])
+
+    def calc_time_grid(self, time_in_days):
+        dvt = np.concatenate(([1], np.diff(self.scen_time_grid), [1]))
+        scen_index = self.scen_time_grid.searchsorted(time_in_days, side='right')
+        index = (scen_index - 1).clip(0, self.scen_time_grid.size - 1)
+        alpha = ((time_in_days - self.scen_time_grid[index]) / dvt[scen_index]).clip(0, 1)
+        return np.dstack([alpha, time_in_days, index])[0]
+
+    def set_base_date(self, base_date, delta=None):
+        # leave the grids in terms of the number of days - note that it's possible to have the scenario_dates
+        # the same as the mtm_dates (for more accurate margin period of risk on collateralized netting sets)
+        self.mtm_time_grid = np.array([(x - base_date).days for x in sorted(self.mtm_dates)])
+        self.scen_time_grid = np.array([(x - base_date).days for x in sorted(self.scenario_dates)])
+
+        self.base_time_grid = set([self.date_lookup[x] for x in self.base_MTM_dates])
+        self.time_grid = self.calc_time_grid(self.mtm_time_grid)
+
+        # store the scenario time_grid
+        self.scenario_grid = np.zeros((self.scen_time_grid.size, 3))
+        self.scenario_grid[:, TIME_GRID_MTM] = self.scen_time_grid
+        self.scenario_grid[:, TIME_GRID_ScenarioPriorIndex] = np.arange(self.scen_time_grid.size)
+
+        # deal with the case that we need a very fine time_grid - note we do this after calculating the
+        # scenario_grid as setting a non-null delta is a way to generate scenarios without calculating the
+        # whole risk factor
+        if delta is not None:
+            delta_days, delta_tenors = delta
+            delta_grid = np.union1d(np.arange(0, self.scen_time_grid.max(), delta_days), delta_tenors)
+            self.scen_time_grid = np.union1d(self.scen_time_grid, delta_grid)
+
+        self.time_grid_years = self.scen_time_grid / DAYS_IN_YEAR
+
+    def get_scenario_offset(self, days_from_base):
+        prev_scen_index = self.scen_time_grid[self.scen_time_grid <= days_from_base].size - 1
+        scenario_grid_delta = np.float64(
+            (self.scen_time_grid[prev_scen_index + 1] - self.scen_time_grid[prev_scen_index]) if (
+                    self.scen_time_grid.size > 1 and self.scen_time_grid.size > prev_scen_index + 1) else 1.0)
+        return (days_from_base - self.scen_time_grid[prev_scen_index]) / scenario_grid_delta, prev_scen_index
+
+    def set_currency_settlement(self, currencies):
+        self.CurrencyMap = {}
+        for currency, dates in currencies.items():
+            settlement_dates = sorted([self.date_lookup[x] for x in dates if x in self.date_lookup])
+            if settlement_dates:
+                currency_lookup = np.zeros(self.mtm_time_grid.size, dtype=np.int32) - 1
+                currency_lookup[settlement_dates] = np.arange(len(settlement_dates))
+                self.CurrencyMap.setdefault(currency, currency_lookup)
+
+    def calc_deal_grid(self, dates):
+        try:
+            dynamic_dates = self.base_time_grid.union([self.date_lookup[x] for x in dates])
+        except KeyError as e:
+            # if there is at least one reset date in the set of dates, then return it, else the deal has expired
+            r = [self.date_lookup[x] for x in dates if x in self.date_lookup]
+            if r:
+                dynamic_dates = self.base_time_grid.union(r)
+            else:
+                if max(dates) < min(self.date_lookup.keys()):
+                    raise InstrumentExpired(e)
+
+                # include this instrument but don't bother pricing it through time
+                return DealTimeDependencies(self.mtm_time_grid, np.array([0]))
+
+        # now construct the full deal grid
+        deal_time_grid = np.array(sorted(dynamic_dates))
+        # find the last dynamic date - should be the expiry date
+        expiry = self.date_lookup[max(dates)]
+        # calculate the interpolation points etc.
+        return DealTimeDependencies(self.mtm_time_grid, deal_time_grid[deal_time_grid <= expiry])
 
 
 class TensorResets(TensorSchedule):

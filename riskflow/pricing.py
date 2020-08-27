@@ -380,6 +380,7 @@ class SensitivitiesEstimator(object):
         
         Returns:
             H_op: Hessian matrix op (tensor)
+            :param allow_unused:
         """
 
         glist = self.grad.values()
@@ -458,15 +459,15 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
     def barrier_option(sigma, expiry, cash_rebate, b, r, spot):
 
         sigma2 = sigma * sigma
-        vol = sigma * np.sqrt(expiry)
+        vol = sigma * torch.sqrt(expiry)
         mu = (b - 0.5 * sigma2) / sigma2
-        log_bar = tf.log(barrier / spot)
-        x1 = tf.log(spot / strike) / vol + (1.0 + mu) * vol
-        x2 = tf.log(spot / barrier) / vol + (1.0 + mu) * vol
+        log_bar = torch.log(barrier / spot)
+        x1 = torch.log(spot / strike) / vol + (1.0 + mu) * vol
+        x2 = torch.log(spot / barrier) / vol + (1.0 + mu) * vol
 
-        y1 = tf.log((barrier * barrier) / (spot * strike)) / vol + (1.0 + mu) * vol
+        y1 = torch.log((barrier * barrier) / (spot * strike)) / vol + (1.0 + mu) * vol
         y2 = log_bar / vol + (1.0 + mu) * vol
-        lam = tf.sqrt(mu * mu + 2.0 * r / sigma2)
+        lam = torch.sqrt(mu * mu + 2.0 * r / sigma2)
         z = log_bar / vol + lam * vol
         eta_scale = 0.7071067811865476 * eta
         phi_scale = 0.7071067811865476 * phi
@@ -477,94 +478,97 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
                     (phi == OPTION_PUT and eta == BARRIER_DOWN and strike <= barrier)):
                 # A+E
                 return (cash_rebate * (
-                        (0.5 * tf.erfc(eta_scale * (-vol + y2)) - 1.0) * tf.exp(2 * log_bar * mu) +
-                        0.5 * tf.erfc(eta_scale * (vol - x2))) - phi * (
-                                spot * (0.5 * tf.erfc(phi_scale * x1) - 1.0) * tf.exp(b * expiry) +
-                                0.5 * strike * tf.erfc(phi_scale * (vol - x1)))) * tf.exp(-expiry_r)
+                        (0.5 * torch.erfc(eta_scale * (-vol + y2)) - 1.0) * torch.exp(2 * log_bar * mu) +
+                        0.5 * torch.erfc(eta_scale * (vol - x2))) - phi * (
+                                spot * (0.5 * torch.erfc(phi_scale * x1) - 1.0) * torch.exp(b * expiry) +
+                                0.5 * strike * torch.erfc(phi_scale * (vol - x1)))) * torch.exp(-expiry_r)
             elif ((phi == OPTION_CALL and eta == BARRIER_UP and strike <= barrier) or
                   (phi == OPTION_PUT and eta == BARRIER_DOWN and strike > barrier)):
                 # B-C+D+E
                 return (cash_rebate * (
-                        (0.5 * tf.erfc(eta_scale * (-vol + y2)) - 1.0) * tf.exp(2 * log_bar * mu) +
-                        0.5 * tf.erfc(eta_scale * (vol - x2))) - phi * (
-                                spot * (0.5 * tf.erfc(phi_scale * x2) - 1.0) * tf.exp(b * expiry) +
-                                0.5 * strike * tf.erfc(phi_scale * (vol - x2))) + phi * (
-                                spot * (0.5 * tf.erfc(eta_scale * y1) - 1.0) * tf.exp(
+                        (0.5 * torch.erfc(eta_scale * (-vol + y2)) - 1.0) * torch.exp(2 * log_bar * mu) +
+                        0.5 * torch.erfc(eta_scale * (vol - x2))) - phi * (
+                                spot * (0.5 * torch.erfc(phi_scale * x2) - 1.0) * torch.exp(b * expiry) +
+                                0.5 * strike * torch.erfc(phi_scale * (vol - x2))) + phi * (
+                                spot * (0.5 * torch.erfc(eta_scale * y1) - 1.0) * torch.exp(
                             expiry * (b - r) + 2 * log_bar * (mu + 1)) - spot * (
-                                        0.5 * tf.erfc(eta_scale * y2) - 1.0) *
-                                tf.exp(expiry * (b - r) + 2 * log_bar * (mu + 1)) + 0.5 * strike * tf.exp(
-                            -expiry_r + 2 * log_bar * mu) * tf.erfc(eta_scale * (vol - y1)) -
-                                0.5 * strike * tf.exp(-expiry_r + 2 * log_bar * mu) * tf.erfc(
-                            eta_scale * (vol - y2))) * tf.exp(expiry_r)) * tf.exp(-expiry_r)
+                                        0.5 * torch.erfc(eta_scale * y2) - 1.0) *
+                                torch.exp(expiry * (b - r) + 2 * log_bar * (mu + 1)) + 0.5 * strike * torch.exp(
+                            -expiry_r + 2 * log_bar * mu) * torch.erfc(eta_scale * (vol - y1)) -
+                                0.5 * strike * torch.exp(-expiry_r + 2 * log_bar * mu) * torch.erfc(
+                            eta_scale * (vol - y2))) * torch.exp(expiry_r)) * torch.exp(-expiry_r)
             elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike > barrier) or
                   (phi == OPTION_CALL and eta == BARRIER_DOWN and strike <= barrier)):
                 # A-B+D+E
-                return (cash_rebate * ((0.5 * tf.erfc(eta_scale * (-vol + y2)) - 1.0) * tf.exp(
-                    2 * log_bar * mu) + 0.5 * tf.erfc(eta_scale * (vol - x2))) - phi * (
-                                spot * (0.5 * tf.erfc(eta_scale * y2) - 1.0) * tf.exp(expiry * (
-                                b - r) + 2 * log_bar * (mu + 1)) + 0.5 * strike * tf.exp(
-                            -expiry_r + 2 * log_bar * mu) * tf.erfc(
-                            eta_scale * (vol - y2))) * tf.exp(expiry_r) - phi * (spot * (0.5 * tf.erfc(
-                    phi_scale * x1) - 1.0) * tf.exp(b * expiry) + 0.5 * strike * tf.erfc(
-                    phi_scale * (vol - x1))) + phi * (spot * (0.5 * tf.erfc(
-                    phi_scale * x2) - 1.0) * tf.exp(b * expiry) + 0.5 * strike * tf.erfc(
-                    phi_scale * (vol - x2)))) * tf.exp(-expiry_r)
+                return (cash_rebate * ((0.5 * torch.erfc(eta_scale * (-vol + y2)) - 1.0) * torch.exp(
+                    2 * log_bar * mu) + 0.5 * torch.erfc(eta_scale * (vol - x2))) - phi * (
+                                spot * (0.5 * torch.erfc(eta_scale * y2) - 1.0) * torch.exp(expiry * (
+                                b - r) + 2 * log_bar * (mu + 1)) + 0.5 * strike * torch.exp(
+                            -expiry_r + 2 * log_bar * mu) * torch.erfc(
+                            eta_scale * (vol - y2))) * torch.exp(expiry_r) - phi * (spot * (0.5 * torch.erfc(
+                    phi_scale * x1) - 1.0) * torch.exp(b * expiry) + 0.5 * strike * torch.erfc(
+                    phi_scale * (vol - x1))) + phi * (spot * (0.5 * torch.erfc(
+                    phi_scale * x2) - 1.0) * torch.exp(b * expiry) + 0.5 * strike * torch.erfc(
+                    phi_scale * (vol - x2)))) * torch.exp(-expiry_r)
             elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike <= barrier) or
                   (phi == OPTION_CALL and eta == BARRIER_DOWN and strike > barrier)):
                 # C+ E
-                return (cash_rebate * ((0.5 * tf.erfc(eta_scale * (-vol + y2)) - 1.0) * tf.exp(
-                    2 * log_bar * mu) + 0.5 * tf.erfc(eta_scale * (vol - x2))) - phi * (spot * (
-                        0.5 * tf.erfc(eta_scale * y1) - 1.0) * tf.exp(expiry * (b - r) + 2 * log_bar * (
-                        mu + 1)) + 0.5 * strike * tf.exp(-expiry_r + 2 * log_bar * mu) * tf.erfc(eta_scale * (
-                        vol - y1))) * tf.exp(expiry_r)) * tf.exp(-expiry_r)
+                return (cash_rebate * ((0.5 * torch.erfc(eta_scale * (-vol + y2)) - 1.0) * torch.exp(
+                    2 * log_bar * mu) + 0.5 * torch.erfc(eta_scale * (vol - x2))) - phi * (spot * (
+                        0.5 * torch.erfc(eta_scale * y1) - 1.0) * torch.exp(expiry * (b - r) + 2 * log_bar * (
+                        mu + 1)) + 0.5 * strike * torch.exp(-expiry_r + 2 * log_bar * mu) * torch.erfc(eta_scale * (
+                        vol - y1))) * torch.exp(expiry_r)) * torch.exp(-expiry_r)
         else:
             if ((phi == OPTION_CALL and eta == BARRIER_UP and strike > barrier) or
                     (phi == OPTION_PUT and eta == BARRIER_DOWN and strike <= barrier)):
                 # F
-                return -cash_rebate * ((0.5 * tf.erfc(eta_scale * z) - 1.0) * tf.exp(2 * lam * log_bar) -
-                                       0.5 * tf.erfc(eta_scale * (2 * lam * vol - z))) * tf.exp(-log_bar * (lam - mu))
+                return -cash_rebate * ((0.5 * torch.erfc(eta_scale * z) - 1.0) * torch.exp(2 * lam * log_bar) -
+                                       0.5 * torch.erfc(eta_scale * (2 * lam * vol - z))) * torch.exp(
+                    -log_bar * (lam - mu))
             elif ((phi == OPTION_CALL and eta == BARRIER_UP and strike <= barrier) or
                   (phi == OPTION_PUT and eta == BARRIER_DOWN and strike > barrier)):
                 # A - B + C - D + F
-                return (-cash_rebate * ((0.5 * tf.erfc(eta_scale * z) - 1.0) * tf.exp(2 * lam * log_bar)
-                                        - 0.5 * tf.erfc(eta_scale * (2 * lam * vol - z))) * tf.exp(expiry_r)
-                        + phi * (-spot * (0.5 * tf.erfc(eta_scale * y1) - 1.0) * tf.exp(
-                            expiry * (b - r) + 2 * log_bar * (mu + 1)) + spot * (0.5 * tf.erfc(eta_scale * y2) - 1.0) *
-                                 tf.exp(expiry * (b - r) + 2 * log_bar * (mu + 1)) - 0.5 * strike * tf.exp(
+                return (-cash_rebate * ((0.5 * torch.erfc(eta_scale * z) - 1.0) * torch.exp(2 * lam * log_bar)
+                                        - 0.5 * torch.erfc(eta_scale * (2 * lam * vol - z))) * torch.exp(expiry_r)
+                        + phi * (-spot * (0.5 * torch.erfc(eta_scale * y1) - 1.0) * torch.exp(
+                            expiry * (b - r) + 2 * log_bar * (mu + 1)) + spot * (
+                                         0.5 * torch.erfc(eta_scale * y2) - 1.0) *
+                                 torch.exp(expiry * (b - r) + 2 * log_bar * (mu + 1)) - 0.5 * strike * torch.exp(
                                     -expiry_r + 2 * log_bar * mu) *
-                                 tf.erfc(eta_scale * (vol - y1)) + 0.5 * strike * tf.exp(-expiry_r + 2 * log_bar * mu) *
-                                 tf.erfc(eta_scale * (vol - y2))) * tf.exp(expiry_r + log_bar * (lam - mu)) +
-                        phi * (-spot * (0.5 * tf.erfc(phi_scale * x1) - 1.0) * tf.exp(b * expiry) + spot * (
-                                0.5 * tf.erfc(phi_scale * x2) - 1.0) * tf.exp(b * expiry) - 0.5 * strike *
-                               tf.erfc(phi_scale * (vol - x1)) + 0.5 * strike * tf.erfc(phi_scale * (vol - x2)))
-                        * tf.exp(log_bar * (lam - mu))) * tf.exp(-expiry_r - log_bar * (lam - mu))
+                                 torch.erfc(eta_scale * (vol - y1)) + 0.5 * strike * torch.exp(
+                                    -expiry_r + 2 * log_bar * mu) *
+                                 torch.erfc(eta_scale * (vol - y2))) * torch.exp(expiry_r + log_bar * (lam - mu)) +
+                        phi * (-spot * (0.5 * torch.erfc(phi_scale * x1) - 1.0) * torch.exp(b * expiry) + spot * (
+                                0.5 * torch.erfc(phi_scale * x2) - 1.0) * torch.exp(b * expiry) - 0.5 * strike *
+                               torch.erfc(phi_scale * (vol - x1)) + 0.5 * strike * torch.erfc(phi_scale * (vol - x2)))
+                        * torch.exp(log_bar * (lam - mu))) * torch.exp(-expiry_r - log_bar * (lam - mu))
             elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike > barrier) or
                   (phi == OPTION_CALL and eta == BARRIER_DOWN and strike <= barrier)):
                 # B - D + F
-                return (-cash_rebate * ((0.5 * tf.erfc(eta_scale * z) - 1.0) * tf.exp(2 * lam * log_bar)
-                                        - 0.5 * tf.erfc(eta_scale * (2 * lam * vol - z))) * tf.exp(expiry_r) +
-                        phi * (spot * (0.5 * tf.erfc(eta_scale * y2) - 1.0) * tf.exp(
+                return (-cash_rebate * ((0.5 * torch.erfc(eta_scale * z) - 1.0) * torch.exp(2 * lam * log_bar)
+                                        - 0.5 * torch.erfc(eta_scale * (2 * lam * vol - z))) * torch.exp(expiry_r) +
+                        phi * (spot * (0.5 * torch.erfc(eta_scale * y2) - 1.0) * torch.exp(
                             expiry * (b - r) + 2 * log_bar * (mu + 1))
-                               + 0.5 * strike * tf.exp(-expiry_r + 2 * log_bar * mu) * tf.erfc(
-                                    eta_scale * (vol - y2))) * tf.exp(
+                               + 0.5 * strike * torch.exp(-expiry_r + 2 * log_bar * mu) * torch.erfc(
+                                    eta_scale * (vol - y2))) * torch.exp(
                             expiry_r + log_bar * (lam - mu)) - phi * (
-                                spot * (0.5 * tf.erfc(phi_scale * x2) - 1.0) * tf.exp(
-                            b * expiry) + 0.5 * strike * tf.erfc(phi_scale * (vol - x2))) * tf.exp(
-                            log_bar * (lam - mu))) * tf.exp(
+                                spot * (0.5 * torch.erfc(phi_scale * x2) - 1.0) * torch.exp(
+                            b * expiry) + 0.5 * strike * torch.erfc(phi_scale * (vol - x2))) * torch.exp(
+                            log_bar * (lam - mu))) * torch.exp(
                     -expiry_r - log_bar * (lam - mu))
             elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike <= barrier) or
                   (phi == OPTION_CALL and eta == BARRIER_DOWN and strike > barrier)):
                 # A-C+F
-                return (-cash_rebate * ((0.5 * tf.erfc(eta_scale * z) - 1.0) * tf.exp(2 * lam * log_bar)
-                                        - 0.5 * tf.erfc(eta_scale * (2 * lam * vol - z))) * tf.exp(expiry_r) +
-                        phi * (spot * (0.5 * tf.erfc(eta_scale * y1) - 1.0) * tf.exp(
+                return (-cash_rebate * ((0.5 * torch.erfc(eta_scale * z) - 1.0) * torch.exp(2 * lam * log_bar)
+                                        - 0.5 * torch.erfc(eta_scale * (2 * lam * vol - z))) * torch.exp(expiry_r) +
+                        phi * (spot * (0.5 * torch.erfc(eta_scale * y1) - 1.0) * torch.exp(
                             expiry * (b - r) + 2 * log_bar * (mu + 1))
-                               + 0.5 * strike * tf.exp(-expiry_r + 2 * log_bar * mu) * tf.erfc(
-                                    eta_scale * (vol - y1))) * tf.exp(
+                               + 0.5 * strike * torch.exp(-expiry_r + 2 * log_bar * mu) * torch.erfc(
+                                    eta_scale * (vol - y1))) * torch.exp(
                             expiry_r + log_bar * (lam - mu)) - phi * (
-                                spot * (0.5 * tf.erfc(phi_scale * x1) - 1.0) * tf.exp(
-                            b * expiry) + 0.5 * strike * tf.erfc(phi_scale * (vol - x1))) * tf.exp(
-                            log_bar * (lam - mu))) * tf.exp(
+                                spot * (0.5 * torch.erfc(phi_scale * x1) - 1.0) * torch.exp(
+                            b * expiry) + 0.5 * strike * torch.erfc(phi_scale * (vol - x1))) * torch.exp(
+                            log_bar * (lam - mu))) * torch.exp(
                     -expiry_r - log_bar * (lam - mu))
 
     return barrier_option
@@ -589,63 +593,66 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal,
     # get the zero curve
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time[:-1], shared)
 
-    expiry = daycount_fn(tau).astype(shared.precision)
+    expiry = daycount_fn(tau)
     need_spot_at_expiry = deal_time.shape[0] - expiry.size
-    spot_prior, spot_at = tf.split(spot, [expiry.size, need_spot_at_expiry])
+    spot_prior, spot_at = torch.split(spot, (expiry.size, need_spot_at_expiry))
     moneyness = strike / spot_prior if invert_moneyness else spot_prior / strike
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     if factor_dep['Barrier_Monitoring']:
-        adj_barrier = barrier * tf.exp((2.0 * tf.cast(
-            barrier > spot, shared.precision) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
+        adj_barrier = barrier * torch.exp(
+            (2.0 * (barrier > spot[0][0]).type(shared.precision) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
     else:
         adj_barrier = barrier
 
     # get the payoff function - should be adj_barrier not barrier - TODO
     barrierOption = getbarrierpayoff(direction, eta, phi, strike, barrier)
 
-    r = tf.squeeze(discounts.gather_weighted_curve(
+    r = torch.squeeze(discounts.gather_weighted_curve(
         shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
-    expiry_years = expiry.reshape(-1, 1)
-    barrier_payoff = buy_or_sell * nominal * barrierOption(sigma, expiry_years, cash_rebate / nominal,
-                                                           b, r, spot_prior)
+    # cache the expiry tenors
+    expiry_years_key = ('Expiry_Years', tuple(expiry))
+    if expiry_years_key not in factor_dep:
+        factor_dep[expiry_years_key] = spot.new(expiry.reshape(-1, 1))
+
+    expiry_years = factor_dep[expiry_years_key]
+    barrier_payoff = buy_or_sell * nominal * barrierOption(
+        sigma, expiry_years, cash_rebate / nominal, b, r, spot_prior)
 
     if need_spot_at_expiry:
         # work out barrier
         if eta == BARRIER_UP:
-            touched = tf.cast(tf.logical_and(
-                spot[:-1] < barrier, spot[1:] > barrier), shared.precision)
+            touched = (spot[:-1] < barrier) & (spot[1:] > barrier)
         else:
-            touched = tf.cast(tf.logical_and(
-                spot[:-1] > barrier, spot[1:] < barrier), shared.precision)
+            touched = (spot[:-1] > barrier) & (spot[1:] < barrier)
 
         # barrier payoff
-        barrier_touched = tf.pad(tf.cast(tf.cumsum(touched, axis=0) > 0, shared.precision), [[1, 0], [0, 0]])
+        barrier_touched = F.pad((torch.cumsum(touched, axis=0) > 0).type(shared.precision), [0, 0, 1, 0])
         first_touch = barrier_touched[1:] - barrier_touched[:-1]
         # final payoff
-        payoff_at = buy_or_sell * tf.nn.relu(phi * (spot_at - strike))
+        payoff_at = buy_or_sell * torch.relu(phi * (spot_at - strike))
 
         if direction == BARRIER_IN:
-            forward = spot_prior * tf.exp(b * expiry_years)
+            forward = spot_prior * torch.exp(b * expiry_years)
             payoff_prior = utils.black_european_option(
-                forward, strike, sigma, expiry, buy_or_sell, phi, shared) * tf.exp(-r * expiry_years)
-            european_part = barrier_touched * (nominal * tf.concat([payoff_prior, payoff_at], axis=0))
-            barrier_part = (1.0 - barrier_touched) * tf.pad(
-                barrier_payoff, [[0, 1], [0, 0]], constant_values=buy_or_sell * cash_rebate)
+                forward, strike, sigma, expiry, buy_or_sell, phi, shared) * torch.exp(-r * expiry_years)
+            european_part = barrier_touched * (nominal * torch.cat([payoff_prior, payoff_at], axis=0))
+            barrier_part = (1.0 - barrier_touched) * F.pad(
+                barrier_payoff, [0, 0, 0, 1], value=buy_or_sell * cash_rebate)
             combined = european_part + barrier_part
             # settle cashflows (can only happen at the end)
             cash_settle(shared, payoff_currency, deal_data.Time_dep.deal_time_grid[-1], combined[-1])
         else:
             # barrier out
-            barrier_part = (1.0 - barrier_touched) * tf.concat([barrier_payoff, nominal * payoff_at], axis=0)
+            barrier_part = (1.0 - barrier_touched) * torch.cat([barrier_payoff, nominal * payoff_at], axis=0)
             rebate_part = buy_or_sell * cash_rebate * first_touch
-            combined = tf.pad(buy_or_sell * cash_rebate * first_touch, [[1, 0], [0, 0]]) + barrier_part
+            combined = F.pad(buy_or_sell * cash_rebate * first_touch, [0, 0, 1, 0]) + barrier_part
             # settle cashflows (The one at expiry)
             cash_settle(shared, payoff_currency, deal_data.Time_dep.deal_time_grid[-1], barrier_part[-1])
             # settle cashflows (The potential rebate knockout)
             if cash_rebate:
-                for cash_index, cash in zip(deal_data.Time_dep.deal_time_grid[1:], tf.unstack(rebate_part)):
+                for cash_index, cash in zip(deal_data.Time_dep.deal_time_grid[1:], rebate_part):
                     cash_settle(shared, payoff_currency, cash_index, cash)
     else:
         combined = barrier_payoff
@@ -668,25 +675,30 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal,
     # get the zero curve
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time[:-1], shared)
 
-    expiry = daycount_fn(tau).astype(shared.precision)
+    expiry = daycount_fn(tau)
     need_spot_at_expiry = deal_time.shape[0] - expiry.size
-    spot_prior, spot_at = tf.split(spot, [expiry.size, need_spot_at_expiry])
+    spot_prior, spot_at = torch.split(spot, (expiry.size, need_spot_at_expiry))
     moneyness = barrier / spot_prior if invert_moneyness else spot_prior / barrier
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     if factor_dep['Barrier_Monitoring']:
-        adj_barrier = barrier * tf.exp((2.0 * tf.cast(
-            barrier > spot_prior, shared.precision) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
+        adj_barrier = barrier * torch.exp(
+            (2.0 * (barrier > spot[0][0]).type(shared.precision) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
     else:
         adj_barrier = barrier
 
-    r = tf.squeeze(discounts.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+    r = torch.squeeze(discounts.gather_weighted_curve(
+        shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
-    # one touch payoff
-    expiry_years = expiry.reshape(-1, 1)
-    root_tau = np.sqrt(expiry_years)
+    # cache the expiry tenors
+    expiry_years_key = ('Expiry_Years', tuple(expiry))
+    if expiry_years_key not in factor_dep:
+        factor_dep[expiry_years_key] = spot.new(expiry.reshape(-1, 1))
+
+    expiry_years = factor_dep[expiry_years_key]
+    root_tau = torch.sqrt(expiry_years)
     mu = b / sigma - 0.5 * sigma
-    log_vol = tf.log(barrier / spot_prior) / sigma
+    log_vol = torch.log(barrier / spot_prior) / sigma
     barrovert = log_vol / root_tau
     eta_scale = 0.7071067811865476 * eta
 
@@ -694,37 +706,35 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal,
         muroot = mu * root_tau
         d1 = muroot - barrovert
         d2 = -muroot - barrovert
-        payoff = tf.exp(-r * expiry_years) * 0.5 * (
-                tf.erfc(eta_scale * d1) + tf.exp(2.0 * mu * log_vol) * tf.erfc(eta_scale * d2))
+        payoff = torch.exp(-r * expiry_years) * 0.5 * (
+                torch.erfc(eta_scale * d1) + torch.exp(2.0 * mu * log_vol) * torch.erfc(eta_scale * d2))
     elif deal_data.Instrument.field['Payment_Timing'] == 'Touch':
-        lamb = tf.sqrt(tf.nn.relu(mu * mu + 2.0 * r))
+        lamb = torch.sqrt(torch.relu(mu * mu + 2.0 * r))
         lambroot = lamb * root_tau
         d1 = lambroot - barrovert
         d2 = -lambroot - barrovert
-        payoff = 0.5 * (tf.exp((mu - lamb) * log_vol) * tf.erfc(eta_scale * d1) +
-                        tf.exp((mu + lamb) * log_vol) * tf.erfc(eta_scale * d2))
+        payoff = 0.5 * (torch.exp((mu - lamb) * log_vol) * torch.erfc(eta_scale * d1) +
+                        torch.exp((mu + lamb) * log_vol) * torch.erfc(eta_scale * d2))
 
     if need_spot_at_expiry:
         # barrier check
         if eta == BARRIER_UP:
-            touched = tf.cast(tf.logical_and(
-                spot[:-1] < barrier, spot[1:] > barrier), shared.precision)
+            touched = (spot[:-1] < barrier) & (spot[1:] > barrier)
         else:
-            touched = tf.cast(tf.logical_and(
-                spot[:-1] > barrier, spot[1:] < barrier), shared.precision)
+            touched = (spot[:-1] > barrier) & (spot[1:] < barrier)
 
-        barrier_touched = tf.pad(tf.cast(tf.cumsum(touched, axis=0) > 0, shared.precision), [[1, 0], [0, 0]])
+        barrier_touched = F.pad((torch.cumsum(touched, axis=0) > 0).type(shared.precision), [0, 0, 1, 0])
         first_touch = barrier_touched[1:] - barrier_touched[:-1]
-        barrier_part = (1.0 - barrier_touched) * tf.pad(payoff, [[0, 1], [0, 0]])
+        barrier_part = (1.0 - barrier_touched) * F.pad(payoff, [0, 0, 0, 1])
 
         if deal_data.Instrument.field['Payment_Timing'] == 'Touch':
-            touch_part = tf.pad(first_touch, [[1, 0], [0, 0]])
+            touch_part = F.pad(first_touch, [0, 0, 1, 0])
             combined = buy_or_sell * nominal * (touch_part + barrier_part)
-            for cash_index, cash in zip(deal_data.Time_dep.deal_time_grid[1:], tf.unstack(first_touch)):
+            for cash_index, cash in zip(deal_data.Time_dep.deal_time_grid[1:], first_touch):
                 cash_settle(shared, payoff_currency, cash_index, buy_or_sell * nominal * cash)
         else:
             # Expiry
-            rebate_part = barrier_touched * tf.pad(tf.exp(-r * expiry_years), [[0, 1], [0, 0]], constant_values=1.0)
+            rebate_part = barrier_touched * F.pad(torch.exp(-r * expiry_years), [0, 0, 0, 1], value=1.0)
             combined = buy_or_sell * nominal * (rebate_part + barrier_part)
             # settle cashflows (The one at expiry)
             cash_settle(shared, payoff_currency, deal_data.Time_dep.deal_time_grid[-1], combined[-1])
@@ -976,6 +986,7 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
 
     return mtm
 
+
 def pricer_float_cashflows(all_resets, t_cash, shared):
     margin = (t_cash[:, utils.CASHFLOW_INDEX_FloatMargin] * t_cash[:, utils.CASHFLOW_INDEX_Year_Frac])
     all_int = all_resets * t_cash[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) + margin.reshape(1, -1, 1)
@@ -1025,7 +1036,9 @@ def pricer_floor(all_resets, t_cash, factor_dep, expiries, tenor, shared):
     return all_int, margin
 
 
-def pv_float_cashflow_list(shared, time_grid, deal_data, cashflow_pricer, mtm_currency=None, settle_cash=True):
+# @torch.jit.script
+def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.TimeGrid, deal_data: utils.DealDataType,
+                           cashflow_pricer, mtm_currency=None, settle_cash=True):
     mtm_list = []
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
@@ -1457,7 +1470,7 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
     for index, (forward_block, discount_block) in enumerate(utils.split_counts(
             [forwards, discounts], start_counts, shared)):
 
-        #cashflows = factor_dep['Cashflows'].schedule[start_index[index]:]
+        # cashflows = factor_dep['Cashflows'].schedule[start_index[index]:]
         cashflows = factor_dep['Cashflows'].merged(shared.device, shared.precision, start_index[index])
         # cash_offset = factor_dep['Cashflows'].offsets[start_index[index]:]
 
@@ -1795,103 +1808,5 @@ def pv_equity_leg(shared, time_grid, deal_data):
                                  deal_time, shared)
 
     mtm = pv_equity_cashflows(shared, time_grid, deal_data) * FX_rep
-
-    return mtm
-
-
-def pv_fx_barrier_option(shared, time_grid, deal_data):
-    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    nominal = deal_data.Instrument.field['Underlying_Amount']
-    payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
-
-    curr_curve = utils.calc_time_grid_curve_rate(
-        deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
-    und_curr_curve = utils.calc_time_grid_curve_rate(
-        deal_data.Factor_dep['Underlying_Currency'][1], deal_time[:-1], shared)
-
-    spot = utils.calc_fx_cross(deal_data.Factor_dep['Underlying_Currency'][0],
-                               deal_data.Factor_dep['Currency'][0], deal_time, shared)
-
-    # need to adjust if there's just 1 timepoint - i.e. base reval
-    if time_grid.mtm_time_grid.size > 1:
-        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
-    else:
-        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
-
-    b = tf.squeeze(curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-                   und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
-
-    fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
-                                 deal_time, shared)
-
-    pv = pv_barrier_option(
-        shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency,
-        invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
-
-    mtm = pv * fx_rep
-
-    return mtm
-
-
-def pv_eq_barrier_option(shared, time_grid, deal_data):
-    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    nominal = deal_data.Instrument.field['Units']
-    payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Currency']]
-
-    eq_zer_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Equity_Zero'], deal_time[:-1], shared)
-    eq_div_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Dividend_Yield'], deal_time[:-1], shared)
-
-    spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
-
-    # need to adjust if there's just 1 timepoint - i.e. base reval
-    if time_grid.mtm_time_grid.size > 1:
-        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
-    else:
-        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
-
-    b = tf.squeeze(
-        eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-        eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
-
-    fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
-
-    pv = pv_barrier_option(
-        shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency,
-        invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
-
-    mtm = pv * fx_rep
-
-    return mtm
-
-
-def pv_fx_onetouch(shared, time_grid, deal_data):
-    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    nominal = deal_data.Instrument.field['Cash_Payoff']
-    payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
-    fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0],
-                                 shared.Report_Currency, deal_time, shared)
-
-    curr_curve = utils.calc_time_grid_curve_rate(
-        deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
-    und_curr_curve = utils.calc_time_grid_curve_rate(
-        deal_data.Factor_dep['Underlying_Currency'][1], deal_time[:-1], shared)
-
-    spot = utils.calc_fx_cross(deal_data.Factor_dep['Underlying_Currency'][0],
-                               deal_data.Factor_dep['Currency'][0], deal_time, shared)
-
-    # need to adjust if there's just 1 timepoint - i.e. base reval
-    if time_grid.mtm_time_grid.size > 1:
-        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
-    else:
-        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
-
-    b = tf.squeeze(curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-                   und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
-
-    pv = pv_one_touch_option(
-        shared, time_grid, deal_data, nominal,
-        spot, b, tau, payoff_currency, invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
-
-    mtm = pv * fx_rep
 
     return mtm

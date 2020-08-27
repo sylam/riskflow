@@ -396,7 +396,6 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         super(HullWhite2FactorImpliedInterestRateModel, self).__init__(factor, param)
         self.implied = implied_factor
         self.factor_tenor = None
-        self.t_quanto_vol = None
         self.clip = clip
         self.grid_index = None
         self.BtT = None
@@ -407,6 +406,10 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
     @staticmethod
     def num_factors():
         return 2
+
+    def reset_implied_factor(self, implied_factor):
+        self.implied = implied_factor
+        self.factor_tenor = None
 
     def link_references(self, implied_tensor, implied_var, implied_ofs):
         """link market variables across different risk factors"""
@@ -427,6 +430,9 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid, shared, ref_date)
             # flatten the tenor
             self.factor_tenor_full = tensor.new_tensor(self.factor.get_tenor(), dtype=torch.float64)
+            # get the quanto vol
+            self.quantofx = tensor.new_tensor(
+                self.implied.param['Quanto_FX_Volatility'].array[:, 1], dtype=torch.float64)
 
         # calculate known functions
         alpha = [implied_tensor['Alpha_1'][0].type(torch.float64),
@@ -453,15 +459,14 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             if 'Quanto_FX_Correlation_1' in implied_tensor and 'Quanto_FX_Correlation_2' in implied_tensor:
                 quantofxcorr = [implied_tensor['Quanto_FX_Correlation_1'][0].type(torch.float64),
                                 implied_tensor['Quanto_FX_Correlation_2'][0].type(torch.float64)]
-                self.t_quanto_vol = implied_tensor['Quanto_FX_Volatility'].type(torch.float64)
+                t_quanto_vol = implied_tensor['Quanto_FX_Volatility'].type(torch.float64)
             else:
                 quantofxcorr = self.implied.get_quanto_correlation(corr, vols)
-                if self.t_quanto_vol is None:
-                    self.t_quanto_vol = tensor.new_tensor(quantofx[:, 1], dtype=torch.float64)
+                t_quanto_vol = self.quantofx
 
             K = [integrate_piecewise_linear(
                 hw_calc_IJK(alpha[i], torch.exp), shared, time_grid.time_grid_years,
-                vols_tenor[i], vols[i], quantofx[:, 0], self.t_quanto_vol) for i in range(2)]
+                vols_tenor[i], vols[i], quantofx[:, 0], t_quanto_vol) for i in range(2)]
         else:
             quantofxcorr = [0.0, 0.0]
             K = [corr.new_zeros(time_grid.time_grid_years.size) for i in range(2)]

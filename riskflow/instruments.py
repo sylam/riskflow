@@ -563,14 +563,14 @@ class NettingCollateralSet(Deal):
         if self.field.get('Collateralized', 'False') == 'True':
             # update each child element with extra reval dates
             for child in node_children:
-                child.add_reval_dates({max(child.get_reval_dates()) + pd.offsets.Day(1)})
-                # child.add_reval_date_offset(1)
+                # child.add_reval_dates({max(child.get_reval_dates()) + pd.offsets.Day(1)})
+                child.add_reval_date_offset(1)
                 settle_liquid = {self.field['Settlement_Period'],
                                  self.field['Settlement_Period'] + self.field['Liquidation_Period']}
                 child.add_reval_date_offset(settle_liquid, relative_to_settlement=False)
                 node_resets.update(child.get_reval_dates())
                 # add an offset for this instrument
-                child.add_reval_date_offset(1)
+                # child.add_reval_date_offset(1)
 
             # Load the time grid
             grid_dates = parser(base_date, max(node_resets), grid)
@@ -2379,7 +2379,31 @@ class EquityBarrierOption(Deal):
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
-        return pricing.pv_eq_barrier_option(shared, time_grid, deal_data)
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        nominal = deal_data.Instrument.field['Units']
+        payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Currency']]
+
+        eq_zer_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Equity_Zero'], deal_time[:-1], shared)
+        eq_div_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Dividend_Yield'], deal_time[:-1], shared)
+
+        spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
+
+        # need to adjust if there's just 1 timepoint - i.e. base reval
+        if time_grid.mtm_time_grid.size > 1:
+            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
+        else:
+            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+
+        b = torch.squeeze(
+            eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
+            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+
+        fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
+
+        pv = pricing.pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)
+        mtm = pv * fx_rep
+
+        return mtm
 
 
 class EquityForwardDeal(Deal):
@@ -2706,7 +2730,37 @@ class FXOneTouchOption(Deal):
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
-        return pricing.pv_fx_onetouch(shared, time_grid, deal_data)
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        nominal = deal_data.Instrument.field['Cash_Payoff']
+        payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
+        fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0],
+                                     shared.Report_Currency, deal_time, shared)
+
+        curr_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
+        und_curr_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Underlying_Currency'][1], deal_time[:-1], shared)
+
+        spot = utils.calc_fx_cross(deal_data.Factor_dep['Underlying_Currency'][0],
+                                   deal_data.Factor_dep['Currency'][0], deal_time, shared)
+
+        # need to adjust if there's just 1 timepoint - i.e. base reval
+        if time_grid.mtm_time_grid.size > 1:
+            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
+        else:
+            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+
+        b = torch.squeeze(
+            curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
+            und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+
+        pv = pricing.pv_one_touch_option(
+            shared, time_grid, deal_data, nominal,
+            spot, b, tau, payoff_currency, invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
+
+        mtm = pv * fx_rep
+
+        return mtm
 
 
 class FXBarrierOption(Deal):
@@ -2770,7 +2824,38 @@ class FXBarrierOption(Deal):
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
-        return pricing.pv_fx_barrier_option(shared, time_grid, deal_data)
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        nominal = deal_data.Instrument.field['Underlying_Amount']
+        payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
+
+        curr_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
+        und_curr_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Underlying_Currency'][1], deal_time[:-1], shared)
+
+        spot = utils.calc_fx_cross(deal_data.Factor_dep['Underlying_Currency'][0],
+                                   deal_data.Factor_dep['Currency'][0], deal_time, shared)
+
+        # need to adjust if there's just 1 timepoint - i.e. base reval
+        if time_grid.mtm_time_grid.size > 1:
+            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
+        else:
+            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+
+        b = torch.squeeze(
+            curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
+            und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+
+        fx_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
+
+        pv = pricing.pv_barrier_option(
+            shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency,
+            invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
+
+        mtm = pv * fx_rep
+
+        return mtm
 
 
 class FXOptionDeal(Deal):

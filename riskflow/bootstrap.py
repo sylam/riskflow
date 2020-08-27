@@ -30,8 +30,6 @@ def work(job_id, queue, result, price_factors,
          price_models, sys_params, holidays):
     # set the visible GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = str(job_id)
-    # set the log level
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
     # log to file
     logging.basicConfig(level=logging.INFO,
