@@ -122,9 +122,9 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
         tenor = (maturity - effective).days / utils.DAYS_IN_YEAR
         expiry = exp_days / utils.DAYS_IN_YEAR
         time_index = np.searchsorted(time_grid.mtm_time_grid, [exp_days], side='right') - 1
-        swaption_name = 'Swap_{0:05.2f}_{1:02.0f}_{2}_{3}'.format(
-            expiry, tenor, date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
-
+        # swaption_name = 'Swap_{0:05.2f}_{1:02.0f}_{2}_{3}'.format(
+        #     expiry, tenor, date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
+        swaption_name = 'Swaption_{}_{}'.format(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
         float_pay_dates = instruments.generate_dates_backward(
             maturity, effective, instrument['Floating_Frequency'])
 
@@ -692,7 +692,7 @@ class RiskNeutralInterestRateModel(object):
         utils.Default_Precision = prec
 
     def calc_loss_on_ir_curve(self, implied_params, base_date, time_grid, process,
-                              implied_obj, ir_factor, vol_surface, resid=tf.square, debug=None):
+                              implied_obj, ir_factor, vol_surface, resid=tf.square, jac=False):
         # calculate a reverse lookup for the tenors and store the daycount code
         all_tenors = utils.update_tenors(base_date, {ir_factor: process})
         # calculate the curve index - need to clean this up - TODO!!!
@@ -717,9 +717,11 @@ class RiskNeutralInterestRateModel(object):
         # setup the variables
         implied_var = {}
         # the curve is treated as constant here - no placeholders
-        stoch_var = tf.constant(process.factor.current_value(), dtype=self.prec)
-        with tf.name_scope("Implied_Input"):
-            for param_name, param_value in implied_obj.current_value().items():
+        with tf.variable_scope("Implied_Input", reuse=tf.AUTO_REUSE):
+            stoch_var = tf.get_variable(
+                name='Curve', initializer=process.factor.current_value().astype(self.prec),
+                dtype=self.prec) if jac else tf.constant(process.factor.current_value(), dtype=self.prec)
+            for param_name, param_value in implied_obj.current_value(include_quanto=jac).items():
                 factor_name = utils.Factor(
                     implied_obj.__class__.__name__, ir_factor.name + (param_name,))
                 tf_variable = tf.get_variable(
@@ -761,10 +763,12 @@ class RiskNeutralInterestRateModel(object):
                     tensor_swaptions[swaption_name] = sum_swaption
 
         calibrated_swaptions = {k: v / (self.batch_size * self.num_batches) for k, v in tensor_swaptions.items()}
-        error = {k: swap.weight * resid(100.0 * (
-                swap.price / calibrated_swaptions[k] - 1.0)) for k, swap in market_swaps.items()}
-
-        return implied_var, error, calibrated_swaptions, market_swaps, benchmarks
+        if jac:
+            return stoch_var, implied_var, calibrated_swaptions
+        else:
+            error = {k: swap.weight * resid(100.0 * (
+                    swap.price / calibrated_swaptions[k] - 1.0)) for k, swap in market_swaps.items()}
+            return implied_var, error, calibrated_swaptions, market_swaps, benchmarks
 
     def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
         base_date = sys_params['Base_Date']
@@ -844,22 +848,28 @@ class RiskNeutralInterestRateModel(object):
                         optimizers[op_loop % num_optimizers].minimize(sess)
                         batch_loss, vars = sess.run([loss, implied_var])
 
-                        if batch_loss < soln[0]:
+                        if batch_loss < soln[0] and sess.run(process.params_ok):
                             soln = (batch_loss, vars)
                             logging.info('{} - run {} - Batch loss {}'.format(
                                 market_factor.name[0], op_loop, batch_loss))
                             for k, v in sorted(vars.items()):
                                 logging.info('{} - {}'.format(k, v))
                             sim_swaptions = sess.run(calibrated_swaptions)
-                            for k, v in sorted(sim_swaptions.items()):
+                            for k, v in sim_swaptions.items():
                                 price = market_swaptions[k].price
                                 logging.info('{},market_value,{:f},sim_model_value,{:f},error,{:.0f}%'.format(
                                     k, price, v, 100.0 * (price - sim_swaptions[k]) / price))
 
-                    # save this
-                    self.save_params(soln[1], price_factors, implied_obj, rate)
-                    # record the time
-                    logging.info('This took {} seconds.'.format(time.clock() - time_now))
+                # save this
+                final_implied_obj = self.save_params(soln[1], price_factors, implied_obj, rate)
+                # calculate the jacobians and final premiums
+                logging.info('{} - Saving Jacobian.'.format(market_factor.name[0]))
+                jacobians = self.calc_jacobians(
+                    implied_params, base_date, time_grid, process, final_implied_obj, ir_factor, swaptionvol)
+                price_param = utils.Factor(implied_obj.__class__.__name__ + 'Jacobian', market_factor.name)
+                price_factors[utils.check_tuple_name(price_param)] = jacobians
+                # record the time
+                logging.info('{} - This took {} seconds.'.format(market_factor.name[0], time.clock() - time_now))
 
 
 class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
@@ -988,9 +998,56 @@ scipy.optimize.leastsq.html) are used.',
     def __init__(self, param, prec=np.float32):
         super(HullWhite2FactorModelParameters, self).__init__(param)
         self.market_factor_type = 'HullWhite2FactorInterestRateModelPrices'
-        self.sigma_bounds = (1e-5, 0.09)
-        self.alpha_bounds = (1e-5, 2.4)
+        self.sigma_bounds = (2**-16, 0.09)
+        self.alpha_bounds = (2**-16, 2.4)
         self.corr_bounds = (-.95, 0.95)
+
+    def calc_jacobians(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):
+        # get the swaption error and market values
+        def fwd_gradients(ys, xs, d_xs):
+            v = dummy_ys_vec
+            g = tf.concat(tf.gradients(ys, xs, grad_ys=v), axis=0)
+            return tf.gradients(g, v, grad_ys=d_xs)
+
+        tf.compat.v1.reset_default_graph()
+        graph = tf.Graph()
+        with graph.as_default():
+            # calculate the error
+            stoch_var, implied_var_dict, calibrated_swaptions = self.calc_loss_on_ir_curve(
+                implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface, jac=True)
+            # add the curve
+            implied_var_dict['Curve'] = stoch_var
+            loss = tf.stack(list(calibrated_swaptions.values()))
+            dummy_ys_vec = tf.placeholder_with_default(
+                np.ones(loss.get_shape()[0].value, dtype=self.prec), shape=loss.get_shape())
+            dummy_jac_vec = array_ops.placeholder(
+                self.prec, sum([_get_shape_tuple(x)[0] for x in implied_var_dict.values()]))
+            jvp = fwd_gradients(loss, list(implied_var_dict.values()), dummy_jac_vec)
+
+        jacobians = {}
+
+        with tf.Session(graph=graph) as sess:
+            sess.run(tf.global_variables_initializer())
+            n = dummy_jac_vec.shape[0].value
+            jacobian = np.vstack([sess.run(jvp, {dummy_jac_vec: np.eye(n)[i]}) for i in range(n)]).T
+            split_vars = np.cumsum([x.shape[0].value for x in list(implied_var_dict.values())])[:-1]
+            var_names = list(implied_var_dict.keys())
+            for index, (swaption_name, premium) in enumerate(sess.run(calibrated_swaptions).items()):
+                grad_swaption = np.split(jacobian[index], split_vars)
+                for name, value in zip(var_names, grad_swaption):
+                    non_zero = np.where(value != 0.0)
+                    if name == 'Curve':
+                        curve = utils.Curve([], list(zip(process.factor.get_tenor()[non_zero], value[non_zero])))
+                        jacobians.setdefault(swaption_name, {}).setdefault('Curve', curve)
+                    elif name.startswith('Sigma') or name == 'Quanto_FX_Volatility':
+                        curve = utils.Curve([], list(
+                            zip(implied_obj.param[name].array[non_zero[0], 0], value[non_zero])))
+                        jacobians.setdefault(swaption_name, {}).setdefault(name, curve)
+                    else:
+                        jacobians.setdefault(swaption_name, {}).setdefault(name, float(value[0]))
+                jacobians[swaption_name]['Premium'] = premium
+
+        return jacobians
 
     def calc_sample(self, time_grid, numfactors=0):
         if numfactors != 2 or self.sample is None:
@@ -1123,21 +1180,27 @@ scipy.optimize.leastsq.html) are used.',
             utils.Factor(type='HullWhite2FactorModelParameters', name=rate[1:]))
         # grab the sigma tenors
         sig1_tenor, sig2_tenor = implied_obj.get_vol_tenors()
+        # store the basic paramters
+        param = {'Property_Aliases': None,
+                 'Quanto_FX_Volatility': None,
+                 'Alpha_1': float(vars['Alpha_1'][0]),
+                 'Sigma_1': utils.Curve([], list(zip(sig1_tenor, vars['Sigma_1']))),
+                 'Alpha_2': float(vars['Alpha_2'][0]),
+                 'Sigma_2': utils.Curve([], list(zip(sig2_tenor, vars['Sigma_2']))),
+                 'Correlation': float(vars['Correlation'][0])}
         # grab the quanto fx correlations
         quanto_fx1, quanto_fx2 = implied_obj.get_quanto_correlation(
             vars['Correlation'], [vars['Sigma_1'], vars['Sigma_2']])
 
-        param = {'Property_Aliases': None,
-                 'Quanto_FX_Volatility': implied_obj.param['Quanto_FX_Volatility'],
-                 'Alpha_1': float(vars['Alpha_1'][0]),
-                 'Sigma_1': utils.Curve([], list(zip(sig1_tenor, vars['Sigma_1']))),
-                 'Quanto_FX_Correlation_1': quanto_fx1,
-                 'Alpha_2': float(vars['Alpha_2'][0]),
-                 'Sigma_2': utils.Curve([], list(zip(sig2_tenor, vars['Sigma_2']))),
-                 'Quanto_FX_Correlation_2': quanto_fx2,
-                 'Correlation': float(vars['Correlation'][0])}
+        if quanto_fx1 is not None and quanto_fx2 is not None:
+            param.update({
+                'Quanto_FX_Volatility': implied_obj.param['Quanto_FX_Volatility'],
+                'Quanto_FX_Correlation_1': quanto_fx1,
+                'Quanto_FX_Correlation_2': quanto_fx2})
 
         price_factors[param_name] = param
+        # return the final implied object
+        return riskfactors.HullWhite2FactorModelParameters(param)
 
 
 def construct_bootstrapper(btype, param):

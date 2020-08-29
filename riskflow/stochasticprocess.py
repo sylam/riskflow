@@ -399,6 +399,37 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             implied_tensor['Quanto_FX_Volatility'] = implied_var[fx_implied_index]['Vol']
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+
+        def tf_cholesky():
+            c = tf.pad(tf.cholesky(tf.reshape(delta_CtT, [-1, 2, 2])), [[1, 0], [0, 0], [0, 0]])
+            return tf.cast(tf.transpose(c, [1, 2, 0]), shared.precision)
+
+        def fix_cholesky():
+            c11 = tf.pad(CtT[0][1:] - CtT[0][:-1], [[1, 0]], constant_values=CtT[0][0])
+            c12 = tf.pad(CtT[1][1:] - CtT[1][:-1], [[1, 0]], constant_values=CtT[1][0])
+            c22 = tf.pad(CtT[3][1:] - CtT[3][:-1], [[1, 0]], constant_values=CtT[3][0])
+
+            # make sure it's ok
+            c11_ok = tf.cast(c11 > 0.0, tf.float64)
+            c22_ok = tf.cast(c22 > 0.0, tf.float64)
+            c12_ok = tf.cast((c12 * c12) < (c11 * c22), tf.float64)
+
+            # fudge factors to prevent underflow
+            epsilon = tf.ones_like(c11, dtype=tf.float64) * 1e-12
+            zero = tf.zeros_like(c11, dtype=tf.float64)
+
+            # calc the covariance matrix
+            C11 = c11_ok * c11 + (1.0 - c11_ok) * epsilon
+            C22 = c22_ok * c22 + (1.0 - c22_ok) * epsilon
+            C12 = c12_ok * c12
+
+            L = tf.stack([c11_ok * tf.sqrt(C11), zero,
+                          c11_ok * (C12 / tf.sqrt(C11)),
+                          c12_ok * tf.sqrt(C22 - (C12 * C12) / C11)])
+
+            # get the correlation through time - this will break if the cholesky is not Positive definite
+            return tf.cast(tf.reshape(L, [2, 2, -1]), shared.precision)
+
         # get the factor's tenor points
         factor_tenor = self.factor.get_tenor()
 
@@ -463,31 +494,14 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
                 tf.concat([first_part, second_part, third_part], axis=1),
                 tf.stack([BtT[j] * BtT[i], BtT[i] / alpha[j], BtT[j] / alpha[i]]))
 
-        # calculate the Covariance matrix
-        c11 = tf.pad(CtT[0][1:] - CtT[0][:-1], [[1, 0]], constant_values=CtT[0][0])
-        c12 = tf.pad(CtT[1][1:] - CtT[1][:-1], [[1, 0]], constant_values=CtT[1][0])
-        c22 = tf.pad(CtT[3][1:] - CtT[3][:-1], [[1, 0]], constant_values=CtT[3][0])
+        # check the paramters
+        t_CtT = tf.transpose(tf.stack(CtT))
+        # get the change in variance
+        delta_CtT = t_CtT[1:] - t_CtT[:-1]
 
-        # make sure it's ok
-        c11_ok = tf.cast(c11 > 0.0, tf.float64)
-        c22_ok = tf.cast(c22 > 0.0, tf.float64)
-        c12_ok = tf.cast((c12 * c12) < (c11 * c22), tf.float64)
+        self.params_ok = tf.reduce_all(delta_CtT[:, 0] * delta_CtT[:, 3] > delta_CtT[:, 1] * delta_CtT[:, 2])
+        self.C = tf.cond(self.params_ok, tf_cholesky, fix_cholesky)
 
-        # fudge factors to prevent underflow
-        epsilon = tf.ones_like(c11, dtype=tf.float64) * 1e-12
-        zero = tf.zeros_like(c11, dtype=tf.float64)
-
-        # calc the covariance matrix
-        C11 = c11_ok * c11 + (1.0 - c11_ok) * epsilon
-        C22 = c22_ok * c22 + (1.0 - c22_ok) * epsilon
-        C12 = c12_ok * c12
-
-        L = tf.stack([c11_ok * tf.sqrt(C11), zero,
-                      c11_ok * (C12 / tf.sqrt(C11)),
-                      c12_ok * tf.sqrt(C22 - (C12 * C12) / C11)])
-
-        # get the correlation through time - this will break if the cholesky is not Positive definite
-        self.C = tf.cast(tf.reshape(L, [2, 2, -1]), shared.precision)
         # intermediate results
         self.BtT = [tf.cast(tf.reshape(Bi, (-1, 1)), shared.precision) for Bi in BtT]
         self.YtT = [tf.cast(tf.exp(-alpha[i] * t), shared.precision) for i in range(2)]
