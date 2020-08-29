@@ -845,7 +845,11 @@ class RiskNeutralInterestRateModel(object):
                     # minimize
                     num_optimizers = len(optimizers)
                     for op_loop in range(2 * num_optimizers):
-                        optimizers[op_loop % num_optimizers].minimize(sess)
+                        try:
+                            optimizers[op_loop % num_optimizers].minimize(sess)
+                        except Exception as e:
+                            logging.warning('{} - Exception in iteration {} - {}'.format(
+                                market_factor.name[0], op_loop, e.args))
                         batch_loss, vars = sess.run([loss, implied_var])
 
                         if batch_loss < soln[0] and sess.run(process.params_ok):
@@ -1045,7 +1049,7 @@ scipy.optimize.leastsq.html) are used.',
                         jacobians.setdefault(swaption_name, {}).setdefault(name, curve)
                     else:
                         jacobians.setdefault(swaption_name, {}).setdefault(name, float(value[0]))
-                jacobians[swaption_name]['Premium'] = premium
+                jacobians[swaption_name]['Premium'] = float(premium)
 
         return jacobians
 
