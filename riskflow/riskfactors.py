@@ -651,6 +651,87 @@ class GBMTSImpliedParameters(Factor1D):
         return {'Vol': self.param['Vol'].array[:, 1]}
 
 
+class HullWhite2FactorModelParametersJacobian(Factor1D):
+    """
+    Represents the Bootstrapped implied parameters for a hull-white 2 factor model
+    """
+
+    def __init__(self, param):
+        super(HullWhite2FactorModelParametersJacobian, self).__init__(param)
+
+    def calculate_components(self, factor, gradients, currency):
+        contrib = {}
+        gradient_index = gradients.index.get_level_values(0)
+        for instrument, value in self.param.items():
+            numerator = []
+            denominator = []
+            values = []
+            for param, grad_param in value.items():
+                if param == 'Curve':
+                    param_name = utils.Factor('InterestRate', factor.name)
+                elif param == 'Quanto_FX_Volatility':
+                    param_name = utils.Factor('GBMTSImpliedParameters', currency+('Vol',))
+                else:
+                    param_name = utils.Factor(factor.type, factor.name + (param,))
+                full_param_name = utils.check_tuple_name(param_name)
+                if full_param_name in gradient_index:
+                    if isinstance(grad_param, utils.Curve):
+                        slice = gradients.loc(axis=0)[full_param_name, grad_param.array[:, 0]]
+                        # have to make sure the denominator and numerator match
+                        denominator.extend(np.interp(slice.index.get_level_values(1), *grad_param.array.T))
+                        numerator.extend(slice['Gradient'].values)
+                        values.extend(slice['Value'].values)
+                    else:
+                        denominator.append(grad_param)
+                        numerator.append(gradients.loc[(full_param_name,)]['Gradient'].iloc[0])
+                        values.append(gradients.loc[(full_param_name,)]['Value'].iloc[0])
+
+            contrib[instrument] = {
+                'Gradient': np.dot(numerator, values)/np.dot(denominator, values),
+                'Premium': value['Premium']
+            }
+
+        return pd.DataFrame(contrib).T
+
+    def get_tenor(self):
+        """Gets the tenor points stored in the Curve attribute"""
+        return np.array([0.0])
+
+    def get_vol_tenors(self):
+        return [self.param['Sigma_1'].array[:, 0], self.param['Sigma_2'].array[:, 0]]
+
+    def get_tenor_indices(self):
+        zero = np.array([[0.0]])
+        sig1, sig2 = self.get_vol_tenors()
+        return {'Alpha_1': zero,
+                'Alpha_2': zero,
+                'Correlation': zero,
+                'Sigma_1': sig1.reshape(-1, 1),
+                'Sigma_2': sig2.reshape(-1, 1),
+                'Quanto_FX_Correlation_1': zero,
+                'Quanto_FX_Correlation_2': zero}
+
+    def current_value(self, tenors=None, offset=0.0, include_quanto=False):
+        """Returns the parameters of the HW2 factor model as a dictionary"""
+
+        params = OrderedDict([('Alpha_1', np.array([self.param['Alpha_1']])),
+                              ('Alpha_2', np.array([self.param['Alpha_2']])),
+                              ('Correlation', np.array([self.param['Correlation']])),
+                              ('Sigma_1', self.param['Sigma_1'].array[:, 1]),
+                              ('Sigma_2', self.param['Sigma_2'].array[:, 1])])
+
+        if self.get_instantaneous_correlation() is None and (
+                'Quanto_FX_Correlation_1' in self.param and 'Quanto_FX_Correlation_2' in self.param):
+            # needs to be looked up if there's not instantaneous correlation - otherwise it's calculated
+            params['Quanto_FX_Correlation_1'] = np.array([self.param['Quanto_FX_Correlation_1']])
+            params['Quanto_FX_Correlation_2'] = np.array([self.param['Quanto_FX_Correlation_2']])
+
+            if include_quanto:
+                params['Quanto_FX_Volatility'] = self.param['Quanto_FX_Volatility'].array[:, 1]
+
+        return params
+
+
 class HullWhite2FactorModelParameters(Factor1D):
     """
     Represents the Bootstrapped implied parameters for a hull-white 2 factor model

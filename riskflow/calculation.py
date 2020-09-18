@@ -760,6 +760,24 @@ class Credit_Monte_Carlo(Calculation):
             else:
                 self.output.setdefault(result, np.concatenate(data, axis=-1).astype(np.float64))
 
+        # now check for jacobians
+        reverse_lookup = {v: k for k, v in self.implied_ofs.items()}
+        jacobians = {}
+        for index, (k, v) in enumerate(self.implied_factors.items()):
+            jac_factor = utils.Factor(k.type + 'Jacobian', k.name)
+            if utils.check_tuple_name(jac_factor) in self.config.params['Price Factors']:
+                jacobian = construct_factor(jac_factor, self.config.params['Price Factors'])
+                currency = self.all_factors[reverse_lookup[index]].factor.get_currency()
+                for res, value in self.output.items():
+                    if res.startswith('grad'):
+                        jacobians.setdefault(res, {}).setdefault(
+                            k, jacobian.calculate_components(k, value, currency))
+
+        # merge and report
+        for grad_xva, jac_xva in jacobians.items():
+            self.output['implied_'+grad_xva[5:]] = pd.concat([v.set_index(pd.MultiIndex.from_tuples([
+                (utils.check_scope_name(k), x) for x in v.index])) for k, v in jac_xva.items()])
+
         return self.output
 
     def execute(self, params):
@@ -957,6 +975,7 @@ class Credit_Monte_Carlo(Calculation):
                         output['grad_cva'] = sensitivity.report_grad()
                         # store the size of the Gradient
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
+
                         if hessian:
                             # calculate the hessian matrix - warning - make sure you have enough memory
                             output['grad_cva_hessian'] = sensitivity.report_hessian()
