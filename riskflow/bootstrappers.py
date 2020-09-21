@@ -51,6 +51,18 @@ date_desc = {'years': 'Y', 'months': 'M', 'days': 'D'}
 # date formatter
 date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwds.items()])
 
+# list of master (Risk Free) curves for each currency
+master_curve_list = {
+     'AUD': 'AUD-MASTER',
+     'CAD': 'CAD-MASTER',
+     'CHF': 'CHF-MASTER',
+     'EUR': 'EUR-MASTER',
+     'GBP': 'GBP-MASTER',
+     'JPY': 'JPY-MASTER',
+     'USD': 'USD-MASTER',
+     'ZAR': 'ZAR-SWAP'
+     }
+
 
 def create_float_cashflows(base_date, cashflow_obj, frequency):
     cashflows = []
@@ -170,11 +182,16 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
             Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, time_index), Calc_res=None)
 
         shifted_strike = K + shift_parameter
+        # first check if we have the actual premium (not implied)
+        if vol_surface.premiums is not None:
+            swaption_price = vol_surface.get_premium(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
+        else:
+            swaption_price = pvbp * utils.black_european_option_price(
+                shifted_strike, shifted_strike, 0.0, vol, expiry, 1.0, 1.0)
+
         # store this
         all_deals[swaption_name] = market_swap_class(
-            deal_data=deal_data,
-            price=pvbp * utils.black_european_option_price(shifted_strike, shifted_strike, 0.0, vol, expiry, 1.0, 1.0),
-            weight=instrument['Weight'])
+            deal_data=deal_data, price=swaption_price, weight=instrument['Weight'])
 
         # store the benchmark
         if rate is not None:
@@ -774,6 +791,12 @@ class RiskNeutralInterestRateModel(object):
         base_date = sys_params['Base_Date']
         base_currency = sys_params['Base_Currency']
 
+        if sys_params.get('Swaption_Premiums') is not None:
+            swaption_premiums = pd.read_csv(sys_params['Swaption_Premiums'], index_col=0)
+            ATM_Premiums = swaption_premiums[swaption_premiums['Strike'] == 'ATM']
+        else:
+            ATM_Premiums = None
+
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
             market_factor = utils.Factor(rate[0], rate[1:])
@@ -787,11 +810,16 @@ class RiskNeutralInterestRateModel(object):
                 try:
                     swaptionvol = riskfactors.construct_factor(vol_factor, price_factors)
                     ir_curve = riskfactors.construct_factor(ir_factor, price_factors)
+                    swaptionvol.set_premiums(ATM_Premiums, ir_curve.get_currency())
                 except KeyError as k:
                     logging.warning('Missing price factor {} - Unable to bootstrap {}'.format(k.args, market_price))
                     continue
                 except Exception:
                     logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
+                    continue
+
+                if master_curve_list.get(ir_curve.get_currency()[0]) != rate[1]:
+                    logging.warning('curve is not Risk Free {} - skipping and will reassign later'.format(market_price))
                     continue
 
                 # set of dates for the calibration
@@ -844,7 +872,7 @@ class RiskNeutralInterestRateModel(object):
 
                     # minimize
                     num_optimizers = len(optimizers)
-                    for op_loop in range(2 * num_optimizers):
+                    for op_loop in range(3 * num_optimizers):
                         try:
                             optimizers[op_loop % num_optimizers].minimize(sess)
                         except Exception as e:
