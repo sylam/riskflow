@@ -215,7 +215,7 @@ class Factor3D(object):
                 exp_surface = surface[surface[:, self.EXPIRY_INDEX] == x]
                 if not exp_surface.any():
                     expiries = np.unique(surface[:, self.EXPIRY_INDEX])
-                    nearest_expiry = expiries[expiries.searchsorted(x).clip(0, expiries.size-1)]
+                    nearest_expiry = expiries[expiries.searchsorted(x).clip(0, expiries.size - 1)]
                     exp_surface = surface[surface[:, self.EXPIRY_INDEX] == nearest_expiry]
                 sigma = exp_surface[:, 3]
                 mns = exp_surface[:, self.MONEYNESS_INDEX]
@@ -770,6 +770,16 @@ class InterestYieldVol(Factor3D):
     def __init__(self, param):
         super(InterestYieldVol, self).__init__(param)
         self.atm_surface = None
+        self.premiums = None
+
+    def set_premiums(self, df, currency):
+        if df is not None:
+            self.premiums = df[df['Currency'] == currency[0]]
+
+    def get_premium(self, expiry, tenor):
+        prem = self.premiums[(self.premiums['UnderlyingTenor'] == tenor) &
+                             (self.premiums['Expiry'] == expiry)]['Payer']
+        return prem.values[0] / 10000.0
 
     @property
     def BlackScholesDisplacedShiftValue(self):
