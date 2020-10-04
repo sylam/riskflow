@@ -32,15 +32,15 @@ from tensorflow.python.client import device_lib
 # load up some useful data types
 from collections import OrderedDict, namedtuple, defaultdict
 # import the risk factors (also known as price factors)
-from riskflow.riskfactors import construct_factor
+from .riskfactors import construct_factor
 # import the stochastic processes
-from riskflow.stochasticprocess import construct_process
+from .stochasticprocess import construct_process
 # import the currency/curve lookup factors 
-from riskflow.instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
+from .instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
 # import the hessian function
-from riskflow.pricing import SensitivitiesEstimator
+from .pricing import SensitivitiesEstimator
 # import the documentation and utils modules
-from riskflow import utils
+from . import utils
 
 
 class InstrumentExpired(Exception):

@@ -21,16 +21,17 @@ import sys
 import glob
 import shutil
 import logging
-import traceback
 import pandas as pd
 
 from multiprocessing import Process, Queue, Manager
 
 
-def work(job_id, queue, result, price_factors, price_factor_interp,
+def work(job_id, queue, result, price_factors,
          price_models, sys_params, holidays):
     # set the visible GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = str(job_id)
+    # set the log level
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
     # log to file
     logging.basicConfig(level=logging.INFO,
@@ -38,7 +39,8 @@ def work(job_id, queue, result, price_factors, price_factor_interp,
                         datefmt='%m-%d %H:%M',
                         filename='bootstrap_{}.log'.format(job_id),
                         filemode='w')
-    from riskflow.bootstrappers import construct_bootstrapper
+
+    from .bootstrappers import construct_bootstrapper
 
     bootstrappers = {}
 
@@ -53,16 +55,11 @@ def work(job_id, queue, result, price_factors, price_factor_interp,
         try:
             name = list(job_price.keys())[0]
             if bootstrapper_name not in bootstrappers:
-                bootstrappers[bootstrapper_name] = construct_bootstrapper(
-                    bootstrapper_name, params)
+                bootstrappers[bootstrapper_name] = construct_bootstrapper(bootstrapper_name, params)
             bootstrapper = bootstrappers[bootstrapper_name]
-            bootstrapper.bootstrap(
-                sys_params, price_models, price_factors, price_factor_interp, job_price, holidays)
+            bootstrapper.bootstrap(sys_params, price_models, price_factors, job_price, holidays)
 
         except Exception as e:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            traceback.print_exception(
-                exc_type, exc_value, exc_traceback, limit=2, file=sys.stdout)
             result.put('Cannot execute Bootstrapper for {0} - {1}'.format(name, e.args))
         else:
             result.put('{} - Job {} Ok'.format(name, job_id))
@@ -82,12 +79,14 @@ class Parent(object):
     def start(self, rundate, input_path, calendar, outfile='CVAMarketDataCal', premium_file=None):
         # disable gpus
         os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
+        # set the log level for the parent
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
         # set the logger
         logging.basicConfig(level=logging.INFO,
                             format='%(asctime)s %(levelname)-8s %(message)s',
                             datefmt='%m-%d %H:%M')
 
-        from adaptiv import AdaptivContext
+        from .adaptiv import AdaptivContext
 
         # create the context
         self.cx = AdaptivContext()
@@ -139,15 +138,14 @@ class Parent(object):
 
         # load the params
         price_factors = self.manager.dict(self.cx.params['Price Factors'])
-        price_factor_interp = self.manager.dict(self.cx.params['Price Factor Interpolation'])
         price_models = self.manager.dict(self.cx.params['Price Models'])
         sys_params = self.manager.dict(self.cx.params['System Parameters'])
         holidays = self.manager.dict(self.cx.holidays)
 
         logging.info("starting {0} workers in {1}".format(self.NUMBER_OF_PROCESSES, input_path))
         self.workers = [Process(target=work, args=(
-            i, self.queue, self.result, price_factors, price_factor_interp,
-            price_models, sys_params, holidays)) for i in range(self.NUMBER_OF_PROCESSES)]
+            i, self.queue, self.result, price_factors, price_models, sys_params, holidays)) for i in
+                        range(self.NUMBER_OF_PROCESSES)]
 
         for w in self.workers:
             w.start()
@@ -179,8 +177,8 @@ class Parent(object):
         self.result.close()
 
         # join the children to this process
-        for w in self.workers:
-            w.join()
+        for i in range(self.NUMBER_OF_PROCESSES):
+            self.workers[i].join()
 
         # write out the data
         logging.info('Parent: All done - saving data')
@@ -188,11 +186,11 @@ class Parent(object):
         if self.daily:
             # write out the calibrated data
             self.cx.write_marketdata_json(os.path.join(self.path, self.outfile + '.json'))
-            # self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
+            self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
             logfilename = os.path.join(self.path, self.outfile + '.log')
         else:
             self.cx.write_marketdata_json(os.path.join(self.path, rundate, 'MarketDataCal.json'))
-            # self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
+            self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
             logfilename = os.path.join(self.path, rundate, 'MarketDataCal.log')
 
         # copy the logs across
@@ -235,10 +233,10 @@ def main():
             None, args.market_file, calendar, outfile=args.output_file, premium_file=args.premium_file)
     elif args.task == 'CopyHW':
         import numpy as np
-        from riskflow import utils
-        from riskflow.riskfactors import construct_factor
-        from riskflow.adaptiv import AdaptivContext
-        from riskflow.bootstrappers import master_curve_list
+        from . import utils
+        from .riskfactors import construct_factor
+        from .adaptiv import AdaptivContext
+        from .bootstrappers import master_curve_list
         # load the context
         context = AdaptivContext()
         context.parse_json(args.market_file)

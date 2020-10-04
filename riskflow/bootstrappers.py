@@ -27,10 +27,10 @@ import pandas as pd
 import tensorflow as tf
 
 # Internal modules
-from riskflow import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
+from . import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
 
 # misc functions/classes
-from riskflow.calculation import TimeGrid
+from .calculation import TimeGrid
 from tensorflow.contrib.opt import ExternalOptimizerInterface
 
 from tensorflow.python.framework import ops
