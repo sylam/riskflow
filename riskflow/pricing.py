@@ -25,7 +25,7 @@ from itertools import zip_longest
 import numpy as np
 import tensorflow as tf
 
-from riskflow import utils
+from . import utils
 
 # useful constants
 BARRIER_UP = -1.0

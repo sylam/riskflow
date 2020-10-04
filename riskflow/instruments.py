@@ -23,7 +23,7 @@ from collections import OrderedDict
 from functools import reduce
 
 # utility functions and constants
-from riskflow import utils, pricing
+from . import utils, pricing
 
 # specific modules
 import numpy as np

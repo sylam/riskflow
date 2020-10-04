@@ -34,10 +34,10 @@ import pandas as pd
 from pyparsing import Literal, Word, nums, OneOrMore, delimitedList, oneOf, Optional, Group
 
 # import libraries
-from riskflow import utils
-from riskflow.bootstrappers import construct_bootstrapper
-from riskflow.instruments import construct_instrument, Deal
-from riskflow.stochasticprocess import construct_calibration_config, construct_process
+from . import utils
+from .bootstrappers import construct_bootstrapper
+from .instruments import construct_instrument, Deal
+from .stochasticprocess import construct_calibration_config, construct_process
 
 # define datetime routines
 Timestamp = pd.Timestamp

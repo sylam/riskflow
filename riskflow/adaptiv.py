@@ -27,10 +27,10 @@ from xml.etree.ElementTree import ElementTree, Element, iterparse
 from collections import OrderedDict
 
 # needed types
-from riskflow import utils
-from riskflow.config import ModelParams, Context
-from riskflow.stochasticprocess import construct_calibration_config
-from riskflow.instruments import construct_instrument
+from . import utils
+from .config import ModelParams, Context
+from .stochasticprocess import construct_calibration_config
+from .instruments import construct_instrument
 
 try:
     # load up extra libraries

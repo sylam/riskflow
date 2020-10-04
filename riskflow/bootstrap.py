@@ -40,7 +40,7 @@ def work(job_id, queue, result, price_factors,
                         filename='bootstrap_{}.log'.format(job_id),
                         filemode='w')
 
-    from riskflow.bootstrappers import construct_bootstrapper
+    from .bootstrappers import construct_bootstrapper
 
     bootstrappers = {}
 
@@ -86,7 +86,7 @@ class Parent(object):
                             format='%(asctime)s %(levelname)-8s %(message)s',
                             datefmt='%m-%d %H:%M')
 
-        from riskflow.adaptiv import AdaptivContext
+        from .adaptiv import AdaptivContext
 
         # create the context
         self.cx = AdaptivContext()
@@ -233,10 +233,10 @@ def main():
             None, args.market_file, calendar, outfile=args.output_file, premium_file=args.premium_file)
     elif args.task == 'CopyHW':
         import numpy as np
-        from riskflow import utils
-        from riskflow.riskfactors import construct_factor
-        from riskflow.adaptiv import AdaptivContext
-        from riskflow.bootstrappers import master_curve_list
+        from . import utils
+        from .riskfactors import construct_factor
+        from .adaptiv import AdaptivContext
+        from .bootstrappers import master_curve_list
         # load the context
         context = AdaptivContext()
         context.parse_json(args.market_file)

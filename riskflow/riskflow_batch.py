@@ -63,7 +63,7 @@ class JOB(object):
 
     def perform_calc(self):
         # should be loaded correctly
-        from riskflow.calculation import construct_calculation
+        from .calculation import construct_calculation
         # create the calculation    
         calc = construct_calculation('Credit_Monte_Carlo', self.cx)
         # call the custom calc
@@ -150,7 +150,7 @@ class CVA_GRAD(JOB):
             return True
 
     def run_calc(self, calc):
-        from riskflow.calculation import construct_calculation
+        from .calculation import construct_calculation
 
         filename = 'CVA_' + self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
 
@@ -245,7 +245,7 @@ class CVA(JOB):
             return True
 
     def run_calc(self, calc):
-        from riskflow.calculation import construct_calculation
+        from .calculation import construct_calculation
 
         # load up CVA calc params
         if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
@@ -309,7 +309,7 @@ class COLLVA(JOB):
                        'Debug': 'No', 'NoModel': 'Constant', 'Partition': 'None',
                        'Generate_Slideshow': 'No', 'PFE_Recon_File': ''}
 
-        from riskflow.adaptiv import AdaptivContext
+        from .adaptiv import AdaptivContext
         self.cx = AdaptivContext()
         old_cx = AdaptivContext()
         # load marketdata
@@ -328,7 +328,7 @@ class COLLVA(JOB):
         self.balance_currency = self.ns.get('Balance_Currency', self.agreement_currency)
         # set the OIS cashflow flag to speed up prime linked swaps
         self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
-        from riskflow.utils import Curve
+        from .utils import Curve
         # change the currency
         self.params['Currency'] = self.agreement_currency
 
@@ -406,7 +406,7 @@ class CVADEFAULT(JOB):
                        'Debug': 'No', 'NoModel': 'Constant', 'Partition': 'None',
                        'Generate_Slideshow': 'No', 'PFE_Recon_File': ''}
 
-        from riskflow.adaptiv import AdaptivContext
+        from .adaptiv import AdaptivContext
         self.cx = AdaptivContext()
         old_cx = AdaptivContext()
         # load marketdata
@@ -425,7 +425,7 @@ class CVADEFAULT(JOB):
         self.balance_currency = self.ns.get('Balance_Currency', self.agreement_currency)
         # set the OIS cashflow flag to speed up prime linked swaps
         self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
-        from riskflow.utils import Curve
+        from .utils import Curve
         # set the survival curve to a default value
         self.crb_default = self.cx.deals['Attributes']['Reference']
         self.cx.params['Price Factors'].setdefault('SurvivalProb.' + self.crb_default,
@@ -511,7 +511,7 @@ class FVADEFAULT(JOB):
                        'Debug': 'No', 'NoModel': 'Constant', 'Partition': 'None',
                        'Generate_Slideshow': 'No', 'PFE_Recon_File': ''}
 
-        from riskflow.adaptiv import AdaptivContext
+        from .adaptiv import AdaptivContext
         self.cx = AdaptivContext()
         old_cx = AdaptivContext()
         # load marketdata
@@ -530,7 +530,7 @@ class FVADEFAULT(JOB):
         self.balance_currency = self.ns.get('Balance_Currency', self.agreement_currency)
         # set the OIS cashflow flag to speed up prime linked swaps
         self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
-        from riskflow.utils import Curve
+        from .utils import Curve
 
         def makeflatcurve(curr, bps, tenor=30):
             return {'Currency': curr, 'Curve': Curve([], [[0, bps * 0.01 * 0.01], [tenor, bps * 0.01 * 0.01]]),
@@ -611,7 +611,7 @@ class CVAVega(JOB):
                        'Partition': 'None', 'Generate_Slideshow': 'No',
                        'PFE_Recon_File': ''}
 
-        from riskflow.adaptiv import AdaptivContext
+        from .adaptiv import AdaptivContext
         self.cx = AdaptivContext()
         self.cx.parse_json(os.path.join(self.input_path, rundate, 'MarketDataCVA.json'))
         self.noshift = AdaptivContext()
@@ -631,7 +631,7 @@ class CVAVega(JOB):
         self.balance_currency = self.ns.get('Balance_Currency', self.agreement_currency)
         # set the OIS cashflow flag to speed up prime linked swaps
         self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
-        from riskflow.utils import Curve
+        from .utils import Curve
         # set the survival curve to a default value
         self.crb_default = self.cx.deals['Attributes']['Reference']
         self.cx.params['Price Factors'].setdefault('SurvivalProb.' + self.crb_default,
@@ -647,7 +647,7 @@ class CVAVega(JOB):
             return True
 
     def run_calc(self, calc):
-        from riskflow.calculation import construct_calculation
+        from .calculation import construct_calculation
 
         self.params['CVA'] = {'Deflation': self.cx.deals['Calculation'].get('Deflation_Interest_Rate', 'ZAR-SWAP'),
                               'Gradient': 'No'}
@@ -726,7 +726,7 @@ class BaseVal(JOB):
             self.logger(self.netting_set, 'Warning: skipping BaseVal calc as file already exists')
         else:
             # should be loaded correctly
-            from riskflow.calculation import construct_calculation
+            from .calculation import construct_calculation
             calc = construct_calculation('Base_Revaluation', self.cx, prec=np.float64)
             self.params.update({'Currency': 'ZAR', 'Greeks': 'No'})
             base_val = calc.execute(self.params)
@@ -759,7 +759,7 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
     # now load the cuda context
-    from riskflow.adaptiv import AdaptivContext
+    from .adaptiv import AdaptivContext
 
     # create the crstal context
     cx = AdaptivContext()
