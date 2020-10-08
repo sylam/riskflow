@@ -27,7 +27,7 @@ import scipy as sp
 import torch
 import torch.nn.functional as F
 
-from riskflow import utils
+from . import utils
 
 # useful constants
 BARRIER_UP = -1.0
@@ -1606,6 +1606,7 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
 
     # first precalc all past resets
     all_samples = []
+
     for samples in cash.get_resets(shared.device, shared.precision).split_groups(2):
         known_sample = samples.known_resets(shared.simulation_batch, include_today=True)
         sim_samples = samples.schedule[
@@ -1617,7 +1618,7 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
 
         # fetch all fixed resets
         if past_samples.shape[1] != shared.simulation_batch:
-            past_samples = past_samples.expand(-1, shared.simulation_batch)
+            past_samples = past_samples.expand(sim_samples.shape[0], shared.simulation_batch)
 
         all_samples.append(torch.cat(
             [torch.cat(known_sample, axis=0), past_samples], axis=0) if known_sample else past_samples)
@@ -1668,7 +1669,8 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
             if factor_dep['PrincipleNotShares']:
                 payment /= St0
 
-            payoffs.append(payment)
+            payoffs.append(payment.expand(time_block.size, -1, -1) if time_block.size > 1 else payment)
+
             # settle cashflow if necessary
             cash_settle(shared, factor_dep['SettleCurrency'],
                         np.searchsorted(time_grid.mtm_time_grid, cashflow_pay[0][0]),

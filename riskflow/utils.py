@@ -189,6 +189,11 @@ WeekendMap = {'Friday and Saturday': 'Sun Mon Tue Wed Thu',
               'Friday': 'Sat Sun Mon Tue Wed Thu'}
 
 
+class InstrumentExpired(Exception):
+    def __init__(self, message):
+        self.message = message
+
+
 # Defined types - things like percentages, basis points etc.
 
 class Descriptor:

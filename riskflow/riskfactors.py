@@ -21,7 +21,7 @@ import itertools
 import numpy as np
 import pandas as pd
 
-from riskflow import utils
+from . import utils
 from collections import OrderedDict
 from scipy.interpolate import RectBivariateSpline
 

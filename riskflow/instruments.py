@@ -23,7 +23,7 @@ from collections import OrderedDict
 from functools import reduce
 
 # utility functions and constants
-from riskflow import utils, pricing
+from . import utils, pricing
 
 # specific modules
 import numpy as np
@@ -2573,7 +2573,7 @@ class EquitySwapLeg(Deal):
         super(EquitySwapLeg, self).reset()
         self.bus_pay_day = calendars.get(self.field.get('Payment_Calendars', self.field['Accrual_Calendars']),
                                          {'businessday': pd.offsets.BDay(1)})['businessday']
-        paydates = {self.field['Maturity_Date'] + self.bus_pay_day * self.field['Payment_Offset']}
+        paydates = {self.field['Maturity_Date'] + self.bus_pay_day * int(self.field['Payment_Offset'])}
         self.add_reval_dates(paydates, self.field['Currency'])
         # this swap could be quantoed
         self.isQuanto = None
@@ -2615,7 +2615,7 @@ class EquitySwapLeg(Deal):
 
         field['cashflow'] = {'Items':
             [{
-                'Payment_Date': self.field['Maturity_Date'] + self.bus_pay_day * self.field['Payment_Offset'],
+                'Payment_Date': self.field['Maturity_Date'] + self.bus_pay_day * int(self.field['Payment_Offset']),
                 'Start_Date': self.field['Effective_Date'],
                 'End_Date': self.field['Maturity_Date'],
                 'Start_Multiplier': 1.0,

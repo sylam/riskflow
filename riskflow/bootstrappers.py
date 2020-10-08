@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 
 # Internal modules
-from riskflow import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
+from . import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
 
 from scipy.stats import norm
 import scipy.optimize

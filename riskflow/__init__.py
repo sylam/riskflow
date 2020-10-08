@@ -27,7 +27,7 @@ import pandas as pd
 import collections.abc
 
 from ._version import version_info, __version__
-from riskflow import utils
+from . import utils
 
 
 def update_dict(d, u):
@@ -82,7 +82,7 @@ def load_market_data(rundate, path, json_name='MarketData.json', cva_default=Tru
     :param cva_default: loads a survival curve with recovery 50% (useful for testing)
     :return: a context object with the data and calendars loaded
     """
-    from riskflow.adaptiv import AdaptivContext as Context
+    from .adaptiv import AdaptivContext as Context
 
     context = Context()
     context.parse_json(os.path.join(path, rundate, json_name))
@@ -107,7 +107,7 @@ def run_baseval(context, prec, device, overrides=None):
     :param overrides: a dictionary of overrides to replace the context's  calculation parameters
     :return: a tuple containing the calculation object and the output dictionary
     """
-    from riskflow.calculation import construct_calculation
+    from .calculation import construct_calculation
     calc_params = context.deals.get('Calculation',
                                     {'Base_Date': context.params['System Parameters']['Base_Date'],
                                      'Currency': 'ZAR'})
@@ -135,7 +135,7 @@ def run_cmc(context, prec, device, overrides=None, CVA=False, FVA=False, CollVA=
     :param CollVA:  calculates CollVA
     :return: a tuple containing the calculation object, output dictionary and exposure profile
     """
-    from riskflow.calculation import construct_calculation
+    from .calculation import construct_calculation
     calc_params = context.deals.get('Calculation',
                                     {'Base_Date': context.params['System Parameters']['Base_Date'],
                                      'Base_Time_Grid': '0d 2d 1w(1w) 1m(1m) 3m(3m)',
