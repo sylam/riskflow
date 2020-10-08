@@ -29,20 +29,15 @@ import torch
 # load up some useful data types
 from collections import OrderedDict, namedtuple, defaultdict
 # import the risk factors (also known as price factors)
-from riskflow.riskfactors import construct_factor
+from .riskfactors import construct_factor
 # import the stochastic processes
-from riskflow.stochasticprocess import construct_process
+from .stochasticprocess import construct_process
 # import the currency/curve lookup factors 
-from riskflow.instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
+from .instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
 # import the hessian function
-from riskflow.pricing import SensitivitiesEstimator
+from .pricing import SensitivitiesEstimator
 # import the documentation and utils modules
-from riskflow import utils, pricing
-
-
-class InstrumentExpired(Exception):
-    def __init__(self, message):
-        self.message = message
+from . import utils, pricing
 
 
 class Aggregation(object):
@@ -70,11 +65,11 @@ class DealStructure(object):
             reval_dates = deal.get_reval_dates(clip_expiry=True)
             if len(time_grid.scenario_dates) == 1:
                 if len(reval_dates) > 0 and max(reval_dates) < base_date:
-                    raise InstrumentExpired(deal.field.get('Reference', 'Unknown Instrument Reference'))
+                    raise utils.InstrumentExpired(deal.field.get('Reference', 'Unknown Instrument Reference'))
                 deal_time_dep = time_grid.calc_deal_grid({base_date})
             else:
                 deal_time_dep = time_grid.calc_deal_grid(reval_dates)
-        except InstrumentExpired as e:
+        except utils.InstrumentExpired as e:
             logging.warning('skipping expired deal {0}'.format(e.args))
 
         return deal_time_dep
@@ -348,11 +343,16 @@ class Calculation(object):
                 if display_val:
                     if name in factor_values:
                         rate_non_zero = grad_index[non_zero][:, :index_len].astype(np.float64)
-                        factor.append(factor_values[name].current_value(rate_non_zero).flatten())
+                        factor_val = factor_values[name].current_value(rate_non_zero).flatten()
                     else:
                         sub_rate, param = name.rsplit('.', 1)
                         sub_rate_non_zero = grad_index[non_zero].shape[0]
-                        factor.append(factor_values[sub_rate].current_value()[param].flatten()[:sub_rate_non_zero])
+                        factor_val = factor_values[sub_rate].current_value()[param].flatten()[:sub_rate_non_zero]
+
+                    if factor_val.size == non_zero.size:
+                        factor.append(factor_val)
+                    else:
+                        logging.warning(('Skipping rate in gradient calculation {} - check data'.format(name)))
 
             tenors = np.vstack(tenor)
             self.hessian_index = (np.hstack(hessian_index[0]), np.vstack(hessian_index[1]))

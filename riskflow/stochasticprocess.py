@@ -27,8 +27,8 @@ import torch
 import torch.nn.functional as F
 
 # Internal modules
-from riskflow import utils
-from riskflow.instruments import get_fx_zero_rate_factor
+from . import utils
+from .instruments import get_fx_zero_rate_factor
 
 
 def piecewise_linear(t, tenor, values, shared):

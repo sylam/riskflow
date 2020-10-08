@@ -40,7 +40,7 @@ def work(job_id, queue, result, price_factors,
                         filename='bootstrap_{}.log'.format(job_id),
                         filemode='w')
     import torch
-    from riskflow.bootstrappers import construct_bootstrapper
+    from .bootstrappers import construct_bootstrapper
 
     bootstrappers = {}
     # set the gpu
