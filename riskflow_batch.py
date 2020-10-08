@@ -18,6 +18,7 @@
 
 import os
 import sys
+import time
 import json
 import glob
 import traceback
@@ -311,13 +312,10 @@ class COLLVA(JOB):
 
         from riskflow.adaptiv import AdaptivContext
         self.cx = AdaptivContext()
-        old_cx = AdaptivContext()
-        # load marketdata
-        old_cx.parse_json(os.path.join(self.input_path, rundate, 'MarketData.json'))
         # load up the CVA marketdata file
         self.cx.parse_json(os.path.join(self.input_path, rundate, 'MarketDataCVA.json'))
-        # update the cva data with the arena data
-        self.cx.params['Price Factors'].update(old_cx.params['Price Factors'])
+        # update the cva data with the arena data - should also have the parameters overridden
+        self.cx.params['Price Factors'].update(cx.params['Price Factors'])
         # load trade
         self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
         # get the netting set
@@ -340,55 +338,75 @@ class COLLVA(JOB):
         if self.agreement_currency == 'ZAR':
             self.cx.params['Price Factors']['InterestRate.ZAR-SWAP.OIS'] = makeflatcurve('ZAR', -15)
             self.cx.params['Price Factors']['InterestRate.ZAR-SWAP.FUNDING'] = makeflatcurve('ZAR', 10)
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0][
-                'Collateral_Rate'] = 'ZAR-SWAP.OIS'
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0][
-                'Funding_Rate'] = 'ZAR-SWAP.FUNDING'
+            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets'] = {
+                'Cash_Collateral': [{
+                    'Currency': 'USD',
+                    'Collateral_Rate': 'ZAR-SWAP.OIS',
+                    'Funding_Rate': 'ZAR-SWAP.FUNDING',
+                    'Haircut_Posted': 0.0,
+                    'Amount': 1.0}]}
         else:
+            # set the OIS curve to use the master curve
+            self.cx.params['Price Factors']['HullWhite2FactorModelParameters.USD-OIS'] = cx.params[
+                'Price Factors']['HullWhite2FactorModelParameters.USD-MASTER']
             self.cx.params['Price Factors']['InterestRate.USD-LIBOR-3M.FUNDING'] = makeflatcurve('USD', 65)
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0][
-                'Collateral_Rate'] = 'USD-OIS'
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets']['Cash_Collateral'][0][
-                'Funding_Rate'] = 'USD-LIBOR-3M.FUNDING'
+            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets'] = {
+                'Cash_Collateral': [{
+                    'Currency': 'USD',
+                    'Collateral_Rate': 'USD-OIS',
+                    'Funding_Rate': 'USD-LIBOR-3M.FUNDING',
+                    'Haircut_Posted': 0.0,
+                    'Amount': 1.0}]}
 
     def valid(self):
         if not self.cx.deals['Deals']['Children'][0]['Children'] or self.cx.deals[
-            'Deals']['Children'][0]['instrument'].field.get('Collateralized', 'False') == 'False':
+            'Deals']['Children'][0]['instrument'].field.get(
+            'Collateralized', 'False') == 'False' or self.agreement_currency != 'USD':
             return False
         else:
+            for x in self.cx.deals['Deals']['Children'][0]['Children']:
+                if 'ZAR_COHN' in x['instrument'].field['Reference']:
+                    x['Ignore'] = 'True'
             return True
 
     def run_calc(self, calc):
-        filename = 'COLLVA_' + self.params['Run_Date'] + '_' + self.crb_default + '.csv'
+        filename = 'COLLVA_' + self.params['Run_Date'] + '_' + self.netting_set + '.csv'
 
         if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping COLLVA calc as file already exists')
         else:
             self.params['CollVA'] = {'Gradient': 'Yes'}
+            self.params['Simulation_Batches'] = 1
+            self.params['Batch_Size'] = 128
 
-            # make sure the margin period of risk is 10 business days (approx 12 calendar days)
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Liquidation_Period'] = 12.0
-            self.params['Simulation_Batches'] = 20
-            self.params['Batch_Size'] = 256
+            calc_complete = False
+            while not calc_complete:
+                try:
+                    out = calc.execute(self.params)
+                except RuntimeError as e:  # Out of memory
+                    exc_type, exc_value, exc_traceback = sys.exc_info()
+                    traceback.print_exception(exc_type, exc_value, exc_traceback,
+                                              limit=2, file=sys.stdout)
+                    self.params['Simulation_Batches'] *= 2
+                    self.params['Batch_Size'] //= 2
+                    self.logger(self.netting_set,
+                                'Exception: OOM - Halving to {} Batchsize'.format(self.params['Batch_Size']))
+                    time.sleep(5)
+                else:
+                    calc_complete = True
 
+            stats = out['Stats']
             try:
-                out = calc.execute(self.params)
-            except Exception as e:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                traceback.print_exception(exc_type, exc_value, exc_traceback,
-                                          limit=2, file=sys.stdout)
-
-                self.logger(self.netting_set, 'Exception: ' + str(e.args))
-            else:
-                stats = out['Stats']
-                grad_collva = calc.gradients_as_df(out['Results']['grad_collva']).rename(
+                grad_collva = out['Results']['grad_collva'].rename(
                     columns={'Gradient': self.cx.deals['Attributes']['Reference']})
-                # store the CollVA as part of the stats
-                out['Stats'].update({'CollVA': out['Results']['collva'], 'Currency': self.params['Currency']})
-                grad_collva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
-                self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
-                # log the netting set
-                self.logger(self.netting_set, 'CollVA calc complete')
+            except:
+                print (out['Results'].keys())
+            # store the CollVA as part of the stats
+            out['Stats'].update({'CollVA': out['Results']['collva'], 'Currency': self.params['Currency']})
+            grad_collva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
+            self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
+            # log the netting set
+            self.logger(self.netting_set, 'CollVA calc complete')
 
 
 class CVADEFAULT(JOB):
@@ -773,7 +791,8 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
         cx_new.parse_json(os.path.join(input_path, rundate, 'CVAMarketData_Calibrated_New.json'))
         log("Parent", "Overriding Calibration")
         for factor in [x for x in cx_new.params['Price Factors'].keys()
-                       if x.startswith('HullWhite2FactorModelParameters')]:
+                       if x.startswith('HullWhite2FactorModelParameters') or
+                          x.startswith('GBMTSImpliedParameters')]:
             # override it
             cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
 
