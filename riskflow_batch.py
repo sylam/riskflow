@@ -375,9 +375,13 @@ class COLLVA(JOB):
         if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping COLLVA calc as file already exists')
         else:
+            import torch
             self.params['CollVA'] = {'Gradient': 'Yes'}
             self.params['Simulation_Batches'] = 1
             self.params['Batch_Size'] = 128
+
+            # make sure calc uses the GPU
+            calc.device = torch.device('cuda')
 
             calc_complete = False
             while not calc_complete:
@@ -774,7 +778,7 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
     # set the visible GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = str(id)
     # set the log level
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    # os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
     # now load the cuda context
     from riskflow.adaptiv import AdaptivContext

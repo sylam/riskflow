@@ -1215,7 +1215,7 @@ def calc_spot_forward(curve, T, time_grid, shared, only_diag):
 
 def calc_dividend_samples(t, T, time_grid):
     divi_scenario_offsets = []
-    samples = np.linspace(t, T, max(10, (T - t) / 30.0))
+    samples = np.linspace(t, T, int(max(10, (T - t) / 30.0)))
 
     d = []
     for reset_start, reset_end in zip(samples[:-1], samples[1:]):
