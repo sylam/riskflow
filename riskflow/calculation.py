@@ -674,7 +674,9 @@ class Credit_Monte_Carlo(Calculation):
                 correlation_matrix[index2, index1] = rho
 
         # need to do cholesky
-        eigval, eigvec = np.linalg.eig(correlation_matrix)
+        raw_eigval, raw_eigvec = np.linalg.eig(correlation_matrix)
+        # only take the real part
+        eigval, eigvec = np.real(raw_eigval), np.real(raw_eigvec)
         if not (eigval > 1e-8).all():
             # matrix not positive definite - find a close positive definite matrix
             if self.config.params['System Parameters']['Correlations_Healing_Method'] == 'Eigenvalue_Raising':
