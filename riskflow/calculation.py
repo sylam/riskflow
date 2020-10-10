@@ -249,8 +249,6 @@ class Calculation(object):
 
                     if factor_val.size == non_zero.size:
                         factor.append(factor_val)
-                    else:
-                        logging.warning(('Skipping rate in gradient calculation {} - check data'.format(name)))
 
             tenors = np.vstack(tenor)
             self.hessian_index = (np.hstack(hessian_index[0]), np.vstack(hessian_index[1]))

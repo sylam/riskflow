@@ -27,7 +27,7 @@ setup(
     entry_points={
         'console_scripts': [
             'RF_Bootstrap = riskflow.bootstrap:main',
-            'RF_Batch = riskflow.riskflow_batch:main',
+            'RF_Batch = riskflow_batch:main',
         ]},
     classifiers=['Development Status :: 4 - Beta',
                  'Intended Audience :: Developers',

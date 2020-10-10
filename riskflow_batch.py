@@ -370,15 +370,24 @@ class COLLVA(JOB):
             return True
 
     def run_calc(self, calc):
+        from riskflow.calculation import construct_calculation
+
         filename = 'COLLVA_' + self.params['Run_Date'] + '_' + self.netting_set + '.csv'
+
+        num_deals = len(self.cx.deals['Deals']['Children'][0]['Children'])
+        num_sims   = 10240
+        guess_batch = int(51200 / num_deals + .5)
+        batch_size = min(2**int(np.log(guess_batch)/np.log(2)+.5), 256)
+
+        self.logger(self.netting_set, 'Netting set has {} deals - initial batch size {}'.format(num_deals, batch_size))
 
         if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping COLLVA calc as file already exists')
         else:
             import torch
             self.params['CollVA'] = {'Gradient': 'Yes'}
-            self.params['Simulation_Batches'] = 1
-            self.params['Batch_Size'] = 128
+            self.params['Simulation_Batches'] = num_sims//batch_size
+            self.params['Batch_Size'] = batch_size
 
             # make sure calc uses the GPU
             calc.device = torch.device('cuda')
@@ -395,16 +404,14 @@ class COLLVA(JOB):
                     self.params['Batch_Size'] //= 2
                     self.logger(self.netting_set,
                                 'Exception: OOM - Halving to {} Batchsize'.format(self.params['Batch_Size']))
-                    time.sleep(5)
+                    # free the cache
+                    torch.cuda.empty_cache()
                 else:
                     calc_complete = True
 
             stats = out['Stats']
-            try:
-                grad_collva = out['Results']['grad_collva'].rename(
-                    columns={'Gradient': self.cx.deals['Attributes']['Reference']})
-            except:
-                print (out['Results'].keys())
+            grad_collva = out['Results']['grad_collva'].rename(
+                columns={'Gradient': self.cx.deals['Attributes']['Reference']})
             # store the CollVA as part of the stats
             out['Stats'].update({'CollVA': out['Results']['collva'], 'Currency': self.params['Currency']})
             grad_collva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
