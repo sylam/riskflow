@@ -400,8 +400,6 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         self.grid_index = None
         self.BtT = None
         self.C = None
-        self.f1 = None
-        self.f2 = None
 
     @staticmethod
     def num_factors():
@@ -427,7 +425,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         if self.factor_tenor is None:
             self.factor_tenor = tensor.new(self.factor.get_tenor().reshape(-1, 1))
             # store the forward curve
-            self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid, shared, ref_date)
+            fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid, shared, ref_date)
             # flatten the tenor
             self.factor_tenor_full = tensor.new_tensor(self.factor.get_tenor(), dtype=torch.float64)
             # get the quanto vol
@@ -528,7 +526,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         if len(time_grid.scenario_grid) != time_grid.time_grid_years.size:
             self.grid_index = time_grid.scen_time_grid.searchsorted(time_grid.scenario_grid[:, utils.TIME_GRID_MTM])
 
-        self.drift = torch.unsqueeze(self.fwd_curve + 0.5 * AtT.type(shared.precision), 2)
+        self.drift = torch.unsqueeze(fwd_curve + 0.5 * AtT.type(shared.precision), 2)
 
     def calc_stoch_deflator(self, time_grid, curve_index, shared):
         cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])
@@ -553,29 +551,31 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             return fwd_curve / t
 
     def calc_factors(self, factor1, factor1and2):
-        self.f1 = torch.unsqueeze((torch.cumsum(factor1 * self.F1, axis=0)
-                                   - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
-        self.f2 = torch.unsqueeze((torch.cumsum(torch.sum(factor1and2 * self.F2, axis=0), axis=0)
-                                   - self.KtT[1] + self.HtT[1]) * self.YtT[1], axis=1)
+        f1 = torch.unsqueeze(
+            (torch.cumsum(factor1 * self.F1, axis=0) - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
+        f2 = torch.unsqueeze(
+            (torch.cumsum(torch.sum(factor1and2 * self.F2, axis=0), axis=0) - self.KtT[1] + self.HtT[1]) * self.YtT[1],
+            axis=1)
+        return f1, f2
 
     @property
     def correlation_name(self):
         return 'HWImpliedInterestRate', [('F1',), ('F2',)]
 
     def generate(self, shared_mem):
-        self.calc_factors(
+        factor1, factor2 = self.calc_factors(
             shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
             shared_mem.t_random_numbers[self.z_offset:self.z_offset + 2, :self.scenario_horizon])
 
         # check if we need deflators
         if self.grid_index is not None:
             # only generate curves for the given grid
-            f1 = self.f1[self.grid_index]
-            f2 = self.f2[self.grid_index]
+            f1 = factor1[self.grid_index]
+            f2 = factor2[self.grid_index]
             drift = self.drift[self.grid_index]
         else:
-            f1 = self.f1
-            f2 = self.f2
+            f1 = factor1
+            f2 = factor2
             drift = self.drift
 
         # generate curves based on
@@ -650,14 +650,17 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
         vols = self.param['Sigma'].array
 
         # calculate known functions
-        self.H = integrate_piecewise_linear(hw_calc_H(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0],
-                                            vols[:, 1])
-        self.I = integrate_piecewise_linear(hw_calc_IJK(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0],
-                                            vols[:, 1], vols[:, 0], vols[:, 1])
-        self.J = integrate_piecewise_linear(hw_calc_IJK(2.0 * alpha, np.exp), shared, time_grid.time_grid_years,
-                                            vols[:, 0], vols[:, 1], vols[:, 0], vols[:, 1])
-        self.K = integrate_piecewise_linear(hw_calc_IJK(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0],
-                                            vols[:, 1], quantofx[:, 0], quantofx[:, 1])
+        self.H = integrate_piecewise_linear(
+            hw_calc_H(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0], vols[:, 1])
+        self.I = integrate_piecewise_linear(
+            hw_calc_IJK(alpha, np.exp), shared, time_grid.time_grid_years,
+            vols[:, 0], vols[:, 1], vols[:, 0], vols[:, 1])
+        self.J = integrate_piecewise_linear(
+            hw_calc_IJK(2.0 * alpha, np.exp), shared, time_grid.time_grid_years,
+            vols[:, 0], vols[:, 1], vols[:, 0], vols[:, 1])
+        self.K = integrate_piecewise_linear(
+            hw_calc_IJK(alpha, np.exp), shared, time_grid.time_grid_years,
+            vols[:, 0], vols[:, 1], quantofx[:, 0], quantofx[:, 1])
 
         # Now precalculate the A and B matrices
         BtT = (1.0 - np.exp(-alpha * factor_tenor)) / alpha
@@ -1019,17 +1022,18 @@ class PCAInterestRateModel(StochasticProcess):
 
     def calc_factors(self, factors):
         pc_portion = (torch.unsqueeze(factors, dim=2) * self.evecs).sum(axis=0) * self.delta_vol
-        self.stoch = (self.drift + pc_portion).cumsum(axis=0)
+        return (self.drift + pc_portion).cumsum(axis=0)
 
     @property
     def correlation_name(self):
         return 'InterestRateOUProcess', [('PC{}'.format(x),) for x in range(1, self.num_factors() + 1)]
 
     def generate(self, shared_mem):
-        self.calc_factors(shared_mem.t_random_numbers[
-                          self.z_offset:self.z_offset + self.num_factors(), :self.scenario_horizon])
+        stoch = self.calc_factors(
+            shared_mem.t_random_numbers[
+            self.z_offset:self.z_offset + self.num_factors(), :self.scenario_horizon])
 
-        return self.fwd_component * torch.exp(self.stoch)
+        return self.fwd_component * torch.exp(stoch)
 
 
 class PCAInterestRateCalibration(object):

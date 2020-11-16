@@ -334,7 +334,7 @@ class InterestRateJacobian(object):
 
                 price_factors[utils.check_tuple_name(price_param)] = jac
 
-
+#GBMAssetPriceTSModelParameters
 class GBMTSImpliedParameters(object):
     documentation = (
         'FX and Equity',
@@ -370,6 +370,7 @@ class GBMTSImpliedParameters(object):
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
             market_factor = utils.Factor(rate[0], rate[1:])
+            #'GBMAssetPriceTSModelPrices'
             if market_factor.type == 'GBMTSModelPrices':
                 # get the vol surface
                 vol_factor = utils.Factor('FXVol', utils.check_rate_name(
@@ -737,6 +738,7 @@ scipy.optimize.leastsq.html) are used.',
 
     def __init__(self, param, device, dtype):
         super(HullWhite2FactorModelParameters, self).__init__(param, device, dtype)
+        # 'HullWhite2FactorModelPrices'
         self.market_factor_type = 'HullWhite2FactorInterestRateModelPrices'
         self.sigma_bounds = (1e-5, 0.09)
         self.alpha_bounds = (1e-5, 2.4)

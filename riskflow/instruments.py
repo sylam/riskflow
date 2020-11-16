@@ -1392,6 +1392,58 @@ class FXForwardDeal(Deal):
                self.field['Sell_Amount'] * FX_Sell_rep * sell_discount_rate
 
 
+class StructuredDeal(Deal):
+    # dependent price factors for this instrument
+    factor_fields = {'Currency': ['FxRate']}
+
+    required_fields = {
+        'Currency': 'ID of the FX rate price factor used to define the settlement currency. For example, USD.'
+    }
+
+    # cuda code required to price this instrument - none - as it's in addfloatcashflow
+    cudacodetemplate = ''
+
+    def __init__(self, params, valuation_options):
+        super(StructuredDeal, self).__init__(params, valuation_options)
+
+    def reset(self, calendars):
+        super(StructuredDeal, self).reset()
+
+    def finalize_dates(self, parser, base_date, grid, node_children, node_resets, node_settlements):
+        # have to reset the original instrument and let the child node decide
+        for child in node_children:
+            node_resets.update(child.get_reval_dates())
+
+        self.reval_dates = node_resets
+        for currency, dates in node_settlements.items():
+            self.add_reval_dates(dates, currency)
+
+        return super(StructuredDeal, self).finalize_dates(
+            parser, base_date, grid, node_children, node_resets, node_settlements)
+
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {}
+        field['Currency'] = utils.check_rate_name(self.field['Currency'])
+
+        field_index = {}
+        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
+
+        return field_index
+
+    def post_process(self, accum, shared, time_grid, deal_data, child_dependencies):
+        net_mtm = 0.0
+
+        for child in child_dependencies:
+            mtm = child.Instrument.calculate(shared, time_grid, child)
+            net_mtm += mtm
+
+        return net_mtm
+
+    def generate(self, shared, time_grid, deal_data):
+        pass
+
+
 class SwapInterestDeal(Deal):
     # dependent price factors for this instrument
     factor_fields = {'Currency': ['FxRate'],
@@ -3152,13 +3204,13 @@ class FixedEnergyDeal(Deal):
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
 
-        field_index = {'SettleCurrency': self.field['Currency'], 'Currency': get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
-                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                       all_tenors, all_factors),
-                       'Cashflows': utils.make_energy_fixed_cashflows(base_date, -1.0
-                       if self.field['Payer_Receiver'] == 'Payer' else 1.0,
-                                                                      self.field['Payments'])}
+        field_index = {'SettleCurrency': self.field['Currency'],
+                       'Currency': get_fx_and_zero_rate_factor(
+                           field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'Discount': get_discount_factor(
+                           field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'Cashflows': utils.make_energy_fixed_cashflows(
+                           base_date, -1.0 if self.field['Payer_Receiver'] == 'Payer' else 1.0, self.field['Payments'])}
 
         return field_index
 

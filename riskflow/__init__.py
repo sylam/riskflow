@@ -163,7 +163,7 @@ def run_cmc(context, prec, device, overrides=None, CVA=False, FVA=False, CollVA=
                  'FVA': {'Funding_Interest_Curve': 'ZAR-SWAP.FUNDING',
                          'Risk_Free_Curve': 'ZAR-SWAP.OIS',
                          'Stochastic_Funding': 'Yes'},
-                 'CollVA': {'Gradient': 'Yes'}
+                 'CollVA': {'Gradient': 'No'}
                  }
 
     if overrides is not None:

@@ -1059,8 +1059,8 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
         known_fx = factor_dep['Cashflows'].known_fx_resets(shared.simulation_batch)
 
         # fetch fx rates - note that there is a slight difference between this and the spot fx rate
-        old_fx_rates = torch.cat([torch.stack(known_fx), sim_fx_forward]
-                                 if known_fx else sim_fx_forward, axis=0).squeeze(axis=1)
+        old_fx_rates = (torch.cat([torch.stack(known_fx), sim_fx_forward], axis=0)
+                        if known_fx else sim_fx_forward).squeeze(axis=1)
 
     forwards = utils.calc_time_grid_curve_rate(factor_dep['Forward'], deal_time, shared)
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
