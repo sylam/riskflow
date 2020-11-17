@@ -81,7 +81,7 @@ class ModelParams(object):
         # valid risk factor subtypes (only Interest rates at the moment)
         self.valid_subtype = {'BasisSpread': 'BasisSpread'}
         # these models need these additional price factors
-        self.implied_models = {'GBMAssetPriceTSModelImplied': 'GBMTSImpliedParameters',
+        self.implied_models = {'GBMAssetPriceTSModelImplied': 'GBMAssetPriceTSModelParameters',
                                'HullWhite2FactorImpliedInterestRateModel': 'HullWhite2FactorModelParameters'}
 
         self.modeldefaults = OrderedDict()

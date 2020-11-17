@@ -1331,7 +1331,7 @@ class ConstructMarkdown(object):
               'The 2 bootstrapper configurations so far supported are:',
               '',
               '```json',
-              '"GBMTSImpliedParameters": "GBMTSModelPrices"',
+              '"GBMAssetPriceTSModelParameters": "GBMAssetPriceTSModelPrices"',
               '"HullWhite2FactorModelParameters": "HullWhite2FactorInterestRateModelPrices"',
               '```',
               '',

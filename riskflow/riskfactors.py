@@ -631,13 +631,13 @@ class ReferencePrice(Factor1D):
             self.param['Fixing_Curve'].array[:, 1]
 
 
-class GBMTSImpliedParameters(Factor1D):
+class GBMAssetPriceTSModelParameters(Factor1D):
     """
     Represents the Bootstrapped TS implied parameters for a risk neutral process
     """
 
     def __init__(self, param):
-        super(GBMTSImpliedParameters, self).__init__(param)
+        super(GBMAssetPriceTSModelParameters, self).__init__(param)
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attribute"""
@@ -670,7 +670,7 @@ class HullWhite2FactorModelParametersJacobian(Factor1D):
                 if param == 'Curve':
                     param_name = utils.Factor('InterestRate', factor.name)
                 elif param == 'Quanto_FX_Volatility':
-                    param_name = utils.Factor('GBMTSImpliedParameters', currency+('Vol',))
+                    param_name = utils.Factor('GBMAssetPriceTSModelParameters', currency+('Vol',))
                 else:
                     param_name = utils.Factor(factor.type, factor.name + (param,))
                 full_param_name = utils.check_tuple_name(param_name)

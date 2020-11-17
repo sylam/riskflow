@@ -413,7 +413,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         """link market variables across different risk factors"""
         fx_implied_index = implied_ofs.get(utils.Factor('FxRate', self.factor.get_currency()))
         if fx_implied_index is not None:
-            FXImplied_vol_factor = utils.Factor('GBMTSImpliedParameters', self.factor.get_currency()+('Vol',))
+            FXImplied_vol_factor = utils.Factor('GBMAssetPriceTSModelParameters', self.factor.get_currency()+('Vol',))
             # now set the Quanto_FX_Volatility to the same vol as the fx rate
             implied_tensor['Quanto_FX_Volatility'] = implied_var[fx_implied_index][FXImplied_vol_factor]
 
