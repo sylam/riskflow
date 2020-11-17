@@ -608,8 +608,9 @@ class InterestRateJacobian(object):
 
                 price_factors[utils.check_tuple_name(price_param)] = jac
 
-
-class GBMTSImpliedParameters(object):
+#GBMAssetPriceTSModelParameters
+#GBMTSImpliedParameters
+class GBMAssetPriceTSModelParameters(object):
     documentation = (
         'FX and Equity',
         ['For Risk Neutral simulation, an integrated curve $\\bar{\\sigma}(t)$ needs to be specified and is',
@@ -643,7 +644,9 @@ class GBMTSImpliedParameters(object):
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
             market_factor = utils.Factor(rate[0], rate[1:])
-            if market_factor.type == 'GBMTSModelPrices':
+            #GBMAssetPriceTSModelPrices
+            #GBMTSModelPrices
+            if market_factor.type == 'GBMAssetPriceTSModelPrices':
                 # get the vol surface
                 vol_factor = utils.Factor('FXVol', utils.check_rate_name(
                     implied_params['instrument']['Asset_Price_Volatility']))
@@ -660,7 +663,7 @@ class GBMTSImpliedParameters(object):
                            fxvol.get_vols()[:, mn_ix - 1:mn_ix + 1]]
 
                 # store the output
-                price_param = utils.Factor('GBMTSImpliedParameters', market_factor.name)
+                price_param = utils.Factor(self.__class__.__name__, market_factor.name)
                 model_param = utils.Factor('GBMAssetPriceTSModelImplied', market_factor.name)
 
                 if fxvol.expiry.size > 1:
@@ -1029,7 +1032,9 @@ scipy.optimize.leastsq.html) are used.',
 
     def __init__(self, param, prec=np.float32):
         super(HullWhite2FactorModelParameters, self).__init__(param)
-        self.market_factor_type = 'HullWhite2FactorInterestRateModelPrices'
+        # HullWhite2FactorModelPrices
+        # HullWhite2FactorInterestRateModelPrices
+        self.market_factor_type = 'HullWhite2FactorModelPrices'
         self.sigma_bounds = (2**-16, 0.09)
         self.alpha_bounds = (2**-16, 2.4)
         self.corr_bounds = (-.95, 0.95)
@@ -1158,10 +1163,10 @@ scipy.optimize.leastsq.html) are used.',
         vol_tenors = np.array([0, 1, 3, 6, 12, 24, 48, 72, 96, 120]) / 12.0
         # construct an initial guess - need to read from params
         param_name = utils.check_tuple_name(
-            utils.Factor(type='HullWhite2FactorModelParameters', name=rate[1:]))
+            utils.Factor(type=self.__class__.__name__, name=rate[1:]))
 
         # check if we need a quanto fx vol
-        fx_factor = utils.Factor('GBMTSImpliedParameters', ir_curve.get_currency())
+        fx_factor = utils.Factor('GBMAssetPriceTSModelParameters', ir_curve.get_currency())
         ir_factor = utils.Factor('InterestRate', ir_curve.get_currency())
         fx_factor_name = utils.check_tuple_name(fx_factor)
         ir_factor_name = utils.check_tuple_name(ir_factor)
@@ -1209,7 +1214,7 @@ scipy.optimize.leastsq.html) are used.',
 
     def save_params(self, vars, price_factors, implied_obj, rate):
         param_name = utils.check_tuple_name(
-            utils.Factor(type='HullWhite2FactorModelParameters', name=rate[1:]))
+            utils.Factor(type=self.__class__.__name__, name=rate[1:]))
         # grab the sigma tenors
         sig1_tenor, sig2_tenor = implied_obj.get_vol_tenors()
         # store the basic paramters
