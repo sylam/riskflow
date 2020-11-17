@@ -372,12 +372,11 @@ class COLLVA(JOB):
     def run_calc(self, calc):
         from riskflow.calculation import construct_calculation
 
-        filename = 'COLLVA_' + self.params['Run_Date'] + '_' + self.netting_set + '.csv'
-
+        filename = 'COLLVA_' + self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
         num_deals = len(self.cx.deals['Deals']['Children'][0]['Children'])
         num_sims   = 10240
-        guess_batch = int(51200 / num_deals + .5)
-        batch_size = min(2**int(np.log(guess_batch)/np.log(2)+.5), 256)
+        guess_batch = int(25600 / num_deals + .5)
+        batch_size = min(2**int(np.log(guess_batch)/np.log(2)+.5), 128)
 
         self.logger(self.netting_set, 'Netting set has {} deals - initial batch size {}'.format(num_deals, batch_size))
 
@@ -404,6 +403,7 @@ class COLLVA(JOB):
                     self.params['Batch_Size'] //= 2
                     self.logger(self.netting_set,
                                 'Exception: OOM - Halving to {} Batchsize'.format(self.params['Batch_Size']))
+                    time.sleep(10)
                     # free the cache
                     torch.cuda.empty_cache()
                 else:
