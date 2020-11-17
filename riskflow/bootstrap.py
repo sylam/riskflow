@@ -21,6 +21,7 @@ import sys
 import glob
 import shutil
 import logging
+import traceback
 import pandas as pd
 
 from multiprocessing import Process, Queue, Manager
@@ -60,6 +61,9 @@ def work(job_id, queue, result, price_factors,
             bootstrapper.bootstrap(sys_params, price_models, price_factors, job_price, holidays)
 
         except Exception as e:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            traceback.print_exception(exc_type, exc_value, exc_traceback,
+                                      limit=2, file=sys.stdout)
             result.put('Cannot execute Bootstrapper for {0} - {1}'.format(name, e.args))
         else:
             result.put('{} - Job {} Ok'.format(name, job_id))

@@ -143,7 +143,7 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
         float_cash = utils.generate_float_cashflows(
             base_date, time_grid, float_pay_dates, 1.0, None, None,
             instrument['Floating_Frequency'], pd.DateOffset(month=0),
-            utils.get_day_count(instrument['Day_Count']), 0.0)
+            utils.get_day_count(instrument['Floating_Day_Count']), 0.0)
 
         K, pvbp = float_cash.get_par_swap_rate(base_date, curve_factor)
 
@@ -151,7 +151,7 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
             fixed_pay_dates = instruments.generate_dates_backward(
                 maturity, effective, instrument['Fixed_Frequency'])
             fixed_cash = utils.generate_fixed_cashflows(
-                base_date, fixed_pay_dates, 1.0, None, utils.get_day_count(instrument['Day_Count']), 0.0)
+                base_date, fixed_pay_dates, 1.0, None, utils.get_day_count(instrument['Fixed_Day_Count']), 0.0)
             pv_float = K * pvbp
             pvbp = fixed_cash.get_par_swap_rate(base_date, curve_factor)
             K = pv_float / pvbp
