@@ -631,13 +631,13 @@ class ReferencePrice(Factor1D):
             self.param['Fixing_Curve'].array[:, 1]
 
 
-class GBMTSImpliedParameters(Factor1D):
+class GBMAssetPriceTSModelParameters(Factor1D):
     """
     Represents the Bootstrapped TS implied parameters for a risk neutral process
     """
 
     def __init__(self, param):
-        super(GBMTSImpliedParameters, self).__init__(param)
+        super(GBMAssetPriceTSModelParameters, self).__init__(param)
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attribute"""
