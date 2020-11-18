@@ -772,8 +772,8 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
         cx_new = AdaptivContext()
         cx_new.parse_json(os.path.join(input_path, rundate, 'CVAMarketData_Calibrated_New.json'))
         log("Parent", "Overriding Calibration")
-        for factor in [x for x in cx_new.params['Price Factors'].keys()
-                       if x.startswith('HullWhite2FactorModelParameters')]:
+        for factor in [x for x in cx_new.params['Price Factors'].keys() if x.startswith(
+                'HullWhite2FactorModelParameters') or x.startswith('GBMAssetPriceTSModelParameters')]:
             # override it
             cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
 

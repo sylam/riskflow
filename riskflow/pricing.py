@@ -1255,7 +1255,7 @@ def pvequityleg(shared, time_grid, deal_data):
 def pvfxbarrieroption(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     nominal = deal_data.Instrument.field['Underlying_Amount']
-    payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
+    payoff_currency = deal_data.Instrument.payoff_ccy
 
     curr_curve = utils.calc_time_grid_curve_rate(
         deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
@@ -1320,7 +1320,7 @@ def pveqbarrieroption(shared, time_grid, deal_data):
 def pvfxonetouch(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     nominal = deal_data.Instrument.field['Cash_Payoff']
-    payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
+    payoff_currency = deal_data.Instrument.payoff_ccy
     fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0],
                                  shared.Report_Currency, deal_time, shared)
 

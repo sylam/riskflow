@@ -2884,7 +2884,9 @@ class FXOneTouchOption(Deal):
 
     def reset(self, calendars):
         super(FXOneTouchOption, self).reset()
-        self.add_reval_dates({self.field['Expiry_Date']}, self.field[self.field['Payoff_Currency']])
+        self.payoff_ccy = self.field[self.field['Payoff_Currency']] if self.field['Payoff_Currency'] in self.field \
+            else self.field['Payoff_Currency']
+        self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def add_grid_dates(self, parser, base_date, grid):
         # only if the payoff is american (Touch) should we add potential payoff dates
@@ -2892,8 +2894,7 @@ class FXOneTouchOption(Deal):
             if isinstance(grid, str):
                 grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
                 self.reval_dates.update(grid_dates)
-                self.settlement_currencies.setdefault(
-                    self.field[self.field['Payoff_Currency']], set()).update(grid_dates)
+                self.settlement_currencies.setdefault(self.payoff_ccy, set()).update(grid_dates)
             else:
                 # this is called if the grid is fully defined i.e. a set of dates
                 for curr, cash_flow in self.settlement_currencies.items():
@@ -2959,7 +2960,9 @@ class FXBarrierOption(Deal):
 
     def reset(self, calendars):
         super(FXBarrierOption, self).reset()
-        self.add_reval_dates({self.field['Expiry_Date']}, self.field[self.field['Payoff_Currency']])
+        self.payoff_ccy = self.field[self.field['Payoff_Currency']] if self.field['Payoff_Currency'] in self.field \
+            else self.field['Payoff_Currency']
+        self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def add_grid_dates(self, parser, base_date, grid):
         # a cash rebate is paid on touch if the option knocks out
@@ -2967,8 +2970,7 @@ class FXBarrierOption(Deal):
             if isinstance(grid, str):
                 grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
                 self.reval_dates.update(grid_dates)
-                self.settlement_currencies.setdefault(
-                    self.field[self.field['Payoff_Currency']], set()).update(grid_dates)
+                self.settlement_currencies.setdefault(self.payoff_ccy, set()).update(grid_dates)
             else:
                 # this is called if the grid is fully defined i.e. a set of dates
                 for curr, cash_flow in self.settlement_currencies.items():
