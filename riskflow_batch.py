@@ -803,7 +803,7 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
         log("Parent", "Overriding Calibration")
         for factor in [x for x in cx_new.params['Price Factors'].keys()
                        if x.startswith('HullWhite2FactorModelParameters') or
-                          x.startswith('GBMTSImpliedParameters')]:
+                          x.startswith('GBMAssetPriceTSModelParameters')]:
             # override it
             cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
 
