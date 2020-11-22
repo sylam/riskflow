@@ -1702,8 +1702,8 @@ class CFFloatingInterestListDeal(Deal):
         if self.field['Cashflows'].get('Properties'):
             first_prop = self.field['Cashflows']['Properties'][0]
             if first_prop.get('Cap_Multiplier') is not None or first_prop.get('Floor_Multiplier') is not None:
-                field_index['Model'] = utils.SCENARIO_CASHFLOWS_Cap if first_prop.get(
-                    'Cap_Multiplier') is not None else utils.SCENARIO_CASHFLOWS_Floor
+                field_index['Model'] = pricing.pricer_cap if first_prop.get(
+                    'Cap_Multiplier') is not None else pricing.pricer_floor
                 field_index['VolSurface'] = get_interest_vol_factor(
                     utils.check_rate_name(self.field['Forecast_Rate_Cap_Volatility']), pd.DateOffset(months=3),
                     static_offsets, stochastic_offsets, all_tenors)
@@ -1713,7 +1713,7 @@ class CFFloatingInterestListDeal(Deal):
                     float(first_prop['Cap_Strike']) if
                     first_prop.get('Cap_Multiplier') is not None else float(first_prop['Floor_Strike']))
         else:
-            field_index['Model'] = utils.SCENARIO_CASHFLOWS_FloatLeg
+            field_index['Model'] = pricing.pricer_float_cashflows
 
         return field_index
 
@@ -1825,8 +1825,7 @@ class CapDeal(Deal):
             # make the child price to the same grid as the parent
             child.Time_dep.assign(deal_data.Time_dep)
             # price the child
-            mtm_list.append(pricing.interpolate(
-                pricing.pv_cap_leg(shared, time_grid, child), shared, time_grid, child))
+            mtm_list.append(child.Instrument.calculate(shared, time_grid, child))
 
         mtm = torch.sum(torch.stack(mtm_list), axis=0)
 
@@ -1903,8 +1902,7 @@ class FloorDeal(Deal):
             # make the child price to the same grid as the parent
             child.Time_dep.assign(deal_data.Time_dep)
             # price the child
-            mtm_list.append(pricing.interpolate(
-                pricing.pv_floor_leg(shared, time_grid, child), shared, time_grid, child))
+            mtm_list.append(child.Instrument.calculate(shared, time_grid, child))
 
         mtm = torch.sum(torch.stack(mtm_list), axis=0)
 
@@ -2436,7 +2434,7 @@ class EquityBarrierOption(Deal):
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         nominal = deal_data.Instrument.field['Units']
-        payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Currency']]
+        payoff_currency = deal_data.Instrument.field['Payoff_Currency']
 
         eq_zer_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Equity_Zero'], deal_time[:-1], shared)
         eq_div_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Dividend_Yield'], deal_time[:-1], shared)
@@ -2727,7 +2725,9 @@ class FXOneTouchOption(Deal):
 
     def reset(self, calendars):
         super(FXOneTouchOption, self).reset()
-        self.add_reval_dates({self.field['Expiry_Date']}, self.field[self.field['Payoff_Currency']])
+        self.payoff_ccy = self.field[self.field['Payoff_Currency']] if self.field['Payoff_Currency'] in self.field \
+            else self.field['Payoff_Currency']
+        self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def add_grid_dates(self, parser, base_date, grid):
         # only if the payoff is american (Touch) should we add potential payoff dates
@@ -2735,8 +2735,7 @@ class FXOneTouchOption(Deal):
             if isinstance(grid, str):
                 grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
                 self.reval_dates.update(grid_dates)
-                self.settlement_currencies.setdefault(
-                    self.field[self.field['Payoff_Currency']], set()).update(grid_dates)
+                self.settlement_currencies.setdefault(self.payoff_ccy, set()).update(grid_dates)
             else:
                 # this is called if the grid is fully defined i.e. a set of dates
                 for curr, cash_flow in self.settlement_currencies.items():
@@ -2787,7 +2786,7 @@ class FXOneTouchOption(Deal):
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         nominal = deal_data.Instrument.field['Cash_Payoff']
-        payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
+        payoff_currency = deal_data.Instrument.payoff_ccy
         fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0],
                                      shared.Report_Currency, deal_time, shared)
 
@@ -2832,7 +2831,9 @@ class FXBarrierOption(Deal):
 
     def reset(self, calendars):
         super(FXBarrierOption, self).reset()
-        self.add_reval_dates({self.field['Expiry_Date']}, self.field[self.field['Payoff_Currency']])
+        self.payoff_ccy = self.field[self.field['Payoff_Currency']] if self.field['Payoff_Currency'] in self.field \
+            else self.field['Payoff_Currency']
+        self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def add_grid_dates(self, parser, base_date, grid):
         # a cash rebate is paid on touch if the option knocks out
@@ -2840,8 +2841,7 @@ class FXBarrierOption(Deal):
             if isinstance(grid, str):
                 grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
                 self.reval_dates.update(grid_dates)
-                self.settlement_currencies.setdefault(
-                    self.field[self.field['Payoff_Currency']], set()).update(grid_dates)
+                self.settlement_currencies.setdefault(self.payoff_ccy, set()).update(grid_dates)
             else:
                 # this is called if the grid is fully defined i.e. a set of dates
                 for curr, cash_flow in self.settlement_currencies.items():
@@ -2881,7 +2881,7 @@ class FXBarrierOption(Deal):
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         nominal = deal_data.Instrument.field['Underlying_Amount']
-        payoff_currency = deal_data.Instrument.field[deal_data.Instrument.field['Payoff_Currency']]
+        payoff_currency = deal_data.Instrument.payoff_ccy
 
         curr_curve = utils.calc_time_grid_curve_rate(
             deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)

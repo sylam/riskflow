@@ -1765,24 +1765,10 @@ def pv_float_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
                                  deal_time, shared)
-
-    mtm = pv_float_cashflow_list(shared, time_grid, deal_data, pricer_float_cashflows) * FX_rep
+    model = deal_data.Factor_dep.get('Model', pricer_float_cashflows)
+    mtm = pv_float_cashflow_list(shared, time_grid, deal_data, model) * FX_rep
 
     return mtm
-
-
-def pv_cap_leg(shared, time_grid, deal_data):
-    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
-                                 deal_time, shared)
-    return pv_float_cashflow_list(shared, time_grid, deal_data, pricer_cap) * FX_rep
-
-
-def pv_floor_leg(shared, time_grid, deal_data):
-    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
-                                 deal_time, shared)
-    return pv_float_cashflow_list(shared, time_grid, deal_data, pricer_floor) * FX_rep
 
 
 def pv_index_leg(shared, time_grid, deal_data):

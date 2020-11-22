@@ -2173,8 +2173,12 @@ def make_fixed_cashflows(reference_date, position, cashflows, settlement_date):
         rate = cashflow['Rate'] if isinstance(cashflow['Rate'], float) else cashflow['Rate'].amount
         if cashflow['Payment_Date'] >= reference_date and (
                 (cashflow['Payment_Date'] >= settlement_date) if settlement_date else True):
-            Accrual_Start_Date = cashflow.get('Accrual_Start_Date', cashflow['Payment_Date'])
-            Accrual_End_Date = cashflow.get('Accrual_End_Date', cashflow['Payment_Date'])
+            # check the accrual dates - if none set it to the payment date
+            Accrual_Start_Date = cashflow['Accrual_Start_Date'] if cashflow[
+                'Accrual_Start_Date'] else cashflow['Payment_Date']
+            Accrual_End_Date = cashflow['Accrual_End_Date'] if cashflow[
+                'Accrual_End_Date'] else cashflow['Payment_Date']
+
             cash.append([(Accrual_Start_Date - reference_date).days, (Accrual_End_Date - reference_date).days,
                          (cashflow['Payment_Date'] - reference_date).days,
                          cashflow['Accrual_Year_Fraction'], position * cashflow['Notional'],
