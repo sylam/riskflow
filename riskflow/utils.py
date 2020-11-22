@@ -322,7 +322,7 @@ class DateEqualList:
             '%02d%s%04d' % (date.day, calendar.month_abbr[date.month], date.year), '='.join([str(y) for y in value]))
                                for date, value in self.data.items()]) + ']'
 
-
+# @torch.jit.script
 class Calculation_State(object):
     """
     Note that all pricing functions depend on this class being correctly setup. All calculations

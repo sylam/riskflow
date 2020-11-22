@@ -644,8 +644,8 @@ class NettingCollateralSet(Deal):
 
             # apparently this should default to the base currency not the agreement currency,
             # but I think this is a better default..
-            field['Balance_Currency'] = utils.check_rate_name(self.field['Balance_Currency']) if self.field[
-                'Balance_Currency'] else field['Agreement_Currency']
+            field['Balance_Currency'] = utils.check_rate_name(self.field['Balance_Currency']) if self.field.get(
+                'Balance_Currency') else field['Agreement_Currency']
 
             field_index['Agreement_Currency'] = get_fxrate_factor(
                 field['Agreement_Currency'], static_offsets, stochastic_offsets)
