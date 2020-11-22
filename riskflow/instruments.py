@@ -332,7 +332,7 @@ class Deal(object):
         return self.settlement_currencies
 
     def calculate(self, shared, time_grid, deal_data):
-        # generate the theo iprice
+        # generate the theo price
         mtm = self.generate(shared, time_grid, deal_data)
         # interpolate it
         return pricing.interpolate(mtm, shared, time_grid, deal_data)
@@ -1704,8 +1704,8 @@ class CFFloatingInterestListDeal(Deal):
         if self.field['Cashflows'].get('Properties'):
             first_prop = self.field['Cashflows']['Properties'][0]
             if first_prop.get('Cap_Multiplier') is not None or first_prop.get('Floor_Multiplier') is not None:
-                field_index['Model'] = utils.SCENARIO_CASHFLOWS_Cap if first_prop.get(
-                    'Cap_Multiplier') is not None else utils.SCENARIO_CASHFLOWS_Floor
+                field_index['Model'] = pricing.pricer_cap if first_prop.get(
+                    'Cap_Multiplier') is not None else pricing.pricer_floor
                 field_index['VolSurface'] = get_interest_vol_factor(
                     utils.check_rate_name(self.field['Forecast_Rate_Cap_Volatility']), pd.DateOffset(months=3),
                     static_offsets, stochastic_offsets, all_tenors)
@@ -1715,7 +1715,7 @@ class CFFloatingInterestListDeal(Deal):
                     float(first_prop['Cap_Strike']) if
                     first_prop.get('Cap_Multiplier') is not None else float(first_prop['Floor_Strike']))
         else:
-            field_index['Model'] = utils.SCENARIO_CASHFLOWS_FloatLeg
+            field_index['Model'] = pricing.pricer_float_cashflows
 
         return field_index
 
@@ -1827,8 +1827,7 @@ class CapDeal(Deal):
             # make the child price to the same grid as the parent
             child.Time_dep.assign(deal_data.Time_dep)
             # price the child
-            mtm_list.append(pricing.interpolate(
-                pricing.pvcapleg(shared, time_grid, child), shared, time_grid, child))
+            mtm_list.append(child.Instrument.calculate(shared, time_grid, child))
 
         mtm = tf.reduce_sum(mtm_list, axis=0)
 
@@ -1905,8 +1904,7 @@ class FloorDeal(Deal):
             # make the child price to the same grid as the parent
             child.Time_dep.assign(deal_data.Time_dep)
             # price the child
-            mtm_list.append(pricing.interpolate(
-                pricing.pvfloorleg(shared, time_grid, child), shared, time_grid, child))
+            mtm_list.append(child.Instrument.calculate(shared, time_grid, child))
 
         mtm = tf.reduce_sum(mtm_list, axis=0)
 
