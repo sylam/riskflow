@@ -144,7 +144,7 @@ if __name__ == '__main__':
         # cx.parse_trade_file(os.path.join(path, rundate, 'ccirs.aap'))
         # cx.parse_json(os.path.join(path, rundate, env, 'CrB_NatWest_Markets_Plc_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_FirstRand_Bank_Ltd_ISDA.json'))
-        # cx.parse_json(os.path.join(path, rundate, 'CrB_Shanta_Mining_ISDA.json'))
+        cx.parse_json(os.path.join(path, rundate, 'CrB_Shanta_Mining_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Ukhamba_Holdings_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_SAPPI_SA_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_AVI_Financial_Services__Pty__Limited_ISDA.json'))
@@ -155,7 +155,7 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Eskom_Hld_SOC_Ltd_ISDA.json'))
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
-        cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_The_Core_Computer_Business_Limited_ISDA.json'))
 
@@ -193,13 +193,13 @@ if __name__ == '__main__':
         #     if 'ZAR-USDCCSJI3M-LI3M201008-211008054' in x['instrument'].field['Reference']:
         #         x['Ignore'] = 'False'
         #
-        cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets'] = {
-            'Cash_Collateral': [{
-                'Currency': 'USD',
-                'Collateral_Rate': 'USD-OIS',
-                'Funding_Rate': 'USD-LIBOR-3M.FUNDING',
-                'Haircut_Posted': 0.0,
-                'Amount': 1.0}]}
+        # cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets'] = {
+        #     'Cash_Collateral': [{
+        #         'Currency': 'USD',
+        #         'Collateral_Rate': 'USD-OIS',
+        #         'Funding_Rate': 'USD-LIBOR-3M.FUNDING',
+        #         'Haircut_Posted': 0.0,
+        #         'Amount': 1.0}]}
 
         if 1:
             # grab the netting set
@@ -216,8 +216,8 @@ if __name__ == '__main__':
                          # 'Time_grid':'1m 5m 1362d',
                          'Random_Seed': 1354,
                          'Generate_Cashflows': 'No',
-                         'Currency': 'ZAR',
-                         'Batch_Size': 100,
+                         'Currency': 'USD',
+                         'Batch_Size': 512,
                          'Simulation_Batches': 10,
                          'CollVA': {'Gradient': 'No'},
                          'CVA': {'Gradient': 'No', 'Hessian': 'No'}}
@@ -228,7 +228,7 @@ if __name__ == '__main__':
                 overrides['Dynamic_Scenario_Dates'] = 'No'
 
             calc, out, res = rf.run_cmc(cx, prec=torch.float32, device=gpudevice,
-                                        overrides=overrides, CVA=False, CollVA=False, FVA=False)
+                                        overrides=overrides, CVA=False, CollVA=True, FVA=False)
 
             # j = check_correlation(out['Results']['scenarios'],
             #                       ('InterestRate', ('ZAR-JIBAR-3M',)), ('FxRate', ('ZAR',)))
