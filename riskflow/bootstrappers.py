@@ -334,8 +334,9 @@ class InterestRateJacobian(object):
 
                 price_factors[utils.check_tuple_name(price_param)] = jac
 
-#GBMAssetPriceTSModelParameters
-#GBMTSImpliedParameters
+
+# GBMAssetPriceTSModelParameters
+# GBMTSImpliedParameters
 class GBMAssetPriceTSModelParameters(object):
     documentation = (
         'FX and Equity',
@@ -371,8 +372,8 @@ class GBMAssetPriceTSModelParameters(object):
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
             market_factor = utils.Factor(rate[0], rate[1:])
-            #GBMAssetPriceTSModelPrices
-            #GBMTSModelPrices
+            # GBMAssetPriceTSModelPrices
+            # GBMTSModelPrices
             if market_factor.type == 'GBMAssetPriceTSModelPrices':
                 # get the vol surface
                 vol_factor = utils.Factor('FXVol', utils.check_rate_name(
@@ -646,7 +647,8 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
 
         return loss, optimizer, implied_var, calibrated_swaptions, market_swaptions, benchmarks
 
-    def implied_process(self, base_currency, price_factors, price_models, ir_curve, rate):
+    @staticmethod
+    def implied_process(base_currency, price_factors, price_models, ir_curve, rate):
         # need to create a process and params as variables to pass to tf
         price_model = utils.Factor('PCAInterestRateModel', rate[1:])
         param_name = utils.check_tuple_name(price_model)
@@ -672,7 +674,8 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
 
         return implied_obj, process, vol_tenors
 
-    def save_params(self, vars, price_factors, implied_obj, rate):
+    @staticmethod
+    def save_params(vars, price_factors, implied_obj, rate):
         # construct an initial guess - need to read from params
         param_name = utils.check_tuple_name(
             utils.Factor(type='PCAInterestRateModel', name=rate[1:]))

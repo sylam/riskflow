@@ -58,7 +58,8 @@ class DealStructure(object):
         # Do we want to store each deal level MTM explicitly?
         self.deal_level_mtm = deal_level_mtm
 
-    def calc_time_dependency(self, base_date, deal, time_grid):
+    @staticmethod
+    def calc_time_dependency(base_date, deal, time_grid):
         # calculate the additional (dynamic) dates that this instrument needs to be evaluated at
         deal_time_dep = None
         try:
@@ -129,13 +130,13 @@ class DealStructure(object):
         Resolves the Structure
         """
 
-        accum = None
+        accum = 0.0
 
         if self.sub_structures:
             # process sub structures
             for structure in self.sub_structures:
                 struct = structure.resolve_structure(shared, time_grid)
-                accum = struct if accum is None else accum + struct
+                accum += struct
 
         if self.dependencies and self.obj.Instrument.accum_dependencies:
             # accumulate the mtm's
@@ -145,8 +146,7 @@ class DealStructure(object):
                 mtm = deal_data.Instrument.calculate(shared, time_grid, deal_data)
                 deal_tensors += mtm
 
-            netting = deal_tensors
-            accum = netting if accum is None else accum + netting
+            accum += deal_tensors
 
         # postprocessing code for working out the mtm of all deals, collateralization etc..
         if hasattr(self.obj.Instrument, 'post_process'):
@@ -165,108 +165,6 @@ class ScenarioTimeGrid(object):
         self.scenario_grid = global_time_grid.scenario_grid[:offset]
 
 
-class TimeGrid(object):
-    def __init__(self, scenario_dates, MTM_dates, base_MTM_dates):
-        self.scenario_dates = scenario_dates
-        self.base_MTM_dates = base_MTM_dates
-        self.CurrencyMap = {}
-        self.set_mtm_dates(MTM_dates)
-
-    def set_mtm_dates(self, MTM_dates):
-        self.mtm_dates = MTM_dates
-        self.date_lookup = dict([(x, i) for i, x in enumerate(sorted(MTM_dates))])
-
-    def calc_time_grid(self, time_in_days):
-        dvt = np.concatenate(([1], np.diff(self.scen_time_grid), [1]))
-        scen_index = self.scen_time_grid.searchsorted(time_in_days, side='right')
-        index = (scen_index - 1).clip(0, self.scen_time_grid.size - 1)
-        alpha = ((time_in_days - self.scen_time_grid[index]) / dvt[scen_index]).clip(0, 1)
-        return np.dstack([alpha, time_in_days, index])[0]
-
-    def set_base_date(self, base_date, delta=None):
-        # leave the grids in terms of the number of days - note that it's possible to have the scenario_dates
-        # the same as the mtm_dates (for more accurate margin period of risk on collateralized netting sets)
-        self.mtm_time_grid = np.array([(x - base_date).days for x in sorted(self.mtm_dates)])
-        self.scen_time_grid = np.array([(x - base_date).days for x in sorted(self.scenario_dates)])
-
-        self.base_time_grid = set([self.date_lookup[x] for x in self.base_MTM_dates])
-        self.time_grid = self.calc_time_grid(self.mtm_time_grid)
-
-        # store the scenario time_grid
-        self.scenario_grid = np.zeros((self.scen_time_grid.size, 3))
-        self.scenario_grid[:, utils.TIME_GRID_MTM] = self.scen_time_grid
-        self.scenario_grid[:, utils.TIME_GRID_ScenarioPriorIndex] = np.arange(self.scen_time_grid.size)
-
-        # deal with the case that we need a very fine time_grid - note we do this after calculating the
-        # scenario_grid as setting a non-null delta is a way to generate scenarios without calculating the
-        # whole risk factor
-        if delta is not None:
-            delta_days, delta_tenors = delta
-            delta_grid = np.union1d(np.arange(0, self.scen_time_grid.max(), delta_days), delta_tenors)
-            self.scen_time_grid = np.union1d(self.scen_time_grid, delta_grid)
-
-        self.time_grid_years = self.scen_time_grid / utils.DAYS_IN_YEAR
-
-    def get_scenario_offset(self, days_from_base):
-        prev_scen_index = self.scen_time_grid[self.scen_time_grid <= days_from_base].size - 1
-        scenario_grid_delta = np.float64(
-            (self.scen_time_grid[prev_scen_index + 1] - self.scen_time_grid[prev_scen_index]) if (
-                    self.scen_time_grid.size > 1 and self.scen_time_grid.size > prev_scen_index + 1) else 1.0)
-        return (days_from_base - self.scen_time_grid[prev_scen_index]) / scenario_grid_delta, prev_scen_index
-
-    def set_currency_settlement(self, currencies):
-        self.CurrencyMap = {}
-        for currency, dates in currencies.items():
-            settlement_dates = sorted([self.date_lookup[x] for x in dates if x in self.date_lookup])
-            if settlement_dates:
-                currency_lookup = np.zeros(self.mtm_time_grid.size, dtype=np.int32) - 1
-                currency_lookup[settlement_dates] = np.arange(len(settlement_dates))
-                self.CurrencyMap.setdefault(currency, currency_lookup)
-
-    def calc_deal_grid(self, dates):
-        try:
-            dynamic_dates = self.base_time_grid.union([self.date_lookup[x] for x in dates])
-        except KeyError as e:
-            # if there is at least one reset date in the set of dates, then return it, else the deal has expired
-            r = [self.date_lookup[x] for x in dates if x in self.date_lookup]
-            if r:
-                dynamic_dates = self.base_time_grid.union(r)
-            else:
-                if max(dates) < min(self.date_lookup.keys()):
-                    raise InstrumentExpired(e)
-
-                # include this instrument but don't bother pricing it through time
-                return utils.DealTimeDependencies(self.mtm_time_grid, np.array([0]))
-
-        # now construct the full deal grid 
-        deal_time_grid = np.array(sorted(dynamic_dates))
-        # find the last dynamic date - should be the expiry date
-        expiry = self.date_lookup[max(dates)]
-        # calculate the interpolation points etc.
-        return utils.DealTimeDependencies(self.mtm_time_grid, deal_time_grid[deal_time_grid <= expiry])
-
-
-class Calculation_State(object):
-    """
-    Note that all pricing functions depend on this class being correctly setup. All calculations
-    should inherit from this calculation state and extend accordingly
-    """
-
-    def __init__(self, static_buffer, report_currency, device, dtype, nomodel):
-        # these are tensors
-        self.t_Buffer = {}
-        self.t_Static_Buffer = static_buffer
-        # these are shared parameter states
-        self.device = device
-        self.precision = dtype
-        self.float = np.float32 if dtype == torch.float32 else np.float64
-        self.simulation_batch = 1
-        self.Report_Currency = report_currency
-        self.t_Cashflows = None
-        # these are shared parameter states
-        self.riskneutral = nomodel == 'RiskNeutral'
-
-
 class Calculation(object):
 
     def __init__(self, config, prec=torch.float32, device=torch.device('cpu')):
@@ -278,6 +176,8 @@ class Calculation(object):
         self.dtype = prec
         self.time_grid = None
         self.device = device
+        # store a unit tensor for the calculation state
+        self.one = torch.ones([1, 1], dtype=prec, device=device)
 
         # the risk factor data
         self.static_factors = OrderedDict()
@@ -351,8 +251,6 @@ class Calculation(object):
 
                     if factor_val.size == non_zero.size:
                         factor.append(factor_val)
-                    else:
-                        logging.warning(('Skipping rate in gradient calculation {} - check data'.format(name)))
 
             tenors = np.vstack(tenor)
             self.hessian_index = (np.hstack(hessian_index[0]), np.vstack(hessian_index[1]))
@@ -414,10 +312,10 @@ class Calculation(object):
             output.build_partitions()
 
 
-class CMC_State(Calculation_State):
-    def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, report_currency,
-                 device, dtype, nomodel='Constant'):
-        super(CMC_State, self).__init__(static_buffer, report_currency, device, dtype, nomodel)
+class CMC_State(utils.Calculation_State):
+    def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, one,
+                 report_currency, nomodel='Constant'):
+        super(CMC_State, self).__init__(static_buffer, one, report_currency, nomodel)
         # these are tensors
         self.t_PreCalc = {}
         self.t_cholesky = cholesky
@@ -427,15 +325,15 @@ class CMC_State(Calculation_State):
         # these are shared parameter states
         self.simulation_batch = batch_size
 
-    def reset(self, num_factors, time_grid):
+    def reset(self, num_factors, time_grid: utils.TimeGrid):
         # update the random numbers
         self.t_random_numbers = torch.matmul(
             self.t_cholesky, torch.randn(num_factors, self.simulation_batch * time_grid.scen_time_grid.size,
-                                         dtype=self.precision, device=self.device)).reshape(
+                                         dtype=self.one.dtype, device=self.one.device)).reshape(
             num_factors, time_grid.scen_time_grid.size, -1)
 
         # reset the cashflows
-        self.t_Cashflows = {k: {t_i: torch.zeros(self.simulation_batch, device=self.device, dtype=self.precision)
+        self.t_Cashflows = {k: {t_i: self.one.new_zeros(self.simulation_batch)
                                 for t_i in np.where(v >= 0)[0]} for k, v in time_grid.CurrencyMap.items()}
 
         # clear the buffers
@@ -667,9 +565,17 @@ class Credit_Monte_Carlo(Calculation):
                             param_value, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
                     self.implied_var.append(vars)
 
+                # check the daycount for the tenor_offset
+                if tenor_offset:
+                    factor_tenor_offset = utils.get_day_count_accrual(
+                        base_date, tenor_offset, value.factor.get_day_count() if hasattr(
+                            value.factor, 'get_day_count') else utils.DAYCOUNT_ACT365)
+                else:
+                    factor_tenor_offset = 0.0
+
                 # record the offset of this risk factor
                 self.stoch_ofs.setdefault(key, len(self.stoch_var))
-                current_val = value.factor.current_value(offset=tenor_offset)
+                current_val = value.factor.current_value(offset=factor_tenor_offset)
                 calc_grad = greeks and sensitivities in ['All', 'Factors']
                 self.stoch_var.append((key, torch.tensor(
                     current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
@@ -677,9 +583,16 @@ class Credit_Monte_Carlo(Calculation):
         # and then get the the static risk factors ready - these will just be looked up
         for key, value in self.static_factors.items():
             if key.type not in utils.DimensionLessFactors:
+                # check the daycount for the tenor_offset
+                if tenor_offset:
+                    factor_tenor_offset = utils.get_day_count_accrual(
+                        base_date, tenor_offset, value.get_day_count() if hasattr(
+                            value, 'get_day_count') else utils.DAYCOUNT_ACT365)
+                else:
+                    factor_tenor_offset = 0.0
                 # record the offset of this risk factor
                 self.static_ofs.setdefault(key, len(self.static_var))
-                current_val = value.current_value(offset=tenor_offset)
+                current_val = value.current_value(offset=factor_tenor_offset)
                 calc_grad = greeks and sensitivities in ['All', 'Factors']
                 self.static_var.append((key, torch.tensor(
                     current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
@@ -728,7 +641,7 @@ class Credit_Monte_Carlo(Calculation):
                 base_date, max(dynamic_dates), self.input_time_grid, past_max_date=True)
 
         # setup the scenario and base time grids
-        self.time_grid = TimeGrid(scenario_dates, mtm_dates, base_mtm_dates)
+        self.time_grid = utils.TimeGrid(scenario_dates, mtm_dates, base_mtm_dates)
         self.base_date = base_date
         self.reset_dates = reset_dates
         self.time_grid.set_base_date(base_date)
@@ -763,7 +676,9 @@ class Credit_Monte_Carlo(Calculation):
                 correlation_matrix[index2, index1] = rho
 
         # need to do cholesky
-        eigval, eigvec = np.linalg.eig(correlation_matrix)
+        raw_eigval, raw_eigvec = np.linalg.eig(correlation_matrix)
+        # only take the real part
+        eigval, eigvec = np.real(raw_eigval), np.real(raw_eigvec)
         if not (eigval > 1e-8).all():
             # matrix not positive definite - find a close positive definite matrix
             if self.config.params['System Parameters']['Correlations_Healing_Method'] == 'Eigenvalue_Raising':
@@ -822,8 +737,7 @@ class Credit_Monte_Carlo(Calculation):
         # Now create a shared state with the cholesky decomp
         shared_mem = CMC_State(
             self.get_cholesky_decomp(), len(self.stoch_factors), [x[-1] for x in self.static_var], self.batch_size,
-            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs),
-            device=self.device, dtype=self.dtype)
+            self.one, get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs))
 
         return shared_mem
 
@@ -847,6 +761,24 @@ class Credit_Monte_Carlo(Calculation):
             else:
                 self.output.setdefault(result, np.concatenate(data, axis=-1).astype(np.float64))
 
+        # now check for jacobians
+        # reverse_lookup = {v: k for k, v in self.implied_ofs.items()}
+        # jacobians = {}
+        # for index, (k, v) in enumerate(self.implied_factors.items()):
+        #     jac_factor = utils.Factor(k.type + 'Jacobian', k.name)
+        #     if utils.check_tuple_name(jac_factor) in self.config.params['Price Factors']:
+        #         jacobian = construct_factor(jac_factor, self.config.params['Price Factors'])
+        #         currency = self.all_factors[reverse_lookup[index]].factor.get_currency()
+        #         for res, value in self.output.items():
+        #             if res.startswith('grad'):
+        #                 jacobians.setdefault(res, {}).setdefault(
+        #                     k, jacobian.calculate_components(k, value, currency))
+
+        # merge and report
+        # for grad_xva, jac_xva in jacobians.items():
+        #     self.output['implied_'+grad_xva[5:]] = pd.concat([v.set_index(pd.MultiIndex.from_tuples([
+        #         (utils.check_scope_name(k), x) for x in v.index])) for k, v in jac_xva.items()])
+
         return self.output
 
     def execute(self, params):
@@ -863,34 +795,32 @@ class Credit_Monte_Carlo(Calculation):
         self.input_time_grid = params['Time_grid']
         self.numscenarios = params['Batch_Size'] * params['Simulation_Batches']
 
-        # set the precision in the utils module - Nasty hack - TODO
-        utils.Default_Precision = self.dtype
-        # store the params                
+        # store the params
         self.params = params
 
         self.batch_size = params['Batch_Size']
-        self.calc_stats['Factor_Setup_Time'] = time.clock()
+        self.calc_stats['Factor_Setup_Time'] = time.monotonic()
         # update the factors and obtain shared state
         shared_mem = self.update_factors(params, base_date)
         # record the setup time
-        self.calc_stats['Factor_Setup_Time'] = time.clock() - self.calc_stats['Factor_Setup_Time']
+        self.calc_stats['Factor_Setup_Time'] = time.monotonic() - self.calc_stats['Factor_Setup_Time']
         # setup the all instruments
-        self.calc_stats['Deal_Setup_Time'] = time.clock()
+        self.calc_stats['Deal_Setup_Time'] = time.monotonic()
         self.netting_sets = DealStructure(Aggregation('root'))
         self.set_deal_structures(
             self.config.deals['Deals']['Children'], self.netting_sets, self.numscenarios,
             params['Batch_Size'], tagging=None, deal_level_mtm=params.get('DealLevel', False))
         # record the (pure python) dependency setup time
-        self.calc_stats['Deal_Setup_Time'] = time.clock() - self.calc_stats['Deal_Setup_Time']
+        self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']
         # clear the output
         output = defaultdict(list)
         # reset the tensors - used for storing simulation data
         tensors = {}
         # record how long it took to run the calc (python + pytorch)
-        self.calc_stats['Tensor_Execution_Time'] = time.clock()
+        self.calc_stats['Tensor_Execution_Time'] = time.monotonic()
 
         for run in range(self.params['Simulation_Batches']):
-            start_run = time.clock()
+            start_run = time.monotonic()
             # need to refresh random numbers and zero out buffers
             shared_mem.reset(self.num_factors, self.time_grid)
 
@@ -977,7 +907,6 @@ class Credit_Monte_Carlo(Calculation):
                         # store the size of the Gradient
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
-
             if 'CVA' in params:
                 discount = get_interest_factor(utils.check_rate_name(params['Deflation_Interest_Rate']),
                                                self.static_ofs, self.stoch_ofs, self.all_tenors)
@@ -1046,11 +975,12 @@ class Credit_Monte_Carlo(Calculation):
                         output['grad_cva'] = sensitivity.report_grad()
                         # store the size of the Gradient
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
+
                         if hessian:
                             # calculate the hessian matrix - warning - make sure you have enough memory
                             output['grad_cva_hessian'] = sensitivity.report_hessian()
 
-            print('Run {} in {:.3f} s'.format(run, time.clock()-start_run))
+            print('Run {} in {:.3f} s'.format(run, time.monotonic() - start_run))
 
             # store all output tensors
             for k, v in tensors.items():
@@ -1071,7 +1001,7 @@ class Credit_Monte_Carlo(Calculation):
                     output.setdefault('scenarios', {}).setdefault(key, []).append(
                         shared_mem.t_Scenario_Buffer[self.stoch_ofs[key]].cpu().detach().numpy())
 
-        self.calc_stats['Tensor_Execution_Time'] = time.clock() - self.calc_stats['Tensor_Execution_Time']
+        self.calc_stats['Tensor_Execution_Time'] = time.monotonic() - self.calc_stats['Tensor_Execution_Time']
 
         # store the results
         results = {'Netting': self.netting_sets, 'Stats': self.calc_stats, 'Jacobians': self.jacobians}
@@ -1080,9 +1010,9 @@ class Credit_Monte_Carlo(Calculation):
         return results
 
 
-class Base_Reval_State(Calculation_State):
-    def __init__(self, static_buffer, report_currency, calc_greeks, gamma, device, dtype, nomodel='Constant'):
-        super(Base_Reval_State, self).__init__(static_buffer, report_currency, device, dtype, nomodel)
+class Base_Reval_State(utils.Calculation_State):
+    def __init__(self, static_buffer, one, report_currency, calc_greeks, gamma, nomodel='Constant'):
+        super(Base_Reval_State, self).__init__(static_buffer, one, report_currency, nomodel)
         self.calc_greeks = calc_greeks
         self.gamma = gamma
 
@@ -1152,7 +1082,7 @@ class Base_Revaluation(Calculation):
 
     def update_time_grid(self, base_date):
         # setup the scenario and base time grids
-        self.time_grid = TimeGrid({base_date}, {base_date}, {base_date})
+        self.time_grid = utils.TimeGrid({base_date}, {base_date}, {base_date})
         self.base_date = base_date
         self.time_grid.set_base_date(base_date)
 
@@ -1170,9 +1100,9 @@ class Base_Revaluation(Calculation):
 
         # allocate memory on the device
         return Base_Reval_State(
-            [x[-1] for x in self.static_var], get_fxrate_factor(
+            [x[-1] for x in self.static_var], self.one, get_fxrate_factor(
                 utils.check_rate_name(reporting_currency), self.static_ofs, {}),
-            all_vars_concat, self.params['Greeks'] == 'All', self.device, self.dtype)
+            all_vars_concat, self.params['Greeks'] == 'All')
 
     def report(self):
 
@@ -1238,27 +1168,22 @@ class Base_Revaluation(Calculation):
         base_date = pd.Timestamp(params['Run_Date'])
         # store the params
         self.params = params
-        # set the precision in the utils module - Nasty hack - Need to fix this - TODO
-        utils.Default_Precision = self.dtype
         # update the factors
         shared_mem = self.update_factors(params, base_date)
 
-        self.calc_stats['Deal_Setup_Time'] = time.clock()
+        self.calc_stats['Deal_Setup_Time'] = time.monotonic()
         self.netting_sets = DealStructure(Aggregation('root'), deal_level_mtm=True)
         self.set_deal_structures(self.config.deals['Deals']['Children'], self.netting_sets, 1, 1,
                                  deal_level_mtm=True)
 
         # record the (pure python) dependency setup time
-        self.calc_stats['Deal_Setup_Time'] = time.clock() - self.calc_stats['Deal_Setup_Time']
-
-        self.calc_stats['Graph_Setup_Time'] = time.clock()
+        self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']
+        self.calc_stats['Graph_Setup_Time'] = time.monotonic()
 
         # now ask the netting set to construct each deal - no looping required (just 1 timepoint)
         mtm = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
-
         # record the graph loading time
-        self.calc_stats['Graph_Setup_Time'] = time.clock() - self.calc_stats['Graph_Setup_Time']
-
+        self.calc_stats['Graph_Setup_Time'] = time.monotonic() - self.calc_stats['Graph_Setup_Time']
         # populate the mtm at the netting set
         ns_obj = self.netting_sets.sub_structures[0].obj
         ns_obj.Calc_res['Value'] = mtm
@@ -1267,9 +1192,9 @@ class Base_Revaluation(Calculation):
 
         if shared_mem.calc_greeks is not None:
             # record the cuda execution stats
-            self.calc_stats['Greek_Execution_Time'] = time.clock()
+            self.calc_stats['Greek_Execution_Time'] = time.monotonic()
             pricing.greeks(shared_mem, ns_obj, mtm)
-            self.calc_stats['Greek_Execution_Time'] = time.clock() - self.calc_stats['Greek_Execution_Time']
+            self.calc_stats['Greek_Execution_Time'] = time.monotonic() - self.calc_stats['Greek_Execution_Time']
 
         # return a dictionary of output
         return {'Netting': self.netting_sets, 'Stats': self.calc_stats, 'Results': self.report()}
