@@ -784,7 +784,7 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal,
     # cost of carry
     b = torch.log(forward / spot) / safe_expiry
     # now precalc all past resets
-    samples = factor_dep['Samples'].reinitialize(shared.device, shared.precision)
+    samples = factor_dep['Samples'].reinitialize(shared.one)
     known_resets = samples.known_resets(shared.simulation_batch)
     start_idx = samples.get_start_index(deal_time)
     sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
@@ -871,7 +871,7 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
     daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
 
     # first precalc all past resets
-    samples = factor_dep['Cashflow'].get_resets(shared.device, shared.precision)
+    samples = factor_dep['Cashflow'].get_resets(shared.one)
     known_samples = samples.known_resets(shared.simulation_batch)
     start_idx = samples.get_start_index(deal_time)
     sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
@@ -1036,7 +1036,6 @@ def pricer_floor(all_resets, t_cash, factor_dep, expiries, tenor, shared):
     return all_int, margin
 
 
-# @torch.jit.script
 def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.TimeGrid, deal_data: utils.DealDataType,
                            cashflow_pricer, mtm_currency=None, settle_cash=True):
     mtm_list = []
@@ -1044,7 +1043,7 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
 
     # first precalc all past resets
-    resets = factor_dep['Cashflows'].get_resets(shared.device, shared.precision)
+    resets = factor_dep['Cashflows'].get_resets(shared.one)
     known_resets = resets.known_resets(shared.simulation_batch)
     sim_resets, sim_weights = resets.sim_resets(deal_time[:, utils.TIME_GRID_MTM].max())
 
@@ -1082,8 +1081,7 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
             old_resets.gather_weighted_curve(shared, delta_end, delta_start)) * reset_weights)
 
     # stack all resets
-    resets.stack(known_resets, reset_values, fillvalue=torch.zeros(
-        (0, 1, shared.simulation_batch), device=shared.device, dtype=shared.precision))
+    resets.stack(known_resets, reset_values, fillvalue=shared.one.new_zeros((0, 1, shared.simulation_batch)))
 
     cash_start_idx = factor_dep['Cashflows'].get_cashflow_start_index(deal_time)
     start_index, start_counts = np.unique(cash_start_idx, return_counts=True)
@@ -1092,7 +1090,7 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
             [forwards, discounts], start_counts, shared)):
 
         # cashflows is a dual representation
-        cashflows = factor_dep['Cashflows'].merged(shared.device, shared.precision, start_index[index])
+        cashflows = factor_dep['Cashflows'].merged(shared.one, start_index[index])
 
         cash_pmts, cash_index, cash_counts = np.unique(
             cashflows.np[:, utils.CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
@@ -1235,7 +1233,7 @@ def pv_fixed_cashflows(shared, time_grid, deal_data, ignore_fixed_rate=False, se
     start_index, counts = np.unique(cash_start_idx, return_counts=True)
 
     for index, [discount_block] in enumerate(utils.split_counts([discounts], counts, shared)):
-        cashflows = factor_dep['Cashflows'].merged(shared.device, shared.precision, start_index[index])
+        cashflows = factor_dep['Cashflows'].merged(shared.one, start_index[index])
 
         cash_pmts, cash_index, cash_counts = np.unique(
             cashflows.np[:, utils.CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
@@ -1372,8 +1370,8 @@ def pv_index_cashflows(shared, time_grid, deal_data, settle_cash=True):
     index_forecast = utils.calc_time_grid_curve_rate(factor_dep['ForecastIndex'], deal_time, shared)
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
 
-    base_resets = factor_dep['Base_Resets'].reinitialize(shared.device, shared.precision)
-    final_resets = factor_dep['Final_Resets'].reinitialize(shared.device, shared.precision)
+    base_resets = factor_dep['Base_Resets'].reinitialize(shared.one)
+    final_resets = factor_dep['Final_Resets'].reinitialize(shared.one)
 
     all_base_resets = filter_resets(base_resets, factor_dep['PriceIndex'])
     all_final_resets = filter_resets(final_resets, factor_dep['PriceIndex'])
@@ -1386,7 +1384,7 @@ def pv_index_cashflows(shared, time_grid, deal_data, settle_cash=True):
 
         last_pub_block = last_pub_blocks[index]
         # cashflows is a dual representation (numpy and tensor) of the same cashflows
-        cashflows = factor_dep['Cashflows'].merged(shared.device, shared.precision, start_index[index])
+        cashflows = factor_dep['Cashflows'].merged(shared.one, start_index[index])
 
         cash_pmts, cash_index, cash_counts = np.unique(
             cashflows.np[:, utils.CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
@@ -1443,7 +1441,7 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
     cash_start_idx = factor_dep['Cashflows'].get_cashflow_start_index(deal_time)
 
     # first precalc all past resets
-    resets = factor_dep['Cashflows'].get_resets(shared.device, shared.precision)
+    resets = factor_dep['Cashflows'].get_resets(shared.one)
     known_resets = resets.known_resets(shared.simulation_batch)
     sim_resets = resets.schedule[(resets.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
                                  (resets.schedule[:, utils.RESET_INDEX_Reset_Day] <=
@@ -1456,8 +1454,7 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
         torch.squeeze(all_resets.gather_weighted_curve(
             shared, sim_resets[:, utils.RESET_INDEX_End_Day].reshape(-1, 1), multiply_by_time=False),
             axis=1) * all_fx_spot, axis=1) \
-        if sim_resets.any() else torch.zeros(
-        [0, 1, shared.simulation_batch], device=shared.device, dtype=shared.precision)
+        if sim_resets.any() else shared.one.new_zeros([0, 1, shared.simulation_batch])
 
     old_resets = torch.squeeze(
         torch.cat([torch.stack(known_resets), reset_values], axis=0) if known_resets else reset_values, axis=1)
@@ -1471,7 +1468,7 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
             [forwards, discounts], start_counts, shared)):
 
         # cashflows = factor_dep['Cashflows'].schedule[start_index[index]:]
-        cashflows = factor_dep['Cashflows'].merged(shared.device, shared.precision, start_index[index])
+        cashflows = factor_dep['Cashflows'].merged(shared.one, start_index[index])
         # cash_offset = factor_dep['Cashflows'].offsets[start_index[index]:]
 
         cash_pmts, cash_index, cash_counts = np.unique(
@@ -1557,7 +1554,7 @@ def pv_credit_cashflows(shared, time_grid, deal_data):
     for index, (discount_block, surv_block) in enumerate(
             utils.split_counts([discounts, surv], counts, shared)):
         # get the duel cashflow at the correct index
-        cashflows = factor_dep['Cashflows'].merged(shared.device, shared.precision, start_index[index])
+        cashflows = factor_dep['Cashflows'].merged(shared.one, start_index[index])
         cash_pmts, cash_index = np.unique(cashflows.np[:, utils.CASHFLOW_INDEX_Pay_Day], return_index=True)
         cash_sts = np.unique(cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day])
 
@@ -1607,7 +1604,7 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
     # first precalc all past resets
     all_samples = []
 
-    for samples in cash.get_resets(shared.device, shared.precision).split_groups(2):
+    for samples in cash.get_resets(shared.one).split_groups(2):
         known_sample = samples.known_resets(shared.simulation_batch, include_today=True)
         sim_samples = samples.schedule[
             (samples.schedule[:, utils.RESET_INDEX_Value] == 0.0) &
@@ -1634,7 +1631,7 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
     repo_discounts = utils.calc_time_grid_curve_rate(factor_dep['Equity_Zero'], deal_time, shared)
 
     # cashflows = cash.schedule
-    cashflows = cash.merged(shared.device, shared.precision)
+    cashflows = cash.merged(shared.one)
     # all_index, all_counts = zip(*all_idx.items())
     all_index, all_counts = np.unique(list(
         zip(cash_start_idx, cash_end_idx, cash_pay_idx)), axis=0, return_counts=True)
