@@ -835,7 +835,7 @@ class NettingCollateralSet(Deal):
                 Cf_Pay = torch.cumsum(torch.relu(-C_base), axis=0)
 
             # calc collateral values
-            St = torch.zeros_like(accum, dtype=shared.precision, device=shared.device)
+            St = torch.zeros_like(accum)
 
             for cash_col in factor_dep['Cash_Collateral']:
                 St += (1.0 - cash_col.Haircut) * cash_col.Amount * utils.calc_time_grid_spot_rate(
@@ -867,9 +867,7 @@ class NettingCollateralSet(Deal):
                                 torch.cat([Cf_Pay[0].reshape(1, -1), Cf_Pay[1:] - Cf_Rec[:-1]], axis=0)
                 Vt -= mtm_today_adj
 
-            At = factor_dep['Independent_Amount'] * fx_agreement + \
-                 (Vt - H) * (Vt > H).type(shared.precision) + \
-                 (Vt - G) * (Vt < G).type(shared.precision)
+            At = factor_dep['Independent_Amount'] * fx_agreement + (Vt - H) * (Vt > H) + (Vt - G) * (Vt < G)
 
             Bt = self.field['Opening_Balance'] * utils.calc_time_grid_spot_rate(
                 factor_dep['Balance_Currency'], np.array([[0, 0, 0]]), shared) / St[0]
@@ -884,16 +882,16 @@ class NettingCollateralSet(Deal):
                 # daily collateral
                 Sim_Bt = [Bt[0]]
                 for mr, mp, bt in zip(Mr[1:], Mp[1:], Bt_new[1:]):
-                    mask = ((Sim_Bt[-1] < mr) | (Sim_Bt[-1] > mp)).type(shared.precision)
-                    Sim_Bt.append(bt * mask + Sim_Bt[-1] * (1 - mask))
+                    mask = ((Sim_Bt[-1] < mr) | (Sim_Bt[-1] > mp))
+                    Sim_Bt.append(bt * mask + Sim_Bt[-1] * (~mask))
             else:
                 # collateral according to call_mask
                 Sim_Bt = [Bt[0]]
                 Call_mask = factor_dep['call_mask'][1:].astype(np.bool)
                 for mr, mp, bt, cm in zip(Mr[1:], Mp[1:], Bt_new[1:], Call_mask[1:]):
                     if cm:
-                        mask = ((Sim_Bt[-1] < mr) | (Sim_Bt[-1] > mp)).type(shared.precision)
-                        Sim_Bt.append(bt * mask + Sim_Bt[-1] * (1 - mask))
+                        mask = ((Sim_Bt[-1] < mr) | (Sim_Bt[-1] > mp))
+                        Sim_Bt.append(bt * mask + Sim_Bt[-1] * (~mask))
                     else:
                         Sim_Bt.append(Sim_Bt[-1])
 

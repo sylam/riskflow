@@ -20,6 +20,7 @@ import calendar
 import functools
 from functools import reduce
 from collections import namedtuple, OrderedDict
+from typing import Tuple, List, Set
 
 import logging
 from itertools import zip_longest
@@ -322,21 +323,22 @@ class DateEqualList:
             '%02d%s%04d' % (date.day, calendar.month_abbr[date.month], date.year), '='.join([str(y) for y in value]))
                                for date, value in self.data.items()]) + ']'
 
-# @torch.jit.script
+
+@torch.jit.script
 class Calculation_State(object):
     """
     Note that all pricing functions depend on this class being correctly setup. All calculations
     should inherit from this calculation state and extend accordingly
     """
 
-    def __init__(self, static_buffer, report_currency, device, dtype, nomodel):
+    # def __init__(self, static_buffer, report_currency, device, dtype, nomodel):
+    def __init__(self, static_buffer, unit, report_currency: List[Tuple[bool, int]], nomodel: str):
         # these are tensors
         self.t_Buffer = {}
         self.t_Static_Buffer = static_buffer
-        # these are shared parameter states
-        self.device = device
-        self.precision = dtype
-        self.float = np.float32 if dtype == torch.float32 else np.float64
+        # storing a unit tensor allows the dtype and device to be encoded in the calculation state
+        self.one = unit
+        #        self.float = np.float32 if dtype == torch.float32 else np.float64
         self.simulation_batch = 1
         self.Report_Currency = report_currency
         self.t_Cashflows = None
@@ -360,9 +362,7 @@ class TensorSchedule(object):
         self.schedule = np.array(schedule)
         self.offsets = np.array(offsets)
         self.cache = {}
-        self.float = None
-        self.dtype = None
-        self.device = None
+        self.unit = None
 
     def __getitem__(self, x):
         return self.schedule[x]
@@ -370,30 +370,27 @@ class TensorSchedule(object):
     def count(self):
         return self.schedule.shape[0]
 
-    def reinitialize(self, device, dtype):
-        if self.dtype is None or dtype != self.dtype:
-            # return a tensor and a numpy array
-            self.dtype = dtype
-            self.device = device
-            self.float = np.float32 if dtype == torch.float32 else np.float64
+    def reinitialize(self, unit):
+        if self.unit is None:
+            # set the unit tensor (this implicitly defines the dtype and the device)
+            self.unit = unit
             self.cache = {}
         return self
 
     def dual(self, index=0):
         '''Returns just the schedule as a dual'''
         if 'dual' not in self.cache:
-            self.cache['dual'] = DualArray(
-                torch.tensor(self.schedule, device=self.device, dtype=self.dtype), self.schedule)
+            self.cache['dual'] = DualArray(self.unit.new_tensor(self.schedule), self.schedule)
         return self.cache['dual'][index:]
 
-    def merged(self, device, dtype, index=0):
+    def merged(self, unit, index=0):
         '''Returns the schedule and offsets as a dual'''
-        if self.dtype is None or dtype != self.dtype:
-            self.reinitialize(device, dtype)
+        if self.unit is None:
+            self.reinitialize(unit)
 
         if 'dual' not in self.cache:
             merged = np.concatenate((self.schedule, self.offsets), axis=1)
-            self.cache['dual'] = DualArray(torch.tensor(merged, device=device, dtype=dtype), merged)
+            self.cache['dual'] = DualArray(self.unit.new_tensor(merged), merged)
         return self.cache['dual'][index:]
 
 
@@ -434,9 +431,6 @@ class TimeGrid(object):
         self.scenario_dates = scenario_dates
         self.base_MTM_dates = base_MTM_dates
         self.CurrencyMap = {}
-        self.set_mtm_dates(MTM_dates)
-
-    def set_mtm_dates(self, MTM_dates):
         self.mtm_dates = MTM_dates
         self.date_lookup = dict([(x, i) for i, x in enumerate(sorted(MTM_dates))])
 
@@ -522,9 +516,8 @@ class TensorResets(TensorSchedule):
         key = ('known_resets', num_scenarios, include_today)
         if self.cache.get(key) is None:
             filter_fn = (lambda x: x <= 0.0) if include_today else (lambda x: x < 0.0)
-            self.cache[key] = [torch.full(
-                (1, num_scenarios), x[index], device=self.device, dtype=self.dtype)
-                for x in self.schedule if filter_fn(x[filter_index])]
+            self.cache[key] = [self.unit.new_full((1, num_scenarios), x[index])
+                               for x in self.schedule if filter_fn(x[filter_index])]
         return self.cache[key]
 
     def split_block_resets(self, reset_offset, t, date_offset=0):
@@ -542,7 +535,7 @@ class TensorResets(TensorSchedule):
             groups = []
             for i in range(group_size):
                 group = TensorResets(self.schedule[i::group_size], self.offsets[i::group_size])
-                groups.append(group.reinitialize(self.device, self.dtype))
+                groups.append(group.reinitialize(self.unit))
             self.cache[('groups', group_size)] = groups
         return self.cache.get(('groups', group_size))
 
@@ -563,8 +556,7 @@ class FloatTensorResets(TensorSchedule):
             known_resets = []
             groups = np.where(np.diff(np.concatenate(([0], self.known_simulated, [0]))))[0].reshape(-1, 2)
             for group in groups:
-                known_resets.append([torch.full((1, num_scenarios), x[RESET_INDEX_Value],
-                                                device=self.device, dtype=self.dtype)
+                known_resets.append([self.unit.new_full((1, num_scenarios), x[RESET_INDEX_Value])
                                      for x in self.schedule[group[0]: group[1]] if x[RESET_INDEX_Reset_Day] < 0.0])
             self.cache[('known_resets', num_scenarios)] = known_resets
         return self.cache[('known_resets', num_scenarios)]
@@ -579,9 +571,8 @@ class FloatTensorResets(TensorSchedule):
     def sim_resets(self, max_time):
         if self.cache.get(('sim_resets', max_time)) is None:
             # cache the weights
-            self.cache['weights'] = torch.tensor(
-                self.schedule[:, RESET_INDEX_Weight] / self.schedule[:, RESET_INDEX_Accrual],
-                dtype=self.dtype, device=self.device)
+            self.cache['weights'] = self.unit.new_tensor(
+                self.schedule[:, RESET_INDEX_Weight] / self.schedule[:, RESET_INDEX_Accrual])
 
             sim_resets = []
             sim_weights = []
@@ -658,8 +649,8 @@ class TensorCashFlows(TensorSchedule):
         # call superclass
         super(TensorCashFlows, self).__init__(schedule, offsets)
 
-    def get_resets(self, device, dtype):
-        return self.Resets.reinitialize(device, dtype)
+    def get_resets(self, unit):
+        return self.Resets.reinitialize(unit)
 
     def known_fx_resets(self, num_scenarios, index=CASHFLOW_INDEX_FXResetValue,
                         filter_index=RESET_INDEX_Reset_Day):
@@ -667,8 +658,8 @@ class TensorCashFlows(TensorSchedule):
         # note that we use the RESET_INDEX_Reset_Day for determining known FX resets
         # we only use CASHFLOW_INDEX_FXResetDate for future FX Resets - it's a little confusing
         if self.Resets.cache.get(('known_fx_resets', num_scenarios)) is None:
-            self.Resets.cache[('known_fx_resets', num_scenarios)] = [torch.full(
-                (1, num_scenarios), x[index], device=self.Resets.device, dtype=self.Resets.dtype)
+            self.Resets.cache[('known_fx_resets', num_scenarios)] = [
+                self.Resets.unit.new_full((1, num_scenarios), x[index])
                 for x, r in zip(self.schedule, self.Resets.schedule) if r[filter_index] < 0.0]
         return self.Resets.cache.get(('known_fx_resets', num_scenarios))
 
@@ -753,7 +744,7 @@ def non_zero(tensor):
     else:
         return tensor
 
-
+#@torch.jit.ignore
 def interpolate_curve_indices(all_tenor_points, curve_component, time_factor=1.0):
     # will only work if all_tenor_points is 2 dimensional
     tenor, delta, curvetype = curve_component[FACTOR_INDEX_Tenor_Index][:3]
@@ -862,6 +853,7 @@ class CurveTensor(object):
                 for sub_index, sub_alpha in zip(np.split(
                 self.index, counts.cumsum()[:-1]), sub_alpha)]
 
+    #@torch.jit.script
     def interpolate_curve(self, curve_component, points, time_factor):
 
         a, i1, w1, i2, w2 = interpolate_curve_indices(
@@ -905,9 +897,8 @@ class CurveTensor(object):
 
         return interp_val
 
-
 class TensorBlock(object):
-    def __init__(self, code, tensors, time_grid):
+    def __init__(self, code, tensors: List[CurveTensor], time_grid: np.ndarray):
         self.code = code
         self.time_grid = time_grid
         self.curve_tensors = tensors
@@ -930,6 +921,7 @@ class TensorBlock(object):
     def gather_weighted_curve(self, shared, end_points,
                               start_points=None, multiply_by_time=True):
 
+        #@torch.jit.script
         def calc_curve(time_multiplier, points):
             temp_curve = None
             for curve_tensor, curve_component in zip(self.curve_tensors, self.code):
@@ -1185,7 +1177,7 @@ def calc_fx_cross(rate1, rate2, time_grid, shared):
                 rate1, time_grid, shared) / calc_time_grid_spot_rate(
                 rate2, time_grid, shared)
     else:
-        shared.t_Buffer[key_code] = torch.ones([1, 1], dtype=shared.precision, device=shared.device)
+        shared.t_Buffer[key_code] = shared.one
     return shared.t_Buffer[key_code]
 
 
@@ -1295,7 +1287,7 @@ def calc_fx_forward(local, other, T, time_grid, shared, only_diag=False):
             shared.t_Buffer[key_code] = fx_spot * torch.squeeze(drift, axis=1) \
                 if T_scalar else torch.unsqueeze(fx_spot, axis=1) * drift
         else:
-            shared.t_Buffer[key_code] = torch.ones([1, 1], dtype=shared.precision, device=shared.device)
+            shared.t_Buffer[key_code] = shared.one
 
     return shared.t_Buffer[key_code]
 
@@ -1386,8 +1378,8 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
     alpha = (torch.squeeze(flat_moneyness, axis=1) - moneyness_t[index]) / moneyness_d[index]
 
     expiry_indices = np.arange(expiry.size).astype(np.int32)
-    expiry_offsets = torch.tensor(
-        [expiry_indices * moneyness_tenor[0].size], device=shared.device,
+    expiry_offsets = shared.one.new_tensor(
+        [expiry_indices * moneyness_tenor[0].size],
         dtype=torch.int32).T.expand(-1, shared.simulation_batch).reshape(-1)
 
     reshape = True
@@ -1578,7 +1570,7 @@ def calc_delivery_time_grid_vol_rate(code, moneyness, expiry, delivery, time_gri
 
     tenor_surface = surface.transpose(0, 1).reshape(-1, surface.shape[2])
     vol_index = index.reshape(-1, shared.simulation_batch)
-    vol_index_next = torch.clamp(vol_index+1, max=money_index[0].size - 1)
+    vol_index_next = torch.clamp(vol_index + 1, max=money_index[0].size - 1)
     vol_alpha = alpha.reshape(-1, shared.simulation_batch, 1)
 
     surface_offset = index.new((np.arange(surface.shape[1]) * surface.shape[0]).reshape(-1, 1))

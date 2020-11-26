@@ -176,6 +176,8 @@ class Calculation(object):
         self.dtype = prec
         self.time_grid = None
         self.device = device
+        # store a unit tensor for the calculation state
+        self.one = torch.ones([1, 1], dtype=prec, device=device)
 
         # the risk factor data
         self.static_factors = OrderedDict()
@@ -311,9 +313,9 @@ class Calculation(object):
 
 
 class CMC_State(utils.Calculation_State):
-    def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, report_currency,
-                 device, dtype, nomodel='Constant'):
-        super(CMC_State, self).__init__(static_buffer, report_currency, device, dtype, nomodel)
+    def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, one,
+                 report_currency, nomodel='Constant'):
+        super(CMC_State, self).__init__(static_buffer, one, report_currency, nomodel)
         # these are tensors
         self.t_PreCalc = {}
         self.t_cholesky = cholesky
@@ -323,15 +325,15 @@ class CMC_State(utils.Calculation_State):
         # these are shared parameter states
         self.simulation_batch = batch_size
 
-    def reset(self, num_factors, time_grid):
+    def reset(self, num_factors, time_grid: utils.TimeGrid):
         # update the random numbers
         self.t_random_numbers = torch.matmul(
             self.t_cholesky, torch.randn(num_factors, self.simulation_batch * time_grid.scen_time_grid.size,
-                                         dtype=self.precision, device=self.device)).reshape(
+                                         dtype=self.one.dtype, device=self.one.device)).reshape(
             num_factors, time_grid.scen_time_grid.size, -1)
 
         # reset the cashflows
-        self.t_Cashflows = {k: {t_i: torch.zeros(self.simulation_batch, device=self.device, dtype=self.precision)
+        self.t_Cashflows = {k: {t_i: self.one.new_zeros(self.simulation_batch)
                                 for t_i in np.where(v >= 0)[0]} for k, v in time_grid.CurrencyMap.items()}
 
         # clear the buffers
@@ -735,8 +737,7 @@ class Credit_Monte_Carlo(Calculation):
         # Now create a shared state with the cholesky decomp
         shared_mem = CMC_State(
             self.get_cholesky_decomp(), len(self.stoch_factors), [x[-1] for x in self.static_var], self.batch_size,
-            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs),
-            device=self.device, dtype=self.dtype)
+            self.one, get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs))
 
         return shared_mem
 
@@ -906,7 +907,6 @@ class Credit_Monte_Carlo(Calculation):
                         # store the size of the Gradient
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
-
             if 'CVA' in params:
                 discount = get_interest_factor(utils.check_rate_name(params['Deflation_Interest_Rate']),
                                                self.static_ofs, self.stoch_ofs, self.all_tenors)
@@ -980,7 +980,7 @@ class Credit_Monte_Carlo(Calculation):
                             # calculate the hessian matrix - warning - make sure you have enough memory
                             output['grad_cva_hessian'] = sensitivity.report_hessian()
 
-            print('Run {} in {:.3f} s'.format(run, time.monotonic()-start_run))
+            print('Run {} in {:.3f} s'.format(run, time.monotonic() - start_run))
 
             # store all output tensors
             for k, v in tensors.items():
@@ -1011,8 +1011,8 @@ class Credit_Monte_Carlo(Calculation):
 
 
 class Base_Reval_State(utils.Calculation_State):
-    def __init__(self, static_buffer, report_currency, calc_greeks, gamma, device, dtype, nomodel='Constant'):
-        super(Base_Reval_State, self).__init__(static_buffer, report_currency, device, dtype, nomodel)
+    def __init__(self, static_buffer, one, report_currency, calc_greeks, gamma, nomodel='Constant'):
+        super(Base_Reval_State, self).__init__(static_buffer, one, report_currency, nomodel)
         self.calc_greeks = calc_greeks
         self.gamma = gamma
 
@@ -1100,9 +1100,9 @@ class Base_Revaluation(Calculation):
 
         # allocate memory on the device
         return Base_Reval_State(
-            [x[-1] for x in self.static_var], get_fxrate_factor(
+            [x[-1] for x in self.static_var], self.one, get_fxrate_factor(
                 utils.check_rate_name(reporting_currency), self.static_ofs, {}),
-            all_vars_concat, self.params['Greeks'] == 'All', self.device, self.dtype)
+            all_vars_concat, self.params['Greeks'] == 'All')
 
     def report(self):
 
