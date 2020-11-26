@@ -103,6 +103,8 @@ def load_market_data(rundate, path, json_name='MarketData.json', cva_default=Tru
 def run_baseval(context, prec, device, overrides=None):
     """
     Runs a base valuation calculation on the provided context
+    :param device:
+    :param prec:
     :param context: a Context object
     :param overrides: a dictionary of overrides to replace the context's  calculation parameters
     :return: a tuple containing the calculation object and the output dictionary
@@ -127,6 +129,7 @@ def run_baseval(context, prec, device, overrides=None):
 def run_cmc(context, prec, device, overrides=None, CVA=False, FVA=False, CollVA=False):
     """
     Runs a credit monte carlo calculation on the provided context
+    :param device:
     :param context: a Context object
     :param overrides: a dictionary of overrides to replace the context's  calculation parameters
     :param prec: the numerical precision to use (default float32)

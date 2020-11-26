@@ -43,7 +43,6 @@ class ConstructMarkdown(object):
     classes in riskflow and pulls through relevant documentation.
     """
 
-
     mkdown = {'Theory':
         OrderedDict([
             ('Definitions',
@@ -892,7 +891,7 @@ class ConstructMarkdown(object):
                  '| PCAInterestRateModel | InterestRateOUProcess | 3 | PC1,PC2,PC3 |',
                  '',
                  'The sections that follow refer to the *Price Factor* section of the market data file.',
-                 ]),
+             ]),
             ('FX and Equity', ['']),
             ('Energy', ['']),
             ('Interest Rates', ['']),
@@ -1606,11 +1605,13 @@ class ConstructMarkdown(object):
               ]),
         ])
     }
+
     def __init__(self, project_dir):
         self.project_dir = project_dir
         self.docdir = os.path.join(self.project_dir, 'docs')
 
-    def config(self, generated_docs):
+    @staticmethod
+    def config(generated_docs):
         return ['site_name: RiskFlow',
                 '',
                 'theme: readthedocs',
@@ -1629,7 +1630,8 @@ class ConstructMarkdown(object):
                 '    - mdx_math:',
                 '        enable_dollar_delimiter: True']
 
-    def requirements(self):
+    @staticmethod
+    def requirements():
         return ['# Requirements',
                 '',
                 'In order to run RiskFlow, an nvidia video card with compute capability 6.1 or above (and ',
@@ -1681,7 +1683,8 @@ class ConstructMarkdown(object):
                 'installed.'
                 ]
 
-    def home(self):
+    @staticmethod
+    def home():
         return ['# Welcome to RiskFlow',
                 '',
                 'RiskFlow is a python framework for performing derivatives pricing and related quantitative finance',

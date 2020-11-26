@@ -58,7 +58,8 @@ class DealStructure(object):
         # Do we want to store each deal level MTM explicitly?
         self.deal_level_mtm = deal_level_mtm
 
-    def calc_time_dependency(self, base_date, deal, time_grid):
+    @staticmethod
+    def calc_time_dependency(base_date, deal, time_grid):
         # calculate the additional (dynamic) dates that this instrument needs to be evaluated at
         deal_time_dep = None
         try:
@@ -129,13 +130,13 @@ class DealStructure(object):
         Resolves the Structure
         """
 
-        accum = None
+        accum = 0.0
 
         if self.sub_structures:
             # process sub structures
             for structure in self.sub_structures:
                 struct = structure.resolve_structure(shared, time_grid)
-                accum = struct if accum is None else accum + struct
+                accum += struct
 
         if self.dependencies and self.obj.Instrument.accum_dependencies:
             # accumulate the mtm's
@@ -145,8 +146,7 @@ class DealStructure(object):
                 mtm = deal_data.Instrument.calculate(shared, time_grid, deal_data)
                 deal_tensors += mtm
 
-            netting = deal_tensors
-            accum = netting if accum is None else accum + netting
+            accum += deal_tensors
 
         # postprocessing code for working out the mtm of all deals, collateralization etc..
         if hasattr(self.obj.Instrument, 'post_process'):
@@ -1178,15 +1178,12 @@ class Base_Revaluation(Calculation):
 
         # record the (pure python) dependency setup time
         self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']
-
         self.calc_stats['Graph_Setup_Time'] = time.monotonic()
 
         # now ask the netting set to construct each deal - no looping required (just 1 timepoint)
         mtm = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
-
         # record the graph loading time
         self.calc_stats['Graph_Setup_Time'] = time.monotonic() - self.calc_stats['Graph_Setup_Time']
-
         # populate the mtm at the netting set
         ns_obj = self.netting_sets.sub_structures[0].obj
         ns_obj.Calc_res['Value'] = mtm

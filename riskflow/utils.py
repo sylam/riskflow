@@ -112,7 +112,6 @@ CASHFLOW_METHOD_IndexReferenceInterpolated4M = 4
 CASHFLOW_METHOD_Equity_Shares = 0
 CASHFLOW_METHOD_Equity_Principal = 1
 CASHFLOW_METHOD_Average_Interest = 0
-# CASHFLOW_METHOD_Average_Rate	 				= 1
 
 CASHFLOW_METHOD_Compounding_Include_Margin = 2
 CASHFLOW_METHOD_Compounding_Flat = 3
@@ -331,14 +330,12 @@ class Calculation_State(object):
     should inherit from this calculation state and extend accordingly
     """
 
-    # def __init__(self, static_buffer, report_currency, device, dtype, nomodel):
     def __init__(self, static_buffer, unit, report_currency: List[Tuple[bool, int]], nomodel: str):
         # these are tensors
         self.t_Buffer = {}
         self.t_Static_Buffer = static_buffer
         # storing a unit tensor allows the dtype and device to be encoded in the calculation state
         self.one = unit
-        #        self.float = np.float32 if dtype == torch.float32 else np.float64
         self.simulation_batch = 1
         self.Report_Currency = report_currency
         self.t_Cashflows = None

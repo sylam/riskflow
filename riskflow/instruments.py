@@ -1038,7 +1038,7 @@ class MtMCrossCurrencySwapDeal(Deal):
                 # make the child price to the same grid as the parent
                 child.Time_dep.assign(deal_data.Time_dep)
                 # work out which leg is which
-                if (child.Factor_dep['Currency'] == factor_dep[factor_dep['MTM']]['Currency']):
+                if child.Factor_dep['Currency'] == factor_dep[factor_dep['MTM']]['Currency']:
                     daycount = self.field.get(factor_dep['MTM'] + '_Day_Count', 'ACT_365')
                     # add a zero nominal payment at the beginning if forward starting
                     child.Factor_dep['Cashflows'].add_mtm_payments(
