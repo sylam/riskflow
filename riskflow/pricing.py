@@ -526,11 +526,11 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
         reset_weights = (sim_group[:, utils.RESET_INDEX_Weight] /
                          sim_group[:, utils.RESET_INDEX_Accrual]).reshape(-1, 1, 1)
 
-        reset_values.append(tf.expm1(old_resets.gather_weighted_curve(shared, delta_end, delta_start)) * reset_weights)
+        reset_values.append(tf.math.expm1(old_resets.gather_weighted_curve(shared, delta_end, delta_start)) * reset_weights)
 
     # stack all resets
     resets.stack(known_resets, reset_values, fillvalue=tf.zeros(
-        [0, 1, shared.simulation_batch], dtype=shared.precision))
+        [0, 1, shared.simulation_batch], dtype=shared.one.dtype))
 
     cash_start_idx = factor_dep['Cashflows'].get_cashflow_start_index(deal_time)
     start_index, start_counts = np.unique(cash_start_idx, return_counts=True)
@@ -568,7 +568,7 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
                 future_ends = reset_block[offset:, utils.RESET_INDEX_End_Day] - time_slice
                 future_weights = (reset_block[offset:, utils.RESET_INDEX_Weight]
                                   / reset_block[offset:, utils.RESET_INDEX_Accrual]).reshape(1, -1, 1)
-                future_resets = tf.expm1(forward_rates.gather_weighted_curve(
+                future_resets = tf.math.expm1(forward_rates.gather_weighted_curve(
                     shared, future_ends, future_starts)) * future_weights
 
                 # now deal with past resets
@@ -630,7 +630,7 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
                     margin = all_margin
                     nominal = reset_cashflows[:, utils.CASHFLOW_INDEX_Nominal]
 
-                default_offst = np.ones(cash_index.size, dtype=np.int32) * (interest.shape[1].value - 1)
+                default_offst = np.ones(cash_index.size, dtype=np.int32) * (interest.shape[1] - 1)
                 total = 0.0
 
                 for i in range(cash_counts.max()):
@@ -697,7 +697,7 @@ def pvfixedcashflows(shared, time_grid, deal_data, ignore_fixed_rate=False, sett
         # empty list for payments
         all_int = (1.0 if ignore_fixed_rate else
                    cashflows[:, utils.CASHFLOW_INDEX_FixedRate]) * cashflows[:, utils.CASHFLOW_INDEX_Year_Frac]
-        payments = np.zeros_like(cash_index, dtype=shared.precision)
+        payments = np.zeros_like(cash_index, dtype=shared.one.dtype.as_numpy_dtype)
 
         if cash_counts.min() != cash_counts.max():
             interest = np.append(all_int, 0.0)
@@ -845,8 +845,8 @@ def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
         payment_all = cashflows[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1) * growth * interest
 
         # check the dtype - can sometimes become problematic
-        if payment_all.dtype != shared.precision:
-            payment_all = tf.cast(payment_all, shared.precision)
+        if payment_all.dtype != shared.one.dtype:
+            payment_all = tf.cast(payment_all, shared.one.dtype)
 
         # reduce if any counts are duplicated
         if (cash_counts == 1).all():
@@ -892,7 +892,7 @@ def pvenergycashflows(shared, time_grid, deal_data):
         tf.squeeze(all_resets.gather_weighted_curve(
             shared, sim_resets[:, utils.RESET_INDEX_End_Day].reshape(-1, 1), multiply_by_time=False),
             axis=1) * all_fx_spot, axis=1) \
-        if sim_resets.any() else tf.zeros([0, 1, shared.simulation_batch], dtype=shared.precision)
+        if sim_resets.any() else tf.zeros([0, 1, shared.simulation_batch], dtype=shared.one.dtype)
 
     old_resets = tf.squeeze(tf.concat([tf.stack(known_resets), reset_values]
                                       if known_resets
@@ -1059,7 +1059,7 @@ def pvequitycashflows(shared, time_grid, deal_data):
             factor_dep['Equity'], sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
 
         # fetch all fixed resets
-        if past_samples.shape[1].value != shared.simulation_batch:
+        if past_samples.shape[1] != shared.simulation_batch:
             past_samples = tf.tile(past_samples, [1, shared.simulation_batch])
 
         all_samples.append(tf.concat(

@@ -20,6 +20,7 @@ import calendar
 import functools
 from functools import reduce
 from collections import namedtuple, OrderedDict
+from typing import Tuple, List, Set
 
 import logging
 from itertools import zip_longest
@@ -189,6 +190,11 @@ WeekendMap = {'Friday and Saturday': 'Sun Mon Tue Wed Thu',
               'Friday': 'Sat Sun Mon Tue Wed Thu'}
 
 
+class InstrumentExpired(Exception):
+    def __init__(self, message):
+        self.message = message
+
+
 # Defined types - things like percentages, basis points etc.
 
 class Descriptor:
@@ -318,6 +324,25 @@ class DateEqualList:
                                for date, value in self.data.items()]) + ']'
 
 
+class Calculation_State(object):
+    """
+    Note that all pricing functions depend on this class being correctly setup. All calculations
+    should inherit from this calculation state and extend accordingly
+    """
+
+    def __init__(self, static_buffer, unit, report_currency: List[Tuple[bool, int]], nomodel: str):
+        # these are tensors
+        self.t_Buffer = {}
+        self.t_Static_Buffer = static_buffer
+        # storing a unit tensor allows the dtype and device to be encoded in the calculation state
+        self.one = unit
+        self.simulation_batch = 1
+        self.Report_Currency = report_currency
+        self.t_Cashflows = None
+        # these are shared parameter states
+        self.riskneutral = nomodel == 'RiskNeutral'
+
+
 # Tensor specific classes that's used internally
 class TensorSchedule(object):
     def __init__(self, schedule, offsets):
@@ -356,6 +381,87 @@ class DealTimeDependencies(object):
 
     def fetch_index_by_day(self, days):
         return self.interp.searchsorted(days)
+
+
+class TimeGrid(object):
+    def __init__(self, scenario_dates, MTM_dates, base_MTM_dates):
+        self.scenario_dates = scenario_dates
+        self.base_MTM_dates = base_MTM_dates
+        self.CurrencyMap = {}
+        self.set_mtm_dates(MTM_dates)
+
+    def set_mtm_dates(self, MTM_dates):
+        self.mtm_dates = MTM_dates
+        self.date_lookup = dict([(x, i) for i, x in enumerate(sorted(MTM_dates))])
+
+    def calc_time_grid(self, time_in_days):
+        dvt = np.concatenate(([1], np.diff(self.scen_time_grid), [1]))
+        scen_index = self.scen_time_grid.searchsorted(time_in_days, side='right')
+        index = (scen_index - 1).clip(0, self.scen_time_grid.size - 1)
+        alpha = ((time_in_days - self.scen_time_grid[index]) / dvt[scen_index]).clip(0, 1)
+        return np.dstack([alpha, time_in_days, index])[0]
+
+    def set_base_date(self, base_date, delta=None):
+        # leave the grids in terms of the number of days - note that it's possible to have the scenario_dates
+        # the same as the mtm_dates (for more accurate margin period of risk on collateralized netting sets)
+        self.mtm_time_grid = np.array([(x - base_date).days for x in sorted(self.mtm_dates)])
+        self.scen_time_grid = np.array([(x - base_date).days for x in sorted(self.scenario_dates)])
+
+        self.base_time_grid = set([self.date_lookup[x] for x in self.base_MTM_dates])
+        self.time_grid = self.calc_time_grid(self.mtm_time_grid)
+
+        # store the scenario time_grid
+        self.scenario_grid = np.zeros((self.scen_time_grid.size, 3))
+        self.scenario_grid[:, TIME_GRID_MTM] = self.scen_time_grid
+        self.scenario_grid[:, TIME_GRID_ScenarioPriorIndex] = np.arange(self.scen_time_grid.size)
+
+        # deal with the case that we need a very fine time_grid - note we do this after calculating the
+        # scenario_grid as setting a non-null delta is a way to generate scenarios without calculating the
+        # whole risk factor
+        if delta is not None:
+            delta_days, delta_tenors = delta
+            delta_grid = np.union1d(np.arange(0, self.scen_time_grid.max(), delta_days), delta_tenors)
+            self.scen_time_grid = np.union1d(self.scen_time_grid, delta_grid)
+
+        self.time_grid_years = self.scen_time_grid / DAYS_IN_YEAR
+
+    def get_scenario_offset(self, days_from_base):
+        prev_scen_index = self.scen_time_grid[self.scen_time_grid <= days_from_base].size - 1
+        scenario_grid_delta = np.float64(
+            (self.scen_time_grid[prev_scen_index + 1] - self.scen_time_grid[prev_scen_index]) if (
+                    self.scen_time_grid.size > 1 and self.scen_time_grid.size > prev_scen_index + 1) else 1.0)
+        return (days_from_base - self.scen_time_grid[prev_scen_index]) / scenario_grid_delta, prev_scen_index
+
+    def set_currency_settlement(self, currencies):
+        self.CurrencyMap = {}
+        for currency, dates in currencies.items():
+            settlement_dates = sorted([self.date_lookup[x] for x in dates if x in self.date_lookup])
+            if settlement_dates:
+                currency_lookup = np.zeros(self.mtm_time_grid.size, dtype=np.int32) - 1
+                currency_lookup[settlement_dates] = np.arange(len(settlement_dates))
+                self.CurrencyMap.setdefault(currency, currency_lookup)
+
+    def calc_deal_grid(self, dates):
+        try:
+            dynamic_dates = self.base_time_grid.union([self.date_lookup[x] for x in dates])
+        except KeyError as e:
+            # if there is at least one reset date in the set of dates, then return it, else the deal has expired
+            r = [self.date_lookup[x] for x in dates if x in self.date_lookup]
+            if r:
+                dynamic_dates = self.base_time_grid.union(r)
+            else:
+                if max(dates) < min(self.date_lookup.keys()):
+                    raise InstrumentExpired(e)
+
+                # include this instrument but don't bother pricing it through time
+                return DealTimeDependencies(self.mtm_time_grid, np.array([0]))
+
+        # now construct the full deal grid
+        deal_time_grid = np.array(sorted(dynamic_dates))
+        # find the last dynamic date - should be the expiry date
+        expiry = self.date_lookup[max(dates)]
+        # calculate the interpolation points etc.
+        return DealTimeDependencies(self.mtm_time_grid, deal_time_grid[deal_time_grid <= expiry])
 
 
 class TensorResets(TensorSchedule):
@@ -412,7 +518,7 @@ class FloatTensorResets(TensorSchedule):
         self.all_resets = [
             tf.squeeze(tf.concat([tf.stack(known), simulated], axis=0), axis=1) for known, simulated in zip_longest(
                 known_resets, reset_values, fillvalue=fillvalue)]
-        self.stack_index = np.cumsum(np.append([0], [x.shape[0].value for x in self.all_resets]))
+        self.stack_index = np.cumsum(np.append([0], [x.shape[0] for x in self.all_resets]))
 
     def sim_resets(self, max_time, filter_index=RESET_INDEX_Reset_Day):
         sim_resets = []
@@ -927,7 +1033,7 @@ def gather_scenario_interp(tensor, time_grid, shared):
     index = time_grid[:, TIME_GRID_ScenarioPriorIndex].astype(np.int64)
     alpha_shape = tuple([-1] + [1] * (len(tensor.shape) - 1))
     alpha = time_grid[:, TIME_GRID_PriorScenarioDelta].reshape(alpha_shape)
-    index_next = (index + 1).clip(0, tensor.shape[0].value - 1)
+    index_next = (index + 1).clip(0, tensor.shape[0] - 1)
 
     return (tf.gather(tensor, index) * (1 - alpha) + tf.gather(tensor, index_next) * alpha) \
         if alpha.any() else tf.gather(tensor, index)
@@ -954,7 +1060,7 @@ def calc_fx_cross(rate1, rate2, time_grid, shared):
 
         return shared.t_Buffer[key_code]
     else:
-        return tf.constant([[1.0]], dtype=shared.precision)
+        return shared.one
 
 
 def calc_discount_rate(block, tenors_in_days, shared, multiply_by_time=True):
@@ -1157,7 +1263,7 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
     reshape = True
     if expiry_offsets.shape != index.shape:
         reshape = False
-        vol_index = index + expiry_offsets[:index.shape[0].value]
+        vol_index = index + expiry_offsets[:index.shape[0]]
     else:
         vol_index = index + expiry_offsets
 
@@ -1347,8 +1453,7 @@ def calc_delivery_time_grid_vol_rate(code, moneyness, expiry, delivery, time_gri
     vol_index = tf.reshape(index, (-1, shared.simulation_batch))
     vol_alpha = tf.reshape(alpha, (-1, shared.simulation_batch, 1))
 
-    surface_offset = (np.arange(surface.shape[1].value) *
-                      surface.shape[0].value).reshape(-1, 1)
+    surface_offset = (np.arange(surface.shape[1]) * surface.shape[0]).reshape(-1, 1)
 
     vols = tf.gather(tenor_surface, vol_index + surface_offset) * (1.0 - vol_alpha) + \
            tf.gather(tenor_surface, tf.clip_by_value(
@@ -1412,61 +1517,58 @@ def calc_time_grid_curve_rate(code, time_grid, shared, points=None, multiply_by_
     key_code = ('curve', code_hash, time_hash, points_hash, multiply_by_time)
 
     if key_code not in shared.t_Buffer:
-        with tf.name_scope(None):
-            value, interp = [], []
+        value, interp = [], []
 
-            for rate in code:
-                rate_code = ('curve_factor', rate[:2], time_hash, points_hash, multiply_by_time)
-                interp_scenario = rate[FACTOR_INDEX_Tenor_Index][2] != 'Linear' or points is None
+        for rate in code:
+            rate_code = ('curve_factor', rate[:2], time_hash, points_hash, multiply_by_time)
+            interp_scenario = rate[FACTOR_INDEX_Tenor_Index][2] != 'Linear' or points is None
 
-                # if points are defined, calculate directly - otherwise interpolate from
-                # the scenario and static buffers
-                if interp_scenario:
-                    # check if the curve factors are already available
-                    if rate_code not in shared.t_Buffer:
-                        if rate[FACTOR_INDEX_Stoch]:
-                            tensor = shared.t_Scenario_Buffer[rate[FACTOR_INDEX_Offset]]
-                            with tf.name_scope(check_tensor_name(tensor.name, 'curve')):
-                                cached_tensor, interpolation_params = cache_interpolation(
-                                    shared, rate, tensor)
-                                spread = gather_scenario_interp(cached_tensor, time_grid, shared)
+            # if points are defined, calculate directly - otherwise interpolate from
+            # the scenario and static buffers
+            if interp_scenario:
+                # check if the curve factors are already available
+                if rate_code not in shared.t_Buffer:
+                    if rate[FACTOR_INDEX_Stoch]:
+                        tensor = shared.t_Scenario_Buffer[rate[FACTOR_INDEX_Offset]]
+                        cached_tensor, interpolation_params = cache_interpolation(
+                            shared, rate, tensor)
+                        spread = gather_scenario_interp(cached_tensor, time_grid, shared)
+                    else:
+                        tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
+                        spread, interpolation_params = cache_interpolation(
+                            shared, rate, tf.reshape(tensor, (1, -1, 1)))
+
+                    # cache interpolation if necessary
+                    interp_interp = [gather_scenario_interp(params, time_grid, shared)
+                                     for params in interpolation_params] \
+                        if interpolation_params is not None else None
+
+                    # store it
+                    shared.t_Buffer[rate_code] = (spread, interp_interp)
+            else:
+                if rate_code not in shared.t_Buffer:
+                    # if points are defined, calculate directly - otherwise interpolate from
+                    # the scenario and static buffers
+                    if rate[FACTOR_INDEX_Stoch]:
+                        spread = rate[FACTOR_INDEX_Process].calc_points(rate, points, time_grid, shared,
+                                                                        multiply_by_time)
+                    else:
+                        tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
+                        if shared.riskneutral:
+                            spread = interpolate_risk_neutral(points, tensor, rate, None, time_grid,
+                                                              multiply_by_time)
                         else:
-                            tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
-                            with tf.name_scope(check_tensor_name(tensor.name, 'curve')):
-                                spread, interpolation_params = cache_interpolation(
-                                    shared, rate, tf.reshape(tensor, (1, -1, 1)))
+                            spread = interpolate_curve(tensor, rate, None, points, multiply_by_time)
 
-                        # cache interpolation if necessary
-                        interp_interp = [gather_scenario_interp(params, time_grid, shared)
-                                         for params in interpolation_params] \
-                            if interpolation_params is not None else None
+                    # store it
+                    shared.t_Buffer[rate_code] = (spread, None)
 
-                        # store it
-                        shared.t_Buffer[rate_code] = (spread, interp_interp)
-                else:
-                    if rate_code not in shared.t_Buffer:
-                        # if points are defined, calculate directly - otherwise interpolate from
-                        # the scenario and static buffers
-                        if rate[FACTOR_INDEX_Stoch]:
-                            spread = rate[FACTOR_INDEX_Process].calc_points(rate, points, time_grid, shared,
-                                                                            multiply_by_time)
-                        else:
-                            tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
-                            if shared.riskneutral:
-                                spread = interpolate_risk_neutral(points, tensor, rate, None, time_grid,
-                                                                  multiply_by_time)
-                            else:
-                                spread = interpolate_curve(tensor, rate, None, points, multiply_by_time)
+            # append the curve and its (possible) interpolation parameters
+            value.append(shared.t_Buffer[rate_code][0])
+            interp.append(shared.t_Buffer[rate_code][1])
 
-                        # store it
-                        shared.t_Buffer[rate_code] = (spread, None)
-
-                # append the curve and its (possible) interpolation parameters
-                value.append(shared.t_Buffer[rate_code][0])
-                interp.append(shared.t_Buffer[rate_code][1])
-
-            shared.t_Buffer[key_code] = TensorBlock(code=code, tensor=value,
-                                                    interp=interp, time_grid=time_grid)
+        shared.t_Buffer[key_code] = TensorBlock(code=code, tensor=value,
+                                                interp=interp, time_grid=time_grid)
 
     return shared.t_Buffer[key_code]
 

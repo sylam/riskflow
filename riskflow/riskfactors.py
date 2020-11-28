@@ -297,7 +297,7 @@ class PriceIndex(Factor0D):
     def __init__(self, param):
         super(PriceIndex, self).__init__(param)
         # the start date for excel's date offset
-        self.start_date = pd.datetime(1899, 12, 30)
+        self.start_date = utils.excel_offset
         # the offset to the latest index value
         self.last_period = self.param['Last_Period_Start'] - self.start_date
         self.latest_index = np.where(self.param['Index'].array[:, 0] >= self.last_period.days)[0]

@@ -69,35 +69,65 @@ if __name__ == '__main__':
     pd.options.display.float_format = '{:,.5f}'.format
 
     # set the visible GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
     import riskflow as rf
 
-    folder = 'CVA'
-    path = rf.getpath(['E:\\Data\\crstal\\{}'.format(folder),
-                       'G:\\Credit Quants\\CRSTAL\\{}'.format(folder),
-                       'G:\\{}'.format(folder)])
+    env = ''
+    paths = {}
+    for folder in ['CVA', 'Arena']:
+        paths[folder] = rf.getpath(
+            [os.path.join('E:\\Data\\crstal\\CVA', folder),
+             os.path.join('G:\\Credit Quants\\CRSTAL', folder),
+             os.path.join('/media/vretiel/Media/Data/crstal', folder),
+             os.path.join('G:', folder)])
 
-    rundate = '2020-03-06'
+    path = paths['CVA']
+
+    rundate = '2020-11-17'
 
     # bootstrap(path, rundate, reuse_cal=True)
 
     if 1:
-        cx = rf.load_market_data(rundate, path, json_name='MarketData.json')
-        cx_new = rf.load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
+        # cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketDataCVA.json'))
+        # cx_arena = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
+        # cx.params['Price Factors'].update(cx_arena.params['Price Factors'])
+        cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
+        try:
+            cx_new = rf.load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
 
-        for factor in [x for x in cx_new.params['Price Factors'].keys()
-                       if x.startswith('HullWhite2FactorModelParameters')]:
-            # override it
-            cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
+            for factor in [x for x in cx_new.params['Price Factors'].keys() if x.startswith(
+                    'HullWhite2FactorModelParameters') or x.startswith('GBMAssetPriceTSModelParameters')]:
+                # override it
+                cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
 
+            logging.info('Using Implied calibration for Interest Rates and FX')
+        except:
+            logging.info('Not using Implied calibration for Interest Rates and FX')
+
+        # cx.parse_trade_file(os.path.join(path, rundate, 'ccirs.aap'))
+        # cx.parse_json(os.path.join(path, rundate, env, 'CrB_NatWest_Markets_Plc_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_FirstRand_Bank_Ltd_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Shanta_Mining_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Ukhamba_Holdings_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_SAPPI_SA_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_AVI_Financial_Services__Pty__Limited_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_AutoX_ISDA.json'))
+
+
+        # cx.parse_json(os.path.join(path, rundate, env, 'CrB_ABSA_Bank_Jhb_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Eskom_Hld_SOC_Ltd_ISDA.json'))
+
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
         cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
 
-        if 1:
+        if 0:
             calc, out, res = rf.run_cmc(cx, overrides={'Calc_Scenarios': 'No',
                                                        'Dynamic_Scenario_Dates': 'No',
+                                                       'Generate_Cashflows': 'Yes',
+
                                                        # 'Run_Date': '2020-03-09',
                                                        # 'Tenor_Offset': -3/365.0,
                                                        # 'Time_grid':'1m 5m 1362d',
@@ -106,4 +136,4 @@ if __name__ == '__main__':
                                                        'CVA': {'Gradient': 'No', 'Hessian': 'No'}}, prec=np.float32)
 
         else:
-            calc, out = run_baseval(cx)
+            calc, out = rf.run_baseval(cx, overrides={'Currency': 'ZAR', 'Greeks': 'No'})

@@ -813,16 +813,18 @@ class NettingCollateralSet(Deal):
 
             for curr, fx_factor in factor_dep['Settlement_Currencies'].items():
                 Ci = []
+                last_padding = 0
                 T = sorted(shared.t_Cashflows[curr].keys())
-                for index, pad in enumerate(np.diff([-1] + T + [time_grid.time_grid.shape[0]]) - 1):
+                for index, padding in enumerate(np.diff([-1] + T + [time_grid.time_grid.shape[0]]) - 1):
                     if index < len(T):
                         cashflow_at_index = tf.expand_dims(shared.t_Cashflows[curr][T[index]], axis=0)
-                        Ci.append(tf.pad(cashflow_at_index, [[pad, 0], [0, 0]]))
+                        Ci.append(tf.pad(cashflow_at_index, [[padding, 0], [0, 0]]))
+                    last_padding = padding
 
                 base_Ci = tf.concat(Ci, axis=0)
                 # pad the last bit
                 C_base += tf.pad(utils.calc_time_grid_spot_rate(
-                    fx_factor, time_grid.time_grid[:-pad], shared) * base_Ci, [[0, pad], [0, 0]])
+                    fx_factor, time_grid.time_grid[:-last_padding], shared) * base_Ci, [[0, last_padding], [0, 0]])
 
             Cf_Rec = tf.cumsum(tf.nn.relu(C_base), axis=0, exclusive=not self.options['Exclude_Paid_Today'])
             Cf_Pay = tf.cumsum(tf.nn.relu(-C_base), axis=0, exclusive=not self.options['Exclude_Paid_Today'])

@@ -37,17 +37,17 @@ def piecewise_linear(t, tenor, values, shared):
         interp = np.interp(t, tenor, values)
         return dt, interp[:-1], np.diff(interp) / dt
     else:
-        key_code = ('piecewise_linear', values.name, tuple(t))
+        key_code = ('piecewise_linear', id(values), tuple(t))
 
-    if key_code not in shared.t_Buffer:
+    if key_code not in shared.t_PreCalc:
         # linear interpolation of the vols at vol_tenor to the grid t
         dt = np.diff(t)
         interp = utils.interpolate_tensor(t, tenor, values)
         grad = (interp[1:] - interp[:-1]) / dt
-        shared.t_Buffer[key_code] = (dt, interp[:-1], grad)
+        shared.t_PreCalc[key_code] = (dt, interp[:-1], grad)
 
     # interpolated vol
-    return shared.t_Buffer[key_code]
+    return shared.t_PreCalc[key_code]
 
 
 def integrate_piecewise_linear(fn_norm, shared, time_grid, tenor1, val1, tenor2=None, val2=None):
@@ -104,6 +104,7 @@ def hw_calc_IJK(a, exp):
 
 class StochasticProcess(object):
     """Base class for all stochastic processes"""
+
     def __init__(self, factor, param):
         self.factor = factor
         self.param = param
@@ -146,10 +147,14 @@ class GBMAssetPriceModel(StochasticProcess):
         return 1
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
         dt = np.diff(np.hstack(([0], time_grid.time_grid_years)))
         var = self.param['Vol'] * self.param['Vol'] * dt
-        drift = shared.precision(self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1)
-        vol = shared.precision(np.sqrt(var)).reshape(-1, 1)
+        drift = tf.cast((self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1), shared.one.dtype)
+        vol = tf.cast(np.sqrt(var).reshape(-1, 1), shared.one.dtype)
 
         # store a reference to the current tensor
         self.spot = tensor
@@ -235,27 +240,27 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         def calc_vol(t, v, dt, m):
             return dt * (dt ** 2 * m ** 2 / 3 + dt * m * v + v ** 2)
 
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
         vols = self.implied.param['Vol'].array
         self.V = tf.expand_dims(integrate_piecewise_linear(
             (calc_vol, 1.0), shared, time_grid.time_grid_years, vols[:, 0], implied_tensor['Vol']), axis=1)
         # calc the incremental vol
-        delta_vol = tf.pad(tf.sqrt(self.V[1:] - self.V[:-1]), [(1, 0), (0, 0)])
+        self.delta_vol = tf.pad(tf.sqrt(self.V[1:] - self.V[:-1]), [(1, 0), (0, 0)])
         self.delta_scen_t = np.insert(
-            np.diff(time_grid.scen_time_grid), 0, 0).reshape(-1, 1).astype(shared.precision)
+            np.diff(time_grid.scen_time_grid), 0, 0).reshape(-1, 1).astype(shared.one.dtype.as_numpy_dtype)
         # store a reference to the current tensor
         self.spot = tensor
         # store the scenario grid
         self.scen_grid = time_grid.scenario_grid
 
-        with tf.name_scope(self.__class__.__name__):
-            self.f1 = tf.cumsum(delta_vol * shared.t_random_numbers[
-                                            process_ofs, :time_grid.scen_time_grid.size], axis=0, name='F1')
-
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         # this is valid for FX factors only - can change this to equities etc. by changing the get_XXX_factor
         # function below
-        self.r_t = get_fx_zero_rate_factor(self.factor.get_domestic_currency(None), static_ofs, stoch_ofs,
-                                           all_tenors, all_factors)
+        self.r_t = get_fx_zero_rate_factor(
+            self.factor.get_domestic_currency(None), static_ofs, stoch_ofs, all_tenors, all_factors)
         self.q_t = get_fx_zero_rate_factor(factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
 
     @property
@@ -264,6 +269,9 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
 
     def generate(self, shared_mem):
         with tf.name_scope(self.__class__.__name__):
+            f1 = tf.cumsum(self.delta_vol *
+                           shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], axis=0)
+
             rt = utils.calc_time_grid_curve_rate(self.r_t, self.scen_grid, shared_mem)
             qt = utils.calc_time_grid_curve_rate(self.q_t, self.scen_grid, shared_mem)
 
@@ -272,7 +280,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
 
             drift = tf.cumsum(tf.squeeze(rt_rates - qt_rates, axis=1), axis=0)
 
-            return self.spot * tf.exp(drift - 0.5 * self.V + self.f1)
+            return self.spot * tf.exp(drift - 0.5 * self.V + f1)
 
 
 class GBMPriceIndexModel(StochasticProcess):
@@ -301,14 +309,18 @@ class GBMPriceIndexModel(StochasticProcess):
         return 1
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = scenario_time_grid.size
+
         scenario_time_grid = np.array([(x - self.factor.param['Last_Period_Start']).days for x in
                                        self.factor.get_last_publication_dates(ref_date,
                                                                               time_grid.scen_time_grid.tolist())],
                                       dtype=np.float64)
         dt = np.diff(np.hstack(([0], scenario_time_grid / utils.DAYS_IN_YEAR)))
         var = self.param['Vol'] * self.param['Vol'] * dt
-        drift = shared.precision(self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1)
-        vol = shared.precision(np.sqrt(var)).reshape(-1, 1)
+        drift = tf.cast((self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1), shared.one.dtype)
+        vol = tf.cast(np.sqrt(var).reshape(-1, 1), shared.one.dtype)
 
         # store a reference to the current tensor
         self.spot = tensor
@@ -401,8 +413,8 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
 
         def tf_cholesky():
-            c = tf.pad(tf.cholesky(tf.reshape(delta_CtT, [-1, 2, 2])), [[1, 0], [0, 0], [0, 0]])
-            return tf.cast(tf.transpose(c, [1, 2, 0]), shared.precision)
+            c = tf.pad(tf.linalg.cholesky(tf.reshape(delta_CtT, [-1, 2, 2])), [[1, 0], [0, 0], [0, 0]])
+            return tf.cast(tf.transpose(c, [1, 2, 0]), shared.one.dtype)
 
         def fix_cholesky():
             c11 = tf.pad(CtT[0][1:] - CtT[0][:-1], [[1, 0]], constant_values=CtT[0][0])
@@ -428,7 +440,11 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
                           c12_ok * tf.sqrt(C22 - (C12 * C12) / C11)])
 
             # get the correlation through time - this will break if the cholesky is not Positive definite
-            return tf.cast(tf.reshape(L, [2, 2, -1]), shared.precision)
+            return tf.cast(tf.reshape(L, [2, 2, -1]), shared.one.dtype)
+
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
 
         # get the factor's tenor points
         factor_tenor = self.factor.get_tenor()
@@ -442,8 +458,8 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         lam = [self.param['Lambda_1'], self.param['Lambda_2']]
         corr = tf.cast(implied_tensor['Correlation'], tf.float64)
         vols = [
-            tf.cast(implied_tensor['Sigma_1'], tf.float64, name='Cast.' + implied_tensor['Sigma_1'].name.split(':')[0]),
-            tf.cast(implied_tensor['Sigma_2'], tf.float64, name='Cast.' + implied_tensor['Sigma_2'].name.split(':')[0])]
+            tf.cast(implied_tensor['Sigma_1'], tf.float64),
+            tf.cast(implied_tensor['Sigma_2'], tf.float64)]
         vols_tenor = [self.implied.param['Sigma_1'].array[:, 0],
                       self.implied.param['Sigma_2'].array[:, 0]]
 
@@ -503,11 +519,11 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         self.C = tf.cond(self.params_ok, tf_cholesky, fix_cholesky)
 
         # intermediate results
-        self.BtT = [tf.cast(tf.reshape(Bi, (-1, 1)), shared.precision) for Bi in BtT]
-        self.YtT = [tf.cast(tf.exp(-alpha[i] * t), shared.precision) for i in range(2)]
-        self.KtT = [tf.cast(quantofxcorr[i] * tf.reshape(K[i], (-1, 1)), shared.precision) for i in range(2)]
-        self.HtT = [tf.cast(lam[i] * tf.reshape(H[i], (-1, 1)), shared.precision) for i in range(2)]
-        self.alpha = [tf.cast(alpha[i], shared.precision) for i in range(2)]
+        self.BtT = [tf.cast(tf.reshape(Bi, (-1, 1)), shared.one.dtype) for Bi in BtT]
+        self.YtT = [tf.cast(tf.exp(-alpha[i] * t), shared.one.dtype) for i in range(2)]
+        self.KtT = [tf.cast(quantofxcorr[i] * tf.reshape(K[i], (-1, 1)), shared.one.dtype) for i in range(2)]
+        self.HtT = [tf.cast(lam[i] * tf.reshape(H[i], (-1, 1)), shared.one.dtype) for i in range(2)]
+        self.alpha = [tf.cast(alpha[i], shared.one.dtype) for i in range(2)]
 
         # needed for factor calcs later
         self.F1 = tf.reshape(self.C[0, 0], [-1, 1])
@@ -517,13 +533,8 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         if len(time_grid.scenario_grid) != time_grid.time_grid_years.size:
             self.grid_index = time_grid.scen_time_grid.searchsorted(time_grid.scenario_grid[:, utils.TIME_GRID_MTM])
 
-        self.drift = tf.expand_dims(self.fwd_curve + 0.5 * tf.cast(AtT, shared.precision), 2)
-
-        if hasattr(shared, 't_random_numbers'):
-            # only run this if we have random numbers
-            with tf.name_scope(self.__class__.__name__):
-                self.calc_factors(shared.t_random_numbers[process_ofs, :time_grid.scen_time_grid.size],
-                                  shared.t_random_numbers[process_ofs:process_ofs + 2, :time_grid.scen_time_grid.size])
+        self.drift = tf.expand_dims(self.fwd_curve + 0.5 * tf.cast(AtT, shared.one.dtype), 2)
+        self.factor_tenor = tf.cast(factor_tenor.reshape(-1, 1), shared.one.dtype)
 
     def calc_stoch_deflator(self, time_grid, curve_index, shared):
         cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])
@@ -548,35 +559,37 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             return fwd_curve / t
 
     def calc_factors(self, factor1, factor1and2):
-        self.f1 = tf.expand_dims((tf.cumsum(factor1 * self.F1, axis=0, name='F1')
-                                  - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
-        self.f2 = tf.expand_dims((tf.cumsum(tf.reduce_sum(factor1and2 * self.F2, axis=0), axis=0, name='F2')
-                                  - self.KtT[1] + self.HtT[1]) * self.YtT[1], axis=1)
+        f1 = tf.expand_dims(
+            (tf.cumsum(factor1 * self.F1, axis=0, name='F1') - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
+        f2 = tf.expand_dims(
+            (tf.cumsum(tf.reduce_sum(factor1and2 * self.F2, axis=0), axis=0, name='F2')
+             - self.KtT[1] + self.HtT[1]) * self.YtT[1], axis=1)
+        return f1, f2
 
     @property
     def correlation_name(self):
         return 'HWImpliedInterestRate', [('F1',), ('F2',)]
 
-    def generate(self, shared_mem, random_sample=None):
-        if random_sample is not None:
-            self.calc_factors(random_sample[0], random_sample[:2])
+    def generate(self, shared_mem):
+        factor1, factor2 = self.calc_factors(
+            shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
+            shared_mem.t_random_numbers[self.z_offset:self.z_offset + 2, :self.scenario_horizon])
 
         with tf.name_scope(self.__class__.__name__):
             # check if we need deflators
             if self.grid_index is not None:
                 # only generate curves for the given grid
-                f1 = tf.gather(self.f1, self.grid_index)
-                f2 = tf.gather(self.f2, self.grid_index)
+                f1 = tf.gather(factor1, self.grid_index)
+                f2 = tf.gather(factor2, self.grid_index)
                 drift = tf.gather(self.drift, self.grid_index)
             else:
-                f1 = self.f1
-                f2 = self.f2
+                f1 = factor1
+                f2 = factor2
                 drift = self.drift
 
             # generate curves based on 
             stoch_component = self.BtT[0] * f1 + self.BtT[1] * f2
-            return (drift + stoch_component) / (
-                self.factor.get_tenor().astype(shared_mem.precision).reshape(-1, 1))
+            return (drift + stoch_component) / self.factor_tenor
 
 
 class HullWhite1FactorInterestRateModel(StochasticProcess):
@@ -630,6 +643,10 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
         factor_tenor = self.factor.get_tenor()
         alpha = self.param['Alpha']
 
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
         # store the forward curve    
         self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid, shared, ref_date)
 
@@ -658,22 +675,19 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
                         zip(self.I, self.J, time_grid.time_grid_years)])
 
         # get the deltas
-        delta_KtT = np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.K)))
-        delta_HtT = np.hstack(
+        self.delta_KtT = np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.K)))
+        self.delta_HtT = np.hstack(
             (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.H)))
         delta_var = np.diff(np.exp(-2.0 * alpha * time_grid.time_grid_years) * self.J)
 
         if delta_var.size:
             # needed for numerical stability
             delta_var[delta_var <= 0.0] = delta_var[delta_var > 0.0].min()
-        delta_vol = np.sqrt(np.hstack((0.0, delta_var)))
 
-        self.AtT = AtT.astype(shared.precision)
-        self.BtT = BtT.astype(shared.precision)
-
-        with tf.name_scope(self.__class__.__name__):
-            self.f1 = tf.cumsum(shared.t_random_numbers[process_ofs, :time_grid.scen_time_grid.size] *
-                                delta_vol.reshape(-1, 1) - delta_KtT[0] + delta_HtT[0], axis=0, name='F1')
+        self.delta_vol = np.sqrt(np.hstack((0.0, delta_var)).reshape(-1, 1))
+        self.BtT = tf.cast(BtT.reshape(-1, 1), shared.one.dtype)
+        self.fwd_component = tf.expand_dims(self.fwd_curve + 0.5 * AtT, 2)
+        self.factor_tenor = tf.cast(factor_tenor.reshape(-1, 1), shared.one.dtype)
 
     @property
     def correlation_name(self):
@@ -681,10 +695,12 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
 
     def generate(self, shared_mem):
         with tf.name_scope(self.__class__.__name__):
-            stoch_component = self.BtT.reshape(-1, 1) * tf.expand_dims(self.f1, 1)
-            fwd_component = tf.expand_dims(self.fwd_curve + 0.5 * self.AtT, 2)
-            return (fwd_component + stoch_component) / (
-                self.factor.get_tenor().astype(shared_mem.precision).reshape(-1, 1))
+            f1 = tf.cumsum(shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon] *
+                  self.delta_vol - self.delta_KtT[0] + self.delta_HtT[0], axis=0)
+
+            stoch_component = self.BtT * tf.expand_dims(f1, 1)
+
+            return (self.fwd_component + stoch_component) / self.factor_tenor
 
 
 class HWInterestRateCalibration(object):
@@ -827,6 +843,9 @@ class CSForwardPriceModel(StochasticProcess):
         return mu, np.sqrt(var)
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
         self.initial_curve = tf.reshape(tensor, [1, -1, 1])
         excel_offset = (ref_date - utils.excel_offset).days
         self.base_date_excel = excel_offset
@@ -948,6 +967,10 @@ class PCAInterestRateModel(StochasticProcess):
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         # ensures that tenors used are the same as the price factor
         factor_tenor = self.factor.get_tenor()
+
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
 
         # rescale and precalculate the eigenvectors
         evecs, evals = np.zeros((factor_tenor.size, self.num_factors())), []

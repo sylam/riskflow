@@ -30,12 +30,7 @@ import tensorflow as tf
 from . import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
 
 # misc functions/classes
-from .calculation import TimeGrid
-from tensorflow.contrib.opt import ExternalOptimizerInterface
-
-from tensorflow.python.framework import ops
-from tensorflow.python.ops import array_ops
-from tensorflow.python.platform import tf_logging as logging
+from .utils import TimeGrid
 
 from scipy.stats import norm
 from tensorflow.python.client import device_lib
@@ -440,61 +435,61 @@ class ScipyLeastsqOptimizerInterface(object):
                 for tensor in tensors]
 
 
-class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
-    """Wrapper allowing `scipy.optimize.basinhopping` to operate a `tf.Session`.
-    Implemented exactly the same as ScipyOptimizerInterface
-    """
-
-    _DEFAULT_METHOD = 'L-BFGS-B'
-
-    def _minimize(self, initial_val, loss_grad_func, equality_funcs,
-                  equality_grad_funcs, inequality_funcs, inequality_grad_funcs,
-                  packed_bounds, step_callback, optimizer_kwargs):
-
-        def loss_grad_func_wrapper(x):
-            # SciPy's L-BFGS-B Fortran implementation requires gradients as doubles.
-            loss, gradient = loss_grad_func(x)
-            return loss, gradient.astype('float64')
-
-        def print_fun(x, f, accepted):
-            logging.debug("at minimum %.4f accepted %d" % (f, int(accepted)))
-            if f < 100.0:
-                return True
-
-        optimizer_kwargs = dict(optimizer_kwargs.items())
-        method = optimizer_kwargs.pop('method', self._DEFAULT_METHOD)
-        take_step = optimizer_kwargs.pop('take_step', None)
-        accept_test = optimizer_kwargs.pop('accept_test', None)
-
-        minimize_args = [loss_grad_func_wrapper, initial_val]
-        minimize_kwargs = {
-            'jac': True,
-            'callback': step_callback,
-            'method': method,
-            'constraints': [],
-            'bounds': packed_bounds,
-        }
-
-        import scipy.optimize
-        result = scipy.optimize.basinhopping(
-            *minimize_args, minimizer_kwargs=minimize_kwargs, niter=100, T=25.0,
-            accept_test=accept_test, callback=print_fun, take_step=take_step)
-
-        message_lines = [
-            'Optimization terminated with:',
-            '  Message: {}'.format(result.message),
-            '  Objective function value: {}'.format(result.fun),
-        ]
-
-        if hasattr(result, 'nit'):
-            # Some optimization methods might not provide information such as nit and
-            # nfev in the return. Logs only available information.
-            message_lines.append('  Number of iterations: {}'.format(result.nit))
-        if hasattr(result, 'nfev'):
-            message_lines.append('  Number of functions evaluations: {}'.format(result.nfev))
-        logging.debug('\n'.join(message_lines))
-
-        return result['x']
+# class ScipyBasinOptimizerInterface(ExternalOptimizerInterface):
+#     """Wrapper allowing `scipy.optimize.basinhopping` to operate a `tf.Session`.
+#     Implemented exactly the same as ScipyOptimizerInterface
+#     """
+#
+#     _DEFAULT_METHOD = 'L-BFGS-B'
+#
+#     def _minimize(self, initial_val, loss_grad_func, equality_funcs,
+#                   equality_grad_funcs, inequality_funcs, inequality_grad_funcs,
+#                   packed_bounds, step_callback, optimizer_kwargs):
+#
+#         def loss_grad_func_wrapper(x):
+#             # SciPy's L-BFGS-B Fortran implementation requires gradients as doubles.
+#             loss, gradient = loss_grad_func(x)
+#             return loss, gradient.astype('float64')
+#
+#         def print_fun(x, f, accepted):
+#             logging.debug("at minimum %.4f accepted %d" % (f, int(accepted)))
+#             if f < 100.0:
+#                 return True
+#
+#         optimizer_kwargs = dict(optimizer_kwargs.items())
+#         method = optimizer_kwargs.pop('method', self._DEFAULT_METHOD)
+#         take_step = optimizer_kwargs.pop('take_step', None)
+#         accept_test = optimizer_kwargs.pop('accept_test', None)
+#
+#         minimize_args = [loss_grad_func_wrapper, initial_val]
+#         minimize_kwargs = {
+#             'jac': True,
+#             'callback': step_callback,
+#             'method': method,
+#             'constraints': [],
+#             'bounds': packed_bounds,
+#         }
+#
+#         import scipy.optimize
+#         result = scipy.optimize.basinhopping(
+#             *minimize_args, minimizer_kwargs=minimize_kwargs, niter=100, T=25.0,
+#             accept_test=accept_test, callback=print_fun, take_step=take_step)
+#
+#         message_lines = [
+#             'Optimization terminated with:',
+#             '  Message: {}'.format(result.message),
+#             '  Objective function value: {}'.format(result.fun),
+#         ]
+#
+#         if hasattr(result, 'nit'):
+#             # Some optimization methods might not provide information such as nit and
+#             # nfev in the return. Logs only available information.
+#             message_lines.append('  Number of iterations: {}'.format(result.nit))
+#         if hasattr(result, 'nfev'):
+#             message_lines.append('  Number of functions evaluations: {}'.format(result.nfev))
+#         logging.debug('\n'.join(message_lines))
+#
+#         return result['x']
 
 
 class InterestRateJacobian(object):
