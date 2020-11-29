@@ -176,8 +176,6 @@ class Calculation(object):
         self.dtype = prec
         self.time_grid = None
         self.device = device
-        # store a unit tensor for the calculation state
-        self.one = torch.ones([1, 1], dtype=prec, device=device)
 
         # the risk factor data
         self.static_factors = OrderedDict()
@@ -737,7 +735,8 @@ class Credit_Monte_Carlo(Calculation):
         # Now create a shared state with the cholesky decomp
         shared_mem = CMC_State(
             self.get_cholesky_decomp(), len(self.stoch_factors), [x[-1] for x in self.static_var], self.batch_size,
-            self.one, get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs))
+            torch.ones([1, 1], dtype=self.dtype, device=self.device),
+            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs))
 
         return shared_mem
 
@@ -1100,8 +1099,8 @@ class Base_Revaluation(Calculation):
 
         # allocate memory on the device
         return Base_Reval_State(
-            [x[-1] for x in self.static_var], self.one, get_fxrate_factor(
-                utils.check_rate_name(reporting_currency), self.static_ofs, {}),
+            [x[-1] for x in self.static_var], torch.ones([1, 1], dtype=self.dtype, device=self.device),
+            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, {}),
             all_vars_concat, self.params['Greeks'] == 'All')
 
     def report(self):
