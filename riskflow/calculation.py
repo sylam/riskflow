@@ -182,7 +182,6 @@ class Calculation(object):
         self.config = config
         self.prec = prec
         self.time_grid = None
-        self.one = tf.ones([1, 1], dtype=prec)
 
         # the risk factor data
         self.static_factors = OrderedDict()
@@ -736,7 +735,7 @@ class Credit_Monte_Carlo(Calculation):
             # Now create a shared state with the cholesky decomp
             shared_mem = CMC_State(
                 self.get_cholesky_decomp(inputTensor), len(self.stoch_factors), [x[-1] for x in self.static_var],
-                self.batch_size, self.one, get_fxrate_factor(
+                self.batch_size, tf.ones([1, 1], dtype=self.prec), get_fxrate_factor(
                     utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs)
             )
 
@@ -1083,7 +1082,7 @@ class Base_Revaluation(Calculation):
         # allocate memory on the device
         with tf.name_scope('Setup'):
             shared_state = Base_Reval_State(
-                self.static_var, self.one, get_fxrate_factor(
+                self.static_var, tf.ones([1, 1], dtype=self.prec), get_fxrate_factor(
                     utils.check_rate_name(reporting_currency), self.static_ofs, {}),
                 all_vars_concat, gamma)
 

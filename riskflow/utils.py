@@ -756,6 +756,82 @@ def interpolate_risk_neutral(points, curve_tensor, curve_component, curve_interp
         curve_tensor, curve_component, curve_interp, T, time_multiplier)
 
 
+class CurveTensor(object):
+    '''
+    This is a container for a curve tensor - a curve typically has tenor points per timepoint per scenario.
+    The original simulation grid that gets computed at the start of each MC run is large enough as it is so
+    we need a way to index into this original grid while keeping track of indices.
+    Also contains information about any interpolation method other than linear.
+    Note that the curve tensor is used directly by the tensorblock object
+    '''
+
+    def __init__(self, tensor, index, alpha):
+        self.tensor = tensor
+        self.index = index
+        if alpha is not None:
+            self.alpha = tensor.new(alpha) if isinstance(alpha, np.ndarray) else alpha
+            self.index_next = (index + 1).clip(0, tensor.shape[0] - 1)
+        else:
+            self.alpha = None
+            self.index_next = None
+
+    def interp_value(self):
+        if self.alpha is not None:
+            return self.tensor[self.index] * (1 - self.alpha) + self.tensor[self.index_next] * self.alpha
+        else:
+            return self.tensor[self.index]
+
+    def split(self, counts):
+        sub_alpha = split_tensor(self.alpha, counts) if self.alpha is not None else [None] * counts.size
+
+        return [CurveTensor(self.tensor, sub_index, sub_alpha)
+                for sub_index, sub_alpha in zip(np.split(
+                self.index, counts.cumsum()[:-1]), sub_alpha)]
+
+    #@torch.jit.script
+    def interpolate_curve(self, curve_component, points, time_factor):
+
+        a, i1, w1, i2, w2 = interpolate_curve_indices(
+            points, curve_component, time_factor)
+
+        time_size, point_size = points.shape
+        time_index_next = None
+        if curve_component[FACTOR_INDEX_Stoch]:
+            time_index = np.tile(self.index.reshape(-1, 1), point_size)
+            if self.index_next is not None:
+                time_index_next = np.tile(self.index_next.reshape(-1, 1), point_size)
+        else:
+            time_index = np.zeros((time_size, point_size), dtype=np.int64)
+
+        if curve_component[FACTOR_INDEX_Tenor_Index][2].startswith('Hermite'):
+            g, c = curve_interp
+            tenors = np.expand_dims(
+                curve_component[FACTOR_INDEX_Daycount](points), axis=2)
+            if curve_component[FACTOR_INDEX_Tenor_Index][2] == 'HermiteRT':
+                mult = None if time_factor else 1.0 / tenors
+            else:
+                mult = tenors if time_factor else None
+
+            val = tf.gather_nd(self.tensor, i1) * (1.0 - a) + (
+                (tf.gather_nd(self.tensor, i2) * a + a * (1.0 - a) * tf.gather_nd(g, i1) +
+                 a * a * (1.0 - a) * tf.gather_nd(c, i1)) if a.any() else 0.0)
+
+            interp_val = val * mult if mult is not None else val
+        else:
+            # default to linear
+            t_w1 = self.tensor.new(w1)
+            t_w2 = self.tensor.new(w2)
+
+            if self.alpha is not None:
+                interp_val = (1 - self.alpha) * (self.tensor[time_index, i1] * t_w1 +
+                                                 self.tensor[time_index, i2] * t_w2) + \
+                             self.alpha * (self.tensor[time_index_next, i1] * t_w1 +
+                                           self.tensor[time_index_next, i2] * t_w2)
+            else:
+                interp_val = self.tensor[time_index, i1] * t_w1 + self.tensor[time_index, i2] * t_w2
+
+        return interp_val
+
 class TensorBlock(object):
     def __init__(self, code, tensor, interp, time_grid):
         self.code = code
