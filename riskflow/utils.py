@@ -1253,7 +1253,7 @@ def calc_eq_forward(equity, repo, div_yield, T, time_grid, shared, only_diag=Fal
                 calc_spot_forward(div_yield, T, time_grid, shared, only_diag))
         else:
             drift = torch.ones([time_grid.shape[0], 1 if only_diag else T_t.size, 1],
-                               dtype=shared.precision)
+                               dtype=shared.one.dtype)
 
         shared.t_Buffer[key_code] = spot * torch.squeeze(drift, axis=1) \
             if T_scalar else torch.unsqueeze(spot, axis=1) * drift

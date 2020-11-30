@@ -601,7 +601,7 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal,
 
     if factor_dep['Barrier_Monitoring']:
         adj_barrier = barrier * torch.exp(
-            (2.0 * (barrier > spot[0][0]).type(shared.precision) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
+            (2.0 * (barrier > spot[0][0]).type(shared.one.dtype) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
     else:
         adj_barrier = barrier
 
@@ -628,7 +628,7 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal,
             touched = (spot[:-1] > barrier) & (spot[1:] < barrier)
 
         # barrier payoff
-        barrier_touched = F.pad((torch.cumsum(touched, axis=0) > 0).type(shared.precision), [0, 0, 1, 0])
+        barrier_touched = F.pad((torch.cumsum(touched, axis=0) > 0).type(shared.one.dtype), [0, 0, 1, 0])
         first_touch = barrier_touched[1:] - barrier_touched[:-1]
         # final payoff
         payoff_at = buy_or_sell * torch.relu(phi * (spot_at - strike))
@@ -683,7 +683,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal,
 
     if factor_dep['Barrier_Monitoring']:
         adj_barrier = barrier * torch.exp(
-            (2.0 * (barrier > spot[0][0]).type(shared.precision) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
+            (2.0 * (barrier > spot[0][0]).type(shared.one.dtype) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
     else:
         adj_barrier = barrier
 
@@ -723,7 +723,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal,
         else:
             touched = (spot[:-1] > barrier) & (spot[1:] < barrier)
 
-        barrier_touched = F.pad((torch.cumsum(touched, axis=0) > 0).type(shared.precision), [0, 0, 1, 0])
+        barrier_touched = F.pad((torch.cumsum(touched, axis=0) > 0).type(shared.one.dtype), [0, 0, 1, 0])
         first_touch = barrier_touched[1:] - barrier_touched[:-1]
         barrier_part = (1.0 - barrier_touched) * F.pad(payoff, [0, 0, 0, 1])
 
