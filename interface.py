@@ -123,7 +123,7 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
         cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
 
-        if 0:
+        if 1:
             calc, out, res = rf.run_cmc(cx, overrides={'Calc_Scenarios': 'No',
                                                        'Dynamic_Scenario_Dates': 'No',
                                                        'Generate_Cashflows': 'Yes',

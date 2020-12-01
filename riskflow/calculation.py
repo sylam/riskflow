@@ -964,7 +964,7 @@ class Credit_Monte_Carlo(Calculation):
         # store the output
         output = defaultdict(list)
 
-        core_eval = tf.function(self.core_evaluation) if True else self.core_evaluation
+        core_eval = tf.function(self.core_evaluation) if params.get('AutoGraph', 'No')=='Yes' else self.core_evaluation
 
         for run in range(params['Simulation_Batches']):
             # get the output tensors

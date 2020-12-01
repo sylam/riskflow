@@ -1010,6 +1010,7 @@ class MtMCrossCurrencySwapDeal(Deal):
                                                 self.field.get('Receive_Frequency', pd.DateOffset(months=6)))
         self.add_reval_dates(self.paydates, self.field['Pay_Currency'])
         self.add_reval_dates(self.recdates, self.field['Receive_Currency'])
+        self.child_map = {}
 
     def finalize_dates(self, parser, base_date, grid, node_children, node_resets, node_settlements):
         # have to reset the original instrument and let the child node decide
@@ -1026,39 +1027,42 @@ class MtMCrossCurrencySwapDeal(Deal):
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         child_map = {}
-
-        for index, child in enumerate(child_dependencies):
-            # make the child price to the same grid as the parent
-            child.Time_dep.assign(deal_data.Time_dep)
-            # work out which leg is which
-            if (child.Factor_dep['Currency'] == factor_dep[factor_dep['MTM']]['Currency']):
-                daycount = self.field.get(factor_dep['MTM'] + '_Day_Count', 'ACT_365')
-                # add a zero nominal payment at the beginning if forward starting
-                child.Factor_dep['Cashflows'].add_mtm_payments(
-                    factor_dep['base_date'], self.field['Principal_Exchange'],
-                    self.field['Effective_Date'], daycount)
-                child_map.setdefault('MTM', child)
-            else:
-                daycount = self.field.get(factor_dep['Other'] + '_Day_Count', 'ACT_365')
-                # get the last nominal amount
-                capital = child.Factor_dep['Cashflows'].schedule[-1][utils.CASHFLOW_INDEX_Nominal]
-                child.Factor_dep['Cashflows'].add_fixed_payments(factor_dep['base_date'],
-                                                                 self.field['Principal_Exchange'],
-                                                                 self.field['Effective_Date'], daycount, capital)
-                child_map.setdefault('Static', child)
+        if not self.child_map:
+            for index, child in enumerate(child_dependencies):
+                # make the child price to the same grid as the parent
+                child.Time_dep.assign(deal_data.Time_dep)
+                # work out which leg is which
+                if child.Factor_dep['Currency'] == factor_dep[factor_dep['MTM']]['Currency']:
+                    daycount = self.field.get(factor_dep['MTM'] + '_Day_Count', 'ACT_365')
+                    # add a zero nominal payment at the beginning if forward starting
+                    child.Factor_dep['Cashflows'].add_mtm_payments(
+                        factor_dep['base_date'], self.field['Principal_Exchange'],
+                        self.field['Effective_Date'], daycount)
+                    self.child_map.setdefault('MTM', child)
+                else:
+                    daycount = self.field.get(factor_dep['Other'] + '_Day_Count', 'ACT_365')
+                    # get the last nominal amount
+                    capital = child.Factor_dep['Cashflows'].schedule[-1][utils.CASHFLOW_INDEX_Nominal]
+                    child.Factor_dep['Cashflows'].add_fixed_payments(factor_dep['base_date'],
+                                                                     self.field['Principal_Exchange'],
+                                                                     self.field['Effective_Date'], daycount, capital)
+                    self.child_map.setdefault('Static', child)
 
         FX_rep = utils.calc_time_grid_spot_rate(shared.Report_Currency, deal_time, shared)
-        FX_static = utils.calc_time_grid_spot_rate(child_map['Static'].Factor_dep['Currency'][0], deal_time, shared)
-        FX_mtm = utils.calc_time_grid_spot_rate(child_map['MTM'].Factor_dep['Currency'][0], deal_time, shared)
+        FX_static = utils.calc_time_grid_spot_rate(
+            self.child_map['Static'].Factor_dep['Currency'][0], deal_time, shared)
+        FX_mtm = utils.calc_time_grid_spot_rate(
+            self.child_map['MTM'].Factor_dep['Currency'][0], deal_time, shared)
 
-        if child_map['Static'].Factor_dep.get('Forward'):
-            static_leg = pricing.pvfloatcashflowlist(shared, time_grid, child_map['Static'],
-                                                     pricing.pricer_float_cashflows)
+        if self.child_map['Static'].Factor_dep.get('Forward'):
+            static_leg = pricing.pvfloatcashflowlist(
+                shared, time_grid, self.child_map['Static'], pricing.pricer_float_cashflows)
         else:
-            static_leg = pricing.pvfixedcashflows(shared, time_grid, child_map['Static'])
+            static_leg = pricing.pvfixedcashflows(shared, time_grid, self.child_map['Static'])
 
-        mtm_leg = pricing.pvfloatcashflowlist(shared, time_grid, child_map['MTM'], pricing.pricer_float_cashflows,
-                                              mtm_currency=child_map['Static'].Factor_dep['Currency'])
+        mtm_leg = pricing.pvfloatcashflowlist(
+            shared, time_grid, self.child_map['MTM'], pricing.pricer_float_cashflows,
+            mtm_currency=self.child_map['Static'].Factor_dep['Currency'])
 
         mtm = (static_leg * FX_static + mtm_leg * FX_mtm) / FX_rep
 
