@@ -809,7 +809,7 @@ class NettingCollateralSet(Deal):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
 
         if self.field.get('Collateralized', 'False') == 'True' and hasattr(shared, 't_Credit'):
-            C_base = tf.zeros_like(accum, dtype=shared.precision)
+            C_base = tf.zeros_like(accum, dtype=shared.one.dtype)
 
             for curr, fx_factor in factor_dep['Settlement_Currencies'].items():
                 Ci = []
@@ -838,7 +838,7 @@ class NettingCollateralSet(Deal):
 
             for bond_col in factor_dep['Bond_Collateral']:
                 bond = pricing.pvfixedcashflows(shared, time_grid, bond_col.Collateral, settle_cash=False)
-                padding = time_grid.time_grid.shape[0] - bond.shape[0].value
+                padding = time_grid.time_grid.shape[0] - bond.shape[0]
                 St += (1.0 - bond_col.Haircut) * utils.calc_time_grid_spot_rate(
                     bond_col.Currency, time_grid.time_grid, shared) * tf.pad(bond, [[0, padding], [0, 0]])
 
@@ -859,12 +859,12 @@ class NettingCollateralSet(Deal):
                 mtm_today_adj = tf.concat([tf.reshape(Cf_Rec[0], (1, -1)), Cf_Rec[1:] - Cf_Rec[:-1]], axis=0) - \
                                 tf.concat([tf.reshape(Cf_Pay[0], (1, -1)), Cf_Pay[1:] - Cf_Rec[:-1]], axis=0)
             else:
-                mtm_today_adj = tf.zeros_like(accum, dtype=shared.precision)
+                mtm_today_adj = tf.zeros_like(accum, dtype=shared.one.dtype)
 
             Vt = accum * fx_base - mtm_today_adj
             At = factor_dep['Independent_Amount'] * fx_agreement + \
-                 (Vt - H) * tf.cast(Vt > H, dtype=shared.precision) + \
-                 (Vt - G) * tf.cast(Vt < G, dtype=shared.precision)
+                 (Vt - H) * tf.cast(Vt > H, dtype=shared.one.dtype) + \
+                 (Vt - G) * tf.cast(Vt < G, dtype=shared.one.dtype)
 
             Bt = self.field['Opening_Balance'] * utils.calc_time_grid_spot_rate(
                 factor_dep['Balance_Currency'], np.array([[0, 0, 0]]), shared) / St[0]
@@ -945,7 +945,7 @@ class NettingCollateralSet(Deal):
                 mtm_grid = deal_time[:, utils.TIME_GRID_MTM]
 
                 # calculate collateral valuation adjustment
-                delta_scen_t = np.append(0, np.diff(mtm_grid)).astype(shared.precision).reshape(-1, 1)
+                delta_scen_t = np.append(0, np.diff(mtm_grid)).astype(shared.one.dtype.as_numpy_dtype).reshape(-1, 1)
                 discount_funding = utils.calc_time_grid_curve_rate(cash_col.Funding_Rate, deal_time, shared)
                 discount_collateral = utils.calc_time_grid_curve_rate(cash_col.Collateral_Rate, deal_time, shared)
 
@@ -2186,8 +2186,8 @@ class SwaptionDeal(Deal):
             value = F_option * theo_price
             Ut_swap = delta * mn_swap * F_swap
 
-            if Ut_swap.shape[0].value:
-                Ut_mask = Ut_swap * tf.cast(Ut_swap[0] >= 0, shared.precision)
+            if Ut_swap.shape[0]:
+                Ut_mask = Ut_swap * tf.cast(Ut_swap[0] >= 0, shared.one.dtype)
                 mtm = FX_rep * tf.concat([value, Ut_mask], axis=0)
             else:
                 mtm = FX_rep * value
@@ -2224,127 +2224,47 @@ class FXDiscreteExplicitAsianOption(Deal):
                           calendars):
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency'])}
-        field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
-            field['Currency']
+        field['Discount_Rate'] = utils.check_rate_name(
+            self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
         field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
 
-        field_index = {'Currency': get_fx_and_zero_rate_factor(field['Currency'], static_offsets, stochastic_offsets,
-                                                               all_tenors, all_factors),
-                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                       all_tenors, all_factors),
-                       'Underlying_Currency': get_fx_and_zero_rate_factor(field['Underlying_Currency'], static_offsets,
-                                                                          stochastic_offsets, all_tenors, all_factors),
-                       'FX_Volatility': get_fx_vol_factor(field['FX_Volatility'], static_offsets,
-                                                          stochastic_offsets, all_tenors),
-                       'Expiry': (self.field['Expiry_Date'] - base_date).days,
-                       'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
-                       'Samples': utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data']),
-                       'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])}
+        field_index = {
+            'Currency': get_fx_and_zero_rate_factor(
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'SettleCurrency': self.field['Currency'],
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Underlying_Currency': get_fx_and_zero_rate_factor(
+                field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Volatility': get_fx_vol_factor(
+                field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Expiry': (self.field['Expiry_Date'] - base_date).days,
+            'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
+            'Samples': utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data']),
+            'Strike': self.field['Strike_Price'],
+            'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
+            'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
+            'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
+        }
 
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
-        mtm_list = []
-        factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
-        daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
-        fx_spot = utils.calc_fx_cross(factor_dep['Underlying_Currency'][0],
-                                      factor_dep['Currency'][0], deal_time, shared)
-        forward = utils.calc_fx_forward(factor_dep['Underlying_Currency'], factor_dep['Currency'],
-                                        factor_dep['Expiry'], deal_time, shared)
-        fx_rep = utils.calc_fx_cross(factor_dep['Currency'][0], shared.Report_Currency,
-                                     deal_time, shared)
+        FX_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
+        # get pricing data
+        spot = utils.calc_fx_cross(
+            deal_data.Factor_dep['Underlying_Currency'][0],
+            deal_data.Factor_dep['Currency'][0], deal_time, shared)
+        forward = utils.calc_fx_forward(
+            deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
+            deal_data.Factor_dep['Expiry'], deal_time, shared)
 
-        # calc cost of carry
-        expiry = daycount_fn(factor_dep['Expiry'] -
-                             deal_time[:, utils.TIME_GRID_MTM]).astype(shared.precision)
-        expiry_ok = tf.greater(expiry, 0.0)
-        safe_expiry = tf.where(expiry_ok, expiry.reshape(-1, 1),
-                               tf.ones_like(expiry.reshape(-1, 1), dtype=shared.precision))
-        b = tf.where(expiry_ok, tf.log(forward / fx_spot) / safe_expiry,
-                     tf.ones_like(forward, dtype=shared.precision))
-
-        # first precalc all past resets
-        samples = factor_dep['Samples']
-        known_resets = factor_dep['Samples'].known_resets(shared.simulation_batch)
-        start_idx = samples.get_start_index(deal_time)
-        sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
-                                       (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
-                                        deal_time[:, utils.TIME_GRID_MTM].max())]
-
-        # check if the spot was simulated - if not, hold it flat
-        if fx_spot.shape != forward.shape:
-            past_samples = tf.tile(fx_spot, [sim_samples.shape[0],
-                                             shared.simulation_batch])
-            fx_spot = tf.tile(fx_spot, forward.shape)
-        else:
-            past_samples = utils.calc_time_grid_spot_rate(
-                factor_dep['Underlying_Currency'][0], sim_samples[:, :utils.RESET_INDEX_Scenario + 1],
-                shared) / utils.calc_time_grid_spot_rate(
-                factor_dep['Currency'][0],
-                sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
-
-        all_samples = tf.concat([tf.concat(known_resets, axis=0), past_samples]
-                                if known_resets
-                                else past_samples, axis=0)
-
-        start_index, counts = np.unique(start_idx, return_counts=True)
-
-        for index, (discount_block, spot_block, carry_block) in enumerate(
-                utils.split_counts([discount, fx_spot, b], counts, shared)):
-            t_block = discount_block.time_grid
-            sample_t = samples.schedule[start_index[index]:]
-            tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
-
-            sample_ts = daycount_fn(sample_t[:, utils.RESET_INDEX_End_Day].reshape(1, -1) -
-                                    t_block[:, utils.TIME_GRID_MTM, np.newaxis]).astype(shared.precision)
-            weight_t = sample_t[:, utils.RESET_INDEX_Weight].reshape(1, -1, 1)
-            sample_ft = weight_t * tf.exp(tf.expand_dims(carry_block, axis=1) *
-                                          tf.expand_dims(sample_ts, axis=2))
-            M1 = tf.reduce_sum(sample_ft, axis=1)
-
-            normalize = sample_t[:, utils.RESET_INDEX_Weight].sum()
-            average = tf.reduce_sum(
-                all_samples[:start_index[index]] *
-                samples.schedule[:start_index[index],
-                utils.RESET_INDEX_Weight].reshape(-1, 1),
-                axis=0)
-
-            strike_bar = self.field['Strike_Price'] - tf.tile(tf.reshape(average, (1, -1)), [counts[index], 1])
-            moneyness = (strike_bar / normalize) / spot_block if factor_dep['Invert_Moneyness'] else spot_block / (
-                    strike_bar / normalize)
-            vols = utils.calc_time_grid_vol_rate(factor_dep['FX_Volatility'], moneyness,
-                                                 daycount_fn(tenor_block), shared)
-
-            product_t = sample_ft * tf.exp(np.expand_dims(sample_ts, axis=2) *
-                                           tf.expand_dims(vols * vols, axis=1))
-            sum_t = tf.cumsum(product_t, axis=1, exclusive=True)
-            M2 = tf.reduce_sum(sample_ft * (product_t + 2.0 * sum_t), axis=1)
-
-            # trick to avoid nans in the gradients
-            MM = tf.log(M2) - 2.0 * tf.log(M1)
-            MM_ok = tf.where(MM > 0, MM, tf.ones_like(MM, dtype=shared.precision))
-            vol_t = tf.where(MM > 0, tf.sqrt(MM_ok), tf.zeros_like(MM_ok, dtype=shared.precision))
-
-            theo_price = utils.black_european_option(
-                M1 * spot_block, strike_bar, vol_t, 1.0,
-                1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
-                1.0 if self.field['Option_Type'] == 'Call' else -1.0, shared)
-
-            discount_rates = tf.squeeze(
-                utils.calc_discount_rate(discount_block,
-                                         tenor_block.reshape(-1, 1), shared),
-                axis=1
-            )
-
-            cash = self.field['Underlying_Amount'] * theo_price
-            mtm_list.append(cash * discount_rates)
-
-            # potential cashflows
-        pricing.cash_settle(shared, self.field['Currency'], deal_data.Time_dep.deal_time_grid[-1], cash[-1])
-        # mtm in reporting currency    
-        mtm = fx_rep * tf.concat(mtm_list, axis=0, name='mtm')
+        mtm = pricing.pv_discrete_asian_option(
+            shared, time_grid, deal_data, self.field['Underlying_Amount'], spot,
+            forward, [deal_data.Factor_dep['Underlying_Currency'][0], deal_data.Factor_dep['Currency'][0]],
+            invert_moneyness=deal_data.Factor_dep['Invert_Moneyness']) * FX_rep
 
         return mtm
 
@@ -2404,16 +2324,16 @@ class EquityDiscreteExplicitAsianOption(Deal):
 
         # calc cost of carry
         expiry = daycount_fn(factor_dep['Expiry'] -
-                             deal_time[:, utils.TIME_GRID_MTM]).astype(shared.precision)
+                             deal_time[:, utils.TIME_GRID_MTM]).astype(shared.one.dtype.as_numpy_dtype)
         expiry_ok = tf.greater(expiry, 0.0)
         safe_expiry = tf.where(expiry_ok, expiry.reshape(-1, 1),
-                               tf.ones_like(expiry.reshape(-1, 1), dtype=shared.precision))
+                               tf.ones_like(expiry.reshape(-1, 1), dtype=shared.one.dtype))
         b = tf.where(expiry_ok, tf.log(forward / eq_spot) / safe_expiry,
-                     tf.ones_like(forward, dtype=shared.precision))
+                     tf.ones_like(forward, dtype=shared.one.dtype))
 
         # first precalc all past resets
         samples = factor_dep['Samples']
-        known_resets = factor_dep['Samples'].known_resets(shared.simulation_batch)
+        known_resets = factor_dep['Samples'].known_resets(shared)
         start_idx = samples.get_start_index(deal_time)
         sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
                                        (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
@@ -2433,7 +2353,7 @@ class EquityDiscreteExplicitAsianOption(Deal):
             tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
 
             sample_ts = daycount_fn(sample_t[:, utils.RESET_INDEX_End_Day].reshape(1, -1) -
-                                    t_block[:, utils.TIME_GRID_MTM, np.newaxis]).astype(shared.precision)
+                                    t_block[:, utils.TIME_GRID_MTM, np.newaxis]).astype(shared.one.dtype.as_numpy_dtype)
             weight_t = sample_t[:, utils.RESET_INDEX_Weight].reshape(1, -1, 1)
             sample_ft = weight_t * tf.exp(tf.expand_dims(carry_block, axis=1) *
                                           tf.expand_dims(sample_ts, axis=2))
@@ -2458,8 +2378,8 @@ class EquityDiscreteExplicitAsianOption(Deal):
 
             # trick to avoid nans in the gradients
             MM = tf.log(M2) - 2.0 * tf.log(M1)
-            MM_ok = tf.where(MM > 0, MM, tf.ones_like(MM, dtype=shared.precision))
-            vol_t = tf.where(MM > 0, tf.sqrt(MM_ok), tf.zeros_like(MM_ok, dtype=shared.precision))
+            MM_ok = tf.where(MM > 0, MM, tf.ones_like(MM, dtype=shared.one.dtype))
+            vol_t = tf.where(MM > 0, tf.sqrt(MM_ok), tf.zeros_like(MM_ok, dtype=shared.one.dtype))
 
             theo_price = utils.black_european_option(
                 M1 * spot_block, strike_bar, vol_t, 1.0,
@@ -3435,7 +3355,7 @@ class EnergySingleOption(Deal):
 
         # first precalc all past resets
         samples = factor_dep['Samples']
-        known_samples = samples.known_resets(shared.simulation_batch)
+        known_samples = samples.known_resets(shared)
         start_idx = samples.get_start_index(deal_time)
         sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
                                        (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
@@ -3473,7 +3393,7 @@ class EnergySingleOption(Deal):
 
             if sample_t.any():
                 sample_ts = np.tile(
-                    sample_t[np.newaxis, :, utils.RESET_INDEX_End_Day].astype(shared.precision),
+                    sample_t[np.newaxis, :, utils.RESET_INDEX_End_Day].astype(shared.one.dtype.as_numpy_dtype),
                     [t_block.shape[0], 1])
                 weight_t = sample_t[:, utils.RESET_INDEX_Weight].reshape(1, -1, 1)
 
@@ -3488,15 +3408,15 @@ class EnergySingleOption(Deal):
 
                 # needed for vol lookup
                 sample_block = daycount_fn(
-                    sample_t[:, utils.RESET_INDEX_Start_Day].reshape(1, -1).astype(shared.precision))
+                    sample_t[:, utils.RESET_INDEX_Start_Day].reshape(1, -1).astype(shared.one.type.as_numpy_dtype))
 
                 delivery_block = daycount_fn(
                     sample_t[:, utils.RESET_INDEX_End_Day] - factor_dep['Basedate']
-                ).reshape(1, -1).astype(shared.precision)
+                ).reshape(1, -1).astype(shared.one.type.as_numpy_dtype)
 
                 sample_tenor = daycount_fn(
                     sample_t[:, utils.RESET_INDEX_Start_Day].reshape(1, -1)
-                    - t_block[:, utils.TIME_GRID_MTM, np.newaxis]).astype(shared.precision)
+                    - t_block[:, utils.TIME_GRID_MTM, np.newaxis]).astype(shared.one.type.as_numpy_dtype)
 
                 M1 = tf.reduce_sum(sample_ft, axis=1)
                 strike_bar = self.field['Strike'] - average
@@ -3512,7 +3432,7 @@ class EnergySingleOption(Deal):
                 if 'FXCompoVol' in factor_dep:
                     fx_vols = tf.expand_dims(
                         utils.calc_time_grid_vol_rate(
-                            factor_dep['FXCompoVol'], shared.precision(1.0),
+                            factor_dep['FXCompoVol'], shared.one.type.as_numpy_dtype(1.0),
                             sample_block.reshape(-1), shared),
                         axis=0)
                     vol2 += fx_vols * fx_vols + 2.0 * fx_vols * ref_vols * factor_dep['ImpliedCorrelation']
@@ -3524,15 +3444,15 @@ class EnergySingleOption(Deal):
                 M2 = tf.reduce_sum(sample_ft * (product_t + 2.0 * sum_t), axis=1)
                 MM = tf.log(M2) - 2.0 * tf.log(M1)
                 # trick to allow the gradients to be defined
-                MM_ok = tf.where(MM > 0, MM, tf.ones_like(MM, dtype=shared.precision))
-                vol_t = tf.where(MM > 0, tf.sqrt(MM_ok), tf.zeros_like(MM_ok, dtype=shared.precision))
+                MM_ok = tf.where(MM > 0, MM, tf.ones_like(MM, dtype=shared.one.dtype))
+                vol_t = tf.where(MM > 0, tf.sqrt(MM_ok), tf.zeros_like(MM_ok, dtype=shared.one.dtype))
                 theo_price = utils.black_european_option(
-                    forward_p, shared.precision(self.field['Strike']), vol_t, 1.0,
+                    forward_p, shared.one.type.as_numpy_dtype(self.field['Strike']), vol_t, 1.0,
                     buyorsell, callorput, shared)
             else:
                 forward_p = tf.reshape(average, [1, -1])
                 theo_price = buyorsell * tf.nn.relu(callorput * (
-                        forward_p - shared.precision(self.field['Strike'])))
+                        forward_p - shared.one.type.as_numpy_dtype(self.field['Strike'])))
 
             discount_rates = tf.squeeze(
                 utils.calc_discount_rate(discount_block, tenor_block, shared),

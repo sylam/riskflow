@@ -289,7 +289,7 @@ def pvbarrieroption(shared, time_grid, deal_data, nominal,
     # get the zero curve
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time[:-1], shared)
 
-    expiry = daycount_fn(tau).astype(shared.precision)
+    expiry = daycount_fn(tau).astype(shared.one.dtype.as_numpy_dtype)
     need_spot_at_expiry = deal_time.shape[0] - expiry.size
     spot_prior, spot_at = tf.split(spot, [expiry.size, need_spot_at_expiry])
     moneyness = strike / spot_prior if invert_moneyness else spot_prior / strike
@@ -297,7 +297,7 @@ def pvbarrieroption(shared, time_grid, deal_data, nominal,
 
     if factor_dep['Barrier_Monitoring']:
         adj_barrier = barrier * tf.exp((2.0 * tf.cast(
-            barrier > spot, shared.precision) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
+            barrier > spot, shared.one.dtype) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
     else:
         adj_barrier = barrier
 
@@ -315,13 +315,13 @@ def pvbarrieroption(shared, time_grid, deal_data, nominal,
         # work out barrier
         if eta == BARRIER_UP:
             touched = tf.cast(tf.logical_and(
-                spot[:-1] < barrier, spot[1:] > barrier), shared.precision)
+                spot[:-1] < barrier, spot[1:] > barrier), shared.one.dtype)
         else:
             touched = tf.cast(tf.logical_and(
-                spot[:-1] > barrier, spot[1:] < barrier), shared.precision)
+                spot[:-1] > barrier, spot[1:] < barrier), shared.one.dtype)
 
         # barrier payoff
-        barrier_touched = tf.pad(tf.cast(tf.cumsum(touched, axis=0) > 0, shared.precision), [[1, 0], [0, 0]])
+        barrier_touched = tf.pad(tf.cast(tf.cumsum(touched, axis=0) > 0, shared.one.dtype), [[1, 0], [0, 0]])
         first_touch = barrier_touched[1:] - barrier_touched[:-1]
         # final payoff
         payoff_at = buy_or_sell * tf.nn.relu(phi * (spot_at - strike))
@@ -368,7 +368,7 @@ def pvonetouchoption(shared, time_grid, deal_data, nominal,
     # get the zero curve
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time[:-1], shared)
 
-    expiry = daycount_fn(tau).astype(shared.precision)
+    expiry = daycount_fn(tau).astype(shared.one.dtype.as_numpy_dtype)
     need_spot_at_expiry = deal_time.shape[0] - expiry.size
     spot_prior, spot_at = tf.split(spot, [expiry.size, need_spot_at_expiry])
     moneyness = barrier / spot_prior if invert_moneyness else spot_prior / barrier
@@ -376,7 +376,7 @@ def pvonetouchoption(shared, time_grid, deal_data, nominal,
 
     if factor_dep['Barrier_Monitoring']:
         adj_barrier = barrier * tf.exp((2.0 * tf.cast(
-            barrier > spot_prior, shared.precision) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
+            barrier > spot_prior, shared.one.dtype) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
     else:
         adj_barrier = barrier
 
@@ -408,12 +408,12 @@ def pvonetouchoption(shared, time_grid, deal_data, nominal,
         # barrier check
         if eta == BARRIER_UP:
             touched = tf.cast(tf.logical_and(
-                spot[:-1] < barrier, spot[1:] > barrier), shared.precision)
+                spot[:-1] < barrier, spot[1:] > barrier), shared.one.dtype)
         else:
             touched = tf.cast(tf.logical_and(
-                spot[:-1] > barrier, spot[1:] < barrier), shared.precision)
+                spot[:-1] > barrier, spot[1:] < barrier), shared.one.dtype)
 
-        barrier_touched = tf.pad(tf.cast(tf.cumsum(touched, axis=0) > 0, shared.precision), [[1, 0], [0, 0]])
+        barrier_touched = tf.pad(tf.cast(tf.cumsum(touched, axis=0) > 0, shared.one.dtype), [[1, 0], [0, 0]])
         first_touch = barrier_touched[1:] - barrier_touched[:-1]
         barrier_part = (1.0 - barrier_touched) * tf.pad(payoff, [[0, 1], [0, 0]])
 
@@ -432,6 +432,125 @@ def pvonetouchoption(shared, time_grid, deal_data, nominal,
         combined = buy_or_sell * nominal * payoff
 
     return combined
+
+
+def pv_european_option(shared, time_grid, deal_data, nominal, spot, forward, invert_moneyness=False):
+    factor_dep = deal_data.Factor_dep
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+    daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
+    moneyness = factor_dep['Strike_Price'] / spot if invert_moneyness else spot / factor_dep['Strike_Price']
+    expiry = daycount_fn(factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+    vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
+
+    theo_price = utils.black_european_option(
+        forward, factor_dep['Strike_Price'], vols, expiry,
+        factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
+
+    discount_rates = torch.squeeze(
+        utils.calc_discount_rate(discount, (
+                factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1), shared),
+        axis=1)
+
+    value = nominal * theo_price
+
+    # handle cashflows (if necessary)
+    cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], value[-1])
+
+    return value * discount_rates
+
+
+def pv_discrete_asian_option(shared, time_grid, deal_data, nominal,
+                             spot, forward, past_factor_list, invert_moneyness=False):
+    mtm_list = []
+    factor_dep = deal_data.Factor_dep
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+    daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
+
+    expiry = daycount_fn(factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+    # make sure there are no zeros
+    safe_expiry = tf.cast(tf.maximum(expiry.reshape(-1, 1), 1e-5), shared.one.dtype)
+    # cost of carry
+    b = tf.math.log(forward / spot) / safe_expiry
+    # now precalc all past resets
+    samples = factor_dep['Samples']
+    known_resets = samples.known_resets(shared)
+    start_idx = samples.get_start_index(deal_time)
+    sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+                                   (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
+                                    deal_time[:, utils.TIME_GRID_MTM].max())]
+
+    # check if the spot was simulated - if not, hold it flat
+    if spot.shape != forward.shape:
+        past_samples = tf.broadcast_to(spot, [sim_samples.shape[0], shared.simulation_batch])
+        spot = tf.broadcast_to(spot, forward.shape)
+    else:
+        past_sample_factor = [utils.calc_time_grid_spot_rate(
+            past_factor, sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
+            for past_factor in past_factor_list]
+        past_samples = past_sample_factor[0] if len(
+            past_sample_factor) == 1 else past_sample_factor[0] / past_sample_factor[1]
+
+    all_samples = tf.concat([tf.concat(known_resets, axis=0), past_samples]
+                            if known_resets else past_samples, axis=0)
+
+    start_index, counts = np.unique(start_idx, return_counts=True)
+
+    for index, (discount_block, spot_block, carry_block) in enumerate(
+            utils.split_counts([discount, spot, b], counts, shared)):
+        t_block = discount_block.time_grid
+        sample_index_t = start_index[index]
+        tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
+
+        sample_ts = daycount_fn(
+            samples.schedule[sample_index_t:, utils.RESET_INDEX_End_Day].reshape(1, -1) -
+            t_block[:, utils.TIME_GRID_MTM, np.newaxis]).astype(shared.one.dtype.as_numpy_dtype)
+
+        weight_t = samples.schedule[sample_index_t:, utils.RESET_INDEX_Weight].reshape(1, -1, 1)
+        sample_ft = weight_t * tf.exp(
+            tf.expand_dims(carry_block, axis=1) * tf.expand_dims(sample_ts, axis=2))
+        M1 = tf.reduce_sum(sample_ft, axis=1)
+
+        normalize = samples.schedule[sample_index_t:, utils.RESET_INDEX_Weight].sum()
+        average = tf.reduce_sum(
+            all_samples[:sample_index_t] * samples.schedule[:sample_index_t, utils.RESET_INDEX_Weight].reshape(-1, 1),
+            axis=0)
+
+        strike_bar = factor_dep['Strike'] - tf.tile(tf.reshape(average, (1, -1)), [counts[index], 1])
+        moneyness = (strike_bar / normalize) / spot_block if invert_moneyness else spot_block / (
+                strike_bar / normalize)
+        vols = utils.calc_time_grid_vol_rate(
+            factor_dep['Volatility'], moneyness, daycount_fn(tenor_block), shared)
+
+        product_t = sample_ft * tf.exp(
+            np.expand_dims(sample_ts, axis=2) * tf.expand_dims(vols * vols, axis=1))
+        sum_t = tf.cumsum(product_t, axis=1, exclusive=True)
+        M2 = tf.reduce_sum(sample_ft * (product_t + 2.0 * sum_t), axis=1)
+
+        # trick to avoid nans in the gradients
+        MM = tf.math.log(M2) - 2.0 * tf.math.log(M1)
+        MM_ok = tf.maximum(MM, 1e-5)
+        vol_t = tf.sqrt(MM_ok)
+
+        theo_price = utils.black_european_option(
+            M1 * spot_block, strike_bar, vol_t, 1.0,
+            factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
+
+        discount_rates = tf.squeeze(
+            utils.calc_discount_rate(discount_block, tenor_block.reshape(-1, 1), shared),
+            axis=1
+        )
+
+        cash = nominal * theo_price
+        mtm_list.append(cash * discount_rates)
+
+    # potential cashflows
+    cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], cash[-1])
+    # mtm in reporting currency
+    mtm = tf.concat(mtm_list, axis=0)
+
+    return mtm
 
 
 def pricer_float_cashflows(all_resets, cashflows, factor_dep, time_slice, shared):
@@ -458,7 +577,7 @@ def pricer_cap(all_resets, cashflows, factor_dep, time_slice, shared):
         vols, expiry, 1.0, 1.0, shared)
 
     all_int = cashflows[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * payoff
-    margin = np.zeros(cashflows.shape[0], dtype=shared.precision)
+    margin = np.zeros(cashflows.shape[0], dtype=shared.one.dtype.as_numpy_dtype)
 
     return all_int, margin
 
@@ -480,11 +599,11 @@ def pricer_floor(all_resets, cashflows, factor_dep, time_slice, shared):
         vols, expiry, 1.0, -1.0, shared)
 
     all_int = cashflows[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * payoff
-    margin = np.zeros(cashflows.shape[0], dtype=shared.precision)
+    margin = np.zeros(cashflows.shape[0], dtype=shared.one.dtype.as_numpy_dtype)
 
     return all_int, margin
 
-
+#@tf.function
 def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_currency=None, settle_cash=True):
     mtm_list = []
     factor_dep = deal_data.Factor_dep
@@ -492,7 +611,7 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
 
     # first precalc all past resets
     resets = factor_dep['Cashflows'].Resets
-    known_resets = resets.known_resets(shared.simulation_batch)
+    known_resets = resets.known_resets(shared)
     sim_resets = resets.sim_resets(deal_time[:, utils.TIME_GRID_MTM].max())
 
     if mtm_currency:
@@ -503,7 +622,7 @@ def pvfloatcashflowlist(shared, time_grid, deal_data, cashflow_pricer, mtm_curre
             mtm_currency, factor_dep['Currency'], raw_sim_resets[:, utils.RESET_INDEX_Start_Day],
             raw_sim_resets[:, :utils.RESET_INDEX_Scenario + 1], shared, only_diag=True)
 
-        known_fx = factor_dep['Cashflows'].known_fx_resets(shared.simulation_batch)
+        known_fx = factor_dep['Cashflows'].known_fx_resets(shared)
 
         # fetch fx rates - note that there is a slight difference between this and the spot fx rate
         old_fx_rates = tf.squeeze(
@@ -738,7 +857,8 @@ def pvfixedcashflows(shared, time_grid, deal_data, ignore_fixed_rate=False, sett
 
 
 def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
-    def calc_index(schedule, sim_schedule):
+
+    def calc_index(last_pub_block, last_index_block, forecast_block, schedule, sim_schedule):
         weight = schedule[:, utils.RESET_INDEX_Weight].reshape(1, -1, 1)
         dates = schedule[np.newaxis, :, utils.RESET_INDEX_Reset_Day] - \
                 last_pub_block[:, np.newaxis, utils.RESET_INDEX_Reset_Day]
@@ -770,23 +890,28 @@ def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
         else:
             return values
 
-    def get_index_val(cash_index_vals, schedule, sim_schedule, resets_per_cf, offset):
+    def get_index_val(last_pub_block, last_index_block, forecast_block,
+                      cash_index_vals, schedule, sim_schedule, resets_per_cf, offset):
+
         if cash_index_vals[cash_index_vals < 0].any():
             num_known = cash_index_vals[cash_index_vals > 0].size
             reset_offset = resets_per_cf * (offset + num_known)
             if num_known:
                 known_indices = tf.tile(
-                    cash_index_vals[cash_index_vals > 0].reshape(1, -1, 1).astype(shared.precision),
+                    cash_index_vals[cash_index_vals > 0].reshape(1, -1, 1).astype(shared.one.dtype.as_numpy_dtype),
                     (last_pub_block.shape[0], 1, shared.simulation_batch))
                 return tf.concat(
-                    [known_indices, calc_index(schedule[reset_offset:], sim_schedule[reset_offset:])], axis=1)
+                    [known_indices, calc_index(
+                        last_pub_block, last_index_block, forecast_block,
+                        schedule[reset_offset:], sim_schedule[reset_offset:])], axis=1)
             else:
-                return calc_index(schedule[reset_offset:], sim_schedule[reset_offset:])
+                return calc_index(last_pub_block, last_index_block, forecast_block,
+                                  schedule[reset_offset:], sim_schedule[reset_offset:])
         else:
             return cash_index_vals.reshape(1, -1, 1)
 
     def filter_resets(resets, index):
-        known_resets = resets.known_resets(shared.simulation_batch)
+        known_resets = resets.known_resets(shared)
         sim_resets = resets.schedule[(resets.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
                                      (resets.schedule[:, utils.RESET_INDEX_Reset_Day] <=
                                       deal_time[:, utils.TIME_GRID_MTM].max())]
@@ -829,13 +954,16 @@ def pvindexcashflows(shared, time_grid, deal_data, settle_cash=True):
         # discount rates
         discount_rates = utils.calc_discount_rate(discount_block, future_pmts, shared)
 
-        cash_base_index_vals = factor_dep['Cashflows'].offsets[start_index[index]:, utils.CASHFLOW_OFFSET_BaseReference]
-        all_base_index_vals = get_index_val(cash_base_index_vals, factor_dep['Base_Resets'].schedule, all_base_resets,
-                                            resets_per_cf, start_index[index])
-        cash_final_index_vals = factor_dep['Cashflows'].offsets[start_index[index]:,
-                                utils.CASHFLOW_OFFSET_FinalReference]
-        all_final_index_vals = get_index_val(cash_final_index_vals, factor_dep['Final_Resets'].schedule,
-                                             all_final_resets, resets_per_cf, start_index[index])
+        cash_base_index_vals = factor_dep['Cashflows'].offsets[
+                               start_index[index]:, utils.CASHFLOW_OFFSET_BaseReference]
+        all_base_index_vals = get_index_val(
+            last_pub_block, last_index_block, forecast_block, cash_base_index_vals,
+            factor_dep['Base_Resets'].schedule, all_base_resets, resets_per_cf, start_index[index])
+        cash_final_index_vals = factor_dep['Cashflows'].offsets[
+                                start_index[index]:, utils.CASHFLOW_OFFSET_FinalReference]
+        all_final_index_vals = get_index_val(
+            last_pub_block, last_index_block, forecast_block, cash_final_index_vals,
+            factor_dep['Final_Resets'].schedule, all_final_resets, resets_per_cf, start_index[index])
 
         # empty list for payments
         interest = (cashflows[:, utils.CASHFLOW_INDEX_FixedRate] *
@@ -880,7 +1008,7 @@ def pvenergycashflows(shared, time_grid, deal_data):
 
     # first precalc all past resets
     resets = factor_dep['Cashflows'].Resets
-    known_resets = resets.known_resets(shared.simulation_batch)
+    known_resets = resets.known_resets(shared)
     sim_resets = resets.schedule[(resets.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
                                  (resets.schedule[:, utils.RESET_INDEX_Reset_Day] <=
                                   deal_time[:, utils.TIME_GRID_MTM].max())]
@@ -1050,7 +1178,7 @@ def pvequitycashflows(shared, time_grid, deal_data):
     # first precalc all past resets
     all_samples = []
     for samples in cash.Resets.split_groups(2):
-        known_sample = samples.known_resets(shared.simulation_batch, include_today=True)
+        known_sample = samples.known_resets(shared, include_today=True)
         sim_samples = samples.schedule[
             (samples.schedule[:, utils.RESET_INDEX_Value] == 0.0) &
             (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <= deal_time[:, utils.TIME_GRID_MTM].max())]

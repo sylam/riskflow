@@ -734,7 +734,7 @@ class Credit_Monte_Carlo(Calculation):
         with tf.name_scope('Setup'):
             # Now create a shared state with the cholesky decomp
             shared_mem = CMC_State(
-                self.get_cholesky_decomp(inputTensor), len(self.stoch_factors), [x[-1] for x in self.static_var],
+                self.get_cholesky_decomp(inputTensor), len(self.stoch_factors), self.static_var,
                 self.batch_size, tf.ones([1, 1], dtype=self.prec), get_fxrate_factor(
                     utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs)
             )
@@ -937,9 +937,6 @@ class Credit_Monte_Carlo(Calculation):
         self.input_time_grid = params['Time_grid']
         self.numscenarios = params['Batch_Size'] * params['Simulation_Batches']
 
-        # set the precision in the utils module - Nasty hack - TODO
-        utils.Default_Precision = self.prec
-
         self.batch_size = params['Batch_Size']
         self.calc_stats['Factor_Setup_Time'] = time.monotonic()
 
@@ -959,16 +956,23 @@ class Credit_Monte_Carlo(Calculation):
         # record the (pure python) dependency setup time
         self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']
 
-        # record how long it took to build the graph
-        self.calc_stats['Graph_Setup_Time'] = time.monotonic()
         # store the output
         output = defaultdict(list)
-
-        core_eval = tf.function(self.core_evaluation) if params.get('AutoGraph', 'No')=='Yes' else self.core_evaluation
+        compile_graph = params.get('AutoGraph', 'No') == 'Yes'
+        core_eval = tf.function(self.core_evaluation) if compile_graph else self.core_evaluation
 
         for run in range(params['Simulation_Batches']):
+            iteration_time = time.monotonic()
             # get the output tensors
             tensors = core_eval(shared_mem, params)
+            if compile_graph and run == 0:
+                self.calc_stats['Graph_Setup_Time'] = time.monotonic() - iteration_time
+
+            self.calc_stats['Iteration_time'] = self.calc_stats.get(
+                'Iteration_time', 0.0) + time.monotonic() - iteration_time
+
+            print('run {} in time {}'.format(run, self.calc_stats['Iteration_time']/(run+1)))
+
             # store all output tensors
             for k, v in tensors.items():
                 if not (k.startswith('_')):
@@ -987,8 +991,6 @@ class Credit_Monte_Carlo(Calculation):
                 for key, value in self.stoch_factors.items():
                     output.setdefault('scenarios', {}).setdefault(key, []).append(
                         tensors['_scenarios'][self.stoch_ofs[key]].numpy())
-
-        self.calc_stats['Graph_Setup_Time'] = time.monotonic() - self.calc_stats['Graph_Setup_Time']
 
         results = {'Netting': self.netting_sets, 'Stats': self.calc_stats, 'Jacobians': self.jacobians}
         results['Results'] = self.report(output)
@@ -1150,9 +1152,6 @@ class Base_Revaluation(Calculation):
     def execute(self, params):
         # get the rundate
         base_date = pd.Timestamp(params['Run_Date'])
-        # set the precision in the utils module - Nasty hack - Need to fix this - TODO
-        utils.Default_Precision = self.prec
-
         shared_mem = self.update_factors(params, base_date)
 
         self.calc_stats['Deal_Setup_Time'] = time.monotonic()

@@ -84,9 +84,9 @@ if __name__ == '__main__':
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
              os.path.join('G:', folder)])
 
-    path = paths['CVA']
+    path = paths['Arena']
 
-    rundate = '2020-11-17'
+    rundate = '2020-11-18'
 
     # bootstrap(path, rundate, reuse_cal=True)
 
@@ -117,17 +117,17 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, 'CrB_AutoX_ISDA.json'))
 
 
-        # cx.parse_json(os.path.join(path, rundate, env, 'CrB_ABSA_Bank_Jhb_ISDA.json'))
+        cx.parse_json(os.path.join(path, rundate, env, 'CrB_ABSA_Bank_Jhb_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Eskom_Hld_SOC_Ltd_ISDA.json'))
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
-        cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
 
         if 1:
             calc, out, res = rf.run_cmc(cx, overrides={'Calc_Scenarios': 'No',
                                                        'Dynamic_Scenario_Dates': 'No',
                                                        'Generate_Cashflows': 'Yes',
-
+                                                       'AutoGraph': 'No',
                                                        # 'Run_Date': '2020-03-09',
                                                        # 'Tenor_Offset': -3/365.0,
                                                        # 'Time_grid':'1m 5m 1362d',
