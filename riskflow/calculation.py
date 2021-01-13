@@ -18,7 +18,6 @@
 
 
 # import standard libraries
-
 import os
 import time
 import logging
@@ -233,9 +232,8 @@ class Calculation(object):
                              for k, v in self.all_factors.items()} if display_val else {}
             hessian_index = ([], [])
             factor, rate, tenor, values = [], [], [], []
-            for k, v in grad.items():
+            for name, v in grad.items():
                 # first derivative
-                name = k.name[:-2]
                 non_zero = np.where(v)[0]
                 grad_index, index_len = self.gradient_index[name]
                 hessian_index[0].append([name] * v.shape[0])
@@ -248,11 +246,15 @@ class Calculation(object):
                     rate_name = name.split('/')[-1]
                     if rate_name in factor_values:
                         rate_non_zero = grad_index[non_zero][:, :index_len].astype(np.float64)
-                        factor.append(factor_values[rate_name].current_value(rate_non_zero).flatten())
+                        factor_val = factor_values[rate_name].current_value(rate_non_zero).flatten()
                     else:
                         sub_rate, param = rate_name.rsplit('.', 1)
                         sub_rate_non_zero = grad_index[non_zero].shape[0]
-                        factor.append(factor_values[sub_rate].current_value()[param].flatten()[:sub_rate_non_zero])
+                        factor_val = factor_values[sub_rate].current_value()[param].flatten()[:sub_rate_non_zero]
+
+                    # final check - should always pass - but there may be data errors
+                    if factor_val.size == non_zero.size:
+                        factor.append(factor_val)
 
             tenors = np.vstack(tenor)
             self.hessian_index = (np.hstack(hessian_index[0]), np.vstack(hessian_index[1]))
@@ -313,9 +315,9 @@ class Calculation(object):
 
 
 class CMC_State(utils.Calculation_State):
-    def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, one,
+    def __init__(self, base_date, cholesky, num_stoch_factors, static_buffer, batch_size, one,
                  report_currency, nomodel='Constant'):
-        super(CMC_State, self).__init__(static_buffer, one, report_currency, nomodel)
+        super(CMC_State, self).__init__(base_date, static_buffer, one, report_currency, nomodel)
         # these are tensors
         self.t_PreCalc = {}
         self.t_cholesky = cholesky
@@ -554,7 +556,7 @@ class Credit_Monte_Carlo(Calculation):
         greeks = bool(np.any([params[x].get('Gradient', 'No') == 'Yes' for x in params.keys() if x.endswith('VA')]))
         sensitivities = params.get('Gradient_Variables', 'All')
         calc_grad = greeks and sensitivities in ['All', 'Implied']
-        inputTensor = tf.Variable if calc_grad else tf.constant
+        inputTensor = tf.Variable if calc_grad else tf.identity
 
         # now get the stochastic risk factors ready - these will be generated from the price models
         with tf.name_scope("Stochastic_Input"):
@@ -566,11 +568,10 @@ class Credit_Monte_Carlo(Calculation):
                             vars = OrderedDict()
                             self.implied_ofs.setdefault(key, len(self.implied_var))
                             for param_name, param_value in value.implied.current_value().items():
-                                factor_name = utils.Factor(value.implied.__class__.__name__,
-                                                           key.name + (param_name,))
-
-                                vars[param_name] = inputTensor(self.prec(param_value),
-                                                               name=utils.check_scope_name(factor_name))
+                                factor_name = utils.Factor(
+                                    value.implied.__class__.__name__, key.name + (param_name,))
+                                vars[param_name] = inputTensor(
+                                    self.prec(param_value), name=utils.check_scope_name(factor_name))
 
                             self.implied_var.append(vars)
 
@@ -590,13 +591,16 @@ class Credit_Monte_Carlo(Calculation):
 
         # setup the device and allocate memory
         calc_state = self.__init_shared_state(
-            params['Random_Seed'], params.get('NoModel', 'Constant'), inputTensor,
+            base_date, params['Random_Seed'], params.get('NoModel', 'Constant'), inputTensor,
             params['Currency'], calc_greeks=sensitivities if greeks else None)
 
         # calculate a reverse lookup for the tenors and store the daycount code
-        self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
+        self.all_tenors = utils.update_tenors(self.base_date, self.all_factors, self.prec)
 
-        # now initialize all stochastic factors
+        return calc_state, dependent_factors
+
+    def init_stochastic_factors(self, calc_state, dependent_factors):
+        # initialize all stochastic factors
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 with tf.name_scope(utils.check_scope_name(key)):
@@ -608,8 +612,8 @@ class Credit_Monte_Carlo(Calculation):
                         implied_tensor = None
 
                     value.precalculate(
-                        base_date, ScenarioTimeGrid(
-                            dependent_factors[key], self.time_grid, base_date),
+                        calc_state.base_date, ScenarioTimeGrid(
+                            dependent_factors[key], self.time_grid, calc_state.base_date),
                         self.stoch_var[self.stoch_ofs[key]],
                         calc_state, self.process_ofs[key],
                         implied_tensor=implied_tensor)
@@ -619,8 +623,6 @@ class Credit_Monte_Carlo(Calculation):
             if key.type not in utils.DimensionLessFactors:
                 # precalculate any values for the stochastic process
                 value.calc_references(key, self.static_ofs, self.stoch_ofs, self.all_tenors, self.all_factors)
-
-        return calc_state
 
     def update_time_grid(self, base_date, reset_dates, settlement_currencies, dynamic_scenario_dates=False):
         # work out the scenario and dynamic dates
@@ -712,7 +714,7 @@ class Credit_Monte_Carlo(Calculation):
 
         return cholesky
 
-    def __init_shared_state(self, seed, nomodel, inputTensor,
+    def __init_shared_state(self, base_date, seed, nomodel, inputTensor,
                             reporting_currency, calc_greeks=None, debug_batch_size=128):
         # set the random seed
         tf.random.set_seed(seed)
@@ -734,7 +736,7 @@ class Credit_Monte_Carlo(Calculation):
         with tf.name_scope('Setup'):
             # Now create a shared state with the cholesky decomp
             shared_mem = CMC_State(
-                self.get_cholesky_decomp(inputTensor), len(self.stoch_factors), self.static_var,
+                base_date, self.get_cholesky_decomp(inputTensor), len(self.stoch_factors), self.static_var,
                 self.batch_size, tf.ones([1, 1], dtype=self.prec), get_fxrate_factor(
                     utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs)
             )
@@ -749,15 +751,21 @@ class Credit_Monte_Carlo(Calculation):
             elif result == 'cashflows':
                 self.output.setdefault('cashflows', {k: pd.concat(v, axis=1) for k, v in data.items()})
             elif result in ['cva', 'collva', 'fva']:
-                self.output.setdefault(result, np.array(data, dtype=np.float64).mean())
+                data = np.array(data, dtype=np.float64)
+                self.output.setdefault(result, data.mean())
+                self.output.setdefault(result+'_error', data.std())
             elif result == 'collva_t':
                 self.output.setdefault(result, np.array(data, dtype=np.float64).mean(axis=0))
             elif result in ['grad_cva', 'grad_collva', 'grad_fva']:
                 grad = dict.fromkeys(data[0].keys())
+                error = dict.fromkeys(data[0].keys())
                 for k in grad.keys():
-                    values = np.array([v[k].astype(np.float64) for v in data])
+                    values = np.array([v[k].numpy().astype(np.float64) for v in data])
                     grad[k] = np.mean(values, axis=0)
+                    error[k] = np.std(values, axis=0)
+                # now record the answer (and errors)
                 self.output.setdefault(result, grad)
+                self.output.setdefault(result+'_error', error)
             elif result in ['grad_cva_hessian']:
                 self.output.setdefault(result, np.stack(data).astype(np.float64).mean(axis=0))
             else:
@@ -786,11 +794,6 @@ class Credit_Monte_Carlo(Calculation):
                 tensors['collva'] = tf.reduce_sum(tensors['collva_t'])
                 tensors['collateral'] = shared_mem.t_Credit['Collateral']
 
-                if params['CollVA'].get('Gradient', 'No') == 'Yes':
-                    # calculate all the derivatives of collva
-                    tensors['grad_collva'] = SensitivitiesEstimator(
-                        tensors['collva'], self.all_var).grad
-
         if 'FVA' in params:
             time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
             mtm_grid = self.time_grid.mtm_time_grid[time_grid]
@@ -807,7 +810,7 @@ class Credit_Monte_Carlo(Calculation):
                 St_T = tf.squeeze(tf.exp(-surv.gather_weighted_curve(
                     shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), axis=0)
             else:
-                St_T = tf.constant([[1.0]], self.prec)
+                St_T = tf.identity([[1.0]], self.prec)
 
             with tf.name_scope('FVA'):
                 deflation = utils.calc_time_grid_curve_rate(riskfree, np.zeros((1, 3)), shared_mem)
@@ -840,17 +843,13 @@ class Credit_Monte_Carlo(Calculation):
 
                 tensors['fva'] = FCA - FBA
 
-                if params['FVA'].get('Gradient', 'No') == 'Yes':
-                    # calculate all the derivatives of fva
-                    tensors['grad_fva'] = SensitivitiesEstimator(
-                        tensors['fva'], self.all_var).grad
-
         if 'CVA' in params:
-            discount = get_interest_factor(utils.check_rate_name(params['Deflation_Interest_Rate']),
-                                           self.static_ofs, self.stoch_ofs, self.all_tenors)
-            survival = get_survival_factor(utils.check_rate_name(params['CVA']['Counterparty']),
-                                           self.static_ofs,
-                                           self.stoch_ofs, self.all_tenors)
+            discount = get_interest_factor(
+                utils.check_rate_name(params['Deflation_Interest_Rate']),
+                self.static_ofs, self.stoch_ofs, self.all_tenors)
+            survival = get_survival_factor(
+                utils.check_rate_name(params['CVA']['Counterparty']),
+                self.static_ofs, self.stoch_ofs, self.all_tenors)
             recovery = get_recovery_rate(utils.check_rate_name(params['CVA']['Counterparty']), self.all_factors)
             # only looks at the first netting set - should be fine . . .
             time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
@@ -886,33 +885,6 @@ class Credit_Monte_Carlo(Calculation):
                 tensors['cva'] = (1.0 - recovery) * tf.reduce_sum(
                     tf.reduce_mean(0.5 * (pv_exposure[1:] + pv_exposure[:-1]) * prob, axis=1), axis=0)
 
-                if params['CVA'].get('Gradient', 'No') == 'Yes':
-                    # potentially fetch ir jacobian matrices for base curves
-                    base_ir_curves = [x for x in self.stoch_ofs.keys() if
-                                      x.type == 'InterestRate' and len(x.name) == 1]
-                    self.jacobians = {}
-                    for ir_factor in base_ir_curves:
-                        jacobian_factor = utils.Factor('InterestRateJacobian', ir_factor.name)
-                        ir_curve = self.stoch_factors[utils.Factor('InterestRate', ir_factor.name)].factor
-                        var_name = 'Stochastic_Input/{0}:0'.format(utils.check_tuple_name(ir_factor))
-                        try:
-                            jac = construct_factor(jacobian_factor, self.config.params['Price Factors'])
-                            jac.update(ir_curve)
-                            self.jacobians[var_name] = jac.current_value()
-                            logging.info('jacobian present for {0} - will attempt inverse bootstrap'.format(
-                                utils.check_tuple_name(ir_factor)))
-                        except KeyError as e:
-                            pass
-
-                    # calculate all the derivatives of cva
-                    sensitivity = SensitivitiesEstimator(tensors['cva'], self.all_var)
-                    tensors['grad_cva'] = sensitivity.grad
-                    # store the size of the Gradient
-                    self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
-                    if params['CVA'].get('Hessian', 'No') == 'Yes':
-                        # calculate the hessian matrix - warning - this will probably kill your box
-                        tensors['grad_cva_hessian'] = sensitivity.get_H_op(self.prec)
-
         # do we need to store cashflows?
         if params.get('Generate_Cashflows', 'No') == 'Yes':
             tensors['_cashflows'] = shared_mem.t_Cashflows
@@ -926,27 +898,28 @@ class Credit_Monte_Carlo(Calculation):
     def execute(self, params):
         # get the rundate
         base_date = pd.Timestamp(params['Run_Date'])
-        # check if we need to produce a slideshow (i.e. documentation)
-        if params.get('Generate_Slideshow', 'No') == 'Yes':
-            # we need to generate scenarios to draw pictures . . .
-            params['Calc_Scenarios'] = 'Yes'
-            # set the name of this calculation
-            self.name = params['calc_name'][0]
-
         # Define the base and scenario grids
         self.input_time_grid = params['Time_grid']
         self.numscenarios = params['Batch_Size'] * params['Simulation_Batches']
 
         self.batch_size = params['Batch_Size']
         self.calc_stats['Factor_Setup_Time'] = time.monotonic()
+        # update the factors and obtain shared state (and define all variables)
+        shared_mem, dependent_factors = self.update_factors(params, base_date)
 
-        # update the factors and obtain shared state
-        shared_mem = self.update_factors(params, base_date)
+        # here's where the gradient calc potentially starts
+        # note that I'd like to precalculate the gradient and store it on a tape so that i don't need to
+        # recompute it - but not sure how to do that in tensorflow
+
+        # with tf.GradientTape(persistent=True) as tape:
+        #     # now init the stoch factors
+        #     self.init_stochastic_factors(shared_mem, dependent_factors)
+
         # record the setup time
         self.calc_stats['Factor_Setup_Time'] = time.monotonic() - self.calc_stats['Factor_Setup_Time']
-
         # now that the memory is setup, all python objects have had a chance to sync with the device
         # (in terms of indices, offsets etc.)
+
         self.calc_stats['Deal_Setup_Time'] = time.monotonic()
         self.netting_sets = DealStructure(Aggregation('root'))
         self.set_deal_structures(
@@ -958,15 +931,34 @@ class Credit_Monte_Carlo(Calculation):
 
         # store the output
         output = defaultdict(list)
-        compile_graph = params.get('AutoGraph', 'No') == 'Yes'
-        core_eval = tf.function(self.core_evaluation) if compile_graph else self.core_evaluation
 
         for run in range(params['Simulation_Batches']):
             iteration_time = time.monotonic()
-            # get the output tensors
-            tensors = core_eval(shared_mem, params)
-            if compile_graph and run == 0:
-                self.calc_stats['Graph_Setup_Time'] = time.monotonic() - iteration_time
+            # get the output tensors and record the operations
+            with tf.GradientTape(persistent=False) as tape:
+                self.init_stochastic_factors(shared_mem, dependent_factors)
+                tensors = self.core_evaluation(shared_mem, params)
+
+            # get all the sensitivities from the tape
+            if params.get('CollVA', {}).get('Gradient', 'No') == 'Yes':
+                # calculate all the derivatives of collva
+                sensitivity = SensitivitiesEstimator(
+                    tape, tensors['collva'], self.all_var).grad
+                output.setdefault('grad_collva', []).append(sensitivity.grad)
+
+            if params.get('FVA', {}).get('Gradient', 'No') == 'Yes':
+                # calculate all the derivatives of fva
+                sensitivity = SensitivitiesEstimator(
+                    tape, tensors['fva'], self.all_var).grad
+                output.setdefault('grad_fva', []).append(sensitivity.grad)
+
+            if params.get('CVA', {}).get('Gradient', 'No') == 'Yes':
+                # calculate all the derivatives of cva
+                sensitivity = SensitivitiesEstimator(
+                    tape, tensors['cva'], self.all_var)
+                output.setdefault('grad_cva', []).append(sensitivity.grad)
+                # store the size of the Gradient
+                self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
             self.calc_stats['Iteration_time'] = self.calc_stats.get(
                 'Iteration_time', 0.0) + time.monotonic() - iteration_time
@@ -999,8 +991,8 @@ class Credit_Monte_Carlo(Calculation):
 
 
 class Base_Reval_State(utils.Calculation_State):
-    def __init__(self, static_buffer, one, report_currency, calc_greeks, gamma, nomodel='Constant'):
-        super(Base_Reval_State, self).__init__(static_buffer, one, report_currency, nomodel)
+    def __init__(self, base_date, static_buffer, one, report_currency, calc_greeks, gamma, nomodel='Constant'):
+        super(Base_Reval_State, self).__init__(base_date, static_buffer, one, report_currency, nomodel)
         self.calc_greeks = calc_greeks
         self.gamma = gamma
 
@@ -1044,7 +1036,7 @@ class Base_Revaluation(Calculation):
 
         self.all_factors = self.static_factors
         calc_grad = params.get('Greeks', 'No') != 'No'
-        inputTensor = tf.Variable if calc_grad else tf.constant
+        inputTensor = tf.Variable if calc_grad else tf.identity
 
         with tf.name_scope("Static_Input"):
             for key, value in self.static_factors.items():
@@ -1055,10 +1047,11 @@ class Base_Revaluation(Calculation):
                         inputTensor(self.prec(value.current_value()), name=utils.check_scope_name(key)))
 
         # setup the device and allocate memory
-        calc_state = self.__init_shared_state(params['Currency'], calc_grad, params.get('Greeks', 'No') == 'All')
+        calc_state = self.__init_shared_state(
+            base_date, params['Currency'], calc_grad, params.get('Greeks', 'No') == 'All')
 
         # calculate a reverse lookup for the tenors and store the daycount code
-        self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
+        self.all_tenors = utils.update_tenors(self.base_date, self.all_factors, self.prec)
 
         return calc_state
 
@@ -1068,7 +1061,7 @@ class Base_Revaluation(Calculation):
         self.base_date = base_date
         self.time_grid.set_base_date(base_date)
 
-    def __init_shared_state(self, reporting_currency, calc_greeks, gamma=False):
+    def __init_shared_state(self, base_date, reporting_currency, calc_greeks, gamma=False):
 
         # name of the base currency
         base_currency = 'Static_Input/FxRate.{}'.format(
@@ -1084,7 +1077,7 @@ class Base_Revaluation(Calculation):
         # allocate memory on the device
         with tf.name_scope('Setup'):
             shared_state = Base_Reval_State(
-                self.static_var, tf.ones([1, 1], dtype=self.prec), get_fxrate_factor(
+                base_date, self.static_var, tf.ones([1, 1], dtype=self.prec), get_fxrate_factor(
                     utils.check_rate_name(reporting_currency), self.static_ofs, {}),
                 all_vars_concat, gamma)
 

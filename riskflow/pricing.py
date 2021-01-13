@@ -51,7 +51,7 @@ class SensitivitiesEstimator(object):
 
     """
 
-    def __init__(self, value, params):
+    def __init__(self, tape, value, params):
         """
         Args:
             cost: Cost function output (tensor)
@@ -59,53 +59,22 @@ class SensitivitiesEstimator(object):
         """
         self.cost = value
         self.grad = OrderedDict([(
-            var, tf.convert_to_tensor(grad)) for grad, var in zip(
-            tf.gradients(value, params, aggregation_method=tf.AggregationMethod.EXPERIMENTAL_ACCUMULATE_N),
-            params) if grad is not None])
+            var.name[:-2], tf.convert_to_tensor(grad)) for grad, var in zip(
+            tape.gradient(value, params), params) if grad is not None])
         self.params = list(self.grad.keys())
-        self.P = self.flatten(self.params).get_shape().as_list()[0]
+        self.P = self.flatten(self.grad.values()).shape[0]
 
     def flatten(self, params):
         """
         Flattens the list of tensor(s) into a 1D tensor
-        
+
         Args:
             params: List of model parameters (List of tensor(s))
-        
+
         Returns:
             A flattened 1D tensor
         """
         return tf.concat([tf.reshape(_params, [-1]) for _params in params], axis=0)
-
-    def get_Hv_op(self, v):
-        """ 
-        Implements a Hessian vector product estimator Hv op defined as the 
-        matrix multiplication of the Hessian matrix H with the vector v.
-    
-        Args:      
-            v: Vector to multiply with Hessian (tensor)
-        
-        Returns:
-            Hv_op: Hessian vector product op (tensor)
-        """
-        cost_gradient = self.flatten(self.grad.values())
-        vprod = tf.multiply(cost_gradient, tf.stop_gradient(v))
-        Hv_op = self.flatten(tf.gradients(vprod, self.params))
-        return Hv_op
-
-    def get_H_op(self, prec):
-        """ 
-        Implements a full Hessian estimator op by forming p Hessian vector 
-        products using HessianEstimator.get_Hv_op(v) for all v's in R^P
-        
-        Args:
-            None
-        
-        Returns:
-            H_op: Hessian matrix op (tensor)
-        """
-        H_op = tf.map_fn(self.get_Hv_op, tf.eye(self.P, self.P, dtype=prec), dtype=prec)
-        return H_op
 
 
 def greeks(shared, deal_data, mtm):
@@ -160,11 +129,11 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
         sigma2 = sigma * sigma
         vol = sigma * np.sqrt(expiry)
         mu = (b - 0.5 * sigma2) / sigma2
-        log_bar = tf.log(barrier / spot)
-        x1 = tf.log(spot / strike) / vol + (1.0 + mu) * vol
-        x2 = tf.log(spot / barrier) / vol + (1.0 + mu) * vol
+        log_bar = tf.math.log(barrier / spot)
+        x1 = tf.math.log(spot / strike) / vol + (1.0 + mu) * vol
+        x2 = tf.math.log(spot / barrier) / vol + (1.0 + mu) * vol
 
-        y1 = tf.log((barrier * barrier) / (spot * strike)) / vol + (1.0 + mu) * vol
+        y1 = tf.math.log((barrier * barrier) / (spot * strike)) / vol + (1.0 + mu) * vol
         y2 = log_bar / vol + (1.0 + mu) * vol
         lam = tf.sqrt(mu * mu + 2.0 * r / sigma2)
         z = log_bar / vol + lam * vol
@@ -386,7 +355,7 @@ def pvonetouchoption(shared, time_grid, deal_data, nominal,
     expiry_years = expiry.reshape(-1, 1)
     root_tau = np.sqrt(expiry_years)
     mu = b / sigma - 0.5 * sigma
-    log_vol = tf.log(barrier / spot_prior) / sigma
+    log_vol = tf.math.log(barrier / spot_prior) / sigma
     barrovert = log_vol / root_tau
     eta_scale = 0.7071067811865476 * eta
 

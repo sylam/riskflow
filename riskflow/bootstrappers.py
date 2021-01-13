@@ -531,7 +531,7 @@ class InterestRateJacobian(object):
                         continue
 
                     # calculate a reverse lookup for the tenors and store the daycount code
-                    all_tenors = utils.update_tenors(base_date, {ir_factor: ir_curve})
+                    all_tenors = utils.update_tenors(base_date, {ir_factor: ir_curve}, self.prec)
                     # calculate the curve index - need to clean this up - TODO!!!
                     curve_index = [instruments.calc_factor_index(ir_factor, {ir_factor: 0}, {}, all_tenors)]
                     benchmarks = OrderedDict()

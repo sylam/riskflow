@@ -331,6 +331,7 @@ class Deal(object):
     def get_settlement_currencies(self):
         return self.settlement_currencies
 
+    # @tf.function
     def calculate(self, shared, time_grid, deal_data):
         # generate the theo price
         mtm = self.generate(shared, time_grid, deal_data)
@@ -1023,10 +1024,9 @@ class MtMCrossCurrencySwapDeal(Deal):
                                                                     node_settlements)
 
     def post_process(self, accum, shared, time_grid, deal_data, child_dependencies):
-        mtm_list = []
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        child_map = {}
+
         if not self.child_map:
             for index, child in enumerate(child_dependencies):
                 # make the child price to the same grid as the parent
@@ -2325,11 +2325,8 @@ class EquityDiscreteExplicitAsianOption(Deal):
         # calc cost of carry
         expiry = daycount_fn(factor_dep['Expiry'] -
                              deal_time[:, utils.TIME_GRID_MTM]).astype(shared.one.dtype.as_numpy_dtype)
-        expiry_ok = tf.greater(expiry, 0.0)
-        safe_expiry = tf.where(expiry_ok, expiry.reshape(-1, 1),
-                               tf.ones_like(expiry.reshape(-1, 1), dtype=shared.one.dtype))
-        b = tf.where(expiry_ok, tf.log(forward / eq_spot) / safe_expiry,
-                     tf.ones_like(forward, dtype=shared.one.dtype))
+        safe_expiry = np.maximum(expiry.reshape(-1, 1), 1e-5)
+        b = tf.math.log(forward / eq_spot) / safe_expiry
 
         # first precalc all past resets
         samples = factor_dep['Samples']
@@ -2368,16 +2365,16 @@ class EquityDiscreteExplicitAsianOption(Deal):
 
             strike_bar = self.field['Strike_Price'] - tf.tile(tf.reshape(average, (1, -1)), [counts[index], 1])
             moneyness = spot_block / (strike_bar / normalize)
-            vols = utils.calc_time_grid_vol_rate(factor_dep['Equity_Volatility'], moneyness,
-                                                 daycount_fn(tenor_block), shared)
+            vols = utils.calc_time_grid_vol_rate(
+                factor_dep['Equity_Volatility'], moneyness, daycount_fn(tenor_block), shared)
 
-            product_t = sample_ft * tf.exp(np.expand_dims(sample_ts, axis=2) *
-                                           tf.expand_dims(vols * vols, axis=1))
+            product_t = sample_ft * tf.exp(
+                np.expand_dims(sample_ts, axis=2) * tf.expand_dims(vols * vols, axis=1))
             sum_t = tf.cumsum(product_t, axis=1, exclusive=True)
             M2 = tf.reduce_sum(sample_ft * (product_t + 2.0 * sum_t), axis=1)
 
             # trick to avoid nans in the gradients
-            MM = tf.log(M2) - 2.0 * tf.log(M1)
+            MM = tf.math.log(M2) - 2.0 * tf.math.log(M1)
             MM_ok = tf.where(MM > 0, MM, tf.ones_like(MM, dtype=shared.one.dtype))
             vol_t = tf.where(MM > 0, tf.sqrt(MM_ok), tf.zeros_like(MM_ok, dtype=shared.one.dtype))
 
@@ -3442,7 +3439,7 @@ class EnergySingleOption(Deal):
 
                 sum_t = tf.cumsum(product_t, axis=1, exclusive=True)
                 M2 = tf.reduce_sum(sample_ft * (product_t + 2.0 * sum_t), axis=1)
-                MM = tf.log(M2) - 2.0 * tf.log(M1)
+                MM = tf.math.log(M2) - 2.0 * tf.math.log(M1)
                 # trick to allow the gradients to be defined
                 MM_ok = tf.where(MM > 0, MM, tf.ones_like(MM, dtype=shared.one.dtype))
                 vol_t = tf.where(MM > 0, tf.sqrt(MM_ok), tf.zeros_like(MM_ok, dtype=shared.one.dtype))

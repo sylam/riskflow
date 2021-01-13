@@ -320,18 +320,83 @@ class DateEqualList:
                                for date, value in self.data.items()]) + ']'
 
 
+@tf.function(experimental_relax_shapes=True)
+def get_index(tenor, delta, max_index, type, tenor_points_in_years):
+    index = tf.clip_by_value(
+        tf.searchsorted(tenor, tenor_points_in_years, side='right') - 1,
+        0, max_index)
+    index_next = tf.clip_by_value(index + 1, 0, max_index)
+
+    if type == 'Dividend':
+        alpha = (1.0 / tf.maximum(tf.gather(tenor, index), 1e-5) -
+                 1.0 / tenor_points_in_years) / tf.gather(delta, index)
+    else:
+        alpha = (tenor_points_in_years - tf.gather(tenor, index)) / tf.gather(delta, index)
+
+    return index, index_next, alpha
+
+
+@tf.function(experimental_relax_shapes=True)
+def get_index_time_weight(tenor, delta, max_index, type, tenor_points_in_years):
+    index, index_next, alpha = get_index(tenor, delta, max_index, type, tenor_points_in_years)
+    w1 = (1.0 - alpha) * tenor_points_in_years
+    w2 = alpha * tenor_points_in_years
+    return index, index_next, alpha, w1, w2
+
+
+@tf.function(experimental_relax_shapes=True)
+def get_index_weight(tenor, delta, max_index, type, tenor_points_in_years):
+    index, index_next, alpha = get_index(tenor, delta, max_index, type, tenor_points_in_years)
+    w1 = (1.0 - alpha)
+    w2 = alpha
+    return index, index_next, alpha, w1, w2
+
+
+class CurveTenor(object):
+    def __init__(self, tenor_points, dtype, interp):
+        # linear interpolation by default
+        points = np.array(tenor_points)
+        min_tenor = points.min()
+        max_tenor = points.max()
+        # check that dividends are defined >0
+        if interp == 'Dividend':
+            tenor_delta = (1.0 / np.array(tenor_points[:-1]).clip(1e-5, np.inf)) - \
+                          (1.0 / np.array(tenor_points[1:]).clip(1e-5, np.inf))
+            min_tenor = max(1e-5, min_tenor)
+            max_tenor = max(1e-5, max_tenor)
+        else:
+            tenor_delta = np.diff(points)
+
+        self.tenor = points.astype(dtype)
+        self.delta = np.append(tenor_delta, 1.0).astype(dtype)
+        self.type = interp
+        self.min = min_tenor
+        self.max = max_tenor
+        self.max_index = np.array(max(points.shape[0] - 1, 0)).astype(np.int32)
+
+    def get_index(self, tenor_points_in_years):
+        return get_index(self.tenor, self.delta, self.max_index, self.type, tenor_points_in_years)
+
+    def get_index_time_weight(self, tenor_points_in_years):
+        return get_index_time_weight(self.tenor, self.delta, self.max_index, self.type, tenor_points_in_years)
+
+    def get_index_weight(self, tenor_points_in_years):
+        return get_index_weight(self.tenor, self.delta, self.max_index, self.type, tenor_points_in_years)
+
+
 class Calculation_State(object):
     """
     Note that all pricing functions depend on this class being correctly setup. All calculations
     should inherit from this calculation state and extend accordingly
     """
 
-    def __init__(self, static_buffer, unit, report_currency: List[Tuple[bool, int]], nomodel: str):
+    def __init__(self, base_date, static_buffer, unit, report_currency: List[Tuple[bool, int]], nomodel: str):
         # these are tensors
         self.t_Buffer = {}
         self.t_Static_Buffer = static_buffer
         # storing a unit tensor allows the dtype and device to be encoded in the calculation state
         self.one = unit
+        self.base_date = base_date
         self.simulation_batch = 1
         self.Report_Currency = report_currency
         self.t_Cashflows = None
@@ -677,27 +742,24 @@ def non_zero(tensor):
         return tensor
 
 
-def interpolate_curve_indices(all_tenor_points, curve_component, time_factor=1.0):
-    # will only work if all_tenor_points is 2 dimensional
-    tenor, delta, curvetype = curve_component[FACTOR_INDEX_Tenor_Index][:3]
+def interpolate_curve_indices_old(all_tenor_points: np.ndarray, curve_component: List, time_factor=1.0):
+    # will only work if all_tenor_points is 2 dimensional - note we don't worry about interpolation here yet
+    tenor_obj = curve_component[FACTOR_INDEX_Tenor_Index]
     daycount = curve_component[FACTOR_INDEX_Daycount]
-    max_tenor_index = max(tenor.size - 1, 0)
 
     a, i1, w1, i2, w2 = [], [], [], [], []
     for tenor_points in all_tenor_points:
-        tenor_points_in_years = daycount(tenor_points)
+        tenor_points_in_years = np.clip(daycount(tenor_points), tenor_obj.min, tenor_obj.max)
         index = np.clip(
-            np.searchsorted(tenor, tenor_points_in_years, side='right') - 1,
-            0, max_tenor_index)
-        index_next = np.clip(index + 1, 0, max_tenor_index)
-        if curvetype == 'Dividend':
-            min_tenor = max(1e-5, tenor.min())
-            max_tenor = max(1e-5, tenor.max())
-            alpha = (1.0 / tenor[index].clip(1e-5, np.inf) -
-                     1.0 / tenor_points_in_years.clip(min_tenor, max_tenor)) / delta[index]
+            np.searchsorted(tenor_obj.tenor, tenor_points_in_years, side='right') - 1,
+            0, tenor_obj.max_index)
+        index_next = np.clip(index + 1, 0, tenor_obj.max_index)
+
+        if tenor_obj.type == 'Dividend':
+            alpha = (1.0 / max(tenor_obj.tenor[index], 1e-5) -
+                     1.0 / tenor_points_in_years) / tenor_obj.delta[index]
         else:
-            alpha = (tenor_points_in_years.clip(tenor.min(), tenor.max()) -
-                     tenor[index]) / delta[index]
+            alpha = (tenor_points_in_years - tenor_obj.tenor[index]) / tenor_obj.delta[index]
 
         time_modifier = time_factor * tenor_points_in_years if time_factor else 1.0
 
@@ -712,36 +774,72 @@ def interpolate_curve_indices(all_tenor_points, curve_component, time_factor=1.0
     return alpha, np.array(i1), np.expand_dims(weight1, axis=2), np.array(i2), np.expand_dims(weight2, axis=2)
 
 
-def interpolate_curve(curve_tensor, curve_component, curve_interp, points, time_factor):
-    a, i1, w1, i2, w2 = interpolate_curve_indices(
-        points, curve_component, time_factor)
+@tf.function(experimental_relax_shapes=True)
+def interpolate_curve_indices(all_tenor_points, curve_component: List, time_factor):
+    # will only work if all_tenor_points is 2 dimensional - note we don't worry about interpolation here yet
+    tenor_obj = curve_component[FACTOR_INDEX_Tenor_Index]
 
-    time_size, point_size = points.shape
-    if curve_component[FACTOR_INDEX_Stoch]:
-        time_index = np.tile(np.arange(time_size).reshape(-1, 1), point_size)
+    if time_factor:
+        i1, i2, a, w1, w2 = tf.vectorized_map(lambda x: tenor_obj.get_index_time_weight(
+            tf.clip_by_value(x, tenor_obj.min, tenor_obj.max)), all_tenor_points)
+
+        return tf.expand_dims(a, axis=2), i1, tf.expand_dims(w1, axis=2), i2, tf.expand_dims(w2, axis=2)
     else:
-        time_index = np.zeros((time_size, point_size), dtype=np.int64)
+        i1, i2, a, w1, w2 = tf.vectorized_map(lambda x: tenor_obj.get_index_weight(
+            tf.clip_by_value(x, tenor_obj.min, tenor_obj.max)), all_tenor_points)
 
-    if curve_component[FACTOR_INDEX_Tenor_Index][2].startswith('Hermite'):
-        g, c = curve_interp
-        tenors = np.expand_dims(
-            curve_component[FACTOR_INDEX_Daycount](points), axis=2)
-        if curve_component[FACTOR_INDEX_Tenor_Index][2] == 'HermiteRT':
-            mult = None if time_factor else 1.0 / tenors
+        return tf.expand_dims(a, axis=2), i1, tf.expand_dims(w1, axis=2), i2, tf.expand_dims(w2, axis=2)
+
+
+@tf.function(experimental_relax_shapes=True)
+def interpolate_curve(index, index_next, alpha, tensor, curve_component, points, time_factor):
+    point_shape = tf.shape(points)
+    time_size, point_size = point_shape[0], point_shape[1]
+
+    if point_size > 0:
+        tenor_points = curve_component[FACTOR_INDEX_Daycount](points)
+        a, i1, w1, i2, w2 = interpolate_curve_indices(tenor_points, curve_component, time_factor)
+
+        time_index_next = None
+        if curve_component[FACTOR_INDEX_Stoch]:
+            time_index = tf.tile(tf.reshape(index, [-1, 1]), [1, point_size])
+            if index_next is not None:
+                time_index_next = tf.tile(tf.reshape(index_next, [-1, 1]), [1, point_size])
         else:
-            mult = tenors if time_factor else None
+            time_index = tf.zeros((time_size, point_size), dtype=np.int32)
 
-        val = tf.gather_nd(curve_tensor, i1) * (1.0 - a) + (
-            (tf.gather_nd(curve_tensor, i2) * a + a * (1.0 - a) * tf.gather_nd(g, i1) +
-             a * a * (1.0 - a) * tf.gather_nd(c, i1)) if a.any() else 0.0)
+        if curve_component[FACTOR_INDEX_Tenor_Index].type.startswith('Hermite'):
+            g, c = curve_interp
+            tenors = np.expand_dims(tenor_points, axis=2)
+            if curve_component[FACTOR_INDEX_Tenor_Index].type == 'HermiteRT':
+                mult = None if time_factor else 1.0 / tenors
+            else:
+                mult = tenors if time_factor else None
 
-        interp_val = val * mult if mult is not None else val
+            val = tf.gather_nd(tensor, i1) * (1.0 - a) + (
+                (tf.gather_nd(tensor, i2) * a + a * (1.0 - a) * tf.gather_nd(g, i1) +
+                 a * a * (1.0 - a) * tf.gather_nd(c, i1)) if a.any() else 0.0)
+
+            interp_val = val * mult if mult is not None else val
+        else:
+            # default to linear
+            t00 = tf.stack([time_index, i1], axis=2)
+            t01 = tf.stack([time_index, i2], axis=2)
+
+            if alpha is not None:
+                t10 = tf.stack([time_index_next, i1], axis=2)
+                t11 = tf.stack([time_index_next, i2], axis=2)
+
+                interp_val = (1 - alpha) * (
+                    tf.gather_nd(tensor, t00) * w1 + tf.gather_nd(tensor, t01) * w2) + alpha * (
+                    tf.gather_nd(tensor, t10) * w1 + tf.gather_nd(tensor, t11) * w2)
+            else:
+                interp_val = tf.gather_nd(tensor, t00) * w1 + tf.gather_nd(tensor, t01) * w2
+
+        return interp_val
     else:
-        # default to linear
-        interp_val = tf.gather_nd(curve_tensor, np.dstack([time_index, i1])) * w1 + (
-            tf.gather_nd(curve_tensor, np.dstack([time_index, i2])) * w2 if w2.any() else 0.0)
-
-    return interp_val
+        # return a null tensor
+        return tf.zeros([time_size, 0, tensor.shape[-1]], dtype=tensor.dtype)
 
 
 def interpolate_risk_neutral(points, curve_tensor, curve_component, curve_interp, time_grid, time_multiplier):
@@ -763,10 +861,10 @@ class CurveTensor(object):
 
     def __init__(self, tensor, index, alpha):
         self.tensor = tensor
-        self.index = index
+        self.index = index.astype(np.int32)
         if alpha is not None:
-            self.alpha = tf.constant(alpha, tensor.dtype) if isinstance(alpha, np.ndarray) else alpha
-            self.index_next = (index + 1).clip(0, tensor.shape[0] - 1)
+            self.alpha = alpha.astype(tensor.dtype.as_numpy_dtype) if isinstance(alpha, np.ndarray) else alpha
+            self.index_next = (self.index + 1).clip(0, tensor.shape[0] - 1)
         else:
             self.alpha = None
             self.index_next = None
@@ -785,49 +883,11 @@ class CurveTensor(object):
                 for sub_index, sub_alpha in zip(np.split(
                 self.index, counts.cumsum()[:-1]), sub_alpha)]
 
-    #@torch.jit.script
     def interpolate_curve(self, curve_component, points, time_factor):
+        # need to add modifications for interpolation etc.
+        return interpolate_curve(
+            self.index, self.index_next, self.alpha, self.tensor, curve_component, points, time_factor)
 
-        a, i1, w1, i2, w2 = interpolate_curve_indices(
-            points, curve_component, time_factor)
-
-        time_size, point_size = points.shape
-        time_index_next = None
-        if curve_component[FACTOR_INDEX_Stoch]:
-            time_index = np.tile(self.index.reshape(-1, 1), point_size)
-            if self.index_next is not None:
-                time_index_next = np.tile(self.index_next.reshape(-1, 1), point_size)
-        else:
-            time_index = np.zeros((time_size, point_size), dtype=np.int64)
-
-        if curve_component[FACTOR_INDEX_Tenor_Index][2].startswith('Hermite'):
-            g, c = curve_interp
-            tenors = np.expand_dims(
-                curve_component[FACTOR_INDEX_Daycount](points), axis=2)
-            if curve_component[FACTOR_INDEX_Tenor_Index][2] == 'HermiteRT':
-                mult = None if time_factor else 1.0 / tenors
-            else:
-                mult = tenors if time_factor else None
-
-            val = tf.gather_nd(self.tensor, i1) * (1.0 - a) + (
-                (tf.gather_nd(self.tensor, i2) * a + a * (1.0 - a) * tf.gather_nd(g, i1) +
-                 a * a * (1.0 - a) * tf.gather_nd(c, i1)) if a.any() else 0.0)
-
-            interp_val = val * mult if mult is not None else val
-        else:
-            # default to linear
-            if self.alpha is not None:
-                interp_val = (1 - self.alpha) * (
-                        tf.gather_nd(self.tensor, np.dstack([time_index, i1])) * w1 +
-                        tf.gather_nd(self.tensor, np.dstack([time_index, i2])) * w2) + \
-                    self.alpha * (tf.gather_nd(self.tensor, np.dstack([time_index_next, i1])) * w1 +
-                                  tf.gather_nd(self.tensor, np.dstack([time_index_next, i2])) * w2)
-            else:
-                interp_val = tf.gather_nd(
-                    self.tensor, np.dstack([time_index, i1])) * w1 + tf.gather_nd(
-                    self.tensor, np.dstack([time_index, i2])) * w2
-
-        return interp_val
 
 class TensorBlock(object):
     def __init__(self, code, tensors: List[CurveTensor], time_grid: np.ndarray):
@@ -861,7 +921,8 @@ class TensorBlock(object):
                     scaled_val = interpolate_risk_neutral(end_points, curve_tensor, curve_component,
                                                           curve_interp, self.time_grid, time_multiplier)
                 else:
-                    scaled_val = curve_tensor.interpolate_curve(curve_component, points, time_multiplier)
+                    scaled_val = curve_tensor.interpolate_curve(
+                        curve_component, tf.cast(points, shared.one.dtype), time_multiplier)
 
                 if temp_curve is None:
                     temp_curve = scaled_val
@@ -876,10 +937,10 @@ class TensorBlock(object):
 
         if local_cache_key not in self.local_cache:
 
-            curve_points = calc_curve(1 if multiply_by_time else 0, end_points)
+            curve_points = calc_curve(multiply_by_time, end_points)
 
             if start_points is not None:
-                curve_points -= calc_curve(1 if multiply_by_time else 0, start_points)
+                curve_points -= calc_curve(multiply_by_time, start_points)
             self.local_cache[local_cache_key] = curve_points
 
         return self.local_cache[local_cache_key]
@@ -992,13 +1053,11 @@ def get_tenors(factor_dict):
     return all_tenor
 
 
-def tenor_diff(tenor_points, interp='Linear'):
-    points = np.array(tenor_points)
-    # linear interpolation by default
-    return (points, np.append(np.diff(points), 1.0), interp)
+def tenor_diff(tenor_points, dtype, interp='Linear'):
+    return CurveTenor(tenor_points, dtype, interp)
 
 
-def update_tenors(base_date, all_factors):
+def update_tenors(base_date, all_factors, dtype):
     def daycount_fn(base_date, daycount):
         def calc_daycount(time_in_days):
             return get_day_count_accrual(base_date, time_in_days, daycount)
@@ -1011,16 +1070,13 @@ def update_tenors(base_date, all_factors):
 
         if factor.type in OneDimensionalFactors:
             tenor_points = risk_factor.get_tenor()
-            # linear interpolation by default
-            tenor_data = tenor_diff(tenor_points)
 
             if factor.type == 'DividendRate':
-                # change the tenor delta to use dividend interpolation
-                tenor_delta = (1.0 / np.array(tenor_points[:-1]).clip(1e-5, np.inf)) - \
-                              (1.0 / np.array(tenor_points[1:]).clip(1e-5, np.inf))
-                tenor_data = (np.array(tenor_points), np.hstack((tenor_delta, [1.0])), 'Dividend')
-            elif factor.type == 'InterestRate' and risk_factor.interpolation[0] != 'Linear':
-                tenor_data = tenor_data[:2] + risk_factor.interpolation
+                tenor_data = tenor_diff(tenor_points, dtype, 'Dividend')
+            elif factor.type == 'InterestRate':
+                tenor_data = tenor_diff(tenor_points, dtype, risk_factor.interpolation[0])
+            else:
+                tenor_data = tenor_diff(tenor_points, dtype)
 
             daycount = risk_factor.get_day_count()
             all_tenors[factor] = [tenor_data, daycount_fn(base_date, daycount), factor_obj]
@@ -1030,10 +1086,11 @@ def update_tenors(base_date, all_factors):
             # we're going to dynamically interpolate when needed
             expiry_map = []
             for moneyness_points in risk_factor.index_map.values():
-                expiry_map.append(tenor_diff(moneyness_points))
+                expiry_map.append(tenor_diff(moneyness_points, dtype))
             # store the moneyness and expiry first
-            all_tenors[factor] = [tenor_diff(risk_factor.get_moneyness()),
-                                  tenor_diff(risk_factor.get_expiry()), expiry_map]
+            all_tenors[factor] = [
+                tenor_diff(risk_factor.get_moneyness(), dtype),
+                tenor_diff(risk_factor.get_expiry(), dtype), expiry_map]
 
         elif factor.type in ThreeDimensionalFactors:
             if factor.type == 'ForwardPriceVol':
@@ -1042,19 +1099,21 @@ def update_tenors(base_date, all_factors):
                 for delivery_expiry_points in risk_factor.index_map.values():
                     expiry_map, exp_index = [], []
                     for exp_day, expiry_points in delivery_expiry_points.items():
-                        expiry_map.append(tenor_diff(expiry_points))
+                        expiry_map.append(tenor_diff(expiry_points, dtype))
                         exp_index.append(exp_day)
-                    expiry_index_map.append(tenor_diff(exp_index))
+                    expiry_index_map.append(tenor_diff(exp_index, dtype))
                     moneyness_map.append(expiry_map)
                 # store the moneyness and expiry first
-                all_tenors[factor] = [tenor_diff(risk_factor.get_moneyness()),
-                                      tenor_diff(risk_factor.get_expiry()),
-                                      tenor_diff(risk_factor.get_tenor()), moneyness_map, expiry_index_map]
+                all_tenors[factor] = [
+                    tenor_diff(risk_factor.get_moneyness(), dtype),
+                    tenor_diff(risk_factor.get_expiry(), dtype),
+                    tenor_diff(risk_factor.get_tenor(), dtype),
+                    moneyness_map, expiry_index_map]
             else:
                 # full surface defined - do not interpolate dynamically
                 for dim_index, data in enumerate(
                         [risk_factor.get_moneyness(), risk_factor.get_expiry(), risk_factor.get_tenor()]):
-                    all_tenors.setdefault(factor, [0, 0, 0])[dim_index] = tenor_diff(data)
+                    all_tenors.setdefault(factor, [0, 0, 0])[dim_index] = tenor_diff(data, dtype)
 
     return all_tenors
 
@@ -1120,8 +1179,8 @@ def calc_discount_rate(block, tenors_in_days, shared, multiply_by_time=True):
                 tenors_in_days.shape, tuple(tenors_in_days.ravel()))
 
     if key_code not in shared.t_Buffer:
-        discount_rates = tf.exp(-block.gather_weighted_curve(shared, tenors_in_days,
-                                                             multiply_by_time=multiply_by_time))
+        discount_rates = tf.exp(-block.gather_weighted_curve(
+            shared, tenors_in_days, multiply_by_time=multiply_by_time))
         shared.t_Buffer[key_code] = discount_rates
 
     return shared.t_Buffer[key_code]
@@ -1228,7 +1287,7 @@ def calc_fx_forward(local, other, T, time_grid, shared, only_diag=False):
         return shared.one
 
 
-def gather_flat_surface(flat_surface, code, expiry, shared, calc_std):
+def gather_flat_surface_old(flat_surface, code, expiry, shared, calc_std):
     # cache the time surface interpolation matrix
     time_code = ('surface_flat', code[:2], tuple(expiry), calc_std)
 
@@ -1237,12 +1296,12 @@ def gather_flat_surface(flat_surface, code, expiry, shared, calc_std):
 
         moneyness_max_index = np.array([x[0].size for x in code[FACTOR_INDEX_Flat_Index]])
         exp_index = np.cumsum(np.append(0, moneyness_max_index[:-1]))
-        index = np.clip(np.searchsorted(expiry_tenor[0], expiry, side='right') - 1, 0, expiry_tenor[0].size - 1)
+        index = np.clip(np.searchsorted(expiry_tenor.tenor, expiry, side='right') - 1, 0, expiry_tenor.max_index)
         time_modifier = np.sqrt(expiry).reshape(-1, 1) if calc_std else 1.0
-        index_next = np.clip(index + 1, 0, expiry_tenor[0].size - 1)
+        index_next = np.clip(index + 1, 0, expiry_tenor.max_index)
         subset = np.union1d(index, index_next)
         alpha = np.clip((expiry - expiry_tenor[0][index]) /
-                        expiry_tenor[1][index], 0, 1.0).reshape(-1, 1, 1)
+                        expiry_tenor[1][index], 0.0, 1.0).reshape(-1, 1, 1)
 
         block_indices, block_alphas = [], []
         new_moneyness_tenor = reduce(np.union1d, [code[FACTOR_INDEX_Flat_Index][x][0] for x in subset])
@@ -1271,7 +1330,56 @@ def gather_flat_surface(flat_surface, code, expiry, shared, calc_std):
             flat_surface, tenor_money_indices) * tenor_money_alpha * (1.0 - alpha) + tf.gather(
             flat_surface, tenor_money_indices_next) * tenor_money_alpha_next * alpha, axis=1)
 
-        shared.t_Buffer[time_code] = (tf.reshape(surface, [-1]), tenor_diff(new_moneyness_tenor))
+        shared.t_Buffer[time_code] = (tf.reshape(surface, [-1]),
+                                      tenor_diff(new_moneyness_tenor, shared.one.dtype))
+
+    return shared.t_Buffer[time_code]
+
+
+def gather_flat_surface(flat_surface, code, expiry, shared, calc_std):
+    # cache the time surface interpolation matrix
+    time_code = ('surface_flat', code[:2], tuple(expiry), calc_std)
+
+    if time_code not in shared.t_Buffer:
+        expiry_tenor = code[FACTOR_INDEX_Expiry_Index]
+
+        moneyness_max_index = np.array([x.tenor.shape[0] for x in code[FACTOR_INDEX_Flat_Index]])
+        exp_index = np.cumsum(np.append(0, moneyness_max_index[:-1]))
+
+        time_modifier = np.sqrt(expiry).reshape(-1, 1) if calc_std else 1.0
+
+        index, index_next, alpha = expiry_tenor.get_index(
+            expiry.astype(shared.one.dtype.as_numpy_dtype))
+        alpha = tf.reshape(alpha, [-1, 1, 1])
+
+        subset = np.union1d(index, index_next)
+
+        block_indices, block_alphas = [], []
+        new_moneyness_tenor = reduce(np.union1d, [code[FACTOR_INDEX_Flat_Index][x].tenor for x in subset])
+
+        for tenor_index in subset:
+            moneyness_tenor = code[FACTOR_INDEX_Flat_Index][tenor_index]
+            moneyness_index, moneyness_index_next, moneyness_alpha = moneyness_tenor.get_index(
+                new_moneyness_tenor.astype(shared.one.dtype.as_numpy_dtype))
+
+            block_indices.append(exp_index[tenor_index] + np.stack([moneyness_index, moneyness_index_next]))
+            block_alphas.append(np.stack([1.0 - moneyness_alpha, moneyness_alpha]))
+
+        # need to interpolate back to the tenor level
+        money_indices, money_alpha = np.array(block_indices), np.array(block_alphas)
+        subset_index = subset.searchsorted(index)
+        tenor_money_indices = money_indices[subset_index]
+        tenor_money_alpha = money_alpha[subset_index]
+        subset_index_next = subset.searchsorted(index_next)
+        tenor_money_alpha_next = money_alpha[subset_index_next]
+        tenor_money_indices_next = money_indices[subset_index_next]
+
+        surface = time_modifier * tf.reduce_sum(tf.gather(
+            flat_surface, tenor_money_indices) * tenor_money_alpha * (1.0 - alpha) + tf.gather(
+            flat_surface, tenor_money_indices_next) * tenor_money_alpha_next * alpha, axis=1)
+
+        shared.t_Buffer[time_code] = (tf.reshape(surface, [-1]),
+                                      tenor_diff(new_moneyness_tenor, shared.one.dtype.as_numpy_dtype))
 
     return shared.t_Buffer[time_code]
 
@@ -1294,7 +1402,7 @@ def gather_surface_interp(surface, code, expiry, shared, calc_std):
     return shared.t_Buffer[time_code]
 
 
-def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
+def calc_moneyness_vol_rate_old(moneyness, expiry, key_code, shared):
     # work out the moneyness - this is a way to fake np.searchsorted - clean this up - TODO!
     surface, moneyness_tenor = shared.t_Buffer[key_code]
     max_index = np.prod(surface.shape.as_list()) - 1
@@ -1311,6 +1419,35 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
     expiry_indices = np.arange(expiry.size).astype(np.int32)
     expiry_offsets = tf.concat([tf.fill([shared.simulation_batch], x)
                                 for x in expiry_indices * moneyness_tenor[0].size], axis=0)
+    reshape = True
+    if expiry_offsets.shape != index.shape:
+        reshape = False
+        vol_index = index + expiry_offsets[:index.shape[0]]
+    else:
+        vol_index = index + expiry_offsets
+
+    vol_index_next = tf.clip_by_value(vol_index + 1, 0, max_index)
+
+    vols = tf.gather(surface, vol_index) * (1.0 - alpha) + \
+           tf.gather(surface, vol_index_next) * alpha
+
+    return tf.reshape(vols, (-1, shared.simulation_batch)) if reshape else tf.reshape(vols, [-1, 1])
+
+
+def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
+    surface, moneyness_tenor = shared.t_Buffer[key_code]
+    max_index = np.prod(surface.shape.as_list()) - 1
+    clipped_moneyness = tf.clip_by_value(moneyness, moneyness_tenor.min, moneyness_tenor.max)
+    flat_moneyness = tf.reshape(clipped_moneyness, (-1, 1))
+    cmp = tf.cast(flat_moneyness >= np.append(moneyness_tenor.tenor, [np.inf]), dtype=tf.int32)
+    index = tf.argmin(cmp[:, 1:] - cmp[:, :-1], axis=1, output_type=tf.int32)
+    alpha = (tf.squeeze(flat_moneyness) -
+             tf.gather(moneyness_tenor.tenor, index)
+             ) / tf.gather(moneyness_tenor.delta, index)
+
+    expiry_indices = np.arange(expiry.size).astype(np.int32)
+    expiry_offsets = tf.concat([tf.fill([shared.simulation_batch], x)
+                                for x in expiry_indices * moneyness_tenor.tenor.shape[0]], axis=0)
     reshape = True
     if expiry_offsets.shape != index.shape:
         reshape = False
@@ -1541,14 +1678,14 @@ def hermite_interpolation_tensor(t, rate_tensor):
 
 
 def make_curve_tensor(tensor, curve_component, time_grid, shared):
-    key_code = (curve_component[FACTOR_INDEX_Tenor_Index][2], curve_component[:2],
+    key_code = (curve_component[FACTOR_INDEX_Tenor_Index].type, curve_component[:2],
                 tuple(tensor.shape))
 
     if key_code not in shared.t_Buffer:
         if key_code[0] in ['HermiteRT', 'Hermite']:
-            t = curve_component[FACTOR_INDEX_Tenor_Index][0].reshape(1, -1, 1)
+            t = curve_component[FACTOR_INDEX_Tenor_Index].tenor.reshape(1, -1, 1)
             mod_tenor = tensor
-            if curve_component[FACTOR_INDEX_Tenor_Index][2] == 'HermiteRT':
+            if curve_component[FACTOR_INDEX_Tenor_Index].type == 'HermiteRT':
                 mod_tenor = tensor * t
 
             g, c = hermite_interpolation_tensor(t, mod_tenor)
@@ -1563,15 +1700,15 @@ def make_curve_tensor(tensor, curve_component, time_grid, shared):
 
 
 def cache_interpolation(shared, curve_component, tensor):
-    key_code = (curve_component[FACTOR_INDEX_Tenor_Index][2], curve_component[:2],
+    key_code = (curve_component[FACTOR_INDEX_Tenor_Index].type, curve_component[:2],
                 tuple(tensor.shape.as_list()))
 
     if key_code not in shared.t_Buffer:
 
         if key_code[0] in ['HermiteRT', 'Hermite']:
-            t = curve_component[FACTOR_INDEX_Tenor_Index][0].reshape(1, -1, 1)
+            t = curve_component[FACTOR_INDEX_Tenor_Index].tenor.reshape(1, -1, 1)
             mod_tenor = tensor
-            if curve_component[FACTOR_INDEX_Tenor_Index][2] == 'HermiteRT':
+            if curve_component[FACTOR_INDEX_Tenor_Index].type == 'HermiteRT':
                 mod_tenor = tensor * t
 
             g, c = hermite_interpolation_tensor(t, mod_tenor)
@@ -1594,7 +1731,7 @@ def calc_time_grid_curve_rate(code, time_grid, shared, points=None, multiply_by_
 
         for rate in code:
             rate_code = ('curve_factor', rate[:2], time_hash, points_hash, multiply_by_time)
-            interp_scenario = rate[FACTOR_INDEX_Tenor_Index][2] != 'Linear' or points is None
+            interp_scenario = rate[FACTOR_INDEX_Tenor_Index].type != 'Linear' or points is None
 
             # if points are defined, calculate directly - otherwise interpolate from
             # the scenario and static buffers
@@ -1603,11 +1740,9 @@ def calc_time_grid_curve_rate(code, time_grid, shared, points=None, multiply_by_
                 if rate_code not in shared.t_Buffer:
                     if rate[FACTOR_INDEX_Stoch]:
                         tensor = shared.t_Scenario_Buffer[rate[FACTOR_INDEX_Offset]]
-
                         spread = make_curve_tensor(tensor, rate, time_grid, shared)
                     else:
                         tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
-
                         spread = make_curve_tensor(tf.reshape(tensor, (1, -1, 1)), rate, None, shared)
 
                     # store it
