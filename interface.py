@@ -17,6 +17,7 @@
 ########################################################################
 
 import os
+import psutil
 import logging
 import numpy as np
 import pandas as pd
@@ -69,14 +70,20 @@ if __name__ == '__main__':
     pd.options.display.float_format = '{:,.5f}'.format
 
     # set the visible GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
     import riskflow as rf
+    import tensorflow as tf
+    physical_cores = psutil.cpu_count(logical=True)
+
+    tf.config.threading.set_intra_op_parallelism_threads(physical_cores)
+    tf.config.threading.set_inter_op_parallelism_threads(physical_cores)
 
     env = ''
     paths = {}
+
     for folder in ['CVA', 'Arena']:
         paths[folder] = rf.getpath(
             [os.path.join('E:\\Data\\crstal\\CVA', folder),
@@ -112,6 +119,8 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, 'CrB_FirstRand_Bank_Ltd_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Shanta_Mining_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Ukhamba_Holdings_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Discovery_Health_Med_Scheme_ISDA.json'))
+
         # cx.parse_json(os.path.join(path, rundate, 'CrB_SAPPI_SA_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_AVI_Financial_Services__Pty__Limited_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_AutoX_ISDA.json'))
@@ -131,9 +140,14 @@ if __name__ == '__main__':
                                                        # 'Run_Date': '2020-03-09',
                                                        # 'Tenor_Offset': -3/365.0,
                                                        # 'Time_grid':'1m 5m 1362d',
-                                                       'Batch_Size': 64 * 4,
-                                                       'Simulation_Batches': 20,
-                                                       'CVA': {'Gradient': 'No', 'Hessian': 'No'}}, prec=np.float32)
+                                                       'Batch_Size': 64 * 4 * 4 * 2,
+                                                       'Simulation_Batches': 10,
+                                                       'CVA': {'Gradient': 'No', 'Hessian': 'No'}},
+                                        CVA=False,
+                                        prec=np.float32)
+
+            if 'grad_cva' in out['Results']:
+                grad_cva = calc.gradients_as_df(out['Results']['grad_cva'], display_val=True)
 
         else:
             calc, out = rf.run_baseval(cx, overrides={'Currency': 'ZAR', 'Greeks': 'No'})
