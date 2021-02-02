@@ -88,10 +88,10 @@ class Factor1D(object):
 
     def check_interpolation(self):
         if self.param.get('Interpolation') == 'HermiteRT':
-            g, c = utils.hermite_interpolation(self.tenors, self.current_value() * self.tenors)
+            g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1] * self.tenors)
             return ('HermiteRT', g, c)
         elif self.param.get('Interpolation') == 'Hermite':
-            g, c = utils.hermite_interpolation(self.tenors, self.current_value())
+            g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1])
             return ('Hermite', g, c)
         else:
             return ('Linear',)
@@ -100,8 +100,9 @@ class Factor1D(object):
         """Returns the value of the rate at each tenor point (if set) else returns what's
         stored in the Curve parameter"""
         bumped_val = self.param['Curve'].array[:, 1] + self.delta
-        # get the tenors
-        tenors = (np.array(tenor_index) if tenor_index is not None else self.tenors) + offset
+        # get the tenors - make sure it's in range
+        tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
+                self.tenors.min(), self.tenors.max())
 
         if self.interpolation[0] != 'Linear':
             index = np.clip(np.searchsorted(self.tenors, tenors, side='right') - 1, 0, self.tenors.size - 1)
@@ -109,8 +110,7 @@ class Factor1D(object):
             dt = np.clip(self.tenors[index_next] - self.tenors[index], 1 / 365.0, np.inf)
             m = np.clip((tenors - self.tenors[index]) / dt, 0.0, 1.0)
             g, c = self.interpolation[1:]
-            rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' \
-                else (bumped_val, 1.0)
+            rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' else (bumped_val, 1.0)
             val = rate[index] * (1.0 - m) + m * rate[index_next] + m * (
                     1.0 - m) * g[index] + m * m * (1.0 - m) * c[index]
             return val / denom

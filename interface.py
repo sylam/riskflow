@@ -87,7 +87,7 @@ def plot_matrix(df, title='Full Gamma'):
 if __name__ == '__main__':
     import matplotlib
 
-    matplotlib.use('Qt4Agg')
+    # matplotlib.use('Qt4Agg')
     import matplotlib.pyplot as plt
     # import seaborn as sns
 
@@ -111,9 +111,9 @@ if __name__ == '__main__':
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
              os.path.join('G:', folder)])
 
-    path = paths['Arena']
+    path = paths['CVA']
 
-    rundate = '2020-11-18'
+    rundate = '2021-01-29'
     # rundate = '2020-08-28'
     # rundate = '2020-08-07'
     # rundate = '2020-11-17'
@@ -125,9 +125,10 @@ if __name__ == '__main__':
     # bootstrap(path, rundate, device=gpudevice, reuse_cal=True)
 
     if 1:
-        cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketDataCVA.json'))
-        cx_arena = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
-        cx.params['Price Factors'].update(cx_arena.params['Price Factors'])
+        cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
+        # cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketDataCVA.json'))
+        # cx_arena = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
+        # cx.params['Price Factors'].update(cx_arena.params['Price Factors'])
         # cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
         try:
             cx_new = rf.load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
@@ -144,7 +145,7 @@ if __name__ == '__main__':
         # cx.parse_trade_file(os.path.join(path, rundate, 'ccirs.aap'))
         # cx.parse_json(os.path.join(path, rundate, env, 'CrB_NatWest_Markets_Plc_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_FirstRand_Bank_Ltd_ISDA.json'))
-        cx.parse_json(os.path.join(path, rundate, 'CrB_Shanta_Mining_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Shanta_Mining_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Ukhamba_Holdings_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_SAPPI_SA_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_AVI_Financial_Services__Pty__Limited_ISDA.json'))
@@ -154,7 +155,7 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, env, 'CrB_ABSA_Bank_Jhb_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Eskom_Hld_SOC_Ltd_ISDA.json'))
 
-        # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
+        cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_The_Core_Computer_Business_Limited_ISDA.json'))
@@ -193,6 +194,7 @@ if __name__ == '__main__':
         #     if 'ZAR-USDCCSJI3M-LI3M201008-211008054' in x['instrument'].field['Reference']:
         #         x['Ignore'] = 'False'
         #
+
         # cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets'] = {
         #     'Cash_Collateral': [{
         #         'Currency': 'USD',
@@ -205,8 +207,8 @@ if __name__ == '__main__':
             # grab the netting set
             ns = cx.deals['Deals']['Children'][0]['instrument']
 
-            ns.field['Collateral_Assets']['Cash_Collateral'][0]['Funding_Rate'] = 'USD-LIBOR-3M.FUNDING'
-            ns.field['Collateral_Assets']['Cash_Collateral'][0]['Collateral_Rate'] = 'USD-OIS'
+            # ns.field['Collateral_Assets']['Cash_Collateral'][0]['Funding_Rate'] = 'USD-LIBOR-3M.FUNDING'
+            # ns.field['Collateral_Assets']['Cash_Collateral'][0]['Collateral_Rate'] = 'USD-OIS'
             # ns.field['Collateral_Call_Frequency']=pd.DateOffset(weeks=1)
             # ns.field['Collateralized'] = 'False'
 
@@ -216,11 +218,11 @@ if __name__ == '__main__':
                          # 'Time_grid':'1m 5m 1362d',
                          'Random_Seed': 1354,
                          'Generate_Cashflows': 'No',
-                         'Currency': 'USD',
-                         'Batch_Size': 512,
+                         'Currency': 'ZAR',
+                         'Batch_Size': 1024,
                          'Simulation_Batches': 10,
                          'CollVA': {'Gradient': 'No'},
-                         'CVA': {'Gradient': 'No', 'Hessian': 'No'}}
+                         'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}}
 
             if ns.field['Collateralized'] == 'True':
                 overrides['Dynamic_Scenario_Dates'] = 'Yes'
@@ -228,7 +230,7 @@ if __name__ == '__main__':
                 overrides['Dynamic_Scenario_Dates'] = 'No'
 
             calc, out, res = rf.run_cmc(cx, prec=torch.float32, device=gpudevice,
-                                        overrides=overrides, CVA=False, CollVA=True, FVA=False)
+                                        overrides=overrides, CVA=True, CollVA=False, FVA=False)
 
             # j = check_correlation(out['Results']['scenarios'],
             #                       ('InterestRate', ('ZAR-JIBAR-3M',)), ('FxRate', ('ZAR',)))
