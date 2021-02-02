@@ -121,13 +121,15 @@ class ModelParams(object):
         add_factor = self.implied_models.get(model)
         return utils.Factor(add_factor, factor.name) if add_factor else None
 
-    def search(self, factor, actual_factor):
+    def search(self, factor, actual_factor, ignore_subtype=False):
         """
         :param factor: Riskfactor of type utils.Factor
         :param actual_factor: corresponding dictionary of parameters for the factor loaded from a marketdata context
         :return: the model associated with the factor (taking any overrides into account)
         """
-        price_factor_type = factor.type + self.valid_subtype.get(actual_factor.get('Sub_Type'), '')
+        price_factor_type = factor.type + ('' if ignore_subtype else self.valid_subtype.get(
+            actual_factor.get('Sub_Type'), ''))
+
         # look for a filter rule
         rule = self.modelfilters.get(price_factor_type)
         if rule:
@@ -639,9 +641,18 @@ class Context(object):
                 dependent_factor_tenors.setdefault(k, set()).update(v)
             # now get the last tenor for each factor
             dependent_factors = {k: max(dependent_factor_tenors.get(k, reset_dates)) for k in sorted_factors}
-
+            # interpolation mapping lookups
+            interp_map = {'CubicSplineCurveInterpolation': 'Hermite',
+                          'LinearInterFlatExtrapCurveGetValue': 'Linear',
+                          'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT'}
             # now lookup the processes
             for factor in sorted_factors:
+                # check the interpolation on interest Rates
+                if factor.type == 'InterestRate':
+                    price_factor = self.params['Price Factors'].get(utils.check_tuple_name(factor), {})
+                    interp_method = self.params['Price Factor Interpolation'].search(factor, price_factor, True)
+                    price_factor['Interpolation'] = interp_map[interp_method]
+                # check the stochastic process
                 stoch_proc = self.params['Model Configuration'].search(factor, self.params['Price Factors'].get(
                     utils.check_tuple_name(factor), {}))
                 # might need implied parameters
