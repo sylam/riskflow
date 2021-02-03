@@ -651,7 +651,7 @@ class Context(object):
                 if factor.type == 'InterestRate':
                     price_factor = self.params['Price Factors'].get(utils.check_tuple_name(factor), {})
                     interp_method = self.params['Price Factor Interpolation'].search(factor, price_factor, True)
-                    price_factor['Interpolation'] = interp_map[interp_method]
+                    price_factor['Interpolation'] = interp_map.get(interp_method, 'Linear')
                 # check the stochastic process
                 stoch_proc = self.params['Model Configuration'].search(factor, self.params['Price Factors'].get(
                     utils.check_tuple_name(factor), {}))
