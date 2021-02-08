@@ -907,12 +907,14 @@ class Credit_Monte_Carlo(Calculation):
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
             if 'CVA' in params:
-                discount = get_interest_factor(utils.check_rate_name(params['Deflation_Interest_Rate']),
-                                               self.static_ofs, self.stoch_ofs, self.all_tenors)
-                survival = get_survival_factor(utils.check_rate_name(params['CVA']['Counterparty']),
-                                               self.static_ofs, self.stoch_ofs, self.all_tenors)
-                recovery = get_recovery_rate(utils.check_rate_name(params['CVA']['Counterparty']),
-                                             self.all_factors)
+                discount = get_interest_factor\
+                    (utils.check_rate_name(params['Deflation_Interest_Rate']),
+                     self.static_ofs, self.stoch_ofs, self.all_tenors)
+                survival = get_survival_factor(
+                    utils.check_rate_name(params['CVA']['Counterparty']),
+                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                recovery = get_recovery_rate(
+                    utils.check_rate_name(params['CVA']['Counterparty']), self.all_factors)
                 # only looks at the first netting set - should be fine . . .
                 time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
 

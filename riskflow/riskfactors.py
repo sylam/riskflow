@@ -105,7 +105,7 @@ class Factor1D(object):
                 self.tenors.min(), self.tenors.max())
 
         if self.interpolation[0] != 'Linear':
-            index = np.clip(np.searchsorted(self.tenors, tenors, side='right') - 1, 0, self.tenors.size - 1)
+            index = np.searchsorted(self.tenors, tenors, side='right') - 1
             index_next = np.clip(index + 1, 0, self.tenors.size - 1)
             dt = np.clip(self.tenors[index_next] - self.tenors[index], 1 / 365.0, np.inf)
             m = np.clip((tenors - self.tenors[index]) / dt, 0.0, 1.0)

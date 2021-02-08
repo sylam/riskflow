@@ -903,11 +903,12 @@ class CurveTensor(object):
                 g, c = self.interp_obj.interp_params
                 tenors = torch.unsqueeze(tensor.new(tenor_points), axis=2)
                 if curve_component[FACTOR_INDEX_Tenor_Index].type == 'HermiteRT':
-                    mult = None if time_factor else 1.0 / tenors.clamp(
+                    clipped = tenors.clamp(
                         curve_component[FACTOR_INDEX_Tenor_Index].min,
                         curve_component[FACTOR_INDEX_Tenor_Index].max)
+                    mult = (tenors if time_factor else 1.0) / clipped
                 else:
-                    mult = tenors if time_factor else None
+                    mult = tenors if time_factor else 1.0
 
                 t_a = tensor.new(a)
                 if self.alpha is not None:
@@ -926,7 +927,7 @@ class CurveTensor(object):
                         (tensor[time_index, i2] * t_a + t_a * (1.0 - t_a) * g[time_index, i1] +
                          t_a * t_a * (1.0 - t_a) * c[time_index, i1]) if a.any() else 0.0)
 
-                interp_val = val * mult if mult is not None else val
+                interp_val = val * mult
             else:
                 # default to linear
                 t_w1 = tensor.new(w1)
