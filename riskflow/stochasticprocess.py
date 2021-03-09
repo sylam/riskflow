@@ -416,6 +416,11 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             FXImplied_vol_factor = utils.Factor('GBMAssetPriceTSModelParameters', self.factor.get_currency()+('Vol',))
             # now set the Quanto_FX_Volatility to the same vol as the fx rate
             implied_tensor['Quanto_FX_Volatility'] = implied_var[fx_implied_index][FXImplied_vol_factor]
+        else:
+            # handle the unlikely case were we need to simulate a curve but not the fx rate.
+            quantofx = self.implied.get_quanto_fx()
+            if quantofx is not None:
+                implied_tensor['Quanto_FX_Volatility'] = implied_tensor['Sigma_1'].new_tensor(quantofx)
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         # store randomnumber id's

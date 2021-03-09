@@ -484,6 +484,7 @@ class AdaptivContext(Context):
         e = CaselessLiteral("E")
         undef = Keyword("<undefined>")
         reference = Keyword("Reference")
+        counterparty = Keyword("Counterparty")
 
         # headings
         aa_format = Keyword("AnalyticsVersion")
@@ -552,7 +553,7 @@ class AdaptivContext(Context):
         tenors = (lsqpar + Group(delimitedList(period)) + rsqpar).setParseAction(pushOffset)
         grid = delimitedList(Group(period + Optional(lpar + period + rpar)),
                              delim=' ').leaveWhitespace().setParseAction(pushDateGrid)
-        assign = ((reference + equals + namedId) | (ident + equals + (
+        assign = (((reference | counterparty) + equals + namedId) | (ident + equals + (
                 chain | creditlist | datelistdel | datelist | date | grid | percentage | basis_pts | descriptor | fnumber | namedId | undef | curve | tenors | obj | null))).leaveWhitespace().setParseAction(
             pushIdent)
         obj << (lsqpar + (delimitedList(curve) | listofstf | delimitedList(
