@@ -102,7 +102,7 @@ class Factor1D(object):
         bumped_val = self.param['Curve'].array[:, 1] + self.delta
         # get the tenors - make sure it's in range
         tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
-                self.tenors.min(), self.tenors.max())
+            self.tenors.min(), self.tenors.max())
 
         if self.interpolation[0] != 'Linear':
             index = np.clip(np.searchsorted(self.tenors, tenors, side='right') - 1, 0, self.tenors.size - 1)
@@ -110,7 +110,8 @@ class Factor1D(object):
             dt = np.clip(self.tenors[index_next] - self.tenors[index], 1 / 365.0, np.inf)
             m = np.clip((tenors - self.tenors[index]) / dt, 0.0, 1.0)
             g, c = self.interpolation[1:]
-            rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' else (bumped_val, 1.0)
+            rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' else (
+            bumped_val, 1.0)
             val = rate[index] * (1.0 - m) + m * rate[index_next] + m * (
                     1.0 - m) * g[index] + m * m * (1.0 - m) * c[index]
             return val / denom
@@ -670,7 +671,7 @@ class HullWhite2FactorModelParametersJacobian(Factor1D):
                 if param == 'Curve':
                     param_name = utils.Factor('InterestRate', factor.name)
                 elif param == 'Quanto_FX_Volatility':
-                    param_name = utils.Factor('GBMAssetPriceTSModelParameters', currency+('Vol',))
+                    param_name = utils.Factor('GBMAssetPriceTSModelParameters', currency + ('Vol',))
                 else:
                     param_name = utils.Factor(factor.type, factor.name + (param,))
                 full_param_name = utils.check_tuple_name(param_name)
@@ -687,7 +688,7 @@ class HullWhite2FactorModelParametersJacobian(Factor1D):
                         values.append(gradients.loc[(full_param_name,)]['Value'].iloc[0])
 
             contrib[instrument] = {
-                'Gradient': np.dot(numerator, values)/np.dot(denominator, values),
+                'Gradient': np.dot(numerator, values) / np.dot(denominator, values),
                 'Premium': value['Premium']
             }
 
@@ -771,6 +772,13 @@ class HullWhite2FactorModelParameters(Factor1D):
                 'Sigma_2': sig2.reshape(-1, 1),
                 'Quanto_FX_Correlation_1': zero,
                 'Quanto_FX_Correlation_2': zero}
+
+    def get_quanto_fx(self):
+        if self.param.get('Quanto_FX_Volatility') is not None and self.param[
+            'Quanto_FX_Volatility'].array.any():
+            return self.param['Quanto_FX_Volatility'].array[:, 1]
+        else:
+            return None
 
     def current_value(self, tenors=None, offset=0.0, include_quanto=False):
         """Returns the parameters of the HW2 factor model as a dictionary"""

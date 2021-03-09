@@ -843,7 +843,7 @@ class NettingCollateralSet(Deal):
 
             for bond_col in factor_dep['Bond_Collateral']:
                 bond = pricing.pv_fixed_cashflows(shared, time_grid, bond_col.Collateral, settle_cash=False)
-                padding = time_grid.time_grid.shape[0] - bond.shape[0].value
+                padding = time_grid.time_grid.shape[0] - bond.shape[0]
                 St += (1.0 - bond_col.Haircut) * utils.calc_time_grid_spot_rate(
                     bond_col.Currency, time_grid.time_grid, shared) * F.pad(bond, [0, 0, 0, padding])
 

@@ -220,7 +220,7 @@ class CVA_GRAD(JOB):
                         columns={'Gradient': self.cx.deals['Attributes']['Reference']})
                     # store the CVA as part of the stats
                     out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
-                    # write the grad                    
+                    # write the grad
                     grad_cva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
                     # now calc theta
                     self.params.update({'Run_Date': next_day, 'Gradient': 'No'})
@@ -409,48 +409,13 @@ class COLLVA(JOB):
             self.logger(self.netting_set, 'CollVA calc complete')
 
 
-class CVADEFAULT(JOB):
+class SA_CVA(JOB):
     def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
-        self.rundate = rundate
-        self.input_path = input_path
-        self.outputdir = outputdir
-        self.netting_set = os.path.splitext(netting_set)[0] + '.json'
-        self.stats = stats
-        self.logger = log
-        self.params = {'calc_name': ('cmc', 'calc1'),
-                       'Time_grid': '0d 2d 1w(1w) 1m(1m) 3m(3m) 1y(1y)',
-                       'Run_Date': rundate, 'Currency': 'ZAR', 'Random_Seed': 5126,
-                       'Calc_Scenarios': 'No', 'Dynamic_Scenario_Dates': 'Yes',
-                       'Debug': 'No', 'NoModel': 'Constant', 'Partition': 'None',
-                       'Generate_Slideshow': 'No', 'PFE_Recon_File': ''}
-
-        from riskflow.adaptiv import AdaptivContext
-        self.cx = AdaptivContext()
-        old_cx = AdaptivContext()
-        # load marketdata
-        old_cx.parse_json(os.path.join(self.input_path, rundate, 'MarketData.json'))
-        # load up the CVA marketdata file
-        self.cx.parse_json(os.path.join(self.input_path, rundate, 'MarketDataCVA.json'))
-        # update the cva data with the arena data
-        self.cx.params['Price Factors'].update(old_cx.params['Price Factors'])
-        # load trade
-        self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
-        # get the netting set
-        self.ns = self.cx.deals['Deals']['Children'][0]['instrument'].field
-        # get the agreement currency
-        self.agreement_currency = self.ns.get('Agreement_Currency', 'ZAR')
-        # get the balance currency
-        self.balance_currency = self.ns.get('Balance_Currency', self.agreement_currency)
+        super(SA_CVA, self).__init__(cx, rundate, input_path, outputdir, netting_set, stats, log)
+        # load up a calendar (for theta)
+        self.business_day = cx.holidays['Johannesburg']['businessday']
         # set the OIS cashflow flag to speed up prime linked swaps
         self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
-        from riskflow.utils import Curve
-        # set the survival curve to a default value
-        self.crb_default = self.cx.deals['Attributes']['Reference']
-        self.cx.params['Price Factors'].setdefault('SurvivalProb.' + self.crb_default,
-                                                   {'Recovery_Rate': 0.5, 'Curve': Curve(
-                                                       [],
-                                                       [[0.0, 0.0], [.5, .01], [1, .02], [3, .07], [5, .15], [10, .35],
-                                                        [20, .71]]), 'Property_Aliases': None})
 
     def valid(self):
         if not self.cx.deals['Deals']['Children'][0]['Children']:
@@ -459,59 +424,72 @@ class CVADEFAULT(JOB):
             return True
 
     def run_calc(self, calc):
-        filename = 'CVA_' + self.params['Run_Date'] + '_' + self.crb_default + '.csv'
+        from riskflow.calculation import construct_calculation
+
+        filename = 'CVA_' + self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
+
+        # load up CVA calc params
+        if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
+            self.logger(self.netting_set, 'is collateralized')
+            # turn on dynamic scenarios (more accurate)
+            self.params['Dynamic_Scenario_Dates'] = 'Yes'
+            self.params['Simulation_Batches'] = 80
+            self.params['Batch_Size'] = 256
+        else:
+            self.params['Dynamic_Scenario_Dates'] = 'No'
+            self.params['Simulation_Batches'] = 40
+            self.params['Batch_Size'] = 512
+            self.logger(self.netting_set, 'is uncollateralized')
+
+        # get the calculation parameters for CVA
+        cva_sect = self.cx.deals['Calculation']['Credit_Valuation_Adjustment']
+
+        # update the params
+        self.params['Currency'] = 'ZAR'
+        self.params['Deflation_Interest_Rate'] = 'ZAR-SWAP'
+        self.params['CVA'] = {'Counterparty': cva_sect['Counterparty'],
+                              'Deflate_Stochastically': cva_sect['Deflate_Stochastically'],
+                              'Stochastic_Hazard': cva_sect['Stochastic_Hazard_Rates']}
 
         if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
-            self.logger(self.netting_set, 'Warning: skipping CVA calc as file already exists')
+            self.logger(self.netting_set, 'Warning: skipping CVA gradient calc as file already exists')
+            self.params['CVA']['Gradient'] = 'No'
+            out = calc.execute(self.params)
+            stats = out['Stats']
+            # store the CVA as part of the stats
+            out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
         else:
-            self.params['CVA'] = {'Deflation': self.cx.deals['Calculation'].get('Deflation_Interest_Rate', 'ZAR-SWAP'),
-                                  'Gradient': 'Yes'}
+            import torch
+            self.params['CVA']['Gradient'] = 'Yes'
+            # make sure calc uses the GPU
+            calc.device = torch.device('cuda')
 
-            if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
-                self.logger(self.netting_set, 'is collateralized')
-                # make sure the margin period of risk is 10 business days (approx 12 calendar days)
-                self.cx.deals['Deals']['Children'][0]['instrument'].field['Liquidation_Period'] = 12.0
-                self.params['Simulation_Batches'] = 20
-                self.params['Batch_Size'] = 256
-            else:
-                self.params['Simulation_Batches'] = 10
-                self.params['Batch_Size'] = 512
-                self.logger(self.netting_set, 'is uncollateralized')
+            calc_complete = False
+            while not calc_complete:
+                try:
+                    out = calc.execute(self.params)
+                except RuntimeError as e:  # Out of memory
+                    exc_type, exc_value, exc_traceback = sys.exc_info()
+                    traceback.print_exception(exc_type, exc_value, exc_traceback,
+                                              limit=2, file=sys.stdout)
+                    self.params['Simulation_Batches'] *= 2
+                    self.params['Batch_Size'] //= 2
+                    self.logger(self.netting_set,
+                                'Exception: OOM - Halving to {} Batchsize'.format(self.params['Batch_Size']))
+                    time.sleep(1)
+                    # free the cache
+                    torch.cuda.empty_cache()
+                else:
+                    calc_complete = True
 
-            # get the calculation parameters for CVA
-            default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No',
-                           'Counterparty': self.crb_default}
-            cva_sect = self.cx.deals.get('Calculation', {'Credit_Valuation_Adjustment': default_cva}).get(
-                'Credit_Valuation_Adjustment', default_cva)
-
-            # update the params
-            self.params['CVA']['Counterparty'] = cva_sect['Counterparty']
-            self.params['CVA']['Deflate_Stochastically'] = cva_sect['Deflate_Stochastically']
-            self.params['CVA']['Stochastic_Hazard'] = cva_sect['Stochastic_Hazard_Rates']
-            # now adjust the survival curve - need intervals of .25 years
-            sc = self.cx.params['Price Factors']['SurvivalProb.' + cva_sect['Counterparty']]['Curve'].array.copy()
-            tenors = np.arange(0, sc[-1][0], .25)
-            self.cx.params['Price Factors']['SurvivalProb.' + cva_sect['Counterparty']]['Curve'].array = np.array(
-                list(zip(tenors, np.interp(tenors, sc[:, 0], sc[:, 1]))))
-
-            try:
-                out = calc.execute(self.params)
-            except Exception as e:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                traceback.print_exception(exc_type, exc_value, exc_traceback,
-                                          limit=2, file=sys.stdout)
-
-                self.logger(self.netting_set, 'Exception: ' + str(e.args))
-            else:
-                stats = out['Stats']
-                grad_cva = calc.gradients_as_df(out['Results']['grad_cva']).rename(
-                    columns={'Gradient': self.cx.deals['Attributes']['Reference']})
-                # store the CVA as part of the stats
-                out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
-                grad_cva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
-                self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
-                # log the netting set
-                self.logger(self.netting_set, 'CVA calc complete')
+            grad_cva = out['Results']['grad_cva'].rename(
+                columns={'Gradient': self.cx.deals['Attributes']['Reference']})
+            # store the CVA as part of the stats
+            out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
+            # write the grad
+            grad_cva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
+            # store it
+            self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
 
 
 class FVADEFAULT(JOB):

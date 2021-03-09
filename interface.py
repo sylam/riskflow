@@ -109,11 +109,12 @@ if __name__ == '__main__':
             [os.path.join('E:\\Data\\crstal\\CVA', folder),
              os.path.join('G:\\Credit Quants\\CRSTAL', folder),
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
-             os.path.join('G:', folder)])
+             os.path.join('G:\\', folder)])
 
     path = paths['CVA']
 
-    rundate = '2021-01-29'
+    rundate = '2021-03-05'
+    # rundate = '2021-01-19'
     # rundate = '2020-08-28'
     # rundate = '2020-08-07'
     # rundate = '2020-11-17'
@@ -126,6 +127,8 @@ if __name__ == '__main__':
 
     if 1:
         cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
+        # cx.params['Price Factor Interpolation'] = rf.config.ModelParams()
+
         # cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketDataCVA.json'))
         # cx_arena = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
         # cx.params['Price Factors'].update(cx_arena.params['Price Factors'])
@@ -152,17 +155,15 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, 'CrB_AutoX_ISDA.json'))
 
 
-        # cx.parse_json(os.path.join(path, rundate, env, 'CrB_ABSA_Bank_Jhb_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Eskom_Hld_SOC_Ltd_ISDA.json'))
-
-        cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_RCL_Foods_Treasury_NonISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
-
+        cx.parse_json(os.path.join(path, rundate, 'CrB_Sanlam_Developing_Markets_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_The_Core_Computer_Business_Limited_ISDA.json'))
 
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Land___Agricul_Bnk_ISDA.json'))
-
         # cx.parse_json(os.path.join(path, rundate, 'CrB_ABSA_Bank_Jhb_ISDA.json'))
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Growthpoint_Properties_Ltd_ISDA.json'))
@@ -172,11 +173,11 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, 'CrB_NatWest_Markets_Plc_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_CS_Sec__Europe__Ltd_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Nomura_International_Plc_ISDA.json'))
-
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_RCL_Foods_Treasury_NonISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Goldman_Sachs_Int_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Momentum_Metro_Life_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Omnia_Group_ISDA.json'))
-
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_CS_Int_London_ISDA.json'))
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Prescient_Toyota_SA_Prov_Fd_ISDA.json'))
         # cx.parse_trade_file(os.path.join(path, rundate, 'equityswap.aap'))
@@ -216,11 +217,12 @@ if __name__ == '__main__':
                          #'Run_Date': '2020-08-21',
                          # 'Tenor_Offset': 2.0,
                          # 'Time_grid':'1m 5m 1362d',
-                         'Random_Seed': 1354,
+                         'Random_Seed': 1254,
                          'Generate_Cashflows': 'No',
                          'Currency': 'ZAR',
-                         'Batch_Size': 1024,
-                         'Simulation_Batches': 10,
+                         'Deflation_Interest_Rate': 'ZAR-SWAP',
+                         'Batch_Size': 256,
+                         'Simulation_Batches': 1,
                          'CollVA': {'Gradient': 'No'},
                          'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}}
 
