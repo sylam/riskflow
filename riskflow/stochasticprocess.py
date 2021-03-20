@@ -396,17 +396,18 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         super(HullWhite2FactorImpliedInterestRateModel, self).__init__(factor, param)
         self.implied = implied_factor
         self.factor_tenor = None
-        self.t_quanto_vol = None
         self.clip = clip
         self.grid_index = None
         self.BtT = None
         self.C = None
-        self.f1 = None
-        self.f2 = None
 
     @staticmethod
     def num_factors():
         return 2
+
+    def reset_implied_factor(self, implied_factor):
+        self.implied = implied_factor
+        self.factor_tenor = None
 
     def link_references(self, implied_tensor, implied_var, implied_ofs):
         """link market variables across different risk factors"""
@@ -425,13 +426,19 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         # store randomnumber id's
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size
+        time_grid_years = np.array([self.factor.get_day_count_accrual(
+            ref_date, t) for t in time_grid.scen_time_grid])
+
         # get the factor's tenor points
         if self.factor_tenor is None:
             self.factor_tenor = tensor.new(self.factor.get_tenor().reshape(-1, 1))
             # store the forward curve
-            self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid, shared, ref_date)
+            fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared)
             # flatten the tenor
             self.factor_tenor_full = tensor.new_tensor(self.factor.get_tenor(), dtype=torch.float64)
+            # get the quanto vol
+            self.quantofx = tensor.new_tensor(
+                self.implied.param['Quanto_FX_Volatility'].array[:, 1], dtype=torch.float64)
 
         # calculate known functions
         alpha = [implied_tensor['Alpha_1'][0].type(torch.float64),
@@ -443,14 +450,14 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         vols_tenor = [self.implied.param['Sigma_1'].array[:, 0],
                       self.implied.param['Sigma_2'].array[:, 0]]
 
-        H = [integrate_piecewise_linear(hw_calc_H(alpha[i], torch.exp), shared, time_grid.time_grid_years,
-                                        vols_tenor[i], vols[i]) for i in range(2)]
-        I = [[integrate_piecewise_linear(hw_calc_IJK(alpha[i], torch.exp), shared, time_grid.time_grid_years,
-                                         vols_tenor[i], vols[i], vols_tenor[j], vols[j])
+        H = [integrate_piecewise_linear(
+            hw_calc_H(alpha[i], torch.exp), shared, time_grid_years, vols_tenor[i], vols[i]) for i in range(2)]
+        I = [[integrate_piecewise_linear(
+            hw_calc_IJK(alpha[i], torch.exp), shared, time_grid_years, vols_tenor[i], vols[i], vols_tenor[j], vols[j])
               for j in range(2)] for i in range(2)]
-        J = [[integrate_piecewise_linear(hw_calc_IJK(alpha[i] + alpha[j], torch.exp), shared, time_grid.time_grid_years,
-                                         vols_tenor[i], vols[i], vols_tenor[j], vols[j])
-              for j in range(2)] for i in range(2)]
+        J = [[integrate_piecewise_linear(
+            hw_calc_IJK(alpha[i] + alpha[j], torch.exp), shared,
+            time_grid_years, vols_tenor[i], vols[i], vols_tenor[j], vols[j]) for j in range(2)] for i in range(2)]
 
         # Check if the curve is not the same as the base currency
         if self.implied.param['Quanto_FX_Volatility'] and self.implied.param['Quanto_FX_Volatility'].array.any():
@@ -458,25 +465,24 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             if 'Quanto_FX_Correlation_1' in implied_tensor and 'Quanto_FX_Correlation_2' in implied_tensor:
                 quantofxcorr = [implied_tensor['Quanto_FX_Correlation_1'][0].type(torch.float64),
                                 implied_tensor['Quanto_FX_Correlation_2'][0].type(torch.float64)]
-                self.t_quanto_vol = implied_tensor['Quanto_FX_Volatility'].type(torch.float64)
+                t_quanto_vol = implied_tensor['Quanto_FX_Volatility'].type(torch.float64)
             else:
                 quantofxcorr = self.implied.get_quanto_correlation(corr, vols)
-                if self.t_quanto_vol is None:
-                    self.t_quanto_vol = tensor.new_tensor(quantofx[:, 1], dtype=torch.float64)
+                t_quanto_vol = self.quantofx
 
             K = [integrate_piecewise_linear(
-                hw_calc_IJK(alpha[i], torch.exp), shared, time_grid.time_grid_years,
-                vols_tenor[i], vols[i], quantofx[:, 0], self.t_quanto_vol) for i in range(2)]
+                hw_calc_IJK(alpha[i], torch.exp), shared, time_grid_years,
+                vols_tenor[i], vols[i], quantofx[:, 0], t_quanto_vol) for i in range(2)]
         else:
             quantofxcorr = [0.0, 0.0]
-            K = [corr.new_zeros(time_grid.time_grid_years.size) for i in range(2)]
+            K = [corr.new_zeros(time_grid_years.size) for i in range(2)]
 
         # now calculate the At
-        AtT = tensor.new_zeros([time_grid.time_grid_years.size, self.factor_tenor.size()[0]])
+        AtT = tensor.new_zeros([time_grid_years.size, self.factor_tenor.size()[0]])
         BtT = [(1.0 - torch.exp(-alpha[i] * self.factor_tenor_full)) / alpha[i] for i in range(2)]
         CtT = []
         rho = [[1.0, corr], [corr, 1.0]]
-        t = tensor.new(time_grid.time_grid_years.reshape(-1, 1))
+        t = tensor.new(time_grid_years.reshape(-1, 1))
 
         for i, j in itertools.product(range(2), range(2)):
             first_part = torch.exp(-(alpha[i] + alpha[j]) * t) * J[i][j].reshape(-1, 1)
@@ -514,21 +520,21 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             C = torch.stack(cholesky)
 
         # intermediate results
-        self.BtT = [Bi.type(shared.precision).reshape(-1, 1) for Bi in BtT]
-        self.YtT = [torch.exp(-alpha[i] * t).type(shared.precision) for i in range(2)]
-        self.KtT = [(quantofxcorr[i] * K[i].reshape(-1, 1)).type(shared.precision) for i in range(2)]
-        self.HtT = [(lam[i] * H[i].reshape(-1, 1)).type(shared.precision) for i in range(2)]
-        self.alpha = [alpha[i].type(shared.precision) for i in range(2)]
+        self.BtT = [Bi.type(shared.one.dtype).reshape(-1, 1) for Bi in BtT]
+        self.YtT = [torch.exp(-alpha[i] * t).type(shared.one.dtype) for i in range(2)]
+        self.KtT = [(quantofxcorr[i] * K[i].reshape(-1, 1)).type(shared.one.dtype) for i in range(2)]
+        self.HtT = [(lam[i] * H[i].reshape(-1, 1)).type(shared.one.dtype) for i in range(2)]
+        self.alpha = [alpha[i].type(shared.one.dtype) for i in range(2)]
 
         # needed for factor calcs later
-        self.F1 = C[:, 0, 0].reshape(-1, 1).type(shared.precision)
-        self.F2 = C[:, 1].t().unsqueeze(axis=2).type(shared.precision)
+        self.F1 = C[:, 0, 0].reshape(-1, 1).type(shared.one.dtype)
+        self.F2 = C[:, 1].t().unsqueeze(axis=2).type(shared.one.dtype)
 
         # store the grid points used if necessary
-        if len(time_grid.scenario_grid) != time_grid.time_grid_years.size:
+        if len(time_grid.scenario_grid) != time_grid_years.size:
             self.grid_index = time_grid.scen_time_grid.searchsorted(time_grid.scenario_grid[:, utils.TIME_GRID_MTM])
 
-        self.drift = torch.unsqueeze(self.fwd_curve + 0.5 * AtT.type(shared.precision), 2)
+        self.drift = torch.unsqueeze(fwd_curve + 0.5 * AtT.type(shared.one.dtype), 2)
 
     def calc_stoch_deflator(self, time_grid, curve_index, shared):
         cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])
@@ -553,29 +559,31 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             return fwd_curve / t
 
     def calc_factors(self, factor1, factor1and2):
-        self.f1 = torch.unsqueeze((torch.cumsum(factor1 * self.F1, axis=0)
-                                   - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
-        self.f2 = torch.unsqueeze((torch.cumsum(torch.sum(factor1and2 * self.F2, axis=0), axis=0)
-                                   - self.KtT[1] + self.HtT[1]) * self.YtT[1], axis=1)
+        f1 = torch.unsqueeze(
+            (torch.cumsum(factor1 * self.F1, axis=0) - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
+        f2 = torch.unsqueeze(
+            (torch.cumsum(torch.sum(factor1and2 * self.F2, axis=0), axis=0) - self.KtT[1] + self.HtT[1]) * self.YtT[1],
+            axis=1)
+        return f1, f2
 
     @property
     def correlation_name(self):
         return 'HWImpliedInterestRate', [('F1',), ('F2',)]
 
     def generate(self, shared_mem):
-        self.calc_factors(
+        factor1, factor2 = self.calc_factors(
             shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
             shared_mem.t_random_numbers[self.z_offset:self.z_offset + 2, :self.scenario_horizon])
 
         # check if we need deflators
         if self.grid_index is not None:
             # only generate curves for the given grid
-            f1 = self.f1[self.grid_index]
-            f2 = self.f2[self.grid_index]
+            f1 = factor1[self.grid_index]
+            f2 = factor2[self.grid_index]
             drift = self.drift[self.grid_index]
         else:
-            f1 = self.f1
-            f2 = self.f2
+            f1 = factor1
+            f2 = factor2
             drift = self.drift
 
         # generate curves based on
@@ -638,8 +646,10 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size
 
-        # store the forward curve    
-        self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid, shared, ref_date)
+        # store the forward curve
+        time_grid_years = np.array([self.factor.get_day_count_accrual(
+            ref_date, t) for t in time_grid.scen_time_grid])
+        self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared)
 
         # Really should implement this . . .
         quantofx = self.param['Quanto_FX_Volatility'].array.T if self.param['Quanto_FX_Volatility'] else np.zeros(
@@ -650,42 +660,41 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
         vols = self.param['Sigma'].array
 
         # calculate known functions
-        self.H = integrate_piecewise_linear(hw_calc_H(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0],
-                                            vols[:, 1])
-        self.I = integrate_piecewise_linear(hw_calc_IJK(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0],
-                                            vols[:, 1], vols[:, 0], vols[:, 1])
-        self.J = integrate_piecewise_linear(hw_calc_IJK(2.0 * alpha, np.exp), shared, time_grid.time_grid_years,
-                                            vols[:, 0], vols[:, 1], vols[:, 0], vols[:, 1])
-        self.K = integrate_piecewise_linear(hw_calc_IJK(alpha, np.exp), shared, time_grid.time_grid_years, vols[:, 0],
-                                            vols[:, 1], quantofx[:, 0], quantofx[:, 1])
+        self.H = integrate_piecewise_linear(
+            hw_calc_H(alpha, np.exp), shared, time_grid_years, vols[:, 0], vols[:, 1])
+        self.I = integrate_piecewise_linear(
+            hw_calc_IJK(alpha, np.exp), shared, time_grid_years,
+            vols[:, 0], vols[:, 1], vols[:, 0], vols[:, 1])
+        self.J = integrate_piecewise_linear(
+            hw_calc_IJK(2.0 * alpha, np.exp), shared, time_grid_years,
+            vols[:, 0], vols[:, 1], vols[:, 0], vols[:, 1])
+        self.K = integrate_piecewise_linear(
+            hw_calc_IJK(alpha, np.exp), shared, time_grid_years,
+            vols[:, 0], vols[:, 1], quantofx[:, 0], quantofx[:, 1])
 
         # Now precalculate the A and B matrices
         BtT = (1.0 - np.exp(-alpha * factor_tenor)) / alpha
         AtT = np.array([(BtT / alpha) * np.exp(-alpha * t) * (
                 2.0 * It - (np.exp(-alpha * t) + np.exp(-alpha * (t + factor_tenor))) * Jt) for (It, Jt, t) in
-                        zip(self.I, self.J, time_grid.time_grid_years)])
+                        zip(self.I, self.J, time_grid_years)])
 
         # get the deltas
-        self.delta_KtT = torch.tensor(
-            np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.K))),
-            dtype=shared.precision, device=shared.device)
+        self.delta_KtT = shared.one.new_tensor(
+            np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid_years) * self.K))))
 
-        self.delta_HtT = torch.tensor(np.hstack(
-            (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid.time_grid_years) * self.H))),
-            dtype=shared.precision, device=shared.device)
+        self.delta_HtT = shared.one.new_tensor(np.hstack(
+            (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid_years) * self.H))))
 
-        delta_var = np.diff(np.exp(-2.0 * alpha * time_grid.time_grid_years) * self.J)
+        delta_var = np.diff(np.exp(-2.0 * alpha * time_grid_years) * self.J)
         if delta_var.size:
             # needed for numerical stability
             delta_var[delta_var <= 0.0] = delta_var[delta_var > 0.0].min()
-        self.delta_vol = torch.tensor(np.sqrt(np.hstack((0.0, delta_var))).reshape(-1, 1),
-                                      dtype=shared.precision, device=shared.device)
+        self.delta_vol = shared.one.new_tensor(np.sqrt(np.hstack((0.0, delta_var))).reshape(-1, 1))
 
-        self.AtT = torch.tensor(AtT, dtype=shared.precision, device=shared.device)
-        self.BtT = torch.tensor(BtT.reshape(-1, 1), dtype=shared.precision, device=shared.device)
+        self.AtT = shared.one.new_tensor(AtT)
+        self.BtT = shared.one.new_tensor(BtT.reshape(-1, 1))
         self.fwd_component = torch.unsqueeze(self.fwd_curve + 0.5 * self.AtT, 2)
-        self.factor_tenor = torch.tensor(
-            factor_tenor.reshape(-1, 1), dtype=shared.precision, device=shared.device)
+        self.factor_tenor = shared.one.new_tensor(factor_tenor.reshape(-1, 1))
 
     @property
     def correlation_name(self):
@@ -750,15 +759,17 @@ class HWHazardRateModel(StochasticProcess):
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         alpha = self.param['Alpha']
         factor_tenor = self.factor.get_tenor()
+        time_grid_years = np.array([self.factor.get_day_count_accrual(
+            ref_date, t) for t in time_grid.scen_time_grid])
 
         # store the forward curve    
-        self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid, shared, ref_date, mul_time=False)
-        Bt = ((1.0 - np.exp(-alpha * time_grid.time_grid_years)) / alpha).reshape(-1, 1)
-        B2t = ((1.0 - np.exp(-2.0 * alpha * time_grid.time_grid_years)) / alpha).reshape(-1, 1)
+        self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared, mul_time=False)
+        Bt = ((1.0 - np.exp(-alpha * time_grid_years)) / alpha).reshape(-1, 1)
+        B2t = ((1.0 - np.exp(-2.0 * alpha * time_grid_years)) / alpha).reshape(-1, 1)
         self.BtT = ((1.0 - np.exp(-alpha * factor_tenor)) / alpha).reshape(1, -1)
         self.AtT = np.square(self.param['Sigma']) * self.BtT * (self.BtT * B2t + (Bt * Bt))
         var = (np.square(self.param['Sigma']) / (2.0 * alpha)) * (
-                1.0 - np.exp(-2.0 * alpha * time_grid.time_grid_years))
+                1.0 - np.exp(-2.0 * alpha * time_grid_years))
         vol = np.sqrt(np.diff(np.insert(var, 0, 0, axis=0), axis=0))
 
         with tf.name_scope(self.__class__.__name__):
@@ -968,6 +979,8 @@ class PCAInterestRateModel(StochasticProcess):
         # store randomnumber id's
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size
+        time_grid_years = np.array([self.factor.get_day_count_accrual(
+            ref_date, t) for t in time_grid.scen_time_grid])
 
         # rescale and precalculate the eigenvectors
         evecs, evals = np.zeros((factor_tenor.size, self.num_factors())), []
@@ -984,15 +997,13 @@ class PCAInterestRateModel(StochasticProcess):
         self.vols = np.interp(factor_tenor, *self.param['Yield_Volatility'].array.T)
         alpha = self.param['Reversion_Speed']
         self.vol_adj = -np.append([0], np.diff(
-            np.exp(-2.0 * alpha * time_grid.time_grid_years) / (2.0 * alpha)))
-        self.delta_vol = torch.tensor(self.vols.reshape(1, -1, 1) * np.sqrt(self.vol_adj).reshape(-1, 1, 1),
-                                      dtype=shared.precision, device=shared.device)
-        self.drift = torch.tensor(np.expand_dims(
-            -0.5 * ((self.vols * self.vols).reshape(1, -1)) * self.vol_adj.reshape(-1, 1), axis=2),
-            dtype=shared.precision, device=shared.device)
+            np.exp(-2.0 * alpha * time_grid_years) / (2.0 * alpha)))
+        self.delta_vol = shared.one.new_tensor(self.vols.reshape(1, -1, 1) * np.sqrt(self.vol_adj).reshape(-1, 1, 1))
+        self.drift = shared.one.new_tensor(np.expand_dims(
+            -0.5 * ((self.vols * self.vols).reshape(1, -1)) * self.vol_adj.reshape(-1, 1), axis=2))
 
         # normalize the eigenvectors
-        self.evecs = torch.tensor(B.T[:, np.newaxis, :, np.newaxis], dtype=shared.precision, device=shared.device)
+        self.evecs = shared.one.new_tensor(B.T[:, np.newaxis, :, np.newaxis])
 
         # also need to pre-calculate the forward curves at time_grid given and pass that to the cuda kernel
         if self.param['Rate_Drift_Model'] == 'Drift_To_Blend':
@@ -1011,25 +1022,25 @@ class PCAInterestRateModel(StochasticProcess):
 
         else:
             # calculate the forward curve across time
-            fwd_curve = utils.calc_curve_forwards(
-                self.factor, tensor, time_grid, shared, ref_date) / torch.tensor(
-                factor_tenor.reshape(1, -1), dtype=shared.precision, device=shared.device)
+            fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared) / shared.one.new_tensor(
+                factor_tenor.reshape(1, -1))
 
         self.fwd_component = torch.unsqueeze(fwd_curve, dim=2)
 
     def calc_factors(self, factors):
         pc_portion = (torch.unsqueeze(factors, dim=2) * self.evecs).sum(axis=0) * self.delta_vol
-        self.stoch = (self.drift + pc_portion).cumsum(axis=0)
+        return (self.drift + pc_portion).cumsum(axis=0)
 
     @property
     def correlation_name(self):
         return 'InterestRateOUProcess', [('PC{}'.format(x),) for x in range(1, self.num_factors() + 1)]
 
     def generate(self, shared_mem):
-        self.calc_factors(shared_mem.t_random_numbers[
-                          self.z_offset:self.z_offset + self.num_factors(), :self.scenario_horizon])
+        stoch = self.calc_factors(
+            shared_mem.t_random_numbers[
+            self.z_offset:self.z_offset + self.num_factors(), :self.scenario_horizon])
 
-        return self.fwd_component * torch.exp(self.stoch)
+        return self.fwd_component * torch.exp(stoch)
 
 
 class PCAInterestRateCalibration(object):
