@@ -782,16 +782,6 @@ def split_tensor(tensor, counts):
     return torch.split(tensor, tuple(counts)) if tensor.shape[0] == counts.sum() else [tensor] * counts.size
 
 
-def non_zero(tensor):
-    if tensor.get_shape()[0] > 1:
-        flat = tf.squeeze(tensor)
-        non_zero = tf.where(tf.cast(flat, tf.bool))
-        return tf.squeeze(tf.gather(flat, non_zero), axis=1)
-    else:
-        return tensor
-
-
-# @torch.jit.ignore
 def interpolate_curve_indices(all_tenor_points_in_years, curve_component, time_factor=1.0):
     # will only work if all_tenor_points is 2 dimensional
     curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index]
@@ -845,6 +835,12 @@ def interpolate_risk_neutral(points, curve_tensor, curve_component, curve_interp
     return interpolate_curve(
         curve_tensor, curve_component, curve_interp, t, time_multiplier) - interpolate_curve(
         curve_tensor, curve_component, curve_interp, T, time_multiplier)
+
+
+@torch.jit.script
+def calc_hermite_curve(t_a, g, c, curve_t0, curve_t1):
+    one_minus_ta = (1.0 - t_a)
+    return curve_t0 * one_minus_ta + t_a * (curve_t1 + one_minus_ta * (g + t_a * c))
 
 
 class CurveTensor(object):
@@ -911,21 +907,17 @@ class CurveTensor(object):
                     mult = tenors if time_factor else 1.0
 
                 t_a = tensor.new(a)
+                val = calc_hermite_curve(
+                    t_a, g[time_index, i1], c[time_index, i1],
+                    tensor[time_index, i1], tensor[time_index, i2])
+
                 if self.alpha is not None:
                     # need to linearly interpolate between 2 time points
-                    val_t0 = tensor[time_index, i1] * (1.0 - t_a) + (
-                        (tensor[time_index, i2] * t_a + t_a * (1.0 - t_a) * g[time_index, i1] +
-                         t_a * t_a * (1.0 - t_a) * c[time_index, i1]) if a.any() else 0.0)
-                    val_t1 = tensor[time_index_next, i1] * (1.0 - t_a) + (
-                        (tensor[time_index_next, i2] * t_a + t_a * (1.0 - t_a) * g[time_index_next, i1] +
-                         t_a * t_a * (1.0 - t_a) * c[time_index_next, i1]) if a.any() else 0.0)
+                    val_t1 = calc_hermite_curve(
+                        t_a, g[time_index_next, i1], c[time_index_next, i1],
+                        tensor[time_index_next, i1], tensor[time_index_next, i2])
 
-                    val = (1 - self.alpha) * val_t0 + self.alpha * val_t1
-                else:
-                    # can get to it directly
-                    val = tensor[time_index, i1] * (1.0 - t_a) + (
-                        (tensor[time_index, i2] * t_a + t_a * (1.0 - t_a) * g[time_index, i1] +
-                         t_a * t_a * (1.0 - t_a) * c[time_index, i1]) if a.any() else 0.0)
+                    val = (1 - self.alpha) * val + self.alpha * val_t1
 
                 interp_val = val * mult
             else:
@@ -1751,7 +1743,7 @@ def calc_time_grid_spot_rate(rate, time_grid, shared):
     return shared.t_Buffer[key_code]
 
 
-def calc_curve_forwards(factor, tensor, time_grid, shared, ref_date, mul_time=True):
+def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
     factor_tenor = factor.get_tenor()
 
     tnr, tnr_d = factor_tenor, np.hstack((np.diff(factor_tenor), [1]))
@@ -1759,27 +1751,18 @@ def calc_curve_forwards(factor, tensor, time_grid, shared, ref_date, mul_time=Tr
 
     # calculate the tenors and indices used for lookups
     ten_t1 = np.array([np.clip(
-        np.searchsorted(factor_tenor,
-                        factor.get_day_count_accrual(ref_date, t),
-                        side='right') - 1,
-        0, max_dim) for t in time_grid.scen_time_grid])
+        np.searchsorted(factor_tenor, t, side='right') - 1, 0, max_dim) for t in time_grid_years])
 
     ten_t = np.array([np.clip(
-        np.searchsorted(factor_tenor,
-                        factor_tenor + factor.get_day_count_accrual(ref_date, t),
-                        side='right') - 1,
-        0, max_dim) for t in time_grid.scen_time_grid])
+        np.searchsorted(factor_tenor, factor_tenor + t, side='right') - 1, 0, max_dim) for t in time_grid_years])
 
     ten_t1_next = np.clip(ten_t1 + 1, 0, max_dim)
     ten_t_next = np.clip(ten_t + 1, 0, max_dim)
 
-    ten_tv = np.clip(np.array(
-        [factor_tenor + factor.get_day_count_accrual(ref_date, t)
-         for t in time_grid.scen_time_grid])
-        , 0, factor_tenor.max())
-
+    ten_tv = np.clip(np.array([factor_tenor + t for t in time_grid_years]), 0, factor_tenor.max())
     alpha_1 = tensor.new((ten_tv - tnr[ten_t]) / tnr_d[ten_t])
-    alpha_2 = tensor.new((time_grid.time_grid_years - tnr[ten_t1]).clip(0, np.inf) / tnr_d[ten_t1])
+    alpha_2 = tensor.new((time_grid_years - tnr[ten_t1]).clip(0, np.inf) / tnr_d[ten_t1])
+
     # make tensor indices
     ten_t_next = tensor.new_tensor(ten_t_next, dtype=torch.int64)
     ten_t = tensor.new_tensor(ten_t, dtype=torch.int64)
@@ -1788,34 +1771,32 @@ def calc_curve_forwards(factor, tensor, time_grid, shared, ref_date, mul_time=Tr
 
     if factor.interpolation[0].startswith('Hermite'):
         t = tensor.new(tnr.reshape(1, -1, 1))
+        time_tenor_tenor = tensor.new(time_grid_years.reshape(-1, 1) + tnr)
+        time_grid_tensor = tensor.new(time_grid_years)
+
+        # calculate the normalization factor for hermite
+        norm = (time_tenor_tenor if mul_time else 1.0, time_grid_tensor if mul_time else 1.0)
         if factor.interpolation[0] == 'HermiteRT':
             mod = tensor.reshape(1, -1, 1) * t
-            norm = None
+            norm = (norm[0] / time_tenor_tenor.clamp(tnr.min(), tnr.max()),
+                    norm[1] / time_grid_tensor.clamp(tnr.min(), tnr.max()))
         else:
             mod = tensor.reshape(1, -1, 1)
-            norm = (tensor.new(ten_tv), tensor.new(time_grid.time_grid_years)) if mul_time else (1.0, 1.0)
 
         g, c = [torch.squeeze(x) for x in hermite_interpolation_tensor(t, mod)]
         sq = torch.squeeze(mod)
 
-        val = sq[ten_t] * (1.0 - alpha_1) + sq[ten_t_next] * alpha_1 + \
-              alpha_1 * (1.0 - alpha_1) * g[ten_t] + alpha_1 * alpha_1 * (1.0 - alpha_1) * c[ten_t]
+        val = calc_hermite_curve(alpha_1, g[ten_t], c[ten_t], sq[ten_t], sq[ten_t_next])
+        val_t = calc_hermite_curve(alpha_2, g[ten_t1], c[ten_t1], sq[ten_t1], sq[ten_t1_next])
 
-        val_t = sq[ten_t1] * (1.0 - alpha_2) + sq[ten_t1_next] * alpha_2 + \
-                alpha_2 * (1.0 - alpha_2) * g[ten_t1] + \
-                alpha_2 * alpha_2 * (1.0 - alpha_2) * c[ten_t1]
-
-        if norm is None:
-            return val - val_t.reshape(-1, 1)
-        else:
-            return val * norm[0] - (val_t * norm[1]).reshape(-1, 1)
+        return val * norm[0] - (val_t * norm[1]).reshape(-1, 1)
     else:
         fwd1 = alpha_1 * tensor.take(ten_t_next) + (1 - alpha_1) * tensor.take(ten_t)
         fwd2 = alpha_2 * tensor.take(ten_t1_next) + (1 - alpha_2) * tensor.take(ten_t1)
 
         if mul_time:
-            time_tenor_tenor = tensor.new(time_grid.time_grid_years.reshape(-1, 1) + tnr)
-            time_grid_tensor = tensor.new(time_grid.time_grid_years)
+            time_tenor_tenor = tensor.new(time_grid_years.reshape(-1, 1) + tnr)
+            time_grid_tensor = tensor.new(time_grid_years)
 
             return fwd1 * time_tenor_tenor - (fwd2 * time_grid_tensor).reshape(-1, 1)
         else:

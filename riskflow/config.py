@@ -133,9 +133,9 @@ class ModelParams(object):
         # look for a filter rule
         rule = self.modelfilters.get(price_factor_type)
         if rule:
-            factor_attribs = dict(actual_factor, **{'ID': '.'.join(factor.name)})
+            factor_attribs = dict({k.lower(): v for k, v in actual_factor.items()}, **{'id': '.'.join(factor.name)})
             for (attrib, value), model in rule:
-                if factor_attribs.get(attrib.strip()) == value.strip():
+                if factor_attribs.get(attrib.strip().lower()) == value.strip():
                     return model
         return self.modeldefaults.get(price_factor_type)
 
