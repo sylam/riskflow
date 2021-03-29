@@ -99,6 +99,7 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
     import riskflow as rf
 
@@ -106,14 +107,14 @@ if __name__ == '__main__':
     paths = {}
     for folder in ['CVA', 'Arena', 'Debug', 'Upgrade']:
         paths[folder] = rf.getpath(
-            [os.path.join('E:\\Data\\crstal\\CVA', folder),
-             os.path.join('G:\\Credit Quants\\CRSTAL', folder),
+            [os.path.join('G:\\Credit Quants\\CRSTAL', folder),
+             os.path.join('N:\\Archive', folder),
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
              os.path.join('G:\\', folder)])
 
     path = paths['CVA']
 
-    rundate = '2021-03-05'
+    rundate = '2021-03-26'
     # rundate = '2021-01-19'
     # rundate = '2020-08-28'
     # rundate = '2020-08-07'
@@ -159,7 +160,8 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, 'CrB_RCL_Foods_Treasury_NonISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
-        cx.parse_json(os.path.join(path, rundate, 'CrB_Sanlam_Developing_Markets_ISDA.json'))
+        cx.parse_json(os.path.join(path, rundate, 'CrB_Omnia_Group_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Sanlam_Developing_Markets_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_The_Core_Computer_Business_Limited_ISDA.json'))
 
 
@@ -204,6 +206,9 @@ if __name__ == '__main__':
         #         'Haircut_Posted': 0.0,
         #         'Amount': 1.0}]}
 
+        # disable interpolation
+        # cx.params['Price Factor Interpolation'].modelfilters = {}
+
         if 1:
             # grab the netting set
             ns = cx.deals['Deals']['Children'][0]['instrument']
@@ -221,17 +226,17 @@ if __name__ == '__main__':
                          'Generate_Cashflows': 'No',
                          'Currency': 'ZAR',
                          'Deflation_Interest_Rate': 'ZAR-SWAP',
-                         'Batch_Size': 256,
-                         'Simulation_Batches': 1,
+                         'Batch_Size': 512,
+                         'Simulation_Batches': 2,
                          'CollVA': {'Gradient': 'No'},
-                         'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}}
+                         'CVA': {'Gradient': 'No', 'Hessian': 'No'}}
 
             if ns.field['Collateralized'] == 'True':
                 overrides['Dynamic_Scenario_Dates'] = 'Yes'
             else:
                 overrides['Dynamic_Scenario_Dates'] = 'No'
 
-            calc, out, res = rf.run_cmc(cx, prec=torch.float32, device=gpudevice,
+            calc, out, res = rf.run_cmc(cx, prec=torch.float32, device=cpudevice,
                                         overrides=overrides, CVA=True, CollVA=False, FVA=False)
 
             # j = check_correlation(out['Results']['scenarios'],
@@ -239,5 +244,5 @@ if __name__ == '__main__':
             # s = check_correlation(out['Results']['scenarios'],
             #                       ('InterestRate', ('ZAR-SWAP',)), ('FxRate', ('ZAR',)))
         else:
-            calc, out = rf.run_baseval(cx, prec=torch.float64, device=gpudevice,
+            calc, out = rf.run_baseval(cx, prec=torch.float64, device=cpudevice,
                                        overrides={'Currency': 'ZAR', 'Greeks': 'No'})
