@@ -51,21 +51,12 @@ def bootstrap(path, rundate, device, reuse_cal=True):
     context = AdaptivContext()
     cal_file = 'CVAMarketData_Calibrated_New.json'
     if reuse_cal and os.path.isfile(os.path.join(path, rundate, cal_file)):
-        # context.parse_json(os.path.join(path, rundate, cal_file))
-        context.parse_json(os.path.join(path, rundate, 'MarketData.json'))
-        context_tmp = AdaptivContext()
-        context_tmp.parse_json(os.path.join(path, rundate, cal_file))
-        for factor in [x for x in context_tmp.params['Price Factors'].keys()
-                       if x.startswith('HullWhite2FactorModelParameters') or
-                          x.startswith('GBMAssetPriceTSModelParameters')]:
-            # override it
-            context.params['Price Factors'][factor] = context_tmp.params['Price Factors'][factor]
+        context.parse_json(os.path.join(path, rundate, cal_file))
     else:
         context.parse_json(os.path.join(path, rundate, 'MarketData.json'))
 
     context.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
-    context.params['System Parameters'][
-        'Swaption_Premiums'] = '~/Downloads/IR_Volatility_Swaption_2021-03-17_0000_LON.csv'
+    context.params['System Parameters']['Swaption_Premiums'] = '~/Downloads/IR_Volatility_Swaption_2020-09-17_0000_LON.csv'
     # for mp in list(context.params['Market Prices'].keys()):
     #     if mp.startswith('HullWhite2FactorInterestRateModelPrices') and not (
     #             mp.endswith('AUD-AONIA') or mp.endswith('ZAR-JIBAR-3M')):
@@ -77,7 +68,8 @@ def bootstrap(path, rundate, device, reuse_cal=True):
                         format='%(asctime)s %(levelname)-8s %(message)s',
                         datefmt='%m-%d %H:%M')
 
-    context.bootstrap(device)
+    # context.bootstrap(device)
+    context.bootstrap()
     # context.write_marketdata_json(os.path.join(path, rundate, cal_file))
     # context.write_market_file(os.path.join(path, rundate, 'MarketDataCal.dat'))
 
@@ -97,7 +89,6 @@ if __name__ == '__main__':
 
     # matplotlib.use('Qt4Agg')
     import matplotlib.pyplot as plt
-
     # import seaborn as sns
 
     plt.interactive(True)
@@ -108,6 +99,7 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
     import riskflow as rf
 
@@ -115,15 +107,19 @@ if __name__ == '__main__':
     paths = {}
     for folder in ['CVA', 'Arena', 'Debug', 'Upgrade']:
         paths[folder] = rf.getpath(
-            [os.path.join('E:\\Data\\crstal\\CVA', folder),
-             os.path.join('G:\\Credit Quants\\CRSTAL', folder),
+            [os.path.join('G:\\Credit Quants\\CRSTAL', folder),
+             os.path.join('N:\\Archive', folder),
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
              os.path.join('G:\\', folder)])
 
     path = paths['CVA']
 
-    rundate = '2021-03-17'
-    # rundate = '2021-03-24'
+    rundate = '2021-03-26'
+    # rundate = '2021-01-19'
+    # rundate = '2020-08-28'
+    # rundate = '2020-08-07'
+    # rundate = '2020-11-17'
+    # rundate = '2020-08-07'
 
     gpudevice = torch.device("cuda:0")
     cpudevice = torch.device("cpu")
@@ -131,7 +127,6 @@ if __name__ == '__main__':
     # bootstrap(path, rundate, device=gpudevice, reuse_cal=True)
 
     if 1:
-        # cx_prod = rf.load_market_data(rundate, path, json_name=os.path.join('', 'MarketData.json'))
         cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
         # cx.params['Price Factor Interpolation'] = rf.config.ModelParams()
 
@@ -160,12 +155,15 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, 'CrB_AVI_Financial_Services__Pty__Limited_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_AutoX_ISDA.json'))
 
+
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Eskom_Hld_SOC_Ltd_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_RCL_Foods_Treasury_NonISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
-        cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        cx.parse_json(os.path.join(path, rundate, 'CrB_Omnia_Group_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Sanlam_Developing_Markets_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_The_Core_Computer_Business_Limited_ISDA.json'))
+
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Land___Agricul_Bnk_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_ABSA_Bank_Jhb_ISDA.json'))
@@ -208,55 +206,43 @@ if __name__ == '__main__':
         #         'Haircut_Posted': 0.0,
         #         'Amount': 1.0}]}
 
+        # disable interpolation
+        # cx.params['Price Factor Interpolation'].modelfilters = {}
+
         if 1:
             # grab the netting set
             ns = cx.deals['Deals']['Children'][0]['instrument']
-            factor = rf.utils.Factor('InterestRate', ('ZAR-SWAP',))
 
             # ns.field['Collateral_Assets']['Cash_Collateral'][0]['Funding_Rate'] = 'USD-LIBOR-3M.FUNDING'
             # ns.field['Collateral_Assets']['Cash_Collateral'][0]['Collateral_Rate'] = 'USD-OIS'
             # ns.field['Collateral_Call_Frequency']=pd.DateOffset(weeks=1)
             # ns.field['Collateralized'] = 'False'
 
-            overrides = {'Calc_Scenarios': 'Yes',
-                         # 'Run_Date': '2020-08-21',
+            overrides = {'Calc_Scenarios': 'No',
+                         #'Run_Date': '2020-08-21',
                          # 'Tenor_Offset': 2.0,
-                         'Time_grid': '0d 2d 1w(1w) 3m(1m)',
+                         # 'Time_grid':'1m 5m 1362d',
                          'Random_Seed': 1254,
                          'Generate_Cashflows': 'No',
                          'Currency': 'ZAR',
                          'Deflation_Interest_Rate': 'ZAR-SWAP',
-                         'Batch_Size': 1024,
+                         'Batch_Size': 512,
                          'Simulation_Batches': 2,
                          'CollVA': {'Gradient': 'No'},
-                         'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}}
+                         'CVA': {'Gradient': 'No', 'Hessian': 'No'}}
 
             if ns.field['Collateralized'] == 'True':
                 overrides['Dynamic_Scenario_Dates'] = 'Yes'
             else:
                 overrides['Dynamic_Scenario_Dates'] = 'No'
 
-            calc, out, res = rf.run_cmc(cx, prec=torch.float32, device=gpudevice,
+            calc, out, res = rf.run_cmc(cx, prec=torch.float32, device=cpudevice,
                                         overrides=overrides, CVA=True, CollVA=False, FVA=False)
 
-            # factors_to_add = {}
-            # for factor in calc.stoch_factors.keys():
-            #     if factor.type == 'InterestRate':
-            #         factor_name = rf.utils.check_tuple_name(factor)
-            #         print(factor, cx.params['Price Factors'][factor_name]['Interpolation'])
-            #         prod = rf.riskfactors.construct_factor(factor, cx_prod.params['Price Factors'])
-            #         uat = rf.riskfactors.construct_factor(factor, cx.params['Price Factors'])
-            #         cx.params['Price Factors'][factor_name]['Curve'] = rf.utils.Curve(
-            #             [], list(zip(prod.tenors, uat.current_value(prod.tenors))))
-            #
-            # cx.params['Price Factor Interpolation'].modelfilters = {}
-            # calc2, out2, res2 = rf.run_cmc(
-            #     cx, prec=torch.float32, device=cpudevice, overrides=overrides, CVA=True, CollVA=False, FVA=False)
             # j = check_correlation(out['Results']['scenarios'],
             #                       ('InterestRate', ('ZAR-JIBAR-3M',)), ('FxRate', ('ZAR',)))
             # s = check_correlation(out['Results']['scenarios'],
             #                       ('InterestRate', ('ZAR-SWAP',)), ('FxRate', ('ZAR',)))
-
         else:
-            calc, out = rf.run_baseval(cx, prec=torch.float64, device=gpudevice,
+            calc, out = rf.run_baseval(cx, prec=torch.float64, device=cpudevice,
                                        overrides={'Currency': 'ZAR', 'Greeks': 'No'})
