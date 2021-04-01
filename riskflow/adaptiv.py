@@ -166,8 +166,7 @@ class AdaptivContext(Context):
                  'Script_Base_Scenario_Multiplier': 1,
                  'Correlations_Healing_Method': 'Eigenvalue_Raising',
                  'Grouping_File': ''
-                 },
-            'Price Factor Interpolation': ModelParams(),
+                 }
         })
 
         # make sure that there are no default calibration mappings

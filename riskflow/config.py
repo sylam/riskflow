@@ -204,6 +204,7 @@ class Context(object):
                  },
             'Model Configuration': ModelParams(),
             'Price Factors': {},
+            'Price Factor Interpolation': ModelParams(),
             'Price Models': {},
             'Correlations': {},
             'Market Prices': {},
@@ -319,6 +320,7 @@ class Context(object):
             bootstrapper.bootstrap(self.params['System Parameters'],
                                    self.params['Price Models'],
                                    self.params['Price Factors'],
+                                   self.params['Price Factor Interpolation'],
                                    self.params['Market Prices'],
                                    self.holidays,
                                    debug=self)
@@ -641,19 +643,9 @@ class Context(object):
                 dependent_factor_tenors.setdefault(k, set()).update(v)
             # now get the last tenor for each factor
             dependent_factors = {k: max(dependent_factor_tenors.get(k, reset_dates)) for k in sorted_factors}
-            # interpolation mapping lookups
-            interp_map = {'CubicSplineCurveInterpolation': 'Hermite',
-                          'LinearInterFlatExtrapCurveGetValue': 'Linear',
-                          'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT'}
+
             # now lookup the processes
             for factor in sorted_factors:
-                # check the interpolation on interest Rates
-                if factor.type == 'InterestRate':
-                    price_factor = self.params['Price Factors'].get(utils.check_tuple_name(factor), {})
-                    interp_method = self.params['Price Factor Interpolation'].search(factor, price_factor, True)
-                    price_factor['Interpolation'] = interp_map.get(interp_method, 'Linear')
-
-                # check the stochastic process
                 stoch_proc = self.params['Model Configuration'].search(factor, self.params['Price Factors'].get(
                     utils.check_tuple_name(factor), {}))
                 # might need implied parameters

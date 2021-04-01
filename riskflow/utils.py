@@ -506,7 +506,7 @@ class TimeGrid(object):
         # whole risk factor
         if delta is not None:
             delta_days, delta_tenors = delta
-            delta_grid = np.union1d(np.arange(0, self.scen_time_grid.max(), delta_days), delta_tenors)
+            delta_grid = np.union1d(np.arange(0, self.scen_time_grid.max(), delta_days), delta_tenors.round())
             self.scen_time_grid = np.union1d(self.scen_time_grid, delta_grid)
 
         self.time_grid_years = self.scen_time_grid / DAYS_IN_YEAR
@@ -796,48 +796,7 @@ def interpolate_curve_indices(all_tenor_points_in_years, curve_component, time_f
     return np.expand_dims(a, axis=2), i1, np.expand_dims(w1, axis=2), i2, np.expand_dims(w2, axis=2)
 
 
-def interpolate_curve(curve_tensor, curve_component, curve_interp, points, time_factor):
-    a, i1, w1, i2, w2 = interpolate_curve_indices(
-        points, curve_component, time_factor)
-
-    time_size, point_size = points.shape
-    if curve_component[FACTOR_INDEX_Stoch]:
-        time_index = np.tile(np.arange(time_size).reshape(-1, 1), point_size)
-    else:
-        time_index = np.zeros((time_size, point_size), dtype=np.int64)
-
-    if curve_component[FACTOR_INDEX_Tenor_Index][2].startswith('Hermite'):
-        g, c = curve_interp
-        tenors = np.expand_dims(
-            curve_component[FACTOR_INDEX_Daycount](points), axis=2)
-        if curve_component[FACTOR_INDEX_Tenor_Index][2] == 'HermiteRT':
-            mult = None if time_factor else 1.0 / tenors
-        else:
-            mult = tenors if time_factor else None
-
-        val = tf.gather_nd(curve_tensor, i1) * (1.0 - a) + (
-            (tf.gather_nd(curve_tensor, i2) * a + a * (1.0 - a) * tf.gather_nd(g, i1) +
-             a * a * (1.0 - a) * tf.gather_nd(c, i1)) if a.any() else 0.0)
-
-        interp_val = val * mult if mult is not None else val
-    else:
-        # default to linear
-        t_w1 = curve_tensor.curve_tensors.new(w1)
-        interp_val = curve_tensor[time_index, i1] * t_w1 + (
-            curve_tensor[time_index, i2] * curve_tensor.new(w2) if w2.any() else 0.0)
-
-    return interp_val
-
-
-def interpolate_risk_neutral(points, curve_tensor, curve_component, curve_interp, time_grid, time_multiplier):
-    t = time_grid[:, 1].reshape(-1, 1)
-    T = points + t
-    return interpolate_curve(
-        curve_tensor, curve_component, curve_interp, t, time_multiplier) - interpolate_curve(
-        curve_tensor, curve_component, curve_interp, T, time_multiplier)
-
-
-@torch.jit.script
+#@torch.jit.script
 def calc_hermite_curve(t_a, g, c, curve_t0, curve_t1):
     one_minus_ta = (1.0 - t_a)
     return curve_t0 * one_minus_ta + t_a * (curve_t1 + one_minus_ta * (g + t_a * c))
@@ -876,7 +835,13 @@ class CurveTensor(object):
                 for sub_index, sub_alpha in zip(np.split(
                 self.index, counts.cumsum()[:-1]), sub_alpha)]
 
-    # @torch.jit.script
+    def interpolate_risk_neutral(self, curve_component, points, time_grid, time_multiplier):
+        t = time_grid[:, 1].reshape(-1, 1)
+        T = points + t
+        return self.interpolate_curve(
+            curve_component, t, time_multiplier) - self.interpolate_curve(
+            curve_component, T, time_multiplier)
+
     def interpolate_curve(self, curve_component, points, time_factor):
         time_size, point_size = points.shape
 
@@ -969,8 +934,8 @@ class TensorBlock(object):
             for curve_tensor, curve_component in zip(self.curve_tensors, self.code):
                 # handle static curves
                 if not curve_component[FACTOR_INDEX_Stoch] and shared.riskneutral:
-                    scaled_val = interpolate_risk_neutral(end_points, curve_tensor, curve_component,
-                                                          curve_interp, self.time_grid, time_multiplier)
+                    scaled_val = curve_tensor.interpolate_risk_neutral(
+                        curve_component, end_points, self.time_grid, time_multiplier)
                 else:
                     scaled_val = curve_tensor.interpolate_curve(curve_component, points, time_multiplier)
 
@@ -995,11 +960,8 @@ class TensorBlock(object):
 
         return self.local_cache[local_cache_key]
 
-    def reduce_deflate(self, time_points, shared):
-        temp_curve = 0
-        for curve_tensor in self.curve_tensors:
-            temp_curve += curve_tensor
-        DtT = torch.exp(-torch.cumsum(temp_curve, axis=0))
+    def reduce_deflate(self, delta_scen_t, time_points, shared):
+        DtT = torch.exp(-torch.squeeze(self.gather_weighted_curve(shared, delta_scen_t)).cumsum(axis=0))
         # we need the index just prior - note this needs to be checked in the calling code
         indices = self.time_grid[:, TIME_GRID_MTM].searchsorted(time_points) - 1
         return {t: DtT[index] for t, index in zip(time_points, indices)}
@@ -1637,7 +1599,13 @@ def make_curve_tensor(tensor, curve_component, time_grid, shared):
 
     if key_code not in shared.t_Buffer:
         if key_code[0] in ['HermiteRT', 'Hermite']:
-            t = tensor.new(curve_component[FACTOR_INDEX_Tenor_Index].tenor).reshape(1, -1, 1)
+            curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index].tenor
+            # check if we are using all the tenor points
+            if curve_tenor.size != tensor.shape[1]:
+                t = tensor.new(curve_tenor[:tensor.shape[1]]).reshape(1, -1, 1)
+            else:
+                t = tensor.new(curve_tenor).reshape(1, -1, 1)
+
             mod_tenor = tensor
             if curve_component[FACTOR_INDEX_Tenor_Index].type == 'HermiteRT':
                 mod_tenor = tensor * t
@@ -1653,71 +1621,29 @@ def make_curve_tensor(tensor, curve_component, time_grid, shared):
         return CurveTensor(shared.t_Buffer[key_code], np.zeros(1, dtype=np.int64), None)
 
 
-def cache_interpolation(shared, curve_component, tensor):
-    key_code = (curve_component[FACTOR_INDEX_Tenor_Index].type, curve_component[:2],
-                tuple(tensor.shape))
-
-    if key_code not in shared.t_Buffer:
-
-        if key_code[0] in ['HermiteRT', 'Hermite']:
-            t = curve_component[FACTOR_INDEX_Tenor_Index].tenor.reshape(1, -1, 1)
-            mod_tenor = tensor
-            if curve_component[FACTOR_INDEX_Tenor_Index].type == 'HermiteRT':
-                mod_tenor = tensor * t
-
-            g, c = hermite_interpolation_tensor(t, mod_tenor)
-            shared.t_Buffer[key_code] = mod_tenor, (g, c)
-        else:
-            shared.t_Buffer[key_code] = tensor, None
-
-    return shared.t_Buffer[key_code]
-
-
-def calc_time_grid_curve_rate(code, time_grid, shared, points=None, multiply_by_time=False):
+def calc_time_grid_curve_rate(code, time_grid, shared):
     time_hash = tuple(time_grid[:, TIME_GRID_MTM])
     code_hash = tuple([x[:2] for x in code])
-    points_hash = tuple(tuple(x) for x in points) if points is not None else None
 
-    key_code = ('curve', code_hash, time_hash, points_hash, multiply_by_time)
+    key_code = ('curve', code_hash, time_hash)
 
     if key_code not in shared.t_Buffer:
         value = []
 
         for rate in code:
-            rate_code = ('curve_factor', rate[:2], time_hash, points_hash, multiply_by_time)
-            interp_scenario = rate[FACTOR_INDEX_Tenor_Index].type != 'Linear' or points is None
+            rate_code = ('curve_factor', rate[:2], time_hash)
 
-            # if points are defined, calculate directly - otherwise interpolate from
-            # the scenario and static buffers
-            if interp_scenario:
-                # check if the curve factors are already available
-                if rate_code not in shared.t_Buffer:
-                    if rate[FACTOR_INDEX_Stoch]:
-                        tensor = shared.t_Scenario_Buffer[rate[FACTOR_INDEX_Offset]]
-                        spread = make_curve_tensor(tensor, rate, time_grid, shared)
-                    else:
-                        tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
-                        spread = make_curve_tensor(tensor.reshape(1, -1, 1), rate, None, shared)
+            # check if the curve factors are already available
+            if rate_code not in shared.t_Buffer:
+                if rate[FACTOR_INDEX_Stoch]:
+                    tensor = shared.t_Scenario_Buffer[rate[FACTOR_INDEX_Offset]]
+                    spread = make_curve_tensor(tensor, rate, time_grid, shared)
+                else:
+                    tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
+                    spread = make_curve_tensor(tensor.reshape(1, -1, 1), rate, None, shared)
 
-                    # store it
-                    shared.t_Buffer[rate_code] = spread
-            else:
-                if rate_code not in shared.t_Buffer:
-                    # if points are defined, calculate directly - otherwise interpolate from
-                    # the scenario and static buffers
-                    if rate[FACTOR_INDEX_Stoch]:
-                        spread = rate[FACTOR_INDEX_Process].calc_points(
-                            rate, points, time_grid, shared, multiply_by_time)
-                    else:
-                        tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
-                        if shared.riskneutral:
-                            spread = interpolate_risk_neutral(
-                                points, tensor, rate, None, time_grid, multiply_by_time)
-                        else:
-                            spread = interpolate_curve(tensor, rate, None, points, multiply_by_time)
-
-                    # store it
-                    shared.t_Buffer[rate_code] = spread
+                # store it
+                shared.t_Buffer[rate_code] = spread
 
             # append the curve and its (possible) interpolation parameters
             value.append(shared.t_Buffer[rate_code])
@@ -2417,15 +2343,15 @@ def make_index_cashflows(base_date, time_grid, position, cashflows, price_index,
 
         cashflows.set_resets(time_resets, time_scenario_offsets)
 
-        return cashflows, TensorResets(base_resets, base_scenario_offsets), TensorResets(final_resets,
-                                                                                         final_scenario_offsets)
+        return cashflows, TensorResets(base_resets, base_scenario_offsets), TensorResets(
+            final_resets, final_scenario_offsets)
 
     else:
         for eval_time in time_grid.time_grid[:, TIME_GRID_MTM]:
             actual_time = base_date + pd.DateOffset(days=eval_time)
 
-            locals()[price_index.param['Reference_Name']](actual_time, index_rate.param['Last_Period_Start'],
-                                                          time_resets, time_scenario_offsets)
+            locals()[price_index.param['Reference_Name']](
+                actual_time, index_rate.param['Last_Period_Start'], time_resets, time_scenario_offsets)
 
         cashflows.set_resets(time_resets, time_scenario_offsets)
 
@@ -2593,32 +2519,12 @@ def compress_no_compounding(cashflows, groupsize):
 
         approx_cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
         approx_cashflows.set_resets(all_resets, reset_scenario_offsets, isFloat=True)
-        logging.warning('Cashflows reduced from {} resets to {} resets'.format(cashflows.Resets.count(),
-                                                                               approx_cashflows.Resets.count()))
+        logging.warning('Cashflows reduced from {} resets to {} resets'.format(
+            cashflows.Resets.count(), approx_cashflows.Resets.count()))
         return approx_cashflows
     else:
         return cashflows
 
 
 if __name__ == '__main__':
-    import pickle
-
-    with open(r'C:\temp\cf.obj', 'rb') as f:
-        cf = pickle.load(f)
-    with open(r'C:\temp\tg.obj', 'rb') as f:
-        tg = pickle.load(f)
-
-
-    def make_df(cf):
-        resets = pd.DataFrame(cf.Resets.schedule,
-                              columns=['time', 'reset', 'scen', 'start', 'end', 'weight', 'value', 'Accrual'])
-        cashflows = pd.DataFrame(cf.schedule,
-                                 columns=['start', 'end', 'pay', 'year_frac', 'nominal', 'fixed', 'float_margin',
-                                          'fxreset', 'fxval'])
-        return cashflows, resets
-
-
-    cashflows, resets = make_df(cf)
-    com_cf = compress_no_compounding(cf, 3)
-
-    com_cashflows, com_resets = make_df(com_cf)
+    pass

@@ -111,6 +111,7 @@ def hw_calc_IJK(a, exp):
 
 class StochasticProcess(object):
     """Base class for all stochastic processes"""
+
     def __init__(self, factor, param):
         self.factor = factor
         self.param = param
@@ -395,6 +396,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
     def __init__(self, factor, param, implied_factor, clip=(1e-5, 3.0)):
         super(HullWhite2FactorImpliedInterestRateModel, self).__init__(factor, param)
         self.implied = implied_factor
+        self.cache = {}
         self.factor_tenor = None
         self.clip = clip
         self.grid_index = None
@@ -407,13 +409,13 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
 
     def reset_implied_factor(self, implied_factor):
         self.implied = implied_factor
-        self.factor_tenor = None
+        self.cache = {}
 
     def link_references(self, implied_tensor, implied_var, implied_ofs):
         """link market variables across different risk factors"""
         fx_implied_index = implied_ofs.get(utils.Factor('FxRate', self.factor.get_currency()))
         if fx_implied_index is not None:
-            FXImplied_vol_factor = utils.Factor('GBMAssetPriceTSModelParameters', self.factor.get_currency()+('Vol',))
+            FXImplied_vol_factor = utils.Factor('GBMAssetPriceTSModelParameters', self.factor.get_currency() + ('Vol',))
             # now set the Quanto_FX_Volatility to the same vol as the fx rate
             implied_tensor['Quanto_FX_Volatility'] = implied_var[fx_implied_index][FXImplied_vol_factor]
         else:
@@ -422,15 +424,13 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             if quantofx is not None:
                 implied_tensor['Quanto_FX_Volatility'] = implied_tensor['Sigma_1'].new_tensor(quantofx)
 
-    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-        # store randomnumber id's
-        self.z_offset = process_ofs
-        self.scenario_horizon = time_grid.scen_time_grid.size
-        time_grid_years = np.array([self.factor.get_day_count_accrual(
-            ref_date, t) for t in time_grid.scen_time_grid])
-
-        # get the factor's tenor points
-        if self.factor_tenor is None:
+    def read_cache(self, ref_date, time_grid, tensor, shared, process_ofs):
+        if not self.cache:
+            self.z_offset = process_ofs
+            self.scenario_horizon = time_grid.scen_time_grid.size
+            time_grid_years = np.array([self.factor.get_day_count_accrual(
+                ref_date, t) for t in time_grid.scen_time_grid])
+            # get the factor's tenor points
             self.factor_tenor = tensor.new(self.factor.get_tenor().reshape(-1, 1))
             # store the forward curve
             fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared)
@@ -439,6 +439,17 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             # get the quanto vol
             self.quantofx = tensor.new_tensor(
                 self.implied.param['Quanto_FX_Volatility'].array[:, 1], dtype=torch.float64)
+
+            # cache tensors/variables
+            self.cache['time_grid_years'] = time_grid_years
+            self.cache['fwd_curve'] = fwd_curve
+            self.cache['t'] = tensor.new(time_grid_years.reshape(-1, 1))
+
+        return self.cache['time_grid_years'], self.cache['fwd_curve'], self.cache['t']
+
+    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        # get the factor's tenor points
+        time_grid_years, fwd_curve, t = self.read_cache(ref_date, time_grid, tensor, shared, process_ofs)
 
         # calculate known functions
         alpha = [implied_tensor['Alpha_1'][0].type(torch.float64),
@@ -454,7 +465,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             hw_calc_H(alpha[i], torch.exp), shared, time_grid_years, vols_tenor[i], vols[i]) for i in range(2)]
         I = [[integrate_piecewise_linear(
             hw_calc_IJK(alpha[i], torch.exp), shared, time_grid_years, vols_tenor[i], vols[i], vols_tenor[j], vols[j])
-              for j in range(2)] for i in range(2)]
+            for j in range(2)] for i in range(2)]
         J = [[integrate_piecewise_linear(
             hw_calc_IJK(alpha[i] + alpha[j], torch.exp), shared,
             time_grid_years, vols_tenor[i], vols[i], vols_tenor[j], vols[j]) for j in range(2)] for i in range(2)]
@@ -477,12 +488,11 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             quantofxcorr = [0.0, 0.0]
             K = [corr.new_zeros(time_grid_years.size) for i in range(2)]
 
-        # now calculate the At
-        AtT = tensor.new_zeros([time_grid_years.size, self.factor_tenor.size()[0]])
+        # now calculate the AtT
+        AtT = 0.0
         BtT = [(1.0 - torch.exp(-alpha[i] * self.factor_tenor_full)) / alpha[i] for i in range(2)]
         CtT = []
         rho = [[1.0, corr], [corr, 1.0]]
-        t = tensor.new(time_grid_years.reshape(-1, 1))
 
         for i, j in itertools.product(range(2), range(2)):
             first_part = torch.exp(-(alpha[i] + alpha[j]) * t) * J[i][j].reshape(-1, 1)
@@ -536,28 +546,6 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
 
         self.drift = torch.unsqueeze(fwd_curve + 0.5 * AtT.type(shared.one.dtype), 2)
 
-    def calc_stoch_deflator(self, time_grid, curve_index, shared):
-        cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])
-        tensor = utils.TensorBlock(curve_index, [cached_tensor], [interpolation_params], time_grid)
-        self.deflation_drift = tensor.gather_weighted_curve(
-            shared, self.stoch_dt * utils.DAYS_IN_YEAR, multiply_by_time=False)
-
-    def calc_points(self, rate, points, time_grid, shared, multiply_by_time=True):
-        """ Much slower way to evaluate points at time t - but more accurate and memory efficient"""
-        t = self.drift.new(rate[utils.FACTOR_INDEX_Daycount](points))
-        BtT = [torch.unsqueeze((1.0 - torch.exp(-self.alpha[i] * t)), axis=2) / self.alpha[i] for i in range(2)]
-        drift_at_grid = utils.gather_scenario_interp(self.drift, time_grid, shared)
-        drift = drift_at_grid.interpolate_curve(rate, points, 0)
-        f1 = utils.gather_scenario_interp(self.f1, time_grid, shared, as_curve_tensor=False)
-        f2 = utils.gather_scenario_interp(self.f2, time_grid, shared, as_curve_tensor=False)
-        stoch_component = BtT[0] * f1 + BtT[1] * f2
-        fwd_curve = drift + stoch_component
-
-        if multiply_by_time:
-            return fwd_curve
-        else:
-            return fwd_curve / t
-
     def calc_factors(self, factor1, factor1and2):
         f1 = torch.unsqueeze(
             (torch.cumsum(factor1 * self.F1, axis=0) - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
@@ -571,24 +559,33 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         return 'HWImpliedInterestRate', [('F1',), ('F2',)]
 
     def generate(self, shared_mem):
+
+        def sim_curve(drift, Bt0, Bt1, f1, f2, factor_tenor):
+            stoch_component = Bt0 * f1 + Bt1 * f2
+            return (drift + stoch_component) / factor_tenor
+
         factor1, factor2 = self.calc_factors(
             shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
             shared_mem.t_random_numbers[self.z_offset:self.z_offset + 2, :self.scenario_horizon])
 
         # check if we need deflators
         if self.grid_index is not None:
-            # only generate curves for the given grid
-            f1 = factor1[self.grid_index]
-            f2 = factor2[self.grid_index]
-            drift = self.drift[self.grid_index]
-        else:
-            f1 = factor1
-            f2 = factor2
-            drift = self.drift
+            # if we have a grid index, then we want to simulate a reduced curve (just the first 6 months) over a
+            # finer time grid - this is useful for stochastic deflation - note that at least 4 tenor points need
+            # to be included to correctly handle interpolation
+            reduced_tenor_index = max(4, self.factor.tenors.searchsorted(0.5))
 
-        # generate curves based on
-        stoch_component = self.BtT[0] * f1 + self.BtT[1] * f2
-        return (drift + stoch_component) / self.factor_tenor
+            full_grid_curve = sim_curve(
+                self.drift[self.grid_index], self.BtT[0], self.BtT[1],
+                factor1[self.grid_index], factor2[self.grid_index], self.factor_tenor)
+
+            partial_grid_curve = sim_curve(
+                self.drift[:, :reduced_tenor_index], self.BtT[0][:reduced_tenor_index],
+                self.BtT[1][:reduced_tenor_index], factor1, factor2, self.factor_tenor[:reduced_tenor_index])
+
+            return full_grid_curve, partial_grid_curve
+        else:
+            return sim_curve(self.drift, self.BtT[0], self.BtT[1], factor1, factor2, self.factor_tenor)
 
 
 class HullWhite1FactorInterestRateModel(StochasticProcess):

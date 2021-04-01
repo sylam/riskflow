@@ -22,11 +22,14 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     python_requires='>=3.6',
-    install_requires=['numpy>=1.16', 'scipy>=1.3', 'pandas>=0.24', 'matplotlib>=2.0', 'tensorflow==1.14.0',
+    install_requires=['numpy>=1.16', 'scipy>=1.3', 'pandas>=0.24', 'matplotlib>=3.0', 'torch>=1.6.0',
                       'python-markdown-math>=0.6'],
+    extras_require={
+        'interactive': ['jupyter'],
+    },
     entry_points={
         'console_scripts': [
-            'RF_Bootstrap = riskflow.bootstrap:main',
+            'RF_Bootstrap = bootstrap:main',
             'RF_Batch = riskflow_batch:main',
         ]},
     classifiers=['Development Status :: 4 - Beta',
