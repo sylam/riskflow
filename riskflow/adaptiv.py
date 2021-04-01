@@ -501,6 +501,7 @@ class AdaptivContext(Context):
         where = Keyword("where").suppress()
 
         equals = Literal("=").suppress()
+        zero = Empty().setParseAction(lambda strg, loc, toks: 0.0)
         null = Empty().suppress()
         eol = LineEnd().suppress()
 
@@ -516,8 +517,8 @@ class AdaptivContext(Context):
         comma = Literal(",").suppress()
 
         ident = Word(alphas, alphas + nums + "_-")
-        desc = Word(alphas, alphas + nums + ", ()/%_-.").setName('Description')
-        arbstring = Word(alphas + nums + '_', alphas + nums + "/*_ :+-()%&#").setName('ArbString')
+        desc = Word(alphas+',', alphas+nums+", ()/%_-.").setName('Description')
+        arbstring = Word(alphas+nums+'_', alphas+nums+"/*_ :+-()%&#$").setName('ArbString')
         namedId = Group(delimitedList(arbstring, delim='.', combine=False)).setName('namedId').setParseAction(pushName)
         integer = (Word("+-" + nums, nums) + ~decimal).setName('int').setParseAction(pushInt)
         fnumber = Combine(Word("+-" + nums, nums) + Optional(decimal + Optional(Word(nums))) + Optional(
@@ -544,7 +545,7 @@ class AdaptivContext(Context):
         obj = Forward()
         chain = (ident + equals + obj).setParseAction(pushChain)
         listofstf = delimitedList(
-            lsqpar + Group(delimitedList(date | percentage | period | fnumber | namedId)) + rsqpar).setParseAction(
+            lsqpar + Group(delimitedList(date | percentage | period | fnumber | namedId | zero)) + rsqpar).setParseAction(
             pushList)
 
         curve = (lsqpar + Optional(delimitedList(integer | fnumber | ident) + comma) + Group(
