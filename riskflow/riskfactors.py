@@ -25,6 +25,12 @@ from . import utils
 from collections import OrderedDict
 from scipy.interpolate import RectBivariateSpline
 
+# map the names of various factor interpolations to something simpler
+factor_interp_map = {
+    'CubicSplineCurveInterpolation': 'Hermite',
+    'LinearInterFlatExtrapCurveGetValue': 'Linear',
+    'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT'
+}
 
 class Factor0D(object):
     """Represents an instantaneous Rate (0D) risk factor"""
@@ -956,9 +962,15 @@ class ForwardPriceVol(Factor3D):
         return self.sorted_vol[:, :3]
 
 
-def construct_factor(factor, price_factors):
-    # return the default factor 
-    return globals().get(factor.type)(price_factors[utils.check_tuple_name(factor)])
+def construct_factor(factor, price_factors, factor_interp):
+    # now lookup the params of the factor
+    price_factor = price_factors[utils.check_tuple_name(factor)]
+    # check the interpolation on interest Rates - can add more methods/price factors as desired
+    if factor.type == 'InterestRate':
+        interp_method = factor_interp.search(factor, price_factor, True)
+        price_factor['Interpolation'] = factor_interp_map.get(interp_method, 'Linear')
+
+    return globals().get(factor.type)(price_factor)
 
 
 if __name__ == '__main__':

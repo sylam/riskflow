@@ -73,7 +73,7 @@ def get_grid_grammar():
     grid = delimitedList(Group(period + Optional(lpar + period + rpar)),
                          delim=' ').leaveWhitespace().setParseAction(push_date_grid)
 
-    return grid, period
+    return grid
 
 
 class ModelParams(object):
@@ -123,7 +123,6 @@ class ModelParams(object):
 
     def search(self, factor, actual_factor, ignore_subtype=False):
         """
-        :param ignore_subtype:
         :param factor: Riskfactor of type utils.Factor
         :param actual_factor: corresponding dictionary of parameters for the factor loaded from a marketdata context
         :return: the model associated with the factor (taking any overrides into account)
@@ -215,7 +214,7 @@ class Context(object):
 
         # make sure that there are no default calibration mappings
         self.calibration_process_map = {}
-        self.gridparser, self.periodparser = get_grid_grammar()
+        self.gridparser = get_grid_grammar()
 
     def parse_grid(self, run_date, max_date, grid, past_max_date=False):
         """
@@ -303,7 +302,7 @@ class Context(object):
 
         return {'present': model_factor, 'absent': remaining_factor}
 
-    def bootstrap(self):
+    def bootstrap(self, device):
         """
         Runs all the bootstrappers - this happens in one process with debugging on by default. For multiprocessing
         bootstrapping, call the construct_bootstrapper method directly
@@ -312,7 +311,7 @@ class Context(object):
         for bootstrapper_name, params in sorted(self.params['Bootstrapper Configuration'].items()):
             # need parsers here - but for now, can just use the name to know what to do
             try:
-                bootstrapper = construct_bootstrapper(bootstrapper_name, params)
+                bootstrapper = construct_bootstrapper(bootstrapper_name, params, device)
             except:
                 logging.warning('Cannot execute Bootstrapper for {0} - skipping'.format(bootstrapper_name))
                 continue
@@ -644,18 +643,9 @@ class Context(object):
                 dependent_factor_tenors.setdefault(k, set()).update(v)
             # now get the last tenor for each factor
             dependent_factors = {k: max(dependent_factor_tenors.get(k, reset_dates)) for k in sorted_factors}
-            # interpolation mapping lookups
-            interp_map = {'CubicSplineCurveInterpolation': 'Hermite',
-                          'LinearInterFlatExtrapCurveGetValue': 'Linear',
-                          'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT'}
+
             # now lookup the processes
             for factor in sorted_factors:
-                # check the interpolation on interest Rates
-                if factor.type == 'InterestRate':
-                    price_factor = self.params['Price Factors'].get(utils.check_tuple_name(factor), {})
-                    interp_method = self.params['Price Factor Interpolation'].search(factor, price_factor, True)
-                    price_factor['Interpolation'] = interp_map[interp_method]
-                # check the stochastic process
                 stoch_proc = self.params['Model Configuration'].search(factor, self.params['Price Factors'].get(
                     utils.check_tuple_name(factor), {}))
                 # might need implied parameters
@@ -738,62 +728,6 @@ class Context(object):
 
             for col in self.archive.columns:
                 self.archive_columns.setdefault(col.split(',')[0], []).append(col)
-
-    def parse_arena_json(self, filename):
-
-        def as_internal(dct):
-            if '.Curve' in dct:
-                return utils.Curve(dct['.Curve']['meta'], dct['.Curve']['data'])
-            elif '.Percent' in dct:
-                return utils.Percent(dct['.Percent'])
-            elif '.Deal' in dct:
-                return construct_instrument(dct['.Deal'], self.params['Valuation Configuration'])
-            elif '.Basis' in dct:
-                return utils.Basis(dct['.Basis'])
-            elif '.Descriptor' in dct:
-                return utils.Descriptor(dct['.Descriptor'])
-            elif '.DateList' in dct:
-                return utils.DateList(OrderedDict([(Timestamp(date), val) for date, val in dct['.DateList']]))
-            elif '.DateEqualList' in dct:
-                return utils.DateEqualList([[Timestamp(values[0])] + values[1:] for values in dct['.DateEqualList']])
-            elif '.CreditSupportList' in dct:
-                return utils.CreditSupportList(dct['.CreditSupportList'])
-            elif '.DateOffset' in dct and '.Offset' in dct:
-                return [self.periodparser.parseString(dct['.DateOffset'])[0],
-                        self.periodparser.parseString(dct['.Offset'])[0]]
-            elif '.DateOffset' in dct:
-                return self.periodparser.parseString(dct['.DateOffset'])[0]
-            elif '.Grid' in dct:
-                return utils.Offsets([(x if isinstance(x, list) else [x]) for x in dct['.Grid']])
-            elif '.Timestamp' in dct:
-                return Timestamp(dct['.Timestamp'])
-            elif '.ModelParams' in dct:
-                return ModelParams((dct['.ModelParams']['modeldefaults'], dct['.ModelParams']['modelfilters']))
-            return dct
-
-        with open(filename, 'rt') as f:
-            data = json.load(f, object_hook=as_internal)
-
-        if 'MergeMarketData' in data['Calc']:
-            market_data = data['Calc']['MergeMarketData']
-
-            # update the marketdata file - if necessary, load and cache the marketdata file
-            # stored here - market_data['MarketDataFile'] - TODO
-
-            for section, section_data in market_data['ExplicitMarketData'].items():
-                self.params[section].update(section_data)
-            self.version = ['JSONVersion', '22.05.30']
-
-        if 'Deals' in data['Calc']:
-            self.deals = {'Attributes': {
-                'Tag_Titles': data['Calc']['Deals']['Tag_Titles'],
-                'Reference': data['Calc']['Deals']['Reference']}}
-            self.deals.update({'Deals': data['Calc']['Deals']['Deals']})
-            self.deals.update({'Calculation': data['Calc']['Calculation']})
-
-        if 'CalendDataFile' in data['Calc']:
-            # parse calendar file
-            self.parse_calendar_file(data['Calc']['CalendDataFile'])
 
     def write_marketdata_json(self, json_filename):
         # backup old data

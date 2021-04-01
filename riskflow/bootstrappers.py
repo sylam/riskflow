@@ -44,12 +44,13 @@ date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwd
 
 class RiskNeutralInterestRate_State(utils.Calculation_State):
     def __init__(self, batch_size, device, dtype, nomodel='Constant'):
-        super(RiskNeutralInterestRate_State, self).__init__(None, None, device, dtype, nomodel)
+        super(RiskNeutralInterestRate_State, self).__init__(
+            None, torch.ones([1, 1], dtype=dtype, device=device), None, nomodel)
         # these are tensors
         self.t_PreCalc = {}
         self.t_random_batch = None
         self.batch_index = 0
-        self.t_Scenario_Buffer = [None]
+        self.t_Scenario_Buffer = None
         # these are shared parameter states
         self.simulation_batch = batch_size
 
@@ -67,10 +68,10 @@ class RiskNeutralInterestRate_State(utils.Calculation_State):
                 self.sobol = torch.quasirandom.SobolEngine(
                     dimension=time_grid.time_grid_years.size * numfactors, scramble=True, seed=1234)
                 sample = torch.distributions.Normal(0, 1).icdf(
-                    self.sobol.fast_forward(3000).draw(self.simulation_batch * num_batches)).reshape(
+                    self.sobol.draw(self.simulation_batch * num_batches)).reshape(
                     num_batches, self.simulation_batch, -1)
                 self.t_random_batch = sample.transpose(1, 2).reshape(
-                    num_batches, numfactors, -1, self.simulation_batch).to(self.device)
+                    num_batches, numfactors, -1, self.simulation_batch).to(self.one.device)
             else:
                 # this is old - fix TODO!
                 self.t_random_batch = normalize(norm.ppf(hdsobol.gen_sobol_vectors(
@@ -228,7 +229,7 @@ class InterestRateJacobian(object):
         self.param = param
         self.batch_size = 1
 
-    def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
+    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
 
         def fwd_gradients(ys, xs, d_xs):
             """ Forward-mode pushforward analogous to the pullback defined by tf.gradients.
@@ -255,7 +256,7 @@ class InterestRateJacobian(object):
                     # this shouldn't fail - if it does, need to log it and move on
                     try:
                         ir_factor = utils.Factor('InterestRate', rate[1:])
-                        ir_curve = riskfactors.construct_factor(ir_factor, price_factors)
+                        ir_curve = riskfactors.construct_factor(ir_factor, price_factors, factor_interp)
                     except Exception:
                         logging.warning('Unable to calculate the Jacobian for {0} - skipping'.format(market_price))
                         continue
@@ -335,8 +336,6 @@ class InterestRateJacobian(object):
                 price_factors[utils.check_tuple_name(price_param)] = jac
 
 
-# GBMAssetPriceTSModelParameters
-# GBMTSImpliedParameters
 class GBMAssetPriceTSModelParameters(object):
     documentation = (
         'FX and Equity',
@@ -365,22 +364,21 @@ class GBMAssetPriceTSModelParameters(object):
         self.prec = dtype
         self.param = param
 
-    def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
+    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
         '''
         Checks for Declining variance in the ATM vols of the relevant price factor and corrects accordingly.
         '''
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
             market_factor = utils.Factor(rate[0], rate[1:])
-            # GBMAssetPriceTSModelPrices
-            # GBMTSModelPrices
+
             if market_factor.type == 'GBMAssetPriceTSModelPrices':
                 # get the vol surface
                 vol_factor = utils.Factor('FXVol', utils.check_rate_name(
                     implied_params['instrument']['Asset_Price_Volatility']))
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
-                    fxvol = riskfactors.construct_factor(vol_factor, price_factors)
+                    fxvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
                 except Exception:
                     logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
                     continue
@@ -432,7 +430,7 @@ class RiskNeutralInterestRateModel(object):
     def __init__(self, param, device, dtype):
         self.param = param
         self.num_batches = 1
-        self.batch_size = 512 * 10
+        self.batch_size = 8192
         self.device = device
         self.prec = dtype
         # set the global precision - not ideal
@@ -453,14 +451,14 @@ class RiskNeutralInterestRateModel(object):
             for batch_index in range(self.num_batches):
                 # load up the batch
                 shared_mem.batch_index = batch_index
-                # simulate the price factor - only need the curve at the mtm time points
-                shared_mem.t_Scenario_Buffer[0] = process.generate(shared_mem)
+                # simulate the price factor - only need the full curve at the mtm time points
+                shared_mem.t_Scenario_Buffer = process.generate(shared_mem)
                 # get the discount factors
                 Dfs = utils.calc_time_grid_curve_rate(
-                    curve_index, time_grid.calc_time_grid(time_grid.scen_time_grid[:-1]),
-                    shared_mem, delta_scen_t, multiply_by_time=True)
+                    curve_index_reduced, time_grid.calc_time_grid(time_grid.scen_time_grid[:-1]),
+                    shared_mem)
                 # get the index in the deflation factor just prior to the given grid
-                deflation = Dfs.reduce_deflate(time_grid.mtm_time_grid, shared_mem)
+                deflation = Dfs.reduce_deflate(delta_scen_t, time_grid.mtm_time_grid, shared_mem)
                 # go over the instrument definitions and build the calibration
                 for swaption_name, market_data in market_swaps.items():
                     expiry = market_data.deal_data.Time_dep.mtm_time_grid[
@@ -482,8 +480,10 @@ class RiskNeutralInterestRateModel(object):
 
         # calculate a reverse lookup for the tenors and store the daycount code
         all_tenors = utils.update_tenors(base_date, {ir_factor: process})
-        # calculate the curve index - need to clean this up - TODO!!!
+        # calculate the curve index
         curve_index = [instruments.calc_factor_index(ir_factor, {}, {ir_factor: 0}, all_tenors)]
+        # calculate the reduced tenor curve index - note it's the same as above but in the next scenario index (1)
+        curve_index_reduced = [instruments.calc_factor_index(ir_factor, {}, {ir_factor: 1}, all_tenors)]
         # calc the market swap rates and instrument_definitions    
         market_swaps, benchmarks = create_market_swaps(
             base_date, time_grid, curve_index, vol_surface, process.factor,
@@ -506,7 +506,7 @@ class RiskNeutralInterestRateModel(object):
         else:
             return implied_var, loss, market_swaps, benchmarks
 
-    def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
+    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
         base_date = sys_params['Base_Date']
         base_currency = sys_params['Base_Currency']
 
@@ -521,8 +521,8 @@ class RiskNeutralInterestRateModel(object):
 
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
-                    swaptionvol = riskfactors.construct_factor(vol_factor, price_factors)
-                    ir_curve = riskfactors.construct_factor(ir_factor, price_factors)
+                    swaptionvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
+                    ir_curve = riskfactors.construct_factor(ir_factor, price_factors, factor_interp)
                 except KeyError as k:
                     logging.warning('Missing price factor {} - Unable to bootstrap {}'.format(k.args, market_price))
                     continue
@@ -580,7 +580,7 @@ class RiskNeutralInterestRateModel(object):
                     x0 = result['x'] if result is not None else optim[1]
                     if optim[0] == 'basin':
                         result = scipy.optimize.basinhopping(
-                            optim[2], x0=x0, take_step=optim[3], accept_test=optim[4], T=5.0,
+                            optim[2], x0=x0, take_step=optim[3], accept_test=optim[4], T=5.0, niter=50,
                             minimizer_kwargs={"method": "L-BFGS-B", "jac": True, "bounds": optim[5]})
                         batch_loss = float(optim[2](result['x'])[0])
                     elif optim[0] == 'leastsq':
