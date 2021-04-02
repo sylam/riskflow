@@ -121,19 +121,21 @@ class ModelParams(object):
         add_factor = self.implied_models.get(model)
         return utils.Factor(add_factor, factor.name) if add_factor else None
 
-    def search(self, factor, actual_factor):
+    def search(self, factor, actual_factor, ignore_subtype=False):
         """
         :param factor: Riskfactor of type utils.Factor
         :param actual_factor: corresponding dictionary of parameters for the factor loaded from a marketdata context
         :return: the model associated with the factor (taking any overrides into account)
         """
-        price_factor_type = factor.type + self.valid_subtype.get(actual_factor.get('Sub_Type'), '')
+        price_factor_type = factor.type + ('' if ignore_subtype else self.valid_subtype.get(
+            actual_factor.get('Sub_Type'), ''))
+
         # look for a filter rule
         rule = self.modelfilters.get(price_factor_type)
         if rule:
-            factor_attribs = dict(actual_factor, **{'ID': '.'.join(factor.name)})
+            factor_attribs = dict({k.lower(): v for k, v in actual_factor.items()}, **{'id': '.'.join(factor.name)})
             for (attrib, value), model in rule:
-                if factor_attribs.get(attrib.strip()) == value.strip():
+                if factor_attribs.get(attrib.strip().lower()) == value.strip():
                     return model
         return self.modeldefaults.get(price_factor_type)
 
@@ -202,6 +204,7 @@ class Context(object):
                  },
             'Model Configuration': ModelParams(),
             'Price Factors': {},
+            'Price Factor Interpolation': ModelParams(),
             'Price Models': {},
             'Correlations': {},
             'Market Prices': {},
@@ -317,6 +320,7 @@ class Context(object):
             bootstrapper.bootstrap(self.params['System Parameters'],
                                    self.params['Price Models'],
                                    self.params['Price Factors'],
+                                   self.params['Price Factor Interpolation'],
                                    self.params['Market Prices'],
                                    self.holidays,
                                    debug=self)

@@ -575,6 +575,11 @@ def non_zero(tensor):
         return tensor
 
 
+def calc_hermite_curve(t_a, g, c, curve_t0, curve_t1):
+    one_minus_ta = (1.0 - t_a)
+    return curve_t0 * one_minus_ta + t_a * (curve_t1 + one_minus_ta * (g + t_a * c))
+
+
 def interpolate_curve_indices(all_tenor_points, curve_component, time_factor=1.0):
     # will only work if all_tenor_points is 2 dimensional
     tenor, delta, curvetype = curve_component[FACTOR_INDEX_Tenor_Index][:3]
@@ -1490,7 +1495,7 @@ def calc_time_grid_spot_rate(rate, time_grid, shared):
     return shared.t_Buffer[key_code]
 
 
-def calc_curve_forwards(factor, tensor, time_grid, shared, ref_date, mul_time=True):
+def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
     factor_tenor = factor.get_tenor()
 
     tnr, tnr_d = factor_tenor, np.hstack((np.diff(factor_tenor), [1]))
@@ -1498,60 +1503,48 @@ def calc_curve_forwards(factor, tensor, time_grid, shared, ref_date, mul_time=Tr
 
     # calculate the tenors and indices used for lookups
     ten_t1 = np.array([np.clip(
-        np.searchsorted(factor_tenor,
-                        factor.get_day_count_accrual(ref_date, t),
-                        side='right') - 1,
-        0, max_dim) for t in time_grid.scen_time_grid])
+        np.searchsorted(factor_tenor, t, side='right') - 1, 0, max_dim) for t in time_grid_years])
 
     ten_t = np.array([np.clip(
-        np.searchsorted(factor_tenor,
-                        factor_tenor + factor.get_day_count_accrual(ref_date, t),
-                        side='right') - 1,
-        0, max_dim) for t in time_grid.scen_time_grid])
+        np.searchsorted(factor_tenor, factor_tenor + t, side='right') - 1, 0, max_dim) for t in time_grid_years])
 
     ten_t1_next = np.clip(ten_t1 + 1, 0, max_dim)
     ten_t_next = np.clip(ten_t + 1, 0, max_dim)
 
-    ten_tv = np.clip(np.array(
-        [factor_tenor + factor.get_day_count_accrual(ref_date, t)
-         for t in time_grid.scen_time_grid])
-        , 0, factor_tenor.max())
+    ten_tv = np.clip(np.array([factor_tenor + t for t in time_grid_years]), 0, factor_tenor.max())
 
     alpha_1 = (ten_tv - tnr[ten_t]) / tnr_d[ten_t]
-    alpha_2 = (time_grid.time_grid_years - tnr[ten_t1]).clip(0, np.inf) / tnr_d[ten_t1]
+    alpha_2 = (time_grid_years - tnr[ten_t1]).clip(0, np.inf) / tnr_d[ten_t1]
 
     if factor.interpolation[0].startswith('Hermite'):
         t = tnr.reshape(1, -1, 1)
+        time_tenor_tenor = time_grid_years.reshape(-1, 1) + tnr
+        norm = (time_tenor_tenor if mul_time else 1.0, time_grid_years if mul_time else 1.0)
+
         if factor.interpolation[0] == 'HermiteRT':
             mod = tf.reshape(tensor, [1, -1, 1]) * t
-            norm = None
+            norm = (norm[0] / time_tenor_tenor.clip(tnr.min(), tnr.max()),
+                    norm[1] / time_grid_years.clip(tnr.min(), tnr.max()))
         else:
             mod = tf.reshape(tensor, [1, -1, 1])
-            norm = (ten_tv, time_grid.time_grid_years) if mul_time else (1.0, 1.0)
 
         g, c = [tf.squeeze(x) for x in hermite_interpolation_tensor(t, mod)]
         sq = tf.squeeze(mod)
 
-        val = tf.gather(sq, ten_t) * (1.0 - alpha_1) + tf.gather(sq, ten_t_next) * alpha_1 + \
-              alpha_1 * (1.0 - alpha_1) * tf.gather(g, ten_t) + \
-              alpha_1 * alpha_1 * (1.0 - alpha_1) * tf.gather(c, ten_t)
+        val = calc_hermite_curve(
+            alpha_1, tf.gather(g, ten_t), tf.gather(c, ten_t), tf.gather(sq, ten_t), tf.gather(sq, ten_t_next))
+        val_t = calc_hermite_curve(
+            alpha_2, tf.gather(g, ten_t1), tf.gather(c, ten_t1), tf.gather(sq, ten_t1), tf.gather(sq, ten_t1_next))
 
-        val_t = tf.gather(sq, ten_t1) * (1.0 - alpha_2) + tf.gather(sq, ten_t1_next) * alpha_2 + \
-                alpha_2 * (1.0 - alpha_2) * tf.gather(g, ten_t1) + \
-                alpha_2 * alpha_2 * (1.0 - alpha_2) * tf.gather(c, ten_t1)
-
-        if norm is None:
-            return val - tf.reshape(val_t, [-1, 1])
-        else:
-            return val * norm[0] - tf.reshape(val_t * norm[1], [-1, 1])
+        return val * norm[0] - tf.reshape(val_t * norm[1], [-1, 1])
     else:
         fwd1 = alpha_1 * tf.gather(tensor, ten_t_next) + (1 - alpha_1) * tf.gather(tensor, ten_t)
         fwd2 = alpha_2 * tf.gather(tensor, ten_t1_next) + (1 - alpha_2) * tf.gather(tensor, ten_t1)
 
-        norm = (time_grid.time_grid_years.reshape(-1, 1) + tnr,
-                time_grid.time_grid_years) if mul_time else (1.0, 1.0)
-
-        return fwd1 * norm[0] - tf.reshape(fwd2 * norm[1], (-1, 1))
+        if mul_time:
+            return fwd1 * time_tenor_tenor - (fwd2 * time_grid_years).reshape(-1, 1)
+        else:
+            return fwd1 - fwd2.reshape(-1, 1)
 
 
 def PCA(matrix, num_redim=0):
