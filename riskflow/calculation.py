@@ -587,11 +587,15 @@ class Credit_Monte_Carlo(Calculation):
         self.stoch_factors.clear()
 
         for price_model, price_factor in stochastic_factors.items():
-            factor_obj = construct_factor(price_factor, self.config.params['Price Factors'])
+            factor_obj = construct_factor(
+                price_factor, self.config.params['Price Factors'],
+                self.config.params['Price Factor Interpolation'])
             implied_factor = implied_factors.get(price_model)
             try:
                 if implied_factor:
-                    implied_obj = construct_factor(implied_factor, self.config.params['Price Factors'])
+                    implied_obj = construct_factor(
+                        implied_factor, self.config.params['Price Factors'],
+                        self.config.params['Price Factor Interpolation'])
                     self.implied_factors[implied_factor] = implied_obj
                 else:
                     implied_obj = None
@@ -603,7 +607,9 @@ class Credit_Monte_Carlo(Calculation):
                 proxy_factor = utils.Factor(implied_factor.type, ('EUR-MASTER',))
                 self.config.params['Price Factors'][utils.check_tuple_name(implied_factor)] = \
                     self.config.params['Price Factors'][utils.check_tuple_name(proxy_factor)]
-                implied_obj = construct_factor(implied_factor, self.config.params['Price Factors'])
+                implied_obj = construct_factor(
+                    implied_factor, self.config.params['Price Factors'],
+                    self.config.params['Price Factor Interpolation'])
 
             self.stoch_factors[price_factor] = construct_process(price_model.type,
                                                                  factor_obj,
@@ -615,7 +621,9 @@ class Credit_Monte_Carlo(Calculation):
         for price_factor in set(dependent_factors).difference(stochastic_factors.values()):
             try:
                 self.static_factors.setdefault(
-                    price_factor, construct_factor(price_factor, self.config.params['Price Factors']))
+                    price_factor, construct_factor(
+                        price_factor, self.config.params['Price Factors'],
+                        self.config.params['Price Factor Interpolation']))
             except KeyError as e:
                 logging.warning('Price Factor {0} missing in market data file - skipping'.format(e.args))
 
@@ -1105,7 +1113,9 @@ class Credit_Monte_Carlo(Calculation):
                             ir_curve = self.stoch_factors[utils.Factor('InterestRate', ir_factor.name)].factor
                             var_name = 'Stochastic_Input/{0}:0'.format(utils.check_tuple_name(ir_factor))
                             try:
-                                jac = construct_factor(jacobian_factor, self.config.params['Price Factors'])
+                                jac = construct_factor(
+                                    jacobian_factor, self.config.params['Price Factors'],
+                                    self.config.params['Price Factor Interpolation'])
                                 jac.update(ir_curve)
                                 self.jacobians[var_name] = jac.current_value()
                                 logging.info('jacobian present for {0} - will attempt inverse bootstrap'.format(
@@ -1179,10 +1189,10 @@ class Base_Revaluation(Calculation):
         self.static_factors = OrderedDict()
         for price_factor in dependent_factors:
             try:
-                self.static_factors.setdefault(price_factor,
-                                               construct_factor(
-                                                   price_factor,
-                                                   self.config.params['Price Factors']))
+                self.static_factors.setdefault(
+                    price_factor, construct_factor(
+                        price_factor, self.config.params['Price Factors'],
+                        self.config.params['Price Factor Interpolation']))
             except KeyError as e:
                 logging.warning('Price Factor {0} missing in market data file - skipping'.format(e.args))
 

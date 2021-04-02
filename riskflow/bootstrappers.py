@@ -503,7 +503,7 @@ class InterestRateJacobian(object):
         self.param = param
         self.batch_size = 1
 
-    def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
+    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
 
         def fwd_gradients(ys, xs, d_xs):
             """ Forward-mode pushforward analogous to the pullback defined by tf.gradients.
@@ -530,7 +530,7 @@ class InterestRateJacobian(object):
                     # this shouldn't fail - if it does, need to log it and move on
                     try:
                         ir_factor = utils.Factor('InterestRate', rate[1:])
-                        ir_curve = riskfactors.construct_factor(ir_factor, price_factors)
+                        ir_curve = riskfactors.construct_factor(ir_factor, price_factors, factor_interp)
                     except Exception:
                         logging.warning('Unable to calculate the Jacobian for {0} - skipping'.format(market_price))
                         continue
@@ -637,7 +637,7 @@ class GBMAssetPriceTSModelParameters(object):
         self.prec = prec
         self.param = param
 
-    def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
+    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
         '''
         Checks for Declining variance in the ATM vols of the relevant price factor and corrects accordingly.
         '''
@@ -653,7 +653,7 @@ class GBMAssetPriceTSModelParameters(object):
 
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
-                    fxvol = riskfactors.construct_factor(vol_factor, price_factors)
+                    fxvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
                 except Exception:
                     logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
                     continue
@@ -790,7 +790,7 @@ class RiskNeutralInterestRateModel(object):
                     swap.price / calibrated_swaptions[k] - 1.0)) for k, swap in market_swaps.items()}
             return implied_var, error, calibrated_swaptions, market_swaps, benchmarks
 
-    def bootstrap(self, sys_params, price_models, price_factors, market_prices, calendars, debug=None):
+    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
         base_date = sys_params['Base_Date']
         base_currency = sys_params['Base_Currency']
 
@@ -811,8 +811,8 @@ class RiskNeutralInterestRateModel(object):
 
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
-                    swaptionvol = riskfactors.construct_factor(vol_factor, price_factors)
-                    ir_curve = riskfactors.construct_factor(ir_factor, price_factors)
+                    swaptionvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
+                    ir_curve = riskfactors.construct_factor(ir_factor, price_factors, factor_interp)
                     swaptionvol.set_premiums(ATM_Premiums, ir_curve.get_currency())
                 except KeyError as k:
                     logging.warning('Missing price factor {} - Unable to bootstrap {}'.format(k.args, market_price))
