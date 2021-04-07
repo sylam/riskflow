@@ -249,7 +249,8 @@ def main():
                      for c, x in master_curve_list.items()}
         # get all ir_base curve names
         ir_curves = {curve_name: construct_factor(
-            utils.Factor('InterestRate', (curve_name,)), context.params['Price Factors']) for curve_name in np.unique(
+            utils.Factor('InterestRate', (curve_name,)),
+            context.params['Price Factors'], context.params['Price Factor Interpolation']) for curve_name in np.unique(
             [x.split('.')[1] for x in context.params['Price Factors'].keys() if x.startswith('InterestRate.')])}
 
         for ir_curve_name, ir_curve in ir_curves.items():

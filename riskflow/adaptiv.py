@@ -166,8 +166,7 @@ class AdaptivContext(Context):
                  'Script_Base_Scenario_Multiplier': 1,
                  'Correlations_Healing_Method': 'Eigenvalue_Raising',
                  'Grouping_File': ''
-                 },
-            'Price Factor Interpolation': ModelParams(),
+                 }
         })
 
         # make sure that there are no default calibration mappings
@@ -402,7 +401,7 @@ class AdaptivContext(Context):
             return toks[0], entry
 
         def pushParam(strg, loc, toks):
-            entry = OrderedDict([('Valuation',toks[1])])
+            entry = OrderedDict([('Valuation', toks[1])])
             for k, v in toks[2:]:
                 entry[k] = v
             return toks[0], entry
@@ -484,6 +483,7 @@ class AdaptivContext(Context):
         e = CaselessLiteral("E")
         undef = Keyword("<undefined>")
         reference = Keyword("Reference")
+        counterparty = Keyword("Counterparty")
 
         # headings
         aa_format = Keyword("AnalyticsVersion")
@@ -501,6 +501,7 @@ class AdaptivContext(Context):
         where = Keyword("where").suppress()
 
         equals = Literal("=").suppress()
+        zero = Empty().setParseAction(lambda strg, loc, toks: 0.0)
         null = Empty().suppress()
         eol = LineEnd().suppress()
 
@@ -516,8 +517,8 @@ class AdaptivContext(Context):
         comma = Literal(",").suppress()
 
         ident = Word(alphas, alphas + nums + "_-")
-        desc = Word(alphas, alphas + nums + ", ()/%_-.").setName('Description')
-        arbstring = Word(alphas + nums + '_', alphas + nums + "/*_ :+-()%&#").setName('ArbString')
+        desc = Word(alphas+',', alphas+nums+", ()/%_-.").setName('Description')
+        arbstring = Word(alphas+nums+'_', alphas+nums+"/*_ :+-()%&#$").setName('ArbString')
         namedId = Group(delimitedList(arbstring, delim='.', combine=False)).setName('namedId').setParseAction(pushName)
         integer = (Word("+-" + nums, nums) + ~decimal).setName('int').setParseAction(pushInt)
         fnumber = Combine(Word("+-" + nums, nums) + Optional(decimal + Optional(Word(nums))) + Optional(
@@ -544,7 +545,7 @@ class AdaptivContext(Context):
         obj = Forward()
         chain = (ident + equals + obj).setParseAction(pushChain)
         listofstf = delimitedList(
-            lsqpar + Group(delimitedList(date | percentage | period | fnumber | namedId)) + rsqpar).setParseAction(
+            lsqpar + Group(delimitedList(date | percentage | period | fnumber | namedId | zero)) + rsqpar).setParseAction(
             pushList)
 
         curve = (lsqpar + Optional(delimitedList(integer | fnumber | ident) + comma) + Group(
@@ -552,7 +553,7 @@ class AdaptivContext(Context):
         tenors = (lsqpar + Group(delimitedList(period)) + rsqpar).setParseAction(pushOffset)
         grid = delimitedList(Group(period + Optional(lpar + period + rpar)),
                              delim=' ').leaveWhitespace().setParseAction(pushDateGrid)
-        assign = ((reference + equals + namedId) | (ident + equals + (
+        assign = (((reference | counterparty) + equals + namedId) | (ident + equals + (
                 chain | creditlist | datelistdel | datelist | date | grid | percentage | basis_pts | descriptor | fnumber | namedId | undef | curve | tenors | obj | null))).leaveWhitespace().setParseAction(
             pushIdent)
         obj << (lsqpar + (delimitedList(curve) | listofstf | delimitedList(

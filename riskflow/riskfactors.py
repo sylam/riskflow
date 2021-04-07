@@ -25,6 +25,12 @@ from . import utils
 from collections import OrderedDict
 from scipy.interpolate import RectBivariateSpline
 
+# map the names of various factor interpolations to something simpler
+factor_interp_map = {
+    'CubicSplineCurveInterpolation': 'Hermite',
+    'LinearInterFlatExtrapCurveGetValue': 'Linear',
+    'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT'
+}
 
 class Factor0D(object):
     """Represents an instantaneous Rate (0D) risk factor"""
@@ -88,10 +94,10 @@ class Factor1D(object):
 
     def check_interpolation(self):
         if self.param.get('Interpolation') == 'HermiteRT':
-            g, c = utils.hermite_interpolation(self.tenors, self.current_value() * self.tenors)
+            g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1] * self.tenors)
             return ('HermiteRT', g, c)
         elif self.param.get('Interpolation') == 'Hermite':
-            g, c = utils.hermite_interpolation(self.tenors, self.current_value())
+            g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1])
             return ('Hermite', g, c)
         else:
             return ('Linear',)
@@ -100,17 +106,18 @@ class Factor1D(object):
         """Returns the value of the rate at each tenor point (if set) else returns what's
         stored in the Curve parameter"""
         bumped_val = self.param['Curve'].array[:, 1] + self.delta
-        # get the tenors
-        tenors = (np.array(tenor_index) if tenor_index is not None else self.tenors) + offset
+        # get the tenors - make sure it's in range
+        tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
+            self.tenors.min(), self.tenors.max())
 
         if self.interpolation[0] != 'Linear':
-            index = np.clip(np.searchsorted(self.tenors, tenors, side='right') - 1, 0, self.tenors.size - 1)
+            index = np.searchsorted(self.tenors, tenors, side='right') - 1
             index_next = np.clip(index + 1, 0, self.tenors.size - 1)
             dt = np.clip(self.tenors[index_next] - self.tenors[index], 1 / 365.0, np.inf)
             m = np.clip((tenors - self.tenors[index]) / dt, 0.0, 1.0)
             g, c = self.interpolation[1:]
-            rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' \
-                else (bumped_val, 1.0)
+            rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' else (
+            bumped_val, 1.0)
             val = rate[index] * (1.0 - m) + m * rate[index_next] + m * (
                     1.0 - m) * g[index] + m * m * (1.0 - m) * c[index]
             return val / denom
@@ -297,7 +304,7 @@ class PriceIndex(Factor0D):
     def __init__(self, param):
         super(PriceIndex, self).__init__(param)
         # the start date for excel's date offset
-        self.start_date = pd.datetime(1899, 12, 30)
+        self.start_date = utils.excel_offset
         # the offset to the latest index value
         self.last_period = self.param['Last_Period_Start'] - self.start_date
         self.latest_index = np.where(self.param['Index'].array[:, 0] >= self.last_period.days)[0]
@@ -877,9 +884,15 @@ class ForwardPriceVol(Factor3D):
         return self.sorted_vol[:, :3]
 
 
-def construct_factor(factor, price_factors):
-    # return the default factor 
-    return globals().get(factor.type)(price_factors[utils.check_tuple_name(factor)])
+def construct_factor(factor, price_factors, factor_interp):
+    # now lookup the params of the factor
+    price_factor = price_factors[utils.check_tuple_name(factor)]
+    # check the interpolation on interest Rates - can add more methods/price factors as desired
+    if factor.type == 'InterestRate':
+        interp_method = factor_interp.search(factor, price_factor, True)
+        price_factor['Interpolation'] = factor_interp_map.get(interp_method, 'Linear')
+
+    return globals().get(factor.type)(price_factor)
 
 
 if __name__ == '__main__':
