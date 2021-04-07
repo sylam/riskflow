@@ -77,10 +77,11 @@ if __name__ == '__main__':
 
     folder = 'CVA'
     path = rf.getpath(['E:\\Data\\crstal\\{}'.format(folder),
+                       'N:\\Archive\\{}'.format(folder),
                        'G:\\Credit Quants\\CRSTAL\\{}'.format(folder),
                        'G:\\{}'.format(folder)])
 
-    rundate = '2020-03-06'
+    rundate = '2021-03-26'
 
     # bootstrap(path, rundate, reuse_cal=True)
 
@@ -89,16 +90,18 @@ if __name__ == '__main__':
         cx_new = rf.load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
 
         for factor in [x for x in cx_new.params['Price Factors'].keys()
-                       if x.startswith('HullWhite2FactorModelParameters')]:
+                       if x.startswith('HullWhite2FactorModelParameters') or
+                          x.startswith('GBMAssetPriceTSModelParameters')]:
             # override it
             cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
 
-        cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        cx.parse_json(os.path.join(path, rundate, 'CrB_Omnia_Group_ISDA.json'))
 
         if 1:
             calc, out, res = rf.run_cmc(cx, overrides={'Calc_Scenarios': 'No',
                                                        'Dynamic_Scenario_Dates': 'No',
-                                                       # 'Run_Date': '2020-03-09',
+                                                       'Run_Date': '2021-03-29',
                                                        # 'Tenor_Offset': -3/365.0,
                                                        # 'Time_grid':'1m 5m 1362d',
                                                        'Batch_Size': 64 * 4,
@@ -106,4 +109,4 @@ if __name__ == '__main__':
                                                        'CVA': {'Gradient': 'No', 'Hessian': 'No'}}, prec=np.float32)
 
         else:
-            calc, out = run_baseval(cx)
+            calc, out = rf.run_baseval(cx, overrides={'Run_Date': '2021-03-29'})
