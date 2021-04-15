@@ -22,6 +22,7 @@ __all__ = ['version_info', '__version__', '__author__', '__license__', 'makeflat
            'set_collateral', 'load_market_data', 'run_baseval', 'run_cmc']
 
 import os
+import torch
 import numpy as np
 import pandas as pd
 import collections.abc
@@ -100,10 +101,9 @@ def load_market_data(rundate, path, json_name='MarketData.json', cva_default=Tru
     return context
 
 
-def run_baseval(context, prec, device, overrides=None):
+def run_baseval(context, prec=torch.float64, overrides=None):
     """
     Runs a base valuation calculation on the provided context
-    :param device:
     :param prec:
     :param context: a Context object
     :param overrides: a dictionary of overrides to replace the context's  calculation parameters
@@ -113,6 +113,9 @@ def run_baseval(context, prec, device, overrides=None):
     calc_params = context.deals.get('Calculation',
                                     {'Base_Date': context.params['System Parameters']['Base_Date'],
                                      'Currency': 'ZAR'})
+
+    # check if the gpu is available
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     params_bv = {'calc_name': ('baseval',), 'Run_Date': rundate,
@@ -126,10 +129,9 @@ def run_baseval(context, prec, device, overrides=None):
     return calc, out
 
 
-def run_cmc(context, prec, device, overrides=None, CVA=False, FVA=False, CollVA=False):
+def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, CollVA=False):
     """
     Runs a credit monte carlo calculation on the provided context
-    :param device:
     :param context: a Context object
     :param overrides: a dictionary of overrides to replace the context's  calculation parameters
     :param prec: the numerical precision to use (default float32)
@@ -144,6 +146,9 @@ def run_cmc(context, prec, device, overrides=None, CVA=False, FVA=False, CollVA=
                                      'Base_Time_Grid': '0d 2d 1w(1w) 1m(1m) 3m(3m)',
                                      'Deflation_Interest_Rate': 'ZAR-SWAP',
                                      'Currency': 'ZAR'})
+
+    # check if the gpu is available
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     time_grid = str(calc_params['Base_Time_Grid'])
