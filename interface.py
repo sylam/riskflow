@@ -17,7 +17,6 @@
 ########################################################################
 
 import os
-import torch
 import logging
 import numpy as np
 import pandas as pd
@@ -108,25 +107,24 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+    os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
     import riskflow as rf
 
-    env = ''
+    env = 'UAT'
     paths = {}
     for folder in ['CVA', 'Arena', 'Debug', 'Upgrade']:
         paths[folder] = rf.getpath(
             [os.path.join('E:\\Data\\crstal\\CVA', folder),
              os.path.join('G:\\Credit Quants\\CRSTAL', folder),
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
+             # os.path.join('N:\\Archive', folder),
              os.path.join('G:\\', folder)])
 
     path = paths['CVA']
 
     rundate = '2021-03-17'
     # rundate = '2021-03-24'
-
-    gpudevice = torch.device("cuda:0")
-    cpudevice = torch.device("cpu")
 
     # bootstrap(path, rundate, device=gpudevice, reuse_cal=True)
 
@@ -140,7 +138,8 @@ if __name__ == '__main__':
         # cx.params['Price Factors'].update(cx_arena.params['Price Factors'])
         # cx = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
         try:
-            cx_new = rf.load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
+            cx_new = rf.load_market_data(
+                rundate, path, json_name=os.path.join(env, 'CVAMarketData_Calibrated_New.json'))
 
             for factor in [x for x in cx_new.params['Price Factors'].keys() if x.startswith(
                     'HullWhite2FactorModelParameters') or x.startswith('GBMAssetPriceTSModelParameters')]:
@@ -163,7 +162,7 @@ if __name__ == '__main__':
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Eskom_Hld_SOC_Ltd_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_RCL_Foods_Treasury_NonISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
-        cx.parse_json(os.path.join(path, rundate, 'CrB_Kathu_Solar_Park_ISDA.json'))
+        cx.parse_json(os.path.join(path, rundate, os.path.join(env, 'CrB_Kathu_Solar_Park_ISDA.json')))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Sanlam_Developing_Markets_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_The_Core_Computer_Business_Limited_ISDA.json'))
 
@@ -208,6 +207,9 @@ if __name__ == '__main__':
         #         'Haircut_Posted': 0.0,
         #         'Amount': 1.0}]}
 
+        # turn off interpolation
+        # cx.params['Price Factor Interpolation'].modelfilters = {}
+
         if 1:
             # grab the netting set
             ns = cx.deals['Deals']['Children'][0]['instrument']
@@ -236,8 +238,7 @@ if __name__ == '__main__':
             else:
                 overrides['Dynamic_Scenario_Dates'] = 'No'
 
-            calc, out, res = rf.run_cmc(cx, prec=torch.float32, device=gpudevice,
-                                        overrides=overrides, CVA=True, CollVA=False, FVA=False)
+            calc, out, res = rf.run_cmc(cx, overrides=overrides, CVA=True, CollVA=False, FVA=False)
 
             # factors_to_add = {}
             # for factor in calc.stoch_factors.keys():
@@ -258,5 +259,4 @@ if __name__ == '__main__':
             #                       ('InterestRate', ('ZAR-SWAP',)), ('FxRate', ('ZAR',)))
 
         else:
-            calc, out = rf.run_baseval(cx, prec=torch.float64, device=gpudevice,
-                                       overrides={'Currency': 'ZAR', 'Greeks': 'No'})
+            calc, out = rf.run_baseval(cx, overrides={'Currency': 'ZAR', 'Greeks': 'No'})
