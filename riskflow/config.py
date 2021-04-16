@@ -123,6 +123,7 @@ class ModelParams(object):
 
     def search(self, factor, actual_factor, ignore_subtype=False):
         """
+        :param ignore_subtype:
         :param factor: Riskfactor of type utils.Factor
         :param actual_factor: corresponding dictionary of parameters for the factor loaded from a marketdata context
         :return: the model associated with the factor (taking any overrides into account)
@@ -302,7 +303,7 @@ class Context(object):
 
         return {'present': model_factor, 'absent': remaining_factor}
 
-    def bootstrap(self, device):
+    def bootstrap(self):
         """
         Runs all the bootstrappers - this happens in one process with debugging on by default. For multiprocessing
         bootstrapping, call the construct_bootstrapper method directly
@@ -311,7 +312,7 @@ class Context(object):
         for bootstrapper_name, params in sorted(self.params['Bootstrapper Configuration'].items()):
             # need parsers here - but for now, can just use the name to know what to do
             try:
-                bootstrapper = construct_bootstrapper(bootstrapper_name, params, device)
+                bootstrapper = construct_bootstrapper(bootstrapper_name, params)
             except:
                 logging.warning('Cannot execute Bootstrapper for {0} - skipping'.format(bootstrapper_name))
                 continue

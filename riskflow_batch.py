@@ -39,14 +39,14 @@ class JOB(object):
         self.stats = stats
         self.logger = log
         self.params = {'Calc_Scenarios': 'No',
-                     'Run_Date': rundate,
-                     'Time_grid': '0d 2d 1w(1w) 3m(1m)',
-                     'Random_Seed': 1254,
-                     'Generate_Cashflows': 'No',
-                     'Currency': 'ZAR',
-                     'Deflation_Interest_Rate': 'ZAR-SWAP',
-                     'CollVA': {'Gradient': 'No'},
-                     'CVA': {'Gradient': 'No', 'Hessian': 'No'}}
+                       'Run_Date': rundate,
+                       'Time_grid': '0d 2d 1w(1w) 3m(1m)',
+                       'Random_Seed': 1254,
+                       'Generate_Cashflows': 'No',
+                       'Currency': 'ZAR',
+                       'Deflation_Interest_Rate': 'ZAR-SWAP',
+                       'CollVA': {'Gradient': 'No'},
+                       'CVA': {'Gradient': 'No', 'Hessian': 'No'}}
         # load trade
         self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
         # get the netting set
@@ -99,14 +99,14 @@ class CVA_GRAD(JOB):
         else:
             self.logger(self.netting_set, 'is uncollateralized')
             self.params['Dynamic_Scenario_Dates'] = 'No'
-            
+
         # do 20000 sims in batches of 1024
-        self.params['Simulation_Batches'] = 10*2
+        self.params['Simulation_Batches'] = 10 * 2
         self.params['Batch_Size'] = 1024
 
         # work out the next business day
         next_day = self.business_day.rollforward(
-            pd.Timestamp(self.params['Run_Date']) + pd.offsets.Day(1)).strftime('%Y-%m-%d')        
+            pd.Timestamp(self.params['Run_Date']) + pd.offsets.Day(1)).strftime('%Y-%m-%d')
 
         if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping CVA gradient calc as file already exists')
@@ -144,7 +144,7 @@ class CVA_GRAD(JOB):
             # write the grad
             grad_cva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
             # run the next day
-            self.params['Run_Date']=next_day
+            self.params['Run_Date'] = next_day
             # switch off gradients
             self.params['CVA']['Gradient'] = 'No'
             _, theta, _ = rf.run_cmc(self.cx, overrides=self.params, CVA=True)
@@ -231,9 +231,9 @@ class COLLVA(JOB):
 
         filename = 'COLLVA_' + self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
         num_deals = len(self.cx.deals['Deals']['Children'][0]['Children'])
-        num_sims   = 10240
+        num_sims = 10240
         guess_batch = int(25600 / num_deals + .5)
-        batch_size = min(2**int(np.log(guess_batch)/np.log(2)+.5), 128)
+        batch_size = min(2 ** int(np.log(guess_batch) / np.log(2) + .5), 128)
 
         self.logger(self.netting_set, 'Netting set has {} deals - initial batch size {}'.format(num_deals, batch_size))
 
@@ -241,7 +241,7 @@ class COLLVA(JOB):
             self.logger(self.netting_set, 'Warning: skipping COLLVA calc as file already exists')
         else:
             self.params['CollVA'] = {'Gradient': 'Yes'}
-            self.params['Simulation_Batches'] = num_sims//batch_size
+            self.params['Simulation_Batches'] = num_sims // batch_size
             self.params['Batch_Size'] = batch_size
 
             calc_complete = False
@@ -319,7 +319,7 @@ class SA_CVA(JOB):
             stats = out['Stats']
             # store the CVA as part of the stats
             out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
-        else:            
+        else:
             self.params['CVA']['Gradient'] = 'Yes'
 
             calc_complete = False
@@ -365,8 +365,8 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
 
     if os.path.isfile(os.path.join(input_path, rundate, 'CVAMarketData_Calibrated_New.json')):
         cx_new = rf.load_market_data(
-                rundate, input_path, json_name='CVAMarketData_Calibrated_New.json')
-        
+            rundate, input_path, json_name='CVAMarketData_Calibrated_New.json')
+
         log("Parent", "Overriding Calibration")
         for factor in [x for x in cx_new.params['Price Factors'].keys()
                        if x.startswith('HullWhite2FactorModelParameters') or
@@ -437,10 +437,12 @@ class Parent:
         # close the queue
         self.queue.close()
         self.results.close()
-        
+
         # terminate all worker processes
         for w in self.workers:
-            w.terminate()
+            w.join()
+            if w.is_alive():
+                w.close()
 
         post_results = {'Stats': [], 'CSA': []}
         for output in post_processing:

@@ -890,13 +890,12 @@ class CurveTensor(object):
                 t_w1 = tensor.new(w1)
                 t_w2 = tensor.new(w2)
 
+                interp_val = tensor[time_index, i1] * t_w1 + tensor[time_index, i2] * t_w2
+
                 if self.alpha is not None:
-                    interp_val = (1 - self.alpha) * (tensor[time_index, i1] * t_w1 +
-                                                     tensor[time_index, i2] * t_w2) + \
+                    interp_val = (1 - self.alpha) * interp_val + \
                                  self.alpha * (tensor[time_index_next, i1] * t_w1 +
                                                tensor[time_index_next, i2] * t_w2)
-                else:
-                    interp_val = tensor[time_index, i1] * t_w1 + tensor[time_index, i2] * t_w2
 
             return interp_val
         else:
