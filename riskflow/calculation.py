@@ -990,7 +990,7 @@ class Credit_Monte_Carlo(Calculation):
                             # calculate the hessian matrix - warning - make sure you have enough memory
                             output['grad_cva_hessian'] = sensitivity.report_hessian()
 
-            print('Run {} in {:.3f} s'.format(run, time.monotonic() - start_run))
+            # print('Run {} in {:.3f} s'.format(run, time.monotonic() - start_run))
 
             # store all output tensors
             for k, v in tensors.items():

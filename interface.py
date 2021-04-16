@@ -44,7 +44,7 @@ def check_correlation(scenarios, ir_factor, fx_factor):
     return np.array(f)
 
 
-def bootstrap(path, rundate, device, reuse_cal=True):
+def bootstrap(path, rundate, reuse_cal=True):
     from riskflow.adaptiv import AdaptivContext
 
     context = AdaptivContext()
@@ -76,7 +76,7 @@ def bootstrap(path, rundate, device, reuse_cal=True):
                         format='%(asctime)s %(levelname)-8s %(message)s',
                         datefmt='%m-%d %H:%M')
 
-    context.bootstrap(device)
+    context.bootstrap()
     # context.write_marketdata_json(os.path.join(path, rundate, cal_file))
     # context.write_market_file(os.path.join(path, rundate, 'MarketDataCal.dat'))
 
@@ -126,7 +126,7 @@ if __name__ == '__main__':
     rundate = '2021-03-17'
     # rundate = '2021-03-24'
 
-    # bootstrap(path, rundate, device=gpudevice, reuse_cal=True)
+    # bootstrap(path, rundate, reuse_cal=True)
 
     if 1:
         # cx_prod = rf.load_market_data(rundate, path, json_name=os.path.join('', 'MarketData.json'))
@@ -229,7 +229,7 @@ if __name__ == '__main__':
                          'Currency': 'ZAR',
                          'Deflation_Interest_Rate': 'ZAR-SWAP',
                          'Batch_Size': 1024,
-                         'Simulation_Batches': 2,
+                         'Simulation_Batches': 1,
                          'CollVA': {'Gradient': 'No'},
                          'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}}
 

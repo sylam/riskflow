@@ -433,8 +433,6 @@ class RiskNeutralInterestRateModel(object):
         self.batch_size = 8192
         self.device = device
         self.prec = dtype
-        # set the global precision - not ideal
-        # utils.Default_Precision = prec
 
     def calc_loss_on_ir_curve(self, implied_params, base_date, time_grid, process,
                               implied_obj, ir_factor, vol_surface, resid=lambda x: x * x, jac=False):
@@ -966,5 +964,6 @@ scipy.optimize.leastsq.html) are used.',
         return riskfactors.HullWhite2FactorModelParameters(param)
 
 
-def construct_bootstrapper(btype, param, device, dtype=torch.float32):
+def construct_bootstrapper(btype, param, dtype=torch.float32):
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     return globals().get(btype)(param, device, dtype)
