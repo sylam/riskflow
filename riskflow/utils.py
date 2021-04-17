@@ -169,7 +169,6 @@ FACTOR_SIZE_RATE = 2
 # Named tuples to make life easier
 Factor = namedtuple('Factor', 'type name')
 RateInfo = namedtuple('RateInfo', 'model_name archive_name calibration')
-Interpolation = namedtuple('Interpolation', 'tensor interp_params')
 CalibrationInfo = namedtuple('CalibrationInfo', 'param correlation delta')
 DealDataType = namedtuple('DealDataType', 'Instrument Factor_dep Time_dep Calc_res')
 Partition = namedtuple('Partition', 'DealMTMs Collateral_Cash Funding_Cost Cashflows')
@@ -190,6 +189,7 @@ WeekendMap = {'Friday and Saturday': 'Sun Mon Tue Wed Thu',
               'Friday': 'Sat Sun Mon Tue Wed Thu'}
 
 
+# Custom Exceptions
 class InstrumentExpired(Exception):
     def __init__(self, message):
         self.message = message
@@ -324,6 +324,15 @@ class DateEqualList:
                                for date, value in self.data.items()]) + ']'
 
 
+class Interpolation(object):
+    def __init__(self, tensor, interp_params):
+        self.tensor = tensor
+        self.indexed_tensor = tensor.reshape(-1, tensor.shape[-1])
+        self.interp_params = []
+        for param in interp_params:
+            self.interp_params.append(param.reshape(-1, param.shape[-1]))
+
+
 class CurveTenor(object):
     def __init__(self, tenor_points, interp):
         # linear interpolation by default
@@ -358,18 +367,6 @@ class CurveTenor(object):
             alpha = (clipped_points - self.tenor[index]) / self.delta[index]
 
         return index, index_next, alpha
-
-    def get_index_time_weight(self, tenor_points_in_years):
-        index, index_next, alpha = self.get_index(tenor_points_in_years)
-        w1 = (1.0 - alpha) * tenor_points_in_years
-        w2 = alpha * tenor_points_in_years
-        return index, index_next, alpha, w1, w2
-
-    def get_index_weight(self, tenor_points_in_years):
-        index, index_next, alpha = self.get_index(tenor_points_in_years)
-        w1 = (1.0 - alpha)
-        w2 = alpha
-        return index, index_next, alpha, w1, w2
 
 
 @torch.jit.script
@@ -782,21 +779,6 @@ def split_tensor(tensor, counts):
     return torch.split(tensor, tuple(counts)) if tensor.shape[0] == counts.sum() else [tensor] * counts.size
 
 
-def interpolate_curve_indices(all_tenor_points_in_years, curve_component, time_factor=1.0):
-    # will only work if all_tenor_points is 2 dimensional
-    curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index]
-
-    if time_factor:
-        i1, i2, a, w1, w2 = [np.array(x) for x in map(list, zip(
-            *[curve_tenor.get_index_time_weight(x) for x in all_tenor_points_in_years]))]
-    else:
-        i1, i2, a, w1, w2 = [np.array(x) for x in map(list, zip(
-            *[curve_tenor.get_index_weight(x) for x in all_tenor_points_in_years]))]
-
-    return np.expand_dims(a, axis=2), i1, np.expand_dims(w1, axis=2), i2, np.expand_dims(w2, axis=2)
-
-
-#@torch.jit.script
 def calc_hermite_curve(t_a, g, c, curve_t0, curve_t1):
     one_minus_ta = (1.0 - t_a)
     return curve_t0 * one_minus_ta + t_a * (curve_t1 + one_minus_ta * (g + t_a * c))
@@ -814,12 +796,15 @@ class CurveTensor(object):
     def __init__(self, interp_obj: Interpolation, index, alpha):
         self.interp_obj = interp_obj
         self.index = index
+        self.time_index = self.index.reshape(-1, 1) * interp_obj.tensor.shape[1]
         if alpha is not None:
             self.alpha = interp_obj.tensor.new(alpha) if isinstance(alpha, np.ndarray) else alpha
             self.index_next = (index + 1).clip(0, interp_obj.tensor.shape[0] - 1)
+            self.time_index_next = self.index_next.reshape(-1, 1) * interp_obj.tensor.shape[1]
         else:
             self.alpha = None
             self.index_next = None
+            self.time_index_next = None
 
     def interp_value(self):
         if self.alpha is not None:
@@ -843,64 +828,58 @@ class CurveTensor(object):
             curve_component, T, time_multiplier)
 
     def interpolate_curve(self, curve_component, points, time_factor):
+        # our tensor object
+        tensor = self.interp_obj.indexed_tensor
+        # check the points being queried
         time_size, point_size = points.shape
 
         if point_size > 0:
-            tenor_points = curve_component[FACTOR_INDEX_Daycount](points)
-            a, i1, w1, i2, w2 = interpolate_curve_indices(
-                tenor_points, curve_component, time_factor)
+            # get the points in years
+            tenor_points_in_years = curve_component[FACTOR_INDEX_Daycount](points)
 
-            time_index_next = None
-            if curve_component[FACTOR_INDEX_Stoch]:
-                time_index = np.tile(self.index.reshape(-1, 1), point_size)
-                if self.index_next is not None:
-                    time_index_next = np.tile(self.index_next.reshape(-1, 1), point_size)
-            else:
-                time_index = np.zeros((time_size, point_size), dtype=np.int64)
+            curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index]
+            i1, i2, a = curve_tenor.get_index(tenor_points_in_years)
 
-            # our tensor object
-            tensor = self.interp_obj.tensor
-            if curve_component[FACTOR_INDEX_Tenor_Index].type.startswith('Hermite'):
+            # check if time_index is non-zero (valid if this was a stochastic factor)
+            offset = self.time_index if self.time_index.any() else 0
+            i00 = offset + i1
+            i01 = offset + i2
+
+            if self.time_index_next is not None:
+                i10 = self.time_index_next + i1
+                i11 = self.time_index_next + i2
+
+            t_w2 = tensor.new(a).unsqueeze(dim=2)
+            t_w1 = 1.0 - t_w2
+
+            tenors = tensor.new(tenor_points_in_years).unsqueeze(dim=2)
+            mult = tenors if time_factor else 1.0
+
+            if curve_tenor.type.startswith('Hermite'):
                 g, c = self.interp_obj.interp_params
-                tenors = torch.unsqueeze(tensor.new(tenor_points), axis=2)
-                if curve_component[FACTOR_INDEX_Tenor_Index].type == 'HermiteRT':
-                    clipped = tenors.clamp(
-                        curve_component[FACTOR_INDEX_Tenor_Index].min,
-                        curve_component[FACTOR_INDEX_Tenor_Index].max)
-                    mult = (tenors if time_factor else 1.0) / clipped
-                else:
-                    mult = tenors if time_factor else 1.0
+                if curve_tenor.type == 'HermiteRT':
+                    mult = mult / tenors.clamp(curve_tenor.min, curve_tenor.max)
 
-                t_a = tensor.new(a)
-                val = calc_hermite_curve(
-                    t_a, g[time_index, i1], c[time_index, i1],
-                    tensor[time_index, i1], tensor[time_index, i2])
+                val = calc_hermite_curve(t_w2, g[i00,], c[i00,], tensor[i00,], tensor[i01,])
 
                 if self.alpha is not None:
                     # need to linearly interpolate between 2 time points
-                    val_t1 = calc_hermite_curve(
-                        t_a, g[time_index_next, i1], c[time_index_next, i1],
-                        tensor[time_index_next, i1], tensor[time_index_next, i2])
+                    val_t1 = calc_hermite_curve(t_w2, g[i10,], c[i10,], tensor[i10,], tensor[i11,])
+
+                    val = (1 - self.alpha) * val + self.alpha * val_t1
+            else:
+                # default to linear
+                val = tensor[i00,] * t_w1 + tensor[i01,] * t_w2
+
+                if self.alpha is not None:
+                    val_t1 = tensor[i10,] * t_w1 + tensor[i11,] * t_w2
 
                     val = (1 - self.alpha) * val + self.alpha * val_t1
 
-                interp_val = val * mult
-            else:
-                # default to linear
-                t_w1 = tensor.new(w1)
-                t_w2 = tensor.new(w2)
-
-                interp_val = tensor[time_index, i1] * t_w1 + tensor[time_index, i2] * t_w2
-
-                if self.alpha is not None:
-                    interp_val = (1 - self.alpha) * interp_val + \
-                                 self.alpha * (tensor[time_index_next, i1] * t_w1 +
-                                               tensor[time_index_next, i2] * t_w2)
-
-            return interp_val
+            return val * mult
         else:
             # return a null tensor
-            return self.interp_obj.tensor.new_zeros([time_size, 0, self.interp_obj.tensor.shape[-1]])
+            return tensor.new_zeros([time_size, 0, tensor.shape[-1]])
 
 
 class TensorBlock(object):
