@@ -77,14 +77,15 @@ if __name__ == '__main__':
 
     folder = 'CVA'
     path = rf.getpath(['E:\\Data\\crstal\\{}'.format(folder),
+                       '/media/vretiel/Media/Data/crstal/{}'.format(folder),
                        'G:\\Credit Quants\\CRSTAL\\{}'.format(folder),
                        'G:\\{}'.format(folder)])
 
-    rundate = '2020-03-06'
+    rundate = '2021-02-05'
 
-    # bootstrap(path, rundate, reuse_cal=True)
+    bootstrap(path, rundate, reuse_cal=True)
 
-    if 1:
+    if 0:
         cx = rf.load_market_data(rundate, path, json_name='MarketData.json')
         cx_new = rf.load_market_data(rundate, path, json_name='CVAMarketData_Calibrated_New.json')
 
@@ -101,9 +102,9 @@ if __name__ == '__main__':
                                                        # 'Run_Date': '2020-03-09',
                                                        # 'Tenor_Offset': -3/365.0,
                                                        # 'Time_grid':'1m 5m 1362d',
-                                                       'Batch_Size': 64 * 4,
-                                                       'Simulation_Batches': 20,
+                                                       'Batch_Size': 2048,
+                                                       'Simulation_Batches': 10,
                                                        'CVA': {'Gradient': 'No', 'Hessian': 'No'}}, prec=np.float32)
 
         else:
-            calc, out = run_baseval(cx)
+            calc, out = rf.run_baseval(cx)

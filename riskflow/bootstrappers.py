@@ -608,8 +608,6 @@ class InterestRateJacobian(object):
 
                 price_factors[utils.check_tuple_name(price_param)] = jac
 
-#GBMAssetPriceTSModelParameters
-#GBMTSImpliedParameters
 class GBMAssetPriceTSModelParameters(object):
     documentation = (
         'FX and Equity',
@@ -715,8 +713,10 @@ class RiskNeutralInterestRateModel(object):
                               implied_obj, ir_factor, vol_surface, resid=tf.square, jac=False):
         # calculate a reverse lookup for the tenors and store the daycount code
         all_tenors = utils.update_tenors(base_date, {ir_factor: process})
-        # calculate the curve index - need to clean this up - TODO!!!
+        # calculate the curve index
         curve_index = [instruments.calc_factor_index(ir_factor, {}, {ir_factor: 0}, all_tenors)]
+        # calculate the reduced tenor curve index - note it's the same as above but in the next scenario index (1)
+        curve_index_reduced = [instruments.calc_factor_index(ir_factor, {}, {ir_factor: 1}, all_tenors)]
         # calc the market swap rates and instrument_definitions    
         market_swaps, benchmarks = create_market_swaps(
             base_date, time_grid, curve_index, vol_surface, process.factor,
@@ -731,7 +731,7 @@ class RiskNeutralInterestRateModel(object):
         # setup a common context - we leave out the random numbers and pass it in explicitly below
         shared_mem = curve_calibration_class(
             t_Buffer={},
-            t_Scenario_Buffer=[None],
+            t_Scenario_Buffer=[],
             precision=self.prec,
             simulation_batch=self.batch_size)
         # setup the variables
@@ -754,20 +754,20 @@ class RiskNeutralInterestRateModel(object):
         process.precalculate(base_date, time_grid, stoch_var, shared_mem, 0, implied_tensor=implied_var)
 
         # needed to interpolate the zero curve
-        delta_scen_t = np.diff(time_grid.scen_time_grid).reshape(-1, 1).astype(self.prec)
+        delta_scen_t = np.diff(time_grid.scen_time_grid).reshape(-1, 1)
 
         for batch_index in range(self.num_batches):
             # load up the batch
             batch_sample = sample[batch_index].T.reshape(
                 numfactors, time_grid.time_grid_years.size, -1).astype(self.prec)
             # simulate the price factor - only need the curve at the mtm time points
-            shared_mem.t_Scenario_Buffer[0] = process.generate(shared_mem, batch_sample)
+            shared_mem.t_Scenario_Buffer.extend(process.generate(shared_mem, batch_sample))
             # get the discount factors
             Dfs = utils.calc_time_grid_curve_rate(
-                curve_index, time_grid.calc_time_grid(time_grid.scen_time_grid[:-1]),
-                shared_mem, delta_scen_t, multiply_by_time=True)
+                curve_index_reduced, time_grid.calc_time_grid(time_grid.scen_time_grid[:-1]),
+                shared_mem)
             # get the index in the deflation factor just prior to the given grid
-            deflation = Dfs.reduce_deflate(time_grid.mtm_time_grid, shared_mem)
+            deflation = Dfs.reduce_deflate(delta_scen_t, time_grid.mtm_time_grid, shared_mem)
             # go over the instrument definitions and build the calibration
             for swaption_name, market_data in market_swaps.items():
                 expiry = market_data.deal_data.Time_dep.mtm_time_grid[
@@ -781,6 +781,9 @@ class RiskNeutralInterestRateModel(object):
                     tensor_swaptions[swaption_name] += sum_swaption
                 else:
                     tensor_swaptions[swaption_name] = sum_swaption
+
+            # clear the scenario buffer
+            shared_mem.t_Scenario_Buffer.clear()
 
         calibrated_swaptions = {k: v / (self.batch_size * self.num_batches) for k, v in tensor_swaptions.items()}
         if jac:

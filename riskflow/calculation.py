@@ -1034,7 +1034,7 @@ class Credit_Monte_Carlo(Calculation):
                         Vk_star_ti_p = (Vk_plus_ti[1:] + Vk_plus_ti[:1]) / 2
                         Vk_star_ti_m = (Vk_minus_ti[1:] + Vk_minus_ti[:1]) / 2
 
-                        delta_scen_t = np.hstack((0.0, np.diff(mtm_grid))).astype(self.prec).reshape(-1, 1)
+                        delta_scen_t = np.hstack((0.0, np.diff(mtm_grid))).reshape(-1, 1)
 
                         discount_fund = utils.calc_time_grid_curve_rate(funding,
                                                                         self.time_grid.time_grid[time_grid],
@@ -1073,7 +1073,7 @@ class Credit_Monte_Carlo(Calculation):
                 # Calculates unilateral CVA with or without stochastic deflation.
                 with tf.name_scope('CVA'):
                     mtm_grid = self.time_grid.mtm_time_grid[time_grid]
-                    delta_scen_t = np.hstack((0.0, np.diff(mtm_grid))).astype(self.prec)
+                    delta_scen_t = np.hstack((0.0, np.diff(mtm_grid)))
 
                     if params['CVA']['Deflate_Stochastically'] == 'Yes':
                         zero = utils.calc_time_grid_curve_rate(discount, self.time_grid.time_grid[time_grid],

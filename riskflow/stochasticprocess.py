@@ -526,28 +526,6 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
                 self.calc_factors(shared.t_random_numbers[process_ofs, :time_grid.scen_time_grid.size],
                                   shared.t_random_numbers[process_ofs:process_ofs + 2, :time_grid.scen_time_grid.size])
 
-    def calc_stoch_deflator(self, time_grid, curve_index, shared):
-        cached_tensor, interpolation_params = utils.cache_interpolation(shared, curve_index[0], self.stoch_drift[:-1])
-        tensor = utils.TensorBlock(curve_index, [cached_tensor], [interpolation_params], time_grid)
-        self.deflation_drift = tensor.gather_weighted_curve(shared, self.stoch_dt * utils.DAYS_IN_YEAR,
-                                                            multiply_by_time=False)
-
-    def calc_points(self, rate, points, time_grid, shared, multiply_by_time=True):
-        """ Much slower way to evaluate points at time t - but more accurate and memory efficient"""
-        t = rate[utils.FACTOR_INDEX_Daycount](points)
-        BtT = [tf.expand_dims((1.0 - tf.exp(-self.alpha[i] * t)), 2) / self.alpha[i] for i in range(2)]
-        drift_at_grid = utils.gather_scenario_interp(self.drift, time_grid, shared)
-        drift = utils.interpolate_curve(drift_at_grid, rate, None, points, 0)
-        f1 = utils.gather_scenario_interp(self.f1, time_grid, shared)
-        f2 = utils.gather_scenario_interp(self.f2, time_grid, shared)
-        stoch_component = BtT[0] * f1 + BtT[1] * f2
-        fwd_curve = drift + stoch_component
-
-        if multiply_by_time:
-            return fwd_curve
-        else:
-            return fwd_curve / t
-
     def calc_factors(self, factor1, factor1and2):
         self.f1 = tf.expand_dims((tf.cumsum(factor1 * self.F1, axis=0, name='F1')
                                   - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
@@ -559,25 +537,35 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         return 'HWImpliedInterestRate', [('F1',), ('F2',)]
 
     def generate(self, shared_mem, random_sample=None):
+
+        def sim_curve(drift, Bt0, Bt1, f1, f2, factor_tenor):
+            stoch_component = Bt0 * f1 + Bt1 * f2
+            return (drift + stoch_component) / factor_tenor
+
         if random_sample is not None:
             self.calc_factors(random_sample[0], random_sample[:2])
 
-        with tf.name_scope(self.__class__.__name__):
-            # check if we need deflators
-            if self.grid_index is not None:
-                # only generate curves for the given grid
-                f1 = tf.gather(self.f1, self.grid_index)
-                f2 = tf.gather(self.f2, self.grid_index)
-                drift = tf.gather(self.drift, self.grid_index)
-            else:
-                f1 = self.f1
-                f2 = self.f2
-                drift = self.drift
+        factor_tenor = self.factor.get_tenor().astype(shared_mem.precision).reshape(-1, 1)
 
-            # generate curves based on 
-            stoch_component = self.BtT[0] * f1 + self.BtT[1] * f2
-            return (drift + stoch_component) / (
-                self.factor.get_tenor().astype(shared_mem.precision).reshape(-1, 1))
+        with tf.name_scope(self.__class__.__name__):
+            if self.grid_index is not None:
+                # if we have a grid index, then we want to simulate a reduced curve (just the first 6 months) over a
+                # finer time grid - this is useful for stochastic deflation - note that at least 4 tenor points need
+                # to be included to correctly handle interpolation
+                reduced_tenor_index = max(4, self.factor.tenors.searchsorted(0.5)+1)
+
+                full_grid_curve = sim_curve(
+                    tf.gather(self.drift, self.grid_index), self.BtT[0], self.BtT[1],
+                    tf.gather(self.f1, self.grid_index), tf.gather(self.f2, self.grid_index),
+                    factor_tenor)
+
+                partial_grid_curve = sim_curve(
+                    self.drift[:, :reduced_tenor_index], self.BtT[0][:reduced_tenor_index],
+                    self.BtT[1][:reduced_tenor_index], self.f1, self.f2, factor_tenor[:reduced_tenor_index])
+
+                return full_grid_curve, partial_grid_curve
+            else:
+                return sim_curve(self.drift, self.BtT[0], self.BtT[1], self.f1, self.f2, factor_tenor)
 
 
 class HullWhite1FactorInterestRateModel(StochasticProcess):
