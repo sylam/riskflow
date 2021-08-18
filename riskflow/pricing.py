@@ -427,7 +427,7 @@ def interpolate(mtm, shared, time_grid, deal_data):
         # if shared.calc_greeks is not None:
         #    greeks(shared, deal_data, mtm)
 
-    if time_grid.mtm_time_grid.size > 1:
+    if isinstance(mtm, torch.Tensor) and time_grid.mtm_time_grid.size > 1:
         # pad it with zeros and return
         return F.pad(mtm, [0, 0, 0, time_grid.mtm_time_grid.size - deal_data.Time_dep.interp.size])
     else:
