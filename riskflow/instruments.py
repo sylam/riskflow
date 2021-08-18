@@ -1408,9 +1408,10 @@ class StructuredDeal(Deal):
         super(StructuredDeal, self).reset()
 
     def finalize_dates(self, parser, base_date, grid, node_children, node_resets, node_settlements):
-        # have to reset the original instrument and let the child node decide
-        for child in node_children:
-            node_resets.update(child.get_reval_dates())
+        if node_children is not None:
+            # have to reset the original instrument and let the child node decide
+            for child in node_children:
+                node_resets.update(child.get_reval_dates())
 
         self.reval_dates = node_resets
         for currency, dates in node_settlements.items():
@@ -1439,7 +1440,7 @@ class StructuredDeal(Deal):
         return net_mtm
 
     def generate(self, shared, time_grid, deal_data):
-        pass
+        return 0.0
 
 
 class SwapInterestDeal(Deal):

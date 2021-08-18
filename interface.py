@@ -107,11 +107,11 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = '1'
     # set the log level
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-    os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+    # os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
     import riskflow as rf
 
-    env = 'UAT'
+    env = ''
     paths = {}
     for folder in ['CVA', 'Arena', 'Debug', 'Upgrade']:
         paths[folder] = rf.getpath(
@@ -123,8 +123,8 @@ if __name__ == '__main__':
 
     path = paths['CVA']
 
-    rundate = '2021-03-17'
-    # rundate = '2021-03-24'
+    # rundate = '2021-03-17'
+    rundate = '2021-05-17'
 
     # bootstrap(path, rundate, reuse_cal=True)
 
@@ -161,16 +161,20 @@ if __name__ == '__main__':
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Eskom_Hld_SOC_Ltd_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_RCL_Foods_Treasury_NonISDA.json'))
-        # cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
-        cx.parse_json(os.path.join(path, rundate, os.path.join(env, 'CrB_Kathu_Solar_Park_ISDA.json')))
-        # cx.parse_json(os.path.join(path, rundate, 'CrB_Sanlam_Developing_Markets_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Growthpoint_Properties_Ltd_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Land___Agricul_Bnk_ISDA.json'))
+        cx.parse_json(os.path.join(path, rundate, 'CrB_Redefine_Properties_Limited_ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_ACWA_Power_SolarReserve_Redstone_So_NonISDA.json'))
+
+        # cx.parse_json(os.path.join(path, rundate, os.path.join(env, 'CrB_Kathu_Solar_Park_ISDA.json')))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_CS_Int_London_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_The_Core_Computer_Business_Limited_ISDA.json'))
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Land___Agricul_Bnk_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_ABSA_Bank_Jhb_ISDA.json'))
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Growthpoint_Properties_Ltd_ISDA.json'))
-        # cx.parse_json(os.path.join(path, rundate, 'CrB_BNP_Paribas__Paris__ISDA.json'))
+        # cx.parse_json(os.path.join(path, rundate, 'CrB_Goldman_Sachs_Int_ISDA.json'))
         # cx.parse_json(os.path.join(path, rundate, 'CrB_Nedbank_Ltd_ISDA.json'))
 
         # cx.parse_json(os.path.join(path, rundate, 'CrB_NatWest_Markets_Plc_ISDA.json'))
@@ -208,8 +212,10 @@ if __name__ == '__main__':
         #         'Amount': 1.0}]}
 
         # turn off interpolation
-        # cx.params['Price Factor Interpolation'].modelfilters = {}
-
+        cx.params['Price Factor Interpolation'].modelfilters = {}
+        # PROTON_NO_ESYNC = 1
+        # PROTON_FORCE_LARGE_ADDRESS_AWARE = 1
+        # DXVK_CONFIG_FILE = "/home/vretiel/nioh.conf" % command %
         if 1:
             # grab the netting set
             ns = cx.deals['Deals']['Children'][0]['instrument']
@@ -220,18 +226,20 @@ if __name__ == '__main__':
             # ns.field['Collateral_Call_Frequency']=pd.DateOffset(weeks=1)
             # ns.field['Collateralized'] = 'False'
 
-            overrides = {'Calc_Scenarios': 'Yes',
-                         # 'Run_Date': '2020-08-21',
-                         # 'Tenor_Offset': 2.0,
-                         'Time_grid': '0d 2d 1w(1w) 3m(1m)',
-                         'Random_Seed': 1254,
-                         'Generate_Cashflows': 'No',
-                         'Currency': 'ZAR',
-                         'Deflation_Interest_Rate': 'ZAR-SWAP',
-                         'Batch_Size': 1024,
-                         'Simulation_Batches': 1,
-                         'CollVA': {'Gradient': 'No'},
-                         'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}}
+            overrides = {
+                 'Calc_Scenarios': 'No',
+                 # 'Run_Date': '2021-05-18',
+                 # 'Tenor_Offset': 2.0,
+                 'Time_grid': '0d 2d 1w(1w) 3m(1m)',
+                 'Random_Seed': 1254,
+                 'Generate_Cashflows': 'No',
+                 # 'Currency': 'ZAR',
+                 # 'Deflation_Interest_Rate': 'ZAR-SWAP',
+                 'Batch_Size': 512,
+                 'Simulation_Batches': 40,
+                 'CollVA': {'Gradient': 'No'},
+                 'CVA': {'Gradient': 'No', 'Hessian': 'No'}
+            }
 
             if ns.field['Collateralized'] == 'True':
                 overrides['Dynamic_Scenario_Dates'] = 'Yes'

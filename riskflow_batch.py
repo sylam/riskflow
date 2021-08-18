@@ -285,7 +285,7 @@ class SA_CVA(JOB):
             return True
 
     def run_calc(self):
-        from riskflow.calculation import construct_calculation
+        import riskflow as rf
 
         filename = 'CVA_' + self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
 
@@ -294,8 +294,8 @@ class SA_CVA(JOB):
             self.logger(self.netting_set, 'is collateralized')
             # turn on dynamic scenarios (more accurate)
             self.params['Dynamic_Scenario_Dates'] = 'Yes'
-            self.params['Simulation_Batches'] = 80
-            self.params['Batch_Size'] = 256
+            self.params['Simulation_Batches'] = 40
+            self.params['Batch_Size'] = 250
         else:
             self.params['Dynamic_Scenario_Dates'] = 'No'
             self.params['Simulation_Batches'] = 40
@@ -315,8 +315,7 @@ class SA_CVA(JOB):
         if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping CVA gradient calc as file already exists')
             self.params['CVA']['Gradient'] = 'No'
-            out = calc.execute(self.params)
-            stats = out['Stats']
+            _, out, _ = rf.run_cmc(self.cx, overrides=self.params, CVA=True)
             # store the CVA as part of the stats
             out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
         else:
@@ -325,7 +324,7 @@ class SA_CVA(JOB):
             calc_complete = False
             while not calc_complete:
                 try:
-                    out = calc.execute(self.params)
+                    _, out, _ = rf.run_cmc(self.cx, overrides=self.params, CVA=True)
                 except RuntimeError as e:  # Out of memory
                     exc_type, exc_value, exc_traceback = sys.exc_info()
                     traceback.print_exception(exc_type, exc_value, exc_traceback,
@@ -334,7 +333,6 @@ class SA_CVA(JOB):
                     self.params['Batch_Size'] //= 2
                     self.logger(self.netting_set,
                                 'Exception: OOM - Halving to {} Batchsize'.format(self.params['Batch_Size']))
-                    time.sleep(1)
                 else:
                     calc_complete = True
 
@@ -344,8 +342,9 @@ class SA_CVA(JOB):
             out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
             # write the grad
             grad_cva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
-            # store it
-            self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
+
+        # store it
+        self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
 
 
 def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir):

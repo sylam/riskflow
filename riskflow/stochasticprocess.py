@@ -574,7 +574,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             # if we have a grid index, then we want to simulate a reduced curve (just the first 6 months) over a
             # finer time grid - this is useful for stochastic deflation - note that at least 4 tenor points need
             # to be included to correctly handle interpolation
-            reduced_tenor_index = max(4, self.factor.tenors.searchsorted(0.5))
+            reduced_tenor_index = max(4, self.factor.tenors.searchsorted(0.5) + 1)
 
             full_grid_curve = sim_curve(
                 self.drift[self.grid_index], self.BtT[0], self.BtT[1],

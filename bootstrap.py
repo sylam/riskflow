@@ -41,8 +41,6 @@ def work(job_id, queue, result, price_factors, price_factor_interp,
     from riskflow.bootstrappers import construct_bootstrapper
 
     bootstrappers = {}
-    # set the gpu
-    gpudevice = torch.device("cuda:0")
 
     # perform the bootstrapping
     while True:
@@ -56,7 +54,7 @@ def work(job_id, queue, result, price_factors, price_factor_interp,
             name = list(job_price.keys())[0]
             if bootstrapper_name not in bootstrappers:
                 bootstrappers[bootstrapper_name] = construct_bootstrapper(
-                    bootstrapper_name, params, device=gpudevice)
+                    bootstrapper_name, params)
             bootstrapper = bootstrappers[bootstrapper_name]
             bootstrapper.bootstrap(
                 sys_params, price_models, price_factors, price_factor_interp, job_price, holidays)

@@ -1347,7 +1347,7 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
 
     expiry_indices = np.arange(expiry.size).astype(np.int32)
     expiry_offsets = shared.one.new_tensor(
-        [expiry_indices * moneyness_tenor.tenor.size],
+        np.array([expiry_indices * moneyness_tenor.tenor.size]),
         dtype=torch.int32).T.expand(-1, shared.simulation_batch).reshape(-1)
 
     reshape = True

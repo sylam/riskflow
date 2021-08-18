@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 
 # Internal modules
-from . import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
+from . import utils, pricing, instruments, riskfactors, stochasticprocess
 
 from scipy.stats import norm
 import scipy.optimize
@@ -64,20 +64,14 @@ class RiskNeutralInterestRate_State(utils.Calculation_State):
         self.t_PreCalc.clear()
 
         if self.t_random_batch is None:
-            if time_grid.time_grid_years.size * numfactors < 1111:
-                self.sobol = torch.quasirandom.SobolEngine(
-                    dimension=time_grid.time_grid_years.size * numfactors, scramble=True, seed=1234)
-                sample = torch.distributions.Normal(0, 1).icdf(
-                    self.sobol.draw(self.simulation_batch * num_batches)).reshape(
-                    num_batches, self.simulation_batch, -1)
-                self.t_random_batch = sample.transpose(1, 2).reshape(
-                    num_batches, numfactors, -1, self.simulation_batch).to(self.one.device)
-            else:
-                # this is old - fix TODO!
-                self.t_random_batch = normalize(norm.ppf(hdsobol.gen_sobol_vectors(
-                    self.simulation_batch * num_batches + 4000, time_grid.time_grid_years.size * numfactors))[
-                                                3999:]).reshape(
-                    self.batches, self.simulation_batch, -1)
+            # the sobol engine in torch > 1.8 goes up to dimension 21201 - so this should be fine
+            self.sobol = torch.quasirandom.SobolEngine(
+                dimension=time_grid.time_grid_years.size * numfactors, scramble=True, seed=1234)
+            sample = torch.distributions.Normal(0, 1).icdf(
+                self.sobol.draw(self.simulation_batch * num_batches)).reshape(
+                num_batches, self.simulation_batch, -1)
+            self.t_random_batch = sample.transpose(1, 2).reshape(
+                num_batches, numfactors, -1, self.simulation_batch).to(self.one.device)
 
 
 def create_float_cashflows(base_date, cashflow_obj, frequency):
@@ -621,9 +615,14 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
 
     def calc_sample(self, time_grid, numfactors=0):
         if numfactors != 3 or self.sample is None:
-            self.sample = normalize(norm.ppf(hdsobol.gen_sobol_vectors(
-                self.batch_size * self.num_batches + 4000, time_grid.scen_time_grid.size * numfactors))[3999:]).reshape(
+            self.sobol = torch.quasirandom.SobolEngine(
+                dimension=time_grid.time_grid_years.size * numfactors, scramble=True, seed=1234)
+            sample = torch.distributions.Normal(0, 1).icdf(
+                self.sobol.draw(self.batch_size * self.num_batches)).reshape(
                 self.num_batches, self.batch_size, -1)
+            self.sample = sample.transpose(1, 2).reshape(
+                self.num_batches, numfactors, -1, self.batch_size).to(self.one.device)
+
         return self.sample
 
     def calc_loss(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):
