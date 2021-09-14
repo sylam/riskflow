@@ -865,6 +865,16 @@ class InterestYieldVol(Factor3D):
     def __init__(self, param):
         super(InterestYieldVol, self).__init__(param)
         self.atm_surface = None
+        self.premiums = None
+
+    def set_premiums(self, df, currency):
+        if df is not None:
+            self.premiums = df[df['Currency'] == currency[0]]
+
+    def get_premium(self, expiry, tenor):
+        prem = self.premiums[(self.premiums['UnderlyingTenor'] == tenor) &
+                             (self.premiums['Expiry'] == expiry)]['Payer']
+        return prem.values[0] / 10000.0
 
     @property
     def BlackScholesDisplacedShiftValue(self):

@@ -67,9 +67,14 @@ class RiskNeutralInterestRate_State(utils.Calculation_State):
             # the sobol engine in torch > 1.8 goes up to dimension 21201 - so this should be fine
             self.sobol = torch.quasirandom.SobolEngine(
                 dimension=time_grid.time_grid_years.size * numfactors, scramble=True, seed=1234)
-            sample = torch.distributions.Normal(0, 1).icdf(
-                self.sobol.draw(self.simulation_batch * num_batches)).reshape(
+            # skip this many samples
+            self.sobol.fast_forward(2048)
+            # make sure we don't include 1 or 0
+            sample_sobol = self.sobol.draw(self.simulation_batch * num_batches).reshape(
                 num_batches, self.simulation_batch, -1)
+            sample = torch.erfinv(2 * (0.5 + (1 - torch.finfo(sample_sobol.dtype).eps) * (
+                    sample_sobol - 0.5)) - 1).reshape(
+                num_batches, self.simulation_batch, -1) * 1.4142135623730951
             self.t_random_batch = sample.transpose(1, 2).reshape(
                 num_batches, numfactors, -1, self.simulation_batch).to(self.one.device)
 
@@ -192,11 +197,16 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
             Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, time_index), Calc_res=None)
 
         shifted_strike = K + shift_parameter
+        # first check if we have the actual premium (not implied)
+        if vol_surface.premiums is not None:
+            swaption_price = vol_surface.get_premium(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
+        else:
+            swaption_price = pvbp * utils.black_european_option_price(
+                shifted_strike, shifted_strike, 0.0, vol, expiry, 1.0, 1.0)
+
         # store this
         all_deals[swaption_name] = market_swap_class(
-            deal_data=deal_data,
-            price=pvbp * utils.black_european_option_price(shifted_strike, shifted_strike, 0.0, vol, expiry, 1.0, 1.0),
-            weight=instrument['Weight'])
+            deal_data=deal_data, price=swaption_price, weight=instrument['Weight'])
 
         # store the benchmark
         if rate is not None:
@@ -501,6 +511,13 @@ class RiskNeutralInterestRateModel(object):
     def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
         base_date = sys_params['Base_Date']
         base_currency = sys_params['Base_Currency']
+        master_curve_list = sys_params.get('Master_Curves')
+
+        if sys_params.get('Swaption_Premiums') is not None:
+            swaption_premiums = pd.read_csv(sys_params['Swaption_Premiums'], index_col=0)
+            ATM_Premiums = swaption_premiums[swaption_premiums['Strike'] == 'ATM']
+        else:
+            ATM_Premiums = None
 
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
@@ -515,11 +532,16 @@ class RiskNeutralInterestRateModel(object):
                 try:
                     swaptionvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
                     ir_curve = riskfactors.construct_factor(ir_factor, price_factors, factor_interp)
+                    swaptionvol.set_premiums(ATM_Premiums, ir_curve.get_currency())
                 except KeyError as k:
                     logging.warning('Missing price factor {} - Unable to bootstrap {}'.format(k.args, market_price))
                     continue
                 except Exception:
                     logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
+                    continue
+
+                if master_curve_list and master_curve_list.get(ir_curve.get_currency()[0]) != rate[1]:
+                    logging.warning('curve is not Risk Free {} - skipping and will reassign later'.format(market_price))
                     continue
 
                 # set of dates for the calibration

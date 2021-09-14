@@ -721,7 +721,7 @@ class Credit_Monte_Carlo(Calculation):
         correlation_matrix = torch.tensor(
             correlation_matrix, device=self.device, dtype=self.dtype, requires_grad=False)
         # return the cholesky decomp
-        return torch.cholesky(correlation_matrix)
+        return torch.linalg.cholesky(correlation_matrix)
 
     def __init_shared_mem(self, seed, nomodel, reporting_currency, calc_greeks=None):
         # set the random seed
@@ -764,7 +764,8 @@ class Credit_Monte_Carlo(Calculation):
                     grad[k] = v.astype(np.float64) / self.params['Simulation_Batches']
                 self.output.setdefault(result, self.gradients_as_df(grad, display_val=True))
             elif result in ['grad_cva_hessian']:
-                self.output.setdefault(result, data.astype(np.float64) / self.params['Simulation_Batches'])
+                self.output.setdefault(result, self.gradients_as_df(
+                    data.astype(np.float64) / self.params['Simulation_Batches']))
             else:
                 self.output.setdefault(result, np.concatenate(data, axis=-1).astype(np.float64))
 
