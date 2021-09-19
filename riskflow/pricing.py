@@ -574,6 +574,97 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
     return barrier_option
 
 
+def getpartialbarrierpayoff(isKnockIn, eta, phi, spot, strike, barrier, startBarrier, limit, expiry, r, b, sigma):
+    '''
+    Function to generate the partial barrier payoff function
+    '''
+
+    def BarrierPutCallTransformation(spot, strike, barrier, r, b, upDown):
+        return strike, spot, spot * strike / barrier, r - b, -b, -upDown
+
+    def PartialBarrierCalc(forward, strike, log1, log2, rho1, rho2, p1, p2, p3, p4, p5, p6, p7, p8):
+        return (forward * (utils.ApproxBivN(p1, p2, rho1) - torch.exp(log1) * utils.ApproxBivN(p3, p4, rho2)) -
+                strike * (utils.ApproxBivN(p5, p6, rho1) - torch.exp(log2) * utils.ApproxBivN(p7, p8, rho2)))
+
+    def partial_barrier_option(spot, strike, barrier, r, b, eta):
+        rho = torch.sqrt(limit / expiry)
+        vol = sigma * torch.sqrt(expiry)
+        vollimit = sigma * torch.sqrt(limit)
+        halfvv = 0.5 * sigma * sigma
+        logSpotOverStrike = torch.log(spot / strike)
+        logSpotOverBarrier = torch.log(spot / barrier)
+        d1 = (logSpotOverStrike + (b + halfvv) * expiry) / vol
+        d2 = d1 - vol
+        f1 = (logSpotOverStrike - 2.0 * logSpotOverBarrier + (b + halfvv) * expiry) / vol
+        f2 = f1 - vol
+        e1 = (logSpotOverBarrier + (b + halfvv) * limit) / vollimit
+        e2 = e1 - vollimit
+        e3 = e1 - 2.0 * logSpotOverBarrier / vollimit
+        e4 = e3 - vollimit
+        mu2 = b / halfvv - 1.0
+        forward = spot * torch.exp(b * expiry)
+        log1 = -logSpotOverBarrier * (mu2 + 2.0)
+        log2 = -logSpotOverBarrier * mu2
+
+        if startBarrier:
+            etaRho = eta * rho
+            pv = PartialBarrierCalc(
+                forward, strike, log1, log2, etaRho, etaRho, d1, e1 * eta,
+                f1, e3 * eta, d2, e2 * eta, f2, e4 * eta)
+        else:
+            g1 = (logSpotOverBarrier + (b + halfvv) * expiry)/vol
+            g2 = g1 - vol
+            g3 = g1 - 2.0 * logSpotOverBarrier / vol
+            g4 = g3 - vol
+
+            if eta == 0: # type B1
+
+                pv = PartialBarrierCalc(
+                    forward, strike, log1, log2, rho, -rho, d1, e1, f1, -e3, d2, e2, f2, -e4)
+                temp = PartialBarrierCalc(
+                    forward, strike, log1, log2, rho, -rho, g1, e1, g3, -e3, g2, e2, g4, -e4)
+                temp += PartialBarrierCalc(
+                    forward, strike, log1, log2, rho, -rho, -g1, -e1, -g3, -e3, -g2, -e2, -g4, -e4)
+                temp -= PartialBarrierCalc(
+                    forward, strike, log1, log2, rho, -rho, -d1, -e1, -f1, -e3, -d2, -e2, -f2, -e4)
+
+                pv = torch.where(strike < barrier, pv, temp)
+            else:
+                if eta == 1:
+
+                    pv = PartialBarrierCalc(
+                        forward, strike, log1, log2, rho, -rho, g1, e1, g3, -e3, g2, e2, g4, -e4)
+                    temp = PartialBarrierCalc(
+                        forward, strike, log1, log2, rho, -rho, d1, e1, f1, -e3, d2, e2, f2, -e4)
+
+                    pv = torch.where(strike < barrier, pv, temp)
+
+                else:  # eta == -1
+
+                    pv = PartialBarrierCalc(
+                        forward, strike, log1, log2, rho, -rho, -g1, -e1, -g3, e3, -g2, -e2, -g4, e4)
+                    pv -= PartialBarrierCalc(
+                        forward, strike, log1, log2, rho, -rho, -d1, -e1, e3, -f1, -d2, -e2, e4, -f2)
+                    pv *= (strike < barrier)
+
+        return pv * torch.exp(-r * expiry)
+
+    if isKnockIn:
+        bs = utils.black_european_option(
+            spot * torch.exp(b * expiry), strike, sigma * torch.sqrt(expiry),
+            1.0, 1.0, phi, None) * torch.exp(-r * expiry)
+
+    if phi == -1:
+        spot, strike, barrier, r, b, eta = BarrierPutCallTransformation(spot, strike, barrier, r, b, eta)
+
+    pv = partial_barrier_option(spot, strike, barrier, r, b, eta)
+
+    if isKnockIn:
+        return bs - pv
+    else:
+        return pv
+
+
 def pv_barrier_option(shared, time_grid, deal_data, nominal,
                       spot, b, tau, payoff_currency, invert_moneyness=False):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
@@ -740,6 +831,98 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal,
             cash_settle(shared, payoff_currency, deal_data.Time_dep.deal_time_grid[-1], combined[-1])
     else:
         combined = buy_or_sell * nominal * payoff
+
+    return combined
+
+
+def pv_partial_barrier_option(shared, time_grid, deal_data, nominal,
+                      spot, b, tau, tau1, payoff_currency, invert_moneyness=False):
+
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    factor_dep = deal_data.Factor_dep
+    daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
+
+    # work out what we're pricing
+    barrierType = deal_data.Instrument.field['Barrier_Type']
+    isKnockIn = barrierType in ['Up_And_In', 'Down_And_In', 'In']
+
+    eta = 0.0
+    if barrierType in ['Down_And_Out', 'Down_And_In']:
+        eta = BARRIER_DOWN
+    elif barrierType in ['Up_And_Out', 'Up_And_In']:
+        eta = BARRIER_UP
+
+    phi = OPTION_CALL if deal_data.Instrument.field['Option_Type'] == 'Call' else OPTION_PUT
+    buy_or_sell = 1.0 if deal_data.Instrument.field['Buy_Sell'] == 'Buy' else -1.0
+    barrier = deal_data.Instrument.field['Barrier_Price']
+    strike = deal_data.Instrument.field['Strike_Price']
+    # get the zero curve
+    discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time[:-1], shared)
+
+    expiry = daycount_fn(tau)
+    limit = daycount_fn(tau1)
+    need_spot_at_expiry = deal_time.shape[0] - expiry.size
+    spot_prior, spot_at = torch.split(spot, (expiry.size, need_spot_at_expiry))
+    moneyness = strike / spot_prior if invert_moneyness else spot_prior / strike
+    sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
+
+    if factor_dep['Barrier_Monitoring']:
+        adj_barrier = barrier * torch.exp(
+            (2.0 * (barrier > spot[0][0]).type(shared.one.dtype) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
+    else:
+        adj_barrier = barrier
+
+    r = torch.squeeze(discounts.gather_weighted_curve(
+        shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+
+    # cache the expiry tenors
+    expiry_years_key = ('Expiry_Years', tuple(expiry), tuple(limit))
+    if expiry_years_key not in factor_dep:
+        factor_dep[expiry_years_key] = (spot.new(expiry.reshape(-1, 1)), spot.new(limit.reshape(-1, 1)))
+
+    expiry_years, limit_years = factor_dep[expiry_years_key]
+
+    barrier_payoff = buy_or_sell * nominal * getpartialbarrierpayoff(
+        isKnockIn, eta, phi, spot_prior, strike, adj_barrier,
+        deal_data.Instrument.field['Barrier_At_Start'] == 'Yes',
+        limit_years, expiry_years, r, b, sigma)
+
+    if need_spot_at_expiry:
+        # work out barrier
+        if eta == BARRIER_UP:
+            touched = (spot[:-1] < barrier) & (spot[1:] > barrier)
+        else:
+            touched = (spot[:-1] > barrier) & (spot[1:] < barrier)
+
+        # barrier payoff
+        barrier_touched = F.pad((torch.cumsum(touched, axis=0) > 0).type(shared.one.dtype), [0, 0, 1, 0])
+        first_touch = barrier_touched[1:] - barrier_touched[:-1]
+        # final payoff
+        payoff_at = buy_or_sell * torch.relu(phi * (spot_at - strike))
+
+        if direction == BARRIER_IN:
+            forward = spot_prior * torch.exp(b * expiry_years)
+            payoff_prior = utils.black_european_option(
+                forward, strike, sigma, expiry, buy_or_sell, phi, shared) * torch.exp(-r * expiry_years)
+            european_part = barrier_touched * (nominal * torch.cat([payoff_prior, payoff_at], axis=0))
+            barrier_part = (1.0 - barrier_touched) * F.pad(
+                barrier_payoff, [0, 0, 0, 1], value=buy_or_sell * cash_rebate)
+            combined = european_part + barrier_part
+            # settle cashflows (can only happen at the end)
+            cash_settle(shared, payoff_currency, deal_data.Time_dep.deal_time_grid[-1], combined[-1])
+        else:
+            # barrier out
+            barrier_part = (1.0 - barrier_touched) * torch.cat([barrier_payoff, nominal * payoff_at], axis=0)
+            rebate_part = buy_or_sell * cash_rebate * first_touch
+            combined = F.pad(buy_or_sell * cash_rebate * first_touch, [0, 0, 1, 0]) + barrier_part
+            # settle cashflows (The one at expiry)
+            cash_settle(shared, payoff_currency, deal_data.Time_dep.deal_time_grid[-1], barrier_part[-1])
+            # settle cashflows (The potential rebate knockout)
+            if cash_rebate:
+                for cash_index, cash in zip(deal_data.Time_dep.deal_time_grid[1:], rebate_part):
+                    cash_settle(shared, payoff_currency, cash_index, cash)
+    else:
+        combined = barrier_payoff
 
     return combined
 

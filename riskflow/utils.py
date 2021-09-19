@@ -982,6 +982,61 @@ def norm_cdf(x):
     return 0.5 * (torch.erfc(x * -0.7071067811865475))
 
 
+def BivN(P, Q, rho):
+    from scipy.stats import multivariate_normal
+    mvn = np.vectorize(lambda x: multivariate_normal(cov=[[1.0, x], [x, 1.0]]))
+    z2 = mvn(rho)
+    cdf = np.vectorize(lambda z, x, y: z.cdf([x, y]))
+    return cdf(z2, P, Q)
+
+
+def ApproxBivN(P, Q, rho):
+    # this is an approximation of the bivariate normal integral accurate to around 4 decimal
+    # places - based on the paper from A Simple Approximation for Bivariate Normal Integral
+    # Based on Error Function and its Application on Probit Model
+    # with Binary Endogenous Regressor (Wen-Jen Tsay and Peng-Hsuan Ke)
+    # might want to improve the accuracy of this but this is fast and vectorized
+
+    # work out the cases
+    denom = torch.sqrt(1.0 - rho * rho)
+    a = -rho / denom
+    b = P / denom
+    numer = a * Q + b
+
+    case1 = (a > 0.0) & (numer >= 0.0)
+    case2 = (a > 0.0) & (numer < 0.0)
+    case3 = (a < 0.0) & (numer >= 0.0)
+    case4 = (a < 0.0) & (numer < 0.0)
+
+    c1 = -1.0950081470333
+    c2 = -0.75651138383854
+    ma2c2 = 1.0 - a * a * c2
+    sq_ma2c2 = torch.sqrt(ma2c2)
+    a2c1_2 = a * a * c1 * c1
+    q_part = np.sqrt(2) * (Q - a * c2 * (a * Q + b))
+    root4_p = torch.exp((a2c1_2 + 2 * b * (np.sqrt(2) * c1 + b * c2)) / (4.0 * ma2c2)) / (4.0 * sq_ma2c2)
+    root4_m = torch.exp((a2c1_2 - 2 * b * (np.sqrt(2) * c1 - b * c2)) / (4.0 * ma2c2)) / (4.0 * sq_ma2c2)
+    erf2_p = torch.erf((q_part + a * c1) / (2.0 * sq_ma2c2))
+    erf2_m = torch.erf((q_part - a * c1) / (2.0 * sq_ma2c2))
+    erf_p1 = (np.sqrt(2) * b) / (2 * a * sq_ma2c2)
+    erf_p2 = (a * a * c1) / (2 * a * sq_ma2c2)
+    erf1 = torch.erf(erf_p1 + erf_p2)
+    erf3 = torch.erf(erf_p1 - erf_p2)
+
+    cas1 = .5 * (torch.erf(Q / np.sqrt(2)) + torch.erf(b / (np.sqrt(2) * a))) + root4_m * (
+            1.0 - erf3) - root4_p * (erf2_m + erf1)
+    cas2 = root4_m * (1 + erf2_p)
+    cas3 = .5 * (1 + torch.erf(Q / np.sqrt(2))) - root4_p * (1.0 + erf2_m)
+    cas4 = .5 * (1 - torch.erf(b / (np.sqrt(2) * a))) - root4_p * (1.0 - erf1) + root4_m * (erf2_p + erf3)
+
+    final = norm_cdf(P) * norm_cdf(Q)
+    for c, f in zip([cas1, cas2, cas3, cas4], [case1, case2, case3, case4]):
+        if f.any():
+            final[f] = c[f]
+
+    return final
+
+
 def black_european_option_price(F, X, r, vol, tenor, buyOrSell, callOrPut):
     stddev = vol * np.sqrt(tenor)
     sign = 1.0 if (F > 0.0 and X > 0.0) else -1.0
@@ -997,7 +1052,7 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
     if isinstance(tenor, float):
         guard = (vol > 0.0) & (X > 0.0)
         stddev = vol.clamp(min=1e-5) * np.sqrt(tenor)
-        strike = min(X, 1e-5) if isinstance(X, float) else X.clamp(min=1e-5)
+        strike = max(X, 1e-5) if isinstance(X, float) else X.clamp(min=1e-5)
     else:
         guard = vol.new_tensor(tenor > 0.0, dtype=torch.bool)
         tau = np.sqrt(tenor.clip(0.0, np.inf))

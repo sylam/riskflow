@@ -2912,6 +2912,89 @@ class FXBarrierOption(Deal):
         return mtm
 
 
+class FXPartialTimeBarrierOption(Deal):
+    factor_fields = {'Currency': ['FxRate'],
+                     'Underlying_Currency': ['FxRate'],
+                     'Discount_Rate': ['DiscountRate'],
+                     'FX_Volatility': ['FXVol']}
+
+    documentation = ('FX and Equity', ['A partial path dependent FX Option described [here](#partial-barrier-options)'])
+
+    def __init__(self, params, valuation_options):
+        super(FXPartialTimeBarrierOption, self).__init__(params, valuation_options)
+        self.path_dependent = True
+
+    def reset(self, calendars):
+        super(FXPartialTimeBarrierOption, self).reset()
+        self.payoff_ccy = self.field.get('Payoff_Currency', self.field['Currency'])
+        self.add_reval_dates({self.field['Expiry_Date'], self.field['Barrier_Limit_Date']}, self.payoff_ccy)
+
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency'])}
+        field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
+            field['Currency']
+        field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
+
+        field_index = {'Currency': get_fx_and_zero_rate_factor(
+            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Underlying_Currency': get_fx_and_zero_rate_factor(
+                field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Volatility': get_fx_vol_factor(
+                field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Barrier_Monitoring': 0.5826 * np.sqrt(
+                (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0),
+            'Expiry': (self.field['Expiry_Date'] - base_date).days,
+            'Limit_Date': (self.field['Barrier_Limit_Date'] - base_date).days,
+            'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
+            'settlement_currency': 1.0,
+            'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])}
+
+        # discrete barrier monitoring requires adjusting the barrier by 0.58
+        # ( -(scipy.special.zetac(0.5)+1)/np.sqrt(2.0*np.pi) ) * sqrt (monitoring freq)
+
+        return field_index
+
+    def generate(self, shared, time_grid, deal_data):
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        nominal = deal_data.Instrument.field['Underlying_Amount']
+        payoff_currency = deal_data.Instrument.payoff_ccy
+
+        curr_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
+        und_curr_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Underlying_Currency'][1], deal_time[:-1], shared)
+
+        spot = utils.calc_fx_cross(deal_data.Factor_dep['Underlying_Currency'][0],
+                                   deal_data.Factor_dep['Currency'][0], deal_time, shared)
+
+        # need to adjust if there's just 1 timepoint - i.e. base reval
+        if time_grid.mtm_time_grid.size > 1:
+            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
+            tau1 = (deal_data.Factor_dep['Limit_Date'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
+        else:
+            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+            tau1 = (deal_data.Factor_dep['Limit_Date'] - deal_time[:, utils.TIME_GRID_MTM])
+
+        b = torch.squeeze(
+            curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
+            und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+
+        fx_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
+
+        pv = pricing.pv_partial_barrier_option(
+            shared, time_grid, deal_data, nominal, spot, b, tau, tau1, payoff_currency,
+            invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
+
+        mtm = pv * fx_rep
+
+        return mtm
+
+
 class FXOptionDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Underlying_Currency': ['FxRate'],
