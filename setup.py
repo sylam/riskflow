@@ -22,7 +22,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     python_requires='>=3.6',
-    install_requires=['numpy>=1.16', 'scipy>=1.3', 'pandas>=0.24', 'matplotlib>=2.0', 'tensorflow==1.14.0',
+    install_requires=['numpy>=1.16', 'scipy>=1.3', 'pandas>=0.24', 'matplotlib>=2.0', 'tensorflow==2.5.3',
                       'python-markdown-math>=0.6'],
     entry_points={
         'console_scripts': [
