@@ -661,85 +661,86 @@ class NettingCollateralSet(Deal):
             # handle equity collateral
             collateral_defined = False
             field_index['Equity_Collateral'] = []
-
-            if self.field.get('Collateral_Assets', {}).get('Equity_Collateral'):
-                collateral_equity = self.field['Collateral_Assets']['Equity_Collateral']
-
-                for col_equity in collateral_equity:
-                    equity_rate = utils.check_rate_name(col_equity['Equity'])
-                    field_index['Equity_Collateral'].append(
-                        utils.Collateral(Haircut=float(col_equity['Haircut_Posted']),
-                                         Amount=col_equity['Units'],
-                                         Currency=get_equity_currency_factor(
-                                             equity_rate, static_offsets, stochastic_offsets, all_factors),
-                                         Funding_Rate=None, Collateral_Rate=None,
-                                         Collateral=get_equity_rate_factor(
-                                             equity_rate, static_offsets, stochastic_offsets))
-                    )
-                collateral_defined = True
-
             # handle bond collateral
             field_index['Bond_Collateral'] = []
-
-            if self.field.get('Collateral_Assets', {}).get('Bond_Collateral'):
-                collateral_bond = self.field['Collateral_Assets']['Bond_Collateral']
-
-                for col_bond in collateral_bond:
-                    if np.array(list(col_bond['Coupon_Interval'].kwds.values())).any():
-                        reset_dates = generate_dates_backward(
-                            base_date + col_bond['Maturity'], base_date, col_bond['Coupon_Interval'])
-                    else:
-                        reset_dates = np.array([base_date, base_date + col_bond['Maturity']])
-                    fixed_cash = utils.generate_fixed_cashflows(
-                        base_date, reset_dates, col_bond['Principal'], None, 0, float(col_bond['Coupon_Rate']))
-                    # make sure there's a nominal repayment at maturity
-                    fixed_cash.add_fixed_payments(base_date, 'Maturity', base_date, 0, col_bond['Principal'])
-                    discount = get_interest_factor(utils.check_rate_name(col_bond['Discount_Rate']),
-                                                   static_offsets, stochastic_offsets,
-                                                   all_tenors)
-                    time_index = np.searchsorted(time_grid.mtm_time_grid, (max(reset_dates) - base_date).days)
-
-                    field_index['Bond_Collateral'].append(
-                        utils.Collateral(Haircut=float(col_bond['Haircut_Posted']),
-                                         Amount=1,
-                                         Currency=get_fxrate_factor(
-                                             utils.check_rate_name(col_bond['Currency']),
-                                             static_offsets, stochastic_offsets),
-                                         Funding_Rate=None, Collateral_Rate=None,
-                                         Collateral=utils.DealDataType(
-                                             Instrument=None,
-                                             Factor_dep={'Cashflows': fixed_cash, 'Discount': discount},
-                                             Time_dep=utils.DealTimeDependencies(
-                                                 time_grid.mtm_time_grid, np.arange(time_index)),
-                                             Calc_res=None))
-                    )
-                collateral_defined = True
-
             # get the collateral currency loaded
             field_index['Cash_Collateral'] = []
 
-            if self.field.get('Collateral_Assets', {}).get('Cash_Collateral'):
-                collateral_cash = self.field['Collateral_Assets']['Cash_Collateral']
-                for col_cash in collateral_cash:
-                    field_index['Cash_Collateral'].append(
-                        utils.Collateral(Haircut=float(col_cash['Haircut_Posted']),
-                                         Amount=col_cash['Amount'],
-                                         Currency=get_fxrate_factor(
-                                             utils.check_rate_name(col_cash['Currency']),
-                                             static_offsets, stochastic_offsets),
-                                         Funding_Rate=get_interest_factor(
-                                             utils.check_rate_name(
-                                                 col_cash['Funding_Rate']), static_offsets,
-                                             stochastic_offsets, all_tenors)
-                                         if col_cash.get('Funding_Rate') else None,
-                                         Collateral_Rate=get_interest_factor(
-                                             utils.check_rate_name(
-                                                 col_cash['Collateral_Rate']),
-                                             static_offsets, stochastic_offsets, all_tenors)
-                                         if col_cash.get('Collateral_Rate') else None,
-                                         Collateral=1.0)
-                    )
-                collateral_defined = True
+            collateral_assets = self.field.get('Collateral_Assets')
+
+            if collateral_assets:
+                if collateral_assets.get('Equity_Collateral'):
+                    collateral_equity = self.field['Collateral_Assets']['Equity_Collateral']
+
+                    for col_equity in collateral_equity:
+                        equity_rate = utils.check_rate_name(col_equity['Equity'])
+                        field_index['Equity_Collateral'].append(
+                            utils.Collateral(Haircut=float(col_equity['Haircut_Posted']),
+                                             Amount=col_equity['Units'],
+                                             Currency=get_equity_currency_factor(
+                                                 equity_rate, static_offsets, stochastic_offsets, all_factors),
+                                             Funding_Rate=None, Collateral_Rate=None,
+                                             Collateral=get_equity_rate_factor(
+                                                 equity_rate, static_offsets, stochastic_offsets))
+                        )
+                    collateral_defined = True
+
+                if collateral_assets.get('Bond_Collateral'):
+                    collateral_bond = self.field['Collateral_Assets']['Bond_Collateral']
+
+                    for col_bond in collateral_bond:
+                        if np.array(list(col_bond['Coupon_Interval'].kwds.values())).any():
+                            reset_dates = generate_dates_backward(
+                                base_date + col_bond['Maturity'], base_date, col_bond['Coupon_Interval'])
+                        else:
+                            reset_dates = np.array([base_date, base_date + col_bond['Maturity']])
+                        fixed_cash = utils.generate_fixed_cashflows(
+                            base_date, reset_dates, col_bond['Principal'], None, 0, float(col_bond['Coupon_Rate']))
+                        # make sure there's a nominal repayment at maturity
+                        fixed_cash.add_fixed_payments(base_date, 'Maturity', base_date, 0, col_bond['Principal'])
+                        discount = get_interest_factor(utils.check_rate_name(col_bond['Discount_Rate']),
+                                                       static_offsets, stochastic_offsets,
+                                                       all_tenors)
+                        time_index = np.searchsorted(time_grid.mtm_time_grid, (max(reset_dates) - base_date).days)
+
+                        field_index['Bond_Collateral'].append(
+                            utils.Collateral(Haircut=float(col_bond['Haircut_Posted']),
+                                             Amount=1,
+                                             Currency=get_fxrate_factor(
+                                                 utils.check_rate_name(col_bond['Currency']),
+                                                 static_offsets, stochastic_offsets),
+                                             Funding_Rate=None, Collateral_Rate=None,
+                                             Collateral=utils.DealDataType(
+                                                 Instrument=None,
+                                                 Factor_dep={'Cashflows': fixed_cash, 'Discount': discount},
+                                                 Time_dep=utils.DealTimeDependencies(
+                                                     time_grid.mtm_time_grid, np.arange(time_index)),
+                                                 Calc_res=None))
+                        )
+                    collateral_defined = True
+
+                if collateral_assets.get('Cash_Collateral'):
+                    collateral_cash = self.field['Collateral_Assets']['Cash_Collateral']
+                    for col_cash in collateral_cash:
+                        field_index['Cash_Collateral'].append(
+                            utils.Collateral(Haircut=float(col_cash['Haircut_Posted']),
+                                             Amount=col_cash['Amount'],
+                                             Currency=get_fxrate_factor(
+                                                 utils.check_rate_name(col_cash['Currency']),
+                                                 static_offsets, stochastic_offsets),
+                                             Funding_Rate=get_interest_factor(
+                                                 utils.check_rate_name(
+                                                     col_cash['Funding_Rate']), static_offsets,
+                                                 stochastic_offsets, all_tenors)
+                                             if col_cash.get('Funding_Rate') else None,
+                                             Collateral_Rate=get_interest_factor(
+                                                 utils.check_rate_name(
+                                                     col_cash['Collateral_Rate']),
+                                                 static_offsets, stochastic_offsets, all_tenors)
+                                             if col_cash.get('Collateral_Rate') else None,
+                                             Collateral=1.0)
+                        )
+                    collateral_defined = True
 
             if not collateral_defined:
                 # default the collateral to the be balance currency

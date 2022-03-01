@@ -28,8 +28,10 @@ from scipy.interpolate import RectBivariateSpline
 # map the names of various factor interpolations to something simpler
 factor_interp_map = {
     'CubicSplineCurveInterpolation': 'Hermite',
+    'HermiteInterpolationCurveGetValue': 'Hermite',
     'LinearInterFlatExtrapCurveGetValue': 'Linear',
-    'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT'
+    'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT',
+    'HermiteRTInterpolationCurveGetValue': 'HermiteRT'
 }
 
 class Factor0D(object):
@@ -864,6 +866,7 @@ class InterestYieldVol(Factor3D):
 
     def __init__(self, param):
         super(InterestYieldVol, self).__init__(param)
+        self.delta = 0.0
         self.atm_surface = None
         self.premiums = None
 
@@ -884,6 +887,8 @@ class InterestYieldVol(Factor3D):
             for property_alias in Property_Aliases:
                 if 'BlackScholesDisplacedShiftValue' in property_alias:
                     return property_alias['BlackScholesDisplacedShiftValue']
+        elif self.premiums is not None:
+            return self.premiums['Shift'].apply(lambda x: float(x.replace('%', ''))).unique()[0]
         return shift_value
 
     @property

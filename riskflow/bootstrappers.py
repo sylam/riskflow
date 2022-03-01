@@ -200,9 +200,14 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
         # first check if we have the actual premium (not implied)
         if vol_surface.premiums is not None:
             swaption_price = vol_surface.get_premium(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
+            if vol_surface.delta:
+                implied_vol = scipy.optimize.brentq(lambda v: pvbp * utils.black_european_option_price(
+                    shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol+.5)
+                swaption_price = pvbp * utils.black_european_option_price(
+                    shifted_strike, shifted_strike, 0.0, implied_vol+vol_surface.delta, expiry, 1.0, 1.0)
         else:
             swaption_price = pvbp * utils.black_european_option_price(
-                shifted_strike, shifted_strike, 0.0, vol, expiry, 1.0, 1.0)
+                shifted_strike, shifted_strike, 0.0, vol+vol_surface.delta, expiry, 1.0, 1.0)
 
         # store this
         all_deals[swaption_name] = market_swap_class(
@@ -531,6 +536,7 @@ class RiskNeutralInterestRateModel(object):
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
                     swaptionvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
+                    swaptionvol.delta = sys_params.get('Swaption_Volatility_Delta', 0.0)
                     ir_curve = riskfactors.construct_factor(ir_factor, price_factors, factor_interp)
                     swaptionvol.set_premiums(ATM_Premiums, ir_curve.get_currency())
                 except KeyError as k:

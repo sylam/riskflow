@@ -73,7 +73,7 @@ def get_grid_grammar():
     grid = delimitedList(Group(period + Optional(lpar + period + rpar)),
                          delim=' ').leaveWhitespace().setParseAction(push_date_grid)
 
-    return grid
+    return grid, period
 
 
 class ModelParams(object):
@@ -215,7 +215,7 @@ class Context(object):
 
         # make sure that there are no default calibration mappings
         self.calibration_process_map = {}
-        self.gridparser = get_grid_grammar()
+        self.gridparser, self.periodparser = get_grid_grammar()
 
     def parse_grid(self, run_date, max_date, grid, past_max_date=False):
         """
@@ -729,6 +729,62 @@ class Context(object):
 
             for col in self.archive.columns:
                 self.archive_columns.setdefault(col.split(',')[0], []).append(col)
+
+    def parse_arena_json(self, filename):
+
+        def as_internal(dct):
+            if '.Curve' in dct:
+                return utils.Curve(dct['.Curve']['meta'], dct['.Curve']['data'])
+            elif '.Percent' in dct:
+                return utils.Percent(dct['.Percent'])
+            elif '.Deal' in dct:
+                return construct_instrument(dct['.Deal'], self.params['Valuation Configuration'])
+            elif '.Basis' in dct:
+                return utils.Basis(dct['.Basis'])
+            elif '.Descriptor' in dct:
+                return utils.Descriptor(dct['.Descriptor'])
+            elif '.DateList' in dct:
+                return utils.DateList(OrderedDict([(Timestamp(date), val) for date, val in dct['.DateList']]))
+            elif '.DateEqualList' in dct:
+                return utils.DateEqualList([[Timestamp(values[0])] + values[1:] for values in dct['.DateEqualList']])
+            elif '.CreditSupportList' in dct:
+                return utils.CreditSupportList(dct['.CreditSupportList'])
+            elif '.DateOffset' in dct and '.Offset' in dct:
+                return [self.periodparser.parseString(dct['.DateOffset'])[0],
+                        self.periodparser.parseString(dct['.Offset'])[0]]
+            elif '.DateOffset' in dct:
+                return self.periodparser.parseString(dct['.DateOffset'])[0]
+            elif '.Grid' in dct:
+                return utils.Offsets([(x if isinstance(x, list) else [x]) for x in dct['.Grid']])
+            elif '.Timestamp' in dct:
+                return Timestamp(dct['.Timestamp'])
+            elif '.ModelParams' in dct:
+                return ModelParams((dct['.ModelParams']['modeldefaults'], dct['.ModelParams']['modelfilters']))
+            return dct
+
+        with open(filename, 'rt') as f:
+            data = json.load(f, object_hook=as_internal)
+
+        if 'MergeMarketData' in data['Calc']:
+            market_data = data['Calc']['MergeMarketData']
+
+            # update the marketdata file - if necessary, load and cache the marketdata file
+            # stored here - market_data['MarketDataFile'] - TODO
+
+            for section, section_data in market_data['ExplicitMarketData'].items():
+                self.params[section].update(section_data)
+            self.version = 'arena_json'
+
+        if 'Deals' in data['Calc']:
+            self.deals = {'Attributes': {
+                'Tag_Titles': data['Calc']['Deals']['Tag_Titles'],
+                'Reference': data['Calc']['Deals']['Reference']}}
+            self.deals.update({'Deals': data['Calc']['Deals']['Deals']})
+            self.deals.update({'Calculation': data['Calc']['Calculation']})
+
+        if 'CalendDataFile' in data['Calc']:
+            # parse calendar file
+            self.parse_calendar_file(data['Calc']['CalendDataFile'])
 
     def write_marketdata_json(self, json_filename):
         # backup old data

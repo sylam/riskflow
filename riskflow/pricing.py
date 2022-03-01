@@ -1379,11 +1379,14 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
                     int_i = interest[:, offst]
 
                     if mtm_currency:
-                        total += int_i * Pi + (Pi - Pi_1)
+                        total = total + int_i * Pi + (Pi - Pi_1)
                     elif factor_dep['CompoundingMethod'] == 'Include_Margin':
-                        total += int_i * (total + nominal[offst].reshape(1, -1, 1))
+                        total = total + int_i * (total + nominal[offst].reshape(1, -1, 1))
                     elif factor_dep['CompoundingMethod'] == 'Flat':
-                        total += (int_i * nominal[offst].reshape(1, -1, 1)) + total * (
+                        total = total + (int_i * nominal[offst].reshape(1, -1, 1)) + total * (
+                                int_i - margin[offst].reshape(1, -1, 1))
+                    elif factor_dep['CompoundingMethod'] == 'Exclude_Margin':
+                        total = total + (int_i * nominal[offst].reshape(1, -1, 1)) + total * (
                                 int_i - margin[offst].reshape(1, -1, 1))
                     else:
                         raise Exception('Floating cashflow list method not implemented')

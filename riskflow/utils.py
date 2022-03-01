@@ -950,7 +950,7 @@ class TensorBlock(object):
 def filter_data_frame(df, from_date, to_date, rate=None):
     index1 = (pd.Timestamp(from_date) - excel_offset).days
     index2 = (pd.Timestamp(to_date) - excel_offset).days
-    return df.ix[index1:index2] if rate is None else df.ix[index1:index2][
+    return df.loc[index1:index2] if rate is None else df.loc[index1:index2][
         [col for col in df.columns if col.startswith(rate)]]
 
 
