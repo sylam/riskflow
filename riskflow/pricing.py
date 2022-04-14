@@ -424,6 +424,8 @@ def interpolate(mtm, shared, time_grid, deal_data):
     # check if we want to store the mtm value for this instrument
     if deal_data.Calc_res is not None:
         deal_data.Calc_res['Value'] = mtm
+        # store the mtm as an array
+        deal_data.Calc_res.setdefault('MTM', []).append(mtm.detach().numpy().astype(np.float64).sum(axis=1))
         # if shared.calc_greeks is not None:
         #    greeks(shared, deal_data, mtm)
 
@@ -927,12 +929,11 @@ def pv_partial_barrier_option(shared, time_grid, deal_data, nominal,
     return combined
 
 
-def pv_european_option(shared, time_grid, deal_data, nominal, spot, forward, invert_moneyness=False):
+def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward):
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
     daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
-    moneyness = factor_dep['Strike_Price'] / spot if invert_moneyness else spot / factor_dep['Strike_Price']
     expiry = daycount_fn(factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
     vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 

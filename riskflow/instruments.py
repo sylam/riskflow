@@ -1438,7 +1438,7 @@ class StructuredDeal(Deal):
             mtm = child.Instrument.calculate(shared, time_grid, child)
             net_mtm += mtm
 
-        return net_mtm
+        return pricing.interpolate(net_mtm, shared, time_grid, deal_data)
 
     def generate(self, shared, time_grid, deal_data):
         return 0.0
@@ -1477,7 +1477,7 @@ class SwapInterestDeal(Deal):
         field['Interest_Rate'] = utils.check_rate_name(
             self.field['Interest_Rate']) if self.field['Interest_Rate'] else field['Discount_Rate']
 
-        field_index = {}
+        field_index = {'SettleCurrency': self.field['Currency']}
         self.isQuanto = get_interest_rate_currency(field['Interest_Rate'], all_factors) != field['Currency']
         if self.isQuanto:
             # TODO - Deal with Quanto Interest Rate swaps
@@ -1487,7 +1487,8 @@ class SwapInterestDeal(Deal):
                                                          all_tenors)
             field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
                                                           all_tenors, all_factors)
-            field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
+            field_index['Currency'] = get_fx_and_zero_rate_factor(
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         if self.field['Pay_Rate_Type'] == 'Fixed':
             field_index['FixedCashflows'] = utils.generate_fixed_cashflows(
@@ -1506,18 +1507,27 @@ class SwapInterestDeal(Deal):
                 self.field['Known_Rates'], self.field['Pay_Interest_Frequency'], self.field['Index_Tenor'],
                 utils.get_day_count(self.field['Pay_Day_Count']), self.field['Floating_Margin'] / 10000.0)
 
-        field_index['CompoundingMethod'] = utils.CASHFLOW_CompoundingMethodLookup[self.field['Compounding_Method']]
-        field_index['Fixed_Compounding'] = utils.CASHFLOW_METHOD_Fixed_Compounding_Yes \
-            if self.field['Fixed_Compounding'] == 'Yes' else utils.CASHFLOW_METHOD_Fixed_Compounding_No
+        field_index['CompoundingMethod'] = self.field.get('Compounding_Method', 'None')
         field_index['InterestYieldVol'] = np.zeros(1, dtype=np.int32)
-        field_index['FixedStartIndex'] = field_index['FixedCashflows'].get_cashflow_start_index(time_grid)
-        field_index['FloatStartIndex'] = field_index['FloatCashflows'].get_cashflow_start_index(time_grid)
 
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
-        # TODO - Complete the definintion of the IRS
-        return pricing.pv_fixed_leg(shared, time_grid, deal_data) + pricing.pv_float_leg(shared, time_grid, deal_data)
+        fixed = deal_data.Factor_dep.copy()
+        fixed['Cashflows'] = fixed['FixedCashflows']
+        fixed['Compounding'] = self.field['Fixed_Compounding'] == 'Yes'
+        fixed_leg = pricing.pv_fixed_leg(shared, time_grid, utils.DealDataType(
+            Instrument=deal_data.Instrument, Factor_dep=fixed,
+            Time_dep=deal_data.Time_dep, Calc_res=deal_data.Calc_res))
+
+        float = deal_data.Factor_dep.copy()
+        float['Cashflows'] = float['FloatCashflows']
+        float['Model'] = pricing.pricer_float_cashflows
+        float_leg = pricing.pv_float_leg(shared, time_grid, utils.DealDataType(
+            Instrument=deal_data.Instrument, Factor_dep=float,
+            Time_dep=deal_data.Time_dep, Calc_res=deal_data.Calc_res))
+
+        return fixed_leg+float_leg
 
 
 class CFFixedInterestListDeal(Deal):
@@ -1692,6 +1702,10 @@ class CFFloatingInterestListDeal(Deal):
 
         field_index['CompoundingMethod'] = self.field['Cashflows'].get('Compounding_Method', 'None')
 
+        # check if the CompoundingMethod is null (None)
+        if field_index['CompoundingMethod'] is None:
+            field_index['CompoundingMethod'] = 'None'
+
         # potentially compress the cashflow list for faster computation
         if field_index['CompoundingMethod'] == 'None' and self.options.get('OIS_Cashflow_Group_Size', 0) > 0:
             field_index['Cashflows'] = utils.compress_no_compounding(
@@ -1699,9 +1713,10 @@ class CFFloatingInterestListDeal(Deal):
         else:
             field_index['Cashflows'] = float_cashflows
 
+        field_index['Model'] = pricing.pricer_float_cashflows
         if self.field['Cashflows'].get('Properties'):
             first_prop = self.field['Cashflows']['Properties'][0]
-            if first_prop.get('Cap_Multiplier') is not None or first_prop.get('Floor_Multiplier') is not None:
+            if first_prop.get('Cap_Multiplier', 0.0) or first_prop.get('Floor_Multiplier', 0.0):
                 field_index['Model'] = pricing.pricer_cap if first_prop.get(
                     'Cap_Multiplier') is not None else pricing.pricer_floor
                 field_index['VolSurface'] = get_interest_vol_factor(
@@ -1712,8 +1727,6 @@ class CFFloatingInterestListDeal(Deal):
                     utils.CASHFLOW_INDEX_Strike,
                     float(first_prop['Cap_Strike']) if
                     first_prop.get('Cap_Multiplier') is not None else float(first_prop['Floor_Strike']))
-        else:
-            field_index['Model'] = pricing.pricer_float_cashflows
 
         return field_index
 
@@ -2367,9 +2380,10 @@ class EquityOptionDeal(Deal):
         forward = utils.calc_eq_forward(
             deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
             deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
+        moneyness = spot / deal_data.Factor_dep['Strike_Price']
 
         mtm = pricing.pv_european_option(
-            shared, time_grid, deal_data, self.field['Units'], spot, forward) * fx_rep
+            shared, time_grid, deal_data, self.field['Units'], moneyness, forward) * fx_rep
 
         return mtm
 
@@ -3046,16 +3060,15 @@ class FXOptionDeal(Deal):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
                                      deal_time, shared)
-        spot = utils.calc_fx_cross(
-            deal_data.Factor_dep['Underlying_Currency'][0],
-            deal_data.Factor_dep['Currency'][0], deal_time, shared)
         forward = utils.calc_fx_forward(
             deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
             deal_data.Factor_dep['Expiry'], deal_time, shared)
 
+        moneyness = deal_data.Factor_dep['Strike_Price'] / forward if deal_data.Factor_dep['Invert_Moneyness']\
+            else forward / deal_data.Factor_dep['Strike_Price']
+
         mtm = pricing.pv_european_option(
-            shared, time_grid, deal_data, self.field['Underlying_Amount'],
-            spot, forward, invert_moneyness=deal_data.Factor_dep['Invert_Moneyness']) * fx_rep
+            shared, time_grid, deal_data, self.field['Underlying_Amount'], moneyness, forward) * fx_rep
 
         return mtm
 

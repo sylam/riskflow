@@ -656,6 +656,55 @@ class Credit_Monte_Carlo(Calculation):
         self.time_grid.set_currency_settlement(settlement_currencies)
         self.settlement_currencies = settlement_currencies
 
+    def calc_individual_FVA(self, params, spreads, discount_curves):
+
+        def calc_approx_fva(exp_mtm, time_grid, spread, delta_t, collateral):
+            return np.sum([spread[s] * mtm * np.exp(-(t / 365.0) * collateral.current_value(t / 365.0)) for mtm, s, t in
+                           zip(exp_mtm, delta_t, time_grid)])
+
+        def report(deal, num_scenario, num_tags):
+            empty = ','.join(['None'] * num_tags)
+            tags = deal.Instrument.field.get('Tags', empty)
+            expiry = max(deal.Instrument.get_reval_dates()).strftime('%Y-%m-%d')
+            return [deal.Instrument.field['Reference'], expiry] + (tags if isinstance(tags, list) else [empty])[
+                0].split(',') + [np.sum(deal.Calc_res['MTM'], axis=0) / num_scenario]
+
+        # Ask for deal level mtm's
+        params['DealLevel'] = True
+        tag_headings = self.config.deals['Attributes'].get('Tag_Titles', '').split(',')
+        base_results = self.execute(params)
+        deals = base_results['Netting'].sub_structures[0].dependencies + [
+            y.obj for y in base_results['Netting'].sub_structures[0].sub_structures]
+        mtms = [report(x, self.numscenarios, len(tag_headings)) for x in deals]
+        time_grid = base_results['Netting'].sub_structures[0].obj.Time_dep.deal_time_grid
+        days = self.time_grid.time_grid[:, 1][time_grid]
+        funding = construct_factor(utils.Factor('InterestRate', (discount_curves['funding'],)),
+                                   self.config.params['Price Factors'],
+                                   self.config.params['Price Factor Interpolation'])
+        collateral = construct_factor(utils.Factor('InterestRate', (discount_curves['collateral'],)),
+                                      self.config.params['Price Factors'],
+                                      self.config.params['Price Factor Interpolation'])
+        delta_t = np.diff(days)
+        all_spread = {k: {} for k in spreads.keys()}
+
+        for k, v in all_spread.items():
+            funding_spread = 0.0001 * spreads[k].get('funding', 0.0)
+            collateral_spread = 0.0001 * spreads[k].get('collateral', 0.0)
+            for s in np.unique(delta_t):
+                v[s] = np.exp((s / 365.0) * ((funding.current_value(s / 365.0) + funding_spread) - (
+                        collateral.current_value(s / 365.0) + collateral_spread))) - 1.0
+
+        results = []
+        output = sorted(all_spread.items())
+
+        for mtm in mtms:
+            results.append(
+                mtm[:-1] + [mtm[-1][0]] + [
+                    calc_approx_fva(mtm[-1], days, spread, delta_t, collateral) for name, spread in output])
+
+        return pd.DataFrame(
+            results, columns=['Reference', 'Expiry'] + tag_headings + ['MTM'] + [x[0] for x in output])
+
     def get_cholesky_decomp(self):
         # create the correlation matrix
         correlation_matrix = np.eye(self.num_factors, dtype=np.float64)
@@ -1129,10 +1178,10 @@ class Base_Revaluation(Calculation):
                     if k.startswith('Greeks'):
                         greeks.setdefault(k, []).append(
                             self.gradients_as_df(v, header=deal.Instrument.field.get('Reference')))
-                    else:
+                    elif k == 'Value':
                         data[k] = float(v)
                 # update any tags
-                if deal.Instrument.field.get('Tags') is not None:
+                if deal.Instrument.field.get('Tags'):
                     data.update(dict(zip(tag_titles, deal.Instrument.field['Tags'][0].split(','))))
 
             block = []
@@ -1187,8 +1236,8 @@ class Base_Revaluation(Calculation):
 
         self.calc_stats['Deal_Setup_Time'] = time.monotonic()
         self.netting_sets = DealStructure(Aggregation('root'), deal_level_mtm=True)
-        self.set_deal_structures(self.config.deals['Deals']['Children'], self.netting_sets, 1, 1,
-                                 deal_level_mtm=True)
+        self.set_deal_structures(
+            self.config.deals['Deals']['Children'], self.netting_sets, 1, 1, deal_level_mtm=True)
 
         # record the (pure python) dependency setup time
         self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']

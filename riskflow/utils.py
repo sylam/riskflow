@@ -126,10 +126,6 @@ CASHFLOW_IndexMethodLookup = {'IndexReference2M': CASHFLOW_METHOD_IndexReference
                               'IndexReferenceInterpolated3M': CASHFLOW_METHOD_IndexReferenceInterpolated3M,
                               'IndexReferenceInterpolated4M': CASHFLOW_METHOD_IndexReferenceInterpolated4M}
 
-CASHFLOW_CompoundingMethodLookup = {'None': CASHFLOW_METHOD_Compounding_None,
-                                    'Flat': CASHFLOW_METHOD_Compounding_Flat,
-                                    'Include_Margin': CASHFLOW_METHOD_Compounding_Include_Margin}
-
 # reset codes - note that the first 3 fields correspond with the TIME_GRID
 # (so that a reset can be treated as a timepoint)
 RESET_INDEX_Time_Grid = 0

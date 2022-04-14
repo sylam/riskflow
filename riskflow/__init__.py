@@ -129,7 +129,7 @@ def run_baseval(context, prec=torch.float64, overrides=None):
     return calc, out
 
 
-def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, CollVA=False):
+def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, CollVA=False, LegacyFVA=False):
     """
     Runs a credit monte carlo calculation on the provided context
     :param context: a Context object
@@ -185,11 +185,14 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         del params_mc['CollVA']
 
     calc = construct_calculation('Credit_Monte_Carlo', context, device=device, prec=prec)
-    out = calc.execute(params_mc)
-    exposure = out['Results']['mtm'].clip(0.0, np.inf)
-    dates = np.array(sorted(calc.time_grid.mtm_dates))[
-        calc.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
+    if LegacyFVA:
+        return calc, params_mc
+    else:
+        out = calc.execute(params_mc)
+        exposure = out['Results']['mtm'].clip(0.0, np.inf)
+        dates = np.array(sorted(calc.time_grid.mtm_dates))[
+            calc.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
 
-    res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(exposure, 95, axis=1)}, index=dates)
+        res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(exposure, 95, axis=1)}, index=dates)
 
-    return calc, out, res
+        return calc, out, res

@@ -131,6 +131,10 @@ class Factor2D(object):
     """Represents a risk factor that's a surface (2D) - Currently this is only vol surfaces"""
 
     def __init__(self, param):
+        # default empty surfaces to 1%
+        if not param['Surface'].array.any():
+            param['Surface'].array = np.array([[0, 0, 0.01]])
+
         self.param = param
         self.flat = None
         self.index_map = OrderedDict()
