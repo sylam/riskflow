@@ -667,8 +667,8 @@ def getpartialbarrierpayoff(isKnockIn, eta, phi, spot, strike, barrier, startBar
         return pv
 
 
-def pv_barrier_option(shared, time_grid, deal_data, nominal,
-                      spot, b, tau, payoff_currency, invert_moneyness=False):
+def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
+                      tau, payoff_currency, invert_moneyness=False, use_forwards=False):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
 
     factor_dep = deal_data.Factor_dep
@@ -689,7 +689,19 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal,
     expiry = daycount_fn(tau)
     need_spot_at_expiry = deal_time.shape[0] - expiry.size
     spot_prior, spot_at = torch.split(spot, (expiry.size, need_spot_at_expiry))
-    moneyness = strike / spot_prior if invert_moneyness else spot_prior / strike
+    # cache the expiry tenors
+    expiry_years_key = ('Expiry_Years', tuple(expiry))
+    if expiry_years_key not in factor_dep:
+        factor_dep[expiry_years_key] = spot.new(expiry.reshape(-1, 1))
+
+    expiry_years = factor_dep[expiry_years_key]
+
+    if use_forwards:
+        forward = spot_prior * torch.exp(b * expiry_years)
+        moneyness = strike / forward if invert_moneyness else forward / strike
+    else:
+        moneyness = strike / spot_prior if invert_moneyness else spot_prior / strike
+
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     if factor_dep['Barrier_Monitoring']:
@@ -704,12 +716,6 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal,
     r = torch.squeeze(discounts.gather_weighted_curve(
         shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
-    # cache the expiry tenors
-    expiry_years_key = ('Expiry_Years', tuple(expiry))
-    if expiry_years_key not in factor_dep:
-        factor_dep[expiry_years_key] = spot.new(expiry.reshape(-1, 1))
-
-    expiry_years = factor_dep[expiry_years_key]
     barrier_payoff = buy_or_sell * nominal * barrierOption(
         sigma, expiry_years, cash_rebate / nominal, b, r, spot_prior)
 
@@ -753,8 +759,8 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal,
     return combined
 
 
-def pv_one_touch_option(shared, time_grid, deal_data, nominal,
-                        spot, b, tau, payoff_currency, invert_moneyness=False):
+def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
+                        tau, payoff_currency, invert_moneyness=False, use_forwards=False):
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
@@ -771,7 +777,19 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal,
     expiry = daycount_fn(tau)
     need_spot_at_expiry = deal_time.shape[0] - expiry.size
     spot_prior, spot_at = torch.split(spot, (expiry.size, need_spot_at_expiry))
-    moneyness = barrier / spot_prior if invert_moneyness else spot_prior / barrier
+    # cache the expiry tenors
+    expiry_years_key = ('Expiry_Years', tuple(expiry))
+    if expiry_years_key not in factor_dep:
+        factor_dep[expiry_years_key] = spot.new(expiry.reshape(-1, 1))
+
+    expiry_years = factor_dep[expiry_years_key]
+
+    if use_forwards:
+        forward = spot_prior * torch.exp(b * expiry_years)
+        moneyness = barrier / forward if invert_moneyness else forward / barrier
+    else:
+        moneyness = barrier / spot_prior if invert_moneyness else spot_prior / barrier
+
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     if factor_dep['Barrier_Monitoring']:
@@ -783,12 +801,6 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal,
     r = torch.squeeze(discounts.gather_weighted_curve(
         shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
-    # cache the expiry tenors
-    expiry_years_key = ('Expiry_Years', tuple(expiry))
-    if expiry_years_key not in factor_dep:
-        factor_dep[expiry_years_key] = spot.new(expiry.reshape(-1, 1))
-
-    expiry_years = factor_dep[expiry_years_key]
     root_tau = torch.sqrt(expiry_years)
     mu = b / sigma - 0.5 * sigma
     log_vol = torch.log(barrier / spot_prior) / sigma
@@ -954,8 +966,8 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
     return value * discount_rates
 
 
-def pv_discrete_asian_option(shared, time_grid, deal_data, nominal,
-                             spot, forward, past_factor_list, invert_moneyness=False):
+def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forward,
+                             past_factor_list, invert_moneyness=False, use_forwards=False):
     mtm_list = []
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
@@ -993,8 +1005,8 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal,
 
     start_index, counts = np.unique(start_idx, return_counts=True)
 
-    for index, (discount_block, spot_block, carry_block) in enumerate(
-            utils.split_counts([discount, spot, b], counts, shared)):
+    for index, (discount_block, spot_block, forward_block, carry_block) in enumerate(
+            utils.split_counts([discount, spot, forward, b], counts, shared)):
         t_block = discount_block.time_grid
         sample_index_t = start_index[index]
         tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
@@ -1014,7 +1026,8 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal,
             axis=0)
 
         strike_bar = factor_dep['Strike'] - average.reshape(1, -1).expand(counts[index], -1)
-        moneyness = (strike_bar / normalize) / spot_block if invert_moneyness else spot_block / (
+        moneyness_block = forward_block if use_forwards else spot_block
+        moneyness = (strike_bar / normalize) / moneyness_block if invert_moneyness else moneyness_block / (
                 strike_bar / normalize)
         vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, daycount_fn(tenor_block), shared)
 

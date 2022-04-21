@@ -2261,7 +2261,7 @@ class FXDiscreteExplicitAsianOption(Deal):
         mtm = pricing.pv_discrete_asian_option(
             shared, time_grid, deal_data, self.field['Underlying_Amount'], spot,
             forward, [deal_data.Factor_dep['Underlying_Currency'][0], deal_data.Factor_dep['Currency'][0]],
-            invert_moneyness=deal_data.Factor_dep['Invert_Moneyness']) * FX_rep
+            invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'], use_forwards=True) * FX_rep
 
         return mtm
 
@@ -2823,8 +2823,8 @@ class FXOneTouchOption(Deal):
             und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
         pv = pricing.pv_one_touch_option(
-            shared, time_grid, deal_data, nominal,
-            spot, b, tau, payoff_currency, invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
+            shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency,
+            invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'], use_forwards=True)
 
         mtm = pv * fx_rep
 
@@ -2920,7 +2920,7 @@ class FXBarrierOption(Deal):
 
         pv = pricing.pv_barrier_option(
             shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency,
-            invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
+            invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'], use_forwards=True)
 
         mtm = pv * fx_rep
 
