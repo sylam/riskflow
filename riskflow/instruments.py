@@ -1435,10 +1435,8 @@ class StructuredDeal(Deal):
             mtm = child.Instrument.calculate(shared, time_grid, child)
             net_mtm += mtm
 
-        # set the deal_time_grid to the interpolated grid (can do this as the children are already interpolated)
-        deal_data.Time_dep.deal_time_grid = np.arange(deal_data.Time_dep.interp.size)
-        # return the interpolated value (not necessary but needed if we want to extract specific values)
-        return pricing.interpolate(net_mtm, shared, time_grid, deal_data)
+        # return the interpolated value (without interpolating the time_grid)
+        return pricing.interpolate(net_mtm, shared, time_grid, deal_data, interpolate_grid=False)
 
     def generate(self, shared, time_grid, deal_data):
         return 0.0
@@ -1842,7 +1840,8 @@ class CapDeal(Deal):
 
         mtm = torch.sum(torch.stack(mtm_list), axis=0)
 
-        return mtm
+        # return the interpolated value (without interpolating the time_grid)
+        return pricing.interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=False)
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
@@ -1919,7 +1918,8 @@ class FloorDeal(Deal):
 
         mtm = torch.sum(torch.stack(mtm_list), axis=0)
 
-        return mtm
+        # return the interpolated value (without interpolating the time_grid)
+        return pricing.interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=False)
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):

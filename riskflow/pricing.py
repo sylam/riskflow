@@ -416,8 +416,8 @@ def greeks(shared, deal_data, mtm):
         deal_data.Calc_res['Greeks_Second'] = greeks_calc.report_hessian(allow_unused=True)
 
 
-def interpolate(mtm, shared, time_grid, deal_data):
-    if deal_data.Time_dep.interp.size > deal_data.Time_dep.deal_time_grid.size:
+def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
+    if interpolate_grid and deal_data.Time_dep.interp.size > deal_data.Time_dep.deal_time_grid.size:
         # interpolate it
         mtm = utils.gather_interp_matrix(mtm, deal_data.Time_dep, shared)
 
