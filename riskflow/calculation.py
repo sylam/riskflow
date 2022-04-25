@@ -286,7 +286,7 @@ class Calculation(object):
         partitioning = False
         for node in deals:
             # get the instrument
-            instrument = node['Instrument']
+            instrument = node['instrument']
             # should we skip it?
             if node.get('Ignore') == 'True':
                 continue

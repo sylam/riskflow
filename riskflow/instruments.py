@@ -1399,9 +1399,6 @@ class StructuredDeal(Deal):
         'Currency': 'ID of the FX rate price factor used to define the settlement currency. For example, USD.'
     }
 
-    # cuda code required to price this instrument - none - as it's in addfloatcashflow
-    cudacodetemplate = ''
-
     def __init__(self, params, valuation_options):
         super(StructuredDeal, self).__init__(params, valuation_options)
 
@@ -1438,6 +1435,9 @@ class StructuredDeal(Deal):
             mtm = child.Instrument.calculate(shared, time_grid, child)
             net_mtm += mtm
 
+        # set the deal_time_grid to the interpolated grid (can do this as the children are already interpolated)
+        deal_data.Time_dep.deal_time_grid = np.arange(deal_data.Time_dep.interp.size)
+        # return the interpolated value (not necessary but needed if we want to extract specific values)
         return pricing.interpolate(net_mtm, shared, time_grid, deal_data)
 
     def generate(self, shared, time_grid, deal_data):

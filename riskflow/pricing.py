@@ -425,11 +425,11 @@ def interpolate(mtm, shared, time_grid, deal_data):
     if deal_data.Calc_res is not None:
         deal_data.Calc_res['Value'] = mtm
         # store the mtm as an array
-        deal_data.Calc_res.setdefault('MTM', []).append(mtm.detach().numpy().astype(np.float64).sum(axis=1))
+        deal_data.Calc_res.setdefault('MTM', []).append(mtm.cpu().detach().numpy().astype(np.float64).sum(axis=1))
         # if shared.calc_greeks is not None:
         #    greeks(shared, deal_data, mtm)
 
-    if isinstance(mtm, torch.Tensor) and time_grid.mtm_time_grid.size > 1:
+    if isinstance(mtm, torch.Tensor) and mtm.shape[0] < time_grid.mtm_time_grid.size:
         # pad it with zeros and return
         return F.pad(mtm, [0, 0, 0, time_grid.mtm_time_grid.size - deal_data.Time_dep.interp.size])
     else:
