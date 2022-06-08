@@ -43,6 +43,7 @@ from . import utils, pricing
 class Aggregation(object):
     def __init__(self, name):
         self.field = {'Reference': name}
+        self.accum_dependencies = True
 
 
 class DealStructure(object):
@@ -1192,7 +1193,7 @@ class Base_Revaluation(Calculation):
                 format_row(sub_struct.obj, data, sub_struct.obj.Calc_res, greeks)
                 block.append(data)
                 sub_block, sub_greeks = check_prices(
-                    sub_struct, parent + [('Parent' + str(len(parent)), data['Reference'])])
+                    sub_struct, [('Parent', data['Reference'])])
                 block.extend(sub_block)
                 # aggregate the sub structure greeks
                 for k, v in sub_greeks.items():

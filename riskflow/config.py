@@ -773,7 +773,7 @@ class Context(object):
 
             for section, section_data in market_data['ExplicitMarketData'].items():
                 self.params[section].update(section_data)
-            self.version = 'arena_json'
+            self.version = ['JSONVersion', '22.05.30']
 
         if 'Deals' in data['Calc']:
             self.deals = {'Attributes': {

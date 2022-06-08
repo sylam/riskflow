@@ -1525,7 +1525,7 @@ class SwapInterestDeal(Deal):
             Instrument=deal_data.Instrument, Factor_dep=float,
             Time_dep=deal_data.Time_dep, Calc_res=deal_data.Calc_res))
 
-        return fixed_leg+float_leg
+        return fixed_leg + float_leg
 
 
 class CFFixedInterestListDeal(Deal):
@@ -1631,6 +1631,7 @@ class FixedCashflowDeal(Deal):
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
                        'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
                                                        all_tenors, all_factors),
+                       'Amount': (1 if self.field.get('Buy_Sell', 'Buy') == 'Buy' else -1) * self.field['Amount'],
                        'Payment_Date': (self.field['Payment_Date'] - base_date).days,
                        'Local_Currency': self.field['Currency']}
 
@@ -1649,11 +1650,11 @@ class FixedCashflowDeal(Deal):
                 shared),
             axis=1)
 
-        mtm = self.field['Amount'] * discount_rates * fx_rep
+        mtm = factor_dep['Amount'] * discount_rates * fx_rep
 
         # settle the cashflow
         pricing.cash_settle(
-            shared, self.field['Currency'], deal_data.Time_dep.deal_time_grid[-1], self.field['Amount'])
+            shared, self.field['Currency'], deal_data.Time_dep.deal_time_grid[-1], factor_dep['Amount'])
 
         return mtm
 
@@ -2266,6 +2267,77 @@ class FXDiscreteExplicitAsianOption(Deal):
         return mtm
 
 
+class FXDiscreteExplicitDoubleAsianOption(Deal):
+    factor_fields = {'Currency': ['FxRate'],
+                     'Underlying_Currency': ['FxRate'],
+                     'Discount_Rate': ['DiscountRate'],
+                     'FX_Volatility': ['FXVol']}
+
+    documentation = ('FX and Equity', ['A path independent option described [here](#discrete-double-asian-options)'])
+
+    def __init__(self, params, valuation_options):
+        super(FXDiscreteExplicitDoubleAsianOption, self).__init__(params, valuation_options)
+
+    def reset(self, calendars):
+        super(FXDiscreteExplicitDoubleAsianOption, self).reset()
+        # sampling_dates = set([x[0] for x in self.field['Sampling_Data_1']]).union(
+        #    [x[0] for x in self.field['Sampling_Data_2']])
+        # self.add_reval_dates(sampling_dates.union({self.field['Expiry_Date']}), self.field['Currency'])
+        self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
+
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency'])}
+        field['Discount_Rate'] = utils.check_rate_name(
+            self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
+        field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
+
+        field_index = {
+            'Currency': get_fx_and_zero_rate_factor(
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'SettleCurrency': self.field['Currency'],
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Underlying_Currency': get_fx_and_zero_rate_factor(
+                field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Volatility': get_fx_vol_factor(
+                field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Expiry': (self.field['Expiry_Date'] - base_date).days,
+            'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
+            'Alpha_0': self.field.get('Strike_Multiplier', 1.0),
+            'Alpha_1': self.field.get('Sampling_Multiplier_1', 1.0),
+            'Alpha_2': self.field.get('Sampling_Multiplier_2', 1.0),
+            'Samples_1': utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data_1']),
+            'Samples_2': utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data_2']),
+            'Strike': self.field.get('Strike_Price', 0.0),
+            'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
+            'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
+            'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
+        }
+
+        return field_index
+
+    def generate(self, shared, time_grid, deal_data):
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        FX_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
+        # get pricing data
+        spot = utils.calc_fx_cross(
+            deal_data.Factor_dep['Underlying_Currency'][0],
+            deal_data.Factor_dep['Currency'][0], deal_time, shared)
+        forward = utils.calc_fx_forward(
+            deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
+            deal_data.Factor_dep['Expiry'], deal_time, shared)
+
+        mtm = pricing.pv_discrete_double_asian_option(
+            shared, time_grid, deal_data, self.field['Underlying_Amount'], spot,
+            forward, [deal_data.Factor_dep['Underlying_Currency'][0], deal_data.Factor_dep['Currency'][0]],
+            invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'], use_forwards=True) * FX_rep
+
+        return mtm
+
+
 class EquityDiscreteExplicitAsianOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
@@ -2338,10 +2410,24 @@ class EquityOptionDeal(Deal):
 
     def __init__(self, params, valuation_options):
         super(EquityOptionDeal, self).__init__(params, valuation_options)
+        self.path_dependent = self.field['Option_Style'] == 'American'
 
     def reset(self, calendars):
         super(EquityOptionDeal, self).reset()
         self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
+
+    def add_grid_dates(self, parser, base_date, grid):
+        # we need to monitor the option for potential early exercise
+        if isinstance(grid, str):
+            grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
+            self.reval_dates.update(grid_dates)
+            self.settlement_currencies.setdefault(self.field['Currency'], set()).update(grid_dates)
+        else:
+            for curr, cash_flow in self.settlement_currencies.items():
+                last_pmt = max(cash_flow)
+                delta = set([x for x in grid if x < last_pmt])
+                self.settlement_currencies[curr].update(delta)
+                self.reval_dates.update(delta)
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
@@ -2366,6 +2452,7 @@ class EquityOptionDeal(Deal):
             'Strike_Price': self.field['Strike_Price'],
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
             'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
+            'Option_Style': self.field['Option_Style'],
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
@@ -2382,8 +2469,12 @@ class EquityOptionDeal(Deal):
             deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
         moneyness = spot / deal_data.Factor_dep['Strike_Price']
 
-        mtm = pricing.pv_european_option(
-            shared, time_grid, deal_data, self.field['Units'], moneyness, forward) * fx_rep
+        if deal_data.Factor_dep['Option_Style'] == 'European':
+            mtm = pricing.pv_european_option(
+                shared, time_grid, deal_data, self.field['Units'], moneyness, forward) * fx_rep
+        else:
+            mtm = pricing.pv_american_option(
+                shared, time_grid, deal_data, self.field['Units'], moneyness, spot, forward) * fx_rep
 
         return mtm
 
@@ -3064,7 +3155,7 @@ class FXOptionDeal(Deal):
             deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
             deal_data.Factor_dep['Expiry'], deal_time, shared)
 
-        moneyness = deal_data.Factor_dep['Strike_Price'] / forward if deal_data.Factor_dep['Invert_Moneyness']\
+        moneyness = deal_data.Factor_dep['Strike_Price'] / forward if deal_data.Factor_dep['Invert_Moneyness'] \
             else forward / deal_data.Factor_dep['Strike_Price']
 
         mtm = pricing.pv_european_option(

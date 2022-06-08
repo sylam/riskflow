@@ -39,7 +39,8 @@ OPTION_CALL = 1.0
 
 
 def cash_settle(shared, currency, time_index, value):
-    if shared.t_Cashflows is not None:
+    # need to check if the time_index is allowed for this currency
+    if shared.t_Cashflows is not None and time_index in shared.t_Cashflows[currency]:
         shared.t_Cashflows[currency][time_index] += value
 
 
@@ -423,9 +424,10 @@ def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
 
     # check if we want to store the mtm value for this instrument
     if deal_data.Calc_res is not None:
-        deal_data.Calc_res['Value'] = mtm
+        mtm_np = mtm.detach().cpu().numpy().astype(np.float64)
+        deal_data.Calc_res['Value'] = mtm_np
         # store the mtm as an array
-        deal_data.Calc_res.setdefault('MTM', []).append(mtm.cpu().detach().numpy().astype(np.float64).sum(axis=1))
+        deal_data.Calc_res.setdefault('MTM', []).append(mtm_np.sum(axis=1))
         # if shared.calc_greeks is not None:
         #    greeks(shared, deal_data, mtm)
 
@@ -614,12 +616,12 @@ def getpartialbarrierpayoff(isKnockIn, eta, phi, spot, strike, barrier, startBar
                 forward, strike, log1, log2, etaRho, etaRho, d1, e1 * eta,
                 f1, e3 * eta, d2, e2 * eta, f2, e4 * eta)
         else:
-            g1 = (logSpotOverBarrier + (b + halfvv) * expiry)/vol
+            g1 = (logSpotOverBarrier + (b + halfvv) * expiry) / vol
             g2 = g1 - vol
             g3 = g1 - 2.0 * logSpotOverBarrier / vol
             g4 = g3 - vol
 
-            if eta == 0: # type B1
+            if eta == 0:  # type B1
 
                 pv = PartialBarrierCalc(
                     forward, strike, log1, log2, rho, -rho, d1, e1, f1, -e3, d2, e2, f2, -e4)
@@ -850,8 +852,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
 
 
 def pv_partial_barrier_option(shared, time_grid, deal_data, nominal,
-                      spot, b, tau, tau1, payoff_currency, invert_moneyness=False):
-
+                              spot, b, tau, tau1, payoff_currency, invert_moneyness=False):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     factor_dep = deal_data.Factor_dep
     daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
@@ -941,12 +942,81 @@ def pv_partial_barrier_option(shared, time_grid, deal_data, nominal,
     return combined
 
 
+def pv_american_option(shared, time_grid, deal_data, nominal, moneyness, spot, forward):
+    def phi(gamma, H, I):
+        kappa = (2 * b) / sigma2 + 2 * gamma - 1
+        d = -1 / vol * (torch.log(S / H) + b * tau + (gamma - 0.5) * sigma2 * tau)
+        lamb = -r + gamma * b + 0.5 * gamma * (gamma - 1) * sigma2
+        I_per_S = I / S
+        return torch.exp(lamb * tau) * (S ** gamma) * (
+                utils.norm_cdf(d) - utils.norm_cdf(d - 2 * torch.log(I_per_S) / vol) * (I_per_S ** kappa))
+
+    factor_dep = deal_data.Factor_dep
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+    tenor_in_days = factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]
+    expiry = discount.code[0][utils.FACTOR_INDEX_Daycount](tenor_in_days)
+    sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
+
+    # make sure there are no zeros
+    tau = spot.new(expiry.reshape(-1, 1)).clamp(min=1e-5)
+    # cost of carry
+    b = torch.log(forward / spot) / tau
+    # interest rates
+    r = torch.squeeze(
+        discount.gather_weighted_curve(shared, tenor_in_days.reshape(-1, 1), multiply_by_time=False), axis=1)
+    # actual volatility
+    vol = sigma * torch.sqrt(tau)
+    # adjust if this is a put option
+    if factor_dep['Option_Type'] > 0:
+        S, K = spot, factor_dep['Strike_Price']
+    else:
+        S, K = factor_dep['Strike_Price'], spot
+        r, b = r - b, -b
+
+    sigma2 = sigma * sigma
+    b_over_sigma2 = b / sigma2
+
+    # we divide by 1-beta later so we want this 1e-6 away from 1 to avoid divide by zero
+    beta_raw = (0.5 - b_over_sigma2) + torch.sqrt((b_over_sigma2 - 0.5) ** 2 + 2.0 * r / sigma2)
+    fix_beta = torch.abs(beta_raw - 1.0) < 1e-6
+    beta = fix_beta * (1.0 + 1e-6) + ~fix_beta * beta_raw
+
+    # we divide by r-b later so we want this 1e-6 away from 0 to avoid divide by zero
+    raw_r_b = r - b
+    fix_r_b = torch.abs(raw_r_b) < 1e-6
+    r_b = fix_r_b * 1e-6 + ~fix_r_b * raw_r_b
+
+    B_0 = K * torch.maximum(r / r_b, torch.ones_like(r))
+    B_inf = K * beta / (beta - 1)
+    h_tau = -(b * tau + 2 * vol) * (B_0 / (B_inf - B_0))
+    I = B_0 + (B_inf - B_0) * (1 - torch.exp(h_tau))
+
+    C_BS = (I - K) * (I ** -beta) * (S ** beta - phi(beta, I, I)) + phi(1.0, I, I) - phi(1, K, I) + K * (
+            phi(0, K, I) - phi(0, I, I))
+
+    Black = utils.black_european_option(
+        S * torch.exp(b * tau), K, vol, 1.0, 1.0, 1.0, shared) * torch.exp(-r * tau)
+
+    theo_price = (b >= r) * Black + (b < r) * ((S < I) * C_BS + (S >= I) * (S - K))
+    early_exercise = (b < r) * (S >= I)
+    value = factor_dep['Buy_Sell'] * nominal * theo_price * ~(early_exercise.cumsum(axis=0) > 0)
+
+    # handle cashflows
+    exercise_val = factor_dep['Buy_Sell'] * nominal * (S - K) * early_exercise
+    for t, cashflows in zip(deal_data.Time_dep.deal_time_grid, exercise_val):
+        if cashflows.any():
+            cash_settle(shared, factor_dep['SettleCurrency'], t, cashflows)
+
+    return value
+
+
 def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward):
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
-    daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
-    expiry = daycount_fn(factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+    tenor_in_days = factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]
+    expiry = discount.code[0][utils.FACTOR_INDEX_Daycount](tenor_in_days)
     vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     theo_price = utils.black_european_option(
@@ -954,9 +1024,7 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
         factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
 
     discount_rates = torch.squeeze(
-        utils.calc_discount_rate(discount, (
-                factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1), shared),
-        axis=1)
+        utils.calc_discount_rate(discount, tenor_in_days.reshape(-1, 1), shared), axis=1)
 
     value = nominal * theo_price
 
@@ -1044,6 +1112,145 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         theo_price = utils.black_european_option(
             M1 * spot_block, strike_bar, vol_t, 1.0,
             factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
+
+        discount_rates = torch.squeeze(
+            utils.calc_discount_rate(discount_block, tenor_block.reshape(-1, 1), shared),
+            axis=1)
+
+        cash = nominal * theo_price
+        mtm_list.append(cash * discount_rates)
+
+    # potential cashflows
+    cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], cash[-1])
+    # mtm in reporting currency
+    mtm = torch.cat(mtm_list, axis=0)
+
+    return mtm
+
+
+def pv_discrete_double_asian_option(shared, time_grid, deal_data, nominal, spot, forward,
+                                    past_factor_list, invert_moneyness=False, use_forwards=False):
+    mtm_list = []
+    factor_dep = deal_data.Factor_dep
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+    daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
+
+    expiry = daycount_fn(factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+    # make sure there are no zeros
+    safe_expiry = spot.new(expiry.reshape(-1, 1)).clamp(min=1e-5)
+    # cost of carry
+    b = torch.log(forward / spot) / safe_expiry
+    # load the alpha multipliers (usually just 1)
+    alphas = [factor_dep['Alpha_1'], factor_dep['Alpha_2']]
+    # merge the resets for both samples before calculating the start_idx
+    sample_reset_days = np.union1d(
+        *[factor_dep[i].schedule[:, utils.RESET_INDEX_Reset_Day] for i in ['Samples_1', 'Samples_2']])
+    start_idx = np.searchsorted(sample_reset_days, deal_time[:, utils.TIME_GRID_MTM], side='right').astype(np.int64)
+    # set the unique index
+    start_index, counts = np.unique(start_idx, return_counts=True)
+    # now precalc all past resets
+
+    all_samples = []
+    dual_samples = []
+    start_samples = []
+
+    for i in ['Samples_1', 'Samples_2']:
+        samples = factor_dep[i].reinitialize(shared.one)
+        sample_idx = samples.get_start_index(deal_time, offset=1)
+        known_resets = samples.known_resets(shared.simulation_batch)
+        sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+                                       (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
+                                        deal_time[:, utils.TIME_GRID_MTM].max())]
+
+        # check if the spot was simulated - if not, hold it flat
+        if spot.shape != forward.shape:
+            past_samples = spot.expand(sim_samples.shape[0], shared.simulation_batch)
+            spot = spot.expand(*forward.shape)
+        else:
+            past_sample_factor = [utils.calc_time_grid_spot_rate(
+                past_factor, sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
+                for past_factor in past_factor_list]
+            past_samples = past_sample_factor[0] if len(
+                past_sample_factor) == 1 else past_sample_factor[0] / past_sample_factor[1]
+
+        full_sample = torch.cat(
+            [torch.cat(known_resets, axis=0), past_samples], axis=0) if known_resets else past_samples
+        # make sure we can access the numpy and tensor components
+        dual_sample = samples.dual()
+        dual_samples.append(dual_sample)
+        # store the sample with the weights applied
+        all_samples.append(full_sample * dual_sample.tn[:, utils.RESET_INDEX_Weight].reshape(-1, 1))
+        # record the index of this sample relative the merged resets calculated earlier
+        start_samples.append({x: y for x, y in zip(start_idx, sample_idx)})
+
+    for index, (discount_block, spot_block, forward_block, carry_block) in enumerate(
+            utils.split_counts([discount, spot, forward, b], counts, shared)):
+        t_block = discount_block.time_grid
+        tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
+
+        # only do moment matching for tenors prior to expiry
+        if tenor_block.any():
+            # use at the money vols
+            moneyness_block = (forward_block if use_forwards else spot_block) / spot_block
+            moneyness = 1.0 / moneyness_block if invert_moneyness else moneyness_block
+            vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, daycount_fn(tenor_block), shared)
+
+            mu = []
+            sigma = []
+            lambdas = []
+            sample_fts = []
+            sample_tss = []
+
+            for alpha, start_idx, dual_sample, all_sample in zip(alphas, start_samples, dual_samples, all_samples):
+                # get the sample at time t
+                sample_index_t = start_idx[index]
+                sample_ts = carry_block.new(
+                    daycount_fn(dual_sample.np[sample_index_t:, utils.RESET_INDEX_End_Day].reshape(1, -1) -
+                                t_block[:, utils.TIME_GRID_MTM, np.newaxis]))
+
+                weight_t = dual_sample.tn[sample_index_t:, utils.RESET_INDEX_Weight].reshape(1, -1, 1)
+                sample_ft = weight_t * torch.exp(
+                    torch.unsqueeze(carry_block, axis=1) * torch.unsqueeze(sample_ts, axis=2))
+                M1 = torch.sum(sample_ft, axis=1)
+                # realized average so far
+                average = torch.sum(all_sample[:sample_index_t], axis=0)
+
+                product_t = sample_ft * torch.exp(
+                    torch.unsqueeze(sample_ts, axis=2) * torch.unsqueeze(vols * vols, axis=1))
+                sum_t = F.pad(torch.cumsum(product_t[:, :-1], axis=1), [0, 0, 1, 0, 0, 0])
+                M2 = torch.sum(sample_ft * (product_t + 2.0 * sum_t), axis=1)
+
+                # trick to avoid nans in the gradients
+                MM = torch.log(M2) - 2.0 * torch.log(M1)
+                MM_ok = MM.clamp(min=1e-6)
+                vol_t = torch.sqrt(MM_ok)
+
+                mu.append(M1)
+                sigma.append(vol_t)
+                sample_fts.append(sample_ft)
+                sample_tss.append(sample_ts)
+                lambdas.append(alpha * average)
+
+            sum_rho = 0.0
+            for i in range(sample_fts[0].shape[1]):
+                min_ts = torch.minimum(sample_tss[0][:, i].reshape(-1, 1), sample_tss[1])
+                sample_fi = torch.unsqueeze(sample_fts[0][:, i], axis=1)
+                sum_rho += sample_fi * sample_fts[1] * torch.exp(
+                    torch.unsqueeze(min_ts, axis=2) * torch.unsqueeze(vols * vols, axis=1))
+
+            M_rho = torch.sum(sum_rho, axis=1)
+            MM_rho = (torch.log(M_rho) - torch.log(mu[0]) - torch.log(mu[1])) / (sigma[0] * sigma[1])
+            K_bar = factor_dep['Alpha_0'] * factor_dep['Strike'] - lambdas[0] + lambdas[1]
+
+            theo_price = factor_dep['Buy_Sell'] * utils.Bjerksund_Stensland(
+                factor_dep['Option_Type'], -factor_dep['Option_Type'],
+                -factor_dep['Option_Type'] * K_bar, alphas[0] * spot_block * mu[0], alphas[1] * spot_block * mu[1],
+                K_bar, sigma[0], sigma[1], MM_rho, factor_dep['Option_Type'])
+        else:
+            lambdas = [alpha * all_sample.sum(axis=0) for alpha, all_sample in zip(alphas, all_samples)]
+            K_bar = factor_dep['Alpha_0'] * factor_dep['Strike'] - lambdas[0] + lambdas[1]
+            theo_price = factor_dep['Buy_Sell'] * torch.relu(-factor_dep['Option_Type'] * K_bar)
 
         discount_rates = torch.squeeze(
             utils.calc_discount_rate(discount_block, tenor_block.reshape(-1, 1), shared),

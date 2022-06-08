@@ -658,6 +658,7 @@ class FloatTensorResets(TensorSchedule):
 
         if len(future_resets) > 1:
             # multiple reset groups
+            logging.warning('!! Multiple reset groups defined !! ({} groups)'.format(len(future_resets)))
             reset_state = [np.unique(future_reset, return_counts=True) for future_reset in future_resets]
             if functools.reduce(lambda x, y: x.size == y.size and (x == y).all(), [x[1] for x in reset_state]):
                 # can be compressed
@@ -1042,6 +1043,22 @@ def black_european_option_price(F, X, r, vol, tenor, buyOrSell, callOrPut):
                                     X * scipy.stats.norm.cdf(callOrPut * sign * d2)) * np.exp(-r * tenor)
 
 
+def Bjerksund_Stensland(A1, A2, B, x1, x2, K, sigma1, sigma2, rho, callOrPut):
+    a = x2+K
+    b = x2/a
+    sigma1_2 = sigma1*sigma1
+    sigma2_2 = sigma2*sigma2
+    # make sure the variance is at least 1e-6
+    v2 = torch.clamp(sigma1_2-2*rho*sigma1*b*sigma2+b*b*sigma2_2, min=1e-6)
+    v = torch.sqrt(v2)
+    d = torch.log(x1/a)/v
+    d1 = d+v/2
+    d2 = d-(sigma1_2-2*rho*sigma1*sigma2-b*b*sigma2_2+2*b*sigma2_2)/(2*v)
+    d3 = d-(sigma1_2-b*b*sigma2_2)/(2*v)
+
+    return A1*x1*norm_cdf(callOrPut*d1)+A2*x2*norm_cdf(callOrPut*d2)+B*norm_cdf(callOrPut*d3)
+
+
 def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
     # calculates the black function WITHOUT discounting
 
@@ -1067,6 +1084,10 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
     forward = torch.clamp(F, min=1e-5)
 
     if isinstance(strike, float) and strike == 0:
+        # note that we're explicitly assuming a call option here
+        # if this was a put option, the value should be 0. But who would
+        # book a put option with 0 strike?
+
         prem = forward
         value = forward
     else:
