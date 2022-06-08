@@ -19,6 +19,7 @@
 import os
 import sys
 import glob
+import time
 import shutil
 import logging
 import traceback
@@ -38,8 +39,10 @@ def work(job_id, queue, result, price_factors, price_factor_interp,
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-8s %(message)s',
                         datefmt='%m-%d %H:%M',
+                        force=True,
                         filename='bootstrap_{}.log'.format(job_id),
                         filemode='w')
+
     from riskflow.bootstrappers import construct_bootstrapper
 
     bootstrappers = {}
@@ -61,7 +64,7 @@ def work(job_id, queue, result, price_factors, price_factor_interp,
                     bootstrapper_name, params, device=gpudevice)
             bootstrapper = bootstrappers[bootstrapper_name]
             bootstrapper.bootstrap(
-                sys_params, price_models, price_factors, price_factor_interp, job_price, holidays)
+                sys_params, price_models, price_factors, price_factor_interp[0], job_price, holidays)
 
         except Exception as e:
             exc_type, exc_value, exc_traceback = sys.exc_info()
@@ -131,7 +134,7 @@ class Parent(object):
 
         # load the params
         price_factors = self.manager.dict(self.cx.params['Price Factors'])
-        price_factor_interp = self.manager.dict(self.cx.params['Price Factor Interpolation'])
+        price_factor_interp = self.manager.list([self.cx.params['Price Factor Interpolation']])
         price_models = self.manager.dict(self.cx.params['Price Models'])
         sys_params = self.manager.dict(self.cx.params['System Parameters'])
         holidays = self.manager.dict(self.cx.holidays)
