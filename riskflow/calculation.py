@@ -43,6 +43,7 @@ from . import utils, pricing
 class Aggregation(object):
     def __init__(self, name):
         self.field = {'Reference': name}
+        self.accum_dependencies = True
 
 
 class DealStructure(object):
@@ -176,8 +177,6 @@ class Calculation(object):
         self.dtype = prec
         self.time_grid = None
         self.device = device
-        # store a unit tensor for the calculation state
-        self.one = torch.ones([1, 1], dtype=prec, device=device)
 
         # the risk factor data
         self.static_factors = OrderedDict()
@@ -288,7 +287,7 @@ class Calculation(object):
         partitioning = False
         for node in deals:
             # get the instrument
-            instrument = node['instrument']
+            instrument = node['Instrument']
             # should we skip it?
             if node.get('Ignore') == 'True':
                 continue
@@ -658,6 +657,55 @@ class Credit_Monte_Carlo(Calculation):
         self.time_grid.set_currency_settlement(settlement_currencies)
         self.settlement_currencies = settlement_currencies
 
+    def calc_individual_FVA(self, params, spreads, discount_curves):
+
+        def calc_approx_fva(exp_mtm, time_grid, spread, delta_t, collateral):
+            return np.sum([spread[s] * mtm * np.exp(-(t / 365.0) * collateral.current_value(t / 365.0)) for mtm, s, t in
+                           zip(exp_mtm, delta_t, time_grid)])
+
+        def report(deal, num_scenario, num_tags):
+            empty = ','.join(['None'] * num_tags)
+            tags = deal.Instrument.field.get('Tags', empty)
+            expiry = max(deal.Instrument.get_reval_dates()).strftime('%Y-%m-%d')
+            return [deal.Instrument.field['Reference'], expiry] + (tags if isinstance(tags, list) else [empty])[
+                0].split(',') + [np.sum(deal.Calc_res['MTM'], axis=0) / num_scenario]
+
+        # Ask for deal level mtm's
+        params['DealLevel'] = True
+        tag_headings = self.config.deals['Attributes'].get('Tag_Titles', '').split(',')
+        base_results = self.execute(params)
+        deals = base_results['Netting'].sub_structures[0].dependencies + [
+            y.obj for y in base_results['Netting'].sub_structures[0].sub_structures]
+        mtms = [report(x, self.numscenarios, len(tag_headings)) for x in deals]
+        time_grid = base_results['Netting'].sub_structures[0].obj.Time_dep.deal_time_grid
+        days = self.time_grid.time_grid[:, 1][time_grid]
+        funding = construct_factor(utils.Factor('InterestRate', (discount_curves['funding'],)),
+                                   self.config.params['Price Factors'],
+                                   self.config.params['Price Factor Interpolation'])
+        collateral = construct_factor(utils.Factor('InterestRate', (discount_curves['collateral'],)),
+                                      self.config.params['Price Factors'],
+                                      self.config.params['Price Factor Interpolation'])
+        delta_t = np.diff(days)
+        all_spread = {k: {} for k in spreads.keys()}
+
+        for k, v in all_spread.items():
+            funding_spread = 0.0001 * spreads[k].get('funding', 0.0)
+            collateral_spread = 0.0001 * spreads[k].get('collateral', 0.0)
+            for s in np.unique(delta_t):
+                v[s] = np.exp((s / 365.0) * ((funding.current_value(s / 365.0) + funding_spread) - (
+                        collateral.current_value(s / 365.0) + collateral_spread))) - 1.0
+
+        results = []
+        output = sorted(all_spread.items())
+
+        for mtm in mtms:
+            results.append(
+                mtm[:-1] + [mtm[-1][0]] + [
+                    calc_approx_fva(mtm[-1], days, spread, delta_t, collateral) for name, spread in output])
+
+        return pd.DataFrame(
+            results, columns=['Reference', 'Expiry'] + tag_headings + ['MTM'] + [x[0] for x in output])
+
     def get_cholesky_decomp(self):
         # create the correlation matrix
         correlation_matrix = np.eye(self.num_factors, dtype=np.float64)
@@ -723,7 +771,7 @@ class Credit_Monte_Carlo(Calculation):
         correlation_matrix = torch.tensor(
             correlation_matrix, device=self.device, dtype=self.dtype, requires_grad=False)
         # return the cholesky decomp
-        return torch.cholesky(correlation_matrix)
+        return torch.linalg.cholesky(correlation_matrix)
 
     def __init_shared_mem(self, seed, nomodel, reporting_currency, calc_greeks=None):
         # set the random seed
@@ -745,7 +793,8 @@ class Credit_Monte_Carlo(Calculation):
         # Now create a shared state with the cholesky decomp
         shared_mem = CMC_State(
             self.get_cholesky_decomp(), len(self.stoch_factors), [x[-1] for x in self.static_var], self.batch_size,
-            self.one, get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs))
+            torch.ones([1, 1], dtype=self.dtype, device=self.device),
+            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs))
 
         return shared_mem
 
@@ -765,7 +814,8 @@ class Credit_Monte_Carlo(Calculation):
                     grad[k] = v.astype(np.float64) / self.params['Simulation_Batches']
                 self.output.setdefault(result, self.gradients_as_df(grad, display_val=True))
             elif result in ['grad_cva_hessian']:
-                self.output.setdefault(result, data.astype(np.float64) / self.params['Simulation_Batches'])
+                self.output.setdefault(result, self.gradients_as_df(
+                    data.astype(np.float64) / self.params['Simulation_Batches']))
             else:
                 self.output.setdefault(result, np.concatenate(data, axis=-1).astype(np.float64))
 
@@ -916,12 +966,14 @@ class Credit_Monte_Carlo(Calculation):
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
             if 'CVA' in params:
-                discount = get_interest_factor(utils.check_rate_name(params['Deflation_Interest_Rate']),
-                                               self.static_ofs, self.stoch_ofs, self.all_tenors)
-                survival = get_survival_factor(utils.check_rate_name(params['CVA']['Counterparty']),
-                                               self.static_ofs, self.stoch_ofs, self.all_tenors)
-                recovery = get_recovery_rate(utils.check_rate_name(params['CVA']['Counterparty']),
-                                             self.all_factors)
+                discount = get_interest_factor\
+                    (utils.check_rate_name(params['Deflation_Interest_Rate']),
+                     self.static_ofs, self.stoch_ofs, self.all_tenors)
+                survival = get_survival_factor(
+                    utils.check_rate_name(params['CVA']['Counterparty']),
+                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                recovery = get_recovery_rate(
+                    utils.check_rate_name(params['CVA']['Counterparty']), self.all_factors)
                 # only looks at the first netting set - should be fine . . .
                 time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
 
@@ -1112,8 +1164,8 @@ class Base_Revaluation(Calculation):
 
         # allocate memory on the device
         return Base_Reval_State(
-            [x[-1] for x in self.static_var], self.one, get_fxrate_factor(
-                utils.check_rate_name(reporting_currency), self.static_ofs, {}),
+            [x[-1] for x in self.static_var], torch.ones([1, 1], dtype=self.dtype, device=self.device),
+            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, {}),
             all_vars_concat, self.params['Greeks'] == 'All')
 
     def report(self):
@@ -1127,10 +1179,10 @@ class Base_Revaluation(Calculation):
                     if k.startswith('Greeks'):
                         greeks.setdefault(k, []).append(
                             self.gradients_as_df(v, header=deal.Instrument.field.get('Reference')))
-                    else:
+                    elif k == 'Value':
                         data[k] = float(v)
                 # update any tags
-                if deal.Instrument.field.get('Tags') is not None:
+                if deal.Instrument.field.get('Tags'):
                     data.update(dict(zip(tag_titles, deal.Instrument.field['Tags'][0].split(','))))
 
             block = []
@@ -1141,7 +1193,7 @@ class Base_Revaluation(Calculation):
                 format_row(sub_struct.obj, data, sub_struct.obj.Calc_res, greeks)
                 block.append(data)
                 sub_block, sub_greeks = check_prices(
-                    sub_struct, parent + [('Parent' + str(len(parent)), data['Reference'])])
+                    sub_struct, [('Parent', data['Reference'])])
                 block.extend(sub_block)
                 # aggregate the sub structure greeks
                 for k, v in sub_greeks.items():
@@ -1185,8 +1237,8 @@ class Base_Revaluation(Calculation):
 
         self.calc_stats['Deal_Setup_Time'] = time.monotonic()
         self.netting_sets = DealStructure(Aggregation('root'), deal_level_mtm=True)
-        self.set_deal_structures(self.config.deals['Deals']['Children'], self.netting_sets, 1, 1,
-                                 deal_level_mtm=True)
+        self.set_deal_structures(
+            self.config.deals['Deals']['Children'], self.netting_sets, 1, 1, deal_level_mtm=True)
 
         # record the (pure python) dependency setup time
         self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']

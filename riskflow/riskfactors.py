@@ -28,8 +28,10 @@ from scipy.interpolate import RectBivariateSpline
 # map the names of various factor interpolations to something simpler
 factor_interp_map = {
     'CubicSplineCurveInterpolation': 'Hermite',
+    'HermiteInterpolationCurveGetValue': 'Hermite',
     'LinearInterFlatExtrapCurveGetValue': 'Linear',
-    'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT'
+    'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT',
+    'HermiteRTInterpolationCurveGetValue': 'HermiteRT'
 }
 
 class Factor0D(object):
@@ -111,7 +113,7 @@ class Factor1D(object):
             self.tenors.min(), self.tenors.max())
 
         if self.interpolation[0] != 'Linear':
-            index = np.clip(np.searchsorted(self.tenors, tenors, side='right') - 1, 0, self.tenors.size - 1)
+            index = np.searchsorted(self.tenors, tenors, side='right') - 1
             index_next = np.clip(index + 1, 0, self.tenors.size - 1)
             dt = np.clip(self.tenors[index_next] - self.tenors[index], 1 / 365.0, np.inf)
             m = np.clip((tenors - self.tenors[index]) / dt, 0.0, 1.0)
@@ -129,6 +131,10 @@ class Factor2D(object):
     """Represents a risk factor that's a surface (2D) - Currently this is only vol surfaces"""
 
     def __init__(self, param):
+        # default empty surfaces to 1%
+        if not param['Surface'].array.any():
+            param['Surface'].array = np.array([[0, 0, 0.01]])
+
         self.param = param
         self.flat = None
         self.index_map = OrderedDict()
@@ -864,7 +870,18 @@ class InterestYieldVol(Factor3D):
 
     def __init__(self, param):
         super(InterestYieldVol, self).__init__(param)
+        self.delta = 0.0
         self.atm_surface = None
+        self.premiums = None
+
+    def set_premiums(self, df, currency):
+        if df is not None:
+            self.premiums = df[df['Currency'] == currency[0]]
+
+    def get_premium(self, expiry, tenor):
+        prem = self.premiums[(self.premiums['UnderlyingTenor'] == tenor) &
+                             (self.premiums['Expiry'] == expiry)]['Payer']
+        return prem.values[0] / 10000.0
 
     @property
     def BlackScholesDisplacedShiftValue(self):
@@ -874,6 +891,8 @@ class InterestYieldVol(Factor3D):
             for property_alias in Property_Aliases:
                 if 'BlackScholesDisplacedShiftValue' in property_alias:
                     return property_alias['BlackScholesDisplacedShiftValue']
+        elif self.premiums is not None:
+            return self.premiums['Shift'].apply(lambda x: float(x.replace('%', ''))).unique()[0]
         return shift_value
 
     @property
