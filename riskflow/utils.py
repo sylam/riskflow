@@ -126,10 +126,6 @@ CASHFLOW_IndexMethodLookup = {'IndexReference2M': CASHFLOW_METHOD_IndexReference
                               'IndexReferenceInterpolated3M': CASHFLOW_METHOD_IndexReferenceInterpolated3M,
                               'IndexReferenceInterpolated4M': CASHFLOW_METHOD_IndexReferenceInterpolated4M}
 
-CASHFLOW_CompoundingMethodLookup = {'None': CASHFLOW_METHOD_Compounding_None,
-                                    'Flat': CASHFLOW_METHOD_Compounding_Flat,
-                                    'Include_Margin': CASHFLOW_METHOD_Compounding_Include_Margin}
-
 # reset codes - note that the first 3 fields correspond with the TIME_GRID
 # (so that a reset can be treated as a timepoint)
 RESET_INDEX_Time_Grid = 0
@@ -169,7 +165,6 @@ FACTOR_SIZE_RATE = 2
 # Named tuples to make life easier
 Factor = namedtuple('Factor', 'type name')
 RateInfo = namedtuple('RateInfo', 'model_name archive_name calibration')
-Interpolation = namedtuple('Interpolation', 'tensor interp_params')
 CalibrationInfo = namedtuple('CalibrationInfo', 'param correlation delta')
 DealDataType = namedtuple('DealDataType', 'Instrument Factor_dep Time_dep Calc_res')
 Partition = namedtuple('Partition', 'DealMTMs Collateral_Cash Funding_Cost Cashflows')
@@ -190,6 +185,7 @@ WeekendMap = {'Friday and Saturday': 'Sun Mon Tue Wed Thu',
               'Friday': 'Sat Sun Mon Tue Wed Thu'}
 
 
+# Custom Exceptions
 class InstrumentExpired(Exception):
     def __init__(self, message):
         self.message = message
@@ -324,6 +320,15 @@ class DateEqualList:
                                for date, value in self.data.items()]) + ']'
 
 
+class Interpolation(object):
+    def __init__(self, tensor, interp_params):
+        self.tensor = tensor
+        self.indexed_tensor = tensor.reshape(-1, tensor.shape[-1])
+        self.interp_params = []
+        for param in interp_params:
+            self.interp_params.append(param.reshape(-1, param.shape[-1]))
+
+
 class CurveTenor(object):
     def __init__(self, tenor_points, interp):
         # linear interpolation by default
@@ -358,18 +363,6 @@ class CurveTenor(object):
             alpha = (clipped_points - self.tenor[index]) / self.delta[index]
 
         return index, index_next, alpha
-
-    def get_index_time_weight(self, tenor_points_in_years):
-        index, index_next, alpha = self.get_index(tenor_points_in_years)
-        w1 = (1.0 - alpha) * tenor_points_in_years
-        w2 = alpha * tenor_points_in_years
-        return index, index_next, alpha, w1, w2
-
-    def get_index_weight(self, tenor_points_in_years):
-        index, index_next, alpha = self.get_index(tenor_points_in_years)
-        w1 = (1.0 - alpha)
-        w2 = alpha
-        return index, index_next, alpha, w1, w2
 
 
 @torch.jit.script
@@ -665,6 +658,7 @@ class FloatTensorResets(TensorSchedule):
 
         if len(future_resets) > 1:
             # multiple reset groups
+            logging.warning('!! Multiple reset groups defined !! ({} groups)'.format(len(future_resets)))
             reset_state = [np.unique(future_reset, return_counts=True) for future_reset in future_resets]
             if functools.reduce(lambda x, y: x.size == y.size and (x == y).all(), [x[1] for x in reset_state]):
                 # can be compressed
@@ -782,21 +776,6 @@ def split_tensor(tensor, counts):
     return torch.split(tensor, tuple(counts)) if tensor.shape[0] == counts.sum() else [tensor] * counts.size
 
 
-def interpolate_curve_indices(all_tenor_points_in_years, curve_component, time_factor=1.0):
-    # will only work if all_tenor_points is 2 dimensional
-    curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index]
-
-    if time_factor:
-        i1, i2, a, w1, w2 = [np.array(x) for x in map(list, zip(
-            *[curve_tenor.get_index_time_weight(x) for x in all_tenor_points_in_years]))]
-    else:
-        i1, i2, a, w1, w2 = [np.array(x) for x in map(list, zip(
-            *[curve_tenor.get_index_weight(x) for x in all_tenor_points_in_years]))]
-
-    return np.expand_dims(a, axis=2), i1, np.expand_dims(w1, axis=2), i2, np.expand_dims(w2, axis=2)
-
-
-#@torch.jit.script
 def calc_hermite_curve(t_a, g, c, curve_t0, curve_t1):
     one_minus_ta = (1.0 - t_a)
     return curve_t0 * one_minus_ta + t_a * (curve_t1 + one_minus_ta * (g + t_a * c))
@@ -814,12 +793,15 @@ class CurveTensor(object):
     def __init__(self, interp_obj: Interpolation, index, alpha):
         self.interp_obj = interp_obj
         self.index = index
+        self.time_index = self.index.reshape(-1, 1) * interp_obj.tensor.shape[1]
         if alpha is not None:
             self.alpha = interp_obj.tensor.new(alpha) if isinstance(alpha, np.ndarray) else alpha
             self.index_next = (index + 1).clip(0, interp_obj.tensor.shape[0] - 1)
+            self.time_index_next = self.index_next.reshape(-1, 1) * interp_obj.tensor.shape[1]
         else:
             self.alpha = None
             self.index_next = None
+            self.time_index_next = None
 
     def interp_value(self):
         if self.alpha is not None:
@@ -843,64 +825,58 @@ class CurveTensor(object):
             curve_component, T, time_multiplier)
 
     def interpolate_curve(self, curve_component, points, time_factor):
+        # our tensor object
+        tensor = self.interp_obj.indexed_tensor
+        # check the points being queried
         time_size, point_size = points.shape
 
         if point_size > 0:
-            tenor_points = curve_component[FACTOR_INDEX_Daycount](points)
-            a, i1, w1, i2, w2 = interpolate_curve_indices(
-                tenor_points, curve_component, time_factor)
+            # get the points in years
+            tenor_points_in_years = curve_component[FACTOR_INDEX_Daycount](points)
 
-            time_index_next = None
-            if curve_component[FACTOR_INDEX_Stoch]:
-                time_index = np.tile(self.index.reshape(-1, 1), point_size)
-                if self.index_next is not None:
-                    time_index_next = np.tile(self.index_next.reshape(-1, 1), point_size)
-            else:
-                time_index = np.zeros((time_size, point_size), dtype=np.int64)
+            curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index]
+            i1, i2, a = curve_tenor.get_index(tenor_points_in_years)
 
-            # our tensor object
-            tensor = self.interp_obj.tensor
-            if curve_component[FACTOR_INDEX_Tenor_Index].type.startswith('Hermite'):
+            # check if time_index is non-zero (valid if this was a stochastic factor)
+            offset = self.time_index if self.time_index.any() else 0
+            i00 = offset + i1
+            i01 = offset + i2
+
+            if self.time_index_next is not None:
+                i10 = self.time_index_next + i1
+                i11 = self.time_index_next + i2
+
+            t_w2 = tensor.new(a).unsqueeze(dim=2)
+            t_w1 = 1.0 - t_w2
+
+            tenors = tensor.new(tenor_points_in_years).unsqueeze(dim=2)
+            mult = tenors if time_factor else 1.0
+
+            if curve_tenor.type.startswith('Hermite'):
                 g, c = self.interp_obj.interp_params
-                tenors = torch.unsqueeze(tensor.new(tenor_points), axis=2)
-                if curve_component[FACTOR_INDEX_Tenor_Index].type == 'HermiteRT':
-                    clipped = tenors.clamp(
-                        curve_component[FACTOR_INDEX_Tenor_Index].min,
-                        curve_component[FACTOR_INDEX_Tenor_Index].max)
-                    mult = (tenors if time_factor else 1.0) / clipped
-                else:
-                    mult = tenors if time_factor else 1.0
+                if curve_tenor.type == 'HermiteRT':
+                    mult = mult / tenors.clamp(curve_tenor.min, curve_tenor.max)
 
-                t_a = tensor.new(a)
-                val = calc_hermite_curve(
-                    t_a, g[time_index, i1], c[time_index, i1],
-                    tensor[time_index, i1], tensor[time_index, i2])
+                val = calc_hermite_curve(t_w2, g[i00,], c[i00,], tensor[i00,], tensor[i01,])
 
                 if self.alpha is not None:
                     # need to linearly interpolate between 2 time points
-                    val_t1 = calc_hermite_curve(
-                        t_a, g[time_index_next, i1], c[time_index_next, i1],
-                        tensor[time_index_next, i1], tensor[time_index_next, i2])
+                    val_t1 = calc_hermite_curve(t_w2, g[i10,], c[i10,], tensor[i10,], tensor[i11,])
+
+                    val = (1 - self.alpha) * val + self.alpha * val_t1
+            else:
+                # default to linear
+                val = tensor[i00,] * t_w1 + tensor[i01,] * t_w2
+
+                if self.alpha is not None:
+                    val_t1 = tensor[i10,] * t_w1 + tensor[i11,] * t_w2
 
                     val = (1 - self.alpha) * val + self.alpha * val_t1
 
-                interp_val = val * mult
-            else:
-                # default to linear
-                t_w1 = tensor.new(w1)
-                t_w2 = tensor.new(w2)
-
-                interp_val = tensor[time_index, i1] * t_w1 + tensor[time_index, i2] * t_w2
-
-                if self.alpha is not None:
-                    interp_val = (1 - self.alpha) * interp_val + \
-                                 self.alpha * (tensor[time_index_next, i1] * t_w1 +
-                                               tensor[time_index_next, i2] * t_w2)
-
-            return interp_val
+            return val * mult
         else:
             # return a null tensor
-            return self.interp_obj.tensor.new_zeros([time_size, 0, self.interp_obj.tensor.shape[-1]])
+            return tensor.new_zeros([time_size, 0, tensor.shape[-1]])
 
 
 class TensorBlock(object):
@@ -971,7 +947,7 @@ class TensorBlock(object):
 def filter_data_frame(df, from_date, to_date, rate=None):
     index1 = (pd.Timestamp(from_date) - excel_offset).days
     index2 = (pd.Timestamp(to_date) - excel_offset).days
-    return df.ix[index1:index2] if rate is None else df.ix[index1:index2][
+    return df.loc[index1:index2] if rate is None else df.loc[index1:index2][
         [col for col in df.columns if col.startswith(rate)]]
 
 
@@ -1003,6 +979,61 @@ def norm_cdf(x):
     return 0.5 * (torch.erfc(x * -0.7071067811865475))
 
 
+def BivN(P, Q, rho):
+    from scipy.stats import multivariate_normal
+    mvn = np.vectorize(lambda x: multivariate_normal(cov=[[1.0, x], [x, 1.0]]))
+    z2 = mvn(rho)
+    cdf = np.vectorize(lambda z, x, y: z.cdf([x, y]))
+    return cdf(z2, P, Q)
+
+
+def ApproxBivN(P, Q, rho):
+    # this is an approximation of the bivariate normal integral accurate to around 4 decimal
+    # places - based on the paper from A Simple Approximation for Bivariate Normal Integral
+    # Based on Error Function and its Application on Probit Model
+    # with Binary Endogenous Regressor (Wen-Jen Tsay and Peng-Hsuan Ke)
+    # might want to improve the accuracy of this but this is fast and vectorized
+
+    # work out the cases
+    denom = torch.sqrt(1.0 - rho * rho)
+    a = -rho / denom
+    b = P / denom
+    numer = a * Q + b
+
+    case1 = (a > 0.0) & (numer >= 0.0)
+    case2 = (a > 0.0) & (numer < 0.0)
+    case3 = (a < 0.0) & (numer >= 0.0)
+    case4 = (a < 0.0) & (numer < 0.0)
+
+    c1 = -1.0950081470333
+    c2 = -0.75651138383854
+    ma2c2 = 1.0 - a * a * c2
+    sq_ma2c2 = torch.sqrt(ma2c2)
+    a2c1_2 = a * a * c1 * c1
+    q_part = np.sqrt(2) * (Q - a * c2 * (a * Q + b))
+    root4_p = torch.exp((a2c1_2 + 2 * b * (np.sqrt(2) * c1 + b * c2)) / (4.0 * ma2c2)) / (4.0 * sq_ma2c2)
+    root4_m = torch.exp((a2c1_2 - 2 * b * (np.sqrt(2) * c1 - b * c2)) / (4.0 * ma2c2)) / (4.0 * sq_ma2c2)
+    erf2_p = torch.erf((q_part + a * c1) / (2.0 * sq_ma2c2))
+    erf2_m = torch.erf((q_part - a * c1) / (2.0 * sq_ma2c2))
+    erf_p1 = (np.sqrt(2) * b) / (2 * a * sq_ma2c2)
+    erf_p2 = (a * a * c1) / (2 * a * sq_ma2c2)
+    erf1 = torch.erf(erf_p1 + erf_p2)
+    erf3 = torch.erf(erf_p1 - erf_p2)
+
+    cas1 = .5 * (torch.erf(Q / np.sqrt(2)) + torch.erf(b / (np.sqrt(2) * a))) + root4_m * (
+            1.0 - erf3) - root4_p * (erf2_m + erf1)
+    cas2 = root4_m * (1 + erf2_p)
+    cas3 = .5 * (1 + torch.erf(Q / np.sqrt(2))) - root4_p * (1.0 + erf2_m)
+    cas4 = .5 * (1 - torch.erf(b / (np.sqrt(2) * a))) - root4_p * (1.0 - erf1) + root4_m * (erf2_p + erf3)
+
+    final = norm_cdf(P) * norm_cdf(Q)
+    for c, f in zip([cas1, cas2, cas3, cas4], [case1, case2, case3, case4]):
+        if f.any():
+            final[f] = c[f]
+
+    return final
+
+
 def black_european_option_price(F, X, r, vol, tenor, buyOrSell, callOrPut):
     stddev = vol * np.sqrt(tenor)
     sign = 1.0 if (F > 0.0 and X > 0.0) else -1.0
@@ -1012,13 +1043,29 @@ def black_european_option_price(F, X, r, vol, tenor, buyOrSell, callOrPut):
                                     X * scipy.stats.norm.cdf(callOrPut * sign * d2)) * np.exp(-r * tenor)
 
 
+def Bjerksund_Stensland(A1, A2, B, x1, x2, K, sigma1, sigma2, rho, callOrPut):
+    a = x2+K
+    b = x2/a
+    sigma1_2 = sigma1*sigma1
+    sigma2_2 = sigma2*sigma2
+    # make sure the variance is at least 1e-6
+    v2 = torch.clamp(sigma1_2-2*rho*sigma1*b*sigma2+b*b*sigma2_2, min=1e-6)
+    v = torch.sqrt(v2)
+    d = torch.log(x1/a)/v
+    d1 = d+v/2
+    d2 = d-(sigma1_2-2*rho*sigma1*sigma2-b*b*sigma2_2+2*b*sigma2_2)/(2*v)
+    d3 = d-(sigma1_2-b*b*sigma2_2)/(2*v)
+
+    return A1*x1*norm_cdf(callOrPut*d1)+A2*x2*norm_cdf(callOrPut*d2)+B*norm_cdf(callOrPut*d3)
+
+
 def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
     # calculates the black function WITHOUT discounting
 
     if isinstance(tenor, float):
         guard = (vol > 0.0) & (X > 0.0)
         stddev = vol.clamp(min=1e-5) * np.sqrt(tenor)
-        strike = min(X, 1e-5) if isinstance(X, float) else X.clamp(min=1e-5)
+        strike = max(X, 1e-5) if isinstance(X, float) else X.clamp(min=1e-5)
     else:
         guard = vol.new_tensor(tenor > 0.0, dtype=torch.bool)
         tau = np.sqrt(tenor.clip(0.0, np.inf))
@@ -1037,6 +1084,10 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
     forward = torch.clamp(F, min=1e-5)
 
     if isinstance(strike, float) and strike == 0:
+        # note that we're explicitly assuming a call option here
+        # if this was a put option, the value should be 0. But who would
+        # book a put option with 0 strike?
+
         prem = forward
         value = forward
     else:
@@ -1368,7 +1419,7 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
 
     expiry_indices = np.arange(expiry.size).astype(np.int32)
     expiry_offsets = shared.one.new_tensor(
-        [expiry_indices * moneyness_tenor.tenor.size],
+        np.array([expiry_indices * moneyness_tenor.tenor.size]),
         dtype=torch.int32).T.expand(-1, shared.simulation_batch).reshape(-1)
 
     reshape = True

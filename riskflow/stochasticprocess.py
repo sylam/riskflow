@@ -514,7 +514,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         # check if the entire cholesky is +ve definite
         if (delta_CtT[:, 0] * delta_CtT[:, 3] > delta_CtT[:, 1] * delta_CtT[:, 2]).all():
             # get the correlation through time
-            C = F.pad(torch.cholesky(delta_CtT.reshape(-1, 2, 2)), (0, 0, 0, 0, 1, 0))
+            C = F.pad(torch.linalg.cholesky(delta_CtT.reshape(-1, 2, 2)), (0, 0, 0, 0, 1, 0))
             # all good
             self.params_ok = True
         else:
@@ -522,7 +522,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             cholesky = [tensor.new_zeros((2, 2), dtype=torch.float64)]
             for i, C in enumerate(t_CtT[1:] - t_CtT[:-1]):
                 if (C[0] > 0.0) & (C[3] > 0.0) & (C[1] * C[2] < C[0] * C[3]):
-                    cholesky.append(torch.cholesky(C.reshape(2, 2)))
+                    cholesky.append(torch.linalg.cholesky(C.reshape(2, 2)))
                 else:
                     cholesky.append(cholesky[-1])
 
@@ -574,7 +574,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
             # if we have a grid index, then we want to simulate a reduced curve (just the first 6 months) over a
             # finer time grid - this is useful for stochastic deflation - note that at least 4 tenor points need
             # to be included to correctly handle interpolation
-            reduced_tenor_index = max(4, self.factor.tenors.searchsorted(0.5))
+            reduced_tenor_index = max(4, self.factor.tenors.searchsorted(0.5) + 1)
 
             full_grid_curve = sim_curve(
                 self.drift[self.grid_index], self.BtT[0], self.BtT[1],

@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 
 # Internal modules
-from . import hdsobol, utils, pricing, instruments, riskfactors, stochasticprocess
+from . import utils, pricing, instruments, riskfactors, stochasticprocess
 
 from scipy.stats import norm
 import scipy.optimize
@@ -64,20 +64,19 @@ class RiskNeutralInterestRate_State(utils.Calculation_State):
         self.t_PreCalc.clear()
 
         if self.t_random_batch is None:
-            if time_grid.time_grid_years.size * numfactors < 1111:
-                self.sobol = torch.quasirandom.SobolEngine(
-                    dimension=time_grid.time_grid_years.size * numfactors, scramble=True, seed=1234)
-                sample = torch.distributions.Normal(0, 1).icdf(
-                    self.sobol.draw(self.simulation_batch * num_batches)).reshape(
-                    num_batches, self.simulation_batch, -1)
-                self.t_random_batch = sample.transpose(1, 2).reshape(
-                    num_batches, numfactors, -1, self.simulation_batch).to(self.one.device)
-            else:
-                # this is old - fix TODO!
-                self.t_random_batch = normalize(norm.ppf(hdsobol.gen_sobol_vectors(
-                    self.simulation_batch * num_batches + 4000, time_grid.time_grid_years.size * numfactors))[
-                                                3999:]).reshape(
-                    self.batches, self.simulation_batch, -1)
+            # the sobol engine in torch > 1.8 goes up to dimension 21201 - so this should be fine
+            self.sobol = torch.quasirandom.SobolEngine(
+                dimension=time_grid.time_grid_years.size * numfactors, scramble=True, seed=1234)
+            # skip this many samples
+            self.sobol.fast_forward(2048)
+            # make sure we don't include 1 or 0
+            sample_sobol = self.sobol.draw(self.simulation_batch * num_batches).reshape(
+                num_batches, self.simulation_batch, -1)
+            sample = torch.erfinv(2 * (0.5 + (1 - torch.finfo(sample_sobol.dtype).eps) * (
+                    sample_sobol - 0.5)) - 1).reshape(
+                num_batches, self.simulation_batch, -1) * 1.4142135623730951
+            self.t_random_batch = sample.transpose(1, 2).reshape(
+                num_batches, numfactors, -1, self.simulation_batch).to(self.one.device)
 
 
 def create_float_cashflows(base_date, cashflow_obj, frequency):
@@ -159,7 +158,7 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
         float_cash = utils.generate_float_cashflows(
             base_date, time_grid, float_pay_dates, 1.0, None, None,
             instrument['Floating_Frequency'], pd.DateOffset(month=0),
-            utils.get_day_count(instrument['Day_Count']), 0.0)
+            utils.get_day_count(instrument['Floating_Day_Count']), 0.0)
 
         K, pvbp = float_cash.get_par_swap_rate(base_date, curve_factor)
 
@@ -167,7 +166,7 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
             fixed_pay_dates = instruments.generate_dates_backward(
                 maturity, effective, instrument['Fixed_Frequency'])
             fixed_cash = utils.generate_fixed_cashflows(
-                base_date, fixed_pay_dates, 1.0, None, utils.get_day_count(instrument['Day_Count']), 0.0)
+                base_date, fixed_pay_dates, 1.0, None, utils.get_day_count(instrument['Fixed_Day_Count']), 0.0)
             pv_float = K * pvbp
             pvbp = fixed_cash.get_par_swap_rate(base_date, curve_factor)
             K = pv_float / pvbp
@@ -198,11 +197,21 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
             Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, time_index), Calc_res=None)
 
         shifted_strike = K + shift_parameter
+        # first check if we have the actual premium (not implied)
+        if vol_surface.premiums is not None:
+            swaption_price = vol_surface.get_premium(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
+            if vol_surface.delta:
+                implied_vol = scipy.optimize.brentq(lambda v: pvbp * utils.black_european_option_price(
+                    shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol+.5)
+                swaption_price = pvbp * utils.black_european_option_price(
+                    shifted_strike, shifted_strike, 0.0, implied_vol+vol_surface.delta, expiry, 1.0, 1.0)
+        else:
+            swaption_price = pvbp * utils.black_european_option_price(
+                shifted_strike, shifted_strike, 0.0, vol+vol_surface.delta, expiry, 1.0, 1.0)
+
         # store this
         all_deals[swaption_name] = market_swap_class(
-            deal_data=deal_data,
-            price=pvbp * utils.black_european_option_price(shifted_strike, shifted_strike, 0.0, vol, expiry, 1.0, 1.0),
-            weight=instrument['Weight'])
+            deal_data=deal_data, price=swaption_price, weight=instrument['Weight'])
 
         # store the benchmark
         if rate is not None:
@@ -507,6 +516,13 @@ class RiskNeutralInterestRateModel(object):
     def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
         base_date = sys_params['Base_Date']
         base_currency = sys_params['Base_Currency']
+        master_curve_list = sys_params.get('Master_Curves')
+
+        if sys_params.get('Swaption_Premiums') is not None:
+            swaption_premiums = pd.read_csv(sys_params['Swaption_Premiums'], index_col=0)
+            ATM_Premiums = swaption_premiums[swaption_premiums['Strike'] == 'ATM']
+        else:
+            ATM_Premiums = None
 
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
@@ -520,12 +536,18 @@ class RiskNeutralInterestRateModel(object):
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
                     swaptionvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
+                    swaptionvol.delta = sys_params.get('Swaption_Volatility_Delta', 0.0)
                     ir_curve = riskfactors.construct_factor(ir_factor, price_factors, factor_interp)
+                    swaptionvol.set_premiums(ATM_Premiums, ir_curve.get_currency())
                 except KeyError as k:
                     logging.warning('Missing price factor {} - Unable to bootstrap {}'.format(k.args, market_price))
                     continue
                 except Exception:
                     logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
+                    continue
+
+                if master_curve_list and master_curve_list.get(ir_curve.get_currency()[0]) != rate[1]:
+                    logging.warning('curve is not Risk Free {} - skipping and will reassign later'.format(market_price))
                     continue
 
                 # set of dates for the calibration
@@ -621,9 +643,14 @@ class PCAMixedFactorModelParameters(RiskNeutralInterestRateModel):
 
     def calc_sample(self, time_grid, numfactors=0):
         if numfactors != 3 or self.sample is None:
-            self.sample = normalize(norm.ppf(hdsobol.gen_sobol_vectors(
-                self.batch_size * self.num_batches + 4000, time_grid.scen_time_grid.size * numfactors))[3999:]).reshape(
+            self.sobol = torch.quasirandom.SobolEngine(
+                dimension=time_grid.time_grid_years.size * numfactors, scramble=True, seed=1234)
+            sample = torch.distributions.Normal(0, 1).icdf(
+                self.sobol.draw(self.batch_size * self.num_batches)).reshape(
                 self.num_batches, self.batch_size, -1)
+            self.sample = sample.transpose(1, 2).reshape(
+                self.num_batches, numfactors, -1, self.batch_size).to(self.one.device)
+
         return self.sample
 
     def calc_loss(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):

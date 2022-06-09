@@ -1,5 +1,5 @@
 # RiskFlow
-An xVA quantitative library written in pure python using tensorflow.
+An xVA quantitative library written in pure python using pytorch
 
 
 ## Installation
@@ -9,7 +9,7 @@ The easiest way to install riskflow is via pip
 pip install riskflow
 ```
 
-Note that this installs tensorflow 1.14 (the cpu version). If gpu's are available, please install tensorflow-gpu (also version 1.14)
+The minimum required version is pytorch 1.8. It is highly recommended to install pytorch with gpu support.
 Downloading the source and running setup also works.
 
 ```
@@ -30,5 +30,5 @@ There are 2 batch scripts installed :
 
 ## Known issues
 
-1. The hessian (matrix of second derivatives) does not always compute - this may be a bug in tensorflow
+1. Documentation is out of date
 
