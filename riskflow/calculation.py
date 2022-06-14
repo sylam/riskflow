@@ -54,8 +54,6 @@ class DealStructure(object):
         self.dependencies = []
         # maintain a list of container objects
         self.sub_structures = []
-        # do we need to create sub_partitions?
-        self.sub_partitions = OrderedDict()
         # Do we want to store each deal level MTM explicitly?
         self.deal_level_mtm = deal_level_mtm
 
@@ -115,16 +113,6 @@ class DealStructure(object):
         except Exception as e:
             logging.error('{0}.{1} {2} - Skipped'.format(
                 struct.obj.Instrument.field['Object'], struct.obj.Instrument.field.get('Reference', '?'), e.args))
-
-    def build_partitions(self):
-        # sort the data by the tags
-        self.dependencies.sort(key=lambda x: x.Instrument.field['Tags'])
-        # get the distinct tags
-        unique_tags = set([x.Instrument.field['Tags'] for x in self.dependencies])
-        if len(unique_tags) > 1:
-            for tag in sorted(unique_tags):
-                # TODO
-                pass
 
     def resolve_structure(self, shared, time_grid):
         """
@@ -1252,7 +1240,9 @@ class Base_Revaluation(Calculation):
         ns_obj = self.netting_sets.sub_structures[0].obj
         ns_obj.Calc_res['Value'] = mtm
         # make sure the netting set object has a reference and a mtm
-        ns_obj.Instrument.field.setdefault('Reference', self.config.deals['Attributes']['Reference'])
+        if ns_obj.Instrument.field.get('Reference') is None:
+            ns_obj.Instrument.field['Reference'] = self.config.deals['Attributes'].get(
+                'Reference', self.config.file_ref)
 
         if shared_mem.calc_greeks is not None:
             # record the cuda execution stats

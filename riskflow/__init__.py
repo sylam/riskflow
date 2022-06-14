@@ -18,7 +18,7 @@
 
 __author__ = "Shuaib Osman"
 __license__ = "Free for non-commercial use"
-__all__ = ['version_info', '__version__', '__author__', '__license__', 'makeflatcurve', 'getpath',
+__all__ = ['version_info', '__version__', '__author__', '__license__', 'Context', 'makeflatcurve', 'getpath',
            'set_collateral', 'load_market_data', 'run_baseval', 'run_cmc']
 
 import os
@@ -29,6 +29,7 @@ import collections.abc
 
 from ._version import version_info, __version__
 from . import utils
+from .adaptiv import AdaptivContext
 
 
 def update_dict(d, u):
@@ -55,12 +56,12 @@ def getpath(pathlist):
             return path
 
 
-def set_collateral(cx, Agreement_Currency, Balance_Currency, Opening_Balance, Received_Threshold=0.0,
+def set_collateral(cfg, Agreement_Currency, Balance_Currency, Opening_Balance, Received_Threshold=0.0,
                    Posted_Threshold=0.0, Minimum_Received=100000.0, Minimum_Posted=100000.0, Liquidation_Period=10.0):
     """
     Loads CSA details on the root netting set in the given context
     """
-    cx.deals['Deals']['Children'][0]['instrument'].field.update(
+    cfg.deals['Deals']['Children'][0]['instrument'].field.update(
         {'Agreement_Currency': Agreement_Currency, 'Opening_Balance': Opening_Balance,
          'Apply_Closeout_When_Uncollateralized': 'No', 'Collateralized': 'True', 'Settlement_Period': 0.0,
          'Balance_Currency': Balance_Currency, 'Liquidation_Period': Liquidation_Period,
@@ -83,22 +84,21 @@ def load_market_data(rundate, path, json_name='MarketData.json', cva_default=Tru
     :param cva_default: loads a survival curve with recovery 50% (useful for testing)
     :return: a context object with the data and calendars loaded
     """
-    from .adaptiv import AdaptivContext as Context
 
-    context = Context()
-    context.parse_json(os.path.join(path, rundate, json_name))
-    context.parse_calendar_file(os.path.join(path, 'calendars.cal'))
+    config = AdaptivContext()
+    config.parse_json(os.path.join(path, rundate, json_name))
+    config.parse_calendar_file(os.path.join(path, 'calendars.cal'))
 
-    context.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
+    config.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
 
     if cva_default:
-        context.params['Price Factors']['SurvivalProb.DEFAULT'] = {
+        config.params['Price Factors']['SurvivalProb.DEFAULT'] = {
             'Recovery_Rate': 0.5,
             'Curve': utils.Curve(
                 [], [[0.0, 0.0], [.5, .01], [1, .02], [3, .07], [5, .15], [10, .35], [20, .71], [30, 1.0]]),
             'Property_Aliases': None}
 
-    return context
+    return config
 
 
 def run_baseval(context, prec=torch.float64, overrides=None):
@@ -193,3 +193,90 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
     res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(exposure, 95, axis=1)}, index=dates)
 
     return calc, out, res
+
+
+class Context:
+    def __init__(self, path_transform={}, file_transform={}):
+        # needed if the json file contains paths to windows files but linux is needed
+        self.path_map = path_transform
+        # needed if the name of the file referenced needs to be changed (e.g. from .dat to .json)
+        self.file_map = file_transform
+        self.config_cache = {}
+        self.holiday_cfg_cache = {}
+        self.current_cfg = AdaptivContext()
+
+    def load_json(self, jobfilename):
+
+        def parse_path(file_path):
+            path, filename = os.path.split(file_path)
+            return os.path.join(self.path_map.get(path, path), self.file_map.get(filename, filename))
+
+        cfg = self.current_cfg
+        # read the raw json data
+        data = self.current_cfg.read_json(jobfilename)
+
+        if 'MergeMarketData' in data['Calc']:
+            market_data = data['Calc']['MergeMarketData']
+
+            if market_data['MarketDataFile'] not in self.config_cache:
+                new_cfg = AdaptivContext()
+                new_cfg.parse_json(parse_path(market_data['MarketDataFile']))
+
+                # check we need to set the base_date
+                if new_cfg.params['System Parameters'].get('Base_Date') is None:
+                    # set it to now
+                    new_cfg.params['System Parameters']['Base_Date'] = pd.Timestamp.now()
+
+                # check if a calendar is loaded
+                if 'CalendDataFile' in data['Calc']:
+                    # parse calendar file
+                    new_cfg.parse_calendar_file(parse_path(data['Calc']['CalendDataFile']))
+                    # store a link
+                    self.holiday_cfg_cache[market_data['MarketDataFile']] = data['Calc']['CalendDataFile']
+
+                # set its version
+                new_cfg.version = ['JSONVersion', '22.05.30']
+                # cache it
+                self.config_cache[market_data['MarketDataFile']] = new_cfg
+
+            cfg = self.config_cache[market_data['MarketDataFile']]
+            for section, section_data in market_data['ExplicitMarketData'].items():
+                cfg.params[section].update(section_data)
+
+            if 'CalendDataFile' in data['Calc'] and data['Calc'][
+                'CalendDataFile'] != self.holiday_cfg_cache[market_data['MarketDataFile']]:
+                # parse calendar file again
+                cfg.parse_calendar_file(parse_path(data['Calc']['CalendDataFile']))
+                # store a link
+                self.holiday_cfg_cache[market_data['MarketDataFile']] = data['Calc']['CalendDataFile']
+
+        if 'Deals' in data['Calc']:
+            cfg.deals = {'Attributes': {
+                'Tag_Titles': data['Calc']['Deals']['Tag_Titles'],
+                'Reference': data['Calc']['Deals']['Reference']}}
+            cfg.deals.update({'Deals': data['Calc']['Deals']['Deals']})
+            cfg.deals.update({'Calculation': data['Calc']['Calculation']})
+
+        #  set the current context to newly loaded one
+        self.current_cfg = cfg
+        # return this object
+        return self
+
+    def run_job(self, overrides=None):
+        # check what calc we should run
+        if self.current_cfg.deals['Calculation']['Object'] == 'CreditMonteCarlo':
+            return self.Credit_Monte_Carlo(overrides)
+        elif self.current_cfg.deals['Calculation']['Object'] == 'BaseValuation':
+            return self.Base_Valuation(overrides)
+        else:
+            raise Exception('Unknown Calculation {}'.format(self.current_cfg.deals['Calculation']['Object']))
+
+    def Credit_Monte_Carlo(self, overrides=None):
+        CollVA = False
+        FVA = False
+        CVA = self.current_cfg.deals['Calculation'].get(
+            'Credit_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes'
+        return run_cmc(self.current_cfg, overrides=overrides, CVA=CVA, FVA=FVA, CollVA=CollVA)
+
+    def Base_Valuation(self,  overrides=None):
+        return run_baseval(self.current_cfg, overrides=overrides)
