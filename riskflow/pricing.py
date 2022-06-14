@@ -75,37 +75,26 @@ class SensitivitiesEstimator(object):
         return OrderedDict([(utils.check_scope_name(factor),
                              tensor.cpu().detach().numpy()) for factor, tensor in self.grad.items()])
 
-    def report_hessian(self, approx_eigenval=None, allow_unused=False):
+    def report_hessian(self, allow_unused=False):
 
         def calc_Hv(x):
             X = self.flat_grad.new(x.T)
             f = [self.get_Hv_op(v) for v in X]
             return torch.stack(f).cpu().detach().numpy().T.astype(np.float64)
 
-        if approx_eigenval is not None:
-            small_eval, small_evec = SensitivitiesEstimator.eigenvalues(
-                calc_Hv, np.random.randn(self.P, approx_eigenval), maxiter=50, largest=False)
-            big_eval, big_evec = SensitivitiesEstimator.eigenvalues(
-                calc_Hv, np.random.randn(self.P, approx_eigenval), maxiter=50, largest=True)
-            # now approximate the hessian using the eigenvalues and eigenvectors
-            dominant_lamda = np.diag(np.concatenate([big_eval, small_eval[::-1]]))
-            dominant_vecs = np.hstack([big_evec, small_evec[::-1]])
-            return dominant_vecs.dot(dominant_lamda).dot(dominant_vecs.T)
+        h_op = self.get_H_op(allow_unused)
+        hessian = np.zeros((self.P, self.P))
 
-        else:
-            h_op = self.get_H_op(allow_unused)
-            hessian = np.zeros((self.P, self.P))
+        # store it in a matrix
+        j = 0
+        for row in h_op:
+            v, _ = row.shape
+            hessian[j:j + v, j:] = row
+            j += v
 
-            # store it in a matrix
-            j = 0
-            for row in h_op:
-                v, _ = row.shape
-                hessian[j:j + v, j:] = row
-                j += v
-
-            # zero out the lower indices
-            hessian[np.tril_indices(self.P, k=-1)] = 0.0
-            return hessian + np.triu(hessian, k=1).T
+        # zero out the lower indices
+        hessian[np.tril_indices(self.P, k=-1)] = 0.0
+        return hessian + np.triu(hessian, k=1).T
 
     def get_Hv_op(self, v):
         """
@@ -135,241 +124,6 @@ class SensitivitiesEstimator(object):
             A flattened 1D tensor
         """
         return torch.cat([_params.reshape(-1) for _params in params], axis=0)
-
-    @staticmethod
-    def _b_orthonormalize(blockVectorV, blockVectorBV=None, retInvR=False):
-        """B-orthonormalize the given block vector using Cholesky."""
-        normalization = blockVectorV.max(axis=0) + np.finfo(blockVectorV.dtype).eps
-        blockVectorV = blockVectorV / normalization
-        if blockVectorBV is None:
-            blockVectorBV = blockVectorV  # Shared data!!!
-        else:
-            blockVectorBV = blockVectorBV / normalization
-        VBV = np.matmul(blockVectorV.T.conj(), blockVectorBV)
-        try:
-            # VBV is a Cholesky factor from now on...
-            VBV = sp.linalg.cholesky(VBV, overwrite_a=True)
-            VBV = sp.linalg.inv(VBV, overwrite_a=True)
-            blockVectorV = np.matmul(blockVectorV, VBV)
-            blockVectorBV = None
-        except sp.linalg.LinAlgError:
-            blockVectorV = None
-            blockVectorBV = None
-
-        if retInvR:
-            return blockVectorV, blockVectorBV, VBV, normalization
-        else:
-            return blockVectorV, blockVectorBV
-
-    @staticmethod
-    def _get_indx(_lambda, num, largest):
-        """Get `num` indices into `_lambda` depending on `largest` option."""
-        ii = np.argsort(_lambda)
-        if largest:
-            ii = ii[:-num - 1:-1]
-        else:
-            ii = ii[:num]
-        return ii
-
-    @staticmethod
-    def _as2d(ar):
-        """
-        If the input array is 2D return it, if it is 1D, append a dimension,
-        making it a column vector.
-        """
-        if ar.ndim == 2:
-            return ar
-        else:  # Assume 1!
-            aux = np.array(ar, copy=False)
-            aux.shape = (ar.shape[0], 1)
-            return aux
-
-    @staticmethod
-    def eigenvalues(A, X, maxiter=None, largest=False):
-        # copied almost verbatum from scipy's lobpcg (modified to interface with torch's tensors)
-        blockVectorX = X
-        residualTolerance = None
-        if maxiter is None:
-            maxiter = 20
-
-        n, sizeX = blockVectorX.shape
-
-        if (residualTolerance is None) or (residualTolerance <= 0.0):
-            residualTolerance = np.sqrt(1e-15) * n
-
-        # B-orthonormalize X.
-        blockVectorX, blockVectorBX = SensitivitiesEstimator._b_orthonormalize(blockVectorX)
-        ##
-        # Compute the initial Ritz vectors: solve the eigenproblem.
-        blockVectorAX = A(blockVectorX)
-        gramXAX = np.dot(blockVectorX.T.conj(), blockVectorAX)
-        _lambda, eigBlockVector = sp.linalg.eigh(gramXAX, check_finite=False)
-        ii = SensitivitiesEstimator._get_indx(_lambda, sizeX, largest)
-        _lambda = _lambda[ii]
-        eigBlockVector = np.asarray(eigBlockVector[:, ii])
-        blockVectorX = np.dot(blockVectorX, eigBlockVector)
-        blockVectorAX = np.dot(blockVectorAX, eigBlockVector)
-
-        ##
-        # Active index set.
-        activeMask = np.ones((sizeX,), dtype=bool)
-        lambdaHistory = [_lambda]
-        residualNormsHistory = []
-        previousBlockSize = sizeX
-        ident = np.eye(sizeX, dtype=blockVectorAX.dtype)
-        ident0 = np.eye(sizeX, dtype=blockVectorAX.dtype)
-        ##
-
-        # Main iteration loop.
-        blockVectorP = None  # set during iteration
-        blockVectorAP = None
-        iterationNumber = -1
-        restart = True
-        explicitGramFlag = False
-        while iterationNumber < maxiter:
-            iterationNumber += 1
-
-            aux = blockVectorX * _lambda[np.newaxis, :]
-            blockVectorR = blockVectorAX - aux
-            aux = np.sum(blockVectorR.conj() * blockVectorR, 0)
-            residualNorms = np.sqrt(aux)
-            residualNormsHistory.append(residualNorms)
-            ii = np.where(residualNorms > residualTolerance, True, False)
-            activeMask = activeMask & ii
-
-            currentBlockSize = activeMask.sum()
-            if currentBlockSize != previousBlockSize:
-                previousBlockSize = currentBlockSize
-                ident = np.eye(currentBlockSize, dtype=blockVectorAX.dtype)
-            if currentBlockSize == 0:
-                break
-
-            activeBlockVectorR = SensitivitiesEstimator._as2d(blockVectorR[:, activeMask])
-            if iterationNumber > 0:
-                activeBlockVectorP = SensitivitiesEstimator._as2d(blockVectorP[:, activeMask])
-                activeBlockVectorAP = SensitivitiesEstimator._as2d(blockVectorAP[:, activeMask])
-
-            activeBlockVectorR = activeBlockVectorR - np.matmul(
-                blockVectorX, np.matmul(blockVectorX.T.conj(), activeBlockVectorR))
-
-            ##
-            # B-orthonormalize the preconditioned residuals.
-            aux = SensitivitiesEstimator._b_orthonormalize(activeBlockVectorR)
-            activeBlockVectorR, activeBlockVectorBR = aux
-            activeBlockVectorAR = A(activeBlockVectorR)
-            if iterationNumber > 0:
-                aux = SensitivitiesEstimator._b_orthonormalize(activeBlockVectorP, retInvR=True)
-                activeBlockVectorP, _, invR, normal = aux
-
-                # Function _b_orthonormalize returns None if Cholesky fails
-                if activeBlockVectorP is not None:
-                    activeBlockVectorAP = activeBlockVectorAP / normal
-                    activeBlockVectorAP = np.dot(activeBlockVectorAP, invR)
-                    restart = False
-                else:
-                    restart = True
-            ##
-            # Perform the Rayleigh Ritz Procedure:
-            # Compute symmetric Gram matrices:
-            if activeBlockVectorAR.dtype == 'float32':
-                myeps = 1
-            elif activeBlockVectorR.dtype == 'float32':
-                myeps = 1e-4
-            else:
-                myeps = 1e-8
-            if residualNorms.max() > myeps and not explicitGramFlag:
-                explicitGramFlag = False
-            else:
-                # Once explicitGramFlag, forever explicitGramFlag.
-                explicitGramFlag = True
-
-            # Shared memory assingments to simplify the code
-            blockVectorBX = blockVectorX
-            activeBlockVectorBR = activeBlockVectorR
-            if not restart:
-                activeBlockVectorBP = activeBlockVectorP
-
-            # Common submatrices:
-            gramXAR = np.dot(blockVectorX.T.conj(), activeBlockVectorAR)
-            gramRAR = np.dot(activeBlockVectorR.T.conj(), activeBlockVectorAR)
-            if explicitGramFlag:
-                gramRAR = (gramRAR + gramRAR.T.conj()) / 2
-                gramXAX = np.dot(blockVectorX.T.conj(), blockVectorAX)
-                gramXAX = (gramXAX + gramXAX.T.conj()) / 2
-                gramXBX = np.dot(blockVectorX.T.conj(), blockVectorBX)
-                gramRBR = np.dot(activeBlockVectorR.T.conj(), activeBlockVectorBR)
-                gramXBR = np.dot(blockVectorX.T.conj(), activeBlockVectorBR)
-            else:
-                gramXAX = np.diag(_lambda)
-                gramXBX = ident0
-                gramRBR = ident
-                gramXBR = np.zeros((sizeX, currentBlockSize), dtype=blockVectorAX.dtype)
-
-            if not restart:
-                gramXAP = np.dot(blockVectorX.T.conj(), activeBlockVectorAP)
-                gramRAP = np.dot(activeBlockVectorR.T.conj(), activeBlockVectorAP)
-                gramPAP = np.dot(activeBlockVectorP.T.conj(), activeBlockVectorAP)
-                gramXBP = np.dot(blockVectorX.T.conj(), activeBlockVectorBP)
-                gramRBP = np.dot(activeBlockVectorR.T.conj(), activeBlockVectorBP)
-                if explicitGramFlag:
-                    gramPAP = (gramPAP + gramPAP.T.conj()) / 2
-                    gramPBP = np.dot(activeBlockVectorP.T.conj(),
-                                     activeBlockVectorBP)
-                else:
-                    gramPBP = ident
-
-                gramA = np.bmat([[gramXAX, gramXAR, gramXAP],
-                                 [gramXAR.T.conj(), gramRAR, gramRAP],
-                                 [gramXAP.T.conj(), gramRAP.T.conj(), gramPAP]])
-
-                gramB = np.bmat([[gramXBX, gramXBR, gramXBP],
-                                 [gramXBR.T.conj(), gramRBR, gramRBP],
-                                 [gramXBP.T.conj(), gramRBP.T.conj(), gramPBP]])
-
-                try:
-                    _lambda, eigBlockVector = sp.linalg.eigh(gramA, gramB, check_finite=False)
-                except sp.linalg.LinAlgError:
-                    # try again after dropping the direction vectors P from RR
-                    restart = True
-
-            if restart:
-                gramA = np.bmat([[gramXAX, gramXAR],
-                                 [gramXAR.T.conj(), gramRAR]])
-                gramB = np.bmat([[gramXBX, gramXBR],
-                                 [gramXBR.T.conj(), gramRBR]])
-
-                try:
-                    _lambda, eigBlockVector = sp.linalg.eigh(gramA, gramB, check_finite=False)
-                except sp.linalg.LinAlgError:
-                    raise ValueError('eigh has failed in lobpcg iterations')
-
-            ii = SensitivitiesEstimator._get_indx(_lambda, sizeX, largest)
-
-            _lambda = _lambda[ii]
-            eigBlockVector = eigBlockVector[:, ii]
-            lambdaHistory.append(_lambda)
-
-            # Compute Ritz vectors.
-            if not restart:
-                eigBlockVectorX = eigBlockVector[:sizeX]
-                eigBlockVectorR = eigBlockVector[sizeX:sizeX + currentBlockSize]
-                eigBlockVectorP = eigBlockVector[sizeX + currentBlockSize:]
-                pp = np.dot(activeBlockVectorR, eigBlockVectorR)
-                pp += np.dot(activeBlockVectorP, eigBlockVectorP)
-                app = np.dot(activeBlockVectorAR, eigBlockVectorR)
-                app += np.dot(activeBlockVectorAP, eigBlockVectorP)
-            else:
-                eigBlockVectorX = eigBlockVector[:sizeX]
-                eigBlockVectorR = eigBlockVector[sizeX:]
-                pp = np.dot(activeBlockVectorR, eigBlockVectorR)
-                app = np.dot(activeBlockVectorAR, eigBlockVectorR)
-
-            blockVectorX = np.dot(blockVectorX, eigBlockVectorX) + pp
-            blockVectorAX = np.dot(blockVectorAX, eigBlockVectorX) + app
-            blockVectorP, blockVectorAP = pp, app
-
-        print(iterationNumber)
-        return _lambda, blockVectorX
 
     def get_H_op(self, allow_unused):
         """ 
@@ -1888,8 +1642,8 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
         time_block = discount_block.time_grid[:, utils.TIME_GRID_MTM]
         future_pmts = cash_pmts.reshape(1, -1) - time_block.reshape(-1, 1)
         reset_block = resets.dual(reset_offset)
-        reset_ofs, reset_count = np.unique(resets.split_block_resets(
-            reset_offset, time_block), return_counts=True)
+        reset_ofs, reset_count = np.unique(
+            resets.split_block_resets(reset_offset, time_block), return_counts=True)
 
         # discount rates
         discount_rates = utils.calc_discount_rate(discount_block, future_pmts, shared)

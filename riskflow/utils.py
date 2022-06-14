@@ -1084,12 +1084,11 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
     forward = torch.clamp(F, min=1e-5)
 
     if isinstance(strike, float) and strike == 0:
-        # note that we're explicitly assuming a call option here
-        # if this was a put option, the value should be 0. But who would
-        # book a put option with 0 strike?
-
-        prem = forward
-        value = forward
+        # need to check if this is a put option (value is 0)
+        # or a call option (value is just the forward)
+        adjustment = 1.0 if callorput == 1.0 else 0.0
+        prem = forward * adjustment
+        value = forward * adjustment
     else:
         d1 = torch.log(forward / strike) / stddev + 0.5 * stddev
         d2 = d1 - stddev

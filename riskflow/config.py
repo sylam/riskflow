@@ -16,7 +16,7 @@
 # along with RiskFlow.  If not, see <http://www.gnu.org/licenses/>.
 ########################################################################
 
-
+import os
 import calendar
 # import standard libraries
 import json
@@ -493,7 +493,7 @@ class Context(object):
 
             for node in deals:
                 # get the instrument
-                instrument = node['instrument']
+                instrument = node['Instrument']
 
                 if node.get('Ignore') == 'True':
                     continue
@@ -695,6 +695,8 @@ class Context(object):
             return dct
 
         with open(filename, 'rt') as f:
+            self.last_file_loaded = filename
+            self.file_ref = os.path.splitext(os.path.split(self.last_file_loaded)[-1])[0]
             data = json.load(f, object_hook=as_internal)
 
         if 'MarketData' in data:
@@ -730,7 +732,7 @@ class Context(object):
             for col in self.archive.columns:
                 self.archive_columns.setdefault(col.split(',')[0], []).append(col)
 
-    def parse_arena_json(self, filename):
+    def read_json(self, filename):
 
         def as_internal(dct):
             if '.Curve' in dct:
@@ -763,28 +765,11 @@ class Context(object):
             return dct
 
         with open(filename, 'rt') as f:
+            self.last_file_loaded = filename
+            self.file_ref = os.path.splitext(os.path.split(self.last_file_loaded)[-1])[0]
             data = json.load(f, object_hook=as_internal)
 
-        if 'MergeMarketData' in data['Calc']:
-            market_data = data['Calc']['MergeMarketData']
-
-            # update the marketdata file - if necessary, load and cache the marketdata file
-            # stored here - market_data['MarketDataFile'] - TODO
-
-            for section, section_data in market_data['ExplicitMarketData'].items():
-                self.params[section].update(section_data)
-            self.version = ['JSONVersion', '22.05.30']
-
-        if 'Deals' in data['Calc']:
-            self.deals = {'Attributes': {
-                'Tag_Titles': data['Calc']['Deals']['Tag_Titles'],
-                'Reference': data['Calc']['Deals']['Reference']}}
-            self.deals.update({'Deals': data['Calc']['Deals']['Deals']})
-            self.deals.update({'Calculation': data['Calc']['Calculation']})
-
-        if 'CalendDataFile' in data['Calc']:
-            # parse calendar file
-            self.parse_calendar_file(data['Calc']['CalendDataFile'])
+        return data
 
     def write_marketdata_json(self, json_filename):
         # backup old data

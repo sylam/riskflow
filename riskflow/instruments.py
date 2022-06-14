@@ -195,27 +195,24 @@ def get_dividend_rate_factor(fieldname, static_offsets, stochastic_offsets, all_
                               stochastic_offsets, all_tenors)]
 
 
-def get_equity_zero_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors, all_factors):
-    """Read the equity's interest rate price factor"""
-    equity_factor = all_factors.get(utils.Factor('EquityPrice', fieldname))
-    ir_curve = (equity_factor.factor if hasattr(equity_factor, 'factor') else equity_factor).get_repo_curve_name()
-    return [calc_factor_index(utils.Factor('InterestRate', ir_curve), static_offsets,
-                              stochastic_offsets, all_tenors)]
-
-
-def get_discount_factor(fieldname, static_offsets, stochastic_offsets, all_tenors, all_factors):
-    """Get the interest rate curve linked to this discount rate price factor"""
-    discout_curve = all_factors.get(utils.Factor('DiscountRate', fieldname)).get_interest_rate()
-    return [calc_factor_index(utils.Factor('InterestRate', discout_curve[:x]),
-                              static_offsets, stochastic_offsets, all_tenors)
-            for x in range(1, len(discout_curve) + 1)]
-
-
 def get_interest_factor(fieldname, static_offsets, stochastic_offsets, all_tenors):
     """Read the index of the interest rate price factor"""
     return [calc_factor_index(utils.Factor('InterestRate', fieldname[:x]),
                               static_offsets, stochastic_offsets, all_tenors)
             for x in range(1, len(fieldname) + 1)]
+
+
+def get_equity_zero_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors, all_factors):
+    """Read the equity's interest rate price factor"""
+    equity_factor = all_factors.get(utils.Factor('EquityPrice', fieldname))
+    ir_curve = (equity_factor.factor if hasattr(equity_factor, 'factor') else equity_factor).get_repo_curve_name()
+    return get_interest_factor(ir_curve, static_offsets, stochastic_offsets, all_tenors)
+
+
+def get_discount_factor(fieldname, static_offsets, stochastic_offsets, all_tenors, all_factors):
+    """Get the interest rate curve linked to this discount rate price factor"""
+    discount_curve = all_factors.get(utils.Factor('DiscountRate', fieldname)).get_interest_rate()
+    return get_interest_factor(discount_curve, static_offsets, stochastic_offsets, all_tenors)
 
 
 def get_fx_zero_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors, all_factors):
@@ -1027,8 +1024,8 @@ class MtMCrossCurrencySwapDeal(Deal):
             if 'Start' in self.field['Principal_Exchange'] and base_date <= self.field['Effective_Date']:
                 dates.add(self.field['Effective_Date'])
             self.add_reval_dates(dates, currency)
-        return super(MtMCrossCurrencySwapDeal, self).finalize_dates(parser, base_date, grid, node_children, node_resets,
-                                                                    node_settlements)
+        return super(MtMCrossCurrencySwapDeal, self).finalize_dates(
+            parser, base_date, grid, node_children, node_resets, node_settlements)
 
     def post_process(self, accum, shared, time_grid, deal_data, child_dependencies):
         factor_dep = deal_data.Factor_dep
@@ -1050,9 +1047,9 @@ class MtMCrossCurrencySwapDeal(Deal):
                     daycount = self.field.get(factor_dep['Other'] + '_Day_Count', 'ACT_365')
                     # get the last nominal amount
                     capital = child.Factor_dep['Cashflows'].schedule[-1][utils.CASHFLOW_INDEX_Nominal]
-                    child.Factor_dep['Cashflows'].add_fixed_payments(factor_dep['base_date'],
-                                                                     self.field['Principal_Exchange'],
-                                                                     self.field['Effective_Date'], daycount, capital)
+                    child.Factor_dep['Cashflows'].add_fixed_payments(
+                        factor_dep['base_date'], self.field['Principal_Exchange'],
+                        self.field['Effective_Date'], daycount, capital)
                     self.child_map.setdefault('Static', child)
 
         FX_rep = utils.calc_time_grid_spot_rate(shared.Report_Currency, deal_time, shared)
@@ -1099,17 +1096,16 @@ class MtMCrossCurrencySwapDeal(Deal):
         else:
             field_index['Pay']['Currency'] = get_fx_and_zero_rate_factor(
                 field['Pay_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-            field_index['Pay']['Forward'] = get_interest_factor(field['Pay_Interest_Rate'], static_offsets,
-                                                                stochastic_offsets, all_tenors)
-            field_index['Pay']['Discount'] = get_discount_factor(field['Pay_Discount_Rate'], static_offsets,
-                                                                 stochastic_offsets, all_tenors, all_factors)
-
+            field_index['Pay']['Forward'] = get_interest_factor(
+                field['Pay_Interest_Rate'], static_offsets, stochastic_offsets, all_tenors)
+            field_index['Pay']['Discount'] = get_discount_factor(
+                field['Pay_Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
             field_index['Receive']['Currency'] = get_fx_and_zero_rate_factor(
                 field['Receive_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-            field_index['Receive']['Forward'] = get_interest_factor(field['Receive_Interest_Rate'], static_offsets,
-                                                                    stochastic_offsets, all_tenors)
-            field_index['Receive']['Discount'] = get_discount_factor(field['Receive_Discount_Rate'], static_offsets,
-                                                                     stochastic_offsets, all_tenors, all_factors)
+            field_index['Receive']['Forward'] = get_interest_factor(
+                field['Receive_Interest_Rate'], static_offsets, stochastic_offsets, all_tenors)
+            field_index['Receive']['Discount'] = get_discount_factor(
+                field['Receive_Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         # TODO - complete cashflow definitions..
 
@@ -1166,19 +1162,18 @@ class FXNonDeliverableForward(Deal):
             field['Settlement_Currency']
 
         field_index = {
-            'BuyFX': get_fx_and_zero_rate_factor(field['Buy_Currency'], static_offsets,
-                                                 stochastic_offsets, all_tenors, all_factors),
-            'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                            all_tenors, all_factors),
-            'SellFX': get_fx_and_zero_rate_factor(field['Sell_Currency'], static_offsets,
-                                                  stochastic_offsets, all_tenors, all_factors),
-            'SettleFX': get_fx_and_zero_rate_factor(field['Settlement_Currency'], static_offsets,
-                                                    stochastic_offsets, all_tenors, all_factors),
+            'BuyFX': get_fx_and_zero_rate_factor(
+                field['Buy_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'SellFX': get_fx_and_zero_rate_factor(
+                field['Sell_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'SettleFX': get_fx_and_zero_rate_factor(
+                field['Settlement_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Maturity': (self.field['Settlement_Date'] - base_date).days,
+            # needed for reporting
             'Local_Currency': '{0}.{1}'.format(self.field['Buy_Currency'], self.field['Sell_Currency'])
         }
-
-        # needed for reporting
 
         return field_index
 
@@ -1277,13 +1272,13 @@ class FXSwapDeal(Deal):
             NearSell_rep = utils.calc_fx_cross(
                 factor_dep['NearSellFX'], shared.Report_Currency, near_deal_time, shared)
 
-            near_sell_discount_rate = tf.squeeze(utils.calc_discount_rate(near_sell_discount, near, shared), axis=1)
-            near_buy_discount_rate = tf.squeeze(utils.calc_discount_rate(near_buy_discount, near, shared), axis=1)
+            near_sell_discount_rate = torch.squeeze(utils.calc_discount_rate(near_sell_discount, near, shared), axis=1)
+            near_buy_discount_rate = torch.squeeze(utils.calc_discount_rate(near_buy_discount, near, shared), axis=1)
 
             mtm_near = self.field['Near_Buy_Amount'] * near_buy_discount_rate * NearBuy_rep - \
                        self.field['Near_Sell_Amount'] * near_sell_discount_rate * NearSell_rep
 
-            mtm = tf.pad(mtm_near, [[0, remaining_tenor.size - near.size], [0, 0]])
+            mtm = F.pad(mtm_near, [0, 0, 0, remaining_tenor.size - near.size])
 
             pricing.cash_settle(
                 shared, self.field['Near_Buy_Far_Sell_Ccy'],
@@ -1304,10 +1299,10 @@ class FXSwapDeal(Deal):
             shared, self.field['Near_Buy_Far_Sell_Ccy'],
             deal_data.Time_dep.fetch_index_by_day(factor_dep['Maturity']), -self.field['Far_Sell_Amount'])
 
-        far_buy_discount_rate = tf.squeeze(utils.calc_discount_rate(near_sell_discount, remaining_tenor, shared),
-                                           axis=1)
-        far_sell_discount_rate = tf.squeeze(utils.calc_discount_rate(near_buy_discount, remaining_tenor, shared),
-                                            axis=1)
+        far_buy_discount_rate = torch.squeeze(
+            utils.calc_discount_rate(near_sell_discount, remaining_tenor, shared), axis=1)
+        far_sell_discount_rate = torch.squeeze(
+            utils.calc_discount_rate(near_buy_discount, remaining_tenor, shared), axis=1)
 
         mtm += self.field['Far_Buy_Amount'] * far_buy_discount_rate * FX_NearSell_rep - \
                self.field['Far_Sell_Amount'] * far_sell_discount_rate * FX_NearBuy_rep
@@ -1352,15 +1347,15 @@ class FXForwardDeal(Deal):
         field['Sell_Discount_Rate'] = utils.check_rate_name(self.field['Sell_Discount_Rate']) if self.field[
             'Sell_Discount_Rate'] else field['Buy_Currency']
 
-        field_index = {'BuyFX': get_fxrate_factor(field['Buy_Currency'], static_offsets, stochastic_offsets),
-                       'BuyDiscount': get_discount_factor(field['Buy_Discount_Rate'], static_offsets,
-                                                          stochastic_offsets,
-                                                          all_tenors, all_factors),
-                       'SellFX': get_fxrate_factor(field['Sell_Currency'], static_offsets, stochastic_offsets),
-                       'SellDiscount': get_discount_factor(field['Sell_Discount_Rate'], static_offsets,
-                                                           stochastic_offsets,
-                                                           all_tenors, all_factors),
-                       'Maturity': (self.field['Settlement_Date'] - base_date).days}
+        field_index = {
+            'BuyFX': get_fxrate_factor(field['Buy_Currency'], static_offsets, stochastic_offsets),
+            'BuyDiscount': get_discount_factor(
+                field['Buy_Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'SellFX': get_fxrate_factor(field['Sell_Currency'], static_offsets, stochastic_offsets),
+            'SellDiscount': get_discount_factor(
+                field['Sell_Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Maturity': (self.field['Settlement_Date'] - base_date).days
+        }
 
         return field_index
 
@@ -1369,23 +1364,23 @@ class FXForwardDeal(Deal):
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
 
-        FX_Buy_rep = utils.calc_fx_cross(factor_dep['BuyFX'], shared.Report_Currency,
-                                         deal_time, shared)
-        FX_Sell_rep = utils.calc_fx_cross(factor_dep['SellFX'], shared.Report_Currency,
-                                          deal_time, shared)
+        FX_Buy_rep = utils.calc_fx_cross(
+            factor_dep['BuyFX'], shared.Report_Currency, deal_time, shared)
+        FX_Sell_rep = utils.calc_fx_cross(
+            factor_dep['SellFX'], shared.Report_Currency, deal_time, shared)
 
         buy_discount = utils.calc_time_grid_curve_rate(factor_dep['BuyDiscount'], deal_time, shared)
         sell_discount = utils.calc_time_grid_curve_rate(factor_dep['SellDiscount'], deal_time, shared)
         remaining_tenor = (factor_dep['Maturity'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1)
 
-        buy_discount_rate = tf.squeeze(utils.calc_discount_rate(buy_discount, remaining_tenor, shared), axis=1)
-        sell_discount_rate = tf.squeeze(utils.calc_discount_rate(sell_discount, remaining_tenor, shared), axis=1)
+        buy_discount_rate = torch.squeeze(utils.calc_discount_rate(buy_discount, remaining_tenor, shared), axis=1)
+        sell_discount_rate = torch.squeeze(utils.calc_discount_rate(sell_discount, remaining_tenor, shared), axis=1)
 
         # settle the cash
-        pricing.cash_settle(shared, self.field['Buy_Currency'],
-                            deal_data.Time_dep.deal_time_grid[-1], self.field['Buy_Amount'])
-        pricing.cash_settle(shared, self.field['Sell_Currency'],
-                            deal_data.Time_dep.deal_time_grid[-1], self.field['Sell_Amount'])
+        pricing.cash_settle(
+            shared, self.field['Buy_Currency'], deal_data.Time_dep.deal_time_grid[-1], self.field['Buy_Amount'])
+        pricing.cash_settle(
+            shared, self.field['Sell_Currency'], deal_data.Time_dep.deal_time_grid[-1], self.field['Sell_Amount'])
 
         return self.field['Buy_Amount'] * FX_Buy_rep * buy_discount_rate - \
                self.field['Sell_Amount'] * FX_Sell_rep * sell_discount_rate
@@ -1481,10 +1476,10 @@ class SwapInterestDeal(Deal):
             # TODO - Deal with Quanto Interest Rate swaps
             pass
         else:
-            field_index['Forward'] = get_interest_factor(field['Interest_Rate'], static_offsets, stochastic_offsets,
-                                                         all_tenors)
-            field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                          all_tenors, all_factors)
+            field_index['Forward'] = get_interest_factor(
+                field['Interest_Rate'], static_offsets, stochastic_offsets, all_tenors)
+            field_index['Discount'] = get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
             field_index['Currency'] = get_fx_and_zero_rate_factor(
                 field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
 
@@ -1595,13 +1590,15 @@ class CFFixedListDeal(Deal):
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
 
-        field_index = {'SettleCurrency': self.field['Currency'], 'Currency': get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
-                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                       all_tenors, all_factors),
-                       'Cashflows': utils.make_simple_fixed_cashflows(base_date,
-                                                                      1 if self.field['Buy_Sell'] == 'Buy' else -1,
-                                                                      self.field['Cashflows'])}
+        field_index = {
+            'SettleCurrency': self.field['Currency'], 'Currency': get_fx_and_zero_rate_factor(
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Cashflows': utils.make_simple_fixed_cashflows(
+                base_date, 1 if self.field['Buy_Sell'] == 'Buy' else -1, self.field['Cashflows'])
+        }
+
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
@@ -1628,12 +1625,14 @@ class FixedCashflowDeal(Deal):
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
 
-        field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                       all_tenors, all_factors),
-                       'Amount': (1 if self.field.get('Buy_Sell', 'Buy') == 'Buy' else -1) * self.field['Amount'],
-                       'Payment_Date': (self.field['Payment_Date'] - base_date).days,
-                       'Local_Currency': self.field['Currency']}
+        field_index = {
+            'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Amount': (1 if self.field.get('Buy_Sell', 'Buy') == 'Buy' else -1) * self.field['Amount'],
+            'Payment_Date': (self.field['Payment_Date'] - base_date).days,
+            'Local_Currency': self.field['Currency']
+        }
 
         # needed for reporting
         return field_index
@@ -1688,13 +1687,16 @@ class CFFloatingInterestListDeal(Deal):
         field['Forecast_Rate'] = utils.check_rate_name(self.field['Forecast_Rate']) if self.field['Forecast_Rate'] else \
             field['Discount_Rate']
 
-        field_index = {'SettleCurrency': self.field['Currency'],
-                       'Forward': get_interest_factor(field['Forecast_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors),
-                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                       all_tenors, all_factors),
-                       'VolSurface': np.zeros(1, dtype=np.int32), 'Currency': get_fx_and_zero_rate_factor(
-                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)}
+        field_index = {
+            'SettleCurrency': self.field['Currency'],
+            'Forward': get_interest_factor(
+                field['Forecast_Rate'], static_offsets, stochastic_offsets, all_tenors),
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'VolSurface': np.zeros(1, dtype=np.int32),
+            'Currency': get_fx_and_zero_rate_factor(
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+        }
 
         float_cashflows = utils.make_float_cashflows(
             base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, self.field['Cashflows'])
@@ -1779,12 +1781,15 @@ class YieldInflationCashflowListDeal(Deal):
         field['Index'] = utils.check_rate_name(self.field['Index'])
         field['PriceIndex'] = utils.check_rate_name(get_inflation_index_name(field['Index'], all_factors))
 
-        field_index = {'ForecastIndex': get_inflation_factor(field['Index'], static_offsets, stochastic_offsets,
-                                                             all_tenors),
-                       'PriceIndex': get_price_index_factor(field['PriceIndex'], static_offsets, stochastic_offsets),
-                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                       all_tenors, all_factors),
-                       'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)}
+        field_index = {
+            'ForecastIndex': get_inflation_factor(
+                field['Index'], static_offsets, stochastic_offsets, all_tenors),
+            'PriceIndex': get_price_index_factor(
+                field['PriceIndex'], static_offsets, stochastic_offsets),
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
+        }
 
         inflation_factor, index_factor = get_inflation_index_objects(field['Index'], field['PriceIndex'], all_factors)
         field_index['IndexMethod'] = utils.CASHFLOW_IndexMethodLookup[inflation_factor.get_reference_name()]
@@ -1816,8 +1821,8 @@ class CapDeal(Deal):
 
     def reset(self, calendars):
         super(CapDeal, self).reset()
-        self.resetdates = generate_dates_backward(self.field['Maturity_Date'], self.field['Effective_Date'],
-                                                  self.field['Payment_Interval'])
+        self.resetdates = generate_dates_backward(
+            self.field['Maturity_Date'], self.field['Effective_Date'], self.field['Payment_Interval'])
         self.add_reval_dates(self.resetdates, self.field['Currency'])
         # this swap could be quantoed
         self.isQuanto = None
@@ -1863,15 +1868,15 @@ class CapDeal(Deal):
             # TODO - Deal with Quanto Interest Rate swaps
             pass
         else:
-            field_index['Forward'] = get_interest_factor(field['Forecast_Rate'], static_offsets, stochastic_offsets,
-                                                         all_tenors)
-            field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                          all_tenors, all_factors)
+            field_index['Forward'] = get_interest_factor(
+                field['Forecast_Rate'], static_offsets, stochastic_offsets, all_tenors)
+            field_index['Discount'] = get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
             field_index['Currency'] = get_fx_and_zero_rate_factor(
                 field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-            field_index['VolSurface'] = get_interest_vol_factor(field['Forecast_Rate_Volatility'],
-                                                                self.field['Payment_Interval'], static_offsets,
-                                                                stochastic_offsets, all_tenors)
+            field_index['VolSurface'] = get_interest_vol_factor(
+                field['Forecast_Rate_Volatility'], self.field['Payment_Interval'],
+                static_offsets, stochastic_offsets, all_tenors)
             field_index['Cashflows'] = utils.generate_float_cashflows(
                 base_date, time_grid, self.resetdates,
                 (1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0) * Principal,
@@ -1905,8 +1910,8 @@ class FloorDeal(Deal):
         super(FloorDeal, self).reset()
         for currency, dates in node_settlements.items():
             self.add_reval_dates(dates, currency)
-        return super(FloorDeal, self).finalize_dates(parser, base_date, grid, node_children, node_resets,
-                                                     node_settlements)
+        return super(FloorDeal, self).finalize_dates(
+            parser, base_date, grid, node_children, node_resets, node_settlements)
 
     def post_process(self, accum, shared, time_grid, deal_data, child_dependencies):
         mtm_list = []
@@ -1941,15 +1946,15 @@ class FloorDeal(Deal):
             # TODO - Deal with Quanto Interest Rate swaps
             pass
         else:
-            field_index['Forward'] = get_interest_factor(field['Forecast_Rate'], static_offsets, stochastic_offsets,
-                                                         all_tenors)
-            field_index['Discount'] = get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                          all_tenors, all_factors)
+            field_index['Forward'] = get_interest_factor(
+                field['Forecast_Rate'], static_offsets, stochastic_offsets, all_tenors)
+            field_index['Discount'] = get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
             field_index['Currency'] = get_fx_and_zero_rate_factor(
                 field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-            field_index['VolSurface'] = get_interest_vol_factor(field['Forecast_Rate_Volatility'],
-                                                                self.field['Payment_Interval'], static_offsets,
-                                                                stochastic_offsets, all_tenors)
+            field_index['VolSurface'] = get_interest_vol_factor(
+                field['Forecast_Rate_Volatility'], self.field['Payment_Interval'],
+                static_offsets, stochastic_offsets, all_tenors)
             field_index['Cashflows'] = utils.generate_float_cashflows(
                 base_date, time_grid, self.resetdates,
                 (1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0) * Principal,
@@ -2065,13 +2070,14 @@ class SwaptionDeal(Deal):
         field['Forecast_Rate_Volatility'] = utils.check_rate_name(self.field['Forecast_Rate_Volatility'])
 
         field_index = {'SettleCurrency': self.field['Currency'],
-                       'Forward': get_interest_factor(field['Forecast_Rate'], static_offsets, stochastic_offsets,
-                                                      all_tenors),
-                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                       all_tenors, all_factors),
+                       'Forward': get_interest_factor(
+                           field['Forecast_Rate'], static_offsets, stochastic_offsets, all_tenors),
+                       'Discount': get_discount_factor(
+                           field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-                       'VolSurface': get_interest_vol_factor(field['Forecast_Rate_Volatility'], pd.DateOffset(years=2),
-                                                             static_offsets, stochastic_offsets, all_tenors),
+                       'VolSurface': get_interest_vol_factor(
+                           field['Forecast_Rate_Volatility'], pd.DateOffset(years=2),
+                           static_offsets, stochastic_offsets, all_tenors),
                        'Expiry': (self.field['Option_Expiry_Date'] - base_date).days}
 
         # need to check defaults
@@ -2280,9 +2286,6 @@ class FXDiscreteExplicitDoubleAsianOption(Deal):
 
     def reset(self, calendars):
         super(FXDiscreteExplicitDoubleAsianOption, self).reset()
-        # sampling_dates = set([x[0] for x in self.field['Sampling_Data_1']]).union(
-        #    [x[0] for x in self.field['Sampling_Data_2']])
-        # self.add_reval_dates(sampling_dates.union({self.field['Expiry_Date']}), self.field['Currency'])
         self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
@@ -2410,7 +2413,7 @@ class EquityOptionDeal(Deal):
 
     def __init__(self, params, valuation_options):
         super(EquityOptionDeal, self).__init__(params, valuation_options)
-        self.path_dependent = True #self.field['Option_Style'] == 'American'
+        self.path_dependent = self.field['Option_Style'] == 'American'
 
     def reset(self, calendars):
         super(EquityOptionDeal, self).reset()
@@ -2518,15 +2521,15 @@ class EquityBarrierOption(Deal):
         field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
 
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                       all_tenors, all_factors),
+                       'Discount': get_discount_factor(
+                           field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
-                       'Equity_Zero': get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                  all_tenors, all_factors),
-                       'Dividend_Yield': get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                  all_tenors),
-                       'Volatility': get_equity_price_vol_factor(field['Equity_Volatility'], static_offsets,
-                                                                 stochastic_offsets, all_tenors),
+                       'Equity_Zero': get_equity_zero_rate_factor(
+                           field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'Dividend_Yield': get_dividend_rate_factor(
+                           field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+                       'Volatility': get_equity_price_vol_factor(
+                           field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
                        'Barrier_Monitoring': 0.5826 * np.sqrt(
                            (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0),
                        'Expiry': (self.field['Expiry_Date'] - base_date).days}
@@ -2587,13 +2590,13 @@ class EquityForwardDeal(Deal):
         # field['Equity_Volatility']		= utils.check_rate_name(self.field['Equity_Volatility'])
 
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-                       'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                                       all_tenors, all_factors),
+                       'Discount': get_discount_factor(
+                           field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
-                       'Equity_Zero': get_equity_zero_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                  all_tenors, all_factors),
-                       'Dividend_Yield': get_dividend_rate_factor(field['Equity'], static_offsets, stochastic_offsets,
-                                                                  all_tenors),
+                       'Equity_Zero': get_equity_zero_rate_factor(
+                           field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'Dividend_Yield': get_dividend_rate_factor(
+                           field['Equity'], static_offsets, stochastic_offsets, all_tenors),
                        'Expiry': (self.field['Maturity_Date'] - base_date).days}
 
         return field_index
@@ -2602,11 +2605,11 @@ class EquityForwardDeal(Deal):
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
-        forward = utils.calc_eq_forward(factor_dep['Equity'], factor_dep['Equity_Zero'],
-                                        factor_dep['Dividend_Yield'], factor_dep['Expiry'],
-                                        deal_time, shared)
-        fx_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency,
-                                     deal_time, shared)
+        forward = utils.calc_eq_forward(
+            factor_dep['Equity'], factor_dep['Equity_Zero'],
+            factor_dep['Dividend_Yield'], factor_dep['Expiry'], deal_time, shared)
+        fx_rep = utils.calc_fx_cross(
+            factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
         nominal = (1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0) * self.field['Units']
 
         discount_rates = torch.squeeze(utils.calc_discount_rate(
@@ -3149,8 +3152,8 @@ class FXOptionDeal(Deal):
 
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
-                                     deal_time, shared)
+        fx_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
         forward = utils.calc_fx_forward(
             deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
             deal_data.Factor_dep['Expiry'], deal_time, shared)
@@ -3264,13 +3267,16 @@ class FRADeal(Deal):
         field['Use_Known_Rate'] = self.field.get('Use_Known_Rate', 'No')
         field['Known_Rate'] = self.field.get('Known_Rate', 0.0)
 
-        field_index = {'Currency': get_fx_and_zero_rate_factor(
+        field_index = {
+            'Currency': get_fx_and_zero_rate_factor(
             field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
-            'Discount': get_discount_factor(field['Discount_Rate'], static_offsets, stochastic_offsets,
-                                            all_tenors, all_factors),
-            'Forward': get_interest_factor(field['Interest_Rate'], static_offsets, stochastic_offsets,
-                                           all_tenors), 'Daycount': utils.get_day_count(self.field['Day_Count']),
-            'CompoundingMethod': 'None', 'SettleCurrency': self.field['Currency']}
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Forward': get_interest_factor(
+                field['Interest_Rate'], static_offsets, stochastic_offsets, all_tenors),
+            'Daycount': utils.get_day_count(self.field['Day_Count']),
+            'CompoundingMethod': 'None', 'SettleCurrency': self.field['Currency']
+        }
 
         Accrual_fraction = utils.get_day_count_accrual(
             base_date, (self.field['Maturity_Date'] - self.field['Effective_Date']).days, field_index['Daycount'])
@@ -3346,7 +3352,6 @@ class FloatingEnergyDeal(Deal):
         fx_sample = get_forwardprice_sampling(field['FX_Sampling_Type'], all_factors) if field[
             'FX_Sampling_Type'] else None
 
-        # need to give cuda the delta from the base date
         field_index['ForwardPrice'], field_index['ForwardFX'], field_index['CashFX'] = get_forwardprice_factor(
             field['Currency'], static_offsets, stochastic_offsets, all_tenors,
             all_factors, reference_factor, forward_factor, base_date)
