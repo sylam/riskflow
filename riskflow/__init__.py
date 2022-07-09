@@ -23,6 +23,7 @@ __all__ = ['version_info', '__version__', '__author__', '__license__', 'Context'
 
 import os
 import torch
+import pathlib
 import numpy as np
 import pandas as pd
 import collections.abc
@@ -129,7 +130,7 @@ def run_baseval(context, prec=torch.float64, overrides=None):
     return calc, out
 
 
-def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, CollVA=False):
+def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, CollVA=False, LegacyFVA=False):
     """
     Runs a credit monte carlo calculation on the provided context
     :param context: a Context object
@@ -171,7 +172,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
                  'FVA': {'Funding_Interest_Curve': 'ZAR-SWAP.FUNDING',
                          'Risk_Free_Curve': 'ZAR-SWAP.OIS',
                          'Stochastic_Funding': 'Yes'},
-                 'CollVA': {'Gradient': 'Yes'}
+                 'CollVA': {'Gradient': 'No'}
                  }
 
     if overrides is not None:
@@ -185,14 +186,19 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         del params_mc['CollVA']
 
     calc = construct_calculation('Credit_Monte_Carlo', context, device=device, prec=prec)
-    out = calc.execute(params_mc)
-    exposure = out['Results']['mtm'].clip(0.0, np.inf)
-    dates = np.array(sorted(calc.time_grid.mtm_dates))[
-        calc.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
+    if LegacyFVA:
+        return calc, params_mc
+    else:
+        out = calc.execute(params_mc)
+        mtm = out['Results']['mtm']
+        exposure = mtm.clip(0.0, np.inf)
+        dates = np.array(sorted(calc.time_grid.mtm_dates))[
+            calc.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
 
-    res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(exposure, 95, axis=1)}, index=dates)
+        res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(mtm, 95, axis=1)}, index=dates)
+        out['Results']['profile'] = res
 
-    return calc, out, res
+        return calc, out
 
 
 class Context:
@@ -205,9 +211,12 @@ class Context:
         self.holiday_cfg_cache = {}
         self.current_cfg = AdaptivContext()
 
-    def load_json(self, jobfilename):
+    def load_json(self, jobfilename, compress=True):
 
         def parse_path(file_path):
+            if os.name == 'posix':
+                file_path = pathlib.PureWindowsPath(file_path).as_posix()
+
             path, filename = os.path.split(file_path)
             return os.path.join(self.path_map.get(path, path), self.file_map.get(filename, filename))
 
@@ -254,7 +263,12 @@ class Context:
             cfg.deals = {'Attributes': {
                 'Tag_Titles': data['Calc']['Deals']['Tag_Titles'],
                 'Reference': data['Calc']['Deals']['Reference']}}
-            cfg.deals.update({'Deals': data['Calc']['Deals']['Deals']})
+            # try to compress the deal data if possible
+            deals = data['Calc']['Deals']['Deals']
+            if compress:
+                deals['Children'][0]['Children'] = utils.compress_deal_data(deals['Children'][0]['Children'])
+
+            cfg.deals.update({'Deals': deals})
             cfg.deals.update({'Calculation': data['Calc']['Calculation']})
 
         #  set the current context to newly loaded one
@@ -278,5 +292,5 @@ class Context:
             'Credit_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes'
         return run_cmc(self.current_cfg, overrides=overrides, CVA=CVA, FVA=FVA, CollVA=CollVA)
 
-    def Base_Valuation(self,  overrides=None):
+    def Base_Valuation(self, overrides=None):
         return run_baseval(self.current_cfg, overrides=overrides)

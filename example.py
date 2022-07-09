@@ -164,6 +164,81 @@ def calibrate_PFE(arena_path, rundate, scratch="Z:\\"):
     aa.calibrate_factors(
         start_date, end_date, to_calibrate, smooth=smoothing_std, correlation_cuttoff=0.1, overwrite_correlations=True)
 
+def compress(data):
+    import joblib
+    # t=data['Calc']['Deals']['Deals']['Children'][0]['Children'][1121]['Instrument'].field
+    # print (data['Children'][0]['Children'][1121]['Instrument'].field)
+    # deals = data['Calc']['Deals']['Deals']['Children'][0]['Children']
+    deals = joblib.load('C:\\temp\\gs.obj')
+    equity_swaps = [x for x in deals if x['Instrument'].field['Object'] == 'EquitySwapletListDeal']
+    if equity_swaps:
+        eq_swap_ref = {x['Instrument'].field['Reference']: x['Instrument'].field['Equity'] for x in equity_swaps}
+        all_other = [y for y in deals if y['Instrument'].field['Reference'] not in eq_swap_ref.keys()]
+        all_eq_swap = [y for y in deals if y['Instrument'].field['Reference'] in eq_swap_ref.keys()]
+        eq_unders = {}
+        ir_unders = {}
+        # first load all compressable deals
+        for k in all_eq_swap:
+            key = tuple([k['Instrument'].field[x] for x in k['Instrument'].field.keys()
+                         if x not in ['Tags', 'Reference', 'Cashflows']])
+            key_tag = key + tuple(k['Instrument'].field['Tags'])
+            if k['Instrument'].field['Object'] == 'EquitySwapletListDeal':
+                eq_unders.setdefault(key_tag, []).append(k)
+            else:
+                under_eq = eq_swap_ref[k['Instrument'].field['Reference']]
+                ir_unders.setdefault(key_tag+(under_eq,), []).append(k)
+
+        # now compress
+        eq_compressed = {}
+        for k, unders in eq_unders.items():
+            cf_list = {}
+            for deal in unders:
+                for cf in deal['Instrument'].field['Cashflows']['Items']:
+                    key = tuple([(k, v) for k, v in cf.items() if k != 'Amount'])
+                    cf_list[key] = cf_list.setdefault(key, 0.0) + cf['Amount']
+
+            # edit the last deal
+            deal['Instrument'].field['Cashflows']['Items'] = [dict(k+(('Amount', v),)) for k, v in cf_list.items()]
+            deal['Instrument'].field['Reference'] = 'COMPRESSED_{}_{}'.format(
+                deal['Instrument'].field['Buy_Sell'], deal['Instrument'].field['Equity'])
+            eq_compressed.setdefault(deal['Instrument'].field['Equity'], []).append(deal)
+
+        ir_compressed = {}
+        for k, unders in ir_unders.items():
+            margin_list = {}
+            notional_list = {}
+            for deal in unders:
+                for cf in deal['Instrument'].field['Cashflows']['Items']:
+                    cf_key = tuple([(k, v) for k, v in cf.items() if k not in ['Notional', 'Resets', 'Margin']])
+                    reset_key = tuple([tuple(x) for x in cf['Resets']])
+                    key = (cf_key, reset_key)
+                    margin_list[key] = margin_list.setdefault(key, 0.0) + cf['Margin'].amount * cf['Notional']
+                    notional_list[key] = notional_list.setdefault(key, 0.0) + cf['Notional']
+
+            # finish this off
+            final = []
+            for key, val in margin_list.items():
+                notional = notional_list[key]
+                cashflow = dict(key[0])
+                cashflow['Notional'] = notional
+                cashflow['Resets'] = [list(x) for x in list(key[1])]
+                cashflow['Margin'] = rf.utils.Basis(10000.0 * val / notional)
+                final.append(cashflow)
+
+            # edit the last deal
+            deal['Instrument'].field['Cashflows']['Items'] = final
+            deal['Instrument'].field['Reference'] = 'COMPRESSED_{}_{}'.format(
+                deal['Instrument'].field['Buy_Sell'], k[-1])
+            ir_compressed.setdefault(k[-1], []).append(deal)
+
+        for k, v in eq_compressed.items():
+            all_other.extend(v)
+            all_other.extend(ir_compressed[k])
+
+        return all_other
+    else:
+        return deals
+
 
 if __name__ == '__main__':
     import glob
@@ -187,20 +262,20 @@ if __name__ == '__main__':
         paths[folder] = rf.getpath(
             [os.path.join('E:\\Data\\crstal\\CVA', folder),
              # os.path.join('/media/vretiel/Media/Data/crstal', folder),
-             os.path.join('U:\\', folder),
+             # os.path.join('U:\\', folder),
              os.path.join('S:\\CCR_PFE_EE_NetCollateral', folder),
              os.path.join('S:\\CCR_Tagged', folder),
              os.path.join('N:\\Archive', folder),
              os.path.join('G:\\', folder)])
 
-    path_json = paths['CVA_JSON']
-    # path_json = paths['Input_JSON']
+    # path_json = paths['CVA_JSON']
+    path_json = paths['Input_JSON']
     # path = paths['CVA_UAT']
     # path = paths['CVA']
     path = paths['PFE']
 
     # rundate = '2021-11-12'
-    rundate = '2022-06-13'
+    rundate = '2022-07-06'
     # rundate = '2021-09-14'
     # calibrate_PFE(path, rundate)
     # bootstrap(path, rundate, reuse_cal=True)
@@ -228,12 +303,8 @@ if __name__ == '__main__':
         'USD': {'collateral': 'USD-SOFR', 'funding': 'USD-LIBOR-3M'},
         'EUR': {'collateral': 'EUR-ESTR', 'funding': 'EUR-EURIBOR-3M'}}
 
-    for json in glob.glob(os.path.join(path_json, rundate, 'Input*.json')):
-        try:
-            cx.load_json(json)
-        except:
-            print('error in json', json)
-            continue
+    for json in glob.glob(os.path.join(path_json, rundate, 'Input*FirstRand*.json')):
+        cx.load_json(json, compress=True)
 
         if not cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             print('no children for crb {} - skipping'.format(json))
@@ -258,8 +329,8 @@ if __name__ == '__main__':
             'Generate_Cashflows': 'No',
             # 'Currency': 'USD',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
-            'Batch_Size': 2500,
-            'Simulation_Batches': 2,
+            'Batch_Size': 256,
+            'Simulation_Batches': 1,
             'CollVA': {'Gradient': 'Yes'},
             'CVA': {'Gradient': 'No', 'Hessian': 'No'}
         }
@@ -275,20 +346,34 @@ if __name__ == '__main__':
         filename = os.path.split(output)[1]
         outfile = os.path.join('C:\\temp', filename)
 
-        calc, out = cx.Base_Valuation()
-        out['Results']['mtm'].to_csv(outfile)
+        calc, out = cx.run_job(overrides)
+        out['Results']['profile'].to_csv(outfile)
+        # calc, out = cx.Base_Valuation()
+        # out['Results']['mtm'].to_csv(outfile)
 
         mike_filename = 'N:\\Archive\\PFE\\{}\\{}'.format(rundate, filename.replace('InputAAJ_', ''))
 
         if os.path.exists(mike_filename):
-            mike = pd.read_csv(mike_filename)
-            me = pd.read_csv(outfile)
+            mike = pd.read_csv(mike_filename, index_col=0)
+            me = pd.read_csv(outfile, index_col=0)
             adaptiv = float(mike.head(1)['PFE'])
-            myval = float(me.head(1)['Value'])
+            if 0:
+                myval = float(me.head(1)['Value'])
 
-            if adaptiv != 0 and np.abs((adaptiv-myval)/adaptiv).max() > 0.01:
-                print('Mismatch - Collateralized is {}, '.format(ns.field['Collateralized']), outfile, adaptiv, myval)
-                if ns.field['Collateralized'] != 'True':
-                    print('investigate', json)
+                if adaptiv != 0 and np.abs((adaptiv-myval)/adaptiv).max() > 0.01:
+                    print('Mismatch - Collateralized is {}, '.format(ns.field['Collateralized']), outfile, adaptiv, myval)
+                    if ns.field['Collateralized'] != 'True':
+                        print('investigate', json)
+            else:
+                common_index = mike.index.intersection(me.index)
+                adaptiv_pfe = mike.reindex(common_index)
+                my_pfe = me.reindex(common_index)
+                abs_error = (my_pfe - adaptiv_pfe).abs()
+                error = ((my_pfe - adaptiv_pfe) / adaptiv_pfe)['PFE'].dropna().abs().max()
+                if error > 0.02:
+                    print('{0:06.2f} Error Mismatch - Crb {1} Collateralized is {2}'.format(
+                        error, json, ns.field['Collateralized']))
+                else:
+                    print('Crb {} is within 2%'.format(json))
         else:
             print('skipping', mike_filename)
