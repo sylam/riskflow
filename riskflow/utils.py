@@ -214,6 +214,26 @@ class Percent:
     def __float__(self):
         return self.amount
 
+    def __lt__(self, other):
+        return self.amount < other.amount
+
+    def __eq__(self, other):
+        if isinstance(other, Percent):
+            return self.amount == other.amount
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self.amount)
+
+    def __mul__(self, other):
+        return self.amount * other
+
+    def __repr__(self):
+        return str(self)
+
+    # define right multiply
+    __rmul__ = __mul__
+
 
 class Basis:
     def __init__(self, amount):
@@ -225,6 +245,26 @@ class Basis:
 
     def __float__(self):
         return self.amount
+
+    def __lt__(self, other):
+        return self.amount < other.amount
+
+    def __eq__(self, other):
+        if isinstance(other, Basis):
+            return self.amount == other.amount
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self.points)
+
+    def __mul__(self, other):
+        return self.amount * other
+
+    def __repr__(self):
+        return str(self)
+
+    # define right multiply
+    __rmul__ = __mul__
 
 
 class Curve:
@@ -1044,19 +1084,19 @@ def black_european_option_price(F, X, r, vol, tenor, buyOrSell, callOrPut):
 
 
 def Bjerksund_Stensland(A1, A2, B, x1, x2, K, sigma1, sigma2, rho, callOrPut):
-    a = x2+K
-    b = x2/a
-    sigma1_2 = sigma1*sigma1
-    sigma2_2 = sigma2*sigma2
+    a = x2 + K
+    b = x2 / a
+    sigma1_2 = sigma1 * sigma1
+    sigma2_2 = sigma2 * sigma2
     # make sure the variance is at least 1e-6
-    v2 = torch.clamp(sigma1_2-2*rho*sigma1*b*sigma2+b*b*sigma2_2, min=1e-6)
+    v2 = torch.clamp(sigma1_2 - 2 * rho * sigma1 * b * sigma2 + b * b * sigma2_2, min=1e-6)
     v = torch.sqrt(v2)
-    d = torch.log(x1/a)/v
-    d1 = d+v/2
-    d2 = d-(sigma1_2-2*rho*sigma1*sigma2-b*b*sigma2_2+2*b*sigma2_2)/(2*v)
-    d3 = d-(sigma1_2-b*b*sigma2_2)/(2*v)
+    d = torch.log(x1 / a) / v
+    d1 = d + v / 2
+    d2 = d - (sigma1_2 - 2 * rho * sigma1 * sigma2 - b * b * sigma2_2 + 2 * b * sigma2_2) / (2 * v)
+    d3 = d - (sigma1_2 - b * b * sigma2_2) / (2 * v)
 
-    return A1*x1*norm_cdf(callOrPut*d1)+A2*x2*norm_cdf(callOrPut*d2)+B*norm_cdf(callOrPut*d3)
+    return A1 * x1 * norm_cdf(callOrPut * d1) + A2 * x2 * norm_cdf(callOrPut * d2) + B * norm_cdf(callOrPut * d3)
 
 
 def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
@@ -2131,11 +2171,11 @@ def make_fixed_cashflows(reference_date, position, cashflows, settlement_date):
     """
     Generates a vector of fixed cashflows from a data source taking nominal amounts into account.
     """
-    # Pay_Date if settlement_date is None else -(settlement_date - base_date).days ])
     cash = []
     reset_offsets = []
 
-    for cashflow in sorted(cashflows['Items'], key=lambda x: x['Payment_Date']):
+    for cashflow in sorted(
+            cashflows['Items'], key=lambda x: (x['Payment_Date'], x.get('Accrual_Start_Date', x['Payment_Date']))):
         rate = cashflow['Rate'] if isinstance(cashflow['Rate'], float) else cashflow['Rate'].amount
         if cashflow['Payment_Date'] >= reference_date and (
                 (cashflow['Payment_Date'] >= settlement_date) if settlement_date else True):
@@ -2519,6 +2559,234 @@ def make_energy_cashflows(reference_date, time_grid, position, cashflows, refere
     cashflows.set_resets(all_resets, reset_scenario_offsets)
 
     return cashflows
+
+
+def compress_deal_data(deals):
+
+    def filter_deals(deals, values):
+        filtered = []
+        unfiltered = []
+        for deal in deals:
+            (filtered if deal['Instrument'].field['Reference'] in values else unfiltered).append(deal)
+        return filtered, unfiltered
+
+    def compress_CFFixedInterestListDeal(unders, ref, use_ref_as_tag=False):
+        compressed = []
+        all_rate = {}
+        all_notional = {}
+        for deal in unders:
+            buy_sell = 1.0 if deal['Instrument'].field['Buy_Sell'] == 'Buy' else -1.0
+            prop_key = tuple(sorted(
+                [(k, v) for k, v in deal['Instrument'].field['Cashflows'].items() if k != 'Items']))
+            rate_list = all_rate.setdefault(prop_key, {})
+            notional_list = all_notional.setdefault(prop_key, {})
+            for cf in deal['Instrument'].field['Cashflows']['Items']:
+                key = tuple(sorted(
+                    [(k, v) for k, v in cf.items() if k not in ['Notional', 'Rate']]))
+                notional = buy_sell * cf['Notional']
+                rate_list[key] = rate_list.setdefault(key, 0.0) + cf['Rate'] * notional
+                notional_list[key] = notional_list.setdefault(key, 0.0) + notional
+
+        # finish this off
+        for prop_index, (cf_prop, rate_list) in enumerate(all_rate.items()):
+            leg = []
+            notional_list = all_notional[cf_prop]
+            for key, val in rate_list.items():
+                notional = notional_list[key]
+                cashflow = dict(key)
+                if notional:
+                    cashflow['Notional'] = notional
+                    cashflow['Rate'] = Percent(100.0 * val / notional)
+                    leg.append(cashflow)
+                elif val:
+                    cashflow['Notional'] = val
+                    cashflow['Rate'] = Percent(100.0)
+                    leg.append(cashflow)
+
+            # sort it
+            final = sorted(leg, key=lambda x: (x['Payment_Date'], x['Accrual_Start_Date'], x['Accrual_End_Date']))
+            # use an exisiting deal to edit the cashflows
+            deal = unders[prop_index]
+            deal['Instrument'].field['Buy_Sell'] = 'Buy'
+            deal['Instrument'].field['Cashflows'] = dict(cf_prop)
+            deal['Instrument'].field['Cashflows']['Items'] = final
+            if use_ref_as_tag:
+                deal['Instrument'].field['Reference'] = 'Compressed_CFFixed_{}_{}'.format(
+                    'Buy', deal['Instrument'].field['Currency'])
+                deal['Instrument'].field['Tags'] = list(ref)
+            else:
+                deal['Instrument'].field['Reference'] = 'Compressed_CFFixed_{}_{}'.format('Buy', ref)
+            compressed.append(deal)
+
+        return compressed
+
+    def compress_CFFloatingInterestListDeal(unders, ref, use_ref_as_tag=False):
+        compressed = []
+        all_margin = {}
+        all_notional = {}
+        for deal in unders:
+            buy_sell = 1.0 if deal['Instrument'].field['Buy_Sell'] == 'Buy' else -1.0
+            prop_key = tuple(sorted(
+                [(k, v) for k, v in deal['Instrument'].field['Cashflows'].items() if k != 'Items']))
+            margin_list = all_margin.setdefault(prop_key, {})
+            notional_list = all_notional.setdefault(prop_key, {})
+            for cf in deal['Instrument'].field['Cashflows']['Items']:
+                cf_key = tuple(sorted(
+                    [(k, v) for k, v in cf.items() if k not in ['Notional', 'Resets', 'Margin']]))
+                reset_key = tuple(sorted([tuple(x) for x in cf['Resets']]))
+                key = (cf_key, reset_key)
+                notional = buy_sell * cf['Notional']
+                margin_list[key] = margin_list.setdefault(key, 0.0) + cf['Margin'] * notional
+                notional_list[key] = notional_list.setdefault(key, 0.0) + notional
+
+        # finish this off
+        prop_index = 0
+        for cf_prop, margin_list in all_margin.items():
+            leg = []
+            existing_deals = unders[prop_index:]
+            notional_list = all_notional[cf_prop]
+            for key, val in margin_list.items():
+                notional = notional_list[key]
+                cashflow = dict(key[0])
+                cashflow['Resets'] = [list(x) for x in list(key[1])]
+                if notional:
+                    cashflow['Notional'] = notional
+                    cashflow['Margin'] = Basis(10000.0 * val / notional)
+                    leg.append(cashflow)
+                elif val:
+                    cashflow['Notional'] = val
+                    cashflow['Margin'] = Basis(10000.0)
+                    # leg.append(cashflow)
+                    logging.warning('Float Cashflow Nominal compressed to 0.0 and margin is not 0 - TEST')
+                else:
+                    logging.info('Float Cashflow Nominal compressed to 0.0 and margin is 0 - will be skipped')
+
+            # check that there are no overlapping resets (if so - create a new leg)
+            final = sorted(leg, key=lambda x: (x['Payment_Date'], x['Accrual_Start_Date'], x['Accrual_End_Date']))
+            # can just check the first reset because we sorted them earlier
+            splits = [i + 1 for i, (x, y) in enumerate(
+                zip(final[:-1], final[1:])) if x['Resets'][0][0] > y['Resets'][0][0]]
+
+            if len(splits) >= len(existing_deals):
+                # can happen with e.g. prime linked swaps (many resets per day)
+                # check to see if we must edit the tag
+                for deal in existing_deals:
+                    if use_ref_as_tag:
+                        deal['Instrument'].field['Tags'] = list(ref)
+                    # add the deal uncompressed
+                    compressed.append(deal)
+            else:
+                for i, (deal, m, n) in enumerate(zip(existing_deals, [0] + splits, splits + [None])):
+                    legnum = '_Leg{}'.format(i) if splits else ''
+                    deal['Instrument'].field['Buy_Sell'] = 'Buy'
+                    deal['Instrument'].field['Cashflows'] = dict(cf_prop)
+                    deal['Instrument'].field['Cashflows']['Items'] = final[m:n]
+                    if use_ref_as_tag:
+                        deal['Instrument'].field['Reference'] = 'Compressed_CFFloat_{}_{}{}'.format(
+                            'Buy', deal['Instrument'].field['Currency'], legnum)
+                        deal['Instrument'].field['Tags'] = list(ref)
+                    else:
+                        deal['Instrument'].field['Reference'] = 'Compressed_CFFloat_{}_{}{}'.format('Buy', ref, legnum)
+
+                    compressed.append(deal)
+
+                # move the existing deal index forward
+                prop_index += i + 1
+
+        return compressed
+
+    # return this as our compressed portfolio
+    reduced_deals = deals
+    # first try and compress equity_swaps
+    equity_swaps = [x for x in reduced_deals if x['Instrument'].field['Object'] == 'EquitySwapletListDeal']
+    # don't bother if there are less than 400 swaps
+    if equity_swaps and len(equity_swaps) > 400:
+        logging.info('Compressing {} EquitySwaplets'.format(len(equity_swaps)))
+        eq_unders = {}
+        ir_unders = {}
+        eq_swap_ref = {x['Instrument'].field['Reference']: x['Instrument'].field['Equity'] for x in equity_swaps}
+        all_eq_swap, all_other = filter_deals(reduced_deals, eq_swap_ref.keys())
+
+        # first load all compressible deals
+        for k in all_eq_swap:
+            key = tuple(
+                sorted([(field, tuple(value) if isinstance(value, list) else value)
+                        for field, value in k['Instrument'].field.items()
+                        if field not in ['Reference', 'Buy_Sell', 'Cashflows']]))
+
+            if k['Instrument'].field['Object'] == 'EquitySwapletListDeal':
+                # need to split buys and sells because there could be at different prices for the same day
+                buy_sell = (('Buy_Sell', k['Instrument'].field['Buy_Sell']),)
+                eq_unders.setdefault(key + buy_sell, []).append(k)
+            else:
+                # pair up with the equity leg so that it's easy to track funding per stock
+                under_eq = eq_swap_ref[k['Instrument'].field['Reference']]
+                ir_unders.setdefault(key + (under_eq,), []).append(k)
+
+        # now compress
+        eq_compressed = {}
+        for k, unders in eq_unders.items():
+            cf_list = {}
+            for deal in unders:
+                for cf in deal['Instrument'].field['Cashflows']['Items']:
+                    key = tuple([(k, v) for k, v in cf.items() if k != 'Amount'])
+                    cf_list[key] = cf_list.setdefault(key, 0.0) + cf['Amount']
+
+            # edit the last deal
+            deal['Instrument'].field['Cashflows']['Items'] = [dict(k + (('Amount', v),)) for k, v in cf_list.items()]
+            deal['Instrument'].field['Reference'] = 'Compressed_EQSwaplet_{}_{}'.format(
+                deal['Instrument'].field['Buy_Sell'], deal['Instrument'].field['Equity'])
+            eq_compressed.setdefault(deal['Instrument'].field['Equity'], []).append(deal)
+
+        ir_compressed = {}
+        for k, unders in ir_unders.items():
+            ir_compressed.setdefault(k[-1], []).extend(compress_CFFloatingInterestListDeal(unders, k[-1]))
+
+        for k, v in eq_compressed.items():
+            all_other.extend(v)
+            all_other.extend(ir_compressed[k])
+
+        reduced_deals = all_other
+
+    # now try and compress ir_swaps - not ideal looking for ',Swap,' in tags - TODO!
+    ir_swaps = [x for x in reduced_deals if x['Instrument'].field['Object'] == 'StructuredDeal'
+                and ',Swap,' in x['Instrument'].field['Tags'][0]]
+
+    if ir_swaps and len(ir_swaps) > 200:
+        logging.info('Compressing {} IR Swaps'.format(len(ir_swaps)))
+        float_unders = {}
+        fixed_unders = {}
+        swap_refs = [x['Instrument'].field['Reference'] for x in ir_swaps]
+        all_ir_swap, all_other = filter_deals(reduced_deals, swap_refs)
+
+        # first load all compressible deals
+        for structure in all_ir_swap:
+            tags = tuple(structure['Instrument'].field['Tags'])
+            for k in structure['Children']:
+                key = tuple(
+                    sorted([(field, value) for field, value in k['Instrument'].field.items()
+                            if field not in ['Reference', 'Tags', 'Buy_Sell', 'Cashflows']]))+(tags,)
+
+                if k['Instrument'].field['Object'] == 'CFFloatingInterestListDeal':
+                    float_unders.setdefault(key, []).append(k)
+                else:
+                    fixed_unders.setdefault(key, []).append(k)
+
+        fixed_compressed = []
+        for k, unders in fixed_unders.items():
+            fixed_compressed.extend(compress_CFFixedInterestListDeal(unders, k[-1], use_ref_as_tag=True))
+
+        float_compressed = []
+        for k, unders in float_unders.items():
+            float_compressed.extend(compress_CFFloatingInterestListDeal(unders, k[-1], use_ref_as_tag=True))
+
+        # add it and continue
+        all_other.extend(fixed_compressed)
+        all_other.extend(float_compressed)
+
+        reduced_deals = all_other
+
+    return reduced_deals
 
 
 def compress_no_compounding(cashflows, groupsize):

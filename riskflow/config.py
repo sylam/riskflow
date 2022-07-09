@@ -453,9 +453,8 @@ class Context(object):
                         utils.Factor(factor.type, factor.name[:i - 1])] if i > 1 else []})
 
             if factor.type in conditional_fields:
-                for conditional_factor in conditional_fields[factor.type](instrument,
-                                                                          self.params['Price Factors'][factor_name],
-                                                                          self.params['Price Factors']):
+                for conditional_factor in conditional_fields[factor.type](
+                        instrument, self.params['Price Factors'][factor_name], self.params['Price Factors']):
                     rates_to_add[factor].append(conditional_factor)
                     rates_to_add.update({conditional_factor: []})
 

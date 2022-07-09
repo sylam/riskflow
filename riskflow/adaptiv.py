@@ -284,7 +284,7 @@ class AdaptivContext(Context):
     def write_trade_file(self, filename):
         def amend(xml_parent, internal_deals):
             for node in internal_deals:
-                instrument = node['instrument']
+                instrument = node['Instrument']
                 deal = Element('Deal')
                 fields = OrderedDict(
                     [(k, v) for k, v in sorted(instrument.field.items(), key=lambda x: -1 if x[0] == 'Object' else 0)])
