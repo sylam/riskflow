@@ -816,6 +816,7 @@ def split_tensor(tensor, counts):
     return torch.split(tensor, tuple(counts)) if tensor.shape[0] == counts.sum() else [tensor] * counts.size
 
 
+@torch.jit.script
 def calc_hermite_curve(t_a, g, c, curve_t0, curve_t1):
     one_minus_ta = (1.0 - t_a)
     return curve_t0 * one_minus_ta + t_a * (curve_t1 + one_minus_ta * (g + t_a * c))
@@ -1015,6 +1016,7 @@ def hermite_interpolation(tenors, rates):
     return gi, ci
 
 
+@torch.jit.script
 def norm_cdf(x):
     return 0.5 * (torch.erfc(x * -0.7071067811865475))
 
@@ -2597,11 +2599,10 @@ def compress_deal_data(deals):
                 if notional:
                     cashflow['Notional'] = notional
                     cashflow['Rate'] = Percent(100.0 * val / notional)
-                    leg.append(cashflow)
-                elif val:
+                else:
                     cashflow['Notional'] = val
                     cashflow['Rate'] = Percent(100.0)
-                    leg.append(cashflow)
+                leg.append(cashflow)
 
             # sort it
             final = sorted(leg, key=lambda x: (x['Payment_Date'], x['Accrual_Start_Date'], x['Accrual_End_Date']))
@@ -2656,7 +2657,7 @@ def compress_deal_data(deals):
                 elif val:
                     cashflow['Notional'] = val
                     cashflow['Margin'] = Basis(10000.0)
-                    # leg.append(cashflow)
+                    leg.append(cashflow)
                     logging.warning('Float Cashflow Nominal compressed to 0.0 and margin is not 0 - TEST')
                 else:
                     logging.info('Float Cashflow Nominal compressed to 0.0 and margin is 0 - will be skipped')
@@ -2752,7 +2753,7 @@ def compress_deal_data(deals):
     ir_swaps = [x for x in reduced_deals if x['Instrument'].field['Object'] == 'StructuredDeal'
                 and ',Swap,' in x['Instrument'].field['Tags'][0]]
 
-    if ir_swaps and len(ir_swaps) > 200:
+    if ir_swaps and len(ir_swaps) > 400:
         logging.info('Compressing {} IR Swaps'.format(len(ir_swaps)))
         float_unders = {}
         fixed_unders = {}

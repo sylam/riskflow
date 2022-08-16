@@ -258,24 +258,24 @@ if __name__ == '__main__':
 
     env = ''
     paths = {}
-    for folder in ['Input_JSON', 'CVA_JSON', 'CVA_UAT', 'CVA', 'PFE', 'PFE_UAT', 'Upgrade']:
+    for folder in ['temp', 'Input_JSON', 'CVA_JSON', 'CVA_UAT', 'CVA', 'PFE', 'PFE_UAT', 'Upgrade']:
         paths[folder] = rf.getpath(
             [os.path.join('E:\\Data\\crstal\\CVA', folder),
              # os.path.join('/media/vretiel/Media/Data/crstal', folder),
-             # os.path.join('U:\\', folder),
+             os.path.join('C:\\', folder),
              os.path.join('S:\\CCR_PFE_EE_NetCollateral', folder),
              os.path.join('S:\\CCR_Tagged', folder),
              os.path.join('N:\\Archive', folder),
              os.path.join('G:\\', folder)])
 
-    # path_json = paths['CVA_JSON']
-    path_json = paths['Input_JSON']
+    path_json = paths['temp']
+    # path_json = paths['Input_JSON']
     # path = paths['CVA_UAT']
     # path = paths['CVA']
     path = paths['PFE']
 
     # rundate = '2021-11-12'
-    rundate = '2022-07-06'
+    rundate = '2022-07-15'
     # rundate = '2021-09-14'
     # calibrate_PFE(path, rundate)
     # bootstrap(path, rundate, reuse_cal=True)
@@ -303,7 +303,7 @@ if __name__ == '__main__':
         'USD': {'collateral': 'USD-SOFR', 'funding': 'USD-LIBOR-3M'},
         'EUR': {'collateral': 'EUR-ESTR', 'funding': 'EUR-EURIBOR-3M'}}
 
-    for json in glob.glob(os.path.join(path_json, rundate, 'Input*FirstRand*.json')):
+    for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
         cx.load_json(json, compress=True)
 
         if not cx.current_cfg.deals['Deals']['Children'][0]['Children']:
@@ -331,8 +331,8 @@ if __name__ == '__main__':
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
             'Batch_Size': 256,
             'Simulation_Batches': 1,
-            'CollVA': {'Gradient': 'Yes'},
-            'CVA': {'Gradient': 'No', 'Hessian': 'No'}
+            'COLLVA': {'Gradient': 'Yes'},
+            'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}
         }
 
         if ns.field['Collateralized'] == 'True':
@@ -345,6 +345,27 @@ if __name__ == '__main__':
         output = json.replace('json', 'csv')
         filename = os.path.split(output)[1]
         outfile = os.path.join('C:\\temp', filename)
+
+        try:
+            assets = list(ns.field['Collateral_Assets'].keys()).pop()
+            if assets is None and ns['Collateralized'] == 'True':
+                assets = 'Cash_Collateral'
+        except:
+            assets = 'Cash_Collateral' if ns['Collateralized'] == 'True' else 'None'
+
+        collva_sect = cx.current_cfg.deals['Calculation'].get(
+            'Collateral_Valuation_Adjustment', {'Calculate': 'Yes' if assets == 'Cash_Collateral' else 'No'})
+
+        # sensible defaults
+        collva_sect['Collateral_Curve'] = collva_sect.get(
+            'Collateral_Curve', curves[agreement_currency]['collateral'])
+        collva_sect['Funding_Curve'] = collva_sect.get(
+            'Funding_Curve', curves[agreement_currency]['funding'])
+        collva_sect['Collateral_Spread'] = collva_sect.get(
+            'Collateral_Spread', spreads[agreement_currency]['FVA@Income']['collateral'])
+        collva_sect['Funding_Spread'] = collva_sect.get(
+            'Funding_Spread', spreads[agreement_currency]['FVA@Income']['funding'])
+        cx.current_cfg.deals['Calculation']['Collateral_Valuation_Adjustment'] = collva_sect
 
         calc, out = cx.run_job(overrides)
         out['Results']['profile'].to_csv(outfile)

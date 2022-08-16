@@ -29,6 +29,7 @@ import pandas as pd
 import collections.abc
 
 from ._version import version_info, __version__
+from . import fields
 from . import utils
 from .adaptiv import AdaptivContext
 
@@ -76,7 +77,7 @@ def set_collateral(cfg, Agreement_Currency, Balance_Currency, Opening_Balance, R
     )
 
 
-def load_market_data(rundate, path, json_name='MarketData.json', cva_default=True):
+def load_market_data(rundate, path, json_name='MarketData.json'):
     """
     Loads a json marketdata file and corresponding calendar (assumed to be named 'calendars.cal')
     :param rundate: folder inside path where the marketdata file resides
@@ -91,13 +92,6 @@ def load_market_data(rundate, path, json_name='MarketData.json', cva_default=Tru
     config.parse_calendar_file(os.path.join(path, 'calendars.cal'))
 
     config.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
-
-    if cva_default:
-        config.params['Price Factors']['SurvivalProb.DEFAULT'] = {
-            'Recovery_Rate': 0.5,
-            'Curve': utils.Curve(
-                [], [[0.0, 0.0], [.5, .01], [1, .02], [3, .07], [5, .15], [10, .35], [20, .71], [30, 1.0]]),
-            'Property_Aliases': None}
 
     return config
 
@@ -116,7 +110,11 @@ def run_baseval(context, prec=torch.float64, overrides=None):
                                      'Currency': 'ZAR'})
 
     # check if the gpu is available
-    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        torch.cuda.empty_cache()
+    else:
+        device = torch.device("cpu")
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     params_bv = {'calc_name': ('baseval',), 'Run_Date': rundate,
@@ -149,47 +147,87 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
                                      'Currency': 'ZAR'})
 
     # check if the gpu is available
-    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        torch.cuda.empty_cache()
+    else:
+        device = torch.device("cpu")
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     time_grid = str(calc_params['Base_Time_Grid'])
-
-    default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No', 'Counterparty': 'DEFAULT'}
-    cva_sect = context.deals.get('Calculation', {'Credit_Valuation_Adjustment': default_cva}).get(
-        'Credit_Valuation_Adjustment', default_cva)
-
+    # default is 10240 simulations
     params_mc = {'calc_name': ('cmc',), 'Time_grid': time_grid, 'Run_Date': rundate,
-                 'Currency': calc_params['Currency'], 'Simulation_Batches': 10, 'Batch_Size': 64 * 8,
+                 'Currency': calc_params['Currency'], 'Simulation_Batches': 5, 'Batch_Size': 2048,
                  'Random_Seed': 8312, 'Calc_Scenarios': 'No', 'Generate_Cashflows': 'No',
-                 'Dynamic_Scenario_Dates': 'No', 'Deflation_Interest_Rate': calc_params['Deflation_Interest_Rate'],
-                 'Debug': 'No', 'Tenor_Offset': 0.0,
+                 'Dynamic_Scenario_Dates': 'No', 'Debug': 'No', 'Tenor_Offset': 0.0,
+                 'Deflation_Interest_Rate': calc_params['Deflation_Interest_Rate']
                  # 'NoModel':'RiskNeutral',
-                 'CVA': {'Deflate_Stochastically': cva_sect['Deflate_Stochastically'],
-                         'Stochastic_Hazard': cva_sect['Stochastic_Hazard_Rates'],
-                         'Counterparty': cva_sect['Counterparty'],
-                         # brave choices these . . .
-                         'Gradient': 'No', 'Hessian': 'No'},
-                 'FVA': {'Funding_Interest_Curve': 'ZAR-SWAP.FUNDING',
-                         'Risk_Free_Curve': 'ZAR-SWAP.OIS',
-                         'Stochastic_Funding': 'Yes'},
-                 'CollVA': {'Gradient': 'No'}
                  }
+
+    if CVA:
+        # defaults
+        context.params['Price Factors']['SurvivalProb.DEFAULT'] = {
+            'Recovery_Rate': 0.5,
+            'Curve': utils.Curve(
+                [], [[0.0, 0.0], [.5, .01], [1, .02], [3, .07], [5, .15], [10, .35], [20, .71], [30, 1.0]]),
+            'Property_Aliases': None}
+        default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No', 'Counterparty': 'DEFAULT'}
+        cva_sect = context.deals.get('Calculation', {'Credit_Valuation_Adjustment': default_cva}).get(
+            'Credit_Valuation_Adjustment', default_cva)
+        cva_sect['Gradient'] = 'No'
+        cva_sect['Hessian'] = 'No'
+        params_mc['CVA'] = cva_sect
+
+    if FVA:
+        default_fva = {'Funding_Interest_Curve': 'ZAR-SWAP.FUNDING',
+                       'Risk_Free_Curve': 'ZAR-SWAP.OIS',
+                       'Stochastic_Funding': 'Yes'}
+        fva_sect = context.deals.get('Calculation', {'Funding_Valuation_Adjustment': default_fva}).get(
+            'Funding_Valuation_Adjustment', default_fva)
+        fva_sect['Gradient'] = 'No'
+        params_mc['FVA'] = fva_sect
+
+    if CollVA:
+        # setup collva calc
+        ns = context.deals['Deals']['Children'][0]['instrument'].field
+        # get the agreement currency
+        agreement_currency = ns.get('Agreement_Currency', 'ZAR')
+        collva_sect = context.deals['Calculation'].get('Collateral_Valuation_Adjustment')
+        # get the funding and collateral rates
+        collateral_curve = collva_sect['Collateral_Curve']
+        funding_curve = collva_sect['Funding_Curve']
+
+        if collva_sect['Collateral_Spread']:
+            collateral_curve = '{}.COLLATERAL'.format(collateral_curve)
+            context.params['Price Factors']['InterestRate.{}'.format(collateral_curve)] = makeflatcurve(
+                agreement_currency, collva_sect['Collateral_Spread'])
+
+        if collva_sect['Funding_Spread']:
+            funding_curve = '{}.FUNDING'.format(funding_curve)
+            context.params['Price Factors']['InterestRate.{}'.format(funding_curve)] = makeflatcurve(
+                agreement_currency, collva_sect['Funding_Spread'])
+
+        ns['Collateral_Assets'] = {
+            'Cash_Collateral': [{
+                'Currency': agreement_currency,
+                'Collateral_Rate': collateral_curve,
+                'Funding_Rate': funding_curve,
+                'Haircut_Posted': 0.0,
+                'Amount': 1.0}]}
+
+        collva_sect['Gradient'] = 'No'
+        params_mc['COLLVA'] = collva_sect
 
     if overrides is not None:
         update_dict(params_mc, overrides)
-
-    if not CVA:
-        del params_mc['CVA']
-    if not FVA:
-        del params_mc['FVA']
-    if not CollVA:
-        del params_mc['CollVA']
 
     calc = construct_calculation('Credit_Monte_Carlo', context, device=device, prec=prec)
     if LegacyFVA:
         return calc, params_mc
     else:
         out = calc.execute(params_mc)
+
+        # summarize the results for easy review
         mtm = out['Results']['mtm']
         exposure = mtm.clip(0.0, np.inf)
         dates = np.array(sorted(calc.time_grid.mtm_dates))[
@@ -197,6 +235,16 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
 
         res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(mtm, 95, axis=1)}, index=dates)
         out['Results']['profile'] = res
+
+        # check if we have collva
+        if 'collva_t' in out['Results']:
+            collateral = out['Results']['collateral']
+            collva = np.append(out['Results']['collva_t'], 0.0)
+            coll = pd.DataFrame({
+                'Collateral(5%)': np.percentile(collateral, 5, axis=1),
+                'Expected': np.mean(collateral, axis=1), 'Cost': collva}, index=dates)
+
+            out['Results']['collateral_profile'] = coll
 
         return calc, out
 
@@ -214,6 +262,7 @@ class Context:
     def load_json(self, jobfilename, compress=True):
 
         def parse_path(file_path):
+            # file_path is assumed to be a windows path - so we need to check if we're in a posix world
             if os.name == 'posix':
                 file_path = pathlib.PureWindowsPath(file_path).as_posix()
 
@@ -286,8 +335,10 @@ class Context:
             raise Exception('Unknown Calculation {}'.format(self.current_cfg.deals['Calculation']['Object']))
 
     def Credit_Monte_Carlo(self, overrides=None):
-        CollVA = False
-        FVA = False
+        FVA = self.current_cfg.deals['Calculation'].get(
+            'Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes'
+        CollVA = self.current_cfg.deals['Calculation'].get(
+            'Collateral_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes'
         CVA = self.current_cfg.deals['Calculation'].get(
             'Credit_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes'
         return run_cmc(self.current_cfg, overrides=overrides, CVA=CVA, FVA=FVA, CollVA=CollVA)

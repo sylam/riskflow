@@ -699,12 +699,13 @@ def pv_partial_barrier_option(shared, time_grid, deal_data, nominal,
 
 def pv_american_option(shared, time_grid, deal_data, nominal, moneyness, spot, forward):
     def phi(gamma, H, I):
-        kappa = (2 * b) / sigma2 + 2 * gamma - 1
-        d = -1 / vol * (torch.log(S / H) + b * tau + (gamma - 0.5) * sigma2 * tau)
-        lamb = -r + gamma * b + 0.5 * gamma * (gamma - 1) * sigma2
-        I_per_S = I / S
-        return torch.exp(lamb * tau) * (S ** gamma) * (
-                utils.norm_cdf(d) - utils.norm_cdf(d - 2 * torch.log(I_per_S) / vol) * (I_per_S ** kappa))
+        kappa = (2.0 * safe_b) / sigma2 + 2.0 * gamma - 1.0
+        d = (torch.log(H / safe_S) - (safe_b + (gamma - 0.5) * sigma2) * tau) / vol
+        lamb = -safe_r + gamma * safe_b + 0.5 * gamma * (gamma - 1.0) * sigma2
+        log_IS = torch.log(I / safe_S)
+        safe_exp = (kappa * log_IS).clamp(max=25.0)
+        ret = utils.norm_cdf(d) - torch.exp(safe_exp) * utils.norm_cdf(d - 2.0 * log_IS / vol)
+        return torch.exp(lamb * tau) * ret
 
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
@@ -730,28 +731,34 @@ def pv_american_option(shared, time_grid, deal_data, nominal, moneyness, spot, f
         r, b = r - b, -b
 
     sigma2 = sigma * sigma
-    b_over_sigma2 = b / sigma2
-
-    # we divide by 1-beta later so we want this 1e-6 away from 1 to avoid divide by zero
-    beta_raw = (0.5 - b_over_sigma2) + torch.sqrt((b_over_sigma2 - 0.5) ** 2 + 2.0 * r / sigma2)
-    fix_beta = torch.abs(beta_raw - 1.0) < 1e-6
-    beta = fix_beta * (1.0 + 1e-6) + ~fix_beta * beta_raw
-
-    # we divide by r-b later so we want this 1e-6 away from 0 to avoid divide by zero
-    raw_r_b = r - b
-    fix_r_b = torch.abs(raw_r_b) < 1e-6
-    r_b = fix_r_b * 1e-6 + ~fix_r_b * raw_r_b
-
-    B_0 = K * torch.maximum(r / r_b, torch.ones_like(r))
+    american = b < r - 1e-6
+    safe_b = american * b
+    b_over_sigma2 = safe_b / sigma2
+    # pad all non american exercise points (0.375 is arbitrary)
+    safe_r = american * r + ~american * 0.375 * sigma2
+    # make sure we avoid nans
+    safe_sqrt = ((b_over_sigma2 - 0.5) ** 2 + 2.0 * safe_r / sigma2).clamp(min=1e-6)
+    beta = (0.5 - b_over_sigma2) + torch.sqrt(safe_sqrt)
+    r_b = safe_r - safe_b
+    # calculate the barrier
+    B_0 = K * torch.maximum(safe_r / r_b, torch.ones_like(safe_r))
     B_inf = K * beta / (beta - 1)
     h_tau = -(b * tau + 2 * vol) * (B_0 / (B_inf - B_0))
     I = B_0 + (B_inf - B_0) * (1 - torch.exp(h_tau))
+    safe_S = torch.min(S - 1e-6, I)
 
-    C_BS = (I - K) * (I ** -beta) * (S ** beta - phi(beta, I, I)) + phi(1.0, I, I) - phi(1, K, I) + K * (
-            phi(0, K, I) - phi(0, I, I))
+    C_BS = (I - K) * torch.exp(torch.log(safe_S / I) * beta) * (1.0 - phi(beta, I, I))
+    x = phi(1.0, I, I)
+    y = phi(1.0, K, I)
+    C_BS += safe_S * (x - y)
+    x = phi(0.0, K, I)
+    y = phi(0.0, I, I)
+    C_BS += K * (x - y)
 
     Black = utils.black_european_option(
         S * torch.exp(b * tau), K, vol, 1.0, 1.0, 1.0, shared) * torch.exp(-r * tau)
+
+    C_BS = torch.maximum(Black, C_BS)
 
     theo_price = (b >= r) * Black + (b < r) * ((S < I) * C_BS + (S >= I) * (S - K))
     early_exercise = (b < r) * (S >= I)

@@ -492,7 +492,7 @@ class Context(object):
 
             for node in deals:
                 # get the instrument
-                instrument = node['Instrument']
+                instrument = node['instrument']
 
                 if node.get('Ignore') == 'True':
                     continue
@@ -533,6 +533,8 @@ class Context(object):
             interest_rate_factor = utils.Factor(
                 'InterestRate', utils.check_rate_name(curve_name))
 
+            # make sure to add the reset dates to this interest rate (and dependents)
+            dependent_factor_tenors[interest_rate_factor] = reset_dates
             dependent_factors.update(get_rates(interest_rate_factor, {}))
             for sub_factor in utils.traverse_dependents(interest_rate_factor, dependent_factors):
                 dependent_factor_tenors[sub_factor] = reset_dates

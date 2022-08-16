@@ -275,7 +275,7 @@ class Calculation(object):
         partitioning = False
         for node in deals:
             # get the instrument
-            instrument = node['Instrument']
+            instrument = node['instrument']
             # should we skip it?
             if node.get('Ignore') == 'True':
                 continue
@@ -881,13 +881,13 @@ class Credit_Monte_Carlo(Calculation):
             final_run = run == self.params['Simulation_Batches'] - 1
 
             # now calculate all the valuation adjustments (if necessary)
-            if 'CollVA' in params and 'Funding' in shared_mem.t_Credit:
+            if 'COLLVA' in params and 'Funding' in shared_mem.t_Credit:
 
                 tensors['collva_t'] = torch.mean(shared_mem.t_Credit['Funding'], axis=1)
                 tensors['collateral'] = shared_mem.t_Credit['Collateral']
                 tensors['collva'] = torch.sum(tensors['collva_t'])
 
-                if params['CollVA'].get('Gradient', 'No') == 'Yes':
+                if params['COLLVA'].get('Gradient', 'No') == 'Yes':
                     # calculate all the derivatives of fva
                     sensitivity = SensitivitiesEstimator(tensors['collva'], self.all_var)
 
@@ -981,7 +981,7 @@ class Credit_Monte_Carlo(Calculation):
 
                 pv_exposure = torch.relu(tensors['mtm'] * Dt_T)
 
-                if params['CVA']['Stochastic_Hazard'] == 'Yes':
+                if params['CVA']['Stochastic_Hazard_Rates'] == 'Yes':
                     surv = utils.calc_time_grid_curve_rate(
                         survival, self.time_grid.time_grid[time_grid], shared_mem)
                     St_T = torch.exp(-torch.cumsum(torch.squeeze(surv.gather_weighted_curve(

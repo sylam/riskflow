@@ -2,6 +2,7 @@
 default = {
     'Integer': 0,
     'Float': 0.0,
+    'Percent': 0.0,
     'Text': '',
     'Flot': '[{"label":"None", "data":[[0.0,0.0]]}]',
     'Surface': '[["Term to maturity/Moneyness",0.0],[0.0,0.0]]',
@@ -455,17 +456,17 @@ mapping = {
     'Instrument': {
         # logical groupings
         'groups': {
-            'STR': ('group', ['NettingCollateralSet']),
-            'IR': ('default',
-                   ['FixedCashflowDeal', 'CFFixedListDeal', 'CFFixedInterestListDeal', 'CFFloatingInterestListDeal',
-                    'DepositDeal', 'CapDeal', 'FRADeal', 'FloorDeal', 'SwapBasisDeal', 'SwapInterestDeal',
-                    'SwaptionDeal', 'YieldInflationCashflowListDeal']),
-            'FX': ('default',
-                   ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'SwapCurrencyDeal', 'FXOneTouchOption',
-                    'FXBarrierOption', 'MtMCrossCurrencySwapDeal']),
+            'STR': ('group', ['NettingCollateralSet', 'StructuredDeal']),
+            'IR': ('default', ['FixedCashflowDeal', 'CFFixedListDeal', 'CFFixedInterestListDeal',
+                               'CFFloatingInterestListDeal', 'DepositDeal', 'CapDeal', 'FRADeal',
+                               'FloorDeal', 'SwapBasisDeal', 'SwapInterestDeal', 'SwaptionDeal',
+                               'YieldInflationCashflowListDeal']),
+            'FX': ('default', ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'SwapCurrencyDeal',
+                               'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption',
+                               'MtMCrossCurrencySwapDeal']),
             'EN': ('default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption']),
-            'ED': (
-            'default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal', 'EquityDiscreteExplicitAsianOption']),
+            'ED': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal',
+                               'EquityDiscreteExplicitAsianOption']),
             'CR': ('default', ['DealDefaultSwap'])
         },
 
@@ -543,11 +544,14 @@ mapping = {
             'FXOptionDeal.Fields': ['Underlying_Amount', 'Settlement_Style', 'Strike_Price', 'Underlying_Currency',
                                     'Buy_Sell', 'Option_Type', 'Option_Style', 'Expiry_Date', 'FX_Volatility',
                                     'Forward_Price_Date', 'Discount_Rate', 'Option_On_Forward', 'Currency'],
-            'FXOneTouchOption.Fields': ['Barrier_Payoff_Currency', 'Underlying_Currency', 'Buy_Sell', 'Cash_Payoff',
+            'FXDiscreteExplicitAsianOption.Fields': ['Currency', 'Discount_Rate', 'Expiry_Date', 'FX_Volatility',
+                                                     'Option_Type', 'Buy_Sell', 'Underlying_Currency', 'Strike_Price',
+                                                     'Underlying_Amount', 'Sampling_Data'],
+            'FXOneTouchOption.Fields': ['Payoff_Currency', 'Underlying_Currency', 'Buy_Sell', 'Cash_Payoff',
                                         'Barrier_Monitoring_Frequency', 'Barrier_Price', 'Barrier_Type_One',
                                         'Option_Payment_Timing', 'Expiry_Date', 'FX_Volatility', 'Discount_Rate',
                                         'Currency'],
-            'FXBarrierOption.Fields': ['Underlying_Amount', 'Barrier_Monitoring_Frequency', 'Barrier_Payoff_Currency',
+            'FXBarrierOption.Fields': ['Underlying_Amount', 'Barrier_Monitoring_Frequency', 'Payoff_Currency',
                                        'Barrier_Price', 'Cash_Rebate', 'Strike_Price', 'Underlying_Currency',
                                        'Buy_Sell', 'Option_Type', 'Barrier_Type', 'Expiry_Date', 'FX_Volatility',
                                        'Discount_Rate', 'Currency'],
@@ -626,6 +630,7 @@ mapping = {
                                             'Credit_Support_Amounts', 'Collateral_Call_Frequency',
                                             'Apply_Closeout_When_Uncollateralized', 'Agreement_Currency',
                                             'Settlement_Period', 'Funding_Rate', 'Base_Collateral_Call_Date'],
+            'StructuredDeal.Fields': ['Currency', 'Net_Cashflows', 'Net_Cashflows'],
             'SwapBasisDeal.Receive': ['Receive_Timing', 'Receive_Known_Rates', 'Receive_Index_Offset', 'Receive_Margin',
                                       'Receive_Index_Publication_Calendars', 'Receive_Rate_Multiplier',
                                       'Receive_Frequency', 'Receive_Accrual_Calendars',
@@ -640,6 +645,8 @@ mapping = {
         'types': {
             'NettingCollateralSet':
                 ['Admin', 'NettingCollateralSet.Fields'],
+            'StructuredDeal':
+                ['Admin', 'StructuredDeal.Fields'],
             'DepositDeal':
                 ['Admin', 'DepositDeal.Fields'],
             'CFFixedInterestListDeal':
@@ -684,6 +691,8 @@ mapping = {
                 ['Admin', 'FXOneTouchOption.Fields'],
             'FXBarrierOption':
                 ['Admin', 'FXBarrierOption.Fields'],
+            'FXDiscreteExplicitAsianOption':
+                ['Admin', 'FXDiscreteExplicitAsianOption.Fields'],
             'FloorDeal':
                 ['Admin', 'FloorDeal.Fields'],
             'SwapBasisDeal':
@@ -761,8 +770,6 @@ mapping = {
                              'values': ['Down_And_In', 'Down_And_Out', 'Up_And_In', 'Up_And_Out']},
             'Barrier_Type_One': {'widget': 'Dropdown', 'description': 'Barrier Type', 'value': 'Up',
                                  'values': ['Up', 'Down']},
-            'Barrier_Payoff_Currency': {'widget': 'Dropdown', 'description': 'Payoff Currency', 'value': 'Currency',
-                                        'values': ['Currency', 'Underlying_Currency']},
             'Option_Payment_Timing': {'widget': 'Dropdown', 'description': 'Payment Timing', 'value': 'Expiry',
                                       'values': ['Touch', 'Expiry']},
 
@@ -845,22 +852,17 @@ mapping = {
                       'source': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360', 'ACT_ACT_ICMA']},
                      {'type': 'numeric', 'format': '0,0.00'},
                      {},
-                     {'type': 'dropdown',
-                      'source': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360', 'ACT_ACT_ICMA']},
-                     {},
-                     {},
                      {'type': 'numeric', 'format': '0,0.00'},
                      {'type': 'numeric', 'format': '0,0.00'},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'numeric', 'format': '0,0.00'}
                      ],
                 'obj':
-                    ['DatePicker', 'Float', 'DatePicker', 'DatePicker', 'Text', 'Float', 'Period', 'Text', 'Period',
+                    ['DatePicker', 'Float', 'DatePicker', 'DatePicker', 'Text', 'Float',
                      'ResetArray', 'Basis', 'Float', 'DatePicker', 'Float'],
                 'col_names':
                     ['Payment_Date', 'Notional', 'Accrual_Start_Date', 'Accrual_End_Date', 'Accrual_Day_Count',
-                     'Accrual_Year_Fraction', 'Rate_Tenor', 'Rate_Day_Count', 'Rate_Frequency', 'Resets', 'Margin',
-                     'Fixed_Amount', 'FX_Reset_Date', 'Known_FX_Rate']
+                     'Accrual_Year_Fraction', 'Resets', 'Margin', 'Fixed_Amount', 'FX_Reset_Date', 'Known_FX_Rate']
             },
 
             'RealYieldItems': {
@@ -972,19 +974,19 @@ mapping = {
                                           'value': default['DatePicker']},
             'Cash_Collateral': {'widget': 'Table', 'description': 'Cash Collateral', 'value': 'null',
                                 'sub_types':
-                                    [{'type': 'numeric', 'format': '0.00 %'},
+                                    [{},
+                                     {'type': 'numeric', 'format': '0.000'},
+                                     {'type': 'numeric', 'format': '0.00 %'},
                                      {'type': 'numeric', 'format': '0.00 %'},
                                      {},
                                      {},
-                                     {'type': 'numeric', 'format': '0.'},
-                                     {},
-                                     {'type': 'numeric', 'format': '0.000'}
+                                     {'type': 'numeric', 'format': '0.'}
                                      ],
                                 'obj':
-                                    ['Percent', 'Percent', 'Text', 'Text', 'Integer', 'Text', 'Float'],
+                                    ['Text', 'Float', 'Percent', 'Percent', 'Text', 'Text', 'Integer'],
                                 'col_names':
-                                    ['Haircut_Posted', 'Haircut_Received', 'Collateral_Rate', 'Funding_Rate',
-                                     'Liquidation_Period', 'Currency', 'Amount']
+                                    ['Currency', 'Amount', 'Haircut_Posted', 'Haircut_Received',
+                                     'Collateral_Rate', 'Funding_Rate', 'Liquidation_Period']
                                 },
             'Bond_Collateral': {'widget': 'Table', 'description': 'Bond Collateral', 'value': 'null',
                                 'sub_types':
@@ -1009,23 +1011,38 @@ mapping = {
                                      'Discount_Rate', 'Maturity', 'Principle', 'Coupon_Rate', 'Coupon_Interval',
                                      'Collateral_Rate', 'Funding_Rate']
                                 },
-            'Equity_Collateral': {'widget': 'Table', 'description': 'Equity Collateral', 'value': 'null',
-                                  'sub_types':
-                                      [{'type': 'numeric', 'format': '0.00 %'},
-                                       {'type': 'numeric', 'format': '0.00 %'},
-                                       {},
-                                       {},
-                                       {'type': 'numeric', 'format': '0.'},
-                                       {},
-                                       {'type': 'numeric', 'format': '0.000'}
-                                       ],
+            'Equity_Collateral': {'widget': 'Table', 'description': 'Equity_Collateral', 'value': 'null',
+                                     'sub_types':
+                                     [{},
+                                      {'type': 'numeric', 'format': '0.000'},
+                                      {'type': 'numeric', 'format': '0.00 %'},
+                                      {'type': 'numeric', 'format': '0.00 %'},
+                                      {},
+                                      {},
+                                      {'type': 'numeric', 'format': '0.'}
+                                      ],
                                   'obj':
-                                      ['Percent', 'Percent', 'Text', 'Text', 'Integer', 'Text', 'Float'],
+                                      ['Text', 'Float', 'Percent', 'Percent', 'Text', 'Text', 'Integer'],
                                   'col_names':
-                                      ['Haircut_Posted', 'Haircut_Received', 'Collateral_Rate', 'Funding_Rate',
-                                       'Liquidation_Period', 'Equity', 'Units']
+                                      ['Equity', 'Units', 'Haircut_Posted', 'Haircut_Received',
+                                       'Collateral_Rate', 'Funding_Rate', 'Liquidation_Period']
                                   },
-            'Commodity_Collateral': {'widget': 'Text', 'description': 'Commodity Collateral', 'value': ''},
+            'Commodity_Collateral': {'widget': 'Table', 'description': 'Commodity Collateral', 'value': 'null',
+                                     'sub_types':
+                                     [{},
+                                      {'type': 'numeric', 'format': '0.000'},
+                                      {'type': 'numeric', 'format': '0.00 %'},
+                                      {'type': 'numeric', 'format': '0.00 %'},
+                                      {},
+                                      {},
+                                      {'type': 'numeric', 'format': '0.'}
+                                      ],
+                                  'obj':
+                                      ['Text', 'Float', 'Percent', 'Percent', 'Text', 'Text', 'Integer'],
+                                  'col_names':
+                                      ['Commodity', 'Units', 'Haircut_Posted', 'Haircut_Received',
+                                       'Collateral_Rate', 'Funding_Rate', 'Liquidation_Period']
+                                  },
             'Underlying_Amount': {'widget': 'Float', 'description': 'Underlying Amount', 'value': 0.0},
             'Pay_Amortisation': {'widget': 'Table', 'description': 'Pay Amortisation',
                                  'value': default['DateList'],
@@ -1266,7 +1283,7 @@ mapping = {
                                                       'Independent_Amount', 'Received_Threshold', 'Posted_Threshold',
                                                       'Minimum_Received', 'Minimum_Posted']},
             'Collateral_Assets': {'widget': 'Container', 'description': 'Collateral Assets',
-                                  'value': '{"Cash_Collateral":[], "Bond_Collateral":"", "Equity_Collateral":[], "Commodity_Collateral":""}',
+                                  'value': '{"Cash_Collateral":[], "Bond_Collateral":[], "Equity_Collateral":[], "Commodity_Collateral":[]}',
                                   'sub_fields': ['Cash_Collateral', 'Bond_Collateral', 'Equity_Collateral',
                                                  'Commodity_Collateral']},
             'Float_Cashflows': {'widget': 'Container', 'description': 'Cashflows',
@@ -1324,6 +1341,8 @@ mapping = {
                                 'values': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360',
                                            'ACT_ACT_ICMA']},
             'Buy_Sell': {'widget': 'Dropdown', 'description': 'Buy Sell', 'value': 'Buy', 'values': ['Buy', 'Sell']},
+            'Net_Cashflows': {'widget': 'Dropdown', 'description': 'Net Cashflows',
+                              'value': 'Yes', 'values': ['Yes', 'No']},
             'Settlement_Date': {'widget': 'DatePicker', 'description': 'Settlement Date',
                                 'value': default['DatePicker']},
             'Payoff_Type': {'widget': 'Dropdown', 'description': 'Payoff Type', 'value': 'Standard',
