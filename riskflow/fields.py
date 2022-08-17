@@ -194,7 +194,7 @@ mapping = {
             "HullWhite2FactorModelParameters":
                 ["Quanto_FX_Volatility", "Alpha_1", "Sigma_1", "Quanto_FX_Correlation_1", "Alpha_2", "Sigma_2",
                  "Quanto_FX_Correlation_2", "Correlation", "Property_Aliases"],
-            "GBMTSImpliedParameters":
+            "GBMAssetPriceTSModelParameters":
                 ["Quanto_FX_Volatility", "Vol", "Quanto_FX_Correlation", "Property_Aliases"],
             "PriceIndex":
                 ["Index", "Next_Publication_Date", "Last_Period_Start", "Publication_Period", "Currency",
@@ -345,7 +345,8 @@ mapping = {
         "ReferencePrice": [],
         "ReferenceVol": [],
         "HullWhite2FactorModelParameters": [],
-        "GBMTSImpliedParameters": [],
+        #"GBMTSImpliedParameters": [],
+        "GBMAssetPriceTSModelParameters": [],
         "EquityPrice": ["GBMAssetPriceModel"],
         "FxRate": ["GBMAssetPriceModel", "GBMAssetPriceTSModelImplied"],
         "SurvivalProb": ["HWHazardRateModel"],
@@ -456,18 +457,18 @@ mapping = {
     'Instrument': {
         # logical groupings
         'groups': {
-            'STR': ('group', ['NettingCollateralSet', 'StructuredDeal']),
-            'IR': ('default', ['FixedCashflowDeal', 'CFFixedListDeal', 'CFFixedInterestListDeal',
+            'New Structure': ('group', ['NettingCollateralSet', 'StructuredDeal']),
+            'New Interest Rate Derivative': ('default', ['FixedCashflowDeal', 'CFFixedListDeal', 'CFFixedInterestListDeal',
                                'CFFloatingInterestListDeal', 'DepositDeal', 'CapDeal', 'FRADeal',
                                'FloorDeal', 'SwapBasisDeal', 'SwapInterestDeal', 'SwaptionDeal',
                                'YieldInflationCashflowListDeal']),
-            'FX': ('default', ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'SwapCurrencyDeal',
+            'New FX Derivative': ('default', ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'SwapCurrencyDeal',
                                'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption',
                                'MtMCrossCurrencySwapDeal']),
-            'EN': ('default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption']),
-            'ED': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal',
+            'New Energy Derivative': ('default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption']),
+            'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal',
                                'EquityDiscreteExplicitAsianOption']),
-            'CR': ('default', ['DealDefaultSwap'])
+            'New Credit Derivative': ('default', ['DealDefaultSwap'])
         },
 
         # field groups
