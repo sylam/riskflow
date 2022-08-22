@@ -14,11 +14,11 @@ from IPython.display import display  # Used to display widgets in the notebook
 # riskflow specific stuff
 import riskflow as rf
 # load the widgets
-from riskflow_widgets import Tree, Table, Flot
+from riskflow_widgets import Tree, Table, Flot, FlotTree, Three
 
 
 def to_json(string):
-    '''converts a string to json - skips the whitespace for a smaller output'''
+    """converts a string to json - skips the whitespace for a smaller output"""
     return json.dumps(string, separators=(',', ':'))
 
 
@@ -802,19 +802,19 @@ class RiskFactorsPage(TreePanel):
             return handleEvent
 
         # generate dummy processes
-        stoch_factors = {stoch_proc: ConstructProcess(
+        stoch_factors = {stoch_proc: rf.stochasticprocess.construct_process(
             stoch_proc.type, None, self.config.params['Price Models'][rf.utils.check_tuple_name(stoch_proc)])
             for stoch_proc in stoch_proc_list
             if rf.utils.check_tuple_name(stoch_proc) in self.config.params['Price Models']}
 
-        num_factors = sum([x.NumFactors() for x in stoch_factors.values()])
+        num_factors = sum([x.num_factors() for x in stoch_factors.values()])
 
         # prepare the correlation matrix (and the offsets of each stochastic process)
         correlation_factors = []
         correlation_matrix = np.eye(num_factors, dtype=np.float32)
 
         for key, value in stoch_factors.items():
-            proc_corr_type, proc_corr_factors = value.CorrelationName()
+            proc_corr_type, proc_corr_factors = value.correlation_name
             for sub_factors in proc_corr_factors:
                 correlation_factors.append(
                     rf.utils.check_tuple_name(rf.utils.Factor(proc_corr_type, key.name + sub_factors)))
@@ -835,9 +835,8 @@ class RiskFactorsPage(TreePanel):
         vals = ['<h4>Correlation:</h4>']
 
         col_types = '[' + ','.join(['{ "type": "numeric", "format": "0.0000" }'] * len(correlation_factors)) + ']'
-        col_headers = to_json(correlation_factors)
 
-        w = Table(description="Matrix", colTypes=col_types, colHeaders=col_headers)
+        w = Table(description="Matrix", colTypes=col_types, colHeaders=correlation_factors)
         vals.append(to_json(correlation_matrix.tolist()))
         w.observe(generate_handler(
             self.config.params['Correlations'], correlation_factors,
