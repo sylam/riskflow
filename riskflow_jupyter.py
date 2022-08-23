@@ -13,13 +13,122 @@ from IPython.display import display  # Used to display widgets in the notebook
 
 # riskflow specific stuff
 import riskflow as rf
+# k3d is used to render vol surfaces
+import k3d
 # load the widgets
-from riskflow_widgets import Tree, Table, Flot, FlotTree  # , Three
+from riskflow_widgets import Tree, Table, Flot, FlotTree
 
 
 def to_json(string):
     """converts a string to json - skips the whitespace for a smaller output"""
     return json.dumps(string, separators=(',', ':'))
+
+
+def load_table_from_vol(vol):
+    sparse_matrix = {}
+    for k in vol.param['Surface'].array:
+        sparse_matrix.setdefault(k[0], {}).setdefault(k[1], k[2])
+
+    df = pd.DataFrame(sparse_matrix).sort_index(0, 1)
+
+    table = np.vstack([[0.0] + df.columns.values.round(5).tolist(),
+                       np.hstack([df.index.values.round(5).reshape(-1, 1).tolist(),
+                                  df.round(5).replace({np.nan: None})])]).tolist()
+
+    return table
+
+
+class Three(widgets.HBox):
+    '''Fake widget build around the HBox widget - just shows a label, a plot and a table for editing'''
+    def __init__(self, description):
+        self.description = widgets.Label(value=description)
+        self.plot = k3d.plot(
+            axes=['log(moneyness)', 'expiry', 'vol(\%)'],
+            # menu_visibility=False,
+            camera_rotate_speed=3.0
+        )
+        self.mesh = None
+        self.data = Table(description='', settings=to_json({
+            'width': 500, 'height': 300, 'contextMenu': True, 'minSpareRows': 1, 'minSpareCols': 1
+        }))
+
+        super().__init__(
+            children=[
+                self.description,
+                widgets.VBox(children=[self.plot, self.data])
+            ]
+        )
+
+    def observe(self, handler, prop, type='change'):
+
+        def make_plot_fn():
+            def update_plot(change):
+                handler(change)
+                self.update_plot(json.loads(change['new']))
+            return update_plot
+
+        if self.children:
+            # link the observable function to the table widget (self.data)
+            self.data.observe(make_plot_fn(), prop, type)
+        else:
+            super().observe(handler, prop, type)
+
+    @staticmethod
+    def make_faces_vectorized1(Nr, Nc):
+
+        out = np.empty((Nr - 1, Nc - 1, 2, 3), dtype=int)
+
+        r = np.arange(Nr * Nc).reshape(Nr, Nc)
+
+        out[:, :, 0, 0] = r[:-1, :-1]
+        out[:, :, 1, 0] = r[:-1, 1:]
+        out[:, :, 0, 1] = r[:-1, 1:]
+
+        out[:, :, 1, 1] = r[1:, 1:]
+        out[:, :, :, 2] = r[1:, :-1, None]
+
+        out.shape = (-1, 3)
+        return out
+
+    @staticmethod
+    def interpolate_surface(json_list):
+        moneyness = json_list[0][1:]
+        e = []
+        for p in json_list[1:]:
+            e.extend([[m, p[0], v] for m, v in zip(moneyness, p[1:]) if v is not None])
+
+        surface = np.array(e)
+        expiry = [p[0] for p in json_list[1:]]
+        return expiry, moneyness, np.array([np.interp(
+            moneyness, surface[surface[:, 1] == x][:, 0], surface[surface[:, 1] == x][:, 2]) for x in expiry])
+
+    def update_plot(self, json_list):
+        e, moneyness, vol = Three.interpolate_surface(json_list)
+        scale = 2 / np.log(2)
+        m = scale * np.log(moneyness)
+        v = vol * 100
+
+        U, V = np.meshgrid(m, e)
+        vertices = np.dstack([U, V, v]).reshape(-1, 3)
+        indices = Three.make_faces_vectorized1(*v.shape)
+        if self.mesh is not None:
+            self.plot -= self.mesh
+        self.mesh = k3d.mesh(
+            vertices.astype(np.float32), indices.astype(np.uint32), flat_shading=False, attribute=v,
+            side='double', color_map=k3d.basic_color_maps.Reds, color_range=[v.min(), v.max()]
+        )
+        self.plot += self.mesh
+
+    @property
+    def value(self):
+        return self.data.value
+
+    # a setter function
+    @value.setter
+    def value(self, json_list):
+        # self.data.value = to_json(json_list)
+        self.data.value = json_list
+        self.update_plot(json.loads(json_list))
 
 
 # portfolio parent data
@@ -97,11 +206,11 @@ class TreePanel(object):
             The field_meta contains the actual field names.
         '''
 
-        def load_table_from_vol(vol_factor, vols):
-            table = [['Term to maturity/Moneyness'] + list(vol_factor.get_moneyness())]
-            for term, vol in zip(vol_factor.get_expiry(), vols):
-                table.append([term] + (list(vol) if isinstance(vol, np.ndarray) else [vol]))
-            return table
+        # def load_table_from_vol(vol_factor, vols):
+        #     table = [['Term to maturity/Moneyness'] + list(vol_factor.get_moneyness())]
+        #     for term, vol in zip(vol_factor.get_expiry(), vols):
+        #         table.append([term] + (list(vol) if isinstance(vol, np.ndarray) else [vol]))
+        #     return table
 
         def get_repr(obj, field_name, default_val):
 
@@ -111,16 +220,20 @@ class TreePanel(object):
                     if obj.meta[0] == 2:
                         t = rf.riskfactors.Factor2D({'Surface': obj})
                         vols = t.get_vols()
-                        vol_space = load_table_from_vol(t, vols)
+                        # vol_space = load_table_from_vol(t, vols)
+                        vol_space = load_table_from_vol(t)
                     else:
                         t = rf.riskfactors.Factor3D({'Surface': obj})
                         vol_cube = t.get_vols()
                         if len(vol_cube.shape) == 2:
-                            vol_space = {t.get_tenor()[0]: load_table_from_vol(t, vol_cube)}
+                            # vol_space = {t.get_tenor()[0]: load_table_from_vol(t, vol_cube)}
+                            vol_space = {t.get_tenor()[0]: load_table_from_vol(t)}
                         elif len(vol_cube.shape) == 3:
                             vol_space = {}
                             for index, tenor in enumerate(t.get_tenor()):
-                                vol_space.setdefault(tenor, load_table_from_vol(t, vol_cube[index]))
+                                # vol_space.setdefault(tenor, load_table_from_vol(t, vol_cube[index]))
+                                vol_space.setdefault(tenor, load_table_from_vol(t))
+
 
                     return_value = to_json(vol_space)
                 else:
@@ -250,9 +363,17 @@ class TreePanel(object):
                 vals.append(element['value'])
             elif element['widget'] == 'Table':
                 w = Table(description=element['description'],
-                          settings=to_json({'columns': element['sub_types'],
-                                            'colHeaders': element['col_names']})
-                          )
+                          settings=to_json({
+                              'columns': element['sub_types'],
+                              'colHeaders': element['col_names'],
+                              'manualColumnMove': True,
+                              'minSpareRows': 1,
+                              'startRows': 1,
+                              'startCols': len(element['col_names']),
+                              'width': 400,
+                              'height': 200
+                          })
+                    )
                 vals.append(element['value'])
             elif element['widget'] == 'Float':
                 w = widgets.FloatText(description=element['description'])
@@ -764,6 +885,7 @@ class RiskFactorsPage(TreePanel):
     def generate_handler(self, field_name, widget_elements, label):
         def handleEvent(change):
             # update the json representation
+            # print('new', change)
             widget_elements[field_name]['value'] = change['new']
             # update the value in the config object
             self.set_value_from_widget(label[0], label[1], widget_elements[field_name], change['new'])
@@ -835,13 +957,21 @@ class RiskFactorsPage(TreePanel):
         # label this container
         wig = [widgets.HTML()]
         vals = ['<h4>Correlation:</h4>']
-
         # col_types = '[' + ','.join(['{ "type": "numeric", "format": "0.0000" }'] * len(correlation_factors)) + ']'
 
-        w = Table(description="Matrix", settings=to_json({
-            'columns': [{"type": "numeric", "format": "0.0000"}] * len(correlation_factors),
-            'colHeaders': correlation_factors}
-        ))
+        w = Table(description="Matrix",
+                  settings=to_json(
+                    {
+                        'columns': [{"type": "numeric",
+                                     "numericFormat": {"pattern": "0.0000"}}] * num_factors,
+                        'startCols': num_factors,
+                        'startRows': num_factors,
+                        'rowHeaders': correlation_factors,
+                        'colHeaders': correlation_factors,
+                        'width': 700,
+                        'height': 300
+                    })
+                  )
 
         vals.append(to_json(correlation_matrix.tolist()))
         w.observe(generate_handler(
@@ -896,8 +1026,14 @@ class RiskFactorsPage(TreePanel):
         w = Table(description="Model Configuration",
                   settings=to_json({
                       'columns': col_types,
-                      'colHeaders': ["Risk_Factor.Stochastic_Process", "Where", "Equals"]})
-                  )
+                      'startCols': 3,
+                      'colHeaders': ["Risk_Factor.Stochastic_Process", "Where", "Equals"],
+                      'contextMenu': True,
+                      'minSpareRows': 1,
+                      'width': 700,
+                      'height': 300
+                  })
+            )
 
         vals.append(to_json(sorted(model_config) if model_config else [[None, None, None]]))
         w.observe(generate_handler(self.config.params['Model Configuration']), 'value')
