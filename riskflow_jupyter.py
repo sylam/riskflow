@@ -14,7 +14,7 @@ from IPython.display import display  # Used to display widgets in the notebook
 # riskflow specific stuff
 import riskflow as rf
 # load the widgets
-from riskflow_widgets import Tree, Table, Flot, FlotTree, Three
+from riskflow_widgets import Tree, Table, Flot, FlotTree  # , Three
 
 
 def to_json(string):
@@ -106,7 +106,7 @@ class TreePanel(object):
         def get_repr(obj, field_name, default_val):
 
             if isinstance(obj, rf.utils.Curve):
-                if obj.meta and obj.meta[0]!='Integrated':
+                if obj.meta and obj.meta[0] != 'Integrated':
                     # need to use a threeview
                     if obj.meta[0] == 2:
                         t = rf.riskfactors.Factor2D({'Surface': obj})
@@ -249,8 +249,10 @@ class TreePanel(object):
                 w = widgets.HTML()
                 vals.append(element['value'])
             elif element['widget'] == 'Table':
-                w = Table(description=element['description'], colTypes=to_json(element['sub_types']),
-                          colHeaders=element['col_names'])
+                w = Table(description=element['description'],
+                          settings=to_json({'columns': element['sub_types'],
+                                            'colHeaders': element['col_names']})
+                          )
                 vals.append(element['value'])
             elif element['widget'] == 'Float':
                 w = widgets.FloatText(description=element['description'])
@@ -508,9 +510,9 @@ class PortfolioPage(TreePanel):
         # tree widget data
         self.tree = Tree(
             plugins=["contextmenu", "sort", "types", "search", "unique"],
-            settings=to_json({'contextmenu': context_menu, 'events':['create','delete']}),
+            settings=to_json({'contextmenu': context_menu, 'events': ['create', 'delete']}),
             type_data=to_json(type_data),
-            #, value=to_json(self.tree_data)
+            # , value=to_json(self.tree_data)
         )
 
         # have a placeholder for the selected model (deal)
@@ -676,9 +678,9 @@ class RiskFactorsPage(TreePanel):
 
         # tree widget data
         self.tree = Tree(
-            plugins = ["contextmenu", "sort", "unique", "types", "search", "checkbox"],
-            settings = to_json({'contextmenu': context_menu, 'events': ['create', 'delete']}),
-            type_data = to_json(type_data)
+            plugins=["contextmenu", "sort", "unique", "types", "search", "checkbox"],
+            settings=to_json({'contextmenu': context_menu, 'events': ['create', 'delete']}),
+            type_data=to_json(type_data)
         )
 
     def get_label(self, label):
@@ -823,7 +825,7 @@ class RiskFactorsPage(TreePanel):
             for index2 in range(index1 + 1, num_factors):
                 factor1, factor2 = correlation_factors[index1], correlation_factors[index2]
                 key = (factor1, factor2) if (factor1, factor2) in self.config.params['Correlations'] else (
-                factor2, factor1)
+                    factor2, factor1)
                 rho = self.config.params['Correlations'].get(key, 0.0) if factor1 != factor2 else 1.0
                 correlation_matrix[index1, index2] = rho
                 correlation_matrix[index2, index1] = rho
@@ -834,9 +836,13 @@ class RiskFactorsPage(TreePanel):
         wig = [widgets.HTML()]
         vals = ['<h4>Correlation:</h4>']
 
-        col_types = '[' + ','.join(['{ "type": "numeric", "format": "0.0000" }'] * len(correlation_factors)) + ']'
+        # col_types = '[' + ','.join(['{ "type": "numeric", "format": "0.0000" }'] * len(correlation_factors)) + ']'
 
-        w = Table(description="Matrix", colTypes=col_types, colHeaders=correlation_factors)
+        w = Table(description="Matrix", settings=to_json({
+            'columns': [{"type": "numeric", "format": "0.0000"}] * len(correlation_factors),
+            'colHeaders': correlation_factors}
+        ))
+
         vals.append(to_json(correlation_matrix.tolist()))
         w.observe(generate_handler(
             self.config.params['Correlations'], correlation_factors,
@@ -873,16 +879,26 @@ class RiskFactorsPage(TreePanel):
         vals = ['<h4>Stochastic Process Mapping:</h4>']
 
         optionmap = {k: v for k, v in rf.fields.mapping['Process_factor_map'].items() if v}
-        col_types = to_json([{"type": "dropdown", "source": sorted(reduce(operator.concat, [
-            ['{0}.{1}'.format(key, val) for val in values] for key, values in optionmap.items()], [])), "strict": True},
-                                {}, {}])
+        col_types = [{"type": "dropdown",
+                      "source": sorted(reduce(
+                          operator.concat,
+                          [['{0}.{1}'.format(key, val) for val in values]
+                           for key, values in optionmap.items()], [])),
+                      "strict": True}, {}, {}]
         model_config = [['{0}.{1}'.format(k, v), None, None] for k, v in
                         sorted(self.config.params['Model Configuration'].modeldefaults.items())]
-        model_config.extend(reduce(operator.concat,
-                                   [[['{0}.{1}'.format(k, rule[1]), rule[0][0], rule[0][1]] for rule in v] for k, v in
-                                    sorted(self.config.params['Model Configuration'].modelfilters.items())], []))
-        w = Table(description="Model Configuration", colTypes=col_types,
-                  colHeaders=["Risk_Factor.Stochastic_Process", "Where", "Equals"])
+
+        model_config.extend(reduce(
+            operator.concat, [[['{0}.{1}'.format(k, rule[1]), rule[0][0], rule[0][1]] for rule in v]
+                              for k, v in sorted(
+                    self.config.params['Model Configuration'].modelfilters.items())], []))
+
+        w = Table(description="Model Configuration",
+                  settings=to_json({
+                      'columns': col_types,
+                      'colHeaders': ["Risk_Factor.Stochastic_Process", "Where", "Equals"]})
+                  )
+
         vals.append(to_json(sorted(model_config) if model_config else [[None, None, None]]))
         w.observe(generate_handler(self.config.params['Model Configuration']), 'value')
         wig.append(w)
@@ -964,7 +980,8 @@ class CalculationPage(TreePanel):
         # tree widget data
         self.tree = CalculationTree()
         self.tree.type_data = to_json(type_data)
-        self.tree.calculation_types = to_json(dict.fromkeys(rf.fields.mapping['Calculation']['types'].keys(), 'default'))
+        self.tree.calculation_types = to_json(
+            dict.fromkeys(rf.fields.mapping['Calculation']['types'].keys(), 'default'))
 
     def GenerateSlides(self, calc, filename, output):
         nb = nbf.new_notebook()
@@ -1070,4 +1087,3 @@ class CalculationPage(TreePanel):
 
     def Delete(self, val):
         del self.data[tuple(json.loads(val))]
-

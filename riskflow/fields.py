@@ -5,7 +5,7 @@ default = {
     'Percent': 0.0,
     'Text': '',
     'Flot': '[{"label":"None", "data":[[0.0,0.0]]}]',
-    'Surface': '[["Term to maturity/Moneyness",0.0],[0.0,0.0]]',
+    'Surface': '[[0.0,1.0], [1.0,0.0]]',
     'Space': '{"0.0":[["Term to maturity/Moneyness",0.0],[0.0,0.0]]}',
     'DateList': 'null',
     'CreditSupportList': '[[0,1]]',
