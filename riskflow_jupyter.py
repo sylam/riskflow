@@ -9,14 +9,13 @@ import pandas as pd
 import ipywidgets as widgets
 
 from functools import reduce
+from abc import ABCMeta, abstractmethod
 from IPython.display import display  # Used to display widgets in the notebook
 
 # riskflow specific stuff
 import riskflow as rf
-# k3d is used to render vol surfaces
-import k3d
 # load the widgets
-from riskflow_widgets import Tree, Table, Flot, FlotTree
+from riskflow_widgets import Tree, Table, Flot, FlotTree, Three
 
 
 def to_json(string):
@@ -24,111 +23,41 @@ def to_json(string):
     return json.dumps(string, separators=(',', ':'))
 
 
-def load_table_from_vol(vol):
-    sparse_matrix = {}
-    for k in vol.param['Surface'].array:
-        sparse_matrix.setdefault(k[0], {}).setdefault(k[1], k[2])
+def load_table_from_vol(vol, rate_type):
+    '''
+    :param vol: a riskfactor representing an array of 2d or 3d surfaces in the
+                'param' dict (usually stored as the 'Surface' key)
+    :return: a list of lists representing the columns and rows (expiry and moneyness) where
+            the vols are in the right cell.
+    '''
 
-    df = pd.DataFrame(sparse_matrix).sort_index(0, 1)
+    def make_table(array, index1=0, index2=1, index3=2):
+        sparse_matrix = {}
+        for k in array:
+            sparse_matrix.setdefault(k[index1], {}).setdefault(k[index2], k[index3])
 
-    table = np.vstack([[0.0] + df.columns.values.round(5).tolist(),
-                       np.hstack([df.index.values.round(5).reshape(-1, 1).tolist(),
-                                  df.round(5).replace({np.nan: None})])]).tolist()
+        df = pd.DataFrame(sparse_matrix).sort_index(level=[0, 1])
 
-    return table
+        return np.vstack([
+            [0.0] + df.columns.values.round(5).tolist(),
+            np.hstack(
+                [df.index.values.round(5).reshape(-1, 1).tolist(),
+                 df.round(5).replace({np.nan: None})]
+            )]
+        ).tolist()
 
-
-class Three(widgets.HBox):
-    '''Fake widget build around the HBox widget - just shows a label, a plot and a table for editing'''
-    def __init__(self, description):
-        self.description = widgets.Label(value=description)
-        self.plot = k3d.plot(
-            axes=['log(moneyness)', 'expiry', 'vol(\%)'],
-            # menu_visibility=False,
-            camera_rotate_speed=3.0
-        )
-        self.mesh = None
-        self.data = Table(description='', settings=to_json({
-            'width': 500, 'height': 300, 'contextMenu': True, 'minSpareRows': 1, 'minSpareCols': 1
-        }))
-
-        super().__init__(
-            children=[
-                self.description,
-                widgets.VBox(children=[self.plot, self.data])
-            ]
-        )
-
-    def observe(self, handler, prop, type='change'):
-
-        def make_plot_fn():
-            def update_plot(change):
-                handler(change)
-                self.update_plot(json.loads(change['new']))
-            return update_plot
-
-        if self.children:
-            # link the observable function to the table widget (self.data)
-            self.data.observe(make_plot_fn(), prop, type)
-        else:
-            super().observe(handler, prop, type)
-
-    @staticmethod
-    def make_faces_vectorized1(Nr, Nc):
-
-        out = np.empty((Nr - 1, Nc - 1, 2, 3), dtype=int)
-
-        r = np.arange(Nr * Nc).reshape(Nr, Nc)
-
-        out[:, :, 0, 0] = r[:-1, :-1]
-        out[:, :, 1, 0] = r[:-1, 1:]
-        out[:, :, 0, 1] = r[:-1, 1:]
-
-        out[:, :, 1, 1] = r[1:, 1:]
-        out[:, :, :, 2] = r[1:, :-1, None]
-
-        out.shape = (-1, 3)
-        return out
-
-    @staticmethod
-    def interpolate_surface(json_list):
-        moneyness = json_list[0][1:]
-        e = []
-        for p in json_list[1:]:
-            e.extend([[m, p[0], v] for m, v in zip(moneyness, p[1:]) if v is not None])
-
-        surface = np.array(e)
-        expiry = [p[0] for p in json_list[1:]]
-        return expiry, moneyness, np.array([np.interp(
-            moneyness, surface[surface[:, 1] == x][:, 0], surface[surface[:, 1] == x][:, 2]) for x in expiry])
-
-    def update_plot(self, json_list):
-        e, moneyness, vol = Three.interpolate_surface(json_list)
-        scale = 2 / np.log(2)
-        m = scale * np.log(moneyness)
-        v = vol * 100
-
-        U, V = np.meshgrid(m, e)
-        vertices = np.dstack([U, V, v]).reshape(-1, 3)
-        indices = Three.make_faces_vectorized1(*v.shape)
-        if self.mesh is not None:
-            self.plot -= self.mesh
-        self.mesh = k3d.mesh(
-            vertices.astype(np.float32), indices.astype(np.uint32), flat_shading=False, attribute=v,
-            side='double', color_map=k3d.basic_color_maps.Reds, color_range=[v.min(), v.max()]
-        )
-        self.plot += self.mesh
-
-    @property
-    def value(self):
-        return self.data.value
-
-    # a setter function
-    @value.setter
-    def value(self, json_list):
-        # self.data.value = to_json(json_list)
-        self.data.value = json_list
-        self.update_plot(json.loads(json_list))
+    if rate_type in rf.utils.TwoDimensionalFactors:
+        return make_table(vol.param['Surface'].array)
+    elif rate_type in rf.utils.ThreeDimensionalFactors:
+        vol_space = {}
+        for t in vol.get_tenor():
+            surface = vol.param['Surface'].array
+            vol_space.setdefault(
+                t, make_table(
+                    surface[surface[:, vol.TENOR_INDEX] == t],
+                    index1=vol.MONEYNESS_INDEX, index2=vol.EXPIRY_INDEX, index3=3)
+            )
+        return vol_space
 
 
 # portfolio parent data
@@ -140,7 +69,7 @@ class DealCache:
 
 
 # Code for custom pages go here
-class TreePanel(object):
+class TreePanel(metaclass=ABCMeta):
     '''
     Base class for tree-based screens with a dynamic panel on the right to show data for the screen.
     '''
@@ -195,7 +124,7 @@ class TreePanel(object):
     @staticmethod
     def get_value_for_widget(config, section_name, field_meta):
         '''Code for mapping between the library (model) and the UI (view) goes here.
-           Handles both deal as well as factor data.
+           Handles both deal and factor data.
 
            For deals, config is the instrument object from the model and the section_name
            is usually the 'field' attribute.
@@ -206,35 +135,13 @@ class TreePanel(object):
             The field_meta contains the actual field names.
         '''
 
-        # def load_table_from_vol(vol_factor, vols):
-        #     table = [['Term to maturity/Moneyness'] + list(vol_factor.get_moneyness())]
-        #     for term, vol in zip(vol_factor.get_expiry(), vols):
-        #         table.append([term] + (list(vol) if isinstance(vol, np.ndarray) else [vol]))
-        #     return table
-
         def get_repr(obj, field_name, default_val):
 
             if isinstance(obj, rf.utils.Curve):
                 if obj.meta and obj.meta[0] != 'Integrated':
                     # need to use a threeview
-                    if obj.meta[0] == 2:
-                        t = rf.riskfactors.Factor2D({'Surface': obj})
-                        vols = t.get_vols()
-                        # vol_space = load_table_from_vol(t, vols)
-                        vol_space = load_table_from_vol(t)
-                    else:
-                        t = rf.riskfactors.Factor3D({'Surface': obj})
-                        vol_cube = t.get_vols()
-                        if len(vol_cube.shape) == 2:
-                            # vol_space = {t.get_tenor()[0]: load_table_from_vol(t, vol_cube)}
-                            vol_space = {t.get_tenor()[0]: load_table_from_vol(t)}
-                        elif len(vol_cube.shape) == 3:
-                            vol_space = {}
-                            for index, tenor in enumerate(t.get_tenor()):
-                                # vol_space.setdefault(tenor, load_table_from_vol(t, vol_cube[index]))
-                                vol_space.setdefault(tenor, load_table_from_vol(t))
-
-
+                    t = getattr(rf.riskfactors, rate_type)({field_name: obj})
+                    vol_space = load_table_from_vol(t, rate_type)
                     return_value = to_json(vol_space)
                 else:
                     return_value = to_json([{'label': 'None', 'data': [[x, y] for x, y in obj.array]}])
@@ -309,6 +216,7 @@ class TreePanel(object):
             return return_value
 
         # update an existing factor
+        rate_type = rf.utils.check_rate_name(section_name)[0]
         field_name = field_meta['description'].replace(' ', '_')
         if section_name in config and field_name in config[section_name]:
             # return the value in the config obj
@@ -317,9 +225,11 @@ class TreePanel(object):
         else:
             return field_meta['value']
 
+    @abstractmethod
     def parse_config(self):
         pass
 
+    @abstractmethod
     def generate_handler(self, field_name, widget_elements, label):
         pass
 
@@ -373,7 +283,7 @@ class TreePanel(object):
                               'width': 400,
                               'height': 200
                           })
-                    )
+                          )
                 vals.append(element['value'])
             elif element['widget'] == 'Float':
                 w = widgets.FloatText(description=element['description'])
@@ -395,9 +305,11 @@ class TreePanel(object):
         container = widgets.VBox(children=wig)
         return container, vals
 
+    @abstractmethod
     def get_label(self, label):
         return ''
 
+    @abstractmethod
     def calc_frames(self, selection):
         pass
 
@@ -421,9 +333,11 @@ class TreePanel(object):
         for container, value in frames:
             update_frame(container, value)
 
+    @abstractmethod
     def create(self, newval):
         pass
 
+    @abstractmethod
     def delete(self, newval):
         pass
 
@@ -885,7 +799,6 @@ class RiskFactorsPage(TreePanel):
     def generate_handler(self, field_name, widget_elements, label):
         def handleEvent(change):
             # update the json representation
-            # print('new', change)
             widget_elements[field_name]['value'] = change['new']
             # update the value in the config object
             self.set_value_from_widget(label[0], label[1], widget_elements[field_name], change['new'])
@@ -957,20 +870,19 @@ class RiskFactorsPage(TreePanel):
         # label this container
         wig = [widgets.HTML()]
         vals = ['<h4>Correlation:</h4>']
-        # col_types = '[' + ','.join(['{ "type": "numeric", "format": "0.0000" }'] * len(correlation_factors)) + ']'
 
         w = Table(description="Matrix",
                   settings=to_json(
-                    {
-                        'columns': [{"type": "numeric",
-                                     "numericFormat": {"pattern": "0.0000"}}] * num_factors,
-                        'startCols': num_factors,
-                        'startRows': num_factors,
-                        'rowHeaders': correlation_factors,
-                        'colHeaders': correlation_factors,
-                        'width': 700,
-                        'height': 300
-                    })
+                      {
+                          'columns': [{"type": "numeric",
+                                       "numericFormat": {"pattern": "0.0000"}}] * num_factors,
+                          'startCols': num_factors,
+                          'startRows': num_factors,
+                          'rowHeaders': correlation_factors,
+                          'colHeaders': correlation_factors,
+                          'width': 700,
+                          'height': 300
+                      })
                   )
 
         vals.append(to_json(correlation_matrix.tolist()))
@@ -1010,18 +922,21 @@ class RiskFactorsPage(TreePanel):
 
         optionmap = {k: v for k, v in rf.fields.mapping['Process_factor_map'].items() if v}
         col_types = [{"type": "dropdown",
-                      "source": sorted(reduce(
-                          operator.concat,
-                          [['{0}.{1}'.format(key, val) for val in values]
-                           for key, values in optionmap.items()], [])),
+                      "source": sorted(
+                          reduce(operator.concat,
+                                 [['{0}.{1}'.format(key, val) for val in values]
+                                  for key, values in optionmap.items()], [])
+                      ),
                       "strict": True}, {}, {}]
         model_config = [['{0}.{1}'.format(k, v), None, None] for k, v in
                         sorted(self.config.params['Model Configuration'].modeldefaults.items())]
 
-        model_config.extend(reduce(
-            operator.concat, [[['{0}.{1}'.format(k, rule[1]), rule[0][0], rule[0][1]] for rule in v]
-                              for k, v in sorted(
-                    self.config.params['Model Configuration'].modelfilters.items())], []))
+        model_config.extend(
+            reduce(operator.concat, [
+                [['{0}.{1}'.format(k, rule[1]), rule[0][0], rule[0][1]] for rule in v]
+                for k, v in sorted(self.config.params['Model Configuration'].modelfilters.items())
+            ], [])
+        )
 
         w = Table(description="Model Configuration",
                   settings=to_json({
@@ -1033,7 +948,7 @@ class RiskFactorsPage(TreePanel):
                       'width': 700,
                       'height': 300
                   })
-            )
+                  )
 
         vals.append(to_json(sorted(model_config) if model_config else [[None, None, None]]))
         w.observe(generate_handler(self.config.params['Model Configuration']), 'value')
@@ -1097,13 +1012,15 @@ class CalculationPage(TreePanel):
     def __init__(self, config):
         super(CalculationPage, self).__init__(config)
 
-    def GetLabel(self, label):
+    def get_label(self, label):
         return '<h4>{0}:</h4><i>{1}</i>'.format(label[0], label[1])
 
-    def ParseConfig(self):
+    def parse_config(self):
         self.data = {}
-        self.calculation_fields = self.load_fields(rf.fields.mapping['Calculation']['types'],
-                                                   rf.fields.mapping['Calculation']['fields'])
+        self.calculation_fields = self.load_fields(
+            rf.fields.mapping['Calculation']['types'],
+            rf.fields.mapping['Calculation']['fields']
+        )
 
         self.tree_data = [{"text": "Calculations",
                            "type": "root",
@@ -1114,38 +1031,22 @@ class CalculationPage(TreePanel):
                      "default": {"valid_children": []}}
 
         # tree widget data
-        self.tree = CalculationTree()
-        self.tree.type_data = to_json(type_data)
-        self.tree.calculation_types = to_json(
-            dict.fromkeys(rf.fields.mapping['Calculation']['types'].keys(), 'default'))
+        # set the context menu to all risk factors defined
+        context_menu = {
+            "Create New Calculation": dict.fromkeys(
+                rf.fields.mapping['Calculation']['types'].keys(), 'default')
+        }
 
-    def GenerateSlides(self, calc, filename, output):
-        nb = nbf.new_notebook()
-        cells = []
+        # tree widget data
+        self.tree = Tree(
+            plugins=["contextmenu", "sort", "unique", "types", "search"],
+            settings=to_json({'contextmenu': context_menu, 'events': ['create', 'delete']}),
+            type_data=to_json(type_data)
+        )
 
-        for cell in calc.slides:
-            nb_cell = nbf.new_text_cell('markdown', cell['text'])
-            nb_cell['metadata'] = cell['metadata']
-            cells.append(nb_cell)
+    def get_results(self, selection, frame, key):
 
-        nb['metadata'] = {'celltoolbar': 'Slideshow'}
-        nb['worksheets'].append(nbf.new_worksheet(cells=cells))
-
-        with open(filename + '.ipynb', 'w') as f:
-            nbf.write(nb, f, 'ipynb')
-
-        # now generate the slideshow
-        call([r'C:\python27\Scripts\ipython', 'nbconvert', filename + '.ipynb', '--to', 'slides', '--reveal-prefix',
-              "http://cdn.jsdelivr.net/reveal.js/2.6.2"])
-
-        # let the gui know about the slides - need to create a custom widget for the label - this is hacky
-        output[
-            'value'] = '<div class="widget-hbox-single"><div class="widget-hlabel" style="display: block;">Slides</div><a href=\'{0}\' target=''_blank''>{0}</a></div>'.format(
-            filename + '.slides.html')
-
-    def GetResults(self, selection, frame, key):
-
-        def Define_Click(widget):
+        def click(widget):
             calc = frame['calc']
             input = frame['frames']['input']
             output = frame['frames']['output']
@@ -1163,28 +1064,24 @@ class CalculationPage(TreePanel):
             # Format the results
             calc.FormatOutput(result, output)
 
-            # generate slides
-            if calc.slides:
-                self.GenerateSlides(calc, key[0], output['Slideshow'])
-
             # flag the gui that we have output
             frame['output'] = True
             # trigger redraw
             self._on_selected_changed({'new': selection})
 
-        return Define_Click
+        return click
 
-    def CalcFrames(self, selection):
+    def calc_frames(self, selection):
         key = tuple(json.loads(selection))
         frame = self.data.get(key, {})
 
         if frame:
             frames = []
-            input = self.DefineInput(key[-1].split('.'), frame['frames']['input'])
+            input = self.define_input(key[-1].split('.'), frame['frames']['input'])
 
             # add the calc button
             execute_button = widgets.Button(description='Execute')
-            execute_button.on_click(self.GetResults(selection, frame, key))
+            execute_button.on_click(self.get_results(selection, frame, key))
 
             input[0].children = input[0].children + (execute_button,)
             input[1].append('')
@@ -1193,7 +1090,7 @@ class CalculationPage(TreePanel):
 
             # now the output
             if frame['output']:
-                output = self.DefineInput([key[-1], 'Results'], frame['frames']['output'])
+                output = self.define_input([key[-1], 'Results'], frame['frames']['output'])
                 frames.append(output)
 
             self.right_container.children = [x[0] for x in frames]
@@ -1203,7 +1100,7 @@ class CalculationPage(TreePanel):
             self.right_container = widgets.VBox()
             return []
 
-    def GenerateHandler(self, field_name, widget_elements, label):
+    def generate_handler(self, field_name, widget_elements, label):
         def handleEvent(change):
             # update the json representation
             widget_elements[field_name]['value'] = change['new']
@@ -1212,14 +1109,16 @@ class CalculationPage(TreePanel):
 
         return handleEvent
 
-    def Create(self, val):
-        key = tuple(json.loads(val))
+    def create(self, val):
+        key = tuple(val)
         calc_type = key[-1][:key[-1].find('.')]
         reference = key[-1][key[-1].find('.') + 1:]
         # print key, calc_type, reference
         # load defaults for the new riskfactor
-        self.data[key] = {'frames': copy.deepcopy(self.calculation_fields.get(calc_type)),
-                          'calc': ConstructCalculation(calc_type, self.config), 'output': False}
+        self.data[key] = {
+            'frames': copy.deepcopy(self.calculation_fields.get(calc_type)),
+            'calc': ConstructCalculation(calc_type, self.config), 'output': False
+        }
 
-    def Delete(self, val):
-        del self.data[tuple(json.loads(val))]
+    def delete(self, val):
+        del self.data[tuple(val)]

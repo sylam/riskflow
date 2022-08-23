@@ -6,11 +6,18 @@ default = {
     'Text': '',
     'Flot': '[{"label":"None", "data":[[0.0,0.0]]}]',
     'Surface': '[[0.0,1.0], [1.0,0.0]]',
-    'Space': '{"0.0":[["Term to maturity/Moneyness",0.0],[0.0,0.0]]}',
+    'Space': '{"0.0":[[0.0,0.0],[0.0,0.0]]}',
     'DateList': 'null',
     'CreditSupportList': '[[0,1]]',
     'TreeFlot': '{"":[{"label":"None", "data":[[0.0,0.0]]}]}',
     'DatePicker': ''
+}
+
+num_format = {
+    'float': {'pattern': '0.000'},
+    'int': {'pattern': '0.'},
+    'percent': {'pattern': '0.00 %'},
+    'currency': {'pattern': '0,0.00'}
 }
 
 # this whole thing could be stored as a json file . . .
@@ -417,7 +424,7 @@ mapping = {
             'Instrument_Definitions': {'widget': 'Table', 'description': 'Instrument Definitions', 'value': 'null',
                                        'sub_types':
                                            [{},
-                                            {'type': 'numeric', 'format': '0,0.00'},
+                                            {'type': 'numeric', 'numericFormat': num_format['currency']},
                                             {},
                                             {'type': 'dropdown',
                                              'source': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360',
@@ -426,8 +433,8 @@ mapping = {
                                             {},
                                             {},
                                             {'type': 'dropdown', 'source': ['Lognormal', 'Normal']},
-                                            {'type': 'numeric', 'format': '0.'},
-                                            {'type': 'numeric', 'format': '0.00 %'}],
+                                            {'type': 'numeric', 'numericFormat': num_format['int']},
+                                            {'type': 'numeric', 'numericFormat': num_format['percent']}],
                                        'obj':
                                            ['Period', 'Period', 'Period', 'Period', 'Text', 'Integer', 'Text', 'Float',
                                             'Percent', 'Text'],
@@ -777,8 +784,8 @@ mapping = {
             'Equity_Known_Prices': {'widget': 'Table', 'description': 'Equity Known Prices', 'value': 'null',
                                     'sub_types':
                                         [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                         {'type': 'numeric', 'format': '0,0.00'},
-                                         {'type': 'numeric', 'format': '0,0.00'}
+                                         {'type': 'numeric', 'numericFormat': num_format['currency']},
+                                         {'type': 'numeric', 'numericFormat': num_format['currency']}
                                          ],
                                     'obj':
                                         'DateEqualList',
@@ -788,7 +795,7 @@ mapping = {
             'Known_Dividends': {'widget': 'Table', 'description': 'Known Dividends', 'value': 'null',
                                 'sub_types':
                                     [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                     {'type': 'numeric', 'format': '0,0.00'}],
+                                     {'type': 'numeric', 'numericFormat': num_format['currency']}],
                                 'obj':
                                     'DateEqualList',
                                 'col_names':
@@ -797,8 +804,8 @@ mapping = {
             'Sampling_Data': {'widget': 'Table', 'description': 'Sampling_Data', 'value': 'null',
                               'sub_types':
                                   [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                   {'type': 'numeric', 'format': '0,0.00'},
-                                   {'type': 'numeric', 'format': '0,0.00'}
+                                   {'type': 'numeric', 'numericFormat': num_format['currency']},
+                                   {'type': 'numeric', 'numericFormat': num_format['currency']}
                                    ],
                               'obj':
                                   ['DatePicker', 'Float', 'Float'],
@@ -807,26 +814,26 @@ mapping = {
                               },
             'Properties': {'widget': 'Table', 'description': 'Properties', 'value': 'null',
                            'sub_types':
-                               [{'type': 'numeric', 'format': '0,0.00'},
-                                {'type': 'numeric', 'format': '0,0.00'},
-                                {'type': 'numeric', 'format': '0.00 %'},
-                                {'type': 'numeric', 'format': '0.00 %'},
-                                {'type': 'numeric', 'format': '0,0.00'},
-                                {'type': 'numeric', 'format': '0,0.00'},
-                                {'type': 'numeric', 'format': '0,0.00'},
-                                {'type': 'numeric', 'format': '0.00 %'},
-                                {'type': 'numeric', 'format': '0,0.00'},
-                                {'type': 'numeric', 'format': '0.00 %'},
+                               [{'type': 'numeric', 'numericFormat': num_format['currency']},
+                                {'type': 'numeric', 'numericFormat': num_format['currency']},
+                                {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                {'type': 'numeric', 'numericFormat': num_format['currency']},
+                                {'type': 'numeric', 'numericFormat': num_format['currency']},
+                                {'type': 'numeric', 'numericFormat': num_format['currency']},
+                                {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                {'type': 'numeric', 'numericFormat': num_format['currency']},
+                                {'type': 'numeric', 'numericFormat': num_format['percent']},
                                 {'type': 'dropdown', 'source': ['Yes', 'No']},
-                                {'type': 'numeric', 'format': '0.00 %'},
+                                {'type': 'numeric', 'numericFormat': num_format['percent']},
                                 {'type': 'dropdown', 'source': ['Yes', 'No']},
-                                {'type': 'numeric', 'format': '0.00 %'},
+                                {'type': 'numeric', 'numericFormat': num_format['percent']},
                                 {'type': 'dropdown', 'source': ['Yes', 'No']},
-                                {'type': 'numeric', 'format': '0.00 %'},
+                                {'type': 'numeric', 'numericFormat': num_format['percent']},
                                 {'type': 'dropdown', 'source': ['Yes', 'No']},
-                                {'type': 'numeric', 'format': '0.00 %'},
-                                {'type': 'numeric', 'format': '0.00 %'},
-                                {'type': 'numeric', 'format': '0,0.00'},
+                                {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                {'type': 'numeric', 'numericFormat': num_format['currency']},
                                 {'type': 'dropdown', 'source': ['Yes', 'No']}
                                 ],
                            'obj':
@@ -846,17 +853,17 @@ mapping = {
                 'widget': 'Table', 'description': 'Items', 'value': 'null',
                 'sub_types':
                     [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'dropdown',
                       'source': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360', 'ACT_ACT_ICMA']},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {},
-                     {'type': 'numeric', 'format': '0,0.00'},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'}
+                     {'type': 'numeric', 'numericFormat': num_format['currency']}
                      ],
                 'obj':
                     ['DatePicker', 'Float', 'DatePicker', 'DatePicker', 'Text', 'Float',
@@ -870,19 +877,19 @@ mapping = {
                 'widget': 'Table', 'description': 'Items', 'value': 'null',
                 'sub_types':
                     [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'dropdown',
                       'source': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360', 'ACT_ACT_ICMA']},
-                     {'type': 'numeric', 'format': '0,0.0000'},
-                     {'type': 'numeric', 'format': '0.00 %'},
-                     {'type': 'numeric', 'format': '0,0.0000'},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['percent']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {'type': 'dropdown', 'source': ['Yes', 'No']}
                      ],
                 'obj':
@@ -897,17 +904,17 @@ mapping = {
                 'widget': 'Table', 'description': 'Items', 'value': 'null',
                 'sub_types':
                     [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'},
-                     {'type': 'numeric', 'format': '0.000 %'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['percent']},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'dropdown',
                       'source': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360', 'ACT_ACT_ICMA']},
-                     {'type': 'numeric', 'format': '0,0.00'},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {'type': 'dropdown', 'source': ['Yes', 'No']},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'}
+                     {'type': 'numeric', 'numericFormat': num_format['currency']}
                      ],
                 'obj':
                     ['DatePicker', 'Float', 'Percent', 'DatePicker', 'DatePicker', 'Text', 'Float', 'Float', 'Text',
@@ -921,7 +928,7 @@ mapping = {
                 'widget': 'Table', 'description': 'Items', 'value': 'null',
                 'sub_types':
                     [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'}
+                     {'type': 'numeric', 'numericFormat': num_format['currency']}
                      ],
                 'obj':
                     ['DatePicker', 'Float'],
@@ -935,14 +942,14 @@ mapping = {
                     [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'},
-                     {'type': 'numeric', 'format': '0,0.00'},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                      {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'}
+                     {'type': 'numeric', 'numericFormat': num_format['currency']}
                      ],
                 'obj':
                     ['DatePicker', 'DatePicker', 'DatePicker', 'Float', 'Float', 'Float', 'DatePicker', 'Float',
@@ -956,8 +963,8 @@ mapping = {
                 'widget': 'Table', 'description': 'Items', 'value': 'null',
                 'sub_types':
                     [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                     {'type': 'numeric', 'format': '0,0.00'},
-                     {'type': 'numeric', 'format': '0,0.00'}
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']}
                      ],
                 'obj':
                     ['DatePicker', 'Float', 'Float'],
@@ -976,12 +983,12 @@ mapping = {
             'Cash_Collateral': {'widget': 'Table', 'description': 'Cash Collateral', 'value': 'null',
                                 'sub_types':
                                     [{},
-                                     {'type': 'numeric', 'format': '0.000'},
-                                     {'type': 'numeric', 'format': '0.00 %'},
-                                     {'type': 'numeric', 'format': '0.00 %'},
+                                     {'type': 'numeric', 'numericFormat': num_format['float']},
+                                     {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                     {'type': 'numeric', 'numericFormat': num_format['percent']},
                                      {},
                                      {},
-                                     {'type': 'numeric', 'format': '0.'}
+                                     {'type': 'numeric', 'numericFormat': num_format['int']}
                                      ],
                                 'obj':
                                     ['Text', 'Float', 'Percent', 'Percent', 'Text', 'Text', 'Integer'],
@@ -991,15 +998,15 @@ mapping = {
                                 },
             'Bond_Collateral': {'widget': 'Table', 'description': 'Bond Collateral', 'value': 'null',
                                 'sub_types':
-                                    [{'type': 'numeric', 'format': '0.00 %'},
-                                     {'type': 'numeric', 'format': '0.00 %'},
-                                     {'type': 'numeric', 'format': '0.'},
+                                    [{'type': 'numeric', 'numericFormat': num_format['percent']},
+                                     {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                     {'type': 'numeric', 'numericFormat': num_format['int']},
                                      {},
                                      {},
                                      {},
                                      {},
-                                     {'type': 'numeric', 'format': '0.'},
-                                     {'type': 'numeric', 'format': '0.00 %'},
+                                     {'type': 'numeric', 'numericFormat': num_format['int']},
+                                     {'type': 'numeric', 'numericFormat': num_format['percent']},
                                      {},
                                      {},
                                      {},
@@ -1015,12 +1022,12 @@ mapping = {
             'Equity_Collateral': {'widget': 'Table', 'description': 'Equity_Collateral', 'value': 'null',
                                      'sub_types':
                                      [{},
-                                      {'type': 'numeric', 'format': '0.000'},
-                                      {'type': 'numeric', 'format': '0.00 %'},
-                                      {'type': 'numeric', 'format': '0.00 %'},
+                                      {'type': 'numeric', 'numericFormat': num_format['float']},
+                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
                                       {},
                                       {},
-                                      {'type': 'numeric', 'format': '0.'}
+                                      {'type': 'numeric', 'numericFormat': num_format['int']}
                                       ],
                                   'obj':
                                       ['Text', 'Float', 'Percent', 'Percent', 'Text', 'Text', 'Integer'],
@@ -1031,12 +1038,12 @@ mapping = {
             'Commodity_Collateral': {'widget': 'Table', 'description': 'Commodity Collateral', 'value': 'null',
                                      'sub_types':
                                      [{},
-                                      {'type': 'numeric', 'format': '0.000'},
-                                      {'type': 'numeric', 'format': '0.00 %'},
-                                      {'type': 'numeric', 'format': '0.00 %'},
+                                      {'type': 'numeric', 'numericFormat': num_format['float']},
+                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
                                       {},
                                       {},
-                                      {'type': 'numeric', 'format': '0.'}
+                                      {'type': 'numeric', 'numericFormat': num_format['int']}
                                       ],
                                   'obj':
                                       ['Text', 'Float', 'Percent', 'Percent', 'Text', 'Text', 'Integer'],
@@ -1049,7 +1056,7 @@ mapping = {
                                  'value': default['DateList'],
                                  'sub_types':
                                      [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                      {'type': 'numeric', 'format': '0,0.00'}],
+                                      {'type': 'numeric', 'numericFormat': num_format['currency']}],
                                  'obj':
                                      'DateList',
                                  'col_names':
@@ -1066,7 +1073,7 @@ mapping = {
                                      'value': default['DateList'],
                                      'sub_types':
                                          [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                          {'type': 'numeric', 'format': '0,0.00'}],
+                                          {'type': 'numeric', 'numericFormat': num_format['currency']}],
                                      'obj':
                                          'DateList',
                                      'col_names':
@@ -1123,7 +1130,7 @@ mapping = {
             'Amortisation': {'widget': 'Table', 'description': 'Amortisation', 'value': default['DateList'],
                              'sub_types':
                                  [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                  {'type': 'numeric', 'format': '0,0.00'}],
+                                  {'type': 'numeric', 'numericFormat': num_format['currency']}],
                              'obj':
                                  'DateList',
                              'col_names':
@@ -1132,7 +1139,7 @@ mapping = {
             'Known_FX_Rates': {'widget': 'Table', 'description': 'Known FX Rates', 'value': default['DateList'],
                                'sub_types':
                                    [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                    {'type': 'numeric', 'format': '0,0.00'}],
+                                    {'type': 'numeric', 'numericFormat': num_format['currency']}],
                                'obj':
                                    'DateList',
                                'col_names':
@@ -1142,7 +1149,7 @@ mapping = {
                                        'value': default['DateList'],
                                        'sub_types':
                                            [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                            {'type': 'numeric', 'format': '0,0.00'}],
+                                            {'type': 'numeric', 'numericFormat': num_format['currency']}],
                                        'obj':
                                            'DateList',
                                        'col_names':
@@ -1171,7 +1178,7 @@ mapping = {
             'Margin_Schedule': {'widget': 'Table', 'description': 'Margin Schedule', 'value': default['DateList'],
                                 'sub_types':
                                     [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                     {'type': 'numeric', 'format': '0,0.00'}],
+                                     {'type': 'numeric', 'numericFormat': num_format['currency']}],
                                 'obj':
                                     'DateList',
                                 'col_names':
@@ -1180,8 +1187,8 @@ mapping = {
             'Independent_Amount': {'widget': 'Table', 'description': 'Independent Amount',
                                    'value': default['CreditSupportList'],
                                    'sub_types':
-                                       [{'type': 'numeric', 'format': '0,0.00'},
-                                        {'type': 'numeric', 'format': '0.'}],
+                                       [{'type': 'numeric', 'numericFormat': num_format['currency']},
+                                        {'type': 'numeric', 'numericFormat': num_format['int']}],
                                    'obj':
                                        'CreditSupportList',
                                    'col_names':
@@ -1190,8 +1197,8 @@ mapping = {
             'Posted_Threshold': {'widget': 'Table', 'description': 'Posted Threshold',
                                  'value': default['CreditSupportList'],
                                  'sub_types':
-                                     [{'type': 'numeric', 'format': '0,0.00'},
-                                      {'type': 'numeric', 'format': '0.'}],
+                                     [{'type': 'numeric', 'numericFormat': num_format['currency']},
+                                      {'type': 'numeric', 'numericFormat': num_format['int']}],
                                  'obj':
                                      'CreditSupportList',
                                  'col_names':
@@ -1200,8 +1207,8 @@ mapping = {
             'Received_Threshold': {'widget': 'Table', 'description': 'Received Threshold',
                                    'value': default['CreditSupportList'],
                                    'sub_types':
-                                       [{'type': 'numeric', 'format': '0,0.00'},
-                                        {'type': 'numeric', 'format': '0.'}],
+                                       [{'type': 'numeric', 'numericFormat': num_format['currency']},
+                                        {'type': 'numeric', 'numericFormat': num_format['int']}],
                                    'obj':
                                        'CreditSupportList',
                                    'col_names':
@@ -1210,8 +1217,8 @@ mapping = {
             'Minimum_Received': {'widget': 'Table', 'description': 'Minimum Received',
                                  'value': default['CreditSupportList'],
                                  'sub_types':
-                                     [{'type': 'numeric', 'format': '0,0.00'},
-                                      {'type': 'numeric', 'format': '0.'}],
+                                     [{'type': 'numeric', 'numericFormat': num_format['currency']},
+                                      {'type': 'numeric', 'numericFormat': num_format['int']}],
                                  'obj':
                                      'CreditSupportList',
                                  'col_names':
@@ -1220,8 +1227,8 @@ mapping = {
             'Minimum_Posted': {'widget': 'Table', 'description': 'Minimum Posted',
                                'value': default['CreditSupportList'],
                                'sub_types':
-                                   [{'type': 'numeric', 'format': '0,0.00'},
-                                    {'type': 'numeric', 'format': '0.'}],
+                                   [{'type': 'numeric', 'numericFormat': num_format['currency']},
+                                    {'type': 'numeric', 'numericFormat': num_format['int']}],
                                'obj':
                                    'CreditSupportList',
                                'col_names':
@@ -1326,7 +1333,7 @@ mapping = {
             'Rate_Schedule': {'widget': 'Table', 'description': 'Rate Schedule', 'value': default['DateList'],
                               'sub_types':
                                   [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                   {'type': 'numeric', 'format': '0,0.00'}],
+                                   {'type': 'numeric', 'numericFormat': num_format['currency']}],
                               'obj':
                                   'DateList',
                               'col_names':
@@ -1376,7 +1383,7 @@ mapping = {
             'Pay_Known_Rates': {'widget': 'Table', 'description': 'Pay Known Rates', 'value': default['DateList'],
                                 'sub_types':
                                     [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                     {'type': 'numeric', 'format': '0,0.00'}],
+                                     {'type': 'numeric', 'numericFormat': num_format['currency']}],
                                 'obj':
                                     'DateList',
                                 'col_names':
@@ -1403,7 +1410,7 @@ mapping = {
                                     'value': default['DateList'],
                                     'sub_types':
                                         [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                         {'type': 'numeric', 'format': '0,0.00'}],
+                                         {'type': 'numeric', 'numericFormat': num_format['currency']}],
                                     'obj':
                                         'DateList',
                                     'col_names':
@@ -1429,7 +1436,7 @@ mapping = {
             'Known_Rates': {'widget': 'Table', 'description': 'Known Rates', 'value': default['DateList'],
                             'sub_types':
                                 [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                 {'type': 'numeric', 'format': '0,0.00'}],
+                                 {'type': 'numeric', 'numericFormat': num_format['currency']}],
                             'obj':
                                 'DateList',
                             'col_names':
