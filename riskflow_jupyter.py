@@ -15,15 +15,10 @@ from IPython.display import display  # Used to display widgets in the notebook
 # riskflow specific stuff
 import riskflow as rf
 # load the widgets
-from riskflow_widgets import Tree, Table, Flot, FlotTree, Three
+from riskflow_widgets import Tree, Table, Flot, FlotTree, Three, to_json
 
 
-def to_json(string):
-    """converts a string to json - skips the whitespace for a smaller output"""
-    return json.dumps(string, separators=(',', ':'))
-
-
-def load_table_from_vol(vol, rate_type):
+def load_table_from_vol(vol):
     '''
     :param vol: a riskfactor representing an array of 2d or 3d surfaces in the
                 'param' dict (usually stored as the 'Surface' key)
@@ -46,9 +41,9 @@ def load_table_from_vol(vol, rate_type):
             )]
         ).tolist()
 
-    if rate_type in rf.utils.TwoDimensionalFactors:
+    if vol.__class__.__name__ in rf.utils.TwoDimensionalFactors:
         return make_table(vol.param['Surface'].array)
-    elif rate_type in rf.utils.ThreeDimensionalFactors:
+    elif vol.__class__.__name__ in rf.utils.ThreeDimensionalFactors:
         vol_space = {}
         for t in vol.get_tenor():
             surface = vol.param['Surface'].array
@@ -141,7 +136,7 @@ class TreePanel(metaclass=ABCMeta):
                 if obj.meta and obj.meta[0] != 'Integrated':
                     # need to use a threeview
                     t = getattr(rf.riskfactors, rate_type)({field_name: obj})
-                    vol_space = load_table_from_vol(t, rate_type)
+                    vol_space = load_table_from_vol(t)
                     return_value = to_json(vol_space)
                 else:
                     return_value = to_json([{'label': 'None', 'data': [[x, y] for x, y in obj.array]}])
@@ -307,7 +302,7 @@ class TreePanel(metaclass=ABCMeta):
 
     @abstractmethod
     def get_label(self, label):
-        return ''
+        pass
 
     @abstractmethod
     def calc_frames(self, selection):
@@ -701,8 +696,15 @@ class RiskFactorsPage(TreePanel):
                            "state": {"opened": True, "selected": False},
                            "children": loaded_data}]
 
-        type_data = {"root": {"icon": "fa fa-folder", "valid_children": ["default"]},
-                     "default": {"icon": "fa fa-file", "valid_children": []}}
+        type_data = {
+            "root": {
+                "icon": "fa fa-folder", "valid_children": ["default"],
+                "check_node": False, "uncheck_node": False
+            },
+            "default": {
+                "icon": "fa fa-file", "valid_children": []
+            }
+        }
 
         # simple lookup to match the params in the config file to the json in the UI
         self.config_map = {'Factor': 'Price Factors', 'Process': 'Price Models', 'Config': 'System Parameters'}
@@ -959,8 +961,10 @@ class RiskFactorsPage(TreePanel):
 
     def calc_frames(self, selection):
         # riskfactors are only 1 level deep (might want to extend this) - TODO
-        key = selection[0]
-        frame = self.data.get(key, {})
+        frame = None
+        if selection:
+            key = selection[0]
+            frame = self.data.get(key, {})
         frames = []
         sps = set()
 
