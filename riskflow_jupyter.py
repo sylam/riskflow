@@ -69,14 +69,13 @@ class TreePanel(metaclass=ABCMeta):
     Base class for tree-based screens with a dynamic panel on the right to show data for the screen.
     '''
 
-    def __init__(self, config):
+    def __init__(self, context):
         # load the config object - to load and store state
-        self.config = config
-
+        self.context = context
         # load up relevant information from the config and define the tree type
         self.parse_config()
 
-        # setup the view containters
+        # set up the view containters
         self.right_container = widgets.VBox()
         # update the style of the right container
         self.right_container._dom_classes = ['rightframe']
@@ -98,6 +97,11 @@ class TreePanel(metaclass=ABCMeta):
             layout=widgets.Layout(border='5px outset black'),
             _dom_classes=['mainframe']
         )
+
+    @property
+    def config(self):
+        # this changes depending on the context
+        return self.context.current_cfg
 
     @staticmethod
     def load_fields(field_names, field_data):
@@ -698,8 +702,7 @@ class RiskFactorsPage(TreePanel):
 
         type_data = {
             "root": {
-                "icon": "fa fa-folder", "valid_children": ["default"],
-                "check_node": False, "uncheck_node": False
+                "icon": "fa fa-folder", "valid_children": ["default"]
             },
             "default": {
                 "icon": "fa fa-file", "valid_children": []
@@ -1026,10 +1029,25 @@ class CalculationPage(TreePanel):
             rf.fields.mapping['Calculation']['fields']
         )
 
+        calculation_to_add = []
+        if self.config.deals['Calculation']:
+            calc_type = self.config.deals['Calculation']['Object']
+            ref_name = self.config.deals['Attributes'].get('Reference', 'Unknown')
+            key = '{}.{}'.format(calc_type, ref_name)
+            calculation_to_add.append({
+                "text": key,
+                "type": "default",
+                "children": []
+            })
+            self.data[key] = {
+                'frames': copy.deepcopy(self.calculation_fields.get(calc_type)),
+                'calc': calc_type, 'output': False
+            }
+
         self.tree_data = [{"text": "Calculations",
                            "type": "root",
                            "state": {"opened": True, "selected": False},
-                           "children": []}]
+                           "children": calculation_to_add}]
 
         type_data = {"root": {"valid_children": ["default"]},
                      "default": {"valid_children": []}}
@@ -1076,12 +1094,14 @@ class CalculationPage(TreePanel):
         return click
 
     def calc_frames(self, selection):
-        key = tuple(json.loads(selection))
-        frame = self.data.get(key, {})
+        frame = None
+        if selection:
+            key = selection[0]
+            frame = self.data.get(key, {})
 
         if frame:
             frames = []
-            input = self.define_input(key[-1].split('.'), frame['frames']['input'])
+            input = self.define_input(key.split('.'), frame['frames']['input'])
 
             # add the calc button
             execute_button = widgets.Button(description='Execute')
@@ -1121,7 +1141,7 @@ class CalculationPage(TreePanel):
         # load defaults for the new riskfactor
         self.data[key] = {
             'frames': copy.deepcopy(self.calculation_fields.get(calc_type)),
-            'calc': ConstructCalculation(calc_type, self.config), 'output': False
+            'calc': calc_type, 'output': False
         }
 
     def delete(self, val):

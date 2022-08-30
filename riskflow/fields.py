@@ -127,16 +127,16 @@ mapping = {
             }
         },
         'types': {
-            'Credit_Monte_Carlo':
+            'CreditMonteCarlo':
                 {
                     'input':
                         ['Run_Date', 'Base_time_grid', 'Scenario_time_grid', 'Currency', 'Number_Simulations',
                          'Random_Seed', 'Calc_Scenarios', 'Generate_Cashflows', 'Generate_Slideshow', 'Partition',
                          'Partition_String', 'ScenarioBatchMemorySize', 'PFE_Recon_File'],
                     'output':
-                        ['PFE', 'Cashflows', 'Slideshow']
+                        ['PFE', 'Cashflows']
                 },
-            'Base_Revaluation':
+            'BaseRevaluation':
                 {
                     'input':
                         ['Run_Date', 'Currency'],
