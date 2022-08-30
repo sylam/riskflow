@@ -261,7 +261,7 @@ if __name__ == '__main__':
     for folder in ['temp', 'Input_JSON', 'CVA_JSON', 'CVA_UAT', 'CVA', 'PFE', 'PFE_UAT', 'Upgrade']:
         paths[folder] = rf.getpath(
             [os.path.join('E:\\Data\\crstal\\CVA', folder),
-             # os.path.join('/media/vretiel/Media/Data/crstal', folder),
+             os.path.join('/media/vretiel/Media/Data/crstal', folder),
              os.path.join('C:\\', folder),
              os.path.join('S:\\CCR_PFE_EE_NetCollateral', folder),
              os.path.join('S:\\CCR_Tagged', folder),
@@ -303,7 +303,9 @@ if __name__ == '__main__':
         'USD': {'collateral': 'USD-SOFR', 'funding': 'USD-LIBOR-3M'},
         'EUR': {'collateral': 'EUR-ESTR', 'funding': 'EUR-EURIBOR-3M'}}
 
+#    for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
     for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
+
         cx.load_json(json, compress=True)
 
         if not cx.current_cfg.deals['Deals']['Children'][0]['Children']:

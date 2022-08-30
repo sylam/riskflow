@@ -148,6 +148,8 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
 
     # check if the gpu is available
     if torch.cuda.is_available():
+        # make sure we try to be deterministic as possible
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
         device = torch.device("cuda:0")
         torch.cuda.empty_cache()
     else:
