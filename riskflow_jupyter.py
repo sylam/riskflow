@@ -237,7 +237,7 @@ class TreePanel(metaclass=ABCMeta):
         wig = [widgets.HTML()]
         vals = [self.get_label(label)]
 
-        for field_name, element in sorted(widget_elements.items()):
+        for field_name, element in widget_elements.items():
             # skip this element if it's not visible
             if element.get('isvisible') == 'False':
                 continue
@@ -345,14 +345,18 @@ class TreePanel(metaclass=ABCMeta):
             # print 'create',val
             self.create(change['new'])
             # reset the created flag
+            self.tree.unobserve(self._on_created_changed, 'created')
             self.tree.created = ''
+            self.tree.observe(self._on_created_changed, 'created')
 
     def _on_deleted_changed(self, change):
         if self.tree.deleted:
             # print 'delete',val
             self.delete(change['new'])
             # reset the deleted flag
+            self.tree.unobserve(self._on_deleted_changed, 'deleted')
             self.tree.deleted = ''
+            self.tree.observe(self._on_deleted_changed, 'deleted')
 
     def _on_displayed(self, e):
         self.tree.value = to_json(self.tree_data)
@@ -576,7 +580,7 @@ class PortfolioPage(TreePanel):
             return frames
         else:
             # load up a set of defaults
-            self.right_container = widgets.VBox()
+            self.right_container.children = []
             return []
 
     def create(self, val):
@@ -1020,10 +1024,29 @@ class CalculationPage(TreePanel):
         super(CalculationPage, self).__init__(config)
 
     def get_label(self, label):
-        return '<h4>{0}:</h4><i>{1}</i>'.format(label[0], label[1])
+        """
+        :param label: a list of text describing this calculation.
+        :return: just prints the last 2 labels as the section and subsection header
+        """
+        return '<h4>{0}:</h4><i>{1}</i>'.format(*label[-2:])
 
     def parse_config(self):
+
+        def load_items(config, field_name, field_data, storage):
+            properties = field_data[field_name] if field_name in field_data else field_data[
+                config[field_name]['Object']]
+            for property_name, property_data in properties.items():
+                value = copy.deepcopy(property_data)
+                if 'sub_fields' in value:
+                    load_items(config[field_name], property_name, {property_name: value['sub_fields']},
+                               value['sub_fields'])
+                value['value'] = self.get_value_for_widget(config, field_name, value)
+
+                storage[property_name] = value
+
         self.data = {}
+
+        # get the fields from the master list
         self.calculation_fields = self.load_fields(
             rf.fields.mapping['Calculation']['types'],
             rf.fields.mapping['Calculation']['fields']
@@ -1037,11 +1060,13 @@ class CalculationPage(TreePanel):
             calculation_to_add.append({
                 "text": key,
                 "type": "default",
+                "data": {},
                 "children": []
             })
+            node_data = {}
+            load_items(self.config.deals, 'Calculation', self.calculation_fields, node_data)
             self.data[key] = {
-                'frames': copy.deepcopy(self.calculation_fields.get(calc_type)),
-                'calc': calc_type, 'output': False
+                'frames': node_data, 'calc': calc_type, 'output': {}
             }
 
         self.tree_data = [{"text": "Calculations",
@@ -1070,26 +1095,33 @@ class CalculationPage(TreePanel):
 
         def click(widget):
             calc = frame['calc']
-            input = frame['frames']['input']
-            output = frame['frames']['output']
+            input = frame['frames']
+            output = {}
 
             param = {k: v['value'] for k, v in input.items()}
             # send the name of the calc to the calculation engine
-            param['calc_name'] = key
-            result = calc.Execute(param)
+            param.update({'calc_name': key, 'Object': calc})
+            print(param)
+            # update the parameters for the current calculation
+            rf.update_dict(self.config.deals['Calculation'], param)
+            # get the output
+            calc, output = self.context.run_job()
+            print(self.config.deals['Calculation'])
 
-            # Disable unneeded fields
-            for k, v in input.items():
-                if v.get('Output'):
-                    output[v['Output']]['isvisible'] = 'True' if v['value'] == 'Yes' else 'False'
+            if 0:
+                # Disable unneeded fields
+                for k, v in input.items():
+                    if v.get('Output'):
+                        output[v['Output']]['isvisible'] = 'True' if v['value'] == 'Yes' else 'False'
 
-            # Format the results
-            calc.FormatOutput(result, output)
+                # Format the results
+                calc.FormatOutput(result, output)
 
-            # flag the gui that we have output
-            frame['output'] = True
-            # trigger redraw
-            self._on_selected_changed({'new': selection})
+                # flag the gui that we have output
+                frame['output'] = output
+
+                # trigger redraw
+                self._on_selected_changed({'new': selection})
 
         return click
 
@@ -1101,7 +1133,7 @@ class CalculationPage(TreePanel):
 
         if frame:
             frames = []
-            input = self.define_input(key.split('.'), frame['frames']['input'])
+            input = self.define_input(key.split('.'), frame['frames'])
 
             # add the calc button
             execute_button = widgets.Button(description='Execute')
@@ -1111,38 +1143,63 @@ class CalculationPage(TreePanel):
             input[1].append('')
 
             frames.append(input)
-
+            print(frame.keys())
             # now the output
             if frame['output']:
-                output = self.define_input([key[-1], 'Results'], frame['frames']['output'])
+                output = self.define_input([key, 'Results'], frame['output'])
                 frames.append(output)
 
             self.right_container.children = [x[0] for x in frames]
             return frames
         else:
             # load up a set of defaults
-            self.right_container = widgets.VBox()
+            self.right_container.children = []
             return []
 
     def generate_handler(self, field_name, widget_elements, label):
         def handleEvent(change):
             # update the json representation
             widget_elements[field_name]['value'] = change['new']
-            # update the value in the config object
+            # we could update the value in the config object if we wanted to save the calculation back
+            # but we won't
             # self.SetValueFromWidget ( label[0], label[1], widget_elements[field_name], new_value )
 
         return handleEvent
 
     def create(self, val):
-        key = tuple(val)
-        calc_type = key[-1][:key[-1].find('.')]
-        reference = key[-1][key[-1].find('.') + 1:]
-        # print key, calc_type, reference
+        key = val[0]
+        calc_type = key[:key.find('.')]
+        reference = key[key.find('.') + 1:]
+        print (key, calc_type, reference)
         # load defaults for the new riskfactor
         self.data[key] = {
             'frames': copy.deepcopy(self.calculation_fields.get(calc_type)),
-            'calc': calc_type, 'output': False
+            'calc': calc_type, 'output': {}
         }
 
     def delete(self, val):
-        del self.data[tuple(val)]
+        if val[0] in self.data:
+            del self.data[val[0]]
+
+
+if __name__ == '__main__':
+    rundate = '2022-07-07'
+    if os.name == 'nt':
+        path = os.path.join('U:\\CVA_JSON', rundate)
+        path_transform = {
+            '\\\\ICMJHBMVDROPPRD\\AdaptiveAnalytics\\Inbound\\MarketData':
+                '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData'}
+    else:
+        path = os.path.join('/media/vretiel/3EFA4BCDFA4B7FDF/Media/Data/crstal/CVA_JSON', rundate)
+        path_transform = {
+            '//ICMJHBMVDROPPRD/AdaptiveAnalytics/Inbound/MarketData':
+                '/media/vretiel/3EFA4BCDFA4B7FDF/Media/Data/crstal/CVA_JSON'}
+
+    cx = rf.Context(
+        path_transform=path_transform,
+        file_transform={
+            'CVAMarketData_Calibrated.dat': 'CVAMarketData_Calibrated_New.json',
+            'MarketData.dat': 'MarketData.json'
+        })
+    cx.load_json(os.path.join(path, 'InputAAJ_CrB_BNP_Paribas__Paris__ISDA.json'))
+    cp = CalculationPage(cx)

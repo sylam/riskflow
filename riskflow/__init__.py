@@ -19,7 +19,7 @@
 __author__ = "Shuaib Osman"
 __license__ = "Free for non-commercial use"
 __all__ = ['version_info', '__version__', '__author__', '__license__', 'Context', 'makeflatcurve', 'getpath',
-           'set_collateral', 'load_market_data', 'run_baseval', 'run_cmc']
+           'set_collateral', 'load_market_data', 'run_baseval', 'run_cmc', 'update_dict']
 
 import os
 import torch
@@ -159,6 +159,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     time_grid = str(calc_params['Base_Time_Grid'])
+
     # default is 10240 simulations
     params_mc = {'calc_name': ('cmc',), 'Time_grid': time_grid, 'Run_Date': rundate,
                  'Currency': calc_params['Currency'], 'Simulation_Batches': 5, 'Batch_Size': 2048,

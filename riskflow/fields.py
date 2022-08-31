@@ -81,68 +81,70 @@ mapping = {
     },
 
     'Calculation': {
+
         'fields': {
-            'Run_Date': {'widget': 'DatePicker', 'description': 'Run Date', 'value': default['DatePicker']},
+            'Base_Date': {'widget': 'DatePicker', 'description': 'Base Date', 'value': default['DatePicker']},
+            'Calculate': {'widget': 'Dropdown', 'description': 'Calculate', 'value': 'No', 'values': ['Yes', 'No']},
+            'Counterparty': {'widget': 'Text', 'description': 'Counterparty', 'value': ''},
+            'Bank': {'widget': 'Text', 'description': 'Bank', 'value': ''},
+            'Deflate_Stochastically': {'widget': 'Dropdown', 'description': 'Deflate Stochastically', 'value': 'Yes',
+                                       'values': ['Yes', 'No']},
+            'Stochastic_Hazard_Rates': {'widget': 'Dropdown', 'description': 'Stochastic Hazard Rates', 'value': 'No',
+                                        'values': ['Yes', 'No']},
+            'Gradient': {'widget': 'Dropdown', 'description': 'Gradient', 'value': 'No', 'values': ['Yes', 'No']},
             'Base_time_grid': {'widget': 'Text', 'description': 'Base time grid',
                                'value': '0d 2d 1w(1w) 3m(1m) 2y(3m)'},
-            'Scenario_time_grid': {'widget': 'Text', 'description': 'Scenario time grid',
-                                   'value': '0d 2d 1w(1w) 3m(1m) 2y(3m)'},
+            'Dynamic_Scenario_Dates': {'widget': 'Dropdown', 'description': 'Dynamic Scenario Dates',
+                                       'value': 'No', 'values': ['Yes', 'No']},
             'Currency': {'widget': 'Text', 'description': 'Currency', 'value': 'ZAR'},
-            'Number_Simulations': {'widget': 'Integer', 'description': 'Number Simulations', 'value': 5000},
+            'Simulation_Batches': {'widget': 'Integer', 'description': 'Simulation Batches', 'value': 1},
+            'Batch_Size': {'widget': 'Integer', 'description': 'Batch Size', 'value': 1024},
             'Random_Seed': {'widget': 'Integer', 'description': 'Random Seed', 'value': 5120},
             'Calc_Scenarios': {'widget': 'Dropdown', 'description': 'Calc Scenarios', 'value': 'No',
                                'values': ['Yes', 'No']},
-            'PFE_Recon_File': {'widget': 'Text', 'description': 'PFE Recon File', 'value': ''},
-            'Partition': {'widget': 'Dropdown', 'description': 'Partition', 'value': 'None',
-                          'values': ['None', 'Product_Type', 'Reference', 'Custom', 'Hedging']},
-            'Partition_String': {'widget': 'Text', 'description': 'Partition_String', 'value': ''},
-            'ScenarioBatchMemorySize': {'widget': 'Float', 'description': 'ScenarioBatchMemorySize', 'value': 2030.0},
+            'Deflation_Interest_Rate': {'widget': 'Text', 'description': 'Deflation Interest Rate',
+                                        'value': 'ZAR-SWAP'},
+            'Credit_Valuation_Adjustment': {'widget': 'Container', 'description': 'Credit Valuation Adjustment',
+                                            'value': {"Calculate": "No", "Counterparty": "", "Bank": "", "Deflate_Stochastically": "Yes", "Stochastic_Hazard_Rates": "No", "Gradient": "No"},
+                                            'sub_fields': ['Calculate', 'Counterparty', 'Bank',
+                                                           'Deflate_Stochastically', 'Stochastic_Hazard_Rates',
+                                                           'Gradient']},
+            'Collateral_Valuation_Adjustment': {'widget': 'Container', 'description': 'Collateral Valuation Adjustment',
+                                                'value': {"Calculate": "No", "Gradient": "No"},
+                                                'sub_fields': ['Calculate', 'Gradient']},
+
             'Generate_Cashflows': {'widget': 'Dropdown', 'description': 'Generate Cashflows', 'value': 'Yes',
                                    'values': ['Yes', 'No'], 'Output': 'Cashflows'},
-            'Generate_Slideshow': {'widget': 'Dropdown', 'description': 'Generate Slideshow', 'value': 'No',
-                                   'values': ['Yes', 'No'], 'Output': 'Slideshow'},
-            'Slideshow': {'widget': 'HTML', 'description': 'Slideshow', 'value': '', 'isvisible': 'False'},
-
-            'PFE': {
+            'Results': {
                 'widget': 'TreeFlot',
-                'description': 'PFE',
+                'description': 'Results',
                 'value': '[{"text": "All", "state": {"selected": false, "opened": true}, "type": "root", "children": []}]',
-                'type_data': '{"default": {"valid_children": [], "icon": "/static/custom/glyphicons/png/glyphicons_001_leaf.png"}, "group": {"valid_children": ["group", "default"], "icon": "/static/custom/glyphicons/png/glyphicons_009_magic.png"}, "root": {"icon": "/static/custom/glyphicons/png/glyphicons_020_home.png", "valid_children": ["group"]}}',
+                'type_data': '{"default": {"valid_children": [], "icon": "fa fa-file"}, "group": {"valid_children": ["group", "default"], "icon": "fa fa-folder"}, "root": {"icon": "fa fa-folder text-primary", "valid_children": ["group"]}}',
                 'profiles': default['TreeFlot']
             },
+
             'Cashflows': {
                 'widget': 'TreeFlot',
                 'description': 'Cashflows',
                 'value': '[{"text": "All", "state": {"selected": false, "opened": true}, "type": "root", "children": []}]',
-                'type_data': '{"default": {"valid_children": [], "icon": "/static/custom/glyphicons/png/glyphicons_001_leaf.png"}, "group": {"valid_children": ["group", "default"], "icon": "/static/custom/glyphicons/png/glyphicons_009_magic.png"}, "root": {"icon": "/static/custom/glyphicons/png/glyphicons_020_home.png", "valid_children": ["group"]}}',
+                'type_data': '{"default": {"valid_children": [], "icon": "fa fa-file"}, "group": {"valid_children": ["group", "default"], "icon": "fa fa-folder"}, "root": {"icon": "fa fa-folder text-primary", "valid_children": ["group"]}}',
                 'profiles': default['TreeFlot'],
                 'isvisible': 'False'
             },
+
             'MTM': {
                 'widget': 'TreeFlot',
                 'description': 'MTM',
                 'value': '[{"text": "All", "state": {"selected": false, "opened": true}, "type": "root", "children": []}]',
-                'type_data': '{"default": {"valid_children": [], "icon": "/static/custom/glyphicons/png/glyphicons_001_leaf.png"}, "group": {"valid_children": ["group", "default"], "icon": "/static/custom/glyphicons/png/glyphicons_009_magic.png"}, "root": {"icon": "/static/custom/glyphicons/png/glyphicons_020_home.png", "valid_children": ["group"]}}',
+                'type_data': '{"default": {"valid_children": [], "icon": "fa fa-file"}, "group": {"valid_children": ["group", "default"], "icon": "fa fa-folder"}, "root": {"icon": "fa fa-folder text-primary", "valid_children": ["group"]}}',
                 'profiles': default['TreeFlot']
             }
         },
         'types': {
-            'CreditMonteCarlo':
-                {
-                    'input':
-                        ['Run_Date', 'Base_time_grid', 'Scenario_time_grid', 'Currency', 'Number_Simulations',
-                         'Random_Seed', 'Calc_Scenarios', 'Generate_Cashflows', 'Generate_Slideshow', 'Partition',
-                         'Partition_String', 'ScenarioBatchMemorySize', 'PFE_Recon_File'],
-                    'output':
-                        ['PFE', 'Cashflows']
-                },
-            'BaseRevaluation':
-                {
-                    'input':
-                        ['Run_Date', 'Currency'],
-                    'output':
-                        ['MTM']
-                }
+            'CreditMonteCarlo': ['Base_Date', 'Currency', 'Base_time_grid', 'Simulation_Batches',
+                                 'Batch_Size', 'Random_Seed', 'Calc_Scenarios', 'Generate_Cashflows',
+                                 'Credit_Valuation_Adjustment', 'Collateral_Valuation_Adjustment'],
+            'BaseRevaluation': ['Base_Date', 'Currency']
         }
     },
     'System': {
@@ -352,7 +354,7 @@ mapping = {
         "ReferencePrice": [],
         "ReferenceVol": [],
         "HullWhite2FactorModelParameters": [],
-        #"GBMTSImpliedParameters": [],
+        # "GBMTSImpliedParameters": [],
         "GBMAssetPriceTSModelParameters": [],
         "EquityPrice": ["GBMAssetPriceModel"],
         "FxRate": ["GBMAssetPriceModel", "GBMAssetPriceTSModelImplied"],
@@ -367,7 +369,7 @@ mapping = {
         # logical groupings
         'groups': {
             'MarketPrices': (
-            'group', ['InterestRatePrices', 'GBMTSModelPrices', 'HullWhite2FactorInterestRateModelPrices']),
+                'group', ['InterestRatePrices', 'GBMTSModelPrices', 'HullWhite2FactorInterestRateModelPrices']),
             'PointFields': ('default', ['FRADeal', 'SwapInterestDeal', 'DepositDeal']),
         },
 
@@ -465,16 +467,18 @@ mapping = {
         # logical groupings
         'groups': {
             'New Structure': ('group', ['NettingCollateralSet', 'StructuredDeal']),
-            'New Interest Rate Derivative': ('default', ['FixedCashflowDeal', 'CFFixedListDeal', 'CFFixedInterestListDeal',
-                               'CFFloatingInterestListDeal', 'DepositDeal', 'CapDeal', 'FRADeal',
-                               'FloorDeal', 'SwapBasisDeal', 'SwapInterestDeal', 'SwaptionDeal',
-                               'YieldInflationCashflowListDeal']),
-            'New FX Derivative': ('default', ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'SwapCurrencyDeal',
-                               'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption',
-                               'MtMCrossCurrencySwapDeal']),
+            'New Interest Rate Derivative': (
+                'default', ['FixedCashflowDeal', 'CFFixedListDeal', 'CFFixedInterestListDeal',
+                            'CFFloatingInterestListDeal', 'DepositDeal', 'CapDeal', 'FRADeal',
+                            'FloorDeal', 'SwapBasisDeal', 'SwapInterestDeal', 'SwaptionDeal',
+                            'YieldInflationCashflowListDeal']),
+            'New FX Derivative': (
+                'default', ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'SwapCurrencyDeal',
+                            'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption',
+                            'MtMCrossCurrencySwapDeal']),
             'New Energy Derivative': ('default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption']),
             'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal',
-                               'EquityDiscreteExplicitAsianOption']),
+                                                  'EquityDiscreteExplicitAsianOption']),
             'New Credit Derivative': ('default', ['DealDefaultSwap'])
         },
 
@@ -1020,15 +1024,15 @@ mapping = {
                                      'Collateral_Rate', 'Funding_Rate']
                                 },
             'Equity_Collateral': {'widget': 'Table', 'description': 'Equity_Collateral', 'value': 'null',
-                                     'sub_types':
-                                     [{},
-                                      {'type': 'numeric', 'numericFormat': num_format['float']},
-                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
-                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
-                                      {},
-                                      {},
-                                      {'type': 'numeric', 'numericFormat': num_format['int']}
-                                      ],
+                                  'sub_types':
+                                      [{},
+                                       {'type': 'numeric', 'numericFormat': num_format['float']},
+                                       {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                       {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                       {},
+                                       {},
+                                       {'type': 'numeric', 'numericFormat': num_format['int']}
+                                       ],
                                   'obj':
                                       ['Text', 'Float', 'Percent', 'Percent', 'Text', 'Text', 'Integer'],
                                   'col_names':
@@ -1037,20 +1041,20 @@ mapping = {
                                   },
             'Commodity_Collateral': {'widget': 'Table', 'description': 'Commodity Collateral', 'value': 'null',
                                      'sub_types':
-                                     [{},
-                                      {'type': 'numeric', 'numericFormat': num_format['float']},
-                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
-                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
-                                      {},
-                                      {},
-                                      {'type': 'numeric', 'numericFormat': num_format['int']}
-                                      ],
-                                  'obj':
-                                      ['Text', 'Float', 'Percent', 'Percent', 'Text', 'Text', 'Integer'],
-                                  'col_names':
-                                      ['Commodity', 'Units', 'Haircut_Posted', 'Haircut_Received',
-                                       'Collateral_Rate', 'Funding_Rate', 'Liquidation_Period']
-                                  },
+                                         [{},
+                                          {'type': 'numeric', 'numericFormat': num_format['float']},
+                                          {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                          {'type': 'numeric', 'numericFormat': num_format['percent']},
+                                          {},
+                                          {},
+                                          {'type': 'numeric', 'numericFormat': num_format['int']}
+                                          ],
+                                     'obj':
+                                         ['Text', 'Float', 'Percent', 'Percent', 'Text', 'Text', 'Integer'],
+                                     'col_names':
+                                         ['Commodity', 'Units', 'Haircut_Posted', 'Haircut_Received',
+                                          'Collateral_Rate', 'Funding_Rate', 'Liquidation_Period']
+                                     },
             'Underlying_Amount': {'widget': 'Float', 'description': 'Underlying Amount', 'value': 0.0},
             'Pay_Amortisation': {'widget': 'Table', 'description': 'Pay Amortisation',
                                  'value': default['DateList'],
