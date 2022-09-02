@@ -9,7 +9,6 @@ default = {
     'Space': '{"0.0":[[0.0,0.0],[0.0,0.0]]}',
     'DateList': 'null',
     'CreditSupportList': '[[0,1]]',
-    'TreeFlot': '{"":[{"label":"None", "data":[[0.0,0.0]]}]}',
     'DatePicker': ''
 }
 
@@ -25,19 +24,35 @@ mapping = {
     'Calibration': {
         'fields': {
             'MLE_Parameters': {'widget': 'Container', 'description': 'MLE Parameters',
-                               'value': '{"Data_Retrieval_Parameters": "{\\"Start_Date\\":\\"\\", \\"End_Date\\":\\"\\", \\"Length\\":\\"\\", \\"Frequency\\":\\"1d\\", \\"Calendar\\":\\"\\", \\"Business_Days_In_Year\\":252, \\"Diagnostics_Error_Level\\":\\"Info\\", \\"Data_Cleaning_Methods\\":\\"\\", \\"Horizon\\":\\"\\"}", "Min_Tenor":"3M", "Reversion_Speed_Lower_Bound":0.1, "Reversion_Speed_Upper_Bound":4.0, "Yield_Volatility_Upper_Bound":"", "Exact_Solution_Optimisation_Parameters":"{\\"Max_Iterations\\":1000, \\"Fractional_Tolerance\\":0.00000001, \\"Downhill_Simplex_Scale\\":0.005}"}',
+                               'value': {"Data_Retrieval_Parameters":
+                                             {"Start_Date": "", "End_Date": "", "Length": "", "Frequency": "1d",
+                                              "Calendar": "", "Business_Days_In_Year": 252,
+                                              "Diagnostics_Error_Level": "Info", "Data_Cleaning_Methods": "",
+                                              "Horizon": ""},
+                                         "Min_Tenor": "3M", "Reversion_Speed_Lower_Bound": 0.1,
+                                         "Reversion_Speed_Upper_Bound": 4.0, "Yield_Volatility_Upper_Bound": "",
+                                         "Exact_Solution_Optimisation_Parameters": {
+                                             "Max_Iterations": 1000, "Fractional_Tolerance": 0.00000001,
+                                             "Downhill_Simplex_Scale": 0.005}
+                                         },
                                'sub_fields': ['Data_Retrieval_Parameters', 'Min_Tenor', 'Reversion_Speed_Fixed',
                                               'Reversion_Speed_Lower_Bound', 'Reversion_Speed_Upper_Bound',
                                               'Yield_Volatility_Upper_Bound',
-                                              'Exact_Solution_Optimisation_Parameters']},
+                                              'Exact_Solution_Optimisation_Parameters']
+                               },
             'Data_Retrieval_Parameters': {'widget': 'Container', 'description': 'Data Retrieval Parameters',
-                                          'value': '{"Start_Date":"", "End_Date":"", "Length":"", "Frequency":"1d", "Calendar":"", "Business_Days_In_Year":252, "Diagnostics_Error_Level":"Info", "Data_Cleaning_Methods":"", "Horizon":""}',
+                                          'value': {"Start_Date": "", "End_Date": "", "Length": "", "Frequency": "1d",
+                                                    "Calendar": "", "Business_Days_In_Year": 252,
+                                                    "Diagnostics_Error_Level": "Info", "Data_Cleaning_Methods": "",
+                                                    "Horizon": ""},
                                           'sub_fields': ['Start_Date', 'End_Date', 'Length', 'Frequency', 'Calendar',
                                                          'Business_Days_In_Year', 'Diagnostics_Error_Level',
                                                          'Data_Cleaning_Methods', 'Horizon']},
             'Exact_Solution_Optimisation_Parameters': {'widget': 'Container',
                                                        'description': 'Exact Solution Optimisation Parameters',
-                                                       'value': '{"Max_Iterations":1000, "Fractional_Tolerance":0.00000001, "Downhill_Simplex_Scale":0.005}',
+                                                       'value': {'Max_Iterations': 1000,
+                                                                 'Fractional_Tolerance': 0.00000001,
+                                                                 'Downhill_Simplex_Scale': 0.005},
                                                        'sub_fields': ['Max_Iterations', 'Fractional_Tolerance',
                                                                       'Downhill_Simplex_Scale']},
             'Max_Iterations': {'widget': 'Integer', 'description': 'Max Iterations', 'value': 1000},
@@ -105,7 +120,9 @@ mapping = {
             'Deflation_Interest_Rate': {'widget': 'Text', 'description': 'Deflation Interest Rate',
                                         'value': 'ZAR-SWAP'},
             'Credit_Valuation_Adjustment': {'widget': 'Container', 'description': 'Credit Valuation Adjustment',
-                                            'value': {"Calculate": "No", "Counterparty": "", "Bank": "", "Deflate_Stochastically": "Yes", "Stochastic_Hazard_Rates": "No", "Gradient": "No"},
+                                            'value': {"Calculate": "No", "Counterparty": "", "Bank": "",
+                                                      "Deflate_Stochastically": "Yes", "Stochastic_Hazard_Rates": "No",
+                                                      "Gradient": "No"},
                                             'sub_fields': ['Calculate', 'Counterparty', 'Bank',
                                                            'Deflate_Stochastically', 'Stochastic_Hazard_Rates',
                                                            'Gradient']},
@@ -114,31 +131,7 @@ mapping = {
                                                 'sub_fields': ['Calculate', 'Gradient']},
 
             'Generate_Cashflows': {'widget': 'Dropdown', 'description': 'Generate Cashflows', 'value': 'Yes',
-                                   'values': ['Yes', 'No'], 'Output': 'Cashflows'},
-            'Results': {
-                'widget': 'TreeFlot',
-                'description': 'Results',
-                'value': '[{"text": "All", "state": {"selected": false, "opened": true}, "type": "root", "children": []}]',
-                'type_data': '{"default": {"valid_children": [], "icon": "fa fa-file"}, "group": {"valid_children": ["group", "default"], "icon": "fa fa-folder"}, "root": {"icon": "fa fa-folder text-primary", "valid_children": ["group"]}}',
-                'profiles': default['TreeFlot']
-            },
-
-            'Cashflows': {
-                'widget': 'TreeFlot',
-                'description': 'Cashflows',
-                'value': '[{"text": "All", "state": {"selected": false, "opened": true}, "type": "root", "children": []}]',
-                'type_data': '{"default": {"valid_children": [], "icon": "fa fa-file"}, "group": {"valid_children": ["group", "default"], "icon": "fa fa-folder"}, "root": {"icon": "fa fa-folder text-primary", "valid_children": ["group"]}}',
-                'profiles': default['TreeFlot'],
-                'isvisible': 'False'
-            },
-
-            'MTM': {
-                'widget': 'TreeFlot',
-                'description': 'MTM',
-                'value': '[{"text": "All", "state": {"selected": false, "opened": true}, "type": "root", "children": []}]',
-                'type_data': '{"default": {"valid_children": [], "icon": "fa fa-file"}, "group": {"valid_children": ["group", "default"], "icon": "fa fa-folder"}, "root": {"icon": "fa fa-folder text-primary", "valid_children": ["group"]}}',
-                'profiles': default['TreeFlot']
-            }
+                                   'values': ['Yes', 'No'], 'Output': 'Cashflows'}
         },
         'types': {
             'CreditMonteCarlo': ['Base_Date', 'Currency', 'Base_time_grid', 'Simulation_Batches',
@@ -403,7 +396,10 @@ mapping = {
         # instrument fields
         'fields': {
             'Generation_Parameters': {'widget': 'Container', 'description': 'Generation Parameters',
-                                      'value': '{"Last_Tenor":"9Y", "Floating_Frequency":"6M", "First_Tenor":"1Y", "Day_Count":"ACT_365", "Last_Maturity":"10Y", "First_Start":"1Y", "Fixed_Frequency":"6M", "Index_Offset":0, "Last_Start":"9Y",  "First_Maturity":"10Y"}',
+                                      'value': {"Last_Tenor": "9Y", "Floating_Frequency": "6M", "First_Tenor": "1Y",
+                                                "Day_Count": "ACT_365", "Last_Maturity": "10Y", "First_Start": "1Y",
+                                                "Fixed_Frequency": "6M", "Index_Offset": 0, "Last_Start": "9Y",
+                                                "First_Maturity": "10Y"},
                                       'sub_fields': ["Last_Tenor", "Floating_Frequency", "First_Tenor", "Day_Count",
                                                      "Last_Maturity", "First_Start", "Fixed_Frequency", "Index_Offset",
                                                      "Last_Start", "First_Maturity"]},
@@ -454,7 +450,8 @@ mapping = {
             'Zero_Rate_Grid': {'widget': 'Text', 'description': 'Zero Rate Grid',
                                'value': '0d 1d 2d 1w 2w 1m 3m 6m 9m 1y 6m1y 2y 6m2y 3y 6m3y 4y 6m4y 5y 6y 7y 8y 9y 10y 15y 20y 25y'},
             'Points': {'widget': 'Container', 'description': 'Points',
-                       'value': '{"Use":"Yes", "Deal":"", "Descriptor":"", "Quote_Type":"ATM", "DealType":"", "Quoted_Market_Value":0.0}',
+                       'value': {"Use": "Yes", "Deal": "", "Descriptor": "", "Quote_Type": "ATM", "DealType": "",
+                                 "Quoted_Market_Value": 0.0},
                        'sub_fields': ['Use', 'Deal', 'Descriptor', 'Quote_Type', 'DealType', 'Quoted_Market_Value']},
             'Quote_Type': {'widget': 'Dropdown', 'description': 'Quote Type', 'value': 'ATM', 'values': ['ATM']},
             'Use': {'widget': 'Dropdown', 'description': 'Use', 'value': 'Yes', 'values': ['Yes', 'No']},
@@ -637,11 +634,11 @@ mapping = {
                                      'Receive_First_Coupon_Date', 'Receive_Amortisation', 'Receive_Payment_Calendars',
                                      'Receive_Timing', 'Receive_Frequency', 'Receive_Calendars',
                                      'Receive_Payment_Offset'],
-            'NettingCollateralSet.Fields': ['Opening_Balance', 'Collateralized', 'Netted', 'Liquidation_Period',
-                                            'Calendars', 'Collateral_Assets', 'Balance_Currency',
-                                            'Credit_Support_Amounts', 'Collateral_Call_Frequency',
-                                            'Apply_Closeout_When_Uncollateralized', 'Agreement_Currency',
-                                            'Settlement_Period', 'Funding_Rate', 'Base_Collateral_Call_Date'],
+            'NettingCollateralSet.Fields': ['Agreement_Currency', 'Apply_Closeout_When_Uncollateralized',
+                                            'Balance_Currency', 'Opening_Balance', 'Base_Collateral_Call_Date',
+                                            'Calendars', 'Collateral_Assets', 'Collateral_Call_Frequency',
+                                            'Collateralized', 'Netted', 'Credit_Support_Amounts',
+                                            'Funding_Rate', 'Liquidation_Period', 'Settlement_Period'],
             'StructuredDeal.Fields': ['Currency', 'Net_Cashflows', 'Net_Cashflows'],
             'SwapBasisDeal.Receive': ['Receive_Timing', 'Receive_Known_Rates', 'Receive_Index_Offset', 'Receive_Margin',
                                       'Receive_Index_Publication_Calendars', 'Receive_Rate_Multiplier',
@@ -1290,27 +1287,31 @@ mapping = {
             'Bank': {'widget': 'Text', 'description': 'Bank', 'value': ''},  # tuple
             'Counterparty': {'widget': 'Text', 'description': 'Counterparty', 'value': ''},  # tuple
             'Credit_Support_Amounts': {'widget': 'Container', 'description': 'Credit Support Amounts',
-                                       'value': '{"Bank":"", "Counterparty":"", "Independent_Amount_Reference":"None", "Independent_Amount":[], "Received_Threshold":[], "Posted_Threshold":[], "Minimum_Received":[], "Minimum_Posted":[]}',
+                                       'value': {"Bank": "", "Counterparty": "", "Independent_Amount_Reference": "None",
+                                                 "Independent_Amount": [], "Received_Threshold": [],
+                                                 "Posted_Threshold": [], "Minimum_Received": [], "Minimum_Posted": []},
                                        'sub_fields': ['Bank', 'Counterparty', 'Independent_Amount_Reference',
                                                       'Independent_Amount', 'Received_Threshold', 'Posted_Threshold',
                                                       'Minimum_Received', 'Minimum_Posted']},
             'Collateral_Assets': {'widget': 'Container', 'description': 'Collateral Assets',
-                                  'value': '{"Cash_Collateral":[], "Bond_Collateral":[], "Equity_Collateral":[], "Commodity_Collateral":[]}',
+                                  'value': {"Cash_Collateral": [], "Bond_Collateral": [], "Equity_Collateral": [],
+                                            "Commodity_Collateral": []},
                                   'sub_fields': ['Cash_Collateral', 'Bond_Collateral', 'Equity_Collateral',
                                                  'Commodity_Collateral']},
             'Float_Cashflows': {'widget': 'Container', 'description': 'Cashflows',
-                                'value': '{"Properties":[], "Compounding_Method":"None", "Averaging_Method":"Average_Interest", "Items":[]}',
+                                'value': {"Properties": [], "Compounding_Method": "None",
+                                          "Averaging_Method": "Average_Interest", "Items": []},
                                 'sub_fields': ['Properties', 'Compounding_Method', 'Averaging_Method', 'FloatItems']},
             'Fixed_Cashflows': {'widget': 'Container', 'description': 'Cashflows',
-                                'value': '{ "Compounding":"No", "Items":[]}',
+                                'value': {"Compounding": "No", "Items": []},
                                 'sub_fields': ['Compounding', 'FixedItems']},
-            'Fixed_Simple_Cashflows': {'widget': 'Container', 'description': 'Cashflows', 'value': '{"Items":[]}',
+            'Fixed_Simple_Cashflows': {'widget': 'Container', 'description': 'Cashflows', 'value': {"Items": []},
                                        'sub_fields': ['FixedSimpleItems']},
-            'Real_Yield_Cashflows': {'widget': 'Container', 'description': 'Cashflows', 'value': '{"Items":[]}',
+            'Real_Yield_Cashflows': {'widget': 'Container', 'description': 'Cashflows', 'value': {"Items": []},
                                      'sub_fields': ['RealYieldItems']},
-            'Energy_Cashflows': {'widget': 'Container', 'description': 'Payments', 'value': '{ "Items":[] }',
+            'Energy_Cashflows': {'widget': 'Container', 'description': 'Payments', 'value': {"Items": []},
                                  'sub_fields': ['EnergyItems']},
-            'Energy_Fixed_Cashflows': {'widget': 'Container', 'description': 'Payments', 'value': '{ "Items":[] }',
+            'Energy_Fixed_Cashflows': {'widget': 'Container', 'description': 'Payments', 'value': {"Items": []},
                                        'sub_fields': ['EnergyFixedItems']},
 
             'Payment_Offset': {'widget': 'Integer', 'description': 'Payment Offset', 'value': 0},

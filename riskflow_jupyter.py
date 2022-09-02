@@ -15,7 +15,7 @@ from IPython.display import display  # Used to display widgets in the notebook
 # riskflow specific stuff
 import riskflow as rf
 # load the widgets
-from riskflow_widgets import Tree, Table, Flot, FlotTree, Three, to_json
+from riskflow_widgets import Tree, Table, Flot, Three, to_json
 
 
 def load_table_from_vol(vol):
@@ -143,7 +143,7 @@ class TreePanel(metaclass=ABCMeta):
                     vol_space = load_table_from_vol(t)
                     return_value = to_json(vol_space)
                 else:
-                    return_value = to_json([{'label': 'None', 'data': [[x, y] for x, y in obj.array]}])
+                    return_value = to_json([{'label': 'Rate', 'data': [[x, y] for x, y in obj.array]}])
             elif isinstance(obj, rf.utils.Percent):
                 return_value = obj.amount
             elif isinstance(obj, rf.utils.Basis):
@@ -261,11 +261,6 @@ class TreePanel(metaclass=ABCMeta):
                 vals.append(element['value'])
             elif element['widget'] == 'Integer':
                 w = widgets.IntText(description=element['description'])
-                vals.append(element['value'])
-            elif element['widget'] == 'TreeFlot':
-                w = FlotTree(description=element['description'])
-                w.type_data = element['type_data']
-                w.profiles = element['profiles']
                 vals.append(element['value'])
             elif element['widget'] == 'HTML':
                 w = widgets.HTML()
@@ -429,9 +424,8 @@ class PortfolioPage(TreePanel):
                     print('FLOAT', obj, field_meta)
                     new_obj = 0.0
                 return new_obj
-            elif obj_type == 'Container':
-                return json.loads(obj)
             else:
+                # default is to just return the object
                 return obj
 
         field_name = field_meta['description'].replace(' ', '_')
@@ -1101,13 +1095,12 @@ class CalculationPage(TreePanel):
             param = {k: v['value'] for k, v in input.items()}
             # send the name of the calc to the calculation engine
             param.update({'calc_name': key, 'Object': calc})
-            print(param)
             # update the parameters for the current calculation
             rf.update_dict(self.config.deals['Calculation'], param)
             # get the output
             calc, output = self.context.run_job()
-            print(self.config.deals['Calculation'])
-
+            stats = output['Stats']
+            res = output['Results']
             if 0:
                 # Disable unneeded fields
                 for k, v in input.items():
@@ -1143,7 +1136,6 @@ class CalculationPage(TreePanel):
             input[1].append('')
 
             frames.append(input)
-            print(frame.keys())
             # now the output
             if frame['output']:
                 output = self.define_input([key, 'Results'], frame['output'])
@@ -1160,7 +1152,7 @@ class CalculationPage(TreePanel):
         def handleEvent(change):
             # update the json representation
             widget_elements[field_name]['value'] = change['new']
-            # we could update the value in the config object if we wanted to save the calculation back
+            # we could update the value in the config object if we wanted to save the calculation back,
             # but we won't
             # self.SetValueFromWidget ( label[0], label[1], widget_elements[field_name], new_value )
 
@@ -1170,7 +1162,7 @@ class CalculationPage(TreePanel):
         key = val[0]
         calc_type = key[:key.find('.')]
         reference = key[key.find('.') + 1:]
-        print (key, calc_type, reference)
+        # print(key, calc_type, reference)
         # load defaults for the new riskfactor
         self.data[key] = {
             'frames': copy.deepcopy(self.calculation_fields.get(calc_type)),

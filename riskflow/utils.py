@@ -816,7 +816,7 @@ def split_tensor(tensor, counts):
     return torch.split(tensor, tuple(counts)) if tensor.shape[0] == counts.sum() else [tensor] * counts.size
 
 
-@torch.jit.script
+# @torch.jit.script
 def calc_hermite_curve(t_a, g, c, curve_t0, curve_t1):
     one_minus_ta = (1.0 - t_a)
     return curve_t0 * one_minus_ta + t_a * (curve_t1 + one_minus_ta * (g + t_a * c))
@@ -1016,7 +1016,7 @@ def hermite_interpolation(tenors, rates):
     return gi, ci
 
 
-@torch.jit.script
+# @torch.jit.script
 def norm_cdf(x):
     return 0.5 * (torch.erfc(x * -0.7071067811865475))
 

@@ -160,14 +160,8 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     time_grid = str(calc_params['Base_Time_Grid'])
 
-    # default is 10240 simulations
-    params_mc = {'calc_name': ('cmc',), 'Time_grid': time_grid, 'Run_Date': rundate,
-                 'Currency': calc_params['Currency'], 'Simulation_Batches': 5, 'Batch_Size': 2048,
-                 'Random_Seed': 8312, 'Calc_Scenarios': 'No', 'Generate_Cashflows': 'No',
-                 'Dynamic_Scenario_Dates': 'No', 'Debug': 'No', 'Tenor_Offset': 0.0,
-                 'Deflation_Interest_Rate': calc_params['Deflation_Interest_Rate']
-                 # 'NoModel':'RiskNeutral',
-                 }
+    params_mc = {'calc_name': ('cmc',), 'Time_grid': time_grid, 'Run_Date': rundate, 'Tenor_Offset': 0.0}
+    params_mc.update(calc_params)
 
     if CVA:
         # defaults
@@ -239,7 +233,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
             calc.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
 
         res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(mtm, 95, axis=1)}, index=dates)
-        out['Results']['profile'] = res
+        out['Results']['exposure_profile'] = res
 
         # check if we have collva
         if 'collva_t' in out['Results']:
@@ -256,7 +250,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
 
 class Context:
     def __init__(self, path_transform={}, file_transform={}):
-        # needed if the json file contains paths to windows files but linux is needed
+        # needed if the json file contains paths to window's files but linux is needed
         self.path_map = path_transform
         # needed if the name of the file referenced needs to be changed (e.g. from .dat to .json)
         self.file_map = file_transform
@@ -267,7 +261,7 @@ class Context:
     def load_json(self, jobfilename, compress=True):
 
         def parse_path(file_path):
-            # file_path is assumed to be a windows path - so we need to check if we're in a posix world
+            # file_path is assumed to be a window's path - so we need to check if we're in a posix world
             if os.name == 'posix':
                 file_path = pathlib.PureWindowsPath(file_path).as_posix()
 
