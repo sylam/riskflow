@@ -292,6 +292,7 @@ class TreePanel(metaclass=ABCMeta):
                 raise Exception('Unknown widget field')
 
             if element['widget'] != 'Container':
+                # print(element, field_name, widget_elements, label)
                 w.observe(self.generate_handler(field_name, widget_elements, label), 'value')
 
             wig.append(w)
@@ -1087,34 +1088,41 @@ class CalculationPage(TreePanel):
 
     def get_results(self, selection, frame, key):
 
+        def get_values(x):
+            return {k: v['value'] if v['widget'] != 'Container' else get_values(
+                v['sub_fields']) for k, v in x.items()}
+
+        def make_float_widgets(x):
+            return {k: {'widget': 'Float', 'description': k.replace('_', ' '), 'value': v} for k, v in x.items()}
+
+        def make_container(label, x):
+            return {label: {'widget': 'Container', 'description': label.replace('_', ' '),
+                             'value': [], 'sub_fields': x}}
+
         def click(widget):
             calc = frame['calc']
             input = frame['frames']
             output = {}
 
-            param = {k: v['value'] for k, v in input.items()}
+            param = get_values(input)
             # send the name of the calc to the calculation engine
             param.update({'calc_name': key, 'Object': calc})
             # update the parameters for the current calculation
             rf.update_dict(self.config.deals['Calculation'], param)
             # get the output
             calc, output = self.context.run_job()
-            stats = output['Stats']
+            stats = make_container('Stats', make_float_widgets(output['Stats']))
             res = output['Results']
-            if 0:
-                # Disable unneeded fields
-                for k, v in input.items():
-                    if v.get('Output'):
-                        output[v['Output']]['isvisible'] = 'True' if v['value'] == 'Yes' else 'False'
 
+            if 0:
                 # Format the results
                 calc.FormatOutput(result, output)
 
-                # flag the gui that we have output
-                frame['output'] = output
+            # flag the gui that we have output
+            frame['output'] = stats
 
-                # trigger redraw
-                self._on_selected_changed({'new': selection})
+            # trigger redraw
+            self._on_selected_changed({'new': selection})
 
         return click
 

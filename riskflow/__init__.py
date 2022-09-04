@@ -160,7 +160,8 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     time_grid = str(calc_params['Base_Time_Grid'])
 
-    params_mc = {'calc_name': ('cmc',), 'Time_grid': time_grid, 'Run_Date': rundate, 'Tenor_Offset': 0.0}
+    params_mc = {'calc_name': ('cmc',), 'Time_grid': time_grid, 'Run_Date': rundate,
+                 'Tenor_Offset': 0.0, 'Batch_Size': 1024, 'Simulation_Batches': 1}
     params_mc.update(calc_params)
 
     if CVA:
@@ -170,28 +171,27 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
             'Curve': utils.Curve(
                 [], [[0.0, 0.0], [.5, .01], [1, .02], [3, .07], [5, .15], [10, .35], [20, .71], [30, 1.0]]),
             'Property_Aliases': None}
-        default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No', 'Counterparty': 'DEFAULT'}
+        default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No',
+                       'Counterparty': 'DEFAULT', 'Gradient': 'No', 'Hessian': 'No'}
         cva_sect = context.deals.get('Calculation', {'Credit_Valuation_Adjustment': default_cva}).get(
             'Credit_Valuation_Adjustment', default_cva)
-        cva_sect['Gradient'] = 'No'
-        cva_sect['Hessian'] = 'No'
         params_mc['CVA'] = cva_sect
 
     if FVA:
         default_fva = {'Funding_Interest_Curve': 'ZAR-SWAP.FUNDING',
                        'Risk_Free_Curve': 'ZAR-SWAP.OIS',
-                       'Stochastic_Funding': 'Yes'}
+                       'Stochastic_Funding': 'Yes',
+                       'Gradient': 'No'}
         fva_sect = context.deals.get('Calculation', {'Funding_Valuation_Adjustment': default_fva}).get(
             'Funding_Valuation_Adjustment', default_fva)
-        fva_sect['Gradient'] = 'No'
         params_mc['FVA'] = fva_sect
 
-    if CollVA:
+    if CollVA and 'Collateral_Valuation_Adjustment' in context.deals['Calculation']:
         # setup collva calc
         ns = context.deals['Deals']['Children'][0]['instrument'].field
         # get the agreement currency
         agreement_currency = ns.get('Agreement_Currency', 'ZAR')
-        collva_sect = context.deals['Calculation'].get('Collateral_Valuation_Adjustment')
+        collva_sect = context.deals['Calculation']['Collateral_Valuation_Adjustment']
         # get the funding and collateral rates
         collateral_curve = collva_sect['Collateral_Curve']
         funding_curve = collva_sect['Funding_Curve']
@@ -214,7 +214,6 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
                 'Haircut_Posted': 0.0,
                 'Amount': 1.0}]}
 
-        collva_sect['Gradient'] = 'No'
         params_mc['COLLVA'] = collva_sect
 
     if overrides is not None:

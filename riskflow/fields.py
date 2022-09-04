@@ -101,6 +101,10 @@ mapping = {
             'Base_Date': {'widget': 'DatePicker', 'description': 'Base Date', 'value': default['DatePicker']},
             'Calculate': {'widget': 'Dropdown', 'description': 'Calculate', 'value': 'No', 'values': ['Yes', 'No']},
             'Counterparty': {'widget': 'Text', 'description': 'Counterparty', 'value': ''},
+            'Collateral_Curve': {'widget': 'Text', 'description': 'Collateral Curve', 'value': ''},
+            'Funding_Curve': {'widget': 'Text', 'description': 'Funding Curve', 'value': ''},
+            'Collateral_Spread': {'widget': 'Integer', 'description': 'Collateral Spread', 'value': 0},
+            'Funding_Spread': {'widget': 'Integer', 'description': 'Funding Spread', 'value': 0},
             'Bank': {'widget': 'Text', 'description': 'Bank', 'value': ''},
             'Deflate_Stochastically': {'widget': 'Dropdown', 'description': 'Deflate Stochastically', 'value': 'Yes',
                                        'values': ['Yes', 'No']},
@@ -127,16 +131,20 @@ mapping = {
                                                            'Deflate_Stochastically', 'Stochastic_Hazard_Rates',
                                                            'Gradient']},
             'Collateral_Valuation_Adjustment': {'widget': 'Container', 'description': 'Collateral Valuation Adjustment',
-                                                'value': {"Calculate": "No", "Gradient": "No"},
-                                                'sub_fields': ['Calculate', 'Gradient']},
-
+                                                'value': {"Calculate": "No", "Collateral_Curve": "",
+                                                          "Funding_Curve": "", "Collateral_Spread": 0,
+                                                          "Funding_Spread": 0, "Gradient": "No"},
+                                                'sub_fields': ['Calculate', 'Collateral_Curve',
+                                                               'Funding_Curve', 'Collateral_Spread',
+                                                               'Funding_Spread', 'Gradient']},
             'Generate_Cashflows': {'widget': 'Dropdown', 'description': 'Generate Cashflows', 'value': 'Yes',
                                    'values': ['Yes', 'No'], 'Output': 'Cashflows'}
         },
         'types': {
-            'CreditMonteCarlo': ['Base_Date', 'Currency', 'Base_time_grid', 'Simulation_Batches',
-                                 'Batch_Size', 'Random_Seed', 'Calc_Scenarios', 'Generate_Cashflows',
-                                 'Credit_Valuation_Adjustment', 'Collateral_Valuation_Adjustment'],
+            'CreditMonteCarlo': ['Base_Date', 'Currency', 'Base_time_grid', 'Deflation_Interest_Rate',
+                                 'Simulation_Batches', 'Batch_Size', 'Random_Seed', 'Calc_Scenarios',
+                                 'Generate_Cashflows', 'Credit_Valuation_Adjustment',
+                                 'Collateral_Valuation_Adjustment'],
             'BaseRevaluation': ['Base_Date', 'Currency']
         }
     },
