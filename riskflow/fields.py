@@ -145,7 +145,7 @@ mapping = {
                                  'Simulation_Batches', 'Batch_Size', 'Random_Seed', 'Calc_Scenarios',
                                  'Generate_Cashflows', 'Credit_Valuation_Adjustment',
                                  'Collateral_Valuation_Adjustment'],
-            'BaseRevaluation': ['Base_Date', 'Currency']
+            'BaseValuation': ['Base_Date', 'Currency']
         }
     },
     'System': {
@@ -483,7 +483,7 @@ mapping = {
                             'MtMCrossCurrencySwapDeal']),
             'New Energy Derivative': ('default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption']),
             'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal',
-                                                  'EquityDiscreteExplicitAsianOption']),
+                                                  'EquitySwapletListDeal', 'EquityDiscreteExplicitAsianOption']),
             'New Credit Derivative': ('default', ['DealDefaultSwap'])
         },
 
@@ -539,6 +539,9 @@ mapping = {
                                      'Roll_Direction', 'Units', 'Include_Dividends', 'Buy_Sell', 'Currency',
                                      'Discount_Rate', 'Principal', 'Payoff_Currency', 'Payoff_Type', 'Reset_Calendars',
                                      'Reset_Offset'],
+            'EquitySwapletListDeal.Fields': ['Equity', 'Equity_Currency', 'Currency',
+                                             'Discount_Rate', 'Buy_Sell', 'Payoff_Type', 'Amount_Type',
+                                             'Equity_Cashflows'],
             'EquityForwardDeal.Fields': ['Forward_Price', 'Buy_Sell', 'Payoff_Type', 'Equity_Volatility',
                                          'Maturity_Date', 'Equity', 'Units', 'Currency', 'Discount_Rate',
                                          'Payoff_Currency'],
@@ -684,6 +687,8 @@ mapping = {
                 ['Admin', 'DealDefaultSwap.Fields'],
             'EquitySwapLeg':
                 ['Admin', 'EquitySwapLeg.Fields'],
+            'EquitySwapletListDeal':
+                ['Admin', 'EquitySwapletListDeal.Fields'],
             'EquityForwardDeal':
                 ['Admin', 'EquityForwardDeal.Fields'],
             'EquityOptionDeal':
@@ -745,11 +750,14 @@ mapping = {
             'Sampling_Type': {'widget': 'Text', 'description': 'Sampling Type', 'value': '', 'obj': 'Tuple'},  # tuple
             'FX_Sampling_Type': {'widget': 'Text', 'description': 'FX Sampling Type', 'value': '', 'obj': 'Tuple'},
             # tuple
+            'Equity_Currency': {'widget': 'Text', 'description': 'Equity Currency', 'value': ''},  # tuple
             'Agreement_Currency': {'widget': 'Text', 'description': 'Agreement Currency', 'value': ''},  # tuple
             'Settlement_Currency': {'widget': 'Text', 'description': 'Settlement Currency', 'value': ''},  # tuple
             'Average_FX': {'widget': 'Dropdown', 'description': 'Average FX', 'value': 'No', 'values': ['Yes', 'No']},
             'Include_Dividends': {'widget': 'Dropdown', 'description': 'Include Dividends', 'value': 'Yes',
                                   'values': ['Yes', 'No']},
+            'Amount_Type': {'widget': 'Dropdown', 'description': 'Amount_Type', 'value': 'Principal',
+                                  'values': ['Principal', 'Shares']},
             'Is_Forward_Deal': {'widget': 'Dropdown', 'description': 'Is Forward Deal', 'value': 'No',
                                 'values': ['Yes', 'No']},
             'Principal_Fixed_Variable': {'widget': 'Dropdown', 'description': 'Principal Fixed Variable',
@@ -967,6 +975,30 @@ mapping = {
                     ['Payment_Date', 'Period_Start', 'Period_End', 'Volume', 'Fixed_Basis', 'Price_Multiplier',
                      'Realized_Average_Date', 'Realized_Average', 'FX_Period_Start', 'FX_Period_End',
                      'FX_Realized_Average']
+            },
+            'EquityItems': {
+                'widget': 'Table', 'description': 'Items', 'value': 'null',
+                'sub_types':
+                    [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                     {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                     {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']},
+                     {'type': 'numeric', 'numericFormat': num_format['currency']}
+                     ],
+                'obj':
+                    ['DatePicker', 'DatePicker', 'DatePicker', 'Float', 'Float', 'Float',
+                     'Float', 'Float', 'Float', 'Float', 'Float', 'Float'],
+                'col_names':
+                    ['Start_Date', 'End_Date', 'Payment_Date', 'Amount', 'Start_Multiplier', 'End_Multiplier',
+                     'Dividend_Multiplier', 'Known_Start_Price', 'Known_End_Price', 'Known_Start_FX_Rate',
+                     'Known_End_FX_Rate', 'Quanto_FX_Rate']
             },
             'EnergyFixedItems': {
                 'widget': 'Table', 'description': 'Items', 'value': 'null',
@@ -1310,6 +1342,8 @@ mapping = {
                                 'value': {"Properties": [], "Compounding_Method": "None",
                                           "Averaging_Method": "Average_Interest", "Items": []},
                                 'sub_fields': ['Properties', 'Compounding_Method', 'Averaging_Method', 'FloatItems']},
+            'Equity_Cashflows': {'widget': 'Container', 'description': 'Cashflows',
+                                'value': {"Items": []}, 'sub_fields': ['EquityItems']},
             'Fixed_Cashflows': {'widget': 'Container', 'description': 'Cashflows',
                                 'value': {"Compounding": "No", "Items": []},
                                 'sub_fields': ['Compounding', 'FixedItems']},

@@ -63,7 +63,7 @@ def set_collateral(cfg, Agreement_Currency, Balance_Currency, Opening_Balance, R
     """
     Loads CSA details on the root netting set in the given context
     """
-    cfg.deals['Deals']['Children'][0]['instrument'].field.update(
+    cfg.deals['Deals']['Children'][0]['Instrument'].field.update(
         {'Agreement_Currency': Agreement_Currency, 'Opening_Balance': Opening_Balance,
          'Apply_Closeout_When_Uncollateralized': 'No', 'Collateralized': 'True', 'Settlement_Period': 0.0,
          'Balance_Currency': Balance_Currency, 'Liquidation_Period': Liquidation_Period,
@@ -188,7 +188,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
 
     if CollVA and 'Collateral_Valuation_Adjustment' in context.deals['Calculation']:
         # setup collva calc
-        ns = context.deals['Deals']['Children'][0]['instrument'].field
+        ns = context.deals['Deals']['Children'][0]['Instrument'].field
         # get the agreement currency
         agreement_currency = ns.get('Agreement_Currency', 'ZAR')
         collva_sect = context.deals['Calculation']['Collateral_Valuation_Adjustment']

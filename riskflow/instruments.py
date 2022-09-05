@@ -901,10 +901,9 @@ class NettingCollateralSet(Deal):
             Vte = accum[factor_dep['Te']] * fx_base
 
             if self.options['Exclude_Paid_Today']:
-                mtm_today_adj = (Cf_Rec[factor_dep['Te']] - F.pad(
-                    Cf_Rec[factor_dep['Te'][1:] - 1], [0, 0, 1, 0])) - (
-                                        Cf_Pay[factor_dep['Te']] - F.pad(
-                                    Cf_Pay[factor_dep['Te'][1:] - 1], [0, 0, 1, 0]))
+                mtm_today_adj = (
+                    Cf_Rec[factor_dep['Te']] - F.pad(Cf_Rec[factor_dep['Te'][1:] - 1], [0, 0, 1, 0])) - (
+                    Cf_Pay[factor_dep['Te']] - F.pad(Cf_Pay[factor_dep['Te'][1:] - 1], [0, 0, 1, 0]))
 
                 Vte -= mtm_today_adj
 
@@ -948,9 +947,9 @@ class NettingCollateralSet(Deal):
                 mtm_grid = deal_time[:, utils.TIME_GRID_MTM]
 
                 # calculate collateral valuation adjustment
-                delta_scen_t = np.append(0, np.diff(mtm_grid)).reshape(-1, 1)
-                discount_funding = utils.calc_time_grid_curve_rate(cash_col.Funding_Rate, deal_time, shared)
-                discount_collateral = utils.calc_time_grid_curve_rate(cash_col.Collateral_Rate, deal_time, shared)
+                delta_scen_t = np.diff(mtm_grid).reshape(-1, 1)
+                discount_funding = utils.calc_time_grid_curve_rate(cash_col.Funding_Rate, deal_time[:-1], shared)
+                discount_collateral = utils.calc_time_grid_curve_rate(cash_col.Collateral_Rate, deal_time[:-1], shared)
                 discount_collateral_t0 = utils.calc_time_grid_curve_rate(
                     cash_col.Collateral_Rate, np.zeros((1, 3)), shared)
 
@@ -961,9 +960,9 @@ class NettingCollateralSet(Deal):
 
                 Dc0_T = torch.exp(
                     -torch.squeeze(discount_collateral_t0.gather_weighted_curve(
-                        shared, mtm_grid.reshape(1, -1)), axis=0))
+                        shared, mtm_grid[:-1].reshape(1, -1)), axis=0))
 
-                shared.t_Credit['Funding'] = (shared.t_Credit['Collateral'] * cash_base *
+                shared.t_Credit['Funding'] = (shared.t_Credit['Collateral'][:-1] * cash_base *
                                               Dc_over_f_tT_m1 * Dc0_T) / fx_base[0]
 
             return net_accum
@@ -1009,10 +1008,12 @@ class MtMCrossCurrencySwapDeal(Deal):
 
     def reset(self, calendars):
         super(MtMCrossCurrencySwapDeal, self).reset()
-        self.paydates = generate_dates_backward(self.field['Maturity_Date'], self.field['Effective_Date'],
-                                                self.field.get('Pay_Frequency', pd.DateOffset(months=6)))
-        self.recdates = generate_dates_backward(self.field['Maturity_Date'], self.field['Effective_Date'],
-                                                self.field.get('Receive_Frequency', pd.DateOffset(months=6)))
+        self.paydates = generate_dates_backward(
+            self.field['Maturity_Date'], self.field['Effective_Date'],
+            self.field.get('Pay_Frequency', pd.DateOffset(months=6)))
+        self.recdates = generate_dates_backward(
+            self.field['Maturity_Date'], self.field['Effective_Date'],
+            self.field.get('Receive_Frequency', pd.DateOffset(months=6)))
         self.add_reval_dates(self.paydates, self.field['Pay_Currency'])
         self.add_reval_dates(self.recdates, self.field['Receive_Currency'])
         self.child_map = {}
@@ -2480,6 +2481,86 @@ class EquityOptionDeal(Deal):
                 shared, time_grid, deal_data, self.field['Units'], moneyness, spot, forward) * fx_rep
 
         return mtm
+
+
+class QEDI_CustomAutoCallSwap(Deal):
+    class EquityOptionDeal(Deal):
+        factor_fields = {'Currency': ['FxRate'],
+                         'Equity': ['EquityPrice', 'DividendRate'],
+                         'Discount_Rate': ['DiscountRate'],
+                         'Equity_Volatility': ['EquityPriceVol']}
+
+        documentation = ('FX and Equity', ['An exotic option described [here](Definitions#QEDI-options)'])
+
+        def __init__(self, params, valuation_options):
+            super(QEDI_CustomAutoCallSwap, self).__init__(params, valuation_options)
+            self.path_dependent = self.field['Option_Style'] == 'American'
+
+        def reset(self, calendars):
+            super(QEDI_CustomAutoCallSwap, self).reset()
+            self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
+
+        def add_grid_dates(self, parser, base_date, grid):
+            # we need to monitor the option for potential early exercise
+            if isinstance(grid, str):
+                grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
+                self.reval_dates.update(grid_dates)
+                self.settlement_currencies.setdefault(self.field['Currency'], set()).update(grid_dates)
+            else:
+                for curr, cash_flow in self.settlement_currencies.items():
+                    last_pmt = max(cash_flow)
+                    delta = set([x for x in grid if x < last_pmt])
+                    self.settlement_currencies[curr].update(delta)
+                    self.reval_dates.update(delta)
+
+        def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                              calendars):
+            field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                     'Equity': utils.check_rate_name(self.field['Equity'])}
+            field['Discount_Rate'] = utils.check_rate_name(
+                self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
+            field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
+
+            field_index = {
+                'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                'SettleCurrency': self.field['Currency'],
+                'Discount': get_discount_factor(
+                    field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+                'Equity_Zero': get_equity_zero_rate_factor(
+                    field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                'Dividend_Yield': get_dividend_rate_factor(
+                    field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+                'Volatility': get_equity_price_vol_factor(
+                    field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+                'Strike_Price': self.field['Strike_Price'],
+                'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
+                'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
+                'Option_Style': self.field['Option_Style'],
+                'Expiry': (self.field['Expiry_Date'] - base_date).days
+            }
+
+            return field_index
+
+        def generate(self, shared, time_grid, deal_data):
+            deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+            fx_rep = utils.calc_fx_cross(
+                deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
+
+            spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
+            forward = utils.calc_eq_forward(
+                deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
+                deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
+            moneyness = spot / deal_data.Factor_dep['Strike_Price']
+
+            if deal_data.Factor_dep['Option_Style'] == 'European':
+                mtm = pricing.pv_european_option(
+                    shared, time_grid, deal_data, self.field['Units'], moneyness, forward) * fx_rep
+            else:
+                mtm = pricing.pv_american_option(
+                    shared, time_grid, deal_data, self.field['Units'], moneyness, spot, forward) * fx_rep
+
+            return mtm
 
 
 class EquityBarrierOption(Deal):

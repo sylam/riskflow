@@ -14,8 +14,8 @@ from IPython.display import display  # Used to display widgets in the notebook
 
 # riskflow specific stuff
 import riskflow as rf
-# load the widgets
-from riskflow_widgets import Tree, Table, Flot, Three, to_json
+# load the widgets - might be able to use more native objects instead of unicode text - TODO!
+from riskflow_widgets import FileChooser, Tree, Table, Flot, Three, to_json
 
 
 def load_table_from_vol(vol):
@@ -63,6 +63,19 @@ class DealCache:
     Count = 3
 
 
+# basic logging class
+class MyStream(object):
+    def __init__(self, log_widget):
+        self.widget = log_widget
+        self.widget.value = u''
+
+    def flush(self):
+        pass
+
+    def write(self, record):
+        self.widget.value += record
+
+
 # Code for custom pages go here
 class TreePanel(metaclass=ABCMeta):
     '''
@@ -87,7 +100,7 @@ class TreePanel(metaclass=ABCMeta):
         self.tree.observe(self._on_selected_changed, 'selected')
         self.tree.observe(self._on_created_changed, 'created')
         self.tree.observe(self._on_deleted_changed, 'deleted')
-        self.tree.on_displayed(self._on_displayed)
+        # self.tree.on_displayed(self._on_displayed)
         # default layout for the widgets
         self.default_layout = widgets.Layout(min_height='30px')
 
@@ -242,8 +255,8 @@ class TreePanel(metaclass=ABCMeta):
             if element.get('isvisible') == 'False':
                 continue
             if element['widget'] == 'Dropdown':
-                w = widgets.Dropdown(options=element['values'], description=element['description'],
-                                     layout=dict(width='420px'))
+                w = widgets.Dropdown(
+                    options=element['values'], description=element['description'], layout=dict(width='420px'))
                 vals.append(element['value'])
             elif element['widget'] == 'Text':
                 w = widgets.Text(description=element['description'])
@@ -254,7 +267,9 @@ class TreePanel(metaclass=ABCMeta):
                 w, v = self.define_input([x.replace(' ', '_') for x in new_label], element['sub_fields'])
                 vals.append(v)
             elif element['widget'] == 'Flot':
-                w = Flot(description=element['description'])
+                w = Flot(description=element['description'],
+                         hot_settings=to_json(element.get('hot_settings', {})),
+                         flot_settings=to_json(element.get('flot_settings', {})))
                 vals.append(element['value'])
             elif element['widget'] == 'Three':
                 w = Three(description=element['description'])
@@ -274,8 +289,8 @@ class TreePanel(metaclass=ABCMeta):
                               'minSpareRows': 1,
                               'startRows': 1,
                               'startCols': len(element['col_names']),
-                              'width': 400,
-                              'height': 200
+                              'width': element.get('width', 400),
+                              'height': element.get('height', 200)
                           })
                           )
                 vals.append(element['value'])
@@ -292,7 +307,7 @@ class TreePanel(metaclass=ABCMeta):
                 raise Exception('Unknown widget field')
 
             if element['widget'] != 'Container':
-                # print(element, field_name, widget_elements, label)
+                # add an observer to any non-containter widget
                 w.observe(self.generate_handler(field_name, widget_elements, label), 'value')
 
             wig.append(w)
@@ -354,8 +369,8 @@ class TreePanel(metaclass=ABCMeta):
             self.tree.deleted = ''
             self.tree.observe(self._on_deleted_changed, 'deleted')
 
-    def _on_displayed(self, e):
-        self.tree.value = to_json(self.tree_data)
+    # def _on_displayed(self, e):
+    #     self.tree.value = to_json(self.tree_data)
 
     def show(self):
         display(self.main_container)
@@ -417,7 +432,8 @@ class PortfolioPage(TreePanel):
                 else:
                     raise Exception('Unknown list field type {0}'.format(field_name))
             elif obj_type == 'DatePicker':
-                return pd.Timestamp(obj) if obj else None
+                # check for NaT's (the obj==obj check will fail for NaT)
+                return pd.Timestamp(obj) if obj and obj == obj else None
             elif obj_type == 'Float':
                 try:
                     new_obj = obj if obj == '<undefined>' else float(obj)
@@ -545,7 +561,7 @@ class PortfolioPage(TreePanel):
             plugins=["contextmenu", "sort", "types", "search", "unique"],
             settings=to_json({'contextmenu': context_menu, 'events': ['create', 'delete']}),
             type_data=to_json(type_data),
-            # , value=to_json(self.tree_data)
+            value=to_json(self.tree_data)
         )
 
         # have a placeholder for the selected model (deal)
@@ -719,7 +735,8 @@ class RiskFactorsPage(TreePanel):
         self.tree = Tree(
             plugins=["contextmenu", "sort", "unique", "types", "search", "checkbox"],
             settings=to_json({'contextmenu': context_menu, 'events': ['create', 'delete']}),
-            type_data=to_json(type_data)
+            type_data=to_json(type_data),
+            value=to_json(self.tree_data)
         )
 
     def get_label(self, label):
@@ -1048,7 +1065,7 @@ class CalculationPage(TreePanel):
         )
 
         calculation_to_add = []
-        if self.config.deals['Calculation']:
+        if self.config.deals.get('Calculation'):
             calc_type = self.config.deals['Calculation']['Object']
             ref_name = self.config.deals['Attributes'].get('Reference', 'Unknown')
             key = '{}.{}'.format(calc_type, ref_name)
@@ -1083,7 +1100,8 @@ class CalculationPage(TreePanel):
         self.tree = Tree(
             plugins=["contextmenu", "sort", "unique", "types", "search"],
             settings=to_json({'contextmenu': context_menu, 'events': ['create', 'delete']}),
-            type_data=to_json(type_data)
+            type_data=to_json(type_data),
+            value=to_json(self.tree_data)
         )
 
     def get_results(self, selection, frame, key):
@@ -1097,30 +1115,66 @@ class CalculationPage(TreePanel):
 
         def make_container(label, x):
             return {label: {'widget': 'Container', 'description': label.replace('_', ' '),
-                             'value': [], 'sub_fields': x}}
+                            'value': {k: v['value'] for k, v in x.items()}, 'sub_fields': x}}
+
+        def make_results(results):
+            out = {}
+            for k, v in sorted(results.items(), key=lambda x: x[0][::-1]):
+                if isinstance(v, pd.DataFrame):
+                    # date index
+                    if v.index.dtype.type == np.datetime64:
+                        widget = {'widget': 'Flot', 'description': k.replace('_', ' '),
+                                  'hot_settings': {
+                                      'columns': [{}] +
+                                                 [{"type": "numeric",
+                                                   "numericFormat": {"pattern": "0,0.00"}}] * len(v.columns),
+                                      'manualColumnResize': True
+                                  },
+                                  'flot_settings': {'xaxis': {'mode': "time", 'timeBase': "milliseconds"}},
+                                  'value': to_json(
+                                      [{'label': c, 'data': [[x, y] for x, y in zip(v.index.astype(np.int64) // 1000000,
+                                                                                    v[c].values)]} for c in v.columns])
+                                  }
+                    else:
+                        # multiindex not yet supported
+                        r = v.reset_index().replace({np.nan: None})
+                        widget = {'widget': 'Table', 'description': k.replace('_', ' '),
+                                  'width': 650,
+                                  'height': 300,
+                                  'sub_types': [{"type": "numeric",
+                                                 "numericFormat": {"pattern": "0,0.0000"}}
+                                                if x.type in [np.float32, np.float64] else {} for x in r.dtypes],
+                                  'col_names': r.columns.tolist(),
+                                  'obj': ['Float' if x.type in [np.float32, np.float64] else 'Text' for x in r.dtypes],
+                                  'value': to_json([x[-1].tolist() for x in r.iterrows()])
+                                  }
+
+                elif isinstance(v, float):
+                    widget = {'widget': 'Float', 'description': k.replace('_', ' '), 'value': v}
+                else:
+                    print('output widget for ', k, ' - TODO')
+                    continue
+
+                out[k] = widget
+
+            return out
 
         def click(widget):
             calc = frame['calc']
             input = frame['frames']
-            output = {}
-
             param = get_values(input)
             # send the name of the calc to the calculation engine
             param.update({'calc_name': key, 'Object': calc})
             # update the parameters for the current calculation
             rf.update_dict(self.config.deals['Calculation'], param)
             # get the output
-            calc, output = self.context.run_job()
-            stats = make_container('Stats', make_float_widgets(output['Stats']))
-            res = output['Results']
-
-            if 0:
-                # Format the results
-                calc.FormatOutput(result, output)
-
+            calc, calc_output = self.context.run_job()
+            # all calculations provide stats
+            output = make_container('Stats', make_float_widgets(calc_output['Stats']))
+            # now look at the results and find suitable widgets
+            output.update(make_container('Output', make_results(calc_output['Results'])))
             # flag the gui that we have output
-            frame['output'] = stats
-
+            frame['output'] = output
             # trigger redraw
             self._on_selected_changed({'new': selection})
 
@@ -1180,6 +1234,130 @@ class CalculationPage(TreePanel):
     def delete(self, val):
         if val[0] in self.data:
             del self.data[val[0]]
+
+
+class Workbench(object):
+    '''
+    Main class for the UI
+    Needs to be able to load and save config files/trade files (in JSON)
+    '''
+
+    def __init__(self, path='', path_transform={}, file_transform={}):
+
+        def select_json(chooser):
+            self.context.file_map = {k: v for k, v in self.file_transform.items() if k}
+            self.context.path_map = {k: v for k, v in self.path_transform.items() if k}
+            self.context.load_json(chooser.selected)
+            self.reload()
+            logging.info('{} loaded'.format(chooser.selected))
+
+        def make_new_map(map_type, map_data):
+
+            def make_frame(kv_map):
+
+                def lock_key(kv_map, key):
+                    def handle(change):
+                        kv_map[key.value] = change.new
+
+                    return handle
+
+                w = []
+                for k, v in kv_map.items():
+                    old = widgets.Text(description='{} name (Old)'.format(map_type), value=k)
+                    new = widgets.Text(description='{} name (New)'.format(map_type), value=v)
+                    new.observe(lock_key(kv_map, old), 'value')
+                    w.append(widgets.VBox(children=[old, new],
+                                          layout=widgets.Layout(padding='5px', border='outset', max_width='700px')))
+                return w
+
+            def add_map_button(e):
+                map_data[''] = ''
+                frame.children = make_frame(map_data)
+
+            def del_map_button(e):
+                if map_data:
+                    last = list(map_data.keys())[-1]
+                    del map_data[last]
+                    frame.children = make_frame(map_data)
+
+            add_map = widgets.Button(description='Add new {} map'.format(map_type),
+                                     tooltip='Remaps occurances of the old name with the new one when loading JSON')
+            add_map.on_click(add_map_button)
+
+            del_map = widgets.Button(description='Delete {} map'.format(map_type),
+                                     tooltip='Removes the last mapping occurance')
+            del_map.on_click(del_map_button)
+            frame = widgets.VBox(children=make_frame(map_data))
+            buttons = widgets.HBox(children=[add_map, del_map])
+            return widgets.VBox(children=[frame, buttons])
+
+        self.context = rf.Context()
+        self.path = path
+        self.path_transform = path_transform
+        self.file_transform = file_transform
+
+        # load the file selectors
+
+        self.path_map = make_new_map('Path', self.path_transform)
+        self.file_map = make_new_map('File', self.file_transform)
+        self.json_file = FileChooser(path, title='Load JSON File', filter_pattern='*.json')
+        self.json_file.register_callback(select_json)
+        self.filename = widgets.VBox(children=[self.path_map, self.file_map, self.json_file])
+
+        # the main containers/widgets
+        self.main = None
+        self.log_area = widgets.Textarea()
+
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        self.logstream = MyStream(self.log_area)
+        self.loghandler = logging.StreamHandler(self.logstream)
+        self.loghandler.setFormatter(formatter)
+
+        self.log = logging.getLogger()
+        self.log.handlers = []
+        self.log.setLevel(logging.DEBUG)
+        self.log.addHandler(self.loghandler)
+        # build the UI
+        self.portfolio = PortfolioPage(self.context)
+        self.factors = RiskFactorsPage(self.context)
+        self.calculations = CalculationPage(self.context)
+
+        self.tabs = widgets.Tab(children=[self.filename,
+                                          self.portfolio.main_container,
+                                          self.factors.main_container,
+                                          self.calculations.main_container])
+
+        self.tabs.set_title(0, 'JSON File')
+        self.tabs.set_title(1, 'Portfolio')
+        self.tabs.set_title(2, 'Price Factors')
+        self.tabs.set_title(3, 'Calculations')
+
+        # draw a new one
+        self.main = widgets.VBox()
+        self.main.children = [self.tabs, self.log_area]
+
+        display(self.main)
+
+    def buildFilewidget(self, file_widget, label):
+
+        header = widgets.HTML(value='<h4>{0}:</h4>'.format(label))
+        save_button = widgets.Button(description='Save')
+        filename = widgets.Text(description='Save to filename', value=file_widget.filename)
+        container = widgets.FlexBox(padding='4px', border_width='2px', border_style='outset',
+                                    background_color='#DCE6FA', children=[header, file_widget, filename, save_button])
+
+        return container, save_button, filename
+
+    def reload(self):
+        self.portfolio = PortfolioPage(self.context)
+        self.factors = RiskFactorsPage(self.context)
+        self.calculations = CalculationPage(self.context)
+
+        self.tabs.children = [self.filename, self.portfolio.main_container,
+                              self.factors.main_container, self.calculations.main_container]
+
+    def __del__(self):
+        self.loghandler.close()
 
 
 if __name__ == '__main__':
