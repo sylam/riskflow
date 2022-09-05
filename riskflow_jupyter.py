@@ -218,7 +218,8 @@ class TreePanel(metaclass=ABCMeta):
             elif isinstance(obj, pd.DateOffset):
                 return_value = ''.join(['%d%s' % (v, rf.config.Context.reverse_offset[k]) for k, v in obj.kwds.items()])
             elif isinstance(obj, pd.Timestamp):
-                return_value = obj.strftime('%Y-%m-%d')
+                # leave datepickers unaltered but convert everything else to a string
+                return_value = obj if field_meta['widget'] == 'DatePicker' else obj.strftime('%Y-%m-%d')
             elif obj is None:
                 return_value = default_val
             else:
@@ -247,8 +248,7 @@ class TreePanel(metaclass=ABCMeta):
 
     def define_input(self, label, widget_elements):
         # label this container
-        wig = [widgets.HTML()]
-        vals = [self.get_label(label)]
+        wig = [widgets.HTML(value=self.get_label(label))]
 
         for field_name, element in widget_elements.items():
             # skip this element if it's not visible
@@ -256,30 +256,25 @@ class TreePanel(metaclass=ABCMeta):
                 continue
             if element['widget'] == 'Dropdown':
                 w = widgets.Dropdown(
-                    options=element['values'], description=element['description'], layout=dict(width='420px'))
-                vals.append(element['value'])
+                    options=element['values'], description=element['description'],
+                    layout=dict(width='420px'), value=element['value'])
             elif element['widget'] == 'Text':
-                w = widgets.Text(description=element['description'])
-                vals.append(str(element['value']))
+                w = widgets.Text(description=element['description'], value=str(element['value']))
             elif element['widget'] == 'Container':
                 new_label = label + [
                     element['description']] if isinstance(label, list) else [element['description']]
-                w, v = self.define_input([x.replace(' ', '_') for x in new_label], element['sub_fields'])
-                vals.append(v)
+                w = self.define_input([x.replace(' ', '_') for x in new_label], element['sub_fields'])
             elif element['widget'] == 'Flot':
                 w = Flot(description=element['description'],
                          hot_settings=to_json(element.get('hot_settings', {})),
-                         flot_settings=to_json(element.get('flot_settings', {})))
-                vals.append(element['value'])
+                         flot_settings=to_json(element.get('flot_settings', {})),
+                         value=element['value'])
             elif element['widget'] == 'Three':
-                w = Three(description=element['description'])
-                vals.append(element['value'])
+                w = Three(description=element['description'], value=element['value'])
             elif element['widget'] == 'Integer':
-                w = widgets.IntText(description=element['description'])
-                vals.append(element['value'])
+                w = widgets.IntText(description=element['description'], value=element['value'])
             elif element['widget'] == 'HTML':
-                w = widgets.HTML()
-                vals.append(element['value'])
+                w = widgets.HTML(value=element['value'])
             elif element['widget'] == 'Table':
                 w = Table(description=element['description'],
                           settings=to_json({
@@ -291,18 +286,17 @@ class TreePanel(metaclass=ABCMeta):
                               'startCols': len(element['col_names']),
                               'width': element.get('width', 400),
                               'height': element.get('height', 200)
-                          })
+                          }),
+                          value=element['value']
                           )
-                vals.append(element['value'])
             elif element['widget'] == 'Float':
-                w = widgets.FloatText(description=element['description'])
-                vals.append(element['value'])
+                w = widgets.FloatText(description=element['description'], value=element['value'])
             elif element['widget'] == 'DatePicker':
-                w = widgets.DatePicker(description=element['description'], layout=dict(width='420px'))
-                vals.append(pd.Timestamp(element['value']))
+                w = widgets.DatePicker(description=element['description'],
+                                       value=pd.Timestamp(element['value']), layout=dict(width='420px'))
             elif element['widget'] == 'BoundedFloat':
-                w = widgets.BoundedFloatText(min=element['min'], max=element['max'], description=element['description'])
-                vals.append(element['value'])
+                w = widgets.BoundedFloatText(min=element['min'], max=element['max'],
+                                             description=element['description'], value=element['value'])
             else:
                 raise Exception('Unknown widget field')
 
@@ -312,8 +306,8 @@ class TreePanel(metaclass=ABCMeta):
 
             wig.append(w)
 
-        container = widgets.VBox(children=wig)
-        return container, vals
+        container = widgets.VBox(children=wig, layout=widgets.Layout(padding='5px', border='outset'))
+        return container
 
     @abstractmethod
     def get_label(self, label):
@@ -324,24 +318,7 @@ class TreePanel(metaclass=ABCMeta):
         pass
 
     def _on_selected_changed(self, change):
-
-        def update_frame(frame, values):
-            # set the style
-            frame._dom_classes = ['genericframe']
-            # update the values in the frame
-            for index, child in enumerate(frame.children):
-                # recursively update the frames if needed
-                if isinstance(values[index], list):
-                    update_frame(child, values[index])
-                else:
-                    child.value = values[index]
-
-        frames = self.calc_frames(change['new'])
-
-        # set the value of all widgets in the frame . . .
-        # need to do this last in case all widgets haven't fully rendered in the DOM
-        for container, value in frames:
-            update_frame(container, value)
+        self.right_container.children = self.calc_frames(change['new'])
 
     @abstractmethod
     def create(self, newval):
@@ -368,9 +345,6 @@ class TreePanel(metaclass=ABCMeta):
             self.tree.unobserve(self._on_deleted_changed, 'deleted')
             self.tree.deleted = ''
             self.tree.observe(self._on_deleted_changed, 'deleted')
-
-    # def _on_displayed(self, e):
-    #     self.tree.value = to_json(self.tree_data)
 
     def show(self):
         display(self.main_container)
@@ -570,15 +544,13 @@ class PortfolioPage(TreePanel):
 
     def calc_frames(self, selection):
         key = tuple(selection)
+        frames = []
         frame, self.current_deal, self.current_deal_parent, count = self.data.get(key, [{}, None, None, 0])
 
         # factor_fields
         if frame:
-            frames = []
             # get the object type - this should always be defined
             obj_type = frame['Object']['value']
-            # get the instrument obj
-            # instrument_obj = self.current_deal['Instrument']
 
             for frame_name in rf.fields.mapping['Instrument']['types'][obj_type]:
                 # load the values:
@@ -586,13 +558,7 @@ class PortfolioPage(TreePanel):
                 frame_fields = {k: v for k, v in frame.items() if k in instrument_fields}
                 frames.append(self.define_input((frame_name, key[-1]), frame_fields))
 
-            # only store the container (first component)
-            self.right_container.children = [x[0] for x in frames]
-            return frames
-        else:
-            # load up a set of defaults
-            self.right_container.children = []
-            return []
+        return frames
 
     def create(self, val):
         key = tuple(val)
@@ -886,11 +852,8 @@ class RiskFactorsPage(TreePanel):
                 correlation_matrix[index1, index2] = rho
                 correlation_matrix[index2, index1] = rho
 
-        container = widgets.VBox()
-
         # label this container
-        wig = [widgets.HTML()]
-        vals = ['<h4>Correlation:</h4>']
+        wig = [widgets.HTML(value='<h4>Correlation:</h4>')]
 
         w = Table(description="Matrix",
                   settings=to_json(
@@ -903,19 +866,16 @@ class RiskFactorsPage(TreePanel):
                           'colHeaders': correlation_factors,
                           'width': 700,
                           'height': 300
-                      })
+                      }),
+                  value=to_json(correlation_matrix.tolist())
                   )
 
-        vals.append(to_json(correlation_matrix.tolist()))
         w.observe(generate_handler(
             self.config.params['Correlations'], correlation_factors,
             {x: i for i, x in enumerate(correlation_factors)}), 'value')
         wig.append(w)
 
-        # print correlation_factors, correlation_matrix, col_headers
-
-        container.children = wig
-        return container, vals
+        return widgets.VBox(children=wig)
 
     def model_config_frame(self):
 
@@ -935,11 +895,8 @@ class RiskFactorsPage(TreePanel):
 
             return handleEvent
 
-        container = widgets.VBox()
-
         # label this container
-        wig = [widgets.HTML()]
-        vals = ['<h4>Stochastic Process Mapping:</h4>']
+        wig = [widgets.HTML(value='<h4>Stochastic Process Mapping:</h4>')]
 
         optionmap = {k: v for k, v in rf.fields.mapping['Process_factor_map'].items() if v}
         col_types = [{"type": "dropdown",
@@ -968,65 +925,61 @@ class RiskFactorsPage(TreePanel):
                       'minSpareRows': 1,
                       'width': 700,
                       'height': 300
-                  })
+                  }),
+                  value=to_json(sorted(model_config) if model_config else [[None, None, None]])
                   )
 
-        vals.append(to_json(sorted(model_config) if model_config else [[None, None, None]]))
         w.observe(generate_handler(self.config.params['Model Configuration']), 'value')
         wig.append(w)
 
-        container.children = wig
-        return container, vals
+        return widgets.VBox(children=wig)
 
     def calc_frames(self, selection):
         # riskfactors are only 1 level deep (might want to extend this) - TODO
         frame = None
+        frames = []
+        sps = set()
         if selection:
             key = selection[0]
             frame = self.data.get(key, {})
-        frames = []
-        sps = set()
+            if frame:
+                # get the name
+                factor_name = rf.utils.check_rate_name(key)
+                factor = rf.utils.Factor(factor_name[0], factor_name[1:])
+                # load the values:
+                for frame_name, frame_value in sorted(frame.items()):
+                    if frame_name == 'Process':
+                        stoch_proc = self.config.params['Model Configuration'].search(
+                            factor, self.config.params['Price Factors'].get(key, {}))
+                        if stoch_proc:
+                            full_name = rf.utils.Factor(stoch_proc, factor.name)
+                            sps.add(full_name)
+                            frames.append(
+                                self.define_input(
+                                    (frame_name, rf.utils.check_tuple_name(full_name)), frame_value[stoch_proc])
+                            )
+                        else:
+                            frames.append(self.define_input((frame_name, ''), {}))
+                    elif frame_name == 'Factor':
+                        frames.append(self.define_input((frame_name, rf.utils.check_tuple_name(factor)), frame_value))
 
-        if frame:
-            # get the name
-            factor_name = rf.utils.check_rate_name(key)
-            factor = rf.utils.Factor(factor_name[0], factor_name[1:])
-            # load the values:
-            for frame_name, frame_value in sorted(frame.items()):
-                if frame_name == 'Process':
-                    stoch_proc = self.config.params['Model Configuration'].search(
-                        factor, self.config.params['Price Factors'].get(key, {}))
-                    if stoch_proc:
-                        full_name = rf.utils.Factor(stoch_proc, factor.name)
-                        sps.add(full_name)
-                        frames.append(
-                            self.define_input(
-                                (frame_name, rf.utils.check_tuple_name(full_name)), frame_value[stoch_proc])
-                        )
-                    else:
-                        frames.append(self.define_input((frame_name, ''), {}))
-                elif frame_name == 'Factor':
-                    frames.append(self.define_input((frame_name, rf.utils.check_tuple_name(factor)), frame_value))
-
-            # need to add a frame for correlations
-            if self.tree.checked:
-                for selected in self.tree.checked:
-                    factor_name = rf.utils.check_rate_name(selected)
-                    factor = rf.utils.Factor(factor_name[0], factor_name[1:])
-                    stoch_proc = self.config.params['Model Configuration'].search(factor, self.config.params[
-                        'Price Factors'].get(selected, {}))
-                    if stoch_proc:
-                        full_name = rf.utils.Factor(stoch_proc, factor.name)
-                        sps.add(full_name)
-                if len(sps) > 1:
-                    frames.append(self.correlation_frame(sorted(sps)))
+                # need to add a frame for correlations
+                if self.tree.checked:
+                    for selected in self.tree.checked:
+                        factor_name = rf.utils.check_rate_name(selected)
+                        factor = rf.utils.Factor(factor_name[0], factor_name[1:])
+                        stoch_proc = self.config.params['Model Configuration'].search(factor, self.config.params[
+                            'Price Factors'].get(selected, {}))
+                        if stoch_proc:
+                            full_name = rf.utils.Factor(stoch_proc, factor.name)
+                            sps.add(full_name)
+                    if len(sps) > 1:
+                        frames.append(self.correlation_frame(sorted(sps)))
 
         # show the system config screen if there are no factors selected
         if not frame:
             frames.append(self.define_input(('Config', ''), self.sys_config))
             frames.append(self.model_config_frame())
-
-        self.right_container.children = [x[0] for x in frames]
 
         return frames
 
@@ -1053,7 +1006,6 @@ class CalculationPage(TreePanel):
                     load_items(config[field_name], property_name, {property_name: value['sub_fields']},
                                value['sub_fields'])
                 value['value'] = self.get_value_for_widget(config, field_name, value)
-
                 storage[property_name] = value
 
         self.data = {}
@@ -1181,34 +1133,27 @@ class CalculationPage(TreePanel):
         return click
 
     def calc_frames(self, selection):
-        frame = None
+        frames = []
         if selection:
             key = selection[0]
             frame = self.data.get(key, {})
 
-        if frame:
-            frames = []
-            input = self.define_input(key.split('.'), frame['frames'])
+            if frame:
+                input = self.define_input(key.split('.'), frame['frames'])
+                print(frame['frames'])
+                # add the calc button
+                execute_button = widgets.Button(description='Execute', tooltip='Run the Calculation')
+                execute_button.on_click(self.get_results(selection, frame, key))
 
-            # add the calc button
-            execute_button = widgets.Button(description='Execute')
-            execute_button.on_click(self.get_results(selection, frame, key))
+                input.children = input.children + (execute_button,)
 
-            input[0].children = input[0].children + (execute_button,)
-            input[1].append('')
+                frames.append(input)
+                # now the output
+                if frame['output']:
+                    output = self.define_input([key, 'Results'], frame['output'])
+                    frames.append(output)
 
-            frames.append(input)
-            # now the output
-            if frame['output']:
-                output = self.define_input([key, 'Results'], frame['output'])
-                frames.append(output)
-
-            self.right_container.children = [x[0] for x in frames]
-            return frames
-        else:
-            # load up a set of defaults
-            self.right_container.children = []
-            return []
+        return frames
 
     def generate_handler(self, field_name, widget_elements, label):
         def handleEvent(change):
@@ -1337,16 +1282,6 @@ class Workbench(object):
         self.main.children = [self.tabs, self.log_area]
 
         display(self.main)
-
-    def buildFilewidget(self, file_widget, label):
-
-        header = widgets.HTML(value='<h4>{0}:</h4>'.format(label))
-        save_button = widgets.Button(description='Save')
-        filename = widgets.Text(description='Save to filename', value=file_widget.filename)
-        container = widgets.FlexBox(padding='4px', border_width='2px', border_style='outset',
-                                    background_color='#DCE6FA', children=[header, file_widget, filename, save_button])
-
-        return container, save_button, filename
 
     def reload(self):
         self.portfolio = PortfolioPage(self.context)
