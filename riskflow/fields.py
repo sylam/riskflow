@@ -178,6 +178,8 @@ mapping = {
                 ["Value", "Property_Aliases"],
             "CommodityPrice":
                 ["Spot", "Currency", "Interest_Rate", "Property_Aliases"],
+            "CommodityPriceVol":
+                ["Currency", "Surface", "Property_Aliases"],
             "ConvenienceYield":
                 ["Curve", "Currency", "Property_Aliases"],
             "EquityPriceVol":
@@ -343,6 +345,7 @@ mapping = {
     'Process_factor_map': {
         "Correlation": [],
         "CommodityPrice": [],
+        "CommodityPriceVol": [],
         "ConvenienceYield": [],
         "EquityPriceVol": [],
         "InterestYieldVol": [],

@@ -1140,7 +1140,6 @@ class CalculationPage(TreePanel):
 
             if frame:
                 input = self.define_input(key.split('.'), frame['frames'])
-                print(frame['frames'])
                 # add the calc button
                 execute_button = widgets.Button(description='Execute', tooltip='Run the Calculation')
                 execute_button.on_click(self.get_results(selection, frame, key))
@@ -1194,6 +1193,8 @@ class Workbench(object):
             self.context.path_map = {k: v for k, v in self.path_transform.items() if k}
             self.context.load_json(chooser.selected)
             self.reload()
+            # select the portfolio index
+            self.tabs.selected_index = 1
             logging.info('{} loaded'.format(chooser.selected))
 
         def make_new_map(map_type, map_data):
@@ -1314,5 +1315,7 @@ if __name__ == '__main__':
             'CVAMarketData_Calibrated.dat': 'CVAMarketData_Calibrated_New.json',
             'MarketData.dat': 'MarketData.json'
         })
-    cx.load_json(os.path.join(path, 'InputAAJ_CrB_BNP_Paribas__Paris__ISDA.json'))
-    cp = CalculationPage(cx)
+    cx.load_json(os.path.join(path, 'InputAAJ_CrB_JPMorgan_Chase_NYK_ISDA.json'))
+    # cx.load_json(os.path.join(path, 'InputAAJ_CrB_BNP_Paribas__Paris__ISDA.json'))
+    # cp = CalculationPage(cx)
+    rp = RiskFactorsPage(cx)

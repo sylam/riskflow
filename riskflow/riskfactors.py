@@ -840,6 +840,16 @@ class PCAMixedFactorModelParameters(Factor1D):
                             ('Yield_Volatility', self.param['Yield_Volatility'].array[:, 1])])
 
 
+class CommodityPriceVol(Factor2D):
+    field_desc = ('Commodities',
+                  ['- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat',
+                   'extrapolated and linearly interpolated. All Floats.'
+                   ])
+
+    def __init__(self, param):
+        super(CommodityPriceVol, self).__init__(param)
+
+
 class FXVol(Factor2D):
     field_desc = ('FX and Equity',
                   ['- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat',

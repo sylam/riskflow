@@ -173,7 +173,7 @@ Collateral = namedtuple('Collateral', 'Haircut Amount Currency Funding_Rate Coll
 # define 1, 2 and 3d risk factors - add more as development proceeds
 DimensionLessFactors = ['DiscountRate', 'ReferenceVol', 'Correlation']
 OneDimensionalFactors = ['InterestRate', 'InflationRate', 'DividendRate', 'SurvivalProb', 'ForwardPrice']
-TwoDimensionalFactors = ['FXVol', 'EquityPriceVol']
+TwoDimensionalFactors = ['FXVol', 'EquityPriceVol', 'CommodityPriceVol']
 ThreeDimensionalFactors = ['InterestRateVol', 'InterestYieldVol', 'ForwardPriceVol']
 ImpliedFactors = ['HullWhite2FactorModelParameters', 'GBMAssetPriceTSModelParameters', 'PCAMixedFactorModelParameters']
 
