@@ -275,7 +275,7 @@ class Calculation(object):
         partitioning = False
         for node in deals:
             # get the instrument
-            instrument = node['instrument']
+            instrument = node['Instrument']
             # should we skip it?
             if node.get('Ignore') == 'True':
                 continue
@@ -863,7 +863,8 @@ class Credit_Monte_Carlo(Calculation):
         # reset the tensors - used for storing simulation data
         tensors = {}
         # record how long it took to run the calc (python + pytorch)
-        self.calc_stats['Tensor_Execution_Time'] = time.monotonic()
+        execution_label = 'Tensor_Execution_Time ({})'.format(self.device.type)
+        self.calc_stats[execution_label] = time.monotonic()
 
         for run in range(self.params['Simulation_Batches']):
             start_run = time.monotonic()
@@ -1051,7 +1052,7 @@ class Credit_Monte_Carlo(Calculation):
                     output.setdefault('scenarios', {}).setdefault(key, []).append(
                         shared_mem.t_Scenario_Buffer[self.stoch_ofs[key]].cpu().detach().numpy())
 
-        self.calc_stats['Tensor_Execution_Time'] = time.monotonic() - self.calc_stats['Tensor_Execution_Time']
+        self.calc_stats[execution_label] = time.monotonic() - self.calc_stats[execution_label]
 
         # store the results
         results = {'Netting': self.netting_sets, 'Stats': self.calc_stats, 'Jacobians': self.jacobians}

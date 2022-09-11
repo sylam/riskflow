@@ -416,7 +416,7 @@ class Context(object):
     def calculate_dependencies(self, options, base_date, base_MTM_dates, calc_dates=True):
         """
         Works out the risk factors (and risk models) in the given set of deals.
-        These factors are cross referenced in the marketdata file and matched by
+        These factors are cross-referenced in the marketdata file and matched by
         name. This can be extended as needed.
 
         Returns the dependant factors, the stochastic models, the full list of
@@ -492,7 +492,7 @@ class Context(object):
 
             for node in deals:
                 # get the instrument
-                instrument = node['instrument']
+                instrument = node['Instrument']
 
                 if node.get('Ignore') == 'True':
                     continue
@@ -524,7 +524,7 @@ class Context(object):
                     if calc_dates:
                         instrument.finalize_dates(self.parse_grid, base_date, base_MTM_dates, None, resets,
                                                   settlement_currencies)
-                    # get it's price factors
+                    # get its price factors
                     get_price_factors(price_factors, factor_tenors, instrument)
 
             return children, resets, settlement_currencies
