@@ -34,6 +34,7 @@ factor_interp_map = {
     'HermiteRTInterpolationCurveGetValue': 'HermiteRT'
 }
 
+
 class Factor0D(object):
     """Represents an instantaneous Rate (0D) risk factor"""
 
@@ -119,7 +120,7 @@ class Factor1D(object):
             m = np.clip((tenors - self.tenors[index]) / dt, 0.0, 1.0)
             g, c = self.interpolation[1:]
             rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' else (
-            bumped_val, 1.0)
+                bumped_val, 1.0)
             val = rate[index] * (1.0 - m) + m * rate[index_next] + m * (
                     1.0 - m) * g[index] + m * m * (1.0 - m) * c[index]
             return val / denom
@@ -892,6 +893,11 @@ class InterestYieldVol(Factor3D):
         prem = self.premiums[(self.premiums['UnderlyingTenor'] == tenor) &
                              (self.premiums['Expiry'] == expiry)]['Payer']
         return prem.values[0] / 10000.0
+
+    def get_strike_from_premiums(self, expiry, tenor):
+        strike = self.premiums[(self.premiums['UnderlyingTenor'] == tenor) &
+                               (self.premiums['Expiry'] == expiry)]['StrikeValue']
+        return strike.values[0] / 100.0
 
     @property
     def BlackScholesDisplacedShiftValue(self):

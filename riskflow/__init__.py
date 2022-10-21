@@ -189,30 +189,35 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
     if CollVA and 'Collateral_Valuation_Adjustment' in context.deals['Calculation']:
         # setup collva calc
         ns = context.deals['Deals']['Children'][0]['Instrument'].field
-        # get the agreement currency
-        agreement_currency = ns.get('Agreement_Currency', 'ZAR')
         collva_sect = context.deals['Calculation']['Collateral_Valuation_Adjustment']
-        # get the funding and collateral rates
-        collateral_curve = collva_sect['Collateral_Curve']
-        funding_curve = collva_sect['Funding_Curve']
-
-        if collva_sect['Collateral_Spread']:
-            collateral_curve = '{}.COLLATERAL'.format(collateral_curve)
-            context.params['Price Factors']['InterestRate.{}'.format(collateral_curve)] = makeflatcurve(
-                agreement_currency, collva_sect['Collateral_Spread'])
-
-        if collva_sect['Funding_Spread']:
-            funding_curve = '{}.FUNDING'.format(funding_curve)
-            context.params['Price Factors']['InterestRate.{}'.format(funding_curve)] = makeflatcurve(
-                agreement_currency, collva_sect['Funding_Spread'])
-
-        ns['Collateral_Assets'] = {
-            'Cash_Collateral': [{
-                'Currency': agreement_currency,
-                'Collateral_Rate': collateral_curve,
-                'Funding_Rate': funding_curve,
-                'Haircut_Posted': 0.0,
-                'Amount': 1.0}]}
+        # get the agreement currency        
+        calc_currency = ns.get('Balance_Currency', 'ZAR')
+                            
+        if 'Cash_Collateral' not in ns.get('Collateral_Assets', {}):
+            # get the funding and collateral rates
+            collateral_curve = collva_sect['Collateral_Curve']
+            funding_curve = collva_sect['Funding_Curve']
+            
+            if collva_sect['Collateral_Spread']:
+                collateral_curve = '{}.COLLATERAL'.format(collateral_curve)
+                context.params['Price Factors']['InterestRate.{}'.format(collateral_curve)] = makeflatcurve(
+                    calc_currency, collva_sect['Collateral_Spread'])
+    
+            if collva_sect['Funding_Spread']:
+                funding_curve = '{}.FUNDING'.format(funding_curve)
+                context.params['Price Factors']['InterestRate.{}'.format(funding_curve)] = makeflatcurve(
+                    calc_currency, collva_sect['Funding_Spread'])
+    
+            ns['Collateral_Assets'] = {
+                'Cash_Collateral': [{
+                    'Currency': calc_currency,
+                    'Collateral_Rate': collateral_curve,
+                    'Funding_Rate': funding_curve,
+                    'Haircut_Posted': 0.0,
+                    'Amount': 1.0}]}
+        elif len(ns['Collateral_Assets']['Cash_Collateral'])>1:
+            #make sure we just take the first definition
+            ns['Collateral_Assets']['Cash_Collateral']=[ns['Collateral_Assets']['Cash_Collateral'][0]]
 
         params_mc['COLLVA'] = collva_sect
 

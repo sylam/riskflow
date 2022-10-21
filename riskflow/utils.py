@@ -2218,6 +2218,24 @@ def make_sampling_data(reference_date, time_grid, samples):
     return TensorResets(all_resets, reset_scenario_offsets)
 
 
+def make_fixing_data(reference_date, time_grid, fixings):
+    all_resets = []
+    reset_scenario_offsets = []
+
+    for fixing in sorted(fixings):
+        Reset_Day = (fixing[0] - reference_date).days
+        Start_Day = Reset_Day
+        End_Day = Reset_Day
+        Time_Grid, Scenario = time_grid.get_scenario_offset(Reset_Day)
+        # only add a reset if its in the past
+        all_resets.append(
+            [Time_Grid, Reset_Day, -1, Start_Day, End_Day, 1.0,
+             fixing[2] if fixing[0] < reference_date else 0.0, 0.0])
+        reset_scenario_offsets.append(Scenario)
+
+    return TensorResets(all_resets, reset_scenario_offsets)
+
+
 def make_simple_fixed_cashflows(reference_date, position, cashflows):
     """
     Generates a vector of fixed cashflows from a data source only looking at the actual fixed value.

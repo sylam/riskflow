@@ -205,9 +205,25 @@ class TreePanel(metaclass=ABCMeta):
                     return_value = to_json(data)
                 elif field_name in ['Description', 'Tags']:
                     return_value = to_json(obj)
+                elif field_name == 'TARF_ExpiryDates':
+                    headings = ['Date', 'Settle', 'Value']
+                    widgets = ['DatePicker', 'DatePicker', 'Float']
+                    data = []
+                    for flow in obj:
+                        data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
+                                     field, item, widget_type in zip(headings, flow, widgets)])
+                    return_value = to_json(data)
                 elif field_name == 'Sampling_Data':
                     headings = ['Date', 'Price', 'Weight']
                     widgets = ['DatePicker', 'Float', 'Float']
+                    data = []
+                    for flow in obj:
+                        data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
+                                     field, item, widget_type in zip(headings, flow, widgets)])
+                    return_value = to_json(data)
+                elif field_name in ['Price_Fixing', 'Autocall_Thresholds', 'Autocall_Coupons', 'Barrier_date']:
+                    headings = ['Date', 'Value']
+                    widgets = ['DatePicker', 'Float']
                     data = []
                     for flow in obj:
                         data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for

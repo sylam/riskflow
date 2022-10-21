@@ -483,9 +483,9 @@ mapping = {
             'New FX Derivative': (
                 'default', ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'SwapCurrencyDeal',
                             'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption',
-                            'MtMCrossCurrencySwapDeal']),
+                            'MtMCrossCurrencySwapDeal', 'FXTARFOptionDeal']),
             'New Energy Derivative': ('default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption']),
-            'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal',
+            'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal', 'QEDI_CustomAutoCallSwap',
                                                   'EquitySwapletListDeal', 'EquityDiscreteExplicitAsianOption']),
             'New Credit Derivative': ('default', ['DealDefaultSwap'])
         },
@@ -535,6 +535,10 @@ mapping = {
                                          'Receive_Index_Calendars', 'Receive_Discount_Rate',
                                          'Receive_Payment_Calendars', 'Receive_Reset_Type', 'Receive_Rate_Constant',
                                          'Receive_Fixed_Rate', 'Receive_Payment_Offset'],
+            'QEDI_CustomAutoCallSwap.Fields': ['Currency', 'Discount_Rate', 'Buy_Sell', 'Expiry_Date', 'Units', 'Option_Type',
+										'Strike_Price', 'Option_On_Forward', 'Settlement_Style', 'Option_Style', 'Payoff_Currency',
+										'Payoff_Type', 'Equity', 'Equity_Volatility', 'Barrier', 'Price_Fixing', 'Autocall_Thresholds',
+                                        'Autocall_Coupons', 'Barrier_date'],
             'EquitySwapLeg.Fields': ['Accrual_Calendars', 'Adjustment_Method', 'Dividend_Timing', 'Equity',
                                      'Equity_Volatility', 'Equity_Known_Prices', 'Effective_Date', 'First_Coupon_Date',
                                      'Known_Dividends', 'Maturity_Date', 'Payment_Calendars', 'Payment_Frequency',
@@ -564,6 +568,12 @@ mapping = {
                                  'Index_Publication_Calendars', 'Payment_Interval', 'Reset_Frequency', 'Amortisation',
                                  'Discount_Rate_Volatility', 'Currency', 'Forecast_Rate_Volatility', 'Index_Offset',
                                  'Principal'],
+            'FXTARFOptionDeal.Fields': ['Currency', 'Underlying_Currency', 'Discount_Rate', 'Buy_Sell', 'Expiry_Date',
+                                      'Underlying_Amount', 'Option_Type', 'Strike_Price', 'Option_On_Forward', 'Settlement_Style',
+                                      'Option_Style', 'FX_Volatility', 'Barrier2Condition', 'Barrier2Memory', 'BarrierCondition', 
+                                      'BarrierMemory', 'InvertedTarget', 'LeverageNotional', 'PivotRate', 'PivotRateStrike', 
+                                      'SettleInCurr2', 'Strike2', 'Strike2Settle', 'StrikeSettle', 'TargetAdjustment', 'TargetLevel',
+                                      'TARF_ExpiryDates'],
             'FXOptionDeal.Fields': ['Underlying_Amount', 'Settlement_Style', 'Strike_Price', 'Underlying_Currency',
                                     'Buy_Sell', 'Option_Type', 'Option_Style', 'Expiry_Date', 'FX_Volatility',
                                     'Forward_Price_Date', 'Discount_Rate', 'Option_On_Forward', 'Currency'],
@@ -708,6 +718,8 @@ mapping = {
                 ['Admin', 'FRADeal.Fields'],
             'FXForwardDeal':
                 ['Admin', 'FXForwardDeal.Fields'],
+            'FXTARFOptionDeal':
+                ['Admin', 'FXTARFOptionDeal.Fields'],
             'FXNonDeliverableForward':
                 ['Admin', 'FXNonDeliverableForward.Fields'],
             'FXOptionDeal':
@@ -727,17 +739,85 @@ mapping = {
             'SwapInterestDeal':
                 ['Admin', 'SwapInterestDeal.Fields', 'SwapInterestDeal.Pay', 'SwapInterestDeal.Receive'],
             'SwaptionDeal':
-                ['Admin', 'SwaptionDeal.Fields', 'SwaptionDeal.Pay', 'SwaptionDeal.Receive']
+                ['Admin', 'SwaptionDeal.Fields', 'SwaptionDeal.Pay', 'SwaptionDeal.Receive'],
+            'QEDI_CustomAutoCallSwap':
+                ['Admin', 'QEDI_CustomAutoCallSwap.Fields']
         },
 
         # instrument fields
         'fields': {
+            'Price_Fixing': {'widget': 'Table', 'description': 'Price Fixing', 'value': 'null',
+                            'sub_types':
+                                [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                                 {'type': 'numeric', 'numericFormat': num_format['currency']}
+                                 ],
+                            'obj':
+                                'DateEqualList',
+                            'col_names':
+                                ['Date', 'Value']
+                            },
+            'Autocall_Thresholds': {'widget': 'Table', 'description': 'Autocall Thresholds', 'value': 'null',
+                            'sub_types':
+                                [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                                 {'type': 'numeric', 'numericFormat': num_format['currency']}
+                                 ],
+                            'obj':
+                                'DateEqualList',
+                            'col_names':
+                                ['Date', 'Value']
+                            },                            
+            'Autocall_Coupons': {'widget': 'Table', 'description': 'Autocall Coupons', 'value': 'null',
+                            'sub_types':
+                                [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                                 {'type': 'numeric', 'numericFormat': num_format['currency']}
+                                 ],
+                            'obj':
+                                'DateEqualList',
+                            'col_names':
+                                ['Date', 'Value']
+                            },
+            'Barrier_date': {'widget': 'Table', 'description': 'Barrier date', 'value': 'null',
+                            'sub_types':
+                                [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                                 {'type': 'numeric', 'numericFormat': num_format['currency']}
+                                 ],
+                            'obj':
+                                'DateEqualList',
+                            'col_names':
+                                ['Date', 'Value']
+                            },
+            'Barrier2Condition': {'widget': 'Text', 'description': 'Barrier2Condition', 'value': ''},
+            'Barrier2Memory': {'widget': 'Text', 'description': 'Barrier2Memory', 'value': ''},
+            'BarrierCondition': {'widget': 'Text', 'description': 'BarrierCondition', 'value': ''},
+            'BarrierMemory': {'widget': 'Text', 'description': 'BarrierMemory', 'value': ''},
+            'InvertedTarget': {'widget': 'Text', 'description': 'InvertedTarget', 'value': ''},
+            'LeverageNotional': {'widget': 'Float', 'description': 'LeverageNotional', 'value': 0},
+            'PivotRate': {'widget': 'Float', 'description': 'PivotRate', 'value': 0},
+            'PivotRateStrike': {'widget': 'Text', 'description': 'PivotRateStrike', 'value': ''},
+            'SettleInCurr2': {'widget': 'Text', 'description': 'SettleInCurr2', 'value': ''},
+            'Strike2': {'widget': 'Float', 'description': 'Strike2', 'value': 0},
+            'Strike2Settle': {'widget': 'Text', 'description': 'Strike2Settle', 'value': ''},
+            'StrikeSettle': {'widget': 'Text', 'description': 'StrikeSettle', 'value': ''},
+            'TargetAdjustment': {'widget': 'Text', 'description': 'TargetAdjustment', 'value': ''},
+            'TargetLevel': {'widget': 'Float', 'description': 'TargetLevel', 'value': 0},
+            'TARF_ExpiryDates': {'widget': 'Table', 'description': 'TARF ExpiryDates', 'value': 'null',
+                            'sub_types':
+                                [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                                 {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                                 {'type': 'numeric', 'numericFormat': num_format['currency']}
+                                 ],
+                            'obj':
+                                'DateEqualList',
+                            'col_names':
+                                ['Date', 'Date', 'Value']
+                            },                                      
             'Netted': {'widget': 'Dropdown', 'description': 'Netted', 'value': 'True', 'values': ['True', 'False']},
             'Collateralized': {'widget': 'Dropdown', 'description': 'Collateralized', 'value': 'False',
                                'values': ['True', 'False']},
             'Use_Known_Rate': {'widget': 'Dropdown', 'description': 'Use Known Rate', 'value': 'No',
                                'values': ['Yes', 'No']},
             'Known_Rate': {'widget': 'Float', 'description': 'Known Rate', 'value': 0, 'obj': 'Percent'},
+            'Barrier': {'widget': 'Float', 'description': 'Barrier', 'value': 0, 'obj': 'Percent'},
             'Upfront_Date': {'widget': 'DatePicker', 'description': 'Upfront Date',
                              'value': default['DatePicker']},
             'Upfront': {'widget': 'Float', 'description': 'Upfront', 'value': 0, 'obj': 'Percent'},

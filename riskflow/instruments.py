@@ -943,10 +943,11 @@ class NettingCollateralSet(Deal):
 
             if len(factor_dep['Cash_Collateral']) == 1 and factor_dep['Cash_Collateral'][0].Collateral_Rate is not None:
                 cash_col = factor_dep['Cash_Collateral'][0]
-                cash_base = utils.calc_time_grid_spot_rate(cash_col.Currency, deal_time, shared)
+                cash_base = utils.calc_time_grid_spot_rate(cash_col.Currency, deal_time[:-1], shared)
                 mtm_grid = deal_time[:, utils.TIME_GRID_MTM]
 
                 # calculate collateral valuation adjustment
+                # delta_scen_t = np.append(0, np.diff(mtm_grid)).reshape(-1, 1)
                 delta_scen_t = np.diff(mtm_grid).reshape(-1, 1)
                 discount_funding = utils.calc_time_grid_curve_rate(cash_col.Funding_Rate, deal_time[:-1], shared)
                 discount_collateral = utils.calc_time_grid_curve_rate(cash_col.Collateral_Rate, deal_time[:-1], shared)
@@ -1195,8 +1196,10 @@ class FXNonDeliverableForward(Deal):
                 discount,
                 (factor_dep['Maturity'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1), shared),
             axis=1)
-
-        cash = (buy_forward * self.field['Buy_Amount'] - sell_forward * self.field['Sell_Amount'])
+        try:
+            cash = (buy_forward * self.field['Buy_Amount'] - sell_forward * self.field['Sell_Amount'])
+        except:
+            cash = (buy_forward * float(self.field['Buy_Amount']) - sell_forward * float(self.field['Sell_Amount']))
 
         # settle the cash
         pricing.cash_settle(
@@ -2484,83 +2487,79 @@ class EquityOptionDeal(Deal):
 
 
 class QEDI_CustomAutoCallSwap(Deal):
-    class EquityOptionDeal(Deal):
-        factor_fields = {'Currency': ['FxRate'],
-                         'Equity': ['EquityPrice', 'DividendRate'],
-                         'Discount_Rate': ['DiscountRate'],
-                         'Equity_Volatility': ['EquityPriceVol']}
+    factor_fields = {'Currency': ['FxRate'],
+                     'Equity': ['EquityPrice', 'DividendRate'],
+                     'Discount_Rate': ['DiscountRate'],
+                     'Equity_Volatility': ['EquityPriceVol']}
 
-        documentation = ('FX and Equity', ['An exotic option described [here](Definitions#QEDI-options)'])
+    documentation = ('FX and Equity', ['An exotic option described [here](Definitions#QEDI-options)'])
 
-        def __init__(self, params, valuation_options):
-            super(QEDI_CustomAutoCallSwap, self).__init__(params, valuation_options)
-            self.path_dependent = self.field['Option_Style'] == 'American'
+    def __init__(self, params, valuation_options):
+        super(QEDI_CustomAutoCallSwap, self).__init__(params, valuation_options)
+        self.path_dependent = True
 
-        def reset(self, calendars):
-            super(QEDI_CustomAutoCallSwap, self).reset()
-            self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
+    def reset(self, calendars):
+        super(QEDI_CustomAutoCallSwap, self).reset()
+        self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
 
-        def add_grid_dates(self, parser, base_date, grid):
-            # we need to monitor the option for potential early exercise
-            if isinstance(grid, str):
-                grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
-                self.reval_dates.update(grid_dates)
-                self.settlement_currencies.setdefault(self.field['Currency'], set()).update(grid_dates)
-            else:
-                for curr, cash_flow in self.settlement_currencies.items():
-                    last_pmt = max(cash_flow)
-                    delta = set([x for x in grid if x < last_pmt])
-                    self.settlement_currencies[curr].update(delta)
-                    self.reval_dates.update(delta)
+    def add_grid_dates(self, parser, base_date, grid):
+        # we need to monitor the option for potential early exercise
+        if isinstance(grid, str):
+            grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
+            self.reval_dates.update(grid_dates)
+            self.settlement_currencies.setdefault(self.field['Currency'], set()).update(grid_dates)
+        else:
+            for curr, cash_flow in self.settlement_currencies.items():
+                last_pmt = max(cash_flow)
+                delta = set([x for x in grid if x < last_pmt])
+                self.settlement_currencies[curr].update(delta)
+                self.reval_dates.update(delta)
 
-        def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
-                              calendars):
-            field = {'Currency': utils.check_rate_name(self.field['Currency']),
-                     'Equity': utils.check_rate_name(self.field['Equity'])}
-            field['Discount_Rate'] = utils.check_rate_name(
-                self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
-            field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
+        field['Discount_Rate'] = utils.check_rate_name(
+            self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
+        field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
 
-            field_index = {
-                'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-                'SettleCurrency': self.field['Currency'],
-                'Discount': get_discount_factor(
-                    field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
-                'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
-                'Equity_Zero': get_equity_zero_rate_factor(
-                    field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
-                'Dividend_Yield': get_dividend_rate_factor(
-                    field['Equity'], static_offsets, stochastic_offsets, all_tenors),
-                'Volatility': get_equity_price_vol_factor(
-                    field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
-                'Strike_Price': self.field['Strike_Price'],
-                'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
-                'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
-                'Option_Style': self.field['Option_Style'],
-                'Expiry': (self.field['Expiry_Date'] - base_date).days
-            }
+        field_index = {
+            'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+            'SettleCurrency': self.field['Currency'],
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+            'Equity_Zero': get_equity_zero_rate_factor(
+                field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Dividend_Yield': get_dividend_rate_factor(
+                field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+            'Volatility': get_equity_price_vol_factor(
+                field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Strike_Price': self.field['Strike_Price'],
+            'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
+            'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
+            'Option_Style': self.field['Option_Style'],
+            'Expiry': (self.field['Expiry_Date'] - base_date).days
+        }
 
-            return field_index
+        return field_index
 
-        def generate(self, shared, time_grid, deal_data):
-            deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-            fx_rep = utils.calc_fx_cross(
-                deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
+    def generate(self, shared, time_grid, deal_data):
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        fx_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
 
-            spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
-            forward = utils.calc_eq_forward(
-                deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
-                deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
-            moneyness = spot / deal_data.Factor_dep['Strike_Price']
+        spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
+        forward = utils.calc_eq_forward(
+            deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
+            deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
+        moneyness = spot / deal_data.Factor_dep['Strike_Price']
 
-            if deal_data.Factor_dep['Option_Style'] == 'European':
-                mtm = pricing.pv_european_option(
-                    shared, time_grid, deal_data, self.field['Units'], moneyness, forward) * fx_rep
-            else:
-                mtm = pricing.pv_american_option(
-                    shared, time_grid, deal_data, self.field['Units'], moneyness, spot, forward) * fx_rep
+        if deal_data.Factor_dep['Option_Style'] == 'European':
+            mtm = pricing.pv_european_option(
+                shared, time_grid, deal_data, 1.0, moneyness, forward) * fx_rep
 
-            return mtm
+        return mtm
 
 
 class EquityBarrierOption(Deal):
@@ -2641,6 +2640,10 @@ class EquityBarrierOption(Deal):
             eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
         fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
+
+        # check that the spot has a defined shape
+        if spot.shape != b.shape:
+            spot = spot.tile(len(deal_time), b.shape[1])
 
         pv = pricing.pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)
         mtm = pv * fx_rep
@@ -3185,6 +3188,353 @@ class FXPartialTimeBarrierOption(Deal):
         return mtm
 
 
+class FXTARFOptionDeal(Deal):
+    '''
+    [StructuredProductsDealPackage]FObject:udmcTRFPayoff
+    # ------------------------------------------
+    # PAYOFF EXPRESSION
+    # Target Redemption Forward
+    #
+    # Features:
+    # - KI Barrier on "down side", only local not with "memory"
+    # ------------------------------------------
+
+    # PARAMETERS
+    param double targetValue;
+    param double barrier;
+    param int targetAdjustment;
+    param matrix(double) notional1;
+    param matrix(double) notional2;
+    param double strike;
+    param double accumulatedValue;
+    param int isCallOption;
+    param matrix(double) timeSteps;
+    param int invertedTarget;
+
+    # PROCESS
+    process matrix(double) S;
+
+    # LOCAL VARIABLES
+    double callOrPut = 2.0 * isCallOption - 1.0;
+    double accumulated = accumulatedValue;
+    int barrierIsHit = 1;
+    double intrinsicValue = 0.0;
+    double intrinsicValueInverted = 0.0;
+    double adjustedStrike = 0.0;
+    double barrierIntrinsic = 0.0;
+    int tMax = length(timeSteps);
+    int t = 0;
+    int terminationEvent = 0;
+    double settlementValue = 0.0;
+    double previousAccumulated = accumulatedValue;
+    double accumulatedVsTarget = 0.0;
+    double zeroComparison = 0.00000001;
+    double notionalAdjustmentFactor = 1.0;
+    double settlementNotional = 1.0;
+
+    # MAIN LOOP
+    terminationEvent = 0;
+    accumulated = accumulatedValue;
+
+    for t = 0 to tMax
+    {
+            if (not terminationEvent)
+            {
+                  previousAccumulated = accumulated;
+                  intrinsicValue = (S[t] - strike) * callOrPut;
+                  barrierIsHit = 1;
+
+                  if (intrinsicValue  > 0.0)
+                  {
+                  # The ITM side, which is where we compare to the Target Level.
+                            settlementNotional = notional1[t];
+                            if (invertedTarget)
+                            {
+                                intrinsicValueInverted = (1.0 / S[t] - 1.0 / strike) * callOrPut * (-1.0);
+                                accumulated = accumulated + intrinsicValueInverted;
+                                adjustedStrike = 1.0 / ((1.0 / S[t]) - (targetValue - previousAccumulated) * callOrPut * (-1.0));
+                                notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValueInverted;
+                            }
+                            else
+                            {
+                                accumulated = accumulated + intrinsicValue;
+                                adjustedStrike = S[t] - (targetValue - previousAccumulated) * callOrPut;
+                                notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValue;
+                            };
+
+                            accumulatedVsTarget = targetValue - accumulated;
+                            if (accumulatedVsTarget < zeroComparison)
+                            {
+                                    terminationEvent = 1;
+                                    if(targetAdjustment == 1)
+                                    {
+                                        intrinsicValue = (S[t] - adjustedStrike) * callOrPut;
+                                    }
+                                    else
+                                    {
+                                        if(targetAdjustment == 2)
+                                        {
+                                            settlementNotional = settlementNotional * notionalAdjustmentFactor;
+                                        };
+                                    };
+
+                            };
+                            settlementValue = settlementNotional * intrinsicValue;
+                   }
+                   else
+                   {
+                   # The OTM side, which is where we check against a potential barrier
+                          if (barrier > zeroComparison)
+                          {
+                                  barrierIntrinsic =  (barrier - S[t]) * callOrPut;
+                                  if (barrierIntrinsic < 0.0)
+                                  {
+                                            barrierIsHit = 0;
+                                  };
+                          };
+                          settlementValue = notional2[t] * intrinsicValue * barrierIsHit;
+                    };
+
+                    #CASHFLOW
+                    cashFlow(t, settlementValue);
+            };
+
+    };
+    '''
+
+    factor_fields = {'Currency': ['FxRate'],
+                     'Underlying_Currency': ['FxRate'],
+                     'Discount_Rate': ['DiscountRate'],
+                     'FX_Volatility': ['FXVol']}
+
+    documentation = (
+        'FX and Equity', ['A path independent vanilla FX Option described [here](Definitions#european-options)'])
+
+    def __init__(self, params, valuation_options):
+        super(FXTARFOptionDeal, self).__init__(params, valuation_options)
+
+    def reset(self, calendars):
+        super(FXTARFOptionDeal, self).reset()
+        self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
+
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency'])}
+        field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
+            field['Currency']
+        field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
+
+        field_index = {
+            'Currency': get_fx_and_zero_rate_factor(
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'SettleCurrency': self.field['Currency'],
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Underlying_Currency': get_fx_and_zero_rate_factor(
+                field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Volatility': get_fx_vol_factor(
+                field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Expiry': (self.field['Expiry_Date'] - base_date).days,
+            'Invert_Moneyness': field['Currency'][0] == field['FX_Volatility'][0],
+            'Strike_Price': self.field['Strike_Price'],
+            'Fixings': utils.make_fixing_data(base_date, time_grid, self.field['TARF_ExpiryDates']),
+            'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
+            'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
+            'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
+        }
+
+        # needed for reporting
+
+        return field_index
+
+    def generate(self, shared, time_grid, deal_data):
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        fx_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
+        forward = utils.calc_fx_forward(
+            deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
+            deal_data.Factor_dep['Expiry'], deal_time, shared)
+
+        moneyness = deal_data.Factor_dep['Strike_Price'] / forward if deal_data.Factor_dep['Invert_Moneyness'] \
+            else forward / deal_data.Factor_dep['Strike_Price']
+
+        spot = utils.calc_fx_cross(deal_data.Factor_dep['Underlying_Currency'][0],
+                                   deal_data.Factor_dep['Currency'][0], deal_time, shared)
+
+        daycount_fn = deal_data.Factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
+
+        expiry = daycount_fn(deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+        # make sure there are no zeros
+        safe_expiry = spot.new(expiry.reshape(-1, 1)).clamp(min=1e-5)
+
+        b = torch.log(forward / spot) / safe_expiry
+        # now precalc all past resets
+        discount = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Discount'], deal_time, shared)
+        samples = deal_data.Factor_dep['Fixings'].reinitialize(shared.one)
+        known_resets = samples.known_resets(shared.simulation_batch)
+        start_idx = samples.get_start_index(deal_time)
+        sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+                                       (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
+                                        deal_time[:, utils.TIME_GRID_MTM].max())]
+        past_factor_list = [deal_data.Factor_dep['Underlying_Currency'][0], deal_data.Factor_dep['Currency'][0]]
+
+        # check if the spot was simulated - if not, hold it flat
+        if spot.shape != forward.shape:
+            past_samples = spot.expand(sim_samples.shape[0], shared.simulation_batch)
+            spot = spot.expand(*forward.shape)
+        else:
+            past_sample_factor = [utils.calc_time_grid_spot_rate(
+                past_factor, sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
+                for past_factor in past_factor_list]
+            past_samples = past_sample_factor[0] if len(
+                past_sample_factor) == 1 else past_sample_factor[0] / past_sample_factor[1]
+
+        all_samples = torch.cat(
+            [torch.cat(known_resets, axis=0), past_samples], axis=0) if known_resets else past_samples
+        # make sure we can access the numpy and tensor components
+        dual_samples = samples.dual()
+
+        # mtm = pricing.pv_european_option(
+        #    shared, time_grid, deal_data, self.field['Underlying_Amount'], moneyness, forward) * fx_rep
+        S = all_samples
+        tarf = deal_data.Instrument.field
+        targetValue = tarf['TargetLevel']
+        barrier = tarf.get('Barrier', 0.0)
+        targetAdjustment = 2 if tarf['TargetAdjustment'] == 'Adjust Notional' else 1
+        notional1 = [1000000.0] * len(tarf['TARF_ExpiryDates'])
+        notional2 = [1000000.0] * len(tarf['TARF_ExpiryDates'])
+        strike = tarf['Strike_Price']
+
+        accumulatedValue = 0.0
+        isCallOption = tarf['Option_Type'] == 'Call'
+
+        timeSteps = 100
+        invertedTarget = tarf['InvertedTarget']
+
+        # LOCAL VARIABLES
+        callOrPut = 2.0 * isCallOption - 1.0
+        accumulated = accumulatedValue
+        barrierIsHit = 1
+        intrinsicValue = 0.0
+        intrinsicValueInverted = 0.0
+        adjustedStrike = 0.0
+        barrierIntrinsic = 0.0
+        t = 0
+        tMax = len(S)
+
+        terminationEvent = 0
+        settlementValue = 0.0
+        previousAccumulated = accumulatedValue
+        accumulatedVsTarget = 0.0
+        zeroComparison = 0.00000001
+        notionalAdjustmentFactor = 1.0
+        settlementNotional = 1.0
+
+        # MAIN LOOP
+        terminationEvent = 0
+        accumulated = accumulatedValue
+        mtm_list = []
+        discount_block = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Discount'], np.array([[0, 0, 0]]), shared)
+        daycount_fn(sim_samples[:, utils.TIME_GRID_MTM])
+
+        for t in range(tMax):
+            if 1:
+                previousAccumulated = accumulated
+                intrinsicValue = (S[t] - strike) * callOrPut
+                barrierIsHit = 1
+                positive_iv = 1.0 * (intrinsicValue > 0.0)
+                settlementNotional = notional1[t]
+                if invertedTarget:
+                    intrinsicValueInverted = (1.0 / S[t] - 1.0 / strike) * callOrPut * (-1.0)
+                    accumulated = accumulated + intrinsicValueInverted
+                    adjustedStrike = 1.0 / ((1.0 / S[t]) - (targetValue - previousAccumulated) * callOrPut * (-1.0))
+                    notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValueInverted
+                else:
+                    accumulated = accumulated + intrinsicValue
+                    adjustedStrike = S[t] - (targetValue - previousAccumulated) * callOrPut
+                    notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValue
+
+                accumulatedVsTarget = targetValue - accumulated
+                if targetAdjustment == 1:
+                    intrinsicValue = (S[t] - adjustedStrike) * callOrPut
+                elif targetAdjustment == 2:
+                    settlementNotional = settlementNotional * notionalAdjustmentFactor
+
+                positive_val = settlementNotional * intrinsicValue
+                if barrier > zeroComparison:
+                    barrierIntrinsic = (barrier - S[t]) * callOrPut
+                    barrierIsHit = 1.0 * (barrierIntrinsic >= 0.0)
+
+                negative_val = notional2[t] * intrinsicValue * barrierIsHit
+                mtm_list.append(
+                    (1 - terminationEvent) * (positive_iv * positive_val + (1 - positive_iv) * negative_val))
+                terminationEvent = 1.0 * (accumulatedVsTarget < zeroComparison)
+        mtm_list = torch.stack(mtm_list)
+
+        manual_list = []
+        for s in S[t]:
+            terminationEvent = 0
+            accumulated = accumulatedValue
+            sim = []
+            for t in range(tMax):
+                if not terminationEvent:
+                    previousAccumulated = accumulated
+                    intrinsicValue = (s - strike) * callOrPut
+                    barrierIsHit = 1
+
+                    if intrinsicValue > 0.0:
+                        # The ITM side, which is where we compare to the Target Level.
+                        settlementNotional = notional1[t]
+                        if invertedTarget:
+                            intrinsicValueInverted = (1.0 / s - 1.0 / strike) * callOrPut * (-1.0)
+                            accumulated = accumulated + intrinsicValueInverted
+                            adjustedStrike = 1.0 / (
+                                    (1.0 / s) - (targetValue - previousAccumulated) * callOrPut * (-1.0))
+                            notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValueInverted
+                        else:
+                            accumulated = accumulated + intrinsicValue
+                            adjustedStrike = s - (targetValue - previousAccumulated) * callOrPut
+                            notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValue
+
+                        accumulatedVsTarget = targetValue - accumulated
+                        if accumulatedVsTarget < zeroComparison:
+                            terminationEvent = 1
+                            if targetAdjustment == 1:
+                                intrinsicValue = (s - adjustedStrike) * callOrPut
+                            elif targetAdjustment == 2:
+                                settlementNotional = settlementNotional * notionalAdjustmentFactor
+
+                        settlementValue = settlementNotional * intrinsicValue
+                    else:
+                        # The OTM side, which is where we check against a potential barrier
+                        if barrier > zeroComparison:
+                            barrierIntrinsic = (barrier - s) * callOrPut
+                            if barrierIntrinsic < 0.0:
+                                barrierIsHit = 0
+                        settlementValue = notional2[t] * intrinsicValue * barrierIsHit
+                    # CASHFLOW
+                    sim.append(settlementValue)
+                else:
+                    sim.append(torch.tensor(0.0))
+            manual_list.append(torch.stack(sim))
+            # cashFlow(t, settlementValue)
+
+        manual_list = torch.stack(manual_list).T
+
+        discount_rates = torch.squeeze(
+            utils.calc_discount_rate(
+                discount_block, sim_samples[:, utils.TIME_GRID_MTM].reshape(-1, 1), shared),
+            axis=1)
+        #
+        # cash = nominal * theo_price
+        # mtm_list.append(cash * discount_rates)
+
+        mtm = discount_rates * torch.stack(mtm_list)
+        return mtm
+
+
 class FXOptionDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Underlying_Currency': ['FxRate'],
@@ -3287,8 +3637,17 @@ class DealDefaultSwap(Deal):
         if list(self.field['Pay_Frequency'].kwds.values()) == [0]:
             self.resetdates = pd.DatetimeIndex([self.field['Effective_Date'], self.field['Maturity_Date']])
         else:
-            self.resetdates = generate_dates_backward(
-                self.field['Maturity_Date'], self.field['Effective_Date'], self.field['Pay_Frequency'], bus_day=bus_day)
+            if self.field.get('Penultimate_Coupon_Date'):
+                self.resetdates = generate_dates_backward(
+                    self.field['Penultimate_Coupon_Date'], self.field['Effective_Date'],
+                    self.field['Pay_Frequency'], bus_day=bus_day)
+                if self.field['Maturity_Date'] > self.field['Penultimate_Coupon_Date']:
+                    self.resetdates.append(pd.DatetimeIndex([self.field['Maturity_Date']]))
+            else:
+                self.resetdates = generate_dates_backward(
+                    self.field['Maturity_Date'], self.field['Effective_Date'],
+                    self.field['Pay_Frequency'], bus_day=bus_day)
+
         self.add_reval_dates(self.resetdates, self.field['Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
@@ -3350,7 +3709,7 @@ class FRADeal(Deal):
 
         field_index = {
             'Currency': get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Discount': get_discount_factor(
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Forward': get_interest_factor(

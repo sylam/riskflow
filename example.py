@@ -258,24 +258,23 @@ if __name__ == '__main__':
 
     env = ''
     paths = {}
-    for folder in ['temp', 'Input_JSON', 'CVA_JSON', 'CVA_UAT', 'CVA', 'PFE', 'PFE_UAT', 'Upgrade']:
+    for folder in ['JSON', 'temp', 'Input_JSON', 'CVA_JSON', 'CVA_UAT', 'CVA', 'PFE', 'PFE_UAT', 'Upgrade']:
         paths[folder] = rf.getpath(
-            [os.path.join('E:\\Data\\crstal\\CVA', folder),
+            [os.path.join('Y:\\CollVA', folder),
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
-             os.path.join('C:\\', folder),
+             os.path.join('U:\\', folder),
              os.path.join('S:\\CCR_PFE_EE_NetCollateral', folder),
              os.path.join('S:\\CCR_Tagged', folder),
-             os.path.join('N:\\Archive', folder),
-             os.path.join('G:\\', folder)])
+             os.path.join('N:\\Archive', folder)])
 
-    path_json = paths['temp']
-    # path_json = paths['Input_JSON']
+    # path_json = paths['CVA_JSON']
+    path_json = paths['JSON']
     # path = paths['CVA_UAT']
     # path = paths['CVA']
     path = paths['PFE']
 
-    # rundate = '2021-11-12'
-    rundate = '2022-07-15'
+    # rundate = '2022-10-12'
+    rundate = '2022-10-20'
     # rundate = '2021-09-14'
     # calibrate_PFE(path, rundate)
     # bootstrap(path, rundate, reuse_cal=True)
@@ -284,28 +283,36 @@ if __name__ == '__main__':
     cx = rf.Context(
         path_transform={
             '\\\\ICMJHBMVDROPPRD\\AdaptiveAnalytics\\Inbound\\MarketData':
-                '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData'},
+                '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData',
+            '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData\\CVAMarketDataBackup':
+                '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData'
+        },
         file_transform={
             'CVAMarketData_Calibrated.dat': 'CVAMarketData_Calibrated_New.json',
-            'MarketData.dat': 'MarketData.json'
+            'MarketData.dat': 'MarketData.json',
+            'CVAMarketData_Calibrated_{}.dat'.format(pd.Timestamp(rundate).strftime('%d%m%y')): 'MarketData.json'
         })
 
     spreads = {
         'USD': {'FVA@Equity': {'collateral': 0, 'funding': 10}, 'FVA@Income': {'collateral': 0, 'funding': 65}},
         'EUR': {'FVA@Equity': {'collateral': 0, 'funding': 10}, 'FVA@Income': {'collateral': 0, 'funding': 65}},
+        'GBP': {'FVA@Equity': {'collateral': 0, 'funding': 10}, 'FVA@Income': {'collateral': 0, 'funding': 65}},
         'ZAR': {'FVA@Equity': {'collateral': -10, 'funding': 15}, 'FVA@Income': {'collateral': -10, 'funding': 15}}}
 
     curves = {'USD': {'collateral': 'USD-OIS', 'funding': 'USD-LIBOR-3M'},
               'EUR': {'collateral': 'EUR-EONIA', 'funding': 'EUR-EURIBOR-3M'},
+              'GBP': {'collateral': 'GBP-SONIA', 'funding': 'GBP-SONIA'},
               'ZAR': {'collateral': 'ZAR-SWAP', 'funding': 'ZAR-SWAP'}}
 
     curves_rfr = {
         'USD': {'collateral': 'USD-SOFR', 'funding': 'USD-LIBOR-3M'},
         'EUR': {'collateral': 'EUR-ESTR', 'funding': 'EUR-EURIBOR-3M'}}
 
-#    for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
-    for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
-
+    # for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris*.json')):
+    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_NatWest_Markets_Plc*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, '*otus*.json')):
         cx.load_json(json, compress=True)
 
         if not cx.current_cfg.deals['Deals']['Children'][0]['Children']:
@@ -331,7 +338,7 @@ if __name__ == '__main__':
             'Generate_Cashflows': 'No',
             # 'Currency': 'USD',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
-            'Batch_Size': 256,
+            'Batch_Size': 256*32,
             'Simulation_Batches': 1,
             'COLLVA': {'Gradient': 'Yes'},
             'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}
@@ -353,7 +360,7 @@ if __name__ == '__main__':
             if assets is None and ns['Collateralized'] == 'True':
                 assets = 'Cash_Collateral'
         except:
-            assets = 'Cash_Collateral' if ns['Collateralized'] == 'True' else 'None'
+            assets = 'Cash_Collateral' if ns.field['Collateralized'] == 'True' else 'None'
 
         collva_sect = cx.current_cfg.deals['Calculation'].get(
             'Collateral_Valuation_Adjustment', {'Calculate': 'Yes' if assets == 'Cash_Collateral' else 'No'})
@@ -368,9 +375,12 @@ if __name__ == '__main__':
         collva_sect['Funding_Spread'] = collva_sect.get(
             'Funding_Spread', spreads[agreement_currency]['FVA@Income']['funding'])
         cx.current_cfg.deals['Calculation']['Collateral_Valuation_Adjustment'] = collva_sect
-
-        calc, out = cx.run_job(overrides)
-        out['Results']['profile'].to_csv(outfile)
+        calc, out = cx.Base_Valuation()
+        try:
+            calc, out = cx.run_job(overrides)
+        except KeyError as k:
+            print('sad')
+        out['Results']['collateral_profile'].to_csv(outfile)
         # calc, out = cx.Base_Valuation()
         # out['Results']['mtm'].to_csv(outfile)
 
