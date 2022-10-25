@@ -242,7 +242,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         # check if we have collva
         if 'collva_t' in out['Results']:
             collateral = out['Results']['collateral']
-            collva = np.append(out['Results']['collva_t'], 0.0)
+            collva = out['Results']['collva_t']
             coll = pd.DataFrame({
                 'Collateral(5%)': np.percentile(collateral, 5, axis=1),
                 'Expected': np.mean(collateral, axis=1), 'Cost': collva}, index=dates)

@@ -936,21 +936,20 @@ class NettingCollateralSet(Deal):
 
             # Store results
             shared.t_Credit['Gross MTM'] = Vte
-            shared.t_Credit['Collateral'] = Bte * Ste
+            shared.t_Credit['Collateral'] = Bte * Ste / fx_base
 
             # The net MTM of the netting set
             net_accum = (Vte + C_ts_te - min_Bt * Ste) / fx_base
 
             if len(factor_dep['Cash_Collateral']) == 1 and factor_dep['Cash_Collateral'][0].Collateral_Rate is not None:
                 cash_col = factor_dep['Cash_Collateral'][0]
-                cash_base = utils.calc_time_grid_spot_rate(cash_col.Currency, deal_time[:-1], shared)
+                cash_rep = utils.calc_time_grid_spot_rate(cash_col.Currency, deal_time, shared)/fx_base
                 mtm_grid = deal_time[:, utils.TIME_GRID_MTM]
 
                 # calculate collateral valuation adjustment
-                # delta_scen_t = np.append(0, np.diff(mtm_grid)).reshape(-1, 1)
-                delta_scen_t = np.diff(mtm_grid).reshape(-1, 1)
-                discount_funding = utils.calc_time_grid_curve_rate(cash_col.Funding_Rate, deal_time[:-1], shared)
-                discount_collateral = utils.calc_time_grid_curve_rate(cash_col.Collateral_Rate, deal_time[:-1], shared)
+                delta_scen_t = np.append(np.diff(mtm_grid), 0).reshape(-1, 1)
+                discount_funding = utils.calc_time_grid_curve_rate(cash_col.Funding_Rate, deal_time, shared)
+                discount_collateral = utils.calc_time_grid_curve_rate(cash_col.Collateral_Rate, deal_time, shared)
                 discount_collateral_t0 = utils.calc_time_grid_curve_rate(
                     cash_col.Collateral_Rate, np.zeros((1, 3)), shared)
 
@@ -961,10 +960,9 @@ class NettingCollateralSet(Deal):
 
                 Dc0_T = torch.exp(
                     -torch.squeeze(discount_collateral_t0.gather_weighted_curve(
-                        shared, mtm_grid[:-1].reshape(1, -1)), axis=0))
+                        shared, mtm_grid.reshape(1, -1)), axis=0))
 
-                shared.t_Credit['Funding'] = (shared.t_Credit['Collateral'][:-1] * cash_base *
-                                              Dc_over_f_tT_m1 * Dc0_T) / fx_base[0]
+                shared.t_Credit['Funding'] = shared.t_Credit['Collateral'] * cash_rep * Dc_over_f_tT_m1 * Dc0_T
 
             return net_accum
         else:
@@ -3642,7 +3640,7 @@ class DealDefaultSwap(Deal):
                     self.field['Penultimate_Coupon_Date'], self.field['Effective_Date'],
                     self.field['Pay_Frequency'], bus_day=bus_day)
                 if self.field['Maturity_Date'] > self.field['Penultimate_Coupon_Date']:
-                    self.resetdates.append(pd.DatetimeIndex([self.field['Maturity_Date']]))
+                    self.resetdates = self.resetdates.append(pd.DatetimeIndex([self.field['Maturity_Date']]))
             else:
                 self.resetdates = generate_dates_backward(
                     self.field['Maturity_Date'], self.field['Effective_Date'],
