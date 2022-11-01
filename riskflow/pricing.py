@@ -796,6 +796,165 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
     return value * discount_rates
 
 
+def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
+    def calc_accum_value(accumulated, s, k, C, invertedTarget):
+        if invertedTarget:
+            iv = (1.0 / s - 1.0 / k) * C * (-1.0)
+            return accumulated + iv.unsqueeze(axis=1)
+        else:
+            iv = (s - k) * C
+            return accumulated + iv.unsqueeze(axis=1)
+
+    def sim_tarf(S, accumulatedValue=0.0):
+        tMax = len(S)
+        zeroComparison = 0.00000001
+        # MAIN LOOP
+        terminationEvent = 1.0 * (targetValue - accumulatedValue < zeroComparison)
+        accumulated = accumulatedValue
+        mtm_list = []
+
+        for t in range(tMax):
+            previousAccumulated = accumulated
+            intrinsicValue = (S[t] - strike) * callOrPut
+            barrierIsHit = 1
+            positive_iv = 1.0 * (intrinsicValue > 0.0)
+            settlementNotional = notional1[t]
+            if invertedTarget:
+                intrinsicValueInverted = (1.0 / S[t] - 1.0 / strike) * callOrPut * (-1.0)
+                accumulated = accumulated + intrinsicValueInverted
+                adjustedStrike = 1.0 / ((1.0 / S[t]) - (targetValue - previousAccumulated) * callOrPut * (-1.0))
+                notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValueInverted
+            else:
+                accumulated = accumulated + intrinsicValue
+                adjustedStrike = S[t] - (targetValue - previousAccumulated) * callOrPut
+                notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValue
+
+            accumulatedVsTarget = targetValue - accumulated
+            termination = 1.0 * (accumulatedVsTarget < zeroComparison)
+            if targetAdjustment == 1:
+                intrinsicValue = termination * (S[t] - adjustedStrike) * callOrPut + (
+                        1.0 - termination) * intrinsicValue
+            elif targetAdjustment == 2:
+                settlementNotional = termination * settlementNotional * notionalAdjustmentFactor + (
+                        1.0 - termination) * settlementNotional
+
+            positive_val = settlementNotional * intrinsicValue
+            if barrier > zeroComparison:
+                barrierIntrinsic = (barrier - S[t]) * callOrPut
+                barrierIsHit = 1.0 * (barrierIntrinsic >= 0.0)
+
+            negative_val = notional2[t] * intrinsicValue * barrierIsHit
+            mtm_list.append(
+                (1 - terminationEvent) * (positive_iv * positive_val + (1 - positive_iv) * negative_val))
+            # should be safe to just look at the last termination state as we accumulate state
+            terminationEvent = termination
+
+        return torch.stack(mtm_list).mean(axis=2)
+
+    def sim_spot(spot_prices, vols, times, carry, prev_accum, sobol=False, num_sims=1024 * 4):
+        timesteps, num_samples = times.shape
+        dt = times.unsqueeze(axis=2)
+        var = (vols * vols).unsqueeze(axis=1) * dt
+        # store params in tensors
+        drift = carry * dt - 0.5 * var
+        vol = torch.sqrt(var)
+        strike_plus_epsilon = var.new([[strike + 0.001]])
+        mcmc = []
+        for s, r, sigma in zip(spot_prices, drift, vol):
+            if sobol:
+                # make sure we don't include 1 or 0
+                z = shared.quasi_rng(shared.simulation_batch, num_samples * num_sims).T.reshape(
+                    num_samples, shared.simulation_batch, -1)
+            else:
+                z = torch.randn([num_samples, shared.simulation_batch, num_sims],
+                                dtype=shared.one.dtype, device=shared.one.device)
+            f1 = (r.unsqueeze(axis=2) + sigma.unsqueeze(axis=2) * z).cumsum(axis=0)
+            mcmc_spot = s.reshape(1, -1, 1) * torch.exp(f1)
+            val = sim_tarf(
+                torch.where(torch.abs(mcmc_spot - strike) < 1e-4, strike_plus_epsilon, mcmc_spot),
+                prev_accum)
+            mcmc.append(val)
+
+        return torch.stack(mcmc)
+
+    mtm_list = []
+    factor_dep = deal_data.Factor_dep
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+    daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
+
+    # now precalc all past resets
+    samples = factor_dep['Fixings'].reinitialize(shared.one)
+    start_idx = samples.get_start_index(deal_time)
+
+    # make sure we can access the numpy and tensor components
+    dual_samples = samples.dual()
+    start_index, counts = np.unique(start_idx, return_counts=True)
+
+    # params for the tarf
+    targetValue = deal_data.Instrument.field['TargetLevel']
+    barrier = deal_data.Instrument.field.get('Barrier', 0.0)
+    targetAdjustment = factor_dep['targetAdjustment']
+
+    num_dates = (samples.schedule[:, utils.RESET_INDEX_Value] == 0).sum()
+    notional1 = [factor_dep['Notional1']] * num_dates
+    notional2 = [factor_dep['Notional2']] * num_dates
+    strike = factor_dep['Strike_Price']
+
+    invertedTarget = deal_data.Instrument.field['InvertedTarget']
+    callOrPut = factor_dep['Option_Type']
+
+    # calculate the correct accumulation to date
+    accumulation = 0.0
+    for sample_val in samples.schedule[:, utils.RESET_INDEX_Value]:
+        if sample_val:
+            accumulation += calc_accum_value(accumulation, sample_val, strike, callOrPut, invertedTarget)
+
+    # use a quasi random generator if we are simulating a large batch
+    sobol = shared.simulation_batch > 16
+
+    for index, (discount_block, spot_block, moneyness_block) in enumerate(
+            utils.split_counts([discount, spot, moneyness], counts, shared)):
+        t_block = discount_block.time_grid
+        sample_index_t = start_index[index]
+        tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
+        fixings = (dual_samples.np[np.newaxis, sample_index_t:, utils.RESET_INDEX_End_Day] -
+                   t_block[:, utils.TIME_GRID_MTM, np.newaxis])
+
+        drifts = utils.calc_fx_drift(
+            deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
+            fixings, t_block, shared, multiply_by_time=False)
+        fixing_block = daycount_fn(fixings)
+
+        # note that we're using just 1 vol moneyness - the one at expiry (the last date of the TARF)
+        # this should actually be the moneyness for each settlement date - TODO!
+        vols = utils.calc_time_grid_vol_rate(
+            factor_dep['Volatility'], moneyness_block, daycount_fn(tenor_block), shared)
+
+        sample_ts = drifts.new(
+            np.hstack([fixing_block[:, 0, np.newaxis], np.diff(fixing_block, axis=1)]))
+        theo_cashflow = factor_dep['Buy_Sell'] * sim_spot(
+            spot_block, vols, sample_ts, drifts, accumulation, sobol=sobol)
+
+        discount_rates = torch.squeeze(
+            utils.calc_discount_rate(discount_block, fixings, shared),
+            axis=1)
+
+        theo_price = (theo_cashflow * discount_rates).sum(axis=1)
+        # settle potential cashflows
+        cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(
+            time_grid.mtm_time_grid, t_block[-1][utils.TIME_GRID_MTM]), theo_cashflow[-1][0])
+        # update the accumulated value
+        accumulation += calc_accum_value(accumulation, spot_block[-1], strike, callOrPut, invertedTarget)
+
+        mtm_list.append(theo_price)
+
+    # mtm in reporting currency
+    mtm = torch.cat(mtm_list, axis=0)
+
+    return mtm
+
+
 def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forward,
                              past_factor_list, invert_moneyness=False, use_forwards=False):
     mtm_list = []

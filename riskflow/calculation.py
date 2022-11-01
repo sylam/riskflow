@@ -311,6 +311,17 @@ class CMC_State(utils.Calculation_State):
         self.t_Credit = {}
         # these are shared parameter states
         self.simulation_batch = batch_size
+        self.sobol = {}
+
+    def quasi_rng(self, dimension, sample_size, seed=1234, fast_forward=1024):
+        if dimension not in self.sobol:
+            self.sobol[dimension] = torch.quasirandom.SobolEngine(dimension=dimension, scramble=True, seed=seed)
+            # skip this many samples
+            self.sobol[dimension].fast_forward(fast_forward)
+        sample_sobol = self.sobol[dimension].draw(sample_size, dtype=self.one.dtype)
+        z = torch.erfinv(2 * (0.5 + (1 - torch.finfo(sample_sobol.dtype).eps) * (
+                sample_sobol - 0.5)) - 1) * 1.4142135623730951
+        return z.to(self.one.device)
 
     def reset(self, num_factors, time_grid: utils.TimeGrid):
         # update the random numbers

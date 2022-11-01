@@ -1354,6 +1354,14 @@ def calc_eq_forward(equity, repo, div_yield, T, time_grid, shared, only_diag=Fal
     return shared.t_Buffer[key_code]
 
 
+def calc_fx_drift(local, other, weights, time_grid, shared, multiply_by_time=True):
+    repo_local = calc_time_grid_curve_rate(local[1], time_grid, shared)
+    repo_other = calc_time_grid_curve_rate(other[1], time_grid, shared)
+    return repo_other.gather_weighted_curve(
+        shared, weights, multiply_by_time=multiply_by_time) - repo_local.gather_weighted_curve(
+        shared, weights, multiply_by_time=multiply_by_time)
+
+
 def calc_fx_forward(local, other, T, time_grid, shared, only_diag=False):
     T_scalar = isinstance(T, int)
     key_code = ('fxforward', local[0][0], other[0][0], only_diag,
@@ -1366,11 +1374,7 @@ def calc_fx_forward(local, other, T, time_grid, shared, only_diag=False):
 
             if T_t.any():
                 weights = np.diag(T_t).reshape(-1, 1) if only_diag else T_t
-                repo_local = calc_time_grid_curve_rate(local[1], time_grid, shared)
-                repo_other = calc_time_grid_curve_rate(other[1], time_grid, shared)
-                drift = torch.exp(
-                    repo_other.gather_weighted_curve(shared, weights) -
-                    repo_local.gather_weighted_curve(shared, weights))
+                drift = torch.exp(calc_fx_drift(local, other, weights, time_grid, shared))
             else:
                 drift = fx_spot.new_ones([time_grid.shape[0], 1 if only_diag else T_t.size, 1])
 

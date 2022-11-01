@@ -3188,6 +3188,8 @@ class FXPartialTimeBarrierOption(Deal):
 
 class FXTARFOptionDeal(Deal):
     '''
+    Python implementation of the following UDMC pricing function
+
     [StructuredProductsDealPackage]FObject:udmcTRFPayoff
     # ------------------------------------------
     # PAYOFF EXPRESSION
@@ -3306,14 +3308,15 @@ class FXTARFOptionDeal(Deal):
                      'FX_Volatility': ['FXVol']}
 
     documentation = (
-        'FX and Equity', ['A path independent vanilla FX Option described [here](Definitions#european-options)'])
+        'FX and Equity', ['A Monte Carlo Priced FX instrument described [here](Definitions#european-options)'])
 
     def __init__(self, params, valuation_options):
         super(FXTARFOptionDeal, self).__init__(params, valuation_options)
 
     def reset(self, calendars):
         super(FXTARFOptionDeal, self).reset()
-        self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
+        self.add_reval_dates(
+            set([x[0] for x in self.field['TARF_ExpiryDates']]), self.field['Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
@@ -3339,17 +3342,31 @@ class FXTARFOptionDeal(Deal):
             'Fixings': utils.make_fixing_data(base_date, time_grid, self.field['TARF_ExpiryDates']),
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
             'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
+            'Notional1': self.field['Underlying_Amount'],
+            'Notional2': self.field['LeverageNotional'],
             'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
         }
 
-        # needed for reporting
+        if self.field['TargetAdjustment'] == 'Adjust Notional':
+            field_index['targetAdjustment'] = 2
+        elif self.field['TargetAdjustment'] == 'Adjust Strike':
+            field_index['targetAdjustment'] = 1
+        else:
+            field_index['targetAdjustment'] = 0
 
+        # needed for reporting
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        fx_rep = utils.calc_fx_cross(
+        FX_rep = utils.calc_fx_cross(
             deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
+
+        # get pricing data
+        spot = utils.calc_fx_cross(
+            deal_data.Factor_dep['Underlying_Currency'][0],
+            deal_data.Factor_dep['Currency'][0], deal_time, shared)
+
         forward = utils.calc_fx_forward(
             deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
             deal_data.Factor_dep['Expiry'], deal_time, shared)
@@ -3357,179 +3374,9 @@ class FXTARFOptionDeal(Deal):
         moneyness = deal_data.Factor_dep['Strike_Price'] / forward if deal_data.Factor_dep['Invert_Moneyness'] \
             else forward / deal_data.Factor_dep['Strike_Price']
 
-        spot = utils.calc_fx_cross(deal_data.Factor_dep['Underlying_Currency'][0],
-                                   deal_data.Factor_dep['Currency'][0], deal_time, shared)
+        mtm = pricing.pv_MC_Tarf(
+            shared, time_grid, deal_data, spot, moneyness) * FX_rep
 
-        daycount_fn = deal_data.Factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
-
-        expiry = daycount_fn(deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
-        # make sure there are no zeros
-        safe_expiry = spot.new(expiry.reshape(-1, 1)).clamp(min=1e-5)
-
-        b = torch.log(forward / spot) / safe_expiry
-        # now precalc all past resets
-        discount = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Discount'], deal_time, shared)
-        samples = deal_data.Factor_dep['Fixings'].reinitialize(shared.one)
-        known_resets = samples.known_resets(shared.simulation_batch)
-        start_idx = samples.get_start_index(deal_time)
-        sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
-                                       (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
-                                        deal_time[:, utils.TIME_GRID_MTM].max())]
-        past_factor_list = [deal_data.Factor_dep['Underlying_Currency'][0], deal_data.Factor_dep['Currency'][0]]
-
-        # check if the spot was simulated - if not, hold it flat
-        if spot.shape != forward.shape:
-            past_samples = spot.expand(sim_samples.shape[0], shared.simulation_batch)
-            spot = spot.expand(*forward.shape)
-        else:
-            past_sample_factor = [utils.calc_time_grid_spot_rate(
-                past_factor, sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
-                for past_factor in past_factor_list]
-            past_samples = past_sample_factor[0] if len(
-                past_sample_factor) == 1 else past_sample_factor[0] / past_sample_factor[1]
-
-        all_samples = torch.cat(
-            [torch.cat(known_resets, axis=0), past_samples], axis=0) if known_resets else past_samples
-        # make sure we can access the numpy and tensor components
-        dual_samples = samples.dual()
-
-        # mtm = pricing.pv_european_option(
-        #    shared, time_grid, deal_data, self.field['Underlying_Amount'], moneyness, forward) * fx_rep
-        S = all_samples
-        tarf = deal_data.Instrument.field
-        targetValue = tarf['TargetLevel']
-        barrier = tarf.get('Barrier', 0.0)
-        targetAdjustment = 2 if tarf['TargetAdjustment'] == 'Adjust Notional' else 1
-        notional1 = [1000000.0] * len(tarf['TARF_ExpiryDates'])
-        notional2 = [1000000.0] * len(tarf['TARF_ExpiryDates'])
-        strike = tarf['Strike_Price']
-
-        accumulatedValue = 0.0
-        isCallOption = tarf['Option_Type'] == 'Call'
-
-        timeSteps = 100
-        invertedTarget = tarf['InvertedTarget']
-
-        # LOCAL VARIABLES
-        callOrPut = 2.0 * isCallOption - 1.0
-        accumulated = accumulatedValue
-        barrierIsHit = 1
-        intrinsicValue = 0.0
-        intrinsicValueInverted = 0.0
-        adjustedStrike = 0.0
-        barrierIntrinsic = 0.0
-        t = 0
-        tMax = len(S)
-
-        terminationEvent = 0
-        settlementValue = 0.0
-        previousAccumulated = accumulatedValue
-        accumulatedVsTarget = 0.0
-        zeroComparison = 0.00000001
-        notionalAdjustmentFactor = 1.0
-        settlementNotional = 1.0
-
-        # MAIN LOOP
-        terminationEvent = 0
-        accumulated = accumulatedValue
-        mtm_list = []
-        discount_block = utils.calc_time_grid_curve_rate(
-            deal_data.Factor_dep['Discount'], np.array([[0, 0, 0]]), shared)
-        daycount_fn(sim_samples[:, utils.TIME_GRID_MTM])
-
-        for t in range(tMax):
-            if 1:
-                previousAccumulated = accumulated
-                intrinsicValue = (S[t] - strike) * callOrPut
-                barrierIsHit = 1
-                positive_iv = 1.0 * (intrinsicValue > 0.0)
-                settlementNotional = notional1[t]
-                if invertedTarget:
-                    intrinsicValueInverted = (1.0 / S[t] - 1.0 / strike) * callOrPut * (-1.0)
-                    accumulated = accumulated + intrinsicValueInverted
-                    adjustedStrike = 1.0 / ((1.0 / S[t]) - (targetValue - previousAccumulated) * callOrPut * (-1.0))
-                    notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValueInverted
-                else:
-                    accumulated = accumulated + intrinsicValue
-                    adjustedStrike = S[t] - (targetValue - previousAccumulated) * callOrPut
-                    notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValue
-
-                accumulatedVsTarget = targetValue - accumulated
-                if targetAdjustment == 1:
-                    intrinsicValue = (S[t] - adjustedStrike) * callOrPut
-                elif targetAdjustment == 2:
-                    settlementNotional = settlementNotional * notionalAdjustmentFactor
-
-                positive_val = settlementNotional * intrinsicValue
-                if barrier > zeroComparison:
-                    barrierIntrinsic = (barrier - S[t]) * callOrPut
-                    barrierIsHit = 1.0 * (barrierIntrinsic >= 0.0)
-
-                negative_val = notional2[t] * intrinsicValue * barrierIsHit
-                mtm_list.append(
-                    (1 - terminationEvent) * (positive_iv * positive_val + (1 - positive_iv) * negative_val))
-                terminationEvent = 1.0 * (accumulatedVsTarget < zeroComparison)
-        mtm_list = torch.stack(mtm_list)
-
-        manual_list = []
-        for s in S[t]:
-            terminationEvent = 0
-            accumulated = accumulatedValue
-            sim = []
-            for t in range(tMax):
-                if not terminationEvent:
-                    previousAccumulated = accumulated
-                    intrinsicValue = (s - strike) * callOrPut
-                    barrierIsHit = 1
-
-                    if intrinsicValue > 0.0:
-                        # The ITM side, which is where we compare to the Target Level.
-                        settlementNotional = notional1[t]
-                        if invertedTarget:
-                            intrinsicValueInverted = (1.0 / s - 1.0 / strike) * callOrPut * (-1.0)
-                            accumulated = accumulated + intrinsicValueInverted
-                            adjustedStrike = 1.0 / (
-                                    (1.0 / s) - (targetValue - previousAccumulated) * callOrPut * (-1.0))
-                            notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValueInverted
-                        else:
-                            accumulated = accumulated + intrinsicValue
-                            adjustedStrike = s - (targetValue - previousAccumulated) * callOrPut
-                            notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValue
-
-                        accumulatedVsTarget = targetValue - accumulated
-                        if accumulatedVsTarget < zeroComparison:
-                            terminationEvent = 1
-                            if targetAdjustment == 1:
-                                intrinsicValue = (s - adjustedStrike) * callOrPut
-                            elif targetAdjustment == 2:
-                                settlementNotional = settlementNotional * notionalAdjustmentFactor
-
-                        settlementValue = settlementNotional * intrinsicValue
-                    else:
-                        # The OTM side, which is where we check against a potential barrier
-                        if barrier > zeroComparison:
-                            barrierIntrinsic = (barrier - s) * callOrPut
-                            if barrierIntrinsic < 0.0:
-                                barrierIsHit = 0
-                        settlementValue = notional2[t] * intrinsicValue * barrierIsHit
-                    # CASHFLOW
-                    sim.append(settlementValue)
-                else:
-                    sim.append(torch.tensor(0.0))
-            manual_list.append(torch.stack(sim))
-            # cashFlow(t, settlementValue)
-
-        manual_list = torch.stack(manual_list).T
-
-        discount_rates = torch.squeeze(
-            utils.calc_discount_rate(
-                discount_block, sim_samples[:, utils.TIME_GRID_MTM].reshape(-1, 1), shared),
-            axis=1)
-        #
-        # cash = nominal * theo_price
-        # mtm_list.append(cash * discount_rates)
-
-        mtm = discount_rates * torch.stack(mtm_list)
         return mtm
 
 
