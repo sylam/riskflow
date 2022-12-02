@@ -164,6 +164,7 @@ def calibrate_PFE(arena_path, rundate, scratch="Z:\\"):
     aa.calibrate_factors(
         start_date, end_date, to_calibrate, smooth=smoothing_std, correlation_cuttoff=0.1, overwrite_correlations=True)
 
+
 def compress(data):
     import joblib
     # t=data['Calc']['Deals']['Deals']['Children'][0]['Children'][1121]['Instrument'].field
@@ -186,7 +187,7 @@ def compress(data):
                 eq_unders.setdefault(key_tag, []).append(k)
             else:
                 under_eq = eq_swap_ref[k['Instrument'].field['Reference']]
-                ir_unders.setdefault(key_tag+(under_eq,), []).append(k)
+                ir_unders.setdefault(key_tag + (under_eq,), []).append(k)
 
         # now compress
         eq_compressed = {}
@@ -198,7 +199,7 @@ def compress(data):
                     cf_list[key] = cf_list.setdefault(key, 0.0) + cf['Amount']
 
             # edit the last deal
-            deal['Instrument'].field['Cashflows']['Items'] = [dict(k+(('Amount', v),)) for k, v in cf_list.items()]
+            deal['Instrument'].field['Cashflows']['Items'] = [dict(k + (('Amount', v),)) for k, v in cf_list.items()]
             deal['Instrument'].field['Reference'] = 'COMPRESSED_{}_{}'.format(
                 deal['Instrument'].field['Buy_Sell'], deal['Instrument'].field['Equity'])
             eq_compressed.setdefault(deal['Instrument'].field['Equity'], []).append(deal)
@@ -267,14 +268,14 @@ if __name__ == '__main__':
              os.path.join('S:\\CCR_Tagged', folder),
              os.path.join('N:\\Archive', folder)])
 
-    # path_json = paths['CVA_JSON']
-    path_json = paths['JSON']
+    path_json = paths['CVA_JSON']
+    # path_json = paths['JSON']
     # path = paths['CVA_UAT']
     # path = paths['CVA']
     path = paths['PFE']
 
     # rundate = '2022-10-12'
-    rundate = '2022-10-20'
+    rundate = '2022-11-22'
     # rundate = '2021-09-14'
     # calibrate_PFE(path, rundate)
     # bootstrap(path, rundate, reuse_cal=True)
@@ -309,11 +310,15 @@ if __name__ == '__main__':
         'EUR': {'collateral': 'EUR-ESTR', 'funding': 'EUR-EURIBOR-3M'}}
 
     # for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Commerzbank_AG_FFT_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris*.json')):
-    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_NatWest_Markets_Plc*.json')):
+    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Standard_Bank_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, '*otus*.json')):
         cx.load_json(json, compress=True)
+        if 'GBMAssetPriceModel.EUR_SX5E' not in cx.current_cfg.params['Price Models']:
+            cx.current_cfg.params['Price Models']['GBMAssetPriceModel.EUR_SX5E'] = cx.current_cfg.params[
+                'Price Models']['GBMAssetPriceModel.EUR_SX5EEX']
 
         if not cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             print('no children for crb {} - skipping'.format(json))
@@ -338,9 +343,9 @@ if __name__ == '__main__':
             'Generate_Cashflows': 'No',
             # 'Currency': 'USD',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
-            'Batch_Size': 256*32,
+            'Batch_Size': 256 * 2,
             'Simulation_Batches': 1,
-            'COLLVA': {'Gradient': 'Yes'},
+            'COLLVA': {'Gradient': 'No'},
             'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}
         }
 
@@ -375,12 +380,21 @@ if __name__ == '__main__':
         collva_sect['Funding_Spread'] = collva_sect.get(
             'Funding_Spread', spreads[agreement_currency]['FVA@Income']['funding'])
         cx.current_cfg.deals['Calculation']['Collateral_Valuation_Adjustment'] = collva_sect
+
+        if 'Funding_Valuation_Adjustment' in cx.current_cfg.deals['Calculation']:
+            del cx.current_cfg.deals['Calculation']['Funding_Valuation_Adjustment']
+
+        for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
+            #if i['Instrument'].field['Reference'] != '118817458':
+            if not i['Instrument'].field['Object'].startswith('QEDI'):
+            # if not i['Instrument'].field['Reference'].startswith('ZARSPI'):
+                i['Ignore'] = 'True'
+            else:
+                i['Ignore'] = 'False'
+
         calc, out = cx.Base_Valuation()
-        try:
-            calc, out = cx.run_job(overrides)
-        except KeyError as k:
-            print('sad')
-        out['Results']['collateral_profile'].to_csv(outfile)
+        # calc, out = cx.run_job(overrides)
+        # out['Results']['collateral_profile'].to_csv(outfile)
         # calc, out = cx.Base_Valuation()
         # out['Results']['mtm'].to_csv(outfile)
 
@@ -393,8 +407,9 @@ if __name__ == '__main__':
             if 0:
                 myval = float(me.head(1)['Value'])
 
-                if adaptiv != 0 and np.abs((adaptiv-myval)/adaptiv).max() > 0.01:
-                    print('Mismatch - Collateralized is {}, '.format(ns.field['Collateralized']), outfile, adaptiv, myval)
+                if adaptiv != 0 and np.abs((adaptiv - myval) / adaptiv).max() > 0.01:
+                    print('Mismatch - Collateralized is {}, '.format(ns.field['Collateralized']), outfile, adaptiv,
+                          myval)
                     if ns.field['Collateralized'] != 'True':
                         print('investigate', json)
             else:

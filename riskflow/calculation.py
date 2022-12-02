@@ -132,6 +132,7 @@ class DealStructure(object):
             deal_tensors = 0.0
 
             for deal_data in self.dependencies:
+                logging.root.name = deal_data.Instrument.field.get('Reference', 'root')
                 mtm = deal_data.Instrument.calculate(shared, time_grid, deal_data)
                 deal_tensors += mtm
 
@@ -140,6 +141,7 @@ class DealStructure(object):
         # postprocessing code for working out the mtm of all deals, collateralization etc..
         if hasattr(self.obj.Instrument, 'post_process'):
             # the actual answer for this netting set
+            logging.root.name = self.obj.Instrument.field.get('Reference', 'root')
             accum = self.obj.Instrument.post_process(accum, shared, time_grid, self.obj, self.dependencies)
 
         return accum

@@ -786,9 +786,9 @@ class NettingCollateralSet(Deal):
                         np.searchsorted(t, call_dates + self.field['Settlement_Period'], side='right').astype(
                             np.int32) - 1).clip(0, time_grid.mtm_time_grid.size - 1)
                 field_index['Te'] = (
-                        np.searchsorted(t,
-                                        call_dates + self.field['Settlement_Period'] + self.field['Liquidation_Period'],
-                                        side='right').astype(np.int32) - 1).clip(0, time_grid.mtm_time_grid.size - 1)
+                        np.searchsorted(
+                            t, call_dates + self.field['Settlement_Period'] + self.field['Liquidation_Period'],
+                            side='right').astype(np.int32) - 1).clip(0, time_grid.mtm_time_grid.size - 1)
             else:
                 field_index['Ts'] = (
                         np.searchsorted(t,
@@ -902,8 +902,10 @@ class NettingCollateralSet(Deal):
 
             if self.options['Exclude_Paid_Today']:
                 mtm_today_adj = (
-                    Cf_Rec[factor_dep['Te']] - F.pad(Cf_Rec[factor_dep['Te'][1:] - 1], [0, 0, 1, 0])) - (
-                    Cf_Pay[factor_dep['Te']] - F.pad(Cf_Pay[factor_dep['Te'][1:] - 1], [0, 0, 1, 0]))
+                                        Cf_Rec[factor_dep['Te']] - F.pad(Cf_Rec[factor_dep['Te'][1:] - 1],
+                                                                         [0, 0, 1, 0])) - (
+                                        Cf_Pay[factor_dep['Te']] - F.pad(Cf_Pay[factor_dep['Te'][1:] - 1],
+                                                                         [0, 0, 1, 0]))
 
                 Vte -= mtm_today_adj
 
@@ -943,7 +945,7 @@ class NettingCollateralSet(Deal):
 
             if len(factor_dep['Cash_Collateral']) == 1 and factor_dep['Cash_Collateral'][0].Collateral_Rate is not None:
                 cash_col = factor_dep['Cash_Collateral'][0]
-                cash_rep = utils.calc_time_grid_spot_rate(cash_col.Currency, deal_time, shared)/fx_base
+                cash_rep = utils.calc_time_grid_spot_rate(cash_col.Currency, deal_time, shared) / fx_base
                 mtm_grid = deal_time[:, utils.TIME_GRID_MTM]
 
                 # calculate collateral valuation adjustment
@@ -1033,6 +1035,9 @@ class MtMCrossCurrencySwapDeal(Deal):
 
         if not self.child_map:
             for index, child in enumerate(child_dependencies):
+                # check if there are compounding resets - if so, remove it
+                child.Factor_dep['Cashflows'] = utils.compress_no_compounding(
+                    child.Factor_dep['Cashflows'], groupsize=1, check_resets=False)
                 # make the child price to the same grid as the parent
                 child.Time_dep.assign(deal_data.Time_dep)
                 # work out which leg is which
@@ -1452,10 +1457,10 @@ class SwapInterestDeal(Deal):
 
     def reset(self, calendars):
         super(SwapInterestDeal, self).reset()
-        self.paydates = generate_dates_backward(self.field['Maturity_Date'], self.field['Effective_Date'],
-                                                self.field['Pay_Frequency'])
-        self.recdates = generate_dates_backward(self.field['Maturity_Date'], self.field['Effective_Date'],
-                                                self.field['Receive_Frequency'])
+        self.paydates = generate_dates_backward(
+            self.field['Maturity_Date'], self.field['Effective_Date'], self.field['Pay_Frequency'])
+        self.recdates = generate_dates_backward(
+            self.field['Maturity_Date'], self.field['Effective_Date'], self.field['Receive_Frequency'])
         self.add_reval_dates(self.paydates, self.field['Currency'])
         self.add_reval_dates(self.recdates, self.field['Currency'])
         # this swap could be quantoed - TODO
@@ -2486,6 +2491,7 @@ class EquityOptionDeal(Deal):
 
 class QEDI_CustomAutoCallSwap(Deal):
     factor_fields = {'Currency': ['FxRate'],
+                     'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
@@ -2494,24 +2500,12 @@ class QEDI_CustomAutoCallSwap(Deal):
 
     def __init__(self, params, valuation_options):
         super(QEDI_CustomAutoCallSwap, self).__init__(params, valuation_options)
-        self.path_dependent = True
 
     def reset(self, calendars):
         super(QEDI_CustomAutoCallSwap, self).reset()
-        self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
-
-    def add_grid_dates(self, parser, base_date, grid):
-        # we need to monitor the option for potential early exercise
-        if isinstance(grid, str):
-            grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
-            self.reval_dates.update(grid_dates)
-            self.settlement_currencies.setdefault(self.field['Currency'], set()).update(grid_dates)
-        else:
-            for curr, cash_flow in self.settlement_currencies.items():
-                last_pmt = max(cash_flow)
-                delta = set([x for x in grid if x < last_pmt])
-                self.settlement_currencies[curr].update(delta)
-                self.reval_dates.update(delta)
+        floatdates = set([x[0] for x in self.field.get('Autocall_Floating', [])])
+        coupondates = set([x[0] for x in self.field['Autocall_Coupons']])
+        self.add_reval_dates(coupondates.union(floatdates), self.field['Payoff_Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
@@ -2521,9 +2515,26 @@ class QEDI_CustomAutoCallSwap(Deal):
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
         field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
 
+        # merge all the dates
+        all_dates = sorted(
+            reduce(set.union, [
+                set([x[0] for x in self.field['Autocall_Coupons']]),
+                set([x[0] for x in self.field['Price_Fixing']]),
+                set([x[0] for x in self.field['Barrier_Dates']]),
+                set([x[0] for x in self.field.get('Autocall_Floating', [])])
+            ])
+        )
+
+        # create lookups
+        pf = dict(self.field['Price_Fixing'])
+        ac = dict(self.field['Autocall_Coupons'])
+        at = dict(self.field['Autocall_Thresholds'])
+        af = dict(self.field.get('Autocall_Floating', []))
+        ab = dict(self.field.get('Barrier_Dates'))
+
         field_index = {
             'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-            'SettleCurrency': self.field['Currency'],
+            'SettleCurrency': self.field['Payoff_Currency'],
             'Discount': get_discount_factor(
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
@@ -2535,8 +2546,13 @@ class QEDI_CustomAutoCallSwap(Deal):
                 field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Strike_Price': self.field['Strike_Price'],
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
-            'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
-            'Option_Style': self.field['Option_Style'],
+            'Fixings': utils.make_fixing_data(
+                base_date, time_grid, [[x, pf.get(x, -1)] for x in all_dates]),
+            'Price_Fixing': [pf.get(x, -1) for x in all_dates],
+            'Autocall_Thresholds': [at.get(x, -1) for x in all_dates],
+            'Autocall_Floating': [af.get(x, -1) for x in all_dates],
+            'Autocall_Coupons': [ac.get(x, -1) for x in all_dates],
+            'Barrier_Dates': [ab.get(x, -1) for x in all_dates],
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
@@ -2551,11 +2567,11 @@ class QEDI_CustomAutoCallSwap(Deal):
         forward = utils.calc_eq_forward(
             deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
             deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
+
         moneyness = spot / deal_data.Factor_dep['Strike_Price']
 
-        if deal_data.Factor_dep['Option_Style'] == 'European':
-            mtm = pricing.pv_european_option(
-                shared, time_grid, deal_data, 1.0, moneyness, forward) * fx_rep
+        mtm = pricing.pv_MC_AutoCallSwap(
+            shared, time_grid, deal_data, spot, moneyness) * fx_rep
 
         return mtm
 

@@ -1330,6 +1330,14 @@ def calc_realized_dividends(equity, repo, div_yield, div_resets, shared, offsets
             S * torch.exp(torch.cumsum(sr, axis=0).flip(0)) * (1 - sq.reshape(-1, 1)), axis=0)
 
 
+def calc_eq_drift(repo, div_yield, weights, time_grid, shared, multiply_by_time=True):
+    repo_curve_grid = calc_time_grid_curve_rate(repo, time_grid, shared)
+    div_curve_grid = calc_time_grid_curve_rate(div_yield, time_grid, shared)
+    return repo_curve_grid.gather_weighted_curve(
+        shared, weights, multiply_by_time=multiply_by_time) - div_curve_grid.gather_weighted_curve(
+        shared, weights, multiply_by_time=multiply_by_time)
+
+
 def calc_eq_forward(equity, repo, div_yield, T, time_grid, shared, only_diag=False):
     T_scalar = isinstance(T, int)
     key_code = ('eqforward', equity[0], div_yield[0][:2], only_diag,
@@ -2231,10 +2239,10 @@ def make_fixing_data(reference_date, time_grid, fixings):
         Start_Day = Reset_Day
         End_Day = Reset_Day
         Time_Grid, Scenario = time_grid.get_scenario_offset(Reset_Day)
-        # only add a reset if its in the past
+        # only add a reset if it's in the past
         all_resets.append(
             [Time_Grid, Reset_Day, -1, Start_Day, End_Day, 1.0,
-             fixing[2] if fixing[0] < reference_date else 0.0, 0.0])
+             fixing[-1] if fixing[0] < reference_date else 0.0, 0.0])
         reset_scenario_offsets.append(Scenario)
 
     return TensorResets(all_resets, reset_scenario_offsets)
@@ -2812,7 +2820,7 @@ def compress_deal_data(deals):
     return reduced_deals
 
 
-def compress_no_compounding(cashflows, groupsize):
+def compress_no_compounding(cashflows, groupsize, check_resets=True):
     cash_pmts, cash_index, cash_counts = np.unique(
         cashflows.schedule[:, CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
 
@@ -2826,8 +2834,8 @@ def compress_no_compounding(cashflows, groupsize):
             reset_offset = cashflows.offsets[index:index + num_cf, 1]
             nominals = np.unique(cashflow_schedule[:, CASHFLOW_INDEX_Nominal])
             margins = np.unique(cashflow_schedule[:, CASHFLOW_INDEX_FloatMargin])
-            if nominals.size <= groupsize and margins.size <= groupsize and not (
-                    cashflows.Resets[reset_offset, RESET_INDEX_Reset_Day] < 0).any():
+            if nominals.size <= groupsize and margins.size <= groupsize and (check_resets and not (
+                    cashflows.Resets[reset_offset, RESET_INDEX_Reset_Day] < 0).any() or not check_resets):
 
                 # we can compress this
                 for cash_group, ofs_group in zip(*map(
