@@ -202,12 +202,12 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
             swaption_price = vol_surface.get_premium(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
             if vol_surface.delta:
                 implied_vol = scipy.optimize.brentq(lambda v: pvbp * utils.black_european_option_price(
-                    shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol+.5)
+                    shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol + .5)
                 swaption_price = pvbp * utils.black_european_option_price(
-                    shifted_strike, shifted_strike, 0.0, implied_vol+vol_surface.delta, expiry, 1.0, 1.0)
+                    shifted_strike, shifted_strike, 0.0, implied_vol + vol_surface.delta, expiry, 1.0, 1.0)
         else:
             swaption_price = pvbp * utils.black_european_option_price(
-                shifted_strike, shifted_strike, 0.0, vol+vol_surface.delta, expiry, 1.0, 1.0)
+                shifted_strike, shifted_strike, 0.0, vol + vol_surface.delta, expiry, 1.0, 1.0)
 
         # store this
         all_deals[swaption_name] = market_swap_class(
@@ -377,38 +377,48 @@ class GBMAssetPriceTSModelParameters(object):
         '''
         Checks for Declining variance in the ATM vols of the relevant price factor and corrects accordingly.
         '''
+        eq_vols = {}
+        fx_vols = {}
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
             market_factor = utils.Factor(rate[0], rate[1:])
 
             if market_factor.type == 'GBMAssetPriceTSModelPrices':
                 # get the vol surface
-                vol_factor = utils.Factor('FXVol', utils.check_rate_name(
-                    implied_params['instrument']['Asset_Price_Volatility']))
+                implied_param = utils.check_rate_name(implied_params['instrument']['Asset_Price_Volatility'])
+                if 'FXVol.' + implied_params['instrument']['Asset_Price_Volatility'] in price_factors:
+                    vol_factor = utils.Factor('FXVol', utils.check_rate_name(
+                        implied_params['instrument']['Asset_Price_Volatility']))
+                    is_fx = True
+                else:
+                    vol_factor = utils.Factor('EquityPriceVol', utils.check_rate_name(
+                        implied_params['instrument']['Asset_Price_Volatility']))
+                    is_fx = False
+
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
-                    fxvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
+                    vol_surface = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
                 except Exception:
                     logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
                     continue
 
-                mn_ix = np.searchsorted(fxvol.moneyness, 1.0)
-                atm_vol = [np.interp(1, fxvol.moneyness[mn_ix - 1:mn_ix + 1], y) for y in
-                           fxvol.get_vols()[:, mn_ix - 1:mn_ix + 1]]
+                mn_ix = np.searchsorted(vol_surface.moneyness, 1.0)
+                atm_vol = [np.interp(1, vol_surface.moneyness[mn_ix - 1:mn_ix + 1], y) for y in
+                           vol_surface.get_vols()[:, mn_ix - 1:mn_ix + 1]]
 
                 # store the output
                 price_param = utils.Factor(self.__class__.__name__, market_factor.name)
                 model_param = utils.Factor('GBMAssetPriceTSModelImplied', market_factor.name)
 
-                if fxvol.expiry.size > 1:
-                    dt = np.diff(np.append(0, fxvol.expiry))
-                    var = fxvol.expiry * np.array(atm_vol) ** 2
+                if vol_surface.expiry.size > 1:
+                    dt = np.diff(np.append(0, vol_surface.expiry))
+                    var = vol_surface.expiry * np.array(atm_vol) ** 2
                     sig = atm_vol[:1]
                     vol = atm_vol[:1]
                     var_tm1 = var[0]
                     fixed_variance = False
 
-                    for var_t, delta_t, t_i in zip(var[1:], dt[1:] / 3.0, fxvol.expiry[1:]):
+                    for var_t, delta_t, t_i in zip(var[1:], dt[1:] / 3.0, vol_surface.expiry[1:]):
                         M = var_tm1 + delta_t * (sig[-1] ** 2)
                         if var_t < M:
                             fixed_variance = True
@@ -427,12 +437,31 @@ class GBMAssetPriceTSModelParameters(object):
                 else:
                     vol = atm_vol
 
-                price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
-                    [('Property_Aliases', None),
-                     ('Vol', utils.Curve(['Integrated'], list(zip(fxvol.expiry, vol)))),
-                     ('Quanto_FX_Volatility', None),
-                     ('Quanto_FX_Correlation', 0.0)])
-                price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
+                if is_fx:
+                    fx_vols[rate[-1]] = [utils.Curve(['Integrated'], list(zip(vol_surface.expiry, vol))), implied_param]
+                    price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
+                        [('Property_Aliases', None),
+                         ('Vol', fx_vols[rate[-1]][0]),
+                         ('Quanto_FX_Volatility', None),
+                         ('Quanto_FX_Correlation', 0.0)])
+                    price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
+                else:
+                    price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
+                        [('Property_Aliases', None),
+                         ('Vol', utils.Curve(['Integrated'], list(zip(vol_surface.expiry, vol)))),
+                         ('Quanto_FX_Volatility', None),
+                         ('Quanto_FX_Correlation', 0.0)])
+                    price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
+                    # store this for later quanto correction
+                    eq_vols[rate[-1]] = [utils.check_tuple_name(price_param), implied_param[-1]]
+
+        for k, v in eq_vols.items():
+            # set the quanto volatility
+            if v[1] in fx_vols:
+                price_factors[v[0]]['Quanto_FX_Volatility'] = fx_vols[v[1]][0]
+                price_factors[v[0]]['Quanto_FX_Correlation'] = price_factors.get(
+                    'Correlation.EquityPrice.{}.{}/FxRate.{}.{}'.format(
+                        k, v[1], *fx_vols[v[1]][1]), {'Value': 0.0})['Value']
 
 
 class RiskNeutralInterestRateModel(object):
