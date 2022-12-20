@@ -658,11 +658,19 @@ class GBMAssetPriceTSModelParameters(Factor1D):
         return self.param['Vol'].array[:, 0]
 
     def get_tenor_indices(self):
-        return {'Vol': self.param['Vol'].array[:, 0].reshape(-1, 1)}
+        if self.param.get('Quanto_FX_Correlation', 0.0):
+            return {'Vol': self.param['Vol'].array[:, 0].reshape(-1, 1),
+                    'Quanto_FX_Correlation': np.array([[0.0]])}
+        else:
+            return {'Vol': self.param['Vol'].array[:, 0].reshape(-1, 1)}
 
     def current_value(self, tenors=None, offset=0.0):
         """Returns the parameters of the GBM factor model as a dictionary"""
-        return {'Vol': self.param['Vol'].array[:, 1]}
+        if self.param.get('Quanto_FX_Correlation', 0.0):
+            return {'Vol': self.param['Vol'].array[:, 1],
+                    'Quanto_FX_Correlation': np.array([self.param['Quanto_FX_Correlation']])}
+        else:
+            return {'Vol': self.param['Vol'].array[:, 1]}
 
 
 class HullWhite2FactorModelParametersJacobian(Factor1D):

@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 # Internal modules
 from . import utils
-from .instruments import get_fx_zero_rate_factor
+from .instruments import get_fx_zero_rate_factor, get_equity_zero_rate_factor, get_dividend_rate_factor
 
 
 def piecewise_linear(t, tenor, values, shared):
@@ -117,7 +117,7 @@ class StochasticProcess(object):
         self.param = param
         self.params_ok = True
 
-    def link_references(self, implied_tensor, implied_var, implied_ofs):
+    def link_references(self, implied_tensor, implied_var, implied_ofs, implied_factors):
         """link market variables across different risk factors"""
         pass
 
@@ -237,6 +237,10 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
     def __init__(self, factor, param, implied_factor=None):
         super(GBMAssetPriceTSModelImplied, self).__init__(factor, param)
         self.implied = implied_factor
+        # get the name of the underlying factor
+        self.factor_type = self.factor.__class__.__name__
+        # potentially handle quanto fx volatility
+        self.quanto_fx_tenor = None
 
     @staticmethod
     def num_factors():
@@ -244,7 +248,12 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         def calc_vol(t, v, dt, m):
+            ''' sympy.simplify(sympy.integrate((v + m * (s - t)) ** 2 , (s, t, t + dt))) '''
             return dt * (dt ** 2 * m ** 2 / 3 + dt * m * v + v ** 2)
+
+        def cal_quanto_fx_vol(t, vi, vj, dt, mi, mj):
+            ''' sympy.simplify(sympy.integrate((vi + mi * (s - t)) * (vj + mj * (s - t)), (s, t, t + dt))) '''
+            return dt * (2 * dt ** 2 * mi * mj + 3 * dt * mi * vj + 3 * dt * mj * vi + 6 * vi * vj) / 6
 
         # store randomnumber id's
         self.z_offset = process_ofs
@@ -260,13 +269,47 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         self.spot = tensor
         # store the scenario grid
         self.scen_grid = time_grid.scenario_grid
+        # check if we need to calculate the quanto fx vol
+        if self.factor_type == 'EquityPrice' and self.quanto_fx_tenor is not None:
+            # need to get the quantofx rate if necessary
+            self.C = torch.unsqueeze(integrate_piecewise_linear(
+                (cal_quanto_fx_vol, 1.0), shared, time_grid.time_grid_years,
+                vol_tenor, implied_tensor['Vol'], self.quanto_fx_tenor, implied_tensor['Quanto_FX_Volatility']),
+                axis=1)
+            self.rho = implied_tensor['Quanto_FX_Correlation']
+        else:
+            self.C = 0.0
+            self.rho = 0.0
+
+    def link_references(self, implied_tensor, implied_var, implied_ofs, implied_factors):
+        """link market variables across different risk factors"""
+        if self.factor_type == 'EquityPrice':
+            fx_implied_index = implied_ofs.get(utils.Factor('FxRate', self.factor.get_currency()))
+            if fx_implied_index is not None:
+                FXImplied_vol_factor = utils.Factor(
+                    'GBMAssetPriceTSModelParameters', self.factor.get_currency() + ('Vol',))
+                # now set the Quanto_FX_Volatility to the same vol as the fx rate
+                implied_tensor['Quanto_FX_Volatility'] = implied_var[fx_implied_index][FXImplied_vol_factor]
+                if self.implied.param['Quanto_FX_Volatility'] is not None:
+                    self.quanto_fx_tenor = self.implied.param['Quanto_FX_Volatility'].array[:, 0]
+                else:
+                    self.quanto_fx_tenor = implied_factors[
+                        utils.Factor('GBMAssetPriceTSModelParameters', self.factor.get_currency())].get_tenor()
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         # this is valid for FX factors only - can change this to equities etc. by changing the get_XXX_factor
         # function below
-        self.r_t = get_fx_zero_rate_factor(
-            self.factor.get_domestic_currency(None), static_ofs, stoch_ofs, all_tenors, all_factors)
-        self.q_t = get_fx_zero_rate_factor(factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
+        if self.factor_type == 'EquityPrice':
+            self.r_t = get_equity_zero_rate_factor(
+                factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
+            self.q_t = get_dividend_rate_factor(
+                factor.name, static_ofs, stoch_ofs, all_tenors)
+        elif self.factor_type == 'FxRate':
+            self.r_t = get_fx_zero_rate_factor(
+                self.factor.get_domestic_currency(None), static_ofs, stoch_ofs, all_tenors, all_factors)
+            self.q_t = get_fx_zero_rate_factor(factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
+        else:
+            raise Exception('Unknown factor type {}'.format(self.factor_type))
 
     @property
     def correlation_name(self):
@@ -284,7 +327,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
 
         drift = torch.cumsum(torch.squeeze(rt_rates - qt_rates, axis=1), axis=0)
 
-        return self.spot * torch.exp(drift - 0.5 * self.V + f1)
+        return self.spot * torch.exp(drift - self.rho * self.C - 0.5 * self.V + f1)
 
 
 class GBMPriceIndexModel(StochasticProcess):
@@ -411,7 +454,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         self.implied = implied_factor
         self.cache = {}
 
-    def link_references(self, implied_tensor, implied_var, implied_ofs):
+    def link_references(self, implied_tensor, implied_var, implied_ofs, implied_factors):
         """link market variables across different risk factors"""
         fx_implied_index = implied_ofs.get(utils.Factor('FxRate', self.factor.get_currency()))
         if fx_implied_index is not None:

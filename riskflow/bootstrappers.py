@@ -446,22 +446,18 @@ class GBMAssetPriceTSModelParameters(object):
                          ('Quanto_FX_Correlation', 0.0)])
                     price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
                 else:
+                    quanto_fx_corr = price_factors.get(
+                        'Correlation.EquityPrice.{}.{}/FxRate.{}.{}'.format(
+                            rate[-1], implied_param[-1], *sorted([sys_params['Base_Currency'], implied_param[-1]])),
+                        {'Value': 0.0})['Value']
                     price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
                         [('Property_Aliases', None),
                          ('Vol', utils.Curve(['Integrated'], list(zip(vol_surface.expiry, vol)))),
                          ('Quanto_FX_Volatility', None),
-                         ('Quanto_FX_Correlation', 0.0)])
+                         ('Quanto_FX_Correlation', quanto_fx_corr)])
                     price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
                     # store this for later quanto correction
                     eq_vols[rate[-1]] = [utils.check_tuple_name(price_param), implied_param[-1]]
-
-        for k, v in eq_vols.items():
-            # set the quanto volatility
-            if v[1] in fx_vols:
-                price_factors[v[0]]['Quanto_FX_Volatility'] = fx_vols[v[1]][0]
-                price_factors[v[0]]['Quanto_FX_Correlation'] = price_factors.get(
-                    'Correlation.EquityPrice.{}.{}/FxRate.{}.{}'.format(
-                        k, v[1], *fx_vols[v[1]][1]), {'Value': 0.0})['Value']
 
 
 class RiskNeutralInterestRateModel(object):

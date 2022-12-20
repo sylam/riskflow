@@ -522,16 +522,7 @@ class Credit_Monte_Carlo(Calculation):
                 else:
                     implied_obj = None
             except KeyError as e:
-                logging.warning(
-                    'Implied Factor {0} missing in market data file - Attempting to Proxy with EUR-MASTER'.format(
-                        e.args))
-                # Hardcoding - Fix this - TODO
-                proxy_factor = utils.Factor(implied_factor.type, ('EUR-MASTER',))
-                self.config.params['Price Factors'][utils.check_tuple_name(implied_factor)] = \
-                    self.config.params['Price Factors'][utils.check_tuple_name(proxy_factor)]
-                implied_obj = construct_factor(
-                    implied_factor, self.config.params['Price Factors'],
-                    self.config.params['Price Factor Interpolation'])
+                logging.error('Implied Factor {0} missing in market data file'.format(e.args))
 
             self.stoch_factors[price_factor] = construct_process(
                 price_model.type, factor_obj,
@@ -619,7 +610,7 @@ class Credit_Monte_Carlo(Calculation):
                 implied_index = self.implied_ofs.get(key, -1)
                 if implied_index > -1:
                     implied_tensor = {k.name[-1]: v for k, v in self.implied_var[implied_index].items()}
-                    value.link_references(implied_tensor, self.implied_var, self.implied_ofs)
+                    value.link_references(implied_tensor, self.implied_var, self.implied_ofs, self.implied_factors)
                 else:
                     implied_tensor = None
                 value.precalculate(
