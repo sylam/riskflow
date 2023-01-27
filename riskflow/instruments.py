@@ -2564,14 +2564,15 @@ class QEDI_CustomAutoCallSwap(Deal):
             deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
 
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
-        forward = utils.calc_eq_forward(
-            deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
-            deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
-
         moneyness = spot / deal_data.Factor_dep['Strike_Price']
 
-        mtm = pricing.pv_MC_AutoCallSwap(
-            shared, time_grid, deal_data, spot, moneyness) * fx_rep
+        if spot.shape[0] == deal_time.shape[0]:
+            mtm = pricing.pv_MC_AutoCallSwap(
+                shared, time_grid, deal_data, spot, moneyness) * fx_rep
+        else:
+            logging.error('AutoCall not priced due to missing equity model for {}'.format(
+                deal_data.Instrument.field['Equity']))
+            mtm = spot.new_zeros(deal_time.shape[0], shared.simulation_batch)
 
         return mtm
 

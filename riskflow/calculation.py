@@ -579,7 +579,7 @@ class Credit_Monte_Carlo(Calculation):
                 self.stoch_var.append((key, torch.tensor(
                     current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
 
-        # and then get the the static risk factors ready - these will just be looked up
+        # and then get the static risk factors ready - these will just be looked up
         for key, value in self.static_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 # check the daycount for the tenor_offset
@@ -847,7 +847,8 @@ class Credit_Monte_Carlo(Calculation):
 
         # store the params
         self.params = params
-
+        # set the name of the root logger to this netting set (makes tracking errors easier)
+        logging.root.name = self.config.deals.get('Attributes', {'Reference': 'root'}).get('Reference', 'root')
         self.batch_size = params['Batch_Size']
         self.calc_stats['Factor_Setup_Time'] = time.monotonic()
         # update the factors and obtain shared state
@@ -959,7 +960,7 @@ class Credit_Monte_Carlo(Calculation):
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
             if 'CVA' in params:
-                discount = get_interest_factor\
+                discount = get_interest_factor \
                     (utils.check_rate_name(params['Deflation_Interest_Rate']),
                      self.static_ofs, self.stoch_ofs, self.all_tenors)
                 survival = get_survival_factor(

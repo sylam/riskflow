@@ -485,8 +485,9 @@ mapping = {
                             'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption',
                             'MtMCrossCurrencySwapDeal', 'FXTARFOptionDeal']),
             'New Energy Derivative': ('default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption']),
-            'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal', 'QEDI_CustomAutoCallSwap',
-                                                  'EquitySwapletListDeal', 'EquityDiscreteExplicitAsianOption']),
+            'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal',
+                                                  'QEDI_CustomAutoCallSwap', 'EquitySwapletListDeal',
+                                                  'EquityBarrierOption', 'EquityDiscreteExplicitAsianOption']),
             'New Credit Derivative': ('default', ['DealDefaultSwap'])
         },
 
@@ -587,6 +588,10 @@ mapping = {
             'FXBarrierOption.Fields': ['Underlying_Amount', 'Barrier_Monitoring_Frequency', 'Payoff_Currency',
                                        'Barrier_Price', 'Cash_Rebate', 'Strike_Price', 'Underlying_Currency',
                                        'Buy_Sell', 'Option_Type', 'Barrier_Type', 'Expiry_Date', 'FX_Volatility',
+                                       'Discount_Rate', 'Currency'],
+            'EquityBarrierOption.Fields': ['Units', 'Barrier_Monitoring_Frequency', 'Payoff_Currency', 'Payoff_Type',
+                                       'Barrier_Price', 'Cash_Rebate', 'Strike_Price', 'Equity',
+                                       'Buy_Sell', 'Option_Type', 'Barrier_Type', 'Expiry_Date', 'Equity_Volatility',
                                        'Discount_Rate', 'Currency'],
             'SwapCurrencyDeal.Pay': ['Pay_Discount_Rate', 'Pay_Principal', 'Pay_Amortisation', 'Pay_First_Coupon_Date',
                                      'Pay_Index_Day_Count', 'Pay_Reset_Type', 'Pay_Penultimate_Coupon_Date',
@@ -706,6 +711,8 @@ mapping = {
                 ['Admin', 'EquityForwardDeal.Fields'],
             'EquityOptionDeal':
                 ['Admin', 'EquityOptionDeal.Fields'],
+            'EquityBarrierOption':
+                ['Admin', 'EquityBarrierOption.Fields'],
             'EquityDiscreteExplicitAsianOption':
                 ['Admin', 'EquityDiscreteExplicitAsianOption.Fields'],
             'FloatingEnergyDeal':

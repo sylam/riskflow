@@ -800,9 +800,11 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
     def calc_accum_value(accumulated, s, k, C, invertedTarget):
         if invertedTarget:
             iv = (1.0 / s - 1.0 / k) * C * (-1.0)
-            return accumulated + iv.unsqueeze(axis=1)
         else:
             iv = (s - k) * C
+        if isinstance(iv, float):
+            return accumulated + iv
+        else:
             return accumulated + iv.unsqueeze(axis=1)
 
     def sim_tarf(S, accumulatedValue=0.0):
@@ -937,9 +939,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
         theo_cashflow = factor_dep['Buy_Sell'] * sim_spot(
             spot_block, vols, sample_ts, drifts, accumulation, sobol=sobol)
 
-        discount_rates = torch.squeeze(
-            utils.calc_discount_rate(discount_block, fixings, shared),
-            axis=1)
+        discount_rates = utils.calc_discount_rate(discount_block, fixings, shared)
 
         theo_price = (theo_cashflow * discount_rates).sum(axis=1)
         # settle potential cashflows
@@ -1240,9 +1240,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         theo_cashflow = factor_dep['Buy_Sell'] * units * sim_spot(
             spot_block, vols, sample_ts, drifts, sample_index_t, terminationDate, sobol=sobol)
 
-        discount_rates = torch.squeeze(
-            utils.calc_discount_rate(discount_block, fixings, shared),
-            axis=1)
+        discount_rates = utils.calc_discount_rate(discount_block, fixings, shared)
 
         theo_price = (theo_cashflow * discount_rates).sum(axis=1)
         # settle potential cashflows

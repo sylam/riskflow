@@ -209,7 +209,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         '',
         '$$ \\frac{dS(t)}{S(t)} = (r(t)-q(t)-v(t)\\sigma(t)\\rho) dt + \\sigma(t) dW(t)$$',
         '',
-        'Note that no risk premium curve is captured. Its final form is:',
+        'Note that no risk premium curve is captured. For Equity factors, its final form is:',
         '',
         '$$ S(t+\\delta) = F(t,t+\\delta)exp \\Big(\\rho(C(t+\\delta)-C(t)) -\\frac{1}{2}(V(t+\\delta)) - V(t))\
          + \\sqrt{V(t+\\delta) - V(t)}Z  \\Big) $$',
@@ -231,7 +231,8 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         '',
         '$$S(t)=S(0)\\beta(t)exp\\Big(\\frac{1}{2}\\bar\\sigma(t)^2t+\\int_0^t\\sigma(s)dW(s)\\Big)$$',
         '',
-        'Here $C(t)=\\bar\\sigma(t)^2t, \\beta(t)=exp\\Big(\\int_0^t(r(s)-q(s))ds\\Big), \\rho=-1 and v(t)=\\sigma(t)$'
+        'Here $C(t)=\\bar\\sigma(t)^2t, \\beta(t)=exp\\Big(\\int_0^t(r(s)-q(s))ds\\Big), \\rho=-1$ and $v(t)=\\sigma('
+        't)$'
     ])
 
     def __init__(self, factor, param, implied_factor=None):
@@ -297,8 +298,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
                         utils.Factor('GBMAssetPriceTSModelParameters', self.factor.get_currency())].get_tenor()
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
-        # this is valid for FX factors only - can change this to equities etc. by changing the get_XXX_factor
-        # function below
+        # this is valid for FX and Equity factors only
         if self.factor_type == 'EquityPrice':
             self.r_t = get_equity_zero_rate_factor(
                 factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
