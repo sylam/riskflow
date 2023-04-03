@@ -186,7 +186,7 @@ def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
         # if shared.calc_greeks is not None:
         #    greeks(shared, deal_data, mtm)
 
-    if isinstance(mtm, torch.Tensor) and mtm.shape[0] < time_grid.mtm_time_grid.size:
+    if mtm.shape != (1, 1) and mtm.shape[0] < time_grid.mtm_time_grid.size:
         # pad it with zeros and return
         return F.pad(mtm, [0, 0, 0, time_grid.mtm_time_grid.size - deal_data.Time_dep.interp.size])
     else:
@@ -473,8 +473,14 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
     r = torch.squeeze(discounts.gather_weighted_curve(
         shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
-    barrier_payoff = buy_or_sell * nominal * barrierOption(
+    raw_payoff = barrierOption(
         sigma, expiry_years, cash_rebate / nominal, b, r, spot_prior)
+
+    # check if this was an out barrier and there was a rebate payable (in which case, clamp the payoff)
+    if direction == BARRIER_OUT and cash_rebate:
+        raw_payoff = raw_payoff.clamp(max=cash_rebate / nominal)
+
+    barrier_payoff = buy_or_sell * nominal * raw_payoff
 
     if need_spot_at_expiry:
         # work out barrier
@@ -913,8 +919,12 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
         if sample_val:
             accumulation += calc_accum_value(accumulation, sample_val, strike, callOrPut, invertedTarget)
 
+    sobol = False
     # use a quasi random generator if we are simulating a large batch
-    sobol = shared.simulation_batch > 16
+    if shared.simulation_batch > 16:
+        # reset the sobol counter (so that subsequent runs reuse the same quasi random numbers)
+        sobol = True
+        shared.reset_qrg()
 
     for index, (discount_block, spot_block, moneyness_block) in enumerate(
             utils.split_counts([discount, spot, moneyness], counts, shared)):
@@ -1211,10 +1221,15 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
     barrierIsHit = 1.0 * (deal_data.Instrument.field.get('BarrierIsHit') is not None)
 
     strike = factor_dep['Strike_Price']
-    units = deal_data.Instrument.field['Units']
-    # use a quasi random generator if we are simulating a large batch
-    sobol = shared.simulation_batch > 16
+    nominal = factor_dep['Buy_Sell'] * deal_data.Instrument.field['Units']
     terminationDate = -shared.one.new_ones(shared.simulation_batch, 1)
+
+    sobol = False
+    # use a quasi random generator if we are simulating a large batch
+    if shared.simulation_batch > 16:
+        # reset the sobol counter (so that subsequent runs reuse the same quasi random numbers)
+        sobol = True
+        shared.reset_qrg()
 
     for index, (discount_block, spot_block, moneyness_block) in enumerate(
             utils.split_counts([discount, spot, moneyness], counts, shared)):
@@ -1237,8 +1252,10 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         sample_ts = drifts.new(
             np.hstack([fixing_block[:, 0, np.newaxis], np.diff(fixing_block, axis=1)]))
 
-        theo_cashflow = factor_dep['Buy_Sell'] * units * sim_spot(
-            spot_block, vols, sample_ts, drifts, sample_index_t, terminationDate, sobol=sobol)
+        theo_cashflow = nominal * sim_spot(
+            spot_block, vols, sample_ts, drifts, sample_index_t, terminationDate,
+            # do fewer simulations if we're moving through time
+            sobol=sobol, num_sims=2048 if sobol else 4096)
 
         discount_rates = utils.calc_discount_rate(discount_block, fixings, shared)
 

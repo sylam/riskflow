@@ -192,22 +192,22 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         collva_sect = context.deals['Calculation']['Collateral_Valuation_Adjustment']
         # get the agreement currency        
         calc_currency = ns.get('Balance_Currency', 'ZAR')
-                            
+
         if 'Cash_Collateral' not in ns.get('Collateral_Assets', {}):
             # get the funding and collateral rates
             collateral_curve = collva_sect['Collateral_Curve']
             funding_curve = collva_sect['Funding_Curve']
-            
+
             if collva_sect['Collateral_Spread']:
                 collateral_curve = '{}.COLLATERAL'.format(collateral_curve)
                 context.params['Price Factors']['InterestRate.{}'.format(collateral_curve)] = makeflatcurve(
                     calc_currency, collva_sect['Collateral_Spread'])
-    
+
             if collva_sect['Funding_Spread']:
                 funding_curve = '{}.FUNDING'.format(funding_curve)
                 context.params['Price Factors']['InterestRate.{}'.format(funding_curve)] = makeflatcurve(
                     calc_currency, collva_sect['Funding_Spread'])
-    
+
             ns['Collateral_Assets'] = {
                 'Cash_Collateral': [{
                     'Currency': calc_currency,
@@ -215,9 +215,10 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
                     'Funding_Rate': funding_curve,
                     'Haircut_Posted': 0.0,
                     'Amount': 1.0}]}
-        elif len(ns['Collateral_Assets']['Cash_Collateral'])>1:
-            #make sure we just take the first definition
-            ns['Collateral_Assets']['Cash_Collateral']=[ns['Collateral_Assets']['Cash_Collateral'][0]]
+
+        elif len(ns['Collateral_Assets']['Cash_Collateral']) > 1:
+            # make sure we just take the first definition
+            ns['Collateral_Assets']['Cash_Collateral'] = [ns['Collateral_Assets']['Cash_Collateral'][0]]
 
         params_mc['COLLVA'] = collva_sect
 
@@ -233,10 +234,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         # summarize the results for easy review
         mtm = out['Results']['mtm']
         exposure = mtm.clip(0.0, np.inf)
-        dates = np.array(sorted(calc.time_grid.mtm_dates))[
-            calc.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
-
-        res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(mtm, 95, axis=1)}, index=dates)
+        res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(mtm, 95, axis=1)})
         out['Results']['exposure_profile'] = res
 
         # check if we have collva
@@ -245,7 +243,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
             collva = out['Results']['collva_t']
             coll = pd.DataFrame({
                 'Collateral(5%)': np.percentile(collateral, 5, axis=1),
-                'Expected': np.mean(collateral, axis=1), 'Cost': collva}, index=dates)
+                'Expected': np.mean(collateral, axis=1), 'Cost': collva}, index=mtm.index)
 
             out['Results']['collateral_profile'] = coll
 

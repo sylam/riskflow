@@ -81,8 +81,11 @@ class ModelParams(object):
         # valid risk factor subtypes (only Interest rates at the moment)
         self.valid_subtype = {'BasisSpread': 'BasisSpread'}
         # these models need these additional price factors
-        self.implied_models = {'GBMAssetPriceTSModelImplied': 'GBMAssetPriceTSModelParameters',
-                               'HullWhite2FactorImpliedInterestRateModel': 'HullWhite2FactorModelParameters'}
+        self.implied_models = {
+            'CSImpliedForwardPriceModel': 'CSForwardPriceModelParameters',
+            'GBMAssetPriceTSModelImplied': 'GBMAssetPriceTSModelParameters',
+            'HullWhite2FactorImpliedInterestRateModel': 'HullWhite2FactorModelParameters'
+        }
 
         self.modeldefaults = OrderedDict()
         self.modelfilters = OrderedDict()
@@ -654,6 +657,14 @@ class Context(object):
                 additional_factor = self.params['Model Configuration'].additional_factors(stoch_proc, factor)
                 if stoch_proc and factor.name[0] != self.params['System Parameters']['Base_Currency']:
                     factor_model = utils.Factor(stoch_proc, factor.name)
+                    if additional_factor and self.params['Price Factors'].get(
+                            utils.check_tuple_name(additional_factor)) is not None and utils.check_tuple_name(
+                        factor_model) not in self.params['Price Models']:
+                        # need a dummy stochastic process
+                        self.params['Price Models'][utils.check_tuple_name(factor_model)] = None
+                        logging.info(
+                            'Risk Factor {0} set to implied stochastic process {1}'.format(
+                                utils.check_tuple_name(factor), stoch_proc))
 
                     if utils.check_tuple_name(factor_model) in self.params['Price Models']:
                         stochastic_factors.setdefault(factor_model, factor)

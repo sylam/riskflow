@@ -345,6 +345,111 @@ class InterestRateJacobian(object):
                 price_factors[utils.check_tuple_name(price_param)] = jac
 
 
+class CSForwardPriceModelParameters(object):
+    documentation = (
+        'Energy',
+        ['For Risk Neutral simulation, the Clewlow Strickland Model is calibrated to a set of European Energy',
+         'futures options $J$. We use scipy',
+         'an integrated curve $\\bar{\\sigma}(t)$ needs to be specified and is',
+         'interpreted as the average volatility at time $t$. This is typically obtained from the corresponding',
+         'ATM volatility. This is then used to construct a new variance curve $V(t)$ which is defined as',
+         '$V(0)=0, V(t_i)=\\bar{\\sigma}(t_i)^2 t_i$ and $V(t)=\\bar{\\sigma}(t_n)^2 t$ for $t>t_n$ where',
+         '$t_1,...,t_n$ are discrete points on the ATM volatility curve.',
+         '',
+         'Points on the curve that imply a decrease in variance (i.e. $V(t_i)<V(t_{i-1})$) are adjusted to',
+         '$V(t_i)=\\bar\\sigma(t_i)^2t_i=V(t_{i-1})$. This curve is then used to construct *instantaneous* curves',
+         'that are then input to the corresponding stochastic process.',
+         '',
+         'The relationship between integrated $F(t)=\\int_0^t f_1(s)f_2(s)ds$ and instantaneous curves $f_1, f_2$',
+         'where the instantaneous curves are defined on discrete points $P={t_0,t_1,..,t_n}$ with $t_0=0$ is defined',
+         'on $P$ by Simpson\'s rule:',
+         '',
+         '$$F(t_i)=F(t_{i-1})+\\frac{t_i-t_{i-1}}{6}\\Big(f(t_i)+4f(\\frac{t_i+t_{i-1}}{2})+f(t_i)\\Big)$$',
+         '',
+         'and $f(t)=f_1(t)f_2(t)$. Integrated curves are flat extrapolated and linearly interpolated.'
+         ]
+    )
+
+    def __init__(self, param, device, dtype):
+        self.device = device
+        self.prec = dtype
+        self.param = param
+
+    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
+        '''
+        Checks for Declining variance in the ATM vols of the relevant price factor and corrects accordingly.
+        '''
+        def calc_error(x, options):
+            sigma, alpha = x
+            B = lambda a, t: (1.0-np.exp(-a*t))/a
+            V = lambda T, S: sigma*sigma*np.exp(-2.0*alpha*S)*B(2.0*alpha, T)
+            error = 0.0
+            for option in options:
+                error += option['Weight']*(option['Quoted_Market_Value'] - utils.black_european_option_price(
+                    option['Forward'], option['Strike'], option['r'], V(option['T'], option['S']), option['T'],
+                    option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0))**2
+            return error
+
+        for market_price, implied_params in market_prices.items():
+            rate = utils.check_rate_name(market_price)
+            market_factor = utils.Factor(rate[0], rate[1:])
+
+            if market_factor.type == 'CSForwardPriceModelPrices':
+                # get the vol surface
+                if 'ForwardPriceVol.' + implied_params['instrument']['Forward_Volatility'] in price_factors:
+                    vol_factor = utils.Factor('ForwardPriceVol', utils.check_rate_name(
+                        implied_params['instrument']['Forward_Volatility']))
+                if 'ForwardPrice.' + implied_params['instrument']['Energy'] in price_factors:
+                    energy_factor = utils.Factor('ForwardPrice', utils.check_rate_name(
+                        implied_params['instrument']['Energy']))
+                if 'InterestRate.' + implied_params['instrument']['Discount_Rate'] in price_factors:
+                    discount_factor = utils.Factor('InterestRate', utils.check_rate_name(
+                        implied_params['instrument']['Discount_Rate']))
+
+                # this shouldn't fail - if it does, need to log it and move on
+                try:
+                    vol_surface = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
+                    forward = riskfactors.construct_factor(energy_factor, price_factors, factor_interp)
+                    discount = riskfactors.construct_factor(discount_factor, price_factors, factor_interp)
+                except Exception:
+                    logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
+                    continue
+
+                # need to loop over this and create some market prices.
+                for option in implied_params['instrument']['Energy_Futures_Options']:
+                    t = discount.get_day_count_accrual(
+                        sys_params['Base_Date'], (option['Expiry_Date'] - sys_params['Base_Date']).days)
+                    d = discount.get_day_count_accrual(
+                        sys_params['Base_Date'], (option['Settlement_Date'] - sys_params['Base_Date']).days)
+                    expiry_excel = (option['Expiry_Date'] - utils.excel_offset).days
+                    settlement_excel = (option['Settlement_Date'] - utils.excel_offset).days
+                    forward_at_exp = forward.current_value(expiry_excel)
+                    forward_at_settle = forward.current_value(settlement_excel)
+                    r = discount.current_value(t)
+                    sigma = vol_surface.current_value([[t, d, 1.0]])[0]
+                    option['Strike'] = forward_at_exp
+                    option['Forward'] = forward_at_settle
+                    option['r'] = r
+                    option['S'] = d
+                    option['T'] = t
+                    option['Quoted_Market_Value'] = utils.black_european_option_price(
+                        forward_at_exp, forward_at_exp, r, sigma, t,
+                        option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0)
+
+                result = scipy.optimize.minimize(
+                    calc_error, (0.5, 0.1),
+                    args=(implied_params['instrument']['Energy_Futures_Options'],),
+                    bounds=[(0.001, 2.5), (0.001, 2.0)])
+
+                price_param = utils.Factor(self.__class__.__name__, market_factor.name)
+                # model_param = utils.Factor('GBMAssetPriceTSModelImplied', market_factor.name)
+
+                price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
+                    [('Property_Aliases', None),
+                     ('Sigma', result.x[1]),
+                     ('Alpha', result.x[0])])
+
+
 class GBMAssetPriceTSModelParameters(object):
     documentation = (
         'FX and Equity',

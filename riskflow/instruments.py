@@ -348,7 +348,7 @@ class NettingCollateralSet(Deal):
                      ('Collateral_Assets', 'Cash_Collateral', 'Currency'): ['FxRate'],
                      ('Collateral_Assets', 'Cash_Collateral', 'Funding_Rate'): ['InterestRate'],
                      ('Collateral_Assets', 'Cash_Collateral', 'Collateral_Rate'): ['InterestRate'],
-                     ('Collateral_Assets', 'Equity_Collateral', 'Equity'): ['EquityPrice'],
+                     ('Collateral_Assets', 'Equity_Collateral', 'Equity'): ['EquityPrice', 'DividendRate'],
                      ('Collateral_Assets', 'Bond_Collateral', 'Currency'): ['FxRate'],
                      ('Collateral_Assets', 'Bond_Collateral', 'Discount_Rate'): ['InterestRate']
                      }
@@ -1441,7 +1441,7 @@ class StructuredDeal(Deal):
         return pricing.interpolate(net_mtm, shared, time_grid, deal_data, interpolate_grid=False)
 
     def generate(self, shared, time_grid, deal_data):
-        return 0.0
+        return shared.one.new_zeros(1, 1)
 
 
 class SwapInterestDeal(Deal):
@@ -2350,6 +2350,7 @@ class FXDiscreteExplicitDoubleAsianOption(Deal):
 
 class EquityDiscreteExplicitAsianOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
+                     'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
@@ -2358,18 +2359,29 @@ class EquityDiscreteExplicitAsianOption(Deal):
 
     def __init__(self, params, valuation_options):
         super(EquityDiscreteExplicitAsianOption, self).__init__(params, valuation_options)
+        self.payoff_ccy = self.field['Payoff_Currency'] if 'Payoff_Currency' in self.field \
+            else self.field['Currency']
 
     def reset(self, calendars):
         super(EquityDiscreteExplicitAsianOption, self).reset()
-        self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
+        self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Equity': utils.check_rate_name(self.field['Equity'])}
+        field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency']) if self.field[
+            'Payoff_Currency'] else field['Currency']
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
         field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
+
+        if field['Payoff_Currency']!=field['Currency']:
+            fx_lookup = tuple(sorted([field['Currency'], field['Payoff_Currency']]))
+            logging.warning('QUANTO Deal - Price needs to be adjusted - !!TODO!!')
+            # field_index['FXCompoVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
+            # field_index['ImpliedCorrelation'] = get_implied_correlation(
+            #     ('FxRate',) + fx_lookup, ('ReferencePrice',) + forward_price_vol, all_factors)
 
         field_index = {
             'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
@@ -2510,6 +2522,7 @@ class QEDI_CustomAutoCallSwap(Deal):
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Payoff_Currency': utils.check_rate_name(self.field['Payoff_Currency']),
                  'Equity': utils.check_rate_name(self.field['Equity'])}
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
@@ -2534,6 +2547,7 @@ class QEDI_CustomAutoCallSwap(Deal):
 
         field_index = {
             'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+            'Payoff_Currency': get_fxrate_factor(field['Payoff_Currency'], static_offsets, stochastic_offsets),
             'SettleCurrency': self.field['Payoff_Currency'],
             'Discount': get_discount_factor(
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
@@ -2561,7 +2575,7 @@ class QEDI_CustomAutoCallSwap(Deal):
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         fx_rep = utils.calc_fx_cross(
-            deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
+            deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
 
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
         moneyness = spot / deal_data.Factor_dep['Strike_Price']
@@ -2657,7 +2671,7 @@ class EquityBarrierOption(Deal):
         fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
 
         # check that the spot has a defined shape
-        if spot.shape != b.shape:
+        if spot.shape[1] != b.shape[1]:
             spot = spot.tile(len(deal_time), b.shape[1])
 
         pv = pricing.pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)
@@ -3633,8 +3647,8 @@ class FloatingEnergyDeal(Deal):
     def reset(self, calendars):
         super(FloatingEnergyDeal, self).reset()
         paydates = set([x['Payment_Date'] for x in self.field['Payments']['Items']])
-        self.add_reval_dates(paydates,
-                             self.field['Payoff_Currency'] if self.field['Payoff_Currency'] else self.field['Currency'])
+        self.add_reval_dates(
+            paydates, self.field['Payoff_Currency'] if self.field['Payoff_Currency'] else self.field['Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
@@ -3741,8 +3755,8 @@ class EnergySingleOption(Deal):
     def reset(self, calendars):
         super(EnergySingleOption, self).reset()
         self.paydates = {self.field['Settlement_Date']}
-        self.add_reval_dates(self.paydates,
-                             self.field['Payoff_Currency'] if self.field['Payoff_Currency'] else self.field['Currency'])
+        self.add_reval_dates(
+            self.paydates, self.field['Payoff_Currency'] if self.field['Payoff_Currency'] else self.field['Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
@@ -3781,9 +3795,9 @@ class EnergySingleOption(Deal):
                 ('FxRate',) + fx_lookup, ('ReferencePrice',) + forward_price_vol, all_factors)
 
         # make a pricing cashflow
-        cashflow = utils.make_energy_cashflows(base_date, time_grid, 1, {'Items': [field['cashflow']]},
-                                               reference_factor,
-                                               forward_sample, fx_sample, calendars)
+        cashflow = utils.make_energy_cashflows(
+            base_date, time_grid, 1, {'Items': [field['cashflow']]},
+            reference_factor, forward_sample, fx_sample, calendars)
         # turn it into a sampling object
         field_index['Cashflow'] = cashflow
         # store the base date in excel format

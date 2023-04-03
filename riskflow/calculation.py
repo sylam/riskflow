@@ -92,8 +92,7 @@ class DealStructure(object):
                                        Time_dep=deal_time_dep,
                                        Calc_res=OrderedDict() if self.deal_level_mtm else None))
             except Exception as e:
-                logging.error('{0}.{1} {2} - Skipped'.format(
-                    deal.field['Object'], deal.field.get('Reference', '?'), e.args))
+                logging.error('{0} {1} - Skipped'.format(deal.field['Object'], e.args))
 
     def add_structure_to_structure(self, struct, base_date, static_offsets, stochastic_offsets,
                                    all_factors, all_tenors, time_grid, calendars):
@@ -111,8 +110,7 @@ class DealStructure(object):
             # Structure object representing a netted set of cashflows
             self.sub_structures.append(struct)
         except Exception as e:
-            logging.error('{0}.{1} {2} - Skipped'.format(
-                struct.obj.Instrument.field['Object'], struct.obj.Instrument.field.get('Reference', '?'), e.args))
+            logging.error('{0} {1} - Skipped'.format(struct.obj.Instrument.field['Object'], e.args))
 
     def resolve_structure(self, shared, time_grid):
         """
@@ -124,6 +122,7 @@ class DealStructure(object):
         if self.sub_structures:
             # process sub structures
             for structure in self.sub_structures:
+                logging.root.name = structure.obj.Instrument.field.get('Reference', 'root')
                 struct = structure.resolve_structure(shared, time_grid)
                 accum += struct
 
@@ -187,8 +186,6 @@ class Calculation(object):
         # the deal structure
         self.netting_sets = None
 
-        # what's the name of this calculation?
-        self.name = 'Unnamed'
         # performance and admin feedback
         self.calc_stats = {}
         # the calculation parameters (defined by calling execute)
@@ -285,14 +282,16 @@ class Calculation(object):
             if tagging:
                 instrument.field['Tags'] = tagging(instrument.field)
                 partitioning = True
+            # logging info
+            logging.root.name = instrument.field.get('Reference', '<undefined>')
             if node.get('Children'):
                 struct = DealStructure(instrument, deal_level_mtm=deal_level_mtm)
-                logging.info('Analysing Group {0}'.format(instrument.field.get('Reference', '<undefined>')))
                 self.set_deal_structures(node['Children'], struct, num_scenarios, batch_size, tagging, deal_level_mtm)
                 output.add_structure_to_structure(struct, self.base_date, self.static_ofs, self.stoch_ofs,
                                                   self.all_factors, self.all_tenors, self.time_grid,
                                                   self.config.holidays)
                 continue
+
             output.add_deal_to_structure(self.base_date, instrument, self.static_ofs, self.stoch_ofs, self.all_factors,
                                          self.all_tenors, self.time_grid, self.config.holidays)
 
@@ -314,16 +313,38 @@ class CMC_State(utils.Calculation_State):
         # these are shared parameter states
         self.simulation_batch = batch_size
         self.sobol = {}
+        # idea is to reuse quasi rng numbers where applicable (but still using enough randomness)
+        self.t_quasi_rng = {}
+        self.t_quasi_rng_batch = {}
 
-    def quasi_rng(self, dimension, sample_size, seed=1234, fast_forward=1024):
+    def quasi_rng(self, dimension, sample_size):
+        # may need to parameterize these
+        seed = 1234
+        fast_forward = 1024
+
         if dimension not in self.sobol:
             self.sobol[dimension] = torch.quasirandom.SobolEngine(dimension=dimension, scramble=True, seed=seed)
             # skip this many samples
             self.sobol[dimension].fast_forward(fast_forward)
-        sample_sobol = self.sobol[dimension].draw(sample_size, dtype=self.one.dtype)
-        z = torch.erfinv(2 * (0.5 + (1 - torch.finfo(sample_sobol.dtype).eps) * (
-                sample_sobol - 0.5)) - 1) * 1.4142135623730951
-        return z.to(self.one.device)
+
+        # hash the tensor
+        batch_key = (dimension, sample_size)
+        batch_num = self.t_quasi_rng_batch.setdefault(batch_key, 0)
+        sample_key = (dimension, sample_size, batch_num)
+
+        if sample_key not in self.t_quasi_rng:
+            sample_sobol = self.sobol[dimension].draw(sample_size, dtype=self.one.dtype)
+            z = torch.erfinv(2 * (0.5 + (1 - torch.finfo(sample_sobol.dtype).eps) * (
+                    sample_sobol - 0.5)) - 1) * 1.4142135623730951
+            self.t_quasi_rng[sample_key] = z.to(self.one.device)
+
+        # update the batch key
+        self.t_quasi_rng_batch[batch_key] += 1
+        # return the cached batch of quasi random numbers
+        return self.t_quasi_rng[sample_key]
+
+    def reset_qrg(self):
+        self.t_quasi_rng_batch = {}
 
     def reset(self, num_factors, time_grid: utils.TimeGrid):
         # update the random numbers
@@ -478,8 +499,6 @@ class Credit_Monte_Carlo(Calculation):
         super(Credit_Monte_Carlo, self).__init__(config, **kwargs)
         self.reset_dates = None
         self.settlement_currencies = None
-        # used to store the Scenarios (if requested)
-        self.Scenarios = {}
         # used to store any jacobian matrices
         self.jacobians = {}
         # implied factors
@@ -501,7 +520,7 @@ class Credit_Monte_Carlo(Calculation):
             self.config.calculate_dependencies(params, base_date, self.input_time_grid)
 
         # update the time grid
-        logging.info('Updating timegrid')
+        # logging.info('Updating timegrid')
         self.update_time_grid(base_date, reset_dates, settlement_currencies,
                               dynamic_scenario_dates=params.get('Dynamic_Scenario_Dates', 'No') == 'Yes')
 
@@ -793,7 +812,20 @@ class Credit_Monte_Carlo(Calculation):
     def report(self, output):
         for result, data in output.items():
             if result == 'scenarios':
-                self.output.setdefault('scenarios', {k: np.concatenate(v, axis=-1) for k, v in data.items()})
+                scen = {}
+                scenario_date_index = pd.DatetimeIndex(sorted(self.time_grid.scenario_dates))
+                for k, v in data.items():
+                    values = np.concatenate(v, axis=-1)
+                    if len(values.shape)==2:
+                        scen[k] = pd.DataFrame(values, index = scenario_date_index[:values.shape[0]])
+                    else:
+                        tenors = self.all_tenors[k][0].tenor
+                        columns = pd.MultiIndex.from_product(
+                            [tenors, np.arange(values.shape[-1])], names = ['tenor', 'scenario'])
+                        scen[k] = pd.DataFrame(
+                            values.reshape(values.shape[0], -1),
+                            index=scenario_date_index[:values.shape[0]], columns=columns)
+                self.output.setdefault('scenarios', scen)
             elif result == 'cashflows':
                 self.output.setdefault('cashflows', {k: pd.concat(v, axis=1) for k, v in data.items()})
             elif result in ['cva', 'collva', 'fva']:
@@ -808,6 +840,11 @@ class Credit_Monte_Carlo(Calculation):
             elif result in ['grad_cva_hessian']:
                 self.output.setdefault(result, self.gradients_as_df(
                     data.astype(np.float64) / self.params['Simulation_Batches']))
+            elif result == 'mtm':
+                dates = np.array(sorted(self.time_grid.mtm_dates))[
+                    self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
+                self.output.setdefault(result, pd.DataFrame(
+                    np.concatenate(data, axis=-1).astype(np.float64), index=dates))
             else:
                 self.output.setdefault(result, np.concatenate(data, axis=-1).astype(np.float64))
 
@@ -1169,6 +1206,10 @@ class Base_Revaluation(Calculation):
             def format_row(deal, data, val, greeks):
                 data['Deal Currency'] = deal.Factor_dep.get(
                     'Local_Currency', deal.Instrument.field.get('Currency'))
+                try:
+                    data['Ref_MTM'] = float(deal.Instrument.field.get('MtM', 0.0))
+                except ValueError:
+                    data['Ref_MTM'] = 0.0
                 for k, v in val.items():
                     if k.startswith('Greeks'):
                         greeks.setdefault(k, []).append(
@@ -1228,7 +1269,8 @@ class Base_Revaluation(Calculation):
         self.params = params
         # update the factors
         shared_mem = self.update_factors(params, base_date)
-
+        # set the logging name
+        logging.root.name = self.config.deals.get('Attributes', {'Reference': 'root'}).get('Reference', 'root')
         self.calc_stats['Deal_Setup_Time'] = time.monotonic()
         self.netting_sets = DealStructure(Aggregation('root'), deal_level_mtm=True)
         self.set_deal_structures(

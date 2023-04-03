@@ -114,7 +114,7 @@ mapping = {
             'Base_time_grid': {'widget': 'Text', 'description': 'Base time grid',
                                'value': '0d 2d 1w(1w) 3m(1m) 2y(3m)'},
             'Dynamic_Scenario_Dates': {'widget': 'Dropdown', 'description': 'Dynamic Scenario Dates',
-                                       'value': 'No', 'values': ['Yes', 'No']},
+                                       'value': 'Yes', 'values': ['Yes', 'No']},
             'Currency': {'widget': 'Text', 'description': 'Currency', 'value': 'ZAR'},
             'Simulation_Batches': {'widget': 'Integer', 'description': 'Simulation Batches', 'value': 1},
             'Batch_Size': {'widget': 'Integer', 'description': 'Batch Size', 'value': 1024},
@@ -142,7 +142,7 @@ mapping = {
         },
         'types': {
             'CreditMonteCarlo': ['Base_Date', 'Currency', 'Base_time_grid', 'Deflation_Interest_Rate',
-                                 'Simulation_Batches', 'Batch_Size', 'Random_Seed', 'Calc_Scenarios',
+                                 'Simulation_Batches', 'Batch_Size', 'Random_Seed', 'Calc_Scenarios', 'Dynamic_Scenario_Dates',
                                  'Generate_Cashflows', 'Credit_Valuation_Adjustment',
                                  'Collateral_Valuation_Adjustment'],
             'BaseValuation': ['Base_Date', 'Currency']
@@ -180,6 +180,8 @@ mapping = {
                 ["Spot", "Currency", "Interest_Rate", "Property_Aliases"],
             "CommodityPriceVol":
                 ["Currency", "Surface", "Property_Aliases"],
+            "CSForwardPriceModelParameters":
+                ["Sigma", "Alpha", "Property_Aliases"],
             "ConvenienceYield":
                 ["Curve", "Currency", "Property_Aliases"],
             "EquityPriceVol":
@@ -247,6 +249,8 @@ mapping = {
                                     'values': ['ForwardPriceSampleDaily', 'ForwardPriceSampleBullet']},
             'Offset': {'widget': 'Integer', 'description': 'Offset', 'value': 0},
             'Value': {'widget': 'Float', 'description': 'Value', 'value': 0},
+            'Sigma': {'widget': 'Float', 'description': 'Sigma', 'value': 0},
+            'Alpha': {'widget': 'Float', 'description': 'Alpha', 'value': 0},
             'Issuer': {'widget': 'Text', 'description': 'Issuer', 'value': ''},
             'Index': {'widget': 'Flot', 'description': 'Index', 'value': default['Flot']},
             'Vol': {'widget': 'Flot', 'description': 'Vol', 'value': default['Flot']},
@@ -302,12 +306,14 @@ mapping = {
             "GBMPriceIndexModel":
                 ["Vol", "Drift", "Seasonal_Adjustment"],
             "HWHazardRateModel":
-                ["Alpha", "Lambda", "sigma"],
+                ["Alpha", "Lambda", "sigma"],            
             "PCAInterestRateModel":
                 ["Reversion_Speed", "Historical_Yield", "Yield_Volatility", "Eigenvectors", "Rate_Drift_Model",
                  "Princ_Comp_Source", "Distribution_Type"],
             "CSForwardPriceModel":
                 ["Alpha", "Drift", "sigma"],
+            "CSImpliedForwardPriceModel":
+                [],
             "HullWhite1FactorInterestRateModel":
                 ["Alpha", "Lambda", "Sigma", "Quanto_FX_Correlation", "Quanto_FX_Volatility"]
         },
@@ -359,6 +365,7 @@ mapping = {
         "ReferenceVol": [],
         "HullWhite2FactorModelParameters": [],
         # "GBMTSImpliedParameters": [],
+        "CSForwardPriceModelParameters": [],
         "GBMAssetPriceTSModelParameters": [],
         "EquityPrice": ["GBMAssetPriceModel"],
         "FxRate": ["GBMAssetPriceModel", "GBMAssetPriceTSModelImplied"],
@@ -759,7 +766,7 @@ mapping = {
                                  {'type': 'numeric', 'numericFormat': num_format['currency']}
                                  ],
                             'obj':
-                                'DateEqualList',
+                                'DateValueList',
                             'col_names':
                                 ['Date', 'Value']
                             },
@@ -769,7 +776,7 @@ mapping = {
                                  {'type': 'numeric', 'numericFormat': num_format['currency']}
                                  ],
                             'obj':
-                                'DateEqualList',
+                                'DateValueList',
                             'col_names':
                                 ['Date', 'Value']
                             },                            
@@ -779,7 +786,7 @@ mapping = {
                                  {'type': 'numeric', 'numericFormat': num_format['currency']}
                                  ],
                             'obj':
-                                'DateEqualList',
+                                'DateValueList',
                             'col_names':
                                 ['Date', 'Value']
                             },
@@ -789,7 +796,7 @@ mapping = {
                                  {'type': 'numeric', 'numericFormat': num_format['currency']}
                                  ],
                             'obj':
-                                'DateEqualList',
+                                'DateValueList',
                             'col_names':
                                 ['Date', 'Value']
                             },
@@ -1114,7 +1121,7 @@ mapping = {
             'Cash_Collateral': {'widget': 'Table', 'description': 'Cash Collateral', 'value': 'null',
                                 'sub_types':
                                     [{},
-                                     {'type': 'numeric', 'numericFormat': num_format['float']},
+                                     {'type': 'numeric', 'numericFormat': num_format['currency']},
                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
                                      {'type': 'numeric', 'numericFormat': num_format['percent']},
                                      {},

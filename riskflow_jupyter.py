@@ -221,7 +221,7 @@ class TreePanel(metaclass=ABCMeta):
                         data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
                                      field, item, widget_type in zip(headings, flow, widgets)])
                     return_value = to_json(data)
-                elif field_name in ['Price_Fixing', 'Autocall_Thresholds', 'Autocall_Coupons', 'Barrier_date']:
+                elif field_name in ['Price_Fixing', 'Autocall_Thresholds', 'Autocall_Coupons']:
                     headings = ['Date', 'Value']
                     widgets = ['DatePicker', 'Float']
                     data = []
@@ -229,6 +229,15 @@ class TreePanel(metaclass=ABCMeta):
                         data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
                                      field, item, widget_type in zip(headings, flow, widgets)])
                     return_value = to_json(data)
+                elif field_name == 'Barrier_Dates':
+                    headings = ['Date', 'Value']
+                    widgets = ['DatePicker', 'Float']
+                    data = []
+                    for flow in [obj]:
+                        data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
+                                     field, item, widget_type in zip(headings, flow, widgets)])
+                    return_value = to_json(data)
+                
                 else:
                     raise Exception('Unknown Array Field type {0}'.format(field_name))
             elif isinstance(obj, pd.DateOffset):
@@ -395,6 +404,9 @@ class PortfolioPage(TreePanel):
                 new_obj = checkArray(json.loads(obj))
                 return rf.utils.DateEqualList(
                     [[pd.Timestamp(item[0])] + item[1:] for item in new_obj]) if new_obj is not None else None
+            elif obj_type == 'DateValueList':
+                new_obj = checkArray(json.loads(obj))
+                return [[pd.Timestamp(item[0])] + item[1:] for item in new_obj] if new_obj is not None else None
             elif obj_type == 'CreditSupportList':
                 new_obj = checkArray(json.loads(obj))
                 return rf.utils.CreditSupportList(
@@ -787,11 +799,11 @@ class RiskFactorsPage(TreePanel):
             config.setdefault(section_name, {}).setdefault(field_name, set_repr(new_val, obj_type))
             # store the new object with all the usual defaults
             if frame_name == 'Factor':
-                frame_defaults = self.data[self.tree.selected][frame_name]
+                frame_defaults = self.data[self.tree.selected[-1]][frame_name]
             elif frame_name == 'Config':
                 frame_defaults = self.sys_config
             else:
-                frame_defaults = self.data[self.tree.selected][frame_name][rate_type]
+                frame_defaults = self.data[self.tree.selected[-1]][frame_name][rate_type]
 
             for new_field_meta in frame_defaults.values():
                 new_field_name = new_field_meta['description'].replace(' ', '_')
@@ -1003,6 +1015,7 @@ class RiskFactorsPage(TreePanel):
 class CalculationPage(TreePanel):
     def __init__(self, config):
         super(CalculationPage, self).__init__(config)
+        self.output = {}
 
     def get_label(self, label):
         """
@@ -1100,23 +1113,24 @@ class CalculationPage(TreePanel):
                                   },
                                   'flot_settings': {'xaxis': {'mode': "time", 'timeBase': "milliseconds"}},
                                   'value': to_json(
-                                      [{'label': c, 'data': [[x, y] for x, y in zip(v.index.astype(np.int64) // 1000000,
+                                      [{'label': c, 'data': [[x, y] for x, y in zip(v.index.view(np.int64) // 1000000,
                                                                                     v[c].values)]} for c in v.columns])
                                   }
                     else:
                         # multiindex not yet supported
-                        r = v.reset_index().replace({np.nan: None})
+                        r = v.reset_index()
+                        dtypes = r.dtypes
+                        r = r.replace({np.nan: None})
                         widget = {'widget': 'Table', 'description': k.replace('_', ' '),
                                   'width': 650,
                                   'height': 300,
                                   'sub_types': [{"type": "numeric",
                                                  "numericFormat": {"pattern": "0,0.0000"}}
-                                                if x.type in [np.float32, np.float64] else {} for x in r.dtypes],
+                                                if x.type in [np.float32, np.float64] else {} for x in dtypes],
                                   'col_names': r.columns.tolist(),
-                                  'obj': ['Float' if x.type in [np.float32, np.float64] else 'Text' for x in r.dtypes],
+                                  'obj': ['Float' if x.type in [np.float32, np.float64] else 'Text' for x in dtypes],
                                   'value': to_json([x[-1].tolist() for x in r.iterrows()])
                                   }
-
                 elif isinstance(v, float):
                     widget = {'widget': 'Float', 'description': k.replace('_', ' '), 'value': v}
                 else:
@@ -1136,7 +1150,7 @@ class CalculationPage(TreePanel):
             # update the parameters for the current calculation
             rf.update_dict(self.config.deals['Calculation'], param)
             # get the output
-            calc, calc_output = self.context.run_job()
+            calc_obj, calc_output = self.context.run_job()
             # all calculations provide stats
             output = make_container('Stats', make_float_widgets(calc_output['Stats']))
             # now look at the results and find suitable widgets
@@ -1145,6 +1159,8 @@ class CalculationPage(TreePanel):
             frame['output'] = output
             # trigger redraw
             self._on_selected_changed({'new': selection})
+            # store the output
+            self.output[key] = calc_output
 
         return click
 

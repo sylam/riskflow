@@ -48,10 +48,12 @@ def bootstrap(path, rundate, reuse_cal=True):
     from riskflow.adaptiv import AdaptivContext
 
     context = AdaptivContext()
-    cal_file = 'CVAMarketData_Calibrated_New.json'
+    # cal_file = 'CVAMarketData_Calibrated_New.json'
+    # cal_file = 'CVAMarketData_test.json'
+    cal_file = 'CVAMarketData_TST.json'
     if reuse_cal and os.path.isfile(os.path.join(path, rundate, cal_file)):
         # context.parse_json(os.path.join(path, rundate, cal_file))
-        context.parse_json(os.path.join(path, rundate, 'MarketData.json'))
+        context.parse_json(os.path.join(path, rundate, 'CVAMarketData_TST.json'))
         context_tmp = AdaptivContext()
         context_tmp.parse_json(os.path.join(path, rundate, cal_file))
         for factor in [x for x in context_tmp.params['Price Factors'].keys()
@@ -60,7 +62,8 @@ def bootstrap(path, rundate, reuse_cal=True):
             # override it
             context.params['Price Factors'][factor] = context_tmp.params['Price Factors'][factor]
     else:
-        context.parse_json(os.path.join(path, rundate, 'MarketData.json'))
+        # context.parse_json(os.path.join(path, rundate, cal_file))
+        context.parse_json(os.path.join(path, '', cal_file))
 
     context.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
     context.params['System Parameters'][
@@ -263,7 +266,7 @@ if __name__ == '__main__':
         paths[folder] = rf.getpath(
             [os.path.join('Y:\\CollVA', folder),
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
-             os.path.join('U:\\', folder),
+             os.path.join('Z:\\', folder),
              os.path.join('S:\\CCR_PFE_EE_NetCollateral', folder),
              os.path.join('S:\\CCR_Tagged', folder),
              os.path.join('N:\\Archive', folder)])
@@ -275,10 +278,11 @@ if __name__ == '__main__':
     path = paths['PFE']
 
     # rundate = '2022-10-12'
-    rundate = '2022-11-22'
-    # rundate = '2021-09-14'
+    # rundate = '2023-03-13'
+    rundate = '2023-03-27'
     # calibrate_PFE(path, rundate)
-    # bootstrap(path, rundate, reuse_cal=True)
+    # bootstrap(path_json, '', reuse_cal=True)
+    # bootstrap('Z:\\', rundate, reuse_cal=False)
 
     # empty context
     cx = rf.Context(
@@ -286,13 +290,18 @@ if __name__ == '__main__':
             '\\\\ICMJHBMVDROPPRD\\AdaptiveAnalytics\\Inbound\\MarketData':
                 '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData',
             '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData\\CVAMarketDataBackup':
-                '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData'
+                '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData',
+            '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData':
+                os.path.join('\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData\\CVA_JSON', rundate),
         },
         file_transform={
-            'CVAMarketData_Calibrated.dat': 'CVAMarketData_Calibrated_New.json',
+            'CVAMarketData_Calibrated.dat': 'CVAMarketData_TST_New.json',
+            'CVAMarketData_Calibrated_New.json': 'CVAMarketData_TST_New.json',
             'MarketData.dat': 'MarketData.json',
             'CVAMarketData_Calibrated_{}.dat'.format(pd.Timestamp(rundate).strftime('%d%m%y')): 'MarketData.json'
         })
+
+    md = rf.load_market_data(rundate, path, json_name=os.path.join(env, 'MarketData.json'))
 
     spreads = {
         'USD': {'FVA@Equity': {'collateral': 0, 'funding': 10}, 'FVA@Income': {'collateral': 0, 'funding': 65}},
@@ -310,19 +319,35 @@ if __name__ == '__main__':
         'EUR': {'collateral': 'EUR-ESTR', 'funding': 'EUR-EURIBOR-3M'}}
 
     # for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Commerzbank_AG_FFT_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_UBS_AG_Zurich_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris*.json')):
-    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
+    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_CS_Int_London_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Goldman_Sachs_Int_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Mr_Price_Group_ISDA*.json')):
+
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Standard_Bank_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, '*otus*.json')):
         cx.load_json(json, compress=True)
         if 'GBMAssetPriceModel.EUR_SX5E' not in cx.current_cfg.params['Price Models']:
             cx.current_cfg.params['Price Models']['GBMAssetPriceModel.EUR_SX5E'] = cx.current_cfg.params[
                 'Price Models']['GBMAssetPriceModel.EUR_SX5EEX']
+        if 'EquityPriceVol.USD_SPX.ZAR' not in cx.current_cfg.params['Price Factors']:
+            cx.current_cfg.params['Price Factors']['EquityPriceVol.USD_SPX.ZAR'] = cx.current_cfg.params[
+                'Price Factors']['EquityPriceVol.USD_SPX.USD']
+
+        # if 'HullWhite2FactorModelParameters.USD-OIS' not in cx.current_cfg.params['Price Factors']:
+        #     cx.current_cfg.params['Price Factors']['HullWhite2FactorModelParameters.USD-OIS'] = cx.current_cfg.params[
+        #         'Price Factors']['HullWhite2FactorModelParameters.USD-SOFR']
 
         if not cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             print('no children for crb {} - skipping'.format(json))
             continue
+
+        # Update any missing models
+        cx.current_cfg.params['Price Factors'].update(md.params['Price Factors'])
 
         # grab the netting set
         ns = cx.current_cfg.deals['Deals']['Children'][0]['Instrument']
@@ -332,10 +357,10 @@ if __name__ == '__main__':
         # ns.field['Collateral_Assets']['Cash_Collateral'][0]['Funding_Rate'] = 'USD-LIBOR-3M.FUNDING'
         # ns.field['Collateral_Assets']['Cash_Collateral'][0]['Collateral_Rate'] = 'USD-OIS'
         # ns.field['Collateral_Call_Frequency']=pd.DateOffset(weeks=1)
-        # ns.field['Collateralized'] = 'False'
+        ns.field['Collateralized'] = 'False'
 
         overrides = {
-            'Calc_Scenarios': 'No',
+            'Calc_Scenarios': 'Yes',
             # 'Run_Date': '2021-10-11',
             # 'Tenor_Offset': 2.0,
             # 'Time_grid': '0d 2d 1w(1w) 3m(1m)',
@@ -343,7 +368,7 @@ if __name__ == '__main__':
             'Generate_Cashflows': 'No',
             # 'Currency': 'USD',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
-            'Batch_Size': 256 * 2,
+            'Batch_Size': 64,
             'Simulation_Batches': 1,
             'COLLVA': {'Gradient': 'No'},
             'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}
@@ -385,22 +410,22 @@ if __name__ == '__main__':
             del cx.current_cfg.deals['Calculation']['Funding_Valuation_Adjustment']
 
         for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
-            #if i['Instrument'].field['Reference'] != '118817458':
-            if not i['Instrument'].field['Object'].startswith('QEDI'):
+            # if i['Instrument'].field['Reference'] != '127579130':
+            if False and not i['Instrument'].field['Object'].startswith('QEDI'):
             # if not i['Instrument'].field['Reference'].startswith('ZARSPI'):
                 i['Ignore'] = 'True'
             else:
                 i['Ignore'] = 'False'
 
-        calc, out = cx.Base_Valuation()
-        # calc, out = cx.run_job(overrides)
+        # calc, out = cx.Base_Valuation()
+        calc, out = cx.run_job(overrides)
         # out['Results']['collateral_profile'].to_csv(outfile)
         # calc, out = cx.Base_Valuation()
         # out['Results']['mtm'].to_csv(outfile)
 
         mike_filename = 'N:\\Archive\\PFE\\{}\\{}'.format(rundate, filename.replace('InputAAJ_', ''))
 
-        if os.path.exists(mike_filename):
+        if False and os.path.exists(mike_filename):
             mike = pd.read_csv(mike_filename, index_col=0)
             me = pd.read_csv(outfile, index_col=0)
             adaptiv = float(mike.head(1)['PFE'])

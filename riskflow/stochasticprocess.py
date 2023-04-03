@@ -907,13 +907,26 @@ class CSForwardPriceModel(StochasticProcess):
             time_grid.scen_time_grid[1:].reshape(-1, 1)
         ) - time_grid.scen_time_grid[:-1].reshape(-1, 1)
         dt = np.insert(delta, 0, 0, axis=0) / utils.DAYS_IN_YEAR
-        # need to scale the vol (as the variance is modelled using an OU Process)
-        var_adj = (1.0 - np.exp(-2.0 * self.param['Alpha'] * dt.cumsum(axis=0))) / (2.0 * self.param['Alpha'])
-        var = np.square(self.param['Sigma']) * np.exp(-2.0 * self.param['Alpha'] * tenors) * var_adj
-        # get the vol
-        vol = np.sqrt(np.diff(np.insert(var, 0, 0, axis=0), axis=0))
-        self.vol = tensor.new(np.expand_dims(vol, axis=2))
-        self.drift = tensor.new(np.expand_dims(self.param['Drift'] * dt.cumsum(axis=0) - 0.5 * var, axis=2))
+
+        if implied_tensor is None:
+            # need to scale the vol (as the variance is modelled using an OU Process)
+            var_adj = (1.0 - np.exp(-2.0 * self.param['Alpha'] * dt.cumsum(axis=0))) / (2.0 * self.param['Alpha'])
+            var = np.square(self.param['Sigma']) * np.exp(-2.0 * self.param['Alpha'] * tenors) * var_adj
+            # get the vol
+            vol = np.sqrt(np.diff(np.insert(var, 0, 0, axis=0), axis=0))
+            self.vol = tensor.new(np.expand_dims(vol, axis=2))
+            self.drift = tensor.new(np.expand_dims(self.param['Drift'] * dt.cumsum(axis=0) - 0.5 * var, axis=2))
+        else:
+            # need to scale the vol (as the variance is modelled using an OU Process)
+            var_adj = (1.0 - torch.exp(-2.0 * implied_tensor['Alpha'] * tensor.new(dt.cumsum(axis=0)))) / (
+                    2.0 * implied_tensor['Alpha'])
+            var = torch.square(implied_tensor['Sigma']) * torch.exp(
+                -2.0 * implied_tensor['Alpha'] * tensor.new(tenors)) * var_adj
+            delta_var = torch.diff(F.pad(var, [0, 0, 1, 0]), axis=0)
+            safe_delta = torch.where(delta_var > 0.0, delta_var, torch.ones_like(delta_var))
+            vol = torch.where(delta_var > 0.0, torch.sqrt(safe_delta), torch.zeros_like(delta_var))
+            self.vol = torch.unsqueeze(vol, axis=2)
+            self.drift = torch.unsqueeze(-0.5 * var, axis=2)
 
     @property
     def correlation_name(self):
@@ -924,9 +937,17 @@ class CSForwardPriceModel(StochasticProcess):
             shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
             axis=1) * self.vol
 
-        stoch = self.drift + torch.cumsum(z_portion, axis=0)
+        return self.initial_curve * torch.exp(self.drift + torch.cumsum(z_portion, axis=0))
 
-        return self.initial_curve * torch.exp(stoch)
+
+class CSImpliedForwardPriceModel(CSForwardPriceModel):
+    """The Clewlow Strickland Stochastic Process with implied vol and mean reversion"""
+
+    def __init__(self, factor, param, implied_factor=None):
+        super(CSImpliedForwardPriceModel, self).__init__(factor, param)
+        self.implied = implied_factor
+        # set the drift explicitly to zero - copy the other 2 params
+        self.param = {'Drift': 0.0, 'Sigma': implied_factor.param['Sigma'], 'Alpha': implied_factor.param['Alpha']}
 
 
 class CSForwardPriceCalibration(object):
