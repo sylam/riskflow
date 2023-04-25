@@ -815,16 +815,20 @@ class Credit_Monte_Carlo(Calculation):
                 scen = {}
                 scenario_date_index = pd.DatetimeIndex(sorted(self.time_grid.scenario_dates))
                 for k, v in data.items():
+                    factor_name = utils.check_tuple_name(k)
                     values = np.concatenate(v, axis=-1)
                     if len(values.shape)==2:
-                        scen[k] = pd.DataFrame(values, index = scenario_date_index[:values.shape[0]])
+                        columns = pd.MultiIndex.from_product(
+                            [[0.0], np.arange(values.shape[-1])], names = ['tenor', 'scenario'])
+                        scen[factor_name] = pd.DataFrame(values, 
+                            index = scenario_date_index[:values.shape[0]], columns=columns).T
                     else:
                         tenors = self.all_tenors[k][0].tenor
                         columns = pd.MultiIndex.from_product(
                             [tenors, np.arange(values.shape[-1])], names = ['tenor', 'scenario'])
-                        scen[k] = pd.DataFrame(
+                        scen[factor_name] = pd.DataFrame(
                             values.reshape(values.shape[0], -1),
-                            index=scenario_date_index[:values.shape[0]], columns=columns)
+                            index=scenario_date_index[:values.shape[0]], columns=columns).T
                 self.output.setdefault('scenarios', scen)
             elif result == 'cashflows':
                 self.output.setdefault('cashflows', {k: pd.concat(v, axis=1) for k, v in data.items()})

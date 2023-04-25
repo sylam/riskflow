@@ -1101,7 +1101,7 @@ def Bjerksund_Stensland(A1, A2, B, x1, x2, K, sigma1, sigma2, rho, callOrPut):
     return A1 * x1 * norm_cdf(callOrPut * d1) + A2 * x2 * norm_cdf(callOrPut * d2) + B * norm_cdf(callOrPut * d3)
 
 
-def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
+def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_payoff=0.0):
     # calculates the black function WITHOUT discounting
 
     if isinstance(tenor, float):
@@ -1134,9 +1134,12 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared):
     else:
         d1 = torch.log(forward / strike) / stddev + 0.5 * stddev
         d2 = d1 - stddev
-        prem = callorput * (forward * norm_cdf(callorput * d1) - X * norm_cdf(callorput * d2))
-        value = torch.relu(callorput * (forward - X))
-
+        if cash_payoff:
+            prem = cash_payoff * norm_cdf(callorput * d2)
+            value = cash_payoff * (callorput * (forward - X) > 0) * shared.one
+        else:
+            prem = callorput * (forward * norm_cdf(callorput * d1) - X * norm_cdf(callorput * d2))
+            value = torch.relu(callorput * (forward - X))
     return buyorsell * torch.where(guard, prem, value)
 
 
@@ -1295,12 +1298,11 @@ def calc_spot_forward(curve, T, time_grid, shared, only_diag):
     return curve_grid.gather_weighted_curve(shared, weights)
 
 
-def calc_dividend_samples(t, T, time_grid):
+def calc_dividend_samples(start_day, samples, time_grid):
     divi_scenario_offsets = []
-    samples = np.linspace(t, T, int(max(10, (T - t) / 30.0)))
-
     d = []
-    for reset_start, reset_end in zip(samples[:-1], samples[1:]):
+    for reset_end in samples:
+        reset_start = max(start_day, 0)
         Time_Grid, Scenario = time_grid.get_scenario_offset(reset_start)
         d.append([Time_Grid, reset_start, -1, reset_start, reset_end, 0.0, 0.0, 0.0])
         divi_scenario_offsets.append(Scenario)
@@ -1308,9 +1310,15 @@ def calc_dividend_samples(t, T, time_grid):
     return TensorResets(d, divi_scenario_offsets)
 
 
-def calc_realized_dividends(equity, repo, div_yield, div_resets, shared, offsets=None):
-    S = calc_time_grid_spot_rate(
-        equity, div_resets[:, :RESET_INDEX_Scenario + 1], shared)
+def calc_realized_dividends(s_t0, equity, repo, div_yield, div_resets, shared):
+    S = s_t0.squeeze(axis=0)
+    num_resets = len(div_resets.schedule)
+    if len(S) == 1 and num_resets > 1:
+        S = S.tile([num_resets, 1])
+    elif S.shape[0] > num_resets:
+        S = S[:num_resets]
+    elif S.shape[0] < num_resets:
+        div_resets.schedule = div_resets.schedule[:S.shape[0]]
 
     sr = torch.squeeze(calc_spot_forward(
         repo, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True), axis=1)
@@ -1319,15 +1327,7 @@ def calc_realized_dividends(equity, repo, div_yield, div_resets, shared, offsets
             div_yield, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True),
         axis=1))
 
-    if offsets is not None:
-        a = []
-        for s, r, q in split_counts([S, sr, sq], offsets, shared):
-            a.append(torch.sum(
-                s * torch.exp(torch.cumsum(r, axis=0).flip(0)) * (1 - q.reshape(-1, 1)), axis=0))
-        return torch.stack(a)
-    else:
-        return torch.sum(
-            S * torch.exp(torch.cumsum(sr, axis=0).flip(0)) * (1 - sq.reshape(-1, 1)), axis=0)
+    return S * torch.exp(sr) * (1 - sq.reshape(-1, 1))
 
 
 def calc_eq_drift(repo, div_yield, weights, time_grid, shared, multiply_by_time=True):
@@ -2296,8 +2296,6 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
     cashflow_reset_offsets = []
     cashflow_divi_offsets = []
     reset_scenario_offsets = []
-    divi_scenario_offsets = []
-    dividend_sample_frq = pd.DateOffset(months=1)
 
     for cashflow in sorted(cashflows['Items'], key=lambda x: (x['Payment_Date'], x['End_Date'], x['Start_Date'])):
         if cashflow['Payment_Date'] >= base_date:
@@ -2317,36 +2315,20 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
                 Time_Grid, Scenario = time_grid.get_scenario_offset(max(Reset_Day, 0))
 
                 # only add a reset if its in the past
-                r.append([Time_Grid, Reset_Day, -1, Start_Day, 0, Weight,
+                r.append([Time_Grid, Reset_Day, -1, Start_Day, Start_Day, Weight,
                           cashflow.get('Known_' + reset + '_Price') if Start_Day <= 0 else 0.0,
                           cashflow.get('Known_' + reset + '_FX_Rate', 0.0) if Start_Day <= 0 else 0.0])
                 reset_scenario_offsets.append(Scenario)
 
-            d = []
-            for reset in pd.date_range(cashflow['Start_Date'], cashflow['End_Date'],
-                                       freq=dividend_sample_frq)[:10]:
-                Reset_Day = (reset - base_date).days
-                Start_Day = Reset_Day
-                End_Day = (reset + dividend_sample_frq - base_date).days
-                # Need to use this reset to estimate future dividends
-                Time_Grid, Scenario = time_grid.get_scenario_offset(max(Reset_Day, 0))
-
-                # only add a reset if its in the past
-                d.append([Time_Grid, Reset_Day, -1, Start_Day, End_Day, Weight, 0.0, 0.0])
-                divi_scenario_offsets.append(Scenario)
-
-            cashflow_divi_offsets.append([len(d), len(all_divs), 0])
             # attach the reset_offsets to the cashflow
             cashflow_reset_offsets.append([len(r), len(all_resets), 0])
             # store resets
             all_resets.extend(r)
-            # store divs
-            all_divs.extend(d)
 
     cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
     cashflows.set_resets(all_resets, reset_scenario_offsets)
-    dividends = TensorCashFlows(cash, cashflow_divi_offsets)
-    dividends.set_resets(all_divs, divi_scenario_offsets)
+    # only interested in the start dates
+    dividends = TensorResets(all_resets[::2], reset_scenario_offsets[::2])
 
     return cashflows, dividends
 
@@ -2594,7 +2576,6 @@ def make_energy_cashflows(reference_date, time_grid, position, cashflows, refere
 
 
 def compress_deal_data(deals):
-
     def filter_deals(deals, values):
         filtered = []
         unfiltered = []
@@ -2776,44 +2757,6 @@ def compress_deal_data(deals):
         for k, v in eq_compressed.items():
             all_other.extend(v)
             all_other.extend(ir_compressed[k])
-
-        reduced_deals = all_other
-
-    # now try and compress ir_swaps - not ideal looking for ',Swap,' in tags - TODO!
-    ir_swaps = [x for x in reduced_deals if x['Instrument'].field['Object'] == 'StructuredDeal'
-                and ',Swap,' in x['Instrument'].field['Tags'][0]]
-
-    if ir_swaps and len(ir_swaps) > 400:
-        logging.info('Compressing {} IR Swaps'.format(len(ir_swaps)))
-        float_unders = {}
-        fixed_unders = {}
-        swap_refs = [x['Instrument'].field['Reference'] for x in ir_swaps]
-        all_ir_swap, all_other = filter_deals(reduced_deals, swap_refs)
-
-        # first load all compressible deals
-        for structure in all_ir_swap:
-            tags = tuple(structure['Instrument'].field['Tags'])
-            for k in structure['Children']:
-                key = tuple(
-                    sorted([(field, value) for field, value in k['Instrument'].field.items()
-                            if field not in ['Reference', 'Tags', 'Buy_Sell', 'Cashflows']]))+(tags,)
-
-                if k['Instrument'].field['Object'] == 'CFFloatingInterestListDeal':
-                    float_unders.setdefault(key, []).append(k)
-                else:
-                    fixed_unders.setdefault(key, []).append(k)
-
-        fixed_compressed = []
-        for k, unders in fixed_unders.items():
-            fixed_compressed.extend(compress_CFFixedInterestListDeal(unders, k[-1], use_ref_as_tag=True))
-
-        float_compressed = []
-        for k, unders in float_unders.items():
-            float_compressed.extend(compress_CFFloatingInterestListDeal(unders, k[-1], use_ref_as_tag=True))
-
-        # add it and continue
-        all_other.extend(fixed_compressed)
-        all_other.extend(float_compressed)
 
         reduced_deals = all_other
 

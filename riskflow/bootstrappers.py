@@ -409,6 +409,7 @@ class CSForwardPriceModelParameters(object):
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
                     vol_surface = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
+                    vol_surface.delta = sys_params.get('Swaption_Volatility_Delta', 0.0)
                     forward = riskfactors.construct_factor(energy_factor, price_factors, factor_interp)
                     discount = riskfactors.construct_factor(discount_factor, price_factors, factor_interp)
                 except Exception:

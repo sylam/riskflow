@@ -15,8 +15,7 @@
 # You should have received a copy of the GNU General Public License
 # along with RiskFlow.  If not, see <http://www.gnu.org/licenses/>.
 ########################################################################
-
-
+import logging
 from collections import OrderedDict
 
 # specific modules
@@ -779,7 +778,7 @@ def pv_american_option(shared, time_grid, deal_data, nominal, moneyness, spot, f
     return value
 
 
-def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward):
+def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward, binary=False):
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
@@ -787,14 +786,38 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
     expiry = discount.code[0][utils.FACTOR_INDEX_Daycount](tenor_in_days)
     vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
-    theo_price = utils.black_european_option(
-        forward, factor_dep['Strike_Price'], vols, expiry,
-        factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
+    # check if this is a compo or quanto deal
+    if 'FXVol' in factor_dep:
+        atm_moneyness = torch.ones_like(moneyness)
+        fx_vols = utils.calc_time_grid_vol_rate(
+                factor_dep['FXVol'], atm_moneyness, expiry, shared)
+
+        if 'QuantoImpliedCorrelation' in factor_dep:
+            # quanto fx deal
+            atm_vol = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], atm_moneyness, expiry, shared)
+            forward = forward * torch.exp(
+                -atm_vol * fx_vols * factor_dep['QuantoImpliedCorrelation'] * shared.one.new(expiry.reshape(-1,1)) )
+        else:
+            forwardfx = utils.calc_fx_forward(
+                factor_dep['Local'], factor_dep['Other'],
+                tenor_in_days, deal_time, shared)
+            vol = torch.sqrt(
+                fx_vols * fx_vols + 2.0 * fx_vols * vols * factor_dep['CompoImpliedCorrelation'] + vols * vols)
+            forward = forward * forwardfx
+
+    if binary:
+        theo_price = utils.black_european_option(
+            forward, factor_dep['Strike_Price'], vols, expiry,
+            factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared, cash_payoff=nominal)
+        value = theo_price
+    else:
+        theo_price = utils.black_european_option(
+            forward, factor_dep['Strike_Price'], vols, expiry,
+            factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
+        value = nominal * theo_price
 
     discount_rates = torch.squeeze(
         utils.calc_discount_rate(discount, tenor_in_days.reshape(-1, 1), shared), axis=1)
-
-    value = nominal * theo_price
 
     # handle cashflows (if necessary)
     cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], value[-1])
@@ -1255,7 +1278,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         theo_cashflow = nominal * sim_spot(
             spot_block, vols, sample_ts, drifts, sample_index_t, terminationDate,
             # do fewer simulations if we're moving through time
-            sobol=sobol, num_sims=2048 if sobol else 4096)
+            sobol=sobol, num_sims=2048 if sobol else 2*4096)
 
         discount_rates = utils.calc_discount_rate(discount_block, fixings, shared)
 
@@ -1596,7 +1619,7 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
                         factor_dep['FXCompoVol'], vol2.new_ones(1),
                         sample_block.reshape(-1), shared),
                     axis=0)
-                vol2 += fx_vols * fx_vols + 2.0 * fx_vols * ref_vols * factor_dep['ImpliedCorrelation'][0]
+                vol2 += fx_vols * fx_vols + 2.0 * fx_vols * ref_vols * factor_dep['ImpliedCorrelation']
 
             product_t = sample_ft * torch.exp(
                 vol2.new(np.expand_dims(sample_tenor, axis=2)) * vol2)
@@ -2238,7 +2261,7 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     eq_spot = utils.calc_time_grid_spot_rate(factor_dep['Equity'], deal_time, shared)
-    cash, divis = factor_dep['Flows']
+    cash, div_samples = factor_dep['Flows']
 
     # needed for grouping 
     cash_start_idx = np.searchsorted(
@@ -2266,12 +2289,11 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
         all_samples.append(torch.cat(
             [torch.cat(known_sample, axis=0), past_samples], axis=0) if known_sample else past_samples)
 
-    # now calculate the dividends
-    div_samples = divis.Resets
-
-    h_t0_t1 = utils.calc_realized_dividends(
+    # all_samples (every second entry) should correspond to the known equity or simulated equity price
+    # at the start of each cashflow date
+    h_t0_t1 = utils.calc_realized_dividends(torch.stack(all_samples[::2]),
         factor_dep['Equity'], factor_dep['Equity_Zero'], factor_dep['Dividend_Yield'],
-        div_samples, shared, offsets=divis.offsets[:, 0])
+        div_samples, shared)
 
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
     repo_discounts = utils.calc_time_grid_curve_rate(factor_dep['Equity_Zero'], deal_time, shared)
@@ -2300,7 +2322,7 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
             St0 = torch.unsqueeze(all_samples[0][pay_idx:end_idx], 0)
             St1 = torch.unsqueeze(all_samples[1][pay_idx:end_idx], 0)
 
-            Ht0_t1 = 0 * h_t0_t1[pay_idx]
+            Ht0_t1 = h_t0_t1[pay_idx]
             units = cashflows.tn[pay_idx:end_idx, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1)
             end_mult = cashflows.tn[pay_idx:end_idx, utils.CASHFLOW_INDEX_End_Mult].reshape(1, -1, 1)
             div_mult = cashflows.tn[pay_idx:end_idx, utils.CASHFLOW_INDEX_Dividend_Mult].reshape(1, -1, 1)
@@ -2329,9 +2351,10 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
             discount_end = utils.calc_discount_rate(repo_block, future_end, shared)
 
             St0 = torch.unsqueeze(all_samples[0][end_idx:start_idx], axis=0)
-            Ht0_t = utils.calc_realized_dividends(
+            Ht0_t = utils.calc_realized_dividends(St0,
                 factor_dep['Equity'], factor_dep['Equity_Zero'], factor_dep['Dividend_Yield'],
-                utils.calc_dividend_samples(time_block[0], time_block[-1], time_grid), shared)
+                utils.calc_dividend_samples(
+                    cashflows.np[end_idx, utils.CASHFLOW_INDEX_Start_Day], time_block, time_grid), shared)
 
             units = cashflows.tn[end_idx:start_idx, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1)
             end_mult = cashflows.tn[end_idx:start_idx, utils.CASHFLOW_INDEX_End_Mult].reshape(1, -1, 1)

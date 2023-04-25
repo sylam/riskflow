@@ -565,7 +565,16 @@ class Context(object):
                 utils.Factor('ForwardPrice', (instrument.field['Reference_Type'],)))]['Currency'] else [],
             'ForwardPrice': lambda instrument, factor_fields, params: [utils.Factor('FXVol', tuple(
                 sorted([instrument.field['Currency'], factor_fields['Currency']])))] if
-            instrument.field['Currency'] != factor_fields['Currency'] else []}
+            instrument.field['Currency'] != factor_fields['Currency'] else [],
+            'EquityPriceVol': lambda instrument, factor_fields, params:
+            [utils.Factor('Correlation', tuple('EquityPrice.{0}/FxRate.{1}'.format(
+                instrument.field['Equity_Volatility'],
+                '.'.join(sorted([instrument.field['Currency'], instrument.field['Payoff_Currency']]))
+            ).split('.'))), utils.Factor('FXVol', tuple(
+                sorted([instrument.field['Currency'], instrument.field['Payoff_Currency']])))
+             ] if instrument.field['Currency'] != instrument.field.get(
+                'Payoff_Currency', instrument.field['Currency']) else [],
+        }
 
         # the list of returned factors
         dependent_factors = set()

@@ -492,7 +492,7 @@ mapping = {
                             'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption',
                             'MtMCrossCurrencySwapDeal', 'FXTARFOptionDeal']),
             'New Energy Derivative': ('default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption']),
-            'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal',
+            'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal', 'EquityBinaryOption',
                                                   'QEDI_CustomAutoCallSwap', 'EquitySwapletListDeal',
                                                   'EquityBarrierOption', 'EquityDiscreteExplicitAsianOption']),
             'New Credit Derivative': ('default', ['DealDefaultSwap'])
@@ -563,6 +563,10 @@ mapping = {
             'EquityOptionDeal.Fields': ['Settlement_Style', 'Strike_Price', 'Buy_Sell', 'Payoff_Type', 'Option_Type',
                                         'Equity_Volatility', 'Option_Style', 'Expiry_Date', 'Forward_Price_Date',
                                         'Equity', 'Units', 'Option_On_Forward', 'Currency', 'Discount_Rate',
+                                        'Payoff_Currency'],
+            'EquityBinaryOption.Fields': ['Strike_Price', 'Buy_Sell', 'Option_Type',
+                                        'Equity_Volatility', 'Expiry_Date', 'Settlement_Date', 'Payoff_Currency',
+                                        'Equity', 'Cash_Payoff', 'Currency', 'Discount_Rate',
                                         'Payoff_Currency'],
             'EquityDiscreteExplicitAsianOption.Fields': ['Strike_Price', 'Buy_Sell', 'Payoff_Type', 'Option_Type',
                                                          'Equity_Volatility', 'Expiry_Date', 'Equity', 'Units',
@@ -718,6 +722,8 @@ mapping = {
                 ['Admin', 'EquityForwardDeal.Fields'],
             'EquityOptionDeal':
                 ['Admin', 'EquityOptionDeal.Fields'],
+            'EquityBinaryOption':
+                ['Admin', 'EquityBinaryOption.Fields'],
             'EquityBarrierOption':
                 ['Admin', 'EquityBarrierOption.Fields'],
             'EquityDiscreteExplicitAsianOption':
