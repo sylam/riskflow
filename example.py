@@ -279,7 +279,7 @@ if __name__ == '__main__':
 
     # rundate = '2022-10-12'
     # rundate = '2023-03-13'
-    rundate = '2023-03-27'
+    rundate = '2023-04-13'
     # calibrate_PFE(path, rundate)
     # bootstrap(path_json, '', reuse_cal=True)
     # bootstrap('Z:\\', rundate, reuse_cal=False)
@@ -321,10 +321,10 @@ if __name__ == '__main__':
     # for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_UBS_AG_Zurich_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris*.json')):
-    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_CS_Int_London_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_CS_Int_London_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Goldman_Sachs_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
+    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Mr_Price_Group_ISDA*.json')):
 
@@ -365,11 +365,11 @@ if __name__ == '__main__':
             # 'Tenor_Offset': 2.0,
             # 'Time_grid': '0d 2d 1w(1w) 3m(1m)',
             'Random_Seed': 1254,
-            'Generate_Cashflows': 'No',
-            # 'Currency': 'USD',
+            'Generate_Cashflows': 'Yes',
+            'Currency': 'ZAR',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
-            'Batch_Size': 64,
-            'Simulation_Batches': 1,
+            'Batch_Size': 256,
+            'Simulation_Batches': 2,
             'COLLVA': {'Gradient': 'No'},
             'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}
         }
@@ -379,8 +379,24 @@ if __name__ == '__main__':
         else:
             overrides['Dynamic_Scenario_Dates'] = 'No'
 
-        # calc, out, res = cx.Credit_Monte_Carlo(overrides=overrides, CVA=False, CollVA=False, FVA=False)
+        for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
+            if i['Instrument'].field['Reference'] != 'ZARTRSKEPLERABG230210-2305101D':
+            # if i['Instrument'].field['Reference'] != '119064188':
+            # if False and not i['Instrument'].field['Object'].startswith('QEDI'):
+            # if not i['Instrument'].field['Reference'].startswith('ZARSPI'):
+                i['Ignore'] = 'True'
+            else:
+                i['Ignore'] = 'False'
+
+        calculation_currency='USD'
         # calc, out = cx.Base_Valuation(overrides={'Currency': 'ZAR'})
+        calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
+        calc, params = rf.run_cmc(
+            cx.current_cfg, overrides=overrides, CVA=False, FVA=False, CollVA=False, LegacyFVA=True)
+        del params['CVA']
+        partial_FVA = calc.calc_individual_FVA(
+            params, spreads=spreads[calculation_currency], discount_curves=curves[calculation_currency])
+
         output = json.replace('json', 'csv')
         filename = os.path.split(output)[1]
         outfile = os.path.join('C:\\temp', filename)
@@ -409,16 +425,8 @@ if __name__ == '__main__':
         if 'Funding_Valuation_Adjustment' in cx.current_cfg.deals['Calculation']:
             del cx.current_cfg.deals['Calculation']['Funding_Valuation_Adjustment']
 
-        for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
-            # if i['Instrument'].field['Reference'] != '127579130':
-            if False and not i['Instrument'].field['Object'].startswith('QEDI'):
-            # if not i['Instrument'].field['Reference'].startswith('ZARSPI'):
-                i['Ignore'] = 'True'
-            else:
-                i['Ignore'] = 'False'
-
-        # calc, out = cx.Base_Valuation()
-        calc, out = cx.run_job(overrides)
+        calc, out = cx.Base_Valuation()
+        # calc, out = cx.run_job(overrides)
         # out['Results']['collateral_profile'].to_csv(outfile)
         # calc, out = cx.Base_Valuation()
         # out['Results']['mtm'].to_csv(outfile)

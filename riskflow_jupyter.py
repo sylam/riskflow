@@ -1101,27 +1101,32 @@ class CalculationPage(TreePanel):
         def make_results(results):
             out = {}
             for k, v in sorted(results.items(), key=lambda x: x[0][::-1]):
+                filename_field = './tmp/{}.{}.csv'.format(key, k)
+                link = {'widget': 'HTML', 'value': '<a href="{}" title="Click to Download">Download {}</a>'.format(filename_field, k)}
                 if isinstance(v, pd.DataFrame):
                     # date index
                     if v.index.dtype.type == np.datetime64:
-                        widget = {'widget': 'Flot', 'description': k.replace('_', ' '),
+                        # clip the columns if there are too many to display
+                        clipped_cols = v.columns[:8]
+                        label_name = k.replace('_', ' ') if len(v.columns)<=8 else 'First {} Columns'.format(len(clipped_cols))  
+                        Widget = {'widget': 'Flot', 'description': label_name,
                                   'hot_settings': {
                                       'columns': [{}] +
                                                  [{"type": "numeric",
-                                                   "numericFormat": {"pattern": "0,0.00"}}] * len(v.columns),
+                                                   "numericFormat": {"pattern": "0,0.00"}}] * len(clipped_cols),
                                       'manualColumnResize': True
                                   },
                                   'flot_settings': {'xaxis': {'mode': "time", 'timeBase': "milliseconds"}},
                                   'value': to_json(
                                       [{'label': c, 'data': [[x, y] for x, y in zip(v.index.view(np.int64) // 1000000,
-                                                                                    v[c].values)]} for c in v.columns])
+                                                                                    v[c].values)]} for c in clipped_cols])
                                   }
                     else:
                         # multiindex not yet supported
                         r = v.reset_index()
                         dtypes = r.dtypes
                         r = r.replace({np.nan: None})
-                        widget = {'widget': 'Table', 'description': k.replace('_', ' '),
+                        Widget = {'widget': 'Table', 'description': k.replace('_', ' '),
                                   'width': 650,
                                   'height': 300,
                                   'sub_types': [{"type": "numeric",
@@ -1131,8 +1136,25 @@ class CalculationPage(TreePanel):
                                   'obj': ['Float' if x.type in [np.float32, np.float64] else 'Text' for x in dtypes],
                                   'value': to_json([x[-1].tolist() for x in r.iterrows()])
                                   }
+                                  
+                    with open(filename_field, 'wt') as fp:
+                        v.to_csv(fp)                        
+                    subfields = {k: Widget, 'link': link}
+                    widget = {'widget': 'Container', 'description': k.replace('_', ' '), 'value': subfields, 'sub_fields': subfields}
+                            
                 elif isinstance(v, float):
                     widget = {'widget': 'Float', 'description': k.replace('_', ' '), 'value': v}
+                    
+                elif isinstance(v, dict):
+                    if k=='scenarios':
+                        multi_index = pd.MultiIndex.from_tuples(
+                            reduce(operator.concat, [[(k2,)+ v1 for v1 in v2.index] for k2,v2 in v.items()]), names = ['factor', 'tenor', 'scenario'])
+                    else:
+                        multi_index = pd.MultiIndex.from_tuples(reduce(operator.concat, [[(k2, v1) for v1 in v2.index] for k2,v2 in v.items()]))
+                    df = pd.concat(v.values()).set_index(multi_index)
+                    with open(filename_field, 'wt') as fp:
+                        df.to_csv(fp)
+                    widget = link
                 else:
                     print('output widget for ', k, ' - TODO')
                     continue
@@ -1223,7 +1245,8 @@ class Workbench(object):
         def select_json(chooser):
             self.context.file_map = {k: v for k, v in self.file_transform.items() if k}
             self.context.path_map = {k: v for k, v in self.path_transform.items() if k}
-            self.context.load_json(chooser.selected)
+            logging.info('loading {}'.format(chooser.selected))
+            self.context.load_json(chooser.selected, compress=self.compress_json.value)
             self.reload()
             # select the portfolio index
             self.tabs.selected_index = 1
@@ -1278,10 +1301,14 @@ class Workbench(object):
 
         self.path_map = make_new_map('Path', self.path_transform)
         self.file_map = make_new_map('File', self.file_transform)
-        self.json_file = FileChooser(path, title='Load JSON File', filter_pattern='*.json')
+        self.json_file = FileChooser(path, title='Load JSON File', filter_pattern='*.json')        
         self.json_file.register_callback(select_json)
-        self.filename = widgets.VBox(children=[self.path_map, self.file_map, self.json_file])
-
+        self.compress_json = widgets.Checkbox(
+            value=False, description='Compress deals', disabled=False, indent=False)
+        self.filename = widgets.VBox(children=[self.path_map, self.file_map, widgets.HBox(
+            children=[self.json_file, self.compress_json])], layout=widgets.Layout(border='5px outset black'),
+            _dom_classes=['mainframe'])
+            
         # the main containers/widgets
         self.main = None
         self.log_area = widgets.Textarea()

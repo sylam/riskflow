@@ -22,6 +22,7 @@ import glob
 import time
 import shutil
 import logging
+import tempfile
 import traceback
 import pandas as pd
 
@@ -46,8 +47,6 @@ def work(job_id, queue, result, price_factors, price_factor_interp,
     from riskflow.bootstrappers import construct_bootstrapper
 
     bootstrappers = {}
-    # set the gpu
-    gpudevice = torch.device("cuda:0")
 
     # perform the bootstrapping
     while True:
@@ -61,7 +60,7 @@ def work(job_id, queue, result, price_factors, price_factor_interp,
             name = list(job_price.keys())[0]
             if bootstrapper_name not in bootstrappers:
                 bootstrappers[bootstrapper_name] = construct_bootstrapper(
-                    bootstrapper_name, params, device=gpudevice)
+                    bootstrapper_name, params)
             bootstrapper = bootstrappers[bootstrapper_name]
             bootstrapper.bootstrap(
                 sys_params, price_models, price_factors, price_factor_interp[0], job_price, holidays)
@@ -86,7 +85,7 @@ class Parent(object):
         self.ref = None
         self.daily = False
 
-    def start(self, rundate, input_path, calendar, outfile='CVAMarketDataCal'):
+    def start(self, rundate, input_path, calendar, outfile='CVAMarketDataCal', premium_file=None, delta=0):
         # disable gpus
         os.environ['CUDA_VISIBLE_DEVICES'] = "-1"
         # set the logger
@@ -94,7 +93,7 @@ class Parent(object):
                             format='%(asctime)s %(levelname)-8s %(message)s',
                             datefmt='%m-%d %H:%M')
 
-        from adaptiv import AdaptivContext
+        from riskflow.adaptiv import AdaptivContext
 
         # create the context
         self.cx = AdaptivContext()
@@ -131,6 +130,9 @@ class Parent(object):
         if self.cx.params['System Parameters']['Base_Date'] is None:
             logging.info('Setting  rundate {}'.format(rundate))
             self.cx.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
+        if delta:
+            logging.info('Setting implied vol delta to {}'.format(delta))
+            self.cx.params['System Parameters']['Swaption_Volatility_Delta'] = delta/100.0
 
         # load the params
         price_factors = self.manager.dict(self.cx.params['Price Factors'])
@@ -211,6 +213,7 @@ def main():
 
     market = parser.add_argument_group('Daily', 'options for calibration of a single marketdata file')
     market.add_argument('-m', '--market_file', type=str, help='marketdata.json filename and path')
+    market.add_argument('-d', '--delta', type=int, help='amount to add (in percentage) to implied swaption vol (default 0)', default=0)
     market.add_argument('-o', '--output_file', type=str, help='output adaptiv filename (uses the path of the '
                                                               'market_file) - do not include the extention .dat')
 
