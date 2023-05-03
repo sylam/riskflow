@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 # Internal modules
 from . import utils
-from .instruments import get_fx_zero_rate_factor
+from .instruments import get_fx_zero_rate_factor, get_equity_zero_rate_factor, get_dividend_rate_factor
 
 
 def piecewise_linear(t, tenor, values, shared):
@@ -117,7 +117,7 @@ class StochasticProcess(object):
         self.param = param
         self.params_ok = True
 
-    def link_references(self, implied_tensor, implied_var, implied_ofs):
+    def link_references(self, implied_tensor, implied_var, implied_ofs, implied_factors):
         """link market variables across different risk factors"""
         pass
 
@@ -209,7 +209,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         '',
         '$$ \\frac{dS(t)}{S(t)} = (r(t)-q(t)-v(t)\\sigma(t)\\rho) dt + \\sigma(t) dW(t)$$',
         '',
-        'Note that no risk premium curve is captured. Its final form is:',
+        'Note that no risk premium curve is captured. For Equity factors, its final form is:',
         '',
         '$$ S(t+\\delta) = F(t,t+\\delta)exp \\Big(\\rho(C(t+\\delta)-C(t)) -\\frac{1}{2}(V(t+\\delta)) - V(t))\
          + \\sqrt{V(t+\\delta) - V(t)}Z  \\Big) $$',
@@ -231,12 +231,17 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         '',
         '$$S(t)=S(0)\\beta(t)exp\\Big(\\frac{1}{2}\\bar\\sigma(t)^2t+\\int_0^t\\sigma(s)dW(s)\\Big)$$',
         '',
-        'Here $C(t)=\\bar\\sigma(t)^2t, \\beta(t)=exp\\Big(\\int_0^t(r(s)-q(s))ds\\Big), \\rho=-1 and v(t)=\\sigma(t)$'
+        'Here $C(t)=\\bar\\sigma(t)^2t, \\beta(t)=exp\\Big(\\int_0^t(r(s)-q(s))ds\\Big), \\rho=-1$ and $v(t)=\\sigma('
+        't)$'
     ])
 
     def __init__(self, factor, param, implied_factor=None):
         super(GBMAssetPriceTSModelImplied, self).__init__(factor, param)
         self.implied = implied_factor
+        # get the name of the underlying factor
+        self.factor_type = self.factor.__class__.__name__
+        # potentially handle quanto fx volatility
+        self.quanto_fx_tenor = None
 
     @staticmethod
     def num_factors():
@@ -244,7 +249,12 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         def calc_vol(t, v, dt, m):
+            ''' sympy.simplify(sympy.integrate((v + m * (s - t)) ** 2 , (s, t, t + dt))) '''
             return dt * (dt ** 2 * m ** 2 / 3 + dt * m * v + v ** 2)
+
+        def cal_quanto_fx_vol(t, vi, vj, dt, mi, mj):
+            ''' sympy.simplify(sympy.integrate((vi + mi * (s - t)) * (vj + mj * (s - t)), (s, t, t + dt))) '''
+            return dt * (2 * dt ** 2 * mi * mj + 3 * dt * mi * vj + 3 * dt * mj * vi + 6 * vi * vj) / 6
 
         # store randomnumber id's
         self.z_offset = process_ofs
@@ -260,13 +270,46 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         self.spot = tensor
         # store the scenario grid
         self.scen_grid = time_grid.scenario_grid
+        # check if we need to calculate the quanto fx vol
+        if self.factor_type == 'EquityPrice' and self.quanto_fx_tenor is not None:
+            # need to get the quantofx rate if necessary
+            self.C = torch.unsqueeze(integrate_piecewise_linear(
+                (cal_quanto_fx_vol, 1.0), shared, time_grid.time_grid_years,
+                vol_tenor, implied_tensor['Vol'], self.quanto_fx_tenor, implied_tensor['Quanto_FX_Volatility']),
+                axis=1)
+            self.rho = implied_tensor['Quanto_FX_Correlation']
+        else:
+            self.C = 0.0
+            self.rho = 0.0
+
+    def link_references(self, implied_tensor, implied_var, implied_ofs, implied_factors):
+        """link market variables across different risk factors"""
+        if self.factor_type == 'EquityPrice':
+            fx_implied_index = implied_ofs.get(utils.Factor('FxRate', self.factor.get_currency()))
+            if fx_implied_index is not None:
+                FXImplied_vol_factor = utils.Factor(
+                    'GBMAssetPriceTSModelParameters', self.factor.get_currency() + ('Vol',))
+                # now set the Quanto_FX_Volatility to the same vol as the fx rate
+                implied_tensor['Quanto_FX_Volatility'] = implied_var[fx_implied_index][FXImplied_vol_factor]
+                if self.implied.param['Quanto_FX_Volatility'] is not None:
+                    self.quanto_fx_tenor = self.implied.param['Quanto_FX_Volatility'].array[:, 0]
+                else:
+                    self.quanto_fx_tenor = implied_factors[
+                        utils.Factor('GBMAssetPriceTSModelParameters', self.factor.get_currency())].get_tenor()
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
-        # this is valid for FX factors only - can change this to equities etc. by changing the get_XXX_factor
-        # function below
-        self.r_t = get_fx_zero_rate_factor(
-            self.factor.get_domestic_currency(None), static_ofs, stoch_ofs, all_tenors, all_factors)
-        self.q_t = get_fx_zero_rate_factor(factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
+        # this is valid for FX and Equity factors only
+        if self.factor_type == 'EquityPrice':
+            self.r_t = get_equity_zero_rate_factor(
+                factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
+            self.q_t = get_dividend_rate_factor(
+                factor.name, static_ofs, stoch_ofs, all_tenors)
+        elif self.factor_type == 'FxRate':
+            self.r_t = get_fx_zero_rate_factor(
+                self.factor.get_domestic_currency(None), static_ofs, stoch_ofs, all_tenors, all_factors)
+            self.q_t = get_fx_zero_rate_factor(factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
+        else:
+            raise Exception('Unknown factor type {}'.format(self.factor_type))
 
     @property
     def correlation_name(self):
@@ -284,7 +327,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
 
         drift = torch.cumsum(torch.squeeze(rt_rates - qt_rates, axis=1), axis=0)
 
-        return self.spot * torch.exp(drift - 0.5 * self.V + f1)
+        return self.spot * torch.exp(drift - self.rho * self.C - 0.5 * self.V + f1)
 
 
 class GBMPriceIndexModel(StochasticProcess):
@@ -411,7 +454,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         self.implied = implied_factor
         self.cache = {}
 
-    def link_references(self, implied_tensor, implied_var, implied_ofs):
+    def link_references(self, implied_tensor, implied_var, implied_ofs, implied_factors):
         """link market variables across different risk factors"""
         fx_implied_index = implied_ofs.get(utils.Factor('FxRate', self.factor.get_currency()))
         if fx_implied_index is not None:
@@ -864,13 +907,26 @@ class CSForwardPriceModel(StochasticProcess):
             time_grid.scen_time_grid[1:].reshape(-1, 1)
         ) - time_grid.scen_time_grid[:-1].reshape(-1, 1)
         dt = np.insert(delta, 0, 0, axis=0) / utils.DAYS_IN_YEAR
-        # need to scale the vol (as the variance is modelled using an OU Process)
-        var_adj = (1.0 - np.exp(-2.0 * self.param['Alpha'] * dt.cumsum(axis=0))) / (2.0 * self.param['Alpha'])
-        var = np.square(self.param['Sigma']) * np.exp(-2.0 * self.param['Alpha'] * tenors) * var_adj
-        # get the vol
-        vol = np.sqrt(np.diff(np.insert(var, 0, 0, axis=0), axis=0))
-        self.vol = tensor.new(np.expand_dims(vol, axis=2))
-        self.drift = tensor.new(np.expand_dims(self.param['Drift'] * dt.cumsum(axis=0) - 0.5 * var, axis=2))
+
+        if implied_tensor is None:
+            # need to scale the vol (as the variance is modelled using an OU Process)
+            var_adj = (1.0 - np.exp(-2.0 * self.param['Alpha'] * dt.cumsum(axis=0))) / (2.0 * self.param['Alpha'])
+            var = np.square(self.param['Sigma']) * np.exp(-2.0 * self.param['Alpha'] * tenors) * var_adj
+            # get the vol
+            vol = np.sqrt(np.diff(np.insert(var, 0, 0, axis=0), axis=0))
+            self.vol = tensor.new(np.expand_dims(vol, axis=2))
+            self.drift = tensor.new(np.expand_dims(self.param['Drift'] * dt.cumsum(axis=0) - 0.5 * var, axis=2))
+        else:
+            # need to scale the vol (as the variance is modelled using an OU Process)
+            var_adj = (1.0 - torch.exp(-2.0 * implied_tensor['Alpha'] * tensor.new(dt.cumsum(axis=0)))) / (
+                    2.0 * implied_tensor['Alpha'])
+            var = torch.square(implied_tensor['Sigma']) * torch.exp(
+                -2.0 * implied_tensor['Alpha'] * tensor.new(tenors)) * var_adj
+            delta_var = torch.diff(F.pad(var, [0, 0, 1, 0]), axis=0)
+            safe_delta = torch.where(delta_var > 0.0, delta_var, torch.ones_like(delta_var))
+            vol = torch.where(delta_var > 0.0, torch.sqrt(safe_delta), torch.zeros_like(delta_var))
+            self.vol = torch.unsqueeze(vol, axis=2)
+            self.drift = torch.unsqueeze(-0.5 * var, axis=2)
 
     @property
     def correlation_name(self):
@@ -881,9 +937,17 @@ class CSForwardPriceModel(StochasticProcess):
             shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
             axis=1) * self.vol
 
-        stoch = self.drift + torch.cumsum(z_portion, axis=0)
+        return self.initial_curve * torch.exp(self.drift + torch.cumsum(z_portion, axis=0))
 
-        return self.initial_curve * torch.exp(stoch)
+
+class CSImpliedForwardPriceModel(CSForwardPriceModel):
+    """The Clewlow Strickland Stochastic Process with implied vol and mean reversion"""
+
+    def __init__(self, factor, param, implied_factor=None):
+        super(CSImpliedForwardPriceModel, self).__init__(factor, param)
+        self.implied = implied_factor
+        # set the drift explicitly to zero - copy the other 2 params
+        self.param = {'Drift': 0.0, 'Sigma': implied_factor.param['Sigma'], 'Alpha': implied_factor.param['Alpha']}
 
 
 class CSForwardPriceCalibration(object):

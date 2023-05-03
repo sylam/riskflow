@@ -34,6 +34,7 @@ factor_interp_map = {
     'HermiteRTInterpolationCurveGetValue': 'HermiteRT'
 }
 
+
 class Factor0D(object):
     """Represents an instantaneous Rate (0D) risk factor"""
 
@@ -119,7 +120,7 @@ class Factor1D(object):
             m = np.clip((tenors - self.tenors[index]) / dt, 0.0, 1.0)
             g, c = self.interpolation[1:]
             rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' else (
-            bumped_val, 1.0)
+                bumped_val, 1.0)
             val = rate[index] * (1.0 - m) + m * rate[index_next] + m * (
                     1.0 - m) * g[index] + m * m * (1.0 - m) * c[index]
             return val / denom
@@ -644,6 +645,24 @@ class ReferencePrice(Factor1D):
             self.param['Fixing_Curve'].array[:, 1]
 
 
+class CSForwardPriceModelParameters(Factor0D):
+    """
+    Represents the Bootstrapped CS implied parameters for a risk neutral process
+    """
+
+    def __init__(self, param):
+        super(CSForwardPriceModelParameters, self).__init__(param)
+
+    def get_tenor_indices(self):
+        zero = np.array([[0.0]])
+        return {'Alpha': zero,
+                'Sigma': zero}
+
+    def current_value(self, tenors=None, offset=0.0):
+        """Returns the parameters of the CS factor model as a dictionary"""
+        return {'Alpha': np.array([self.param['Alpha']]), 'Sigma': np.array([self.param['Sigma']])}
+
+
 class GBMAssetPriceTSModelParameters(Factor1D):
     """
     Represents the Bootstrapped TS implied parameters for a risk neutral process
@@ -657,11 +676,19 @@ class GBMAssetPriceTSModelParameters(Factor1D):
         return self.param['Vol'].array[:, 0]
 
     def get_tenor_indices(self):
-        return {'Vol': self.param['Vol'].array[:, 0].reshape(-1, 1)}
+        if self.param.get('Quanto_FX_Correlation', 0.0):
+            return {'Vol': self.param['Vol'].array[:, 0].reshape(-1, 1),
+                    'Quanto_FX_Correlation': np.array([[0.0]])}
+        else:
+            return {'Vol': self.param['Vol'].array[:, 0].reshape(-1, 1)}
 
     def current_value(self, tenors=None, offset=0.0):
         """Returns the parameters of the GBM factor model as a dictionary"""
-        return {'Vol': self.param['Vol'].array[:, 1]}
+        if self.param.get('Quanto_FX_Correlation', 0.0):
+            return {'Vol': self.param['Vol'].array[:, 1],
+                    'Quanto_FX_Correlation': np.array([self.param['Quanto_FX_Correlation']])}
+        else:
+            return {'Vol': self.param['Vol'].array[:, 1]}
 
 
 class HullWhite2FactorModelParametersJacobian(Factor1D):
@@ -840,6 +867,16 @@ class PCAMixedFactorModelParameters(Factor1D):
                             ('Yield_Volatility', self.param['Yield_Volatility'].array[:, 1])])
 
 
+class CommodityPriceVol(Factor2D):
+    field_desc = ('Commodities',
+                  ['- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat',
+                   'extrapolated and linearly interpolated. All Floats.'
+                   ])
+
+    def __init__(self, param):
+        super(CommodityPriceVol, self).__init__(param)
+
+
 class FXVol(Factor2D):
     field_desc = ('FX and Equity',
                   ['- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat',
@@ -882,6 +919,11 @@ class InterestYieldVol(Factor3D):
         prem = self.premiums[(self.premiums['UnderlyingTenor'] == tenor) &
                              (self.premiums['Expiry'] == expiry)]['Payer']
         return prem.values[0] / 10000.0
+
+    def get_strike_from_premiums(self, expiry, tenor):
+        strike = self.premiums[(self.premiums['UnderlyingTenor'] == tenor) &
+                               (self.premiums['Expiry'] == expiry)]['StrikeValue']
+        return strike.values[0] / 100.0
 
     @property
     def BlackScholesDisplacedShiftValue(self):
@@ -961,20 +1003,29 @@ class ForwardPriceVol(Factor3D):
         Again, this is symmetric wih get_tenor_indices i.e. self.current_value(self.get_tenor_indices()) should be
         just the list of corresponding vols.
         """
-        if tenors is not None and self.expiry.size > 1 and self.moneyness.size > 1:
-            interpolator = [RectBivariateSpline(self.expiry, self.tenor, vol.reshape(self.expiry.size, -1), kx=1, ky=1)
-                            for vol in self.vols.reshape(self.moneyness.size, -1)]
+        if tenors is not None:
             interp_vols = []
-            for tenor in tenors:
-                index = np.clip(self.moneyness.searchsorted(
-                    tenor[self.MONEYNESS_INDEX], side='right') - 1, 0, self.moneyness.size - 1)
-                index_p1 = np.clip(index + 1, 0, self.moneyness.size - 1)
-                val = np.interp(
-                    tenor[self.MONEYNESS_INDEX], self.moneyness[[index, index_p1]],
-                    np.dstack([interpolator[index](tenor[self.EXPIRY_INDEX], tenor[self.TENOR_INDEX]),
-                               interpolator[index_p1](tenor[self.EXPIRY_INDEX], tenor[self.TENOR_INDEX])]).flatten())
-                interp_vols.append(val)
-            return np.array(interp_vols)
+            if self.expiry.size > 1 and self.moneyness.size > 1:
+                interpolator = [RectBivariateSpline(self.expiry, self.tenor, vol.reshape(self.expiry.size, -1), kx=1, ky=1)
+                                for vol in self.vols.reshape(self.moneyness.size, -1)]
+
+                for tenor in tenors:
+                    index = np.clip(self.moneyness.searchsorted(
+                        tenor[self.MONEYNESS_INDEX], side='right') - 1, 0, self.moneyness.size - 1)
+                    index_p1 = np.clip(index + 1, 0, self.moneyness.size - 1)
+                    val = np.interp(
+                        tenor[self.MONEYNESS_INDEX], self.moneyness[[index, index_p1]],
+                        np.dstack([interpolator[index](tenor[self.EXPIRY_INDEX], tenor[self.TENOR_INDEX]),
+                                   interpolator[index_p1](tenor[self.EXPIRY_INDEX], tenor[self.TENOR_INDEX])]).flatten())
+                    interp_vols.append(val)
+                return np.array(interp_vols)
+            elif self.expiry.size > 1:
+                for tenor in tenors:
+                    val = np.interp(
+                        tenor[self.EXPIRY_INDEX], self.sorted_vol[:, self.EXPIRY_INDEX], self.sorted_vol[:, -1])
+                    interp_vols.append(val)
+                return np.array(interp_vols)
+
         return self.flat
 
     def get_tenor_indices(self):
@@ -988,7 +1039,6 @@ def construct_factor(factor, price_factors, factor_interp):
     if factor.type == 'InterestRate':
         interp_method = factor_interp.search(factor, price_factor, True)
         price_factor['Interpolation'] = factor_interp_map.get(interp_method, 'Linear')
-
     return globals().get(factor.type)(price_factor)
 
 

@@ -202,12 +202,12 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
             swaption_price = vol_surface.get_premium(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
             if vol_surface.delta:
                 implied_vol = scipy.optimize.brentq(lambda v: pvbp * utils.black_european_option_price(
-                    shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol+.5)
+                    shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol + .5)
                 swaption_price = pvbp * utils.black_european_option_price(
-                    shifted_strike, shifted_strike, 0.0, implied_vol+vol_surface.delta, expiry, 1.0, 1.0)
+                    shifted_strike, shifted_strike, 0.0, implied_vol + vol_surface.delta, expiry, 1.0, 1.0)
         else:
             swaption_price = pvbp * utils.black_european_option_price(
-                shifted_strike, shifted_strike, 0.0, vol+vol_surface.delta, expiry, 1.0, 1.0)
+                shifted_strike, shifted_strike, 0.0, vol + vol_surface.delta, expiry, 1.0, 1.0)
 
         # store this
         all_deals[swaption_name] = market_swap_class(
@@ -345,6 +345,112 @@ class InterestRateJacobian(object):
                 price_factors[utils.check_tuple_name(price_param)] = jac
 
 
+class CSForwardPriceModelParameters(object):
+    documentation = (
+        'Energy',
+        ['For Risk Neutral simulation, the Clewlow Strickland Model is calibrated to a set of European Energy',
+         'futures options $J$. We use scipy',
+         'an integrated curve $\\bar{\\sigma}(t)$ needs to be specified and is',
+         'interpreted as the average volatility at time $t$. This is typically obtained from the corresponding',
+         'ATM volatility. This is then used to construct a new variance curve $V(t)$ which is defined as',
+         '$V(0)=0, V(t_i)=\\bar{\\sigma}(t_i)^2 t_i$ and $V(t)=\\bar{\\sigma}(t_n)^2 t$ for $t>t_n$ where',
+         '$t_1,...,t_n$ are discrete points on the ATM volatility curve.',
+         '',
+         'Points on the curve that imply a decrease in variance (i.e. $V(t_i)<V(t_{i-1})$) are adjusted to',
+         '$V(t_i)=\\bar\\sigma(t_i)^2t_i=V(t_{i-1})$. This curve is then used to construct *instantaneous* curves',
+         'that are then input to the corresponding stochastic process.',
+         '',
+         'The relationship between integrated $F(t)=\\int_0^t f_1(s)f_2(s)ds$ and instantaneous curves $f_1, f_2$',
+         'where the instantaneous curves are defined on discrete points $P={t_0,t_1,..,t_n}$ with $t_0=0$ is defined',
+         'on $P$ by Simpson\'s rule:',
+         '',
+         '$$F(t_i)=F(t_{i-1})+\\frac{t_i-t_{i-1}}{6}\\Big(f(t_i)+4f(\\frac{t_i+t_{i-1}}{2})+f(t_i)\\Big)$$',
+         '',
+         'and $f(t)=f_1(t)f_2(t)$. Integrated curves are flat extrapolated and linearly interpolated.'
+         ]
+    )
+
+    def __init__(self, param, device, dtype):
+        self.device = device
+        self.prec = dtype
+        self.param = param
+
+    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
+        '''
+        Checks for Declining variance in the ATM vols of the relevant price factor and corrects accordingly.
+        '''
+        def calc_error(x, options):
+            sigma, alpha = x
+            B = lambda a, t: (1.0-np.exp(-a*t))/a
+            V = lambda T, S: sigma*sigma*np.exp(-2.0*alpha*S)*B(2.0*alpha, T)
+            error = 0.0
+            for option in options:
+                error += option['Weight']*(option['Quoted_Market_Value'] - utils.black_european_option_price(
+                    option['Forward'], option['Strike'], option['r'], V(option['T'], option['S']), option['T'],
+                    option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0))**2
+            return error
+
+        for market_price, implied_params in market_prices.items():
+            rate = utils.check_rate_name(market_price)
+            market_factor = utils.Factor(rate[0], rate[1:])
+
+            if market_factor.type == 'CSForwardPriceModelPrices':
+                # get the vol surface
+                if 'ForwardPriceVol.' + implied_params['instrument']['Forward_Volatility'] in price_factors:
+                    vol_factor = utils.Factor('ForwardPriceVol', utils.check_rate_name(
+                        implied_params['instrument']['Forward_Volatility']))
+                if 'ForwardPrice.' + implied_params['instrument']['Energy'] in price_factors:
+                    energy_factor = utils.Factor('ForwardPrice', utils.check_rate_name(
+                        implied_params['instrument']['Energy']))
+                if 'InterestRate.' + implied_params['instrument']['Discount_Rate'] in price_factors:
+                    discount_factor = utils.Factor('InterestRate', utils.check_rate_name(
+                        implied_params['instrument']['Discount_Rate']))
+
+                # this shouldn't fail - if it does, need to log it and move on
+                try:
+                    vol_surface = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
+                    vol_surface.delta = sys_params.get('Swaption_Volatility_Delta', 0.0)
+                    forward = riskfactors.construct_factor(energy_factor, price_factors, factor_interp)
+                    discount = riskfactors.construct_factor(discount_factor, price_factors, factor_interp)
+                except Exception:
+                    logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
+                    continue
+
+                # need to loop over this and create some market prices.
+                for option in implied_params['instrument']['Energy_Futures_Options']:
+                    t = discount.get_day_count_accrual(
+                        sys_params['Base_Date'], (option['Expiry_Date'] - sys_params['Base_Date']).days)
+                    d = discount.get_day_count_accrual(
+                        sys_params['Base_Date'], (option['Settlement_Date'] - sys_params['Base_Date']).days)
+                    expiry_excel = (option['Expiry_Date'] - utils.excel_offset).days
+                    settlement_excel = (option['Settlement_Date'] - utils.excel_offset).days
+                    forward_at_exp = forward.current_value(expiry_excel)
+                    forward_at_settle = forward.current_value(settlement_excel)
+                    r = discount.current_value(t)
+                    sigma = vol_surface.current_value([[t, d, 1.0]])[0]
+                    option['Strike'] = forward_at_exp
+                    option['Forward'] = forward_at_settle
+                    option['r'] = r
+                    option['S'] = d
+                    option['T'] = t
+                    option['Quoted_Market_Value'] = utils.black_european_option_price(
+                        forward_at_exp, forward_at_exp, r, sigma, t,
+                        option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0)
+
+                result = scipy.optimize.minimize(
+                    calc_error, (0.5, 0.1),
+                    args=(implied_params['instrument']['Energy_Futures_Options'],),
+                    bounds=[(0.001, 2.5), (0.001, 2.0)])
+
+                price_param = utils.Factor(self.__class__.__name__, market_factor.name)
+                # model_param = utils.Factor('GBMAssetPriceTSModelImplied', market_factor.name)
+
+                price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
+                    [('Property_Aliases', None),
+                     ('Sigma', result.x[1]),
+                     ('Alpha', result.x[0])])
+
+
 class GBMAssetPriceTSModelParameters(object):
     documentation = (
         'FX and Equity',
@@ -377,38 +483,48 @@ class GBMAssetPriceTSModelParameters(object):
         '''
         Checks for Declining variance in the ATM vols of the relevant price factor and corrects accordingly.
         '''
+        eq_vols = {}
+        fx_vols = {}
         for market_price, implied_params in market_prices.items():
             rate = utils.check_rate_name(market_price)
             market_factor = utils.Factor(rate[0], rate[1:])
 
             if market_factor.type == 'GBMAssetPriceTSModelPrices':
                 # get the vol surface
-                vol_factor = utils.Factor('FXVol', utils.check_rate_name(
-                    implied_params['instrument']['Asset_Price_Volatility']))
+                implied_param = utils.check_rate_name(implied_params['instrument']['Asset_Price_Volatility'])
+                if 'FXVol.' + implied_params['instrument']['Asset_Price_Volatility'] in price_factors:
+                    vol_factor = utils.Factor('FXVol', utils.check_rate_name(
+                        implied_params['instrument']['Asset_Price_Volatility']))
+                    is_fx = True
+                else:
+                    vol_factor = utils.Factor('EquityPriceVol', utils.check_rate_name(
+                        implied_params['instrument']['Asset_Price_Volatility']))
+                    is_fx = False
+
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
-                    fxvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
+                    vol_surface = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
                 except Exception:
                     logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
                     continue
 
-                mn_ix = np.searchsorted(fxvol.moneyness, 1.0)
-                atm_vol = [np.interp(1, fxvol.moneyness[mn_ix - 1:mn_ix + 1], y) for y in
-                           fxvol.get_vols()[:, mn_ix - 1:mn_ix + 1]]
+                mn_ix = np.searchsorted(vol_surface.moneyness, 1.0)
+                atm_vol = [np.interp(1, vol_surface.moneyness[mn_ix - 1:mn_ix + 1], y) for y in
+                           vol_surface.get_vols()[:, mn_ix - 1:mn_ix + 1]]
 
                 # store the output
                 price_param = utils.Factor(self.__class__.__name__, market_factor.name)
                 model_param = utils.Factor('GBMAssetPriceTSModelImplied', market_factor.name)
 
-                if fxvol.expiry.size > 1:
-                    dt = np.diff(np.append(0, fxvol.expiry))
-                    var = fxvol.expiry * np.array(atm_vol) ** 2
+                if vol_surface.expiry.size > 1:
+                    dt = np.diff(np.append(0, vol_surface.expiry))
+                    var = vol_surface.expiry * np.array(atm_vol) ** 2
                     sig = atm_vol[:1]
                     vol = atm_vol[:1]
                     var_tm1 = var[0]
                     fixed_variance = False
 
-                    for var_t, delta_t, t_i in zip(var[1:], dt[1:] / 3.0, fxvol.expiry[1:]):
+                    for var_t, delta_t, t_i in zip(var[1:], dt[1:] / 3.0, vol_surface.expiry[1:]):
                         M = var_tm1 + delta_t * (sig[-1] ** 2)
                         if var_t < M:
                             fixed_variance = True
@@ -427,12 +543,27 @@ class GBMAssetPriceTSModelParameters(object):
                 else:
                     vol = atm_vol
 
-                price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
-                    [('Property_Aliases', None),
-                     ('Vol', utils.Curve(['Integrated'], list(zip(fxvol.expiry, vol)))),
-                     ('Quanto_FX_Volatility', None),
-                     ('Quanto_FX_Correlation', 0.0)])
-                price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
+                if is_fx:
+                    fx_vols[rate[-1]] = [utils.Curve(['Integrated'], list(zip(vol_surface.expiry, vol))), implied_param]
+                    price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
+                        [('Property_Aliases', None),
+                         ('Vol', fx_vols[rate[-1]][0]),
+                         ('Quanto_FX_Volatility', None),
+                         ('Quanto_FX_Correlation', 0.0)])
+                    price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
+                else:
+                    quanto_fx_corr = price_factors.get(
+                        'Correlation.EquityPrice.{}.{}/FxRate.{}.{}'.format(
+                            rate[-1], implied_param[-1], *sorted([sys_params['Base_Currency'], implied_param[-1]])),
+                        {'Value': 0.0})['Value']
+                    price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
+                        [('Property_Aliases', None),
+                         ('Vol', utils.Curve(['Integrated'], list(zip(vol_surface.expiry, vol)))),
+                         ('Quanto_FX_Volatility', None),
+                         ('Quanto_FX_Correlation', quanto_fx_corr)])
+                    price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
+                    # store this for later quanto correction
+                    eq_vols[rate[-1]] = [utils.check_tuple_name(price_param), implied_param[-1]]
 
 
 class RiskNeutralInterestRateModel(object):

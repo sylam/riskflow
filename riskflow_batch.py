@@ -40,17 +40,11 @@ class JOB(object):
         self.logger = log
         self.params = {'Calc_Scenarios': 'No',
                        'Run_Date': rundate,
-                       'Time_grid': '0d 2d 1w(1w) 3m(1m)',
-                       'Random_Seed': 1254,
-                       'Generate_Cashflows': 'No',
-                       'Currency': 'ZAR',
-                       'Deflation_Interest_Rate': 'ZAR-SWAP',
-                       'CollVA': {'Gradient': 'No'},
-                       'CVA': {'Gradient': 'No', 'Hessian': 'No'}}
-        # load trade
-        self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
+                       'Time_grid': '0d 2d 1w(1w) 3m(1m) 1y(3m)'}
+        # load trades (and marketdata)
+        self.cx.load_json(os.path.join(self.input_path, self.rundate, self.netting_set))
         # get the netting set
-        self.ns = self.cx.deals['Deals']['Children'][0]['instrument'].field
+        self.ns = self.cx.current_cfg.deals['Deals']['Children'][0]['Instrument'].field
         # get the agreement currency
         self.agreement_currency = self.ns.get('Agreement_Currency', 'ZAR')
         # get the balance currency
@@ -64,35 +58,31 @@ class JOB(object):
     def valid(self):
         return False
 
-    def get_filename(self, csa_stat):
-        # filename to write the results to
-        return 'Tagged_{0}_{1}_{2}_{3}.csv'.format(self.rundate, self.balance_currency, csa_stat, self.netting_set)
-
     def run_calc(self):
         pass
 
 
-class CVA_GRAD(JOB):
+class PFE(JOB):
     def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
-        super(CVA_GRAD, self).__init__(cx, rundate, input_path, outputdir, netting_set, stats, log)
+        super(PFE, self).__init__(cx, rundate, input_path, outputdir, netting_set, stats, log)
         # load up a calendar (for theta)
-        self.business_day = cx.holidays['Johannesburg']['businessday']
+        self.business_day = self.cx.current_cfg.holidays['Johannesburg']['businessday']
         # set the OIS cashflow flag to speed up prime linked swaps
-        self.cx.params['Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
+        self.cx.current_cfg.params[
+            'Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
 
     def valid(self):
-        if not self.cx.deals['Deals']['Children'][0]['Children']:
+        if not self.cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             return False
         else:
             return True
 
     def run_calc(self):
-        import riskflow as rf
-
-        filename = 'CVA_' + self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
+        filename = 'PFE_{}_{}.csv'.format(
+            self.params['Run_Date'], self.cx.current_cfg.deals['Attributes']['Reference'])
 
         # load up CVA calc params
-        if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
+        if self.ns.get('Collateralized') == 'True':
             self.logger(self.netting_set, 'is collateralized')
             # turn on dynamic scenarios (more accurate)
             self.params['Dynamic_Scenario_Dates'] = 'Yes'
@@ -103,6 +93,55 @@ class CVA_GRAD(JOB):
         # do 20000 sims in batches of 1024
         self.params['Simulation_Batches'] = 10 * 2
         self.params['Batch_Size'] = 1024
+        try:
+            calc, out = self.cx.run_job(overrides=self.params)
+        except RuntimeError as e:  # Out of memory
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            traceback.print_exception(
+                exc_type, exc_value, exc_traceback, limit=2, file=sys.stdout)
+            self.logger(self.netting_set, 'Exception: Could not complete')
+        else:        
+            profile = out['Results']['profile']
+            out['Stats'].update({'PFE': profile['PFE'].max(), 'Currency': calc.params['Currency']})            
+            # write the grad
+            profile.index.name = calc.params['Currency']
+            profile.to_csv(os.path.join(self.outputdir, filename))
+            self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
+
+
+class CVA_GRAD(JOB):
+    def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
+        super(CVA_GRAD, self).__init__(cx, rundate, input_path, outputdir, netting_set, stats, log)
+        # load up a calendar (for theta)
+        self.business_day = self.cx.current_cfg.holidays['Johannesburg']['businessday']
+        # set the OIS cashflow flag to speed up prime linked swaps
+        self.cx.current_cfg.params[
+            'Valuation Configuration']['CFFloatingInterestListDeal']['OIS_Cashflow_Group_Size'] = 1
+        # allow cva overrides
+        self.params['CVA'] = {}
+
+    def valid(self):
+        if not self.cx.current_cfg.deals['Deals']['Children'][0]['Children']:
+            return False
+        else:
+            return True
+
+    def run_calc(self):
+        filename = 'CVA_{}_{}.csv'.format(
+            self.params['Run_Date'], self.cx.current_cfg.deals['Attributes']['Reference'])
+
+        # load up CVA calc params
+        if self.ns.get('Collateralized') == 'True':
+            self.logger(self.netting_set, 'is collateralized')
+            # turn on dynamic scenarios (more accurate)
+            self.params['Dynamic_Scenario_Dates'] = 'Yes'
+        else:
+            self.logger(self.netting_set, 'is uncollateralized')
+            self.params['Dynamic_Scenario_Dates'] = 'No'
+
+        # do 10000 sims in batches of 512
+        self.params['Simulation_Batches'] = 1
+        self.params['Batch_Size'] = 512
 
         # work out the next business day
         next_day = self.business_day.rollforward(
@@ -111,13 +150,13 @@ class CVA_GRAD(JOB):
         if os.path.isfile(os.path.join(self.outputdir, 'Greeks', filename)):
             self.logger(self.netting_set, 'Warning: skipping CVA gradient calc as file already exists')
             self.params['CVA']['Gradient'] = 'No'
-            _, out, _ = rf.run_cmc(self.cx, overrides=self.params, CVA=True)
+            calc, out = self.cx.run_job(overrides=self.params)
             stats = out['Stats']
             # store the CVA as part of the stats
-            out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
+            out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': calc.params['Currency']})
             # now calc theta
             self.params.update({'Run_Date': next_day})
-            _, theta, _ = rf.run_cmc(self.cx, overrides=self.params, CVA=True)
+            calc, theta = self.cx.run_job(overrides=self.params)
             out['Stats'].update({'CVA_Theta': theta['Results']['cva']})
             # store cva
             self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
@@ -126,31 +165,45 @@ class CVA_GRAD(JOB):
             calc_complete = False
             while not calc_complete:
                 try:
-                    _, out, _ = rf.run_cmc(self.cx, overrides=self.params, CVA=True)
+                    calc, out = self.cx.run_job(overrides=self.params)                  
                 except RuntimeError as e:  # Out of memory
                     exc_type, exc_value, exc_traceback = sys.exc_info()
-                    traceback.print_exception(exc_type, exc_value, exc_traceback,
-                                              limit=2, file=sys.stdout)
+                    traceback.print_exception(
+                        exc_type, exc_value, exc_traceback, limit=2, file=sys.stdout)
                     self.params['Simulation_Batches'] *= 2
                     self.params['Batch_Size'] //= 2
                     self.logger(self.netting_set,
-                                'Exception: OOM - Halving to {} Batchsize'.format(self.params['Batch_Size']))
+                        'Exception: OOM - Halving to {} Batchsize'.format(self.params['Batch_Size']))
+                    if self.params['Batch_Size']<128:
+                        self.logger(self.netting_set, 'Batchsize too small - skipping')
+                        break
+                except:
+                    exc_type, exc_value, exc_traceback = sys.exc_info()
+                    traceback.print_exception(
+                        exc_type, exc_value, exc_traceback, limit=2, file=sys.stdout)
+                    self.logger(self.netting_set, 'Unhandled Exception: Skipping')
+                    break
                 else:
-                    calc_complete = True
-
-            grad_cva = out['Results']['grad_cva'].rename(
-                columns={'Gradient': self.cx.deals['Attributes']['Reference']})
-            out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': self.params['Currency']})
-            # write the grad
-            grad_cva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
-            # run the next day
-            self.params['Run_Date'] = next_day
-            # switch off gradients
-            self.params['CVA']['Gradient'] = 'No'
-            _, theta, _ = rf.run_cmc(self.cx, overrides=self.params, CVA=True)
-            out['Stats'].update({'CVA_Theta': theta['Results']['cva']})
-            self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
-
+                    calc_complete = True            
+                    
+            if calc_complete:      
+                grad_cva = out['Results']['grad_cva'].rename(
+                    columns={'Gradient': self.cx.current_cfg.deals['Attributes']['Reference']})
+                out['Stats'].update({'CVA': out['Results']['cva'], 'Currency': calc.params['Currency']})
+                # write the grad
+                grad_cva.to_csv(os.path.join(self.outputdir, 'Greeks', filename))
+                # run the next day
+                self.params['Run_Date'] = next_day
+                # switch off gradients
+                self.params['CVA']['Gradient'] = 'No'
+                _, theta = self.cx.run_job(overrides=self.params)
+                out['Stats'].update({'CVA_Theta': theta['Results']['cva']})
+                self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
+                # log the netting set
+                self.logger(self.netting_set, 'CVA calc complete')
+            else:
+              self.logger(self.netting_set, 'Error CVA calc NOT complete!')            
+        
 
 class COLLVA(JOB):
     def __init__(self, cx, rundate, input_path, outputdir, netting_set, stats, log):
@@ -176,7 +229,7 @@ class COLLVA(JOB):
         # load trade
         self.cx.parse_json(os.path.join(self.input_path, self.rundate, self.netting_set))
         # get the netting set
-        self.ns = self.cx.deals['Deals']['Children'][0]['instrument'].field
+        self.ns = self.cx.deals['Deals']['Children'][0]['Instrument'].field
         # get the agreement currency
         self.agreement_currency = self.ns.get('Agreement_Currency', 'ZAR')
         # get the balance currency
@@ -195,7 +248,7 @@ class COLLVA(JOB):
         if self.agreement_currency == 'ZAR':
             self.cx.params['Price Factors']['InterestRate.ZAR-SWAP.OIS'] = makeflatcurve('ZAR', -15)
             self.cx.params['Price Factors']['InterestRate.ZAR-SWAP.FUNDING'] = makeflatcurve('ZAR', 10)
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets'] = {
+            self.cx.deals['Deals']['Children'][0]['Instrument'].field['Collateral_Assets'] = {
                 'Cash_Collateral': [{
                     'Currency': 'USD',
                     'Collateral_Rate': 'ZAR-SWAP.OIS',
@@ -207,7 +260,7 @@ class COLLVA(JOB):
             self.cx.params['Price Factors']['HullWhite2FactorModelParameters.USD-OIS'] = cx.params[
                 'Price Factors']['HullWhite2FactorModelParameters.USD-MASTER']
             self.cx.params['Price Factors']['InterestRate.USD-LIBOR-3M.FUNDING'] = makeflatcurve('USD', 65)
-            self.cx.deals['Deals']['Children'][0]['instrument'].field['Collateral_Assets'] = {
+            self.cx.deals['Deals']['Children'][0]['Instrument'].field['Collateral_Assets'] = {
                 'Cash_Collateral': [{
                     'Currency': 'USD',
                     'Collateral_Rate': 'USD-OIS',
@@ -217,12 +270,12 @@ class COLLVA(JOB):
 
     def valid(self):
         if not self.cx.deals['Deals']['Children'][0]['Children'] or self.cx.deals[
-            'Deals']['Children'][0]['instrument'].field.get(
+            'Deals']['Children'][0]['Instrument'].field.get(
             'Collateralized', 'False') == 'False' or self.agreement_currency != 'USD':
             return False
         else:
             for x in self.cx.deals['Deals']['Children'][0]['Children']:
-                if 'ZAR_COHN' in x['instrument'].field['Reference']:
+                if 'ZAR_COHN' in x['Instrument'].field['Reference']:
                     x['Ignore'] = 'True'
             return True
 
@@ -290,7 +343,7 @@ class SA_CVA(JOB):
         filename = 'CVA_' + self.params['Run_Date'] + '_' + self.cx.deals['Attributes']['Reference'] + '.csv'
 
         # load up CVA calc params
-        if self.cx.deals['Deals']['Children'][0]['instrument'].field.get('Collateralized') == 'True':
+        if self.ns.get('Collateralized') == 'True':
             self.logger(self.netting_set, 'is collateralized')
             # turn on dynamic scenarios (more accurate)
             self.params['Dynamic_Scenario_Dates'] = 'Yes'
@@ -348,7 +401,7 @@ class SA_CVA(JOB):
             self.stats.setdefault('Stats', {})[self.netting_set] = out['Stats']
 
 
-def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir):
+def work(id, lock, queue, results, job, rundate, input_path, outputdir):
     def log(netting_set, msg):
         lock.acquire()
         print('JOB %s: ' % id)
@@ -360,19 +413,16 @@ def work(id, lock, queue, results, job, rundate, input_path, calendar, outputdir
 
     # now load the library 
     import riskflow as rf
-
-    cx = rf.load_market_data(rundate, input_path, json_name='MarketData.json')
-
-    if os.path.isfile(os.path.join(input_path, rundate, 'CVAMarketData_Calibrated_New.json')):
-        cx_new = rf.load_market_data(
-            rundate, input_path, json_name='CVAMarketData_Calibrated_New.json')
-
-        log("Parent", "Overriding Calibration")
-        for factor in [x for x in cx_new.params['Price Factors'].keys()
-                       if x.startswith('HullWhite2FactorModelParameters') or
-                          x.startswith('GBMAssetPriceTSModelParameters')]:
-            # override it
-            cx.params['Price Factors'][factor] = cx_new.params['Price Factors'][factor]
+    # a context object loads (and caches) one or more configs
+    # remap any paths as necessary
+    cx = rf.Context(
+        path_transform={
+            '//ICMJHBMVDROPPRD/AdaptiveAnalytics/Inbound/MarketData': '/mnt/MarketData'
+        },
+        file_transform={
+            'CVAMarketData_Calibrated.dat': 'CVAMarketData_Calibrated_New.json',
+            'MarketData.dat': 'MarketData.json'
+        })
 
     # log results
     logs = {}
@@ -410,10 +460,11 @@ class Parent:
         self.lock = Lock()
         self.NUMBER_OF_PROCESSES = num_jobs
 
-    def start(self, job, rundate, input_path, calendar, outputdir, wildcard='CrB*.json'):
+    def start(self, job, rundate, input_path, outputdir, wildcard='CrB*.json'):
         print("starting {0} workers in {1}".format(self.NUMBER_OF_PROCESSES, input_path))
+
         self.workers = [Process(target=work, args=(
-            i, self.lock, self.queue, self.results, job, rundate, input_path, calendar, outputdir))
+            i, self.lock, self.queue, self.results, job, rundate, input_path, outputdir))
                         for i in range(self.NUMBER_OF_PROCESSES)]
 
         # start all children
@@ -469,15 +520,14 @@ def main():
     parser.add_argument('rundate', type=str, help='batch rundate')
     parser.add_argument('input_path', type=str, help='directory containing the input files (note that the rundate is '
                                                      'assumed to be a directory within)')
-    parser.add_argument('calendar_file', type=str, help='calendar file to use')
     parser.add_argument('output_path', type=str, help='output directory')
     parser.add_argument('filename', type=str, help='filename(s) in input_path to run - wildcards allowed')
 
     # get the arguments
     args = parser.parse_args()
 
-    Parent(args.num_jobs).start(args.job, args.rundate, args.input_path, args.calendar_file, args.output_path,
-                                args.filename)
+    Parent(args.num_jobs).start(
+        args.job, args.rundate, args.input_path, args.output_path, args.filename)
     return 0
 
 

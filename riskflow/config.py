@@ -81,8 +81,11 @@ class ModelParams(object):
         # valid risk factor subtypes (only Interest rates at the moment)
         self.valid_subtype = {'BasisSpread': 'BasisSpread'}
         # these models need these additional price factors
-        self.implied_models = {'GBMAssetPriceTSModelImplied': 'GBMAssetPriceTSModelParameters',
-                               'HullWhite2FactorImpliedInterestRateModel': 'HullWhite2FactorModelParameters'}
+        self.implied_models = {
+            'CSImpliedForwardPriceModel': 'CSForwardPriceModelParameters',
+            'GBMAssetPriceTSModelImplied': 'GBMAssetPriceTSModelParameters',
+            'HullWhite2FactorImpliedInterestRateModel': 'HullWhite2FactorModelParameters'
+        }
 
         self.modeldefaults = OrderedDict()
         self.modelfilters = OrderedDict()
@@ -416,7 +419,7 @@ class Context(object):
     def calculate_dependencies(self, options, base_date, base_MTM_dates, calc_dates=True):
         """
         Works out the risk factors (and risk models) in the given set of deals.
-        These factors are cross referenced in the marketdata file and matched by
+        These factors are cross-referenced in the marketdata file and matched by
         name. This can be extended as needed.
 
         Returns the dependant factors, the stochastic models, the full list of
@@ -524,7 +527,7 @@ class Context(object):
                     if calc_dates:
                         instrument.finalize_dates(self.parse_grid, base_date, base_MTM_dates, None, resets,
                                                   settlement_currencies)
-                    # get it's price factors
+                    # get its price factors
                     get_price_factors(price_factors, factor_tenors, instrument)
 
             return children, resets, settlement_currencies
@@ -533,6 +536,8 @@ class Context(object):
             interest_rate_factor = utils.Factor(
                 'InterestRate', utils.check_rate_name(curve_name))
 
+            # make sure to add the reset dates to this interest rate (and dependents)
+            dependent_factor_tenors[interest_rate_factor] = reset_dates
             dependent_factors.update(get_rates(interest_rate_factor, {}))
             for sub_factor in utils.traverse_dependents(interest_rate_factor, dependent_factors):
                 dependent_factor_tenors[sub_factor] = reset_dates
@@ -560,7 +565,16 @@ class Context(object):
                 utils.Factor('ForwardPrice', (instrument.field['Reference_Type'],)))]['Currency'] else [],
             'ForwardPrice': lambda instrument, factor_fields, params: [utils.Factor('FXVol', tuple(
                 sorted([instrument.field['Currency'], factor_fields['Currency']])))] if
-            instrument.field['Currency'] != factor_fields['Currency'] else []}
+            instrument.field['Currency'] != factor_fields['Currency'] else [],
+            'EquityPriceVol': lambda instrument, factor_fields, params:
+            [utils.Factor('Correlation', tuple('EquityPrice.{0}/FxRate.{1}'.format(
+                instrument.field['Equity_Volatility'],
+                '.'.join(sorted([instrument.field['Currency'], instrument.field['Payoff_Currency']]))
+            ).split('.'))), utils.Factor('FXVol', tuple(
+                sorted([instrument.field['Currency'], instrument.field['Payoff_Currency']])))
+             ] if instrument.field['Currency'] != instrument.field.get(
+                'Payoff_Currency', instrument.field['Currency']) else [],
+        }
 
         # the list of returned factors
         dependent_factors = set()
@@ -652,6 +666,14 @@ class Context(object):
                 additional_factor = self.params['Model Configuration'].additional_factors(stoch_proc, factor)
                 if stoch_proc and factor.name[0] != self.params['System Parameters']['Base_Currency']:
                     factor_model = utils.Factor(stoch_proc, factor.name)
+                    if additional_factor and self.params['Price Factors'].get(
+                            utils.check_tuple_name(additional_factor)) is not None and utils.check_tuple_name(
+                        factor_model) not in self.params['Price Models']:
+                        # need a dummy stochastic process
+                        self.params['Price Models'][utils.check_tuple_name(factor_model)] = None
+                        logging.info(
+                            'Risk Factor {0} set to implied stochastic process {1}'.format(
+                                utils.check_tuple_name(factor), stoch_proc))
 
                     if utils.check_tuple_name(factor_model) in self.params['Price Models']:
                         stochastic_factors.setdefault(factor_model, factor)
