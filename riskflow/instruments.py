@@ -1433,11 +1433,10 @@ class StructuredDeal(Deal):
         return field_index
 
     def post_process(self, accum, shared, time_grid, deal_data, child_dependencies):
-        net_mtm = 0.0
+        net_mtm = shared.one.new_zeros(1, 1)
 
         for child in child_dependencies:
-            mtm = child.Instrument.calculate(shared, time_grid, child)
-            net_mtm += mtm
+            net_mtm = net_mtm + child.Instrument.calculate(shared, time_grid, child)
 
         # return the interpolated value (without interpolating the time_grid)
         return pricing.interpolate(net_mtm, shared, time_grid, deal_data, interpolate_grid=False)

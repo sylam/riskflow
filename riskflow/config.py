@@ -265,7 +265,9 @@ class Context(object):
         self.calendars = ElementTree(file=filename)
         for elem in self.calendars.iter():
             if elem.attrib.get('Location'):
-                holidays = dict(tuple(x.split("|")) for x in elem.attrib['Holidays'].split(', '))
+                if elem.attrib['Holidays']:
+                    holidays = dict(tuple(x.split("|")) for x in
+                                    elem.attrib['Holidays'].split(', ')) if elem.attrib['Holidays'] else {}
                 self.holidays[elem.attrib['Location']] = {
                     'businessday': pd.tseries.offsets.CustomBusinessDay(
                         holidays=holidays.keys(), weekmask=utils.WeekendMap[elem.attrib['Weekends']]),
@@ -627,7 +629,7 @@ class Context(object):
             # check if we need to fetch curve data for FVA
             if options.get('FVA'):
                 # add curves
-                add_interest_rate(options['FVA']['Funding_Interest_Curve'])
+                add_interest_rate(options['FVA']['Funding_Cost_Interest_Curve'])
                 add_interest_rate(options['FVA']['Risk_Free_Curve'])
 
                 # need to weight the FVA by the survival prob of the counterparty (if defined)

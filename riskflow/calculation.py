@@ -947,7 +947,7 @@ class Credit_Monte_Carlo(Calculation):
                 time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
                 mtm_grid = self.time_grid.mtm_time_grid[time_grid]
 
-                funding = get_interest_factor(utils.check_rate_name(params['FVA']['Funding_Interest_Curve']),
+                funding = get_interest_factor(utils.check_rate_name(params['FVA']['Funding_Cost_Interest_Curve']),
                                               self.static_ofs, self.stoch_ofs, self.all_tenors)
                 riskfree = get_interest_factor(utils.check_rate_name(params['FVA']['Risk_Free_Curve']),
                                                self.static_ofs, self.stoch_ofs, self.all_tenors)
@@ -965,7 +965,7 @@ class Credit_Monte_Carlo(Calculation):
                 DF_rf = torch.squeeze(torch.exp(-deflation.gather_weighted_curve(
                     shared_mem, mtm_grid.reshape(1, -1))), axis=0)
 
-                if params['FVA'].get('Stochastic_Funding', 'No') == 'Yes':
+                if params['FVA'].get('Deflate_Stochastically', 'No') == 'Yes':
                     Vk_plus_ti = torch.relu(tensors['mtm'] * DF_rf)
                     Vk_minus_ti = torch.relu(-tensors['mtm'] * DF_rf)
                     Vk_star_ti_p = (Vk_plus_ti[1:] + Vk_plus_ti[:-1]) / 2

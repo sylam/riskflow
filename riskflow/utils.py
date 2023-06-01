@@ -594,9 +594,15 @@ class TensorResets(TensorSchedule):
                      filter_index=RESET_INDEX_Reset_Day, include_today=False):
         key = ('known_resets', num_scenarios, include_today)
         if self.cache.get(key) is None:
-            filter_fn = (lambda x: x <= 0.0) if include_today else (lambda x: x < 0.0)
-            self.cache[key] = [self.unit.new_full((1, num_scenarios), x[index])
-                               for x in self.schedule if filter_fn(x[filter_index])]
+            if include_today:
+                # we only include today if we are dealing with equity resets
+                filter_fn = lambda x: x <= 0.0
+                self.cache[key] = [self.unit.new_full((1, num_scenarios), x[index])
+                                   for x in self.schedule if filter_fn(x[filter_index]) and x[index] > 0]
+            else:
+                filter_fn = lambda x: x < 0.0
+                self.cache[key] = [self.unit.new_full((1, num_scenarios), x[index])
+                                   for x in self.schedule if filter_fn(x[filter_index])]
         return self.cache[key]
 
     def split_block_resets(self, reset_offset, t, date_offset=0):
@@ -1299,35 +1305,28 @@ def calc_spot_forward(curve, T, time_grid, shared, only_diag):
 
 
 def calc_dividend_samples(start_day, samples, time_grid):
-    divi_scenario_offsets = []
-    d = []
-    for reset_end in samples:
-        reset_start = max(start_day, 0)
-        Time_Grid, Scenario = time_grid.get_scenario_offset(reset_start)
-        d.append([Time_Grid, reset_start, -1, reset_start, reset_end, 0.0, 0.0, 0.0])
-        divi_scenario_offsets.append(Scenario)
+    reset_start_day = start_day.clip(min=0)
+    time_grid_scenario = [time_grid.get_scenario_offset(x) for x in reset_start_day]
+    scenario = [x[1] for x in time_grid_scenario]
+    time_interp = [x[0] for x in time_grid_scenario]
+    resets = [TensorResets([[Time_Grid, reset_start, -1, reset_start, reset_end, 0.0, 0.0, 0.0]
+                            for reset_end in samples], [scenario_offset] * len(samples))
+              for Time_Grid, reset_start, scenario_offset in zip(time_interp, reset_start_day, scenario)]
+    return resets
 
-    return TensorResets(d, divi_scenario_offsets)
 
+def calc_realized_dividends(s_t0, repo, div_yield, div_reset_stack, shared):
+    # Calculate exp(sr) * (1 - exp(-sq))
+    sr_minus_sq = torch.stack([
+        torch.exp(torch.squeeze(calc_spot_forward(
+            repo, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True), axis=1)
+        ) * (1.0 - torch.exp(
+            -torch.squeeze(calc_spot_forward(
+                div_yield, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True), axis=1))
+             )
+        for div_resets in div_reset_stack], axis=1)
 
-def calc_realized_dividends(s_t0, equity, repo, div_yield, div_resets, shared):
-    S = s_t0.squeeze(axis=0)
-    num_resets = len(div_resets.schedule)
-    if len(S) == 1 and num_resets > 1:
-        S = S.tile([num_resets, 1])
-    elif S.shape[0] > num_resets:
-        S = S[:num_resets]
-    elif S.shape[0] < num_resets:
-        div_resets.schedule = div_resets.schedule[:S.shape[0]]
-
-    sr = torch.squeeze(calc_spot_forward(
-        repo, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True), axis=1)
-    sq = torch.exp(-torch.squeeze(
-        calc_spot_forward(
-            div_yield, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True),
-        axis=1))
-
-    return S * torch.exp(sr) * (1 - sq.reshape(-1, 1))
+    return s_t0 * sr_minus_sq
 
 
 def calc_eq_drift(repo, div_yield, weights, time_grid, shared, multiply_by_time=True):
@@ -2292,9 +2291,7 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
     """
     cash = []
     all_resets = []
-    all_divs = []
     cashflow_reset_offsets = []
-    cashflow_divi_offsets = []
     reset_scenario_offsets = []
 
     for cashflow in sorted(cashflows['Items'], key=lambda x: (x['Payment_Date'], x['End_Date'], x['Start_Date'])):
@@ -2327,10 +2324,8 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
 
     cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
     cashflows.set_resets(all_resets, reset_scenario_offsets)
-    # only interested in the start dates
-    dividends = TensorResets(all_resets[::2], reset_scenario_offsets[::2])
 
-    return cashflows, dividends
+    return cashflows
 
 
 def make_index_cashflows(base_date, time_grid, position, cashflows, price_index, index_rate, settlement_date,

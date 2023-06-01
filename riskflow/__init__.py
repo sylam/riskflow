@@ -234,7 +234,17 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         # summarize the results for easy review
         mtm = out['Results']['mtm']
         exposure = mtm.clip(0.0, np.inf)
-        res = pd.DataFrame({'EE': np.mean(exposure, axis=1), 'PFE': np.percentile(mtm, 95, axis=1)})
+        neg_exposure = mtm.clip(-np.inf, 0.0)
+
+        exposure = {
+            'EE': np.mean(exposure, axis=1),
+            'ENE': np.mean(neg_exposure, axis=1)}
+        percentiles = calc_params.get('Percentile', '95').replace(' ', '')
+        if percentiles:
+            extra = {'PFE_{}'.format(x): np.percentile(mtm, int(x), axis=1) for x in percentiles.split(',')}
+            exposure.update(extra)
+
+        res = pd.DataFrame(exposure)
         out['Results']['exposure_profile'] = res
 
         # check if we have collva
@@ -311,8 +321,8 @@ class Context:
 
         if 'Deals' in data['Calc']:
             cfg.deals = {'Attributes': {
-                'Tag_Titles': data['Calc']['Deals']['Tag_Titles'],
-                'Reference': data['Calc']['Deals']['Reference']}}
+                'Tag_Titles': data['Calc']['Deals'].get('Tag_Titles', ''),
+                'Reference': data['Calc']['Deals'].get('Reference')}}
             # try to compress the deal data if possible
             deals = data['Calc']['Deals']['Deals']
             if compress:
