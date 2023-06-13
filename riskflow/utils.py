@@ -412,7 +412,7 @@ class Calculation_State(object):
     should inherit from this calculation state and extend accordingly
     """
 
-    def __init__(self, static_buffer, unit, report_currency: List[Tuple[bool, int]], nomodel: str):
+    def __init__(self, static_buffer, unit, mcmc_sims, report_currency: List[Tuple[bool, int]], nomodel: str):
         # these are tensors
         self.t_Buffer = {}
         self.t_Static_Buffer = static_buffer
@@ -423,6 +423,7 @@ class Calculation_State(object):
         self.t_Cashflows = None
         # these are shared parameter states
         self.riskneutral = nomodel == 'RiskNeutral'
+        self.MCMC_sims = mcmc_sims
 
 
 # often we need a numpy array and it's tensor equivalent at the same time

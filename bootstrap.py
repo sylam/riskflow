@@ -130,9 +130,58 @@ class Parent(object):
         if self.cx.params['System Parameters']['Base_Date'] is None:
             logging.info('Setting  rundate {}'.format(rundate))
             self.cx.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
+
+        if premium_file is not None:
+            waited = 0
+            base = ''
+            while True:
+                logging.info('Watching for premium file in {} for rundate {}'.format(premium_file, rundate))
+                prem = glob.glob(os.path.join(premium_file, base, 'IR_Volatility_Swaption_{}*.csv'.format(rundate)))
+                if prem:
+                    if prem[0].endswith('_RFR.csv'):
+                        rfr, libor = prem[0], prem[1]
+                    else:
+                        rfr, libor = prem[1], prem[0]
+
+                    # load up the files
+                    rfr_premiums = pd.read_csv(rfr, index_col=0)
+                    libor_premiums = pd.read_csv(libor, index_col=0)
+
+                    with tempfile.NamedTemporaryFile(delete=False) as fp:
+                        valid_rfr = rfr_premiums[
+                            rfr_premiums['Currency'].isin(['AUD', 'CHF', 'EUR', 'GBP', 'JPY', 'USD'])]
+                        valid_libor = libor_premiums[libor_premiums['Currency'].isin(['CAD', 'ZAR'])]
+                        pd.concat([valid_rfr, valid_libor]).to_csv(fp)
+                        logging.info('Merging {} and {} as {}'.format(rfr, libor, fp.name))
+                        prem[0] = fp.name
+                    break
+                else:
+                    if waited > 60:
+                        logging.info('Waited an hour for Premium file in {} - exiting'.format(premium_file))
+                        sys.exit(1)
+                    else:
+                        time.sleep(60)
+                        waited += 1
+                        base = '..' if base == '' else ''
+
+            logging.info('Setting swaption premiums from {}'.format(prem[0]))
+            self.cx.params['System Parameters']['Swaption_Premiums'] = prem[0]
+
         if delta:
             logging.info('Setting implied vol delta to {}'.format(delta))
-            self.cx.params['System Parameters']['Swaption_Volatility_Delta'] = delta/100.0
+            self.cx.params['System Parameters']['Volatility_Delta'] = delta / 100.0
+
+        # load up master curves
+        self.cx.params['System Parameters']['Master_Curves'] = {
+            'AUD': 'AUD-AONIA',
+            'CAD': 'CAD-MASTER',
+            'CHF': 'CHF-OIS',
+            'EUR': 'EUR-ESTR',
+            'GBP': 'GBP-SONIA',
+            'JPY': 'JPY-TONAR',
+            'USD': 'USD-SOFR',
+            'ZAR': 'ZAR-SWAP'
+        }
 
         # load the params
         price_factors = self.manager.dict(self.cx.params['Price Factors'])
@@ -185,11 +234,11 @@ class Parent(object):
         if self.daily:
             # write out the calibrated data
             self.cx.write_marketdata_json(os.path.join(self.path, self.outfile + '.json'))
-            # self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
+            self.cx.write_market_file(os.path.join(self.path, self.outfile + '.dat'))
             logfilename = os.path.join(self.path, self.outfile + '.log')
         else:
             self.cx.write_marketdata_json(os.path.join(self.path, rundate, 'MarketDataCal.json'))
-            # self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
+            self.cx.write_market_file(os.path.join(self.path, rundate, 'MarketDataCal.dat'))
             logfilename = os.path.join(self.path, rundate, 'MarketDataCal.log')
 
         # copy the logs across
@@ -204,7 +253,7 @@ def main():
 
     parser = argparse.ArgumentParser(description='Bootstrap xVA risk neutral Calibration.')
     parser.add_argument('num_jobs', type=int, help='number of processes to run in parallel')
-    parser.add_argument('task', type=str, help='the task name', choices=['Historical', 'Daily'])
+    parser.add_argument('task', type=str, help='the task name', choices=['Historical', 'Daily', 'CopyHW'])
 
     hist = parser.add_argument_group('Historical', 'options for bootstrapping past data')
     hist.add_argument('-i', '--input_path', type=str, help='root directory containing rundates with marketdata')
@@ -213,9 +262,12 @@ def main():
 
     market = parser.add_argument_group('Daily', 'options for calibration of a single marketdata file')
     market.add_argument('-m', '--market_file', type=str, help='marketdata.json filename and path')
-    market.add_argument('-d', '--delta', type=int, help='amount to add (in percentage) to implied swaption vol (default 0)', default=0)
+    market.add_argument('-p', '--premium_file', type=str, help='swaption premium csv filename and path', default=None)
+    market.add_argument('-d', '--delta', type=int,
+                        help='amount to add (in percentage) to implied swaption vol (default 0)', default=0)
     market.add_argument('-o', '--output_file', type=str, help='output adaptiv filename (uses the path of the '
                                                               'market_file) - do not include the extention .dat')
+    parser.add_argument_group('CopyHW', 'options for copying the HW2 factor model to non RF curves')
 
     # get the arguments
     args = parser.parse_args()
@@ -226,8 +278,55 @@ def main():
             Parent(args.num_jobs).start(rundate, args.input_path, os.path.join(args.input_path, 'calendars.cal'))
     elif args.task == 'Daily':
         calendar = os.path.join(
-            os.path.split(args.market_file)[0], 'Calendars.cal')
-        Parent(args.num_jobs).start(None, args.market_file, calendar, outfile=args.output_file)
+            os.path.split(args.market_file)[0], 'calendars.cal')
+        Parent(args.num_jobs).start(
+            None, args.market_file, calendar, outfile=args.output_file, premium_file=args.premium_file,
+            delta=args.delta)
+    elif args.task == 'CopyHW':
+        import numpy as np
+        import riskflow.utils as utils
+        from riskflow.riskfactors import construct_factor
+        from riskflow.adaptiv import AdaptivContext
+        from riskflow.bootstrappers import master_curve_list
+        # load the context
+        context = AdaptivContext()
+        context.parse_json(args.market_file)
+        # get the hw2factor params
+        hw2params = {c: context.params['Price Factors']['HullWhite2FactorModelParameters.{}'.format(x)]
+                     for c, x in master_curve_list.items()}
+        # get all ir_base curve names
+        ir_curves = {curve_name: construct_factor(
+            utils.Factor('InterestRate', (curve_name,)), context.params['Price Factors'],
+            context.params['Price Factor Interpolation']) for curve_name in np.unique(
+            [x.split('.')[1] for x in context.params['Price Factors'].keys() if x.startswith('InterestRate.')])}
+
+        params_to_create = {}
+        for ir_curve_name, ir_curve in ir_curves.items():
+            ccy = ir_curve.get_currency()[0]
+            if ccy in master_curve_list:
+                params_to_create['HullWhite2FactorModelParameters.{}'.format(ir_curve_name)] = hw2params[ccy]
+
+        # delete old parameters          
+        for k in list(context.params['Price Factors'].keys()):
+            if k.startswith('HullWhite2FactorModelParameters.'):
+                del context.params['Price Factors'][k]
+        # write out the new ones        
+        context.params['Price Factors'].update(params_to_create)
+        # write out the data
+        context.write_marketdata_json(args.market_file)
+        # remove any jacobians before we write out the .dat
+        jacobians = [i for i in context.params['Price Factors'].keys() if
+                     i.startswith('HullWhite2FactorModelParametersJacobian')]
+        for i in jacobians:
+            del context.params['Price Factors'][i]
+        # remove the Swaption_Premiums param if it exists
+        if 'Swaption_Premiums' in context.params['System Parameters']:
+            del context.params['System Parameters']['Swaption_Premiums']
+        if 'Volatility_Delta' in context.params['System Parameters']:
+            del context.params['System Parameters']['Volatility_Delta']
+        if 'Master_Curves' in context.params['System Parameters']:
+            del context.params['System Parameters']['Master_Curves']
+        context.write_market_file(args.market_file.replace('.json', '.dat'))
     else:
         logging.error('Invalid Job - aborting')
 

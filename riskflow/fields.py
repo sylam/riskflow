@@ -116,6 +116,7 @@ mapping = {
             'Stochastic_Funding': {'widget': 'Dropdown', 'description': 'Stochastic Funding', 'value': 'No',
                                         'values': ['Yes', 'No']},
             'Gradient': {'widget': 'Dropdown', 'description': 'Gradient', 'value': 'No', 'values': ['Yes', 'No']},
+            'Greeks': {'widget': 'Dropdown', 'description': 'Greeks', 'value': 'No', 'values': ['First', 'No']},
             'Base_Time_Grid': {'widget': 'Text', 'description': 'Base Time Grid',
                                'value': '0d 2d 1w(1w) 3m(1m) 2y(3m)'},
             'Dynamic_Scenario_Dates': {'widget': 'Dropdown', 'description': 'Dynamic Scenario Dates',
@@ -123,6 +124,7 @@ mapping = {
             'Currency': {'widget': 'Text', 'description': 'Currency', 'value': 'ZAR'},
             'Percentile': {'widget': 'Text', 'description': 'Percentile', 'value': '95'},
             'Simulation_Batches': {'widget': 'Integer', 'description': 'Simulation Batches', 'value': 1},
+            'MCMC_Simulations': {'widget': 'Integer', 'description': 'MCMC Simulations', 'value': 2048},
             'Batch_Size': {'widget': 'Integer', 'description': 'Batch Size', 'value': 1024},
             'Random_Seed': {'widget': 'Integer', 'description': 'Random Seed', 'value': 5120},
             'Calc_Scenarios': {'widget': 'Dropdown', 'description': 'Calc Scenarios', 'value': 'No',
@@ -157,11 +159,11 @@ mapping = {
                                    'values': ['Yes', 'No'], 'Output': 'Cashflows'}
         },
         'types': {
-            'CreditMonteCarlo': ['Base_Date', 'Currency', 'Base_Time_Grid', 'Deflation_Interest_Rate', 'Percentile',
-                                 'Simulation_Batches', 'Batch_Size', 'Random_Seed', 'Calc_Scenarios', 'Dynamic_Scenario_Dates',
-                                 'Generate_Cashflows', 'Credit_Valuation_Adjustment', 'Funding_Valuation_Adjustment',
-                                 'Collateral_Valuation_Adjustment'],
-            'BaseValuation': ['Base_Date', 'Currency']
+            'CreditMonteCarlo': ['Base_Date', 'Currency', 'Base_Time_Grid', 'Deflation_Interest_Rate', 'Percentile',  
+                                 'MCMC_Simulations', 'Simulation_Batches', 'Batch_Size', 'Random_Seed', 'Calc_Scenarios', 
+                                 'Dynamic_Scenario_Dates', 'Generate_Cashflows', 'Credit_Valuation_Adjustment', 
+                                 'Funding_Valuation_Adjustment', 'Collateral_Valuation_Adjustment'],
+            'BaseValuation': ['Base_Date', 'Currency', 'MCMC_Simulations', 'Greeks']
         }
     },
     'System': {
@@ -322,7 +324,7 @@ mapping = {
             "GBMPriceIndexModel":
                 ["Vol", "Drift", "Seasonal_Adjustment"],
             "HWHazardRateModel":
-                ["Alpha", "Lambda", "sigma"],            
+                ["Alpha", "Lambda", "sigma"],
             "PCAInterestRateModel":
                 ["Reversion_Speed", "Historical_Yield", "Yield_Volatility", "Eigenvectors", "Rate_Drift_Model",
                  "Princ_Comp_Source", "Distribution_Type"],
@@ -516,6 +518,7 @@ mapping = {
 
         # field groups
         'sections': {
+            'EquityDeal.Fields': ['Equity', 'Investment_Horizon', 'Currency', 'Buy_Sell', 'Units'],
             'SwapCurrencyDeal.Fields': ['Effective_Date', 'Principal_Exchange', 'Maturity_Date'],
             'CapDeal.Fields': ['Reset_Type', 'Penultimate_Coupon_Date', 'Index_Day_Count', 'Buy_Sell',
                                'Index_Frequency', 'Payment_Calendars', 'Discount_Rate', 'Forecast_Rate', 'Index_Tenor',
@@ -730,6 +733,8 @@ mapping = {
                 ['Admin', 'CapDeal.Fields'],
             'DealDefaultSwap':
                 ['Admin', 'DealDefaultSwap.Fields'],
+            'EquityDeal':
+                ['Admin', 'EquityDeal.Fields'],
             'EquitySwapLeg':
                 ['Admin', 'EquitySwapLeg.Fields'],
             'EquitySwapletListDeal':

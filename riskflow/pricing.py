@@ -971,7 +971,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
             np.hstack([fixing_block[:, 0, np.newaxis], np.diff(fixing_block, axis=1)]))
         theo_cashflow = factor_dep['Buy_Sell'] * sim_spot(
             spot_block, vols, sample_ts, drifts, accumulation, sobol=sobol,
-            num_sims=2048 if sobol else 8 * 4096)
+            num_sims=shared.MCMC_sims)
 
         discount_rates = utils.calc_discount_rate(discount_block, fixings, shared)
 
@@ -1278,8 +1278,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
         theo_cashflow = nominal * sim_spot(
             spot_block, vols, sample_ts, drifts, sample_index_t, terminationDate,
-            # do fewer simulations if we're moving through time
-            sobol=sobol, num_sims=2048 if sobol else 8 * 4096)
+            sobol=sobol, num_sims=shared.MCMC_sims)
 
         discount_rates = utils.calc_discount_rate(discount_block, fixings, shared)
 

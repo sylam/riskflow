@@ -201,8 +201,18 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
         if vol_surface.premiums is not None:
             swaption_price = vol_surface.get_premium(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
             if vol_surface.delta:
-                implied_vol = scipy.optimize.brentq(lambda v: pvbp * utils.black_european_option_price(
-                    shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol + .5)
+                try:
+                    implied_vol = scipy.optimize.brentq(lambda v: pvbp * utils.black_european_option_price(
+                        shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol+.5)
+                except:                    
+                    modified_k = vol_surface.get_strike_from_premiums(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
+                    logging.warning(
+                    'Implied vol calc during delta bump failed - calculated strike is {} - using strike from premium file {}'.format(
+                        K, modified_k))
+                    shifted_strike = modified_k + shift_parameter
+                    implied_vol = scipy.optimize.brentq(lambda v: pvbp * utils.black_european_option_price(
+                        shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol+.5)
+                    
                 swaption_price = pvbp * utils.black_european_option_price(
                     shifted_strike, shifted_strike, 0.0, implied_vol + vol_surface.delta, expiry, 1.0, 1.0)
         else:
@@ -385,7 +395,7 @@ class CSForwardPriceModelParameters(object):
             V = lambda T, S: sigma*sigma*np.exp(-2.0*alpha*S)*B(2.0*alpha, T)
             error = 0.0
             for option in options:
-                error += option['Weight']*(option['Quoted_Market_Value'] - utils.black_european_option_price(
+                error += option['Weight']*(option['Premium'] - utils.black_european_option_price(
                     option['Forward'], option['Strike'], option['r'], V(option['T'], option['S']), option['T'],
                     option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0))**2
             return error
@@ -409,7 +419,7 @@ class CSForwardPriceModelParameters(object):
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
                     vol_surface = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
-                    vol_surface.delta = sys_params.get('Swaption_Volatility_Delta', 0.0)
+                    vol_surface.delta = sys_params.get('Volatility_Delta', 0.0)
                     forward = riskfactors.construct_factor(energy_factor, price_factors, factor_interp)
                     discount = riskfactors.construct_factor(discount_factor, price_factors, factor_interp)
                 except Exception:
@@ -417,6 +427,7 @@ class CSForwardPriceModelParameters(object):
                     continue
 
                 # need to loop over this and create some market prices.
+                quote_type = implied_params['instrument']['Quote_Type']
                 for option in implied_params['instrument']['Energy_Futures_Options']:
                     t = discount.get_day_count_accrual(
                         sys_params['Base_Date'], (option['Expiry_Date'] - sys_params['Base_Date']).days)
@@ -427,15 +438,23 @@ class CSForwardPriceModelParameters(object):
                     forward_at_exp = forward.current_value(expiry_excel)
                     forward_at_settle = forward.current_value(settlement_excel)
                     r = discount.current_value(t)
-                    sigma = vol_surface.current_value([[t, d, 1.0]])[0]
-                    option['Strike'] = forward_at_exp
-                    option['Forward'] = forward_at_settle
+                    if quote_type=='Implied_Volatility':
+                        sigma = vol_surface.current_value([[t, d, 1.0]])[0] if not option['Quoted_Market_Value'] else option['Quoted_Market_Value']
+                        sigma += vol_surface.delta
+                    else:
+                        logging.error('quote_type {} not supported yet'.format(quote_type))
+                        continue
+                        
+                    option['Strike'] = forward.current_value(expiry_excel) if not option['Strike'] else option['Strike']   
+                    option['Forward'] = forward.current_value(settlement_excel) 
                     option['r'] = r
                     option['S'] = d
                     option['T'] = t
-                    option['Quoted_Market_Value'] = utils.black_european_option_price(
-                        forward_at_exp, forward_at_exp, r, sigma, t,
+                    option['Premium'] = utils.black_european_option_price(
+                        option['Forward'], option['Strike'], r, sigma, t,
                         option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0)
+                    logging.info('Commodity {} forward {}, strike {}, expiry {}'.format(implied_params['instrument']['Energy'],
+                        option['Forward'], option['Strike'], option['Expiry_Date']))
 
                 result = scipy.optimize.minimize(
                     calc_error, (0.5, 0.1),
@@ -667,7 +686,7 @@ class RiskNeutralInterestRateModel(object):
                 # this shouldn't fail - if it does, need to log it and move on
                 try:
                     swaptionvol = riskfactors.construct_factor(vol_factor, price_factors, factor_interp)
-                    swaptionvol.delta = sys_params.get('Swaption_Volatility_Delta', 0.0)
+                    swaptionvol.delta = sys_params.get('Volatility_Delta', 0.0)
                     ir_curve = riskfactors.construct_factor(ir_factor, price_factors, factor_interp)
                     swaptionvol.set_premiums(ATM_Premiums, ir_curve.get_currency())
                 except KeyError as k:
@@ -758,10 +777,10 @@ class RiskNeutralInterestRateModel(object):
                 # calculate the jacobians and final premiums
                 jacobians, premiums = self.calc_jacobians(
                     implied_params, base_date, time_grid, process, final_implied_obj, ir_factor, swaptionvol)
-                price_param = utils.Factor(implied_obj.__class__.__name__ + 'Jacobian', market_factor.name)
-                price_factors[utils.check_tuple_name(price_param)] = jacobians
-                prem_param = utils.Factor(implied_obj.__class__.__name__ + 'Premiums', market_factor.name)
-                price_factors[utils.check_tuple_name(prem_param)] = premiums
+                # price_param = utils.Factor(implied_obj.__class__.__name__ + 'Jacobian', market_factor.name)
+                # price_factors[utils.check_tuple_name(price_param)] = jacobians
+                # prem_param = utils.Factor(implied_obj.__class__.__name__ + 'Premiums', market_factor.name)
+                # price_factors[utils.check_tuple_name(prem_param)] = premiums
 
                 # record the time
                 logging.info('This took {} seconds.'.format(time.monotonic() - time_now))

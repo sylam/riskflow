@@ -301,9 +301,9 @@ class Calculation(object):
 
 
 class CMC_State(utils.Calculation_State):
-    def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, one,
+    def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, one, mcmc_sims,
                  report_currency, nomodel='Constant'):
-        super(CMC_State, self).__init__(static_buffer, one, report_currency, nomodel)
+        super(CMC_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel)
         # these are tensors
         self.t_PreCalc = {}
         self.t_cholesky = cholesky
@@ -618,7 +618,7 @@ class Credit_Monte_Carlo(Calculation):
         # setup the device and allocate memory
         shared_mem = self.__init_shared_mem(
             params['Random_Seed'], params.get('NoModel', 'Constant'),
-            params['Currency'], calc_greeks=sensitivities if greeks else None)
+            params['Currency'], params.get('MCMC_Simulations', 2048), calc_greeks=sensitivities if greeks else None)
 
         # calculate a reverse lookup for the tenors and store the daycount code
         self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
@@ -784,7 +784,7 @@ class Credit_Monte_Carlo(Calculation):
         # return the cholesky decomp
         return torch.linalg.cholesky(correlation_matrix)
 
-    def __init_shared_mem(self, seed, nomodel, reporting_currency, calc_greeks=None):
+    def __init_shared_mem(self, seed, nomodel, reporting_currency, mcmc_sim, calc_greeks=None):
         # set the random seed
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
@@ -804,7 +804,7 @@ class Credit_Monte_Carlo(Calculation):
         # Now create a shared state with the cholesky decomp
         shared_mem = CMC_State(
             self.get_cholesky_decomp(), len(self.stoch_factors), [x[-1] for x in self.static_var], self.batch_size,
-            torch.ones([1, 1], dtype=self.dtype, device=self.device),
+            torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim,
             get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs))
 
         return shared_mem
@@ -1108,8 +1108,8 @@ class Credit_Monte_Carlo(Calculation):
 
 
 class Base_Reval_State(utils.Calculation_State):
-    def __init__(self, static_buffer, one, report_currency, calc_greeks, gamma, nomodel='Constant'):
-        super(Base_Reval_State, self).__init__(static_buffer, one, report_currency, nomodel)
+    def __init__(self, static_buffer, one, mcmc_sims, report_currency, calc_greeks, gamma, nomodel='Constant'):
+        super(Base_Reval_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel)
         self.calc_greeks = calc_greeks
         self.gamma = gamma
 
@@ -1172,7 +1172,7 @@ class Base_Revaluation(Calculation):
                     current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
 
         # setup the device and allocate memory
-        shared_mem = self.__init_shared_mem(params['Currency'], calc_grad)
+        shared_mem = self.__init_shared_mem(params['Currency'], params.get('MCMC_Simulations', 8 * 4096), calc_grad)
 
         # calculate a reverse lookup for the tenors and store the daycount code
         self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
@@ -1185,7 +1185,7 @@ class Base_Revaluation(Calculation):
         self.base_date = base_date
         self.time_grid.set_base_date(base_date)
 
-    def __init_shared_mem(self, reporting_currency, calc_greeks):
+    def __init_shared_mem(self, reporting_currency, mcmc_sim, calc_greeks):
 
         # name of the base currency
         base_currency = utils.Factor(
@@ -1200,7 +1200,7 @@ class Base_Revaluation(Calculation):
         # allocate memory on the device
         return Base_Reval_State(
             [x[-1] for x in self.static_var], torch.ones([1, 1], dtype=self.dtype, device=self.device),
-            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, {}),
+            mcmc_sim, get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, {}),
             all_vars_concat, self.params['Greeks'] == 'All')
 
     def report(self):

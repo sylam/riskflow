@@ -165,7 +165,7 @@ def get_reference_factor_objects(fieldname, all_factors):
 
 def get_implied_correlation(rate1, rate2, all_factors):
     correlation_name = rate1[:-1] + ('{0}/{1}'.format(rate1[-1], rate2[0]),) + rate2[1:]
-    if rate1[0]=='FxRate':
+    if rate1[0] == 'FxRate':
         correlation_name += (rate1[1],)
     implied_correlation = all_factors.get(utils.Factor('Correlation', correlation_name))
     return implied_correlation.current_value()[0] if implied_correlation else 0.0
@@ -903,9 +903,8 @@ class NettingCollateralSet(Deal):
             Vte = accum[factor_dep['Te']] * fx_base
 
             if self.options['Exclude_Paid_Today']:
-                mtm_today_adj = (
-                                        Cf_Rec[factor_dep['Te']] - F.pad(Cf_Rec[factor_dep['Te'][1:] - 1],
-                                                                         [0, 0, 1, 0])) - (
+                mtm_today_adj = (Cf_Rec[factor_dep['Te']] -
+                                 F.pad(Cf_Rec[factor_dep['Te'][1:] - 1], [0, 0, 1, 0])) - (
                                         Cf_Pay[factor_dep['Te']] - F.pad(Cf_Pay[factor_dep['Te'][1:] - 1],
                                                                          [0, 0, 1, 0]))
 
@@ -2397,13 +2396,13 @@ class EquityDiscreteExplicitAsianOption(Deal):
             'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0
         }
 
-        if field['Payoff_Currency']!=field['Currency']:
+        if field['Payoff_Currency'] != field['Currency']:
             fx_lookup = tuple(sorted([field['Currency'][0], field['Payoff_Currency'][0]]))
             field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
             field_index['{}ImpliedCorrelation'.format(self.field['Payoff_Type'])] = get_implied_correlation(
                 ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors)
             logging.warning("Quanto deal. TODO!!!!!!!")
-            if self.field['Payoff_Type']=='Compo':
+            if self.field['Payoff_Type'] == 'Compo':
                 # needed to calculate fx forwards
                 field_index['Local'] = get_fx_and_zero_rate_factor(
                     field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
@@ -2477,13 +2476,13 @@ class EquityBinaryOption(Deal):
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
-        if field['Payoff_Currency']!=field['Currency']:
+        if field['Payoff_Currency'] != field['Currency']:
             fx_lookup = tuple(sorted([field['Currency'][0], field['Payoff_Currency'][0]]))
             field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
             field_index['{}ImpliedCorrelation'.format(self.field['Payoff_Type'])] = get_implied_correlation(
                 ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors)
 
-            if self.field['Payoff_Type']=='Compo':
+            if self.field['Payoff_Type'] == 'Compo':
                 # needed to calculate fx forwards
                 field_index['Local'] = get_fx_and_zero_rate_factor(
                     field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
@@ -2571,13 +2570,13 @@ class EquityOptionDeal(Deal):
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
-        if field['Payoff_Currency']!=field['Currency']:
+        if field['Payoff_Currency'] != field['Currency']:
             fx_lookup = tuple(sorted([field['Currency'][0], field['Payoff_Currency'][0]]))
             field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
             field_index['{}ImpliedCorrelation'.format(self.field['Payoff_Type'])] = get_implied_correlation(
                 ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors)
 
-            if self.field['Payoff_Type']=='Compo':
+            if self.field['Payoff_Type'] == 'Compo':
                 # needed to calculate fx forwards
                 field_index['Local'] = get_fx_and_zero_rate_factor(
                     field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
@@ -2871,6 +2870,9 @@ class EquityDeal(Deal):
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         spot = utils.calc_time_grid_spot_rate(factor_dep['Equity'], deal_time, shared)
+        if spot.shape[1] != len(deal_time):
+            logging.warning('Equity {} is not being simulated - holding flat'.format(self.field['Equity']))
+            spot = spot.tile(len(deal_time), shared.simulation_batch)
         fx_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
         nominal = (1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0) * self.field['Units']
         cash = nominal * spot
