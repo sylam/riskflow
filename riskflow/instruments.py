@@ -2870,7 +2870,7 @@ class EquityDeal(Deal):
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         spot = utils.calc_time_grid_spot_rate(factor_dep['Equity'], deal_time, shared)
-        if spot.shape[1] != len(deal_time):
+        if spot.shape[0] != len(deal_time):
             logging.warning('Equity {} is not being simulated - holding flat'.format(self.field['Equity']))
             spot = spot.tile(len(deal_time), shared.simulation_batch)
         fx_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency, deal_time, shared)

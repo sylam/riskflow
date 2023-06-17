@@ -119,7 +119,7 @@ def run_baseval(context, prec=torch.float64, overrides=None):
         device = torch.device("cpu")
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
-    params_bv = {'Run_Date': rundate, 'MCMC_Simulations': 4096 * 8}
+    params_bv = {'Run_Date': rundate, 'MCMC_Simulations': 4096 * 8, 'Greeks': 'No'}
     params_bv.update(calc_params)
 
     if overrides is not None:

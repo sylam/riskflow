@@ -45,7 +45,7 @@ date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwd
 class RiskNeutralInterestRate_State(utils.Calculation_State):
     def __init__(self, batch_size, device, dtype, nomodel='Constant'):
         super(RiskNeutralInterestRate_State, self).__init__(
-            None, torch.ones([1, 1], dtype=dtype, device=device), None, nomodel)
+            None, torch.ones([1, 1], dtype=dtype, device=device), 2048, None, nomodel)
         # these are tensors
         self.t_PreCalc = {}
         self.t_random_batch = None
@@ -203,16 +203,17 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
             if vol_surface.delta:
                 try:
                     implied_vol = scipy.optimize.brentq(lambda v: pvbp * utils.black_european_option_price(
-                        shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol+.5)
-                except:                    
-                    modified_k = vol_surface.get_strike_from_premiums(date_fmt(instrument['Start']), date_fmt(instrument['Tenor']))
+                        shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol + .5)
+                except:
+                    modified_k = vol_surface.get_strike_from_premiums(date_fmt(instrument['Start']),
+                                                                      date_fmt(instrument['Tenor']))
                     logging.warning(
-                    'Implied vol calc during delta bump failed - calculated strike is {} - using strike from premium file {}'.format(
-                        K, modified_k))
+                        'Implied vol calc during delta bump failed - calculated strike is {} - using strike from premium file {}'.format(
+                            K, modified_k))
                     shifted_strike = modified_k + shift_parameter
                     implied_vol = scipy.optimize.brentq(lambda v: pvbp * utils.black_european_option_price(
-                        shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol+.5)
-                    
+                        shifted_strike, shifted_strike, 0.0, v, expiry, 1.0, 1.0) - swaption_price, 0.01, vol + .5)
+
                 swaption_price = pvbp * utils.black_european_option_price(
                     shifted_strike, shifted_strike, 0.0, implied_vol + vol_surface.delta, expiry, 1.0, 1.0)
         else:
@@ -389,15 +390,16 @@ class CSForwardPriceModelParameters(object):
         '''
         Checks for Declining variance in the ATM vols of the relevant price factor and corrects accordingly.
         '''
+
         def calc_error(x, options):
             sigma, alpha = x
-            B = lambda a, t: (1.0-np.exp(-a*t))/a
-            V = lambda T, S: sigma*sigma*np.exp(-2.0*alpha*S)*B(2.0*alpha, T)
+            B = lambda a, t: (1.0 - np.exp(-a * t)) / a
+            V = lambda T, S: sigma * sigma * np.exp(-2.0 * alpha * S) * B(2.0 * alpha, T)
             error = 0.0
             for option in options:
-                error += option['Weight']*(option['Premium'] - utils.black_european_option_price(
+                error += option['Weight'] * (option['Premium'] - utils.black_european_option_price(
                     option['Forward'], option['Strike'], option['r'], V(option['T'], option['S']), option['T'],
-                    option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0))**2
+                    option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0)) ** 2
             return error
 
         for market_price, implied_params in market_prices.items():
@@ -438,23 +440,26 @@ class CSForwardPriceModelParameters(object):
                     forward_at_exp = forward.current_value(expiry_excel)
                     forward_at_settle = forward.current_value(settlement_excel)
                     r = discount.current_value(t)
-                    if quote_type=='Implied_Volatility':
-                        sigma = vol_surface.current_value([[t, d, 1.0]])[0] if not option['Quoted_Market_Value'] else option['Quoted_Market_Value']
+                    if quote_type == 'Implied_Volatility':
+                        sigma = vol_surface.current_value([[t, d, 1.0]])[0] if not option['Quoted_Market_Value'] else \
+                        option['Quoted_Market_Value']
                         sigma += vol_surface.delta
                     else:
                         logging.error('quote_type {} not supported yet'.format(quote_type))
                         continue
-                        
-                    option['Strike'] = forward.current_value(expiry_excel) if not option['Strike'] else option['Strike']   
-                    option['Forward'] = forward.current_value(settlement_excel) 
+
+                    option['Strike'] = forward.current_value(expiry_excel) if not option['Strike'] else option['Strike']
+                    option['Forward'] = forward.current_value(settlement_excel)
                     option['r'] = r
                     option['S'] = d
                     option['T'] = t
                     option['Premium'] = utils.black_european_option_price(
                         option['Forward'], option['Strike'], r, sigma, t,
                         option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0)
-                    logging.info('Commodity {} forward {}, strike {}, expiry {}'.format(implied_params['instrument']['Energy'],
-                        option['Forward'], option['Strike'], option['Expiry_Date']))
+                    logging.info(
+                        'Commodity {} forward {}, strike {}, expiry {}'.format(
+                            implied_params['instrument']['Energy'], option['Forward'],
+                            option['Strike'], option['Expiry_Date']))
 
                 result = scipy.optimize.minimize(
                     calc_error, (0.5, 0.1),

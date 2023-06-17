@@ -28,13 +28,22 @@ import pandas as pd
 
 from multiprocessing import Process, Queue, Manager
 
+# list of curves that are assumed to be represented with swaption vols that we calibrate to
+master_curve_list = {
+    'AUD': 'AUD-AONIA',
+    'CAD': 'CAD-MASTER',
+    'CHF': 'CHF-OIS',
+    'EUR': 'EUR-ESTR',
+    'GBP': 'GBP-SONIA',
+    'JPY': 'JPY-TONAR',
+    'USD': 'USD-SOFR',
+    'ZAR': 'ZAR-SWAP'
+}
 
 def work(job_id, queue, result, price_factors, price_factor_interp,
          price_models, sys_params, holidays):
     # set the visible GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = str(job_id)
-    # set the log level
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
     # log to file
     logging.basicConfig(level=logging.INFO,
@@ -172,16 +181,7 @@ class Parent(object):
             self.cx.params['System Parameters']['Volatility_Delta'] = delta / 100.0
 
         # load up master curves
-        self.cx.params['System Parameters']['Master_Curves'] = {
-            'AUD': 'AUD-AONIA',
-            'CAD': 'CAD-MASTER',
-            'CHF': 'CHF-OIS',
-            'EUR': 'EUR-ESTR',
-            'GBP': 'GBP-SONIA',
-            'JPY': 'JPY-TONAR',
-            'USD': 'USD-SOFR',
-            'ZAR': 'ZAR-SWAP'
-        }
+        self.cx.params['System Parameters']['Master_Curves'] = master_curve_list
 
         # load the params
         price_factors = self.manager.dict(self.cx.params['Price Factors'])
@@ -287,7 +287,7 @@ def main():
         import riskflow.utils as utils
         from riskflow.riskfactors import construct_factor
         from riskflow.adaptiv import AdaptivContext
-        from riskflow.bootstrappers import master_curve_list
+
         # load the context
         context = AdaptivContext()
         context.parse_json(args.market_file)
