@@ -2132,32 +2132,35 @@ class SwaptionDeal(Deal):
         return field_index
 
     def post_process(self, accum, shared, time_grid, deal_data, child_dependencies):
-        mtm_list = []
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
         child_map = {}
+        buy_sell = {}
 
         for child in child_dependencies:
             # make the child price to the same grid as the parent
             child.Time_dep.assign(deal_data.Time_dep)
             child_map[child.Instrument.field['Object']] = child
+            buy_sell[child.Instrument.field['Object']] = -1.0 if child.Instrument.field['Buy_Sell'] == 'Sell' else 1.0
 
-        FX_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency,
-                                     deal_time, shared)
-
+        FX_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
+        buysell = 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0
         delta = 1.0 if self.field['Payer_Receiver'] == 'Payer' else -1.0
-        pvbp = -delta * pricing.pv_fixed_cashflows(
+
+        # pvbp, vfixed and vfloat should all be positive
+        pvbp = buy_sell['CFFixedInterestListDeal'] * pricing.pv_fixed_cashflows(
             shared, time_grid, child_map['CFFixedInterestListDeal'], ignore_fixed_rate=True, settle_cash=False)
-        vfixed = -delta * pricing.pv_fixed_cashflows(
-            shared, time_grid, child_map['CFFixedInterestListDeal'], ignore_fixed_rate=False, settle_cash=False)
-        vfloat = delta * pricing.pv_float_cashflow_list(shared, time_grid, child_map['CFFloatingInterestListDeal'],
-                                                        pricing.pricer_float_cashflows, settle_cash=False)
+        vfixed = buy_sell['CFFixedInterestListDeal'] * pricing.pv_fixed_cashflows(
+            shared, time_grid, child_map['CFFixedInterestListDeal'], settle_cash=False)
+        vfloat = buy_sell['CFFloatingInterestListDeal'] * pricing.pv_float_cashflow_list(
+            shared, time_grid, child_map['CFFloatingInterestListDeal'],
+            pricing.pricer_float_cashflows, settle_cash=False)
+
         if child_map['CFFloatingInterestListDeal'].Factor_dep[
                'Cashflows'].schedule[:, utils.CASHFLOW_INDEX_FloatMargin].any():
-            # note that the margin index is the same as the fixed rate index - so this should pv the margin amounts
-            vmargin = delta * pricing.pv_fixed_cashflows(
-                shared, time_grid, child_map['CFFloatingInterestListDeal'], ignore_fixed_rate=False, settle_cash=False)
+            vmargin = buy_sell['CFFloatingInterestListDeal'] * pricing.pv_fixed_cashflows(
+                shared, time_grid, child_map['CFFloatingInterestListDeal'], settle_cash=False)
         else:
             vmargin = 0.0
 
@@ -2173,11 +2176,9 @@ class SwaptionDeal(Deal):
                 factor_dep['Underlying_Swap_maturity'], shared)
 
             theo_price = utils.black_european_option(
-                st, self.field['Swap_Rate'] / 100.0, vols, tenor,
-                1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0, delta, shared)
+                st, self.field['Swap_Rate'] / 100.0, vols, tenor, buysell, delta, shared)
 
             mtm = FX_rep * pvbp * theo_price
-
         else:
             expiry = tenor[tenor >= 0.0]
             counts = (expiry.size, tenor.size - expiry.size)
@@ -2191,15 +2192,14 @@ class SwaptionDeal(Deal):
                 factor_dep['Underlying_Swap_maturity'], shared)
 
             theo_price = utils.black_european_option(
-                spot_option, self.field['Swap_Rate'] / 100.0, vols, expiry,
-                1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0, delta, shared)
+                spot_option, self.field['Swap_Rate'] / 100.0, vols, expiry, buysell, delta, shared)
 
             value = F_option * theo_price
             Ut_swap = delta * mn_swap * F_swap
 
             if Ut_swap.shape[0]:
                 Ut_mask = Ut_swap * (Ut_swap[0] >= 0)
-                mtm = FX_rep * torch.cat([value, Ut_mask], axis=0)
+                mtm = FX_rep * torch.cat([value, buysell * Ut_mask], axis=0)
             else:
                 mtm = FX_rep * value
 
