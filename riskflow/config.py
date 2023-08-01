@@ -332,7 +332,7 @@ class Context(object):
                                    debug=self)
 
     def calibrate_factors(self, from_date, to_date, factors, smooth=0.0, correlation_cuttoff=0.2,
-                          overwrite_correlations=True):
+                          overwrite_correlations=True, vol_shift=0.0):
         """
         Assumes a valid calibration JSON configuration file is loaded first, then proceeds to strip out only data
         between from_date and to_date. The calibration rules as specified by the calibration configuration file is then
@@ -361,7 +361,7 @@ class Context(object):
 
             # calibrate
             try:
-                result = rate_value.calibration.calibrate(data_frame, num_business_days=252.0)
+                result = rate_value.calibration.calibrate(data_frame, vol_shift, num_business_days=252.0)
             except:
                 logging.error('Data errors in factor {0} resulting in flawed calibration - skipping'.format(
                     rate_value.archive_name))
@@ -477,7 +477,7 @@ class Context(object):
                             if reval_dates:
                                 rate_tenors.setdefault(factor, set()).update({max(reval_dates)})
                             # now look at dependent factors
-                            if factor not in rates_to_add:
+                            if factor not in rates_to_add or factor.type in conditional_fields:
                                 try:
                                     rates_to_add.update(get_rates(factor, instrument))
                                 except KeyError as e:
@@ -513,9 +513,9 @@ class Context(object):
                     instrument.reset(self.holidays)
 
                     if calc_dates:
-                        instrument.finalize_dates(self.parse_grid, base_date, base_MTM_dates, node_children,
-                                                  node_resets, node_settlements)
-                    # get it's price factors
+                        instrument.finalize_dates(
+                            self.parse_grid, base_date, base_MTM_dates, node_children, node_resets, node_settlements)
+                    # get its price factors
                     get_price_factors(price_factors, factor_tenors, instrument)
 
                     # merge dates
@@ -527,8 +527,8 @@ class Context(object):
                     instrument.reset(self.holidays)
 
                     if calc_dates:
-                        instrument.finalize_dates(self.parse_grid, base_date, base_MTM_dates, None, resets,
-                                                  settlement_currencies)
+                        instrument.finalize_dates(
+                            self.parse_grid, base_date, base_MTM_dates, None, resets, settlement_currencies)
                     # get its price factors
                     get_price_factors(price_factors, factor_tenors, instrument)
 
@@ -580,9 +580,6 @@ class Context(object):
 
         # the list of returned factors
         dependent_factors = set()
-        stochastic_factors = OrderedDict()
-        additional_factors = OrderedDict()
-
         # complete list of reset dates referenced
         reset_dates = set()
         # complete list of currency settlement dates
@@ -661,32 +658,39 @@ class Context(object):
             dependent_factors = {k: max(dependent_factor_tenors.get(k, reset_dates)) for k in sorted_factors}
 
             # now lookup the processes
-            for factor in sorted_factors:
-                stoch_proc = self.params['Model Configuration'].search(factor, self.params['Price Factors'].get(
-                    utils.check_tuple_name(factor), {}))
-                # might need implied parameters
-                additional_factor = self.params['Model Configuration'].additional_factors(stoch_proc, factor)
-                if stoch_proc and factor.name[0] != self.params['System Parameters']['Base_Currency']:
-                    factor_model = utils.Factor(stoch_proc, factor.name)
-                    if additional_factor and self.params['Price Factors'].get(
-                            utils.check_tuple_name(additional_factor)) is not None and utils.check_tuple_name(
-                        factor_model) not in self.params['Price Models']:
-                        # need a dummy stochastic process
-                        self.params['Price Models'][utils.check_tuple_name(factor_model)] = None
-                        logging.info(
-                            'Risk Factor {0} set to implied stochastic process {1}'.format(
-                                utils.check_tuple_name(factor), stoch_proc))
-
-                    if utils.check_tuple_name(factor_model) in self.params['Price Models']:
-                        stochastic_factors.setdefault(factor_model, factor)
-                        if additional_factor:
-                            additional_factors.setdefault(factor_model, additional_factor)
-                    else:
-                        logging.error(
-                            'Risk Factor {0} using stochastic process {1} missing in Price Models section'.format(
-                                utils.check_tuple_name(factor), stoch_proc))
+            stochastic_factors, additional_factors = self.find_models(sorted_factors)
 
         return dependent_factors, stochastic_factors, additional_factors, reset_dates, currency_settlement_dates
+
+    def find_models(self, sorted_factors):
+        stochastic_factors = {}
+        additional_factors = {}
+        for factor in sorted_factors:
+            stoch_proc = self.params['Model Configuration'].search(factor, self.params['Price Factors'].get(
+                utils.check_tuple_name(factor), {}))
+            # might need implied parameters
+            additional_factor = self.params['Model Configuration'].additional_factors(stoch_proc, factor)
+            if stoch_proc and factor.name[0] != self.params['System Parameters']['Base_Currency']:
+                factor_model = utils.Factor(stoch_proc, factor.name)
+                if additional_factor and self.params['Price Factors'].get(
+                        utils.check_tuple_name(additional_factor)) is not None and utils.check_tuple_name(
+                    factor_model) not in self.params['Price Models']:
+                    # need a dummy stochastic process
+                    self.params['Price Models'][utils.check_tuple_name(factor_model)] = None
+                    logging.info(
+                        'Risk Factor {0} set to implied stochastic process {1}'.format(
+                            utils.check_tuple_name(factor), stoch_proc))
+
+                if utils.check_tuple_name(factor_model) in self.params['Price Models']:
+                    stochastic_factors.setdefault(factor_model, factor)
+                    if additional_factor:
+                        additional_factors.setdefault(factor_model, additional_factor)
+                else:
+                    logging.error(
+                        'Risk Factor {0} using stochastic process {1} missing in Price Models section'.format(
+                            utils.check_tuple_name(factor), stoch_proc))
+
+        return stochastic_factors, additional_factors
 
     def parse_json(self, filename):
 

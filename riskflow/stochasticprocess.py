@@ -188,7 +188,7 @@ class GBMAssetPriceCalibration(object):
         self.param = param
         self.num_factors = 1
 
-    def calibrate(self, data_frame, num_business_days=252.0, vol_cuttoff=0.5, drift_cuttoff=0.1):
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0, vol_cuttoff=0.5, drift_cuttoff=0.1):
         stats, correlation, delta = utils.calc_statistics(
             data_frame, method='Log', num_business_days=num_business_days)
         mu = (stats['Drift'] + 0.5 * (stats['Volatility'] ** 2)).values[0]
@@ -390,7 +390,7 @@ class GBMPriceIndexCalibration(object):
         self.param = param
         self.num_factors = 1
 
-    def calibrate(self, data_frame, num_business_days=252.0):
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
         stats, correlation, delta = utils.calc_statistics(data_frame, method='Log', num_business_days=num_business_days)
         mu = (stats['Drift'] + 0.5 * (stats['Volatility'] ** 2)).values[0]
         sigma = stats['Volatility'].values[0]
@@ -755,7 +755,7 @@ class HWInterestRateCalibration(object):
         self.param = param
         self.num_factors = 1
 
-    def calibrate(self, data_frame, num_business_days=252.0):
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
         tenor = np.array([(x.split(',')[1]) for x in data_frame.columns], dtype=np.float64)
         stats, correlation, delta = utils.calc_statistics(data_frame, method='Diff',
                                                           num_business_days=num_business_days, max_alpha=4.0)
@@ -836,7 +836,7 @@ class HWHazardRateCalibration(object):
         self.param = param
         self.num_factors = 1
 
-    def calibrate(self, data_frame, num_business_days=252.0):
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
         tenor = np.array([(x.split(',')[1]) for x in data_frame.columns], dtype=np.float64)
         stats, correlation, delta = utils.calc_statistics(data_frame, method='Diff',
                                                           num_business_days=num_business_days, max_alpha=4.0)
@@ -956,7 +956,7 @@ class CSForwardPriceCalibration(object):
         self.param = param
         self.num_factors = 1
 
-    def calibrate(self, data_frame, num_business_days=252.0):
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
         tenor = np.array([(x.split(',')[1]) for x in data_frame.columns], dtype=np.float64)
         stats, correlation, delta = utils.calc_statistics(
             data_frame, method='Log', num_business_days=num_business_days, max_alpha=5.0)
@@ -1075,8 +1075,6 @@ class PCAInterestRateModel(StochasticProcess):
                                                    fill_value=self.param['Historical_Yield'].array.T[-1][-1])
             curve_t0 = self.factor.current_value(self.factor.tenors)
             omega = hist_mean(self.factor.tenors)
-            # TODO - convert the code below to tensorflow
-
         ##            fwd_curve = np.array(
         ##                [curve_t0 * np.exp(-alpha * self.factor.get_day_count_accrual(ref_date, t)) + omega *
         ##                 (1.0 - np.exp(-alpha * self.factor.get_day_count_accrual(ref_date, t)))
@@ -1111,7 +1109,7 @@ class PCAInterestRateCalibration(object):
         self.param = param
         self.num_factors = 3
 
-    def calibrate(self, data_frame, num_business_days=252.0):
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
         min_rate = data_frame.min().min()
         force_positive = 0.0 if min_rate > 0.0 else -5.0 * min_rate
         tenor = np.array([(x.split(',')[1]) for x in data_frame.columns], dtype=np.float64)

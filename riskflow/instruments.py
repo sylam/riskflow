@@ -2638,7 +2638,7 @@ class QEDI_CustomAutoCallSwap(Deal):
             reduce(set.union, [
                 set([x[0] for x in self.field['Autocall_Coupons']]),
                 set([x[0] for x in self.field['Price_Fixing']]),
-                set([x[0] for x in self.field['Barrier_Dates']]),
+                set([x[0] for x in self.field.get('Barrier_Dates', [])]),
                 set([x[0] for x in self.field.get('Autocall_Floating', [])])
             ])
         )
@@ -2648,7 +2648,7 @@ class QEDI_CustomAutoCallSwap(Deal):
         ac = dict(self.field['Autocall_Coupons'])
         at = dict(self.field['Autocall_Thresholds'])
         af = dict(self.field.get('Autocall_Floating', []))
-        ab = dict(self.field.get('Barrier_Dates'))
+        ab = dict(self.field.get('Barrier_Dates', []))
 
         field_index = {
             'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
@@ -2665,6 +2665,7 @@ class QEDI_CustomAutoCallSwap(Deal):
                 field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Strike_Price': self.field['Strike_Price'],
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
+            'Barrier': self.field.get('Barrier', 0.0) * self.field['Strike_Price'],
             'Fixings': utils.make_fixing_data(
                 base_date, time_grid, [[x, pf.get(x, -1)] for x in all_dates]),
             'Price_Fixing': [pf.get(x, -1) for x in all_dates],
@@ -2694,6 +2695,61 @@ class QEDI_CustomAutoCallSwap(Deal):
             mtm = spot.new_zeros(deal_time.shape[0], shared.simulation_batch)
 
         return mtm
+
+
+class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
+    factor_fields = {'Currency': ['FxRate'],
+                     'Payoff_Currency': ['FxRate'],
+                     'Equity': ['EquityPrice', 'DividendRate'],
+                     'Discount_Rate': ['DiscountRate'],
+                     'Forecast_Rate': ['InterestRate'],
+                     'Equity_Volatility': ['EquityPriceVol']}
+
+    documentation = ('FX and Equity', ['An exotic option described [here](Definitions#QEDI-options-v2)'])
+
+    def __init__(self, params, valuation_options):
+        super(QEDI_CustomAutoCallSwap_V2, self).__init__(params, valuation_options)
+
+    def calc_dependencies(
+            self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid, calendars):
+
+        field_index = super(QEDI_CustomAutoCallSwap_V2, self).calc_dependencies(
+            base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid, calendars)
+
+        field_index['Forward'] = get_interest_factor(
+            utils.check_rate_name(self.field['Forecast_Rate']), static_offsets, stochastic_offsets, all_tenors)
+
+        # barrier is now absolute (not relative to strike)
+        field_index['Barrier'] = self.field['Barrier']
+
+        # get the daycount for this forward rate
+        daycount = field_index['Forward'][0][utils.FACTOR_INDEX_Daycount]
+
+        # get the full set of floating dates
+        floating_pay_dates = [x[0] for x in self.field['Autocall_Floating']]
+        floating_pay_dates = [min(floating_pay_dates) - self.field['Reset_Frequency']] + floating_pay_dates
+
+        cashflows = {'Items':
+                         [{'Accrual_Start_Date': start,
+                           'Accrual_End_Date': end,
+                           'Payment_Date': end,
+                           'Accrual_Year_Fraction': daycount((end - start).days),
+                           'Notional': 1.0,
+                           'Resets': [[
+                               start, start, end, daycount((end - start).days),
+                               self.field['Reset_Frequency'], 'ACT_365', None, 0.0, 'No',
+                               utils.Percent(
+                                   100.0 * (reset_val/daycount((end - start).days) - self.field['Margin'].amount)
+                                   if start < base_date else 0.0)
+                           ]],
+                           'Margin': self.field['Margin']}
+                          for start, end, (_, reset_val) in zip(
+                             floating_pay_dates[:-1], floating_pay_dates[1:], self.field['Autocall_Floating'])]
+                     }
+
+        field_index['Cashflows'] = utils.make_float_cashflows(base_date, time_grid, 1.0, cashflows)
+
+        return field_index
 
 
 class EquityBarrierOption(Deal):

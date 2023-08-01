@@ -991,148 +991,16 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
 
 
 def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
-    '''
-    Implementation of the following UDMC payoff function
-    [QEDIPricingModels]FObject:udmcCustomAutoCallableSwapPayoff
 
-    #PARAMETERS
-    param matrix(double) timeSteps;
-    param matrix(double) isFixingDate;
-    param matrix(double) isThresholdDate;
-    param matrix(double) isCouponDate;
-    param matrix(double) isBarrierDate;
-    param matrix(double) isFloatingDate;
-
-    param matrix(double) coupon;
-    param matrix(double) threshold;
-    param matrix(double) floating;
-
-    param int barrierIsHit;
-    param double rebate;
-    param double putBarrier;
-    param int isQuanto;
-    param double fixFXRate;
-
-    #LOCAL VARIABLES
-    double hits = 0.0;
-    int tMax = length(timeSteps);
-    double sumOfSpots = 0.0;
-    int t = 0;
-    int resetTime = 0;
-    int couponTime = 0;
-    int floatingTime = 0;
-    double averageCounter = 0.0;
-    double avg = 0.0;
-    int terminationDate = -1;
-    double value = 0.0;
-    double fx = isQuanto * (fixFXRate -1.0) + 1.0;
-    double max_n = 0.0;
-    double breachEvent = 0.0;
-    double isInitialSpot = 1.0;
-    double lastKnownFloatingRate = 0.0;
-
-    #PROCESS
-    process matrix(double) S;
-
-    #MAIN LOOP
-    terminationDate = -1;
-    value = rebate;
-    resetTime = 0;
-    floatingTime = 0;
-    couponTime = 0;
-    breachEvent = barrierIsHit - 0.01;
-    isInitialSpot = 1.0;
-    lastKnownFloatingRate = 0.0;
-    hits = 0.0;
-    sumOfSpots = 0.0;
-
-
-    for t = 0 to tMax
-    {
-            if(terminationDate < 0.0)
-            {
-                    if (isBarrierDate[t] > 0.0)
-                    {
-                            if (S[t] <= (putBarrier * S[0]))
-                            {
-                                    breachEvent = 1.0;
-                            }
-                    };
-
-                    if (isFixingDate[t] > 0.0)
-                    {
-                            if (isInitialSpot < 0.0)
-                            {
-                                    sumOfSpots = sumOfSpots + S[t];
-                                    averageCounter= averageCounter + 1.0;
-                            };
-
-                            if (isInitialSpot > 0.0)
-                            {
-                                    isInitialSpot = -1.0;
-                            };
-                    };
-
-                    if(isFloatingDate[t] > 0.0)
-                    {
-                            if(floating[floatingTime] > 0.0)
-                            {
-                                    lastKnownFloatingRate = -floating[floatingTime] ;
-                            };
-
-                            cashFlow(resetTime,  fx * lastKnownFloatingRate);
-
-                            floatingTime = floatingTime + 1;
-                            if(isCouponDate[t] <= 0.0)
-                            {
-                                    resetTime = resetTime + 1;
-                            };
-                    };
-
-                    if(isCouponDate[t] > 0.0)
-                    {
-                           avg = isCouponDate[t] * sumOfSpots / averageCounter;
-
-                           sumOfSpots = 0.0;
-                           averageCounter = 0.0;
-
-                           if(avg >= (threshold[couponTime] * S[0]))
-                           {
-                                    cashFlow(resetTime, fx * (rebate + coupon[couponTime]));
-                                    terminationDate = resetTime;
-                                    breachEvent = 0.0;
-                           };
-
-                           couponTime = couponTime + 1;
-                           resetTime = resetTime + 1;
-                    };
-            };
-    };
-
-    if(terminationDate < 0)
-    {
-            terminationDate = resetTime - 1;
-            cashFlow(terminationDate, fx * rebate);
-            if(breachEvent > 0.0)
-            {
-                   cashFlow(terminationDate, fx * (rebate - (S[0] - avg) / S[0]));
-            };
-    };
-    '''
-
-    def sim_autocall(S, isBarrierDate, isFixingDate, isFloatingDate, isCouponDate,
-                     floating, threshold, coupon, terminationDate, isInitialSpot=1.0):
-        averageCounter = 0.0
+    def sim_autocall(S, isBarrierDate, isFixingDate, isFloatDate, floating, threshold, coupon, terminationDate):
         avg = 0.0
+        averageCounter = 0.0
         fx = isQuanto * (fixFXRate - 1.0) + 1.0
 
         # MAIN LOOP
-        # terminationDate = -torch.ones_like(S[0])
         resetTime = 0
-        floatingTime = 0
-        couponTime = 0
         breachEvent = barrierIsHit - 0.01
-        lastKnownFloatingRate = 0.0
+        floatingTime = 0
         sumOfSpots = 0.0
 
         tMax = len(S)
@@ -1142,36 +1010,30 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
             inforce = 1.0 * (terminationDate < 0.0)
 
             if isBarrierDate[t] > 0.0:
-                breachEvent = inforce * (S[t] <= putBarrier * strike)
+                breachEvent = inforce * (S[t] <= putBarrier)
 
             if isFixingDate[t] > 0.0:
-                if isInitialSpot < 0.0:
-                    sumOfSpots = sumOfSpots + S[t]
-                    averageCounter = averageCounter + 1.0
+                sumOfSpots = sumOfSpots + S[t]
+                averageCounter = averageCounter + 1.0
 
-                if isInitialSpot > 0.0:
-                    isInitialSpot = -1.0
-
-            if isFloatingDate[t] > 0.0:
-                if floating[floatingTime] > 0.0:
-                    lastKnownFloatingRate = -floating[floatingTime]
+            if isFloatDate[t] > 0.0:
+                lastKnownFloatingRate = -floating[floatingTime]
                 mtm_list[resetTime] = inforce * fx * lastKnownFloatingRate
-
                 floatingTime = floatingTime + 1
-                if isCouponDate[t] <= 0.0:
+
+                if coupon[t] <= 0.0:
                     resetTime = resetTime + 1
 
-            if isCouponDate[t] > 0.0:
-                avg = isCouponDate[t] * sumOfSpots / averageCounter
+            if coupon[t] > 0.0:
+                avg = sumOfSpots / averageCounter
 
                 sumOfSpots = 0.0
                 averageCounter = 0.0
-                termination = inforce * (avg >= threshold[couponTime] * strike)
-                mtm_list[resetTime] += termination * fx * (rebate + coupon[couponTime])
+                termination = inforce * (avg >= threshold[t] * strike)
+                mtm_list[resetTime] += termination * fx * (rebate + coupon[t])
                 terminationDate = (1 - termination) * terminationDate + termination * resetTime
                 breachEvent = (1 - termination) * breachEvent
 
-                couponTime = couponTime + 1
                 resetTime = resetTime + 1
 
         alive = 1.0 * (terminationDate < 0.0)
@@ -1191,15 +1053,12 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
         isBarrierDate = BarrierDates[offset:]
         isFixingDate = FixingDates[offset:]
-        isFloatingDate = FloatingDates[offset:]
-        isCouponDate = CouponDates[offset:]
-        floating = Floating[offset:]
+        isFloatingDate = Floating[offset:]
         threshold = Threshold[offset:]
         coupon = Coupon[offset:]
-        isInitialSpot = 1.0 if offset == 0 else -1.0
 
         mcmc = []
-        for s, r, sigma in zip(spot_prices, drift, vol):
+        for s, r, sigma, floating in zip(spot_prices, drift, vol, floating_leg):
             if sobol:
                 z = shared.quasi_rng(shared.simulation_batch, num_samples * num_sims).T.reshape(
                     num_samples, shared.simulation_batch, -1)
@@ -1209,8 +1068,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
             f1 = (r.unsqueeze(axis=2) + sigma.unsqueeze(axis=2) * z).cumsum(axis=0)
             mcmc_spot = s.reshape(1, -1, 1) * torch.exp(f1)
             val = sim_autocall(
-                mcmc_spot, isBarrierDate, isFixingDate, isFloatingDate, isCouponDate,
-                floating, threshold, coupon, terminationDate, isInitialSpot)
+                mcmc_spot, isBarrierDate, isFixingDate, isFloatingDate, floating, threshold, coupon, terminationDate)
             mcmc.append(val)
 
         return torch.stack(mcmc)
@@ -1218,32 +1076,60 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
     mtm_list = []
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+
+    # get the discount curve and daycount
     discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
     daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
 
-    BarrierDates = [1 if x != -1 else -1 for x in factor_dep['Barrier_Dates']]
-    FixingDates = [1 if x != -1 else -1 for x in factor_dep['Price_Fixing']]
-    FloatingDates = [1 if x > 0 else -1 for x in factor_dep['Autocall_Floating']]
-    CouponDates = [1 if x > 0 else -1 for x in factor_dep['Autocall_Coupons']]
-    Threshold = factor_dep['Autocall_Thresholds']
-    Floating = factor_dep['Autocall_Floating']
-    Coupon = factor_dep['Autocall_Coupons']
-
-    # now precalc all past resets
+    # setup the calculation grid
     samples = factor_dep['Fixings'].reinitialize(shared.one)
     start_idx = samples.get_start_index(deal_time)
-
-    # make sure we can access the numpy and tensor components
     dual_samples = samples.dual()
     start_index, counts = np.unique(start_idx, return_counts=True)
 
+    # make sure we can price the floating leg (if present)
+    if 'Forward' in factor_dep:
+        resets = factor_dep['Cashflows'].get_resets(shared.one)
+        known_resets = [shared.one.new_full((1, shared.simulation_batch), x[utils.RESET_INDEX_Value])
+                        for x in resets.schedule if x[utils.RESET_INDEX_Reset_Day] < 0.0]
+        forward = utils.calc_time_grid_curve_rate(factor_dep['Forward'], deal_time, shared)
+        sim_resets = resets.schedule[
+            (resets.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+            (resets.schedule[:, utils.RESET_INDEX_Reset_Day] <= deal_time[:, utils.TIME_GRID_MTM].max())]
+        old_resets = utils.calc_time_grid_curve_rate(
+            factor_dep['Forward'], sim_resets[:, :utils.RESET_INDEX_Scenario + 1], shared)
+        delta_start = (sim_resets[:, utils.RESET_INDEX_Start_Day] -
+                       sim_resets[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
+        delta_end = (sim_resets[:, utils.RESET_INDEX_End_Day] -
+                     sim_resets[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
+        reset_weights = (sim_resets[:, utils.RESET_INDEX_Weight] /
+                         sim_resets[:, utils.RESET_INDEX_Accrual]).reshape(-1, 1, 1)
+
+        reset_values = torch.expm1(
+            old_resets.gather_weighted_curve(shared, delta_end, delta_start)) * reset_weights \
+            if sim_resets.any() else shared.one.new_zeros(0, 1, shared.simulation_batch)
+
+        # fetch all fixed resets
+        old_resets = torch.squeeze(
+            torch.concat(
+                [torch.stack(known_resets), reset_values] if known_resets else reset_values, axis=0), axis=1)
+        cash_start_idx = factor_dep['Cashflows'].get_cashflow_start_index(deal_time)
+        cash_start_index = dict(zip(start_idx, cash_start_idx))
+    else:
+        # not used - set it to discount
+        forward = discount
+
     # params for the autocallable
-    putBarrier = deal_data.Instrument.field.get('Barrier', 0.0)
+    BarrierDates = [1 if x != -1 else -1 for x in factor_dep['Barrier_Dates']]
+    FixingDates = [1 if x != -1 else -1 for x in factor_dep['Price_Fixing']]
+    Threshold = factor_dep['Autocall_Thresholds']
+    Floating = factor_dep['Autocall_Floating']
+    Coupon = factor_dep['Autocall_Coupons']
+    putBarrier = factor_dep['Barrier']
     isQuanto = 1.0 * (deal_data.Instrument.field.get('Payoff_Type') == 'Quanto')
     fixFXRate = deal_data.Instrument.field.get('FixFXRate', 1.0)
     rebate = deal_data.Instrument.field.get('Rebate', 0.0)
     barrierIsHit = 1.0 * (deal_data.Instrument.field.get('BarrierIsHit') is not None)
-
     strike = factor_dep['Strike_Price']
     nominal = factor_dep['Buy_Sell'] * deal_data.Instrument.field['Units']
     terminationDate = -shared.one.new_ones(shared.simulation_batch, 1)
@@ -1255,8 +1141,9 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         sobol = True
         shared.reset_qrg()
 
-    for index, (discount_block, spot_block, moneyness_block) in enumerate(
-            utils.split_counts([discount, spot, moneyness], counts, shared)):
+    for index, (forward_block, discount_block, spot_block, moneyness_block) in enumerate(
+            utils.split_counts([forward, discount, spot, moneyness], counts, shared)):
+
         t_block = discount_block.time_grid
         sample_index_t = start_index[index]
         tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
@@ -1276,9 +1163,45 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         sample_ts = drifts.new(
             np.hstack([fixing_block[:, 0, np.newaxis], np.diff(fixing_block, axis=1)]))
 
-        theo_cashflow = nominal * sim_spot(
-            spot_block, vols, sample_ts, drifts, sample_index_t, terminationDate,
-            sobol=sobol, num_sims=shared.MCMC_sims)
+        if 'Forward' in factor_dep:
+            cashflows = factor_dep['Cashflows'].merged(shared.one, cash_start_index[sample_index_t])
+            reset_offset = factor_dep['Cashflows'].offsets[cash_start_index[sample_index_t]][1]
+            reset_ofs, reset_count = np.unique(
+                np.searchsorted(
+                    resets.schedule[reset_offset:, utils.RESET_INDEX_Reset_Day],
+                    t_block[:, utils.TIME_GRID_MTM]),
+                return_counts=True)
+
+            for offset, size in zip(*[reset_ofs, reset_count]):
+                time_block = t_block[:, utils.TIME_GRID_MTM]
+                time_slice = time_block[:size].reshape(-1, 1)
+                reset_block = resets.schedule[reset_offset:]
+                future_starts = reset_block[offset:, utils.RESET_INDEX_Start_Day] - time_slice
+                future_ends = reset_block[offset:, utils.RESET_INDEX_End_Day] - time_slice
+                future_weights = (reset_block[offset:, utils.RESET_INDEX_Weight]
+                                  / reset_block[offset:, utils.RESET_INDEX_Accrual]).reshape(1, -1, 1)
+                future_resets = torch.expm1(forward_block.gather_weighted_curve(
+                    shared, future_ends, future_starts)) * future_weights
+
+                # now deal with past resets
+                past_resets = torch.tile(
+                    torch.unsqueeze(old_resets[reset_offset:reset_offset + offset], axis=0), [size, 1, 1])
+                all_resets = torch.concat([past_resets, future_resets], axis=1)
+                # we now have all the expected floating payments for each scenario
+                all_int, _ = pricer_float_cashflows(all_resets, cashflows.tn, shared)
+                # need to reshape this for the mcmc pricing
+                floating_leg = torch.unsqueeze(all_int, axis=-1)
+        else:
+            # not used - set it the the spot_block
+            floating_leg = spot_block
+
+        # sometimes the autocall kicks out early for this batch - skip redundant calcs
+        if terminationDate.any():
+            theo_cashflow = nominal * sim_spot(
+                spot_block, vols, sample_ts, drifts, sample_index_t, terminationDate,
+                sobol=sobol, num_sims=shared.MCMC_sims)
+        else:
+            theo_cashflow = torch.zeros_like(drifts)
 
         discount_rates = utils.calc_discount_rate(discount_block, fixings, shared)
 

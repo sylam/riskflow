@@ -24,6 +24,7 @@ __all__ = ['version_info', '__version__', '__author__', '__license__', 'Context'
 import os
 import torch
 import pathlib
+import logging
 import numpy as np
 import pandas as pd
 import collections.abc
@@ -77,7 +78,7 @@ def set_collateral(cfg, Agreement_Currency, Balance_Currency, Opening_Balance, R
     )
 
 
-def load_market_data(rundate, path, json_name='MarketData.json'):
+def load_market_data(rundate, path, json_name='MarketData.json', calendar_name='calendars.cal'):
     """
     Loads a json marketdata file and corresponding calendar (assumed to be named 'calendars.cal')
     :param rundate: folder inside path where the marketdata file resides
@@ -89,7 +90,10 @@ def load_market_data(rundate, path, json_name='MarketData.json'):
 
     config = AdaptivContext()
     config.parse_json(os.path.join(path, rundate, json_name))
-    config.parse_calendar_file(os.path.join(path, 'calendars.cal'))
+    if os.path.isfile(os.path.join(path, 'calendars.cal')):
+        config.parse_calendar_file(os.path.join(path, calendar_name))
+    else:
+        logging.warning('Calendar file {} not loaded'.format(calendar_name))
 
     config.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
 
@@ -230,7 +234,6 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         return calc, params_mc
     else:
         out = calc.execute(params_mc)
-
         # summarize the results for easy review
         mtm = out['Results']['mtm']
         exposure = mtm.clip(0.0, np.inf)
@@ -269,43 +272,50 @@ class Context:
         self.config_cache = {}
         self.holiday_cfg_cache = {}
         self.current_cfg = AdaptivContext()
+        # there may be a stressed config file attached to the context
+        self.stressed_config_file = None
+
+    def load_config(self, path_name):
+        new_cfg = AdaptivContext()
+        new_cfg.parse_json(path_name)
+
+        # check we need to set the base_date
+        if new_cfg.params['System Parameters'].get('Base_Date') is None:
+            # set it to now
+            new_cfg.params['System Parameters']['Base_Date'] = pd.Timestamp.now()
+
+        # set its version
+        new_cfg.version = ['JSONVersion', '22.05.30']
+        return new_cfg
+
+    def parse_path(self, file_path):
+        # file_path is assumed to be a window's path - so we need to check if we're in a posix world
+        if os.name == 'posix':
+            file_path = pathlib.PureWindowsPath(file_path).as_posix()
+
+        path, filename = os.path.split(file_path)
+        return os.path.join(self.path_map.get(path, path), self.file_map.get(filename, filename))
 
     def load_json(self, jobfilename, compress=True):
-
-        def parse_path(file_path):
-            # file_path is assumed to be a window's path - so we need to check if we're in a posix world
-            if os.name == 'posix':
-                file_path = pathlib.PureWindowsPath(file_path).as_posix()
-
-            path, filename = os.path.split(file_path)
-            return os.path.join(self.path_map.get(path, path), self.file_map.get(filename, filename))
-
         cfg = self.current_cfg
         # read the raw json data
         data = self.current_cfg.read_json(jobfilename)
 
         if 'MergeMarketData' in data['Calc']:
             market_data = data['Calc']['MergeMarketData']
+            # check if there's a stressed marketdata defined (record but don't load it)
+            self.stressed_config_file = market_data.get('StressedMarketDataFile')
 
             if market_data['MarketDataFile'] not in self.config_cache:
-                new_cfg = AdaptivContext()
-                new_cfg.parse_json(parse_path(market_data['MarketDataFile']))
-
-                # check we need to set the base_date
-                if new_cfg.params['System Parameters'].get('Base_Date') is None:
-                    # set it to now
-                    new_cfg.params['System Parameters']['Base_Date'] = pd.Timestamp.now()
+                new_cfg = self.load_config(self.parse_path(market_data['MarketDataFile']))
 
                 # check if a calendar is loaded
                 if 'CalendDataFile' in data['Calc']:
                     # parse calendar file
-                    new_cfg.parse_calendar_file(parse_path(data['Calc']['CalendDataFile']))
+                    new_cfg.parse_calendar_file(self.parse_path(data['Calc']['CalendDataFile']))
                     # store a link
                     self.holiday_cfg_cache[market_data['MarketDataFile']] = data['Calc']['CalendDataFile']
 
-                # set its version
-                new_cfg.version = ['JSONVersion', '22.05.30']
-                # cache it
                 self.config_cache[market_data['MarketDataFile']] = new_cfg
 
             cfg = self.config_cache[market_data['MarketDataFile']]
@@ -315,7 +325,7 @@ class Context:
             if 'CalendDataFile' in data['Calc'] and data['Calc'][
                 'CalendDataFile'] != self.holiday_cfg_cache[market_data['MarketDataFile']]:
                 # parse calendar file again
-                cfg.parse_calendar_file(parse_path(data['Calc']['CalendDataFile']))
+                cfg.parse_calendar_file(self.parse_path(data['Calc']['CalendDataFile']))
                 # store a link
                 self.holiday_cfg_cache[market_data['MarketDataFile']] = data['Calc']['CalendDataFile']
 
@@ -356,3 +366,62 @@ class Context:
 
     def Base_Valuation(self, overrides=None):
         return run_baseval(self.current_cfg, overrides=overrides)
+
+
+class StressedContext(Context):
+
+    def __init__(self, path_transform={}, file_transform={}):
+        super(StressedContext, self).__init__(path_transform, file_transform)
+        self.stressed_cfg = None
+        self.current_models = None
+        self.current_factors = None
+
+    def restore_config(self):
+        if self.current_models is not None:
+            self.current_cfg.params['Price Models'].update(self.current_models)
+        if self.current_factors is not None:
+            self.current_cfg.params['Price Factors'].update(self.current_factors)
+
+    def stress_config(self, rate_group):
+        # calculate the current factors to stress
+        factors_to_override, models_to_override = self.calc_stress_config(rate_group)
+        # back up the old factors and models
+        self.current_factors = {k: self.current_cfg.params['Price Factors'][k] for k in factors_to_override.keys()}
+        self.current_models = {k: self.current_cfg.params['Price Models'][k] for k in models_to_override.keys()}
+        # override the models
+        self.current_cfg.params['Price Factors'].update(factors_to_override)
+        self.current_cfg.params['Price Models'].update(models_to_override)
+
+    def calc_stress_config(self, rate_group):
+        '''
+        :param rate_type: Rate type
+        :return:
+        '''
+        # check if the stressed file is loaded
+        if self.stressed_config_file not in self.config_cache:
+            self.stressed_cfg = self.load_config(self.parse_path(self.stressed_config_file))
+            self.config_cache[self.stressed_config_file] = self.stressed_cfg
+
+        self.stressed_cfg = self.config_cache[self.stressed_config_file]
+
+        factors_to_override = {}
+        models_to_override = {}
+
+        for factor_type in rate_group:
+            factors = [utils.Factor(factor_type, utils.check_rate_name(i)[1:])
+                       for i in self.current_cfg.params['Price Factors'].keys() if i.startswith(factor_type)]
+            factor_models, additional_factors = self.current_cfg.find_models(factors)
+            for factor in [utils.check_tuple_name(x) for x in additional_factors.values()]:
+                try:
+                    factors_to_override[factor] = self.stressed_cfg.params['Price Factors'][factor]
+                except KeyError as k:
+                    logging.warning(
+                        "Skipping Stressed Price Factor {} - not present in stressed file".format(k))
+            for factor_model in [utils.check_tuple_name(x) for x in factor_models.keys()]:
+                try:
+                    models_to_override[factor_model] = self.stressed_cfg.params['Price Models'][factor_model]
+                except KeyError as k:
+                    logging.warning(
+                        "Skipping Stressed Price Model {} - not present in stressed file".format(k))
+
+        return factors_to_override, models_to_override

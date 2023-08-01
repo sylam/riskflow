@@ -346,12 +346,19 @@ class CMC_State(utils.Calculation_State):
     def reset_qrg(self):
         self.t_quasi_rng_batch = {}
 
-    def reset(self, num_factors, time_grid: utils.TimeGrid):
+    def reset(self, num_factors, time_grid: utils.TimeGrid, use_antithetic=False):
         # update the random numbers
-        self.t_random_numbers = torch.matmul(
-            self.t_cholesky, torch.randn(num_factors, self.simulation_batch * time_grid.scen_time_grid.size,
-                                         dtype=self.one.dtype, device=self.one.device)).reshape(
-            num_factors, time_grid.scen_time_grid.size, -1)
+        sample_size = self.simulation_batch // 2 if use_antithetic else self.simulation_batch
+        correlated_sample = torch.matmul(
+            self.t_cholesky, torch.randn(
+                num_factors, sample_size * time_grid.scen_time_grid.size,
+                dtype=self.one.dtype, device=self.one.device)
+        ).reshape(num_factors, time_grid.scen_time_grid.size, -1)
+
+        if use_antithetic:
+            self.t_random_numbers = torch.concat([correlated_sample, -correlated_sample], axis=-1)
+        else:
+            self.t_random_numbers = correlated_sample
 
         # reset the cashflows
         self.t_Cashflows = {k: {t_i: self.one.new_zeros(self.simulation_batch)
@@ -817,15 +824,15 @@ class Credit_Monte_Carlo(Calculation):
                 for k, v in data.items():
                     factor_name = utils.check_tuple_name(k)
                     values = np.concatenate(v, axis=-1)
-                    if len(values.shape)==2:
+                    if len(values.shape) == 2:
                         columns = pd.MultiIndex.from_product(
-                            [[0.0], np.arange(values.shape[-1])], names = ['tenor', 'scenario'])
-                        scen[factor_name] = pd.DataFrame(values, 
-                            index = scenario_date_index[:values.shape[0]], columns=columns).T
+                            [[0.0], np.arange(values.shape[-1])], names=['tenor', 'scenario'])
+                        scen[factor_name] = pd.DataFrame(values,
+                                                         index=scenario_date_index[:values.shape[0]], columns=columns).T
                     else:
                         tenors = self.all_tenors[k][0].tenor
                         columns = pd.MultiIndex.from_product(
-                            [tenors, np.arange(values.shape[-1])], names = ['tenor', 'scenario'])
+                            [tenors, np.arange(values.shape[-1])], names=['tenor', 'scenario'])
                         scen[factor_name] = pd.DataFrame(
                             values.reshape(values.shape[0], -1),
                             index=scenario_date_index[:values.shape[0]], columns=columns).T
@@ -891,19 +898,17 @@ class Credit_Monte_Carlo(Calculation):
         # set the name of the root logger to this netting set (makes tracking errors easier)
         logging.root.name = self.config.deals.get('Attributes', {'Reference': 'root'}).get('Reference', 'root')
         self.batch_size = params['Batch_Size']
-        self.calc_stats['Factor_Setup_Time'] = time.monotonic()
+        # store the stats for the batches
+        self.calc_stats['Batch_Size'] = params['Batch_Size']
+        self.calc_stats['Simulation_Batches'] = params['Simulation_Batches']
+        self.calc_stats['Random_Seed'] = params['Random_Seed']
         # update the factors and obtain shared state
         shared_mem = self.update_factors(params, base_date)
-        # record the setup time
-        self.calc_stats['Factor_Setup_Time'] = time.monotonic() - self.calc_stats['Factor_Setup_Time']
         # setup the all instruments
-        self.calc_stats['Deal_Setup_Time'] = time.monotonic()
         self.netting_sets = DealStructure(Aggregation('root'))
         self.set_deal_structures(
             self.config.deals['Deals']['Children'], self.netting_sets, self.numscenarios,
             params['Batch_Size'], tagging=None, deal_level_mtm=params.get('DealLevel', False))
-        # record the (pure python) dependency setup time
-        self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']
         # clear the output
         output = defaultdict(list)
         # reset the tensors - used for storing simulation data
@@ -915,7 +920,8 @@ class Credit_Monte_Carlo(Calculation):
         for run in range(self.params['Simulation_Batches']):
             start_run = time.monotonic()
             # need to refresh random numbers and zero out buffers
-            shared_mem.reset(self.num_factors, self.time_grid)
+            shared_mem.reset(
+                self.num_factors, self.time_grid, use_antithetic=params.get('Antithetic', 'No') == 'Yes')
 
             # simulate the price factors
             for key, value in self.stoch_factors.items():
@@ -952,7 +958,7 @@ class Credit_Monte_Carlo(Calculation):
                 riskfree = get_interest_factor(utils.check_rate_name(params['FVA']['Risk_Free_Curve']),
                                                self.static_ofs, self.stoch_ofs, self.all_tenors)
 
-                if 'Counterparty' in params['FVA']:
+                if params['FVA'].get('Counterparty'):
                     survival = get_survival_factor(utils.check_rate_name(params['FVA']['Counterparty']),
                                                    self.static_ofs, self.stoch_ofs, self.all_tenors)
                     surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), shared_mem)
@@ -1077,8 +1083,6 @@ class Credit_Monte_Carlo(Calculation):
                             # calculate the hessian matrix - warning - make sure you have enough memory
                             output['grad_cva_hessian'] = sensitivity.report_hessian()
 
-            # print('Run {} in {:.3f} s'.format(run, time.monotonic() - start_run))
-
             # store all output tensors
             for k, v in tensors.items():
                 output[k].append(v.cpu().detach().numpy())
@@ -1089,8 +1093,8 @@ class Credit_Monte_Carlo(Calculation):
                 for currency, values in shared_mem.t_Cashflows.items():
                     cash_index = dates[sorted(values.keys())]
                     output.setdefault('cashflows', {}).setdefault(currency, []).append(
-                        pd.DataFrame([v.cpu().detach().numpy() for _, v in sorted(values.items())],
-                                     index=cash_index))
+                        pd.DataFrame(
+                            [v.cpu().detach().numpy() for _, v in sorted(values.items())], index=cash_index))
 
             # add any scenarios if necessary
             if self.params.get('Calc_Scenarios', 'No') == 'Yes':

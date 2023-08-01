@@ -20,7 +20,7 @@ import calendar
 import functools
 from functools import reduce
 from collections import namedtuple, OrderedDict
-from typing import Tuple, List, Set
+from typing import Tuple, List
 
 import logging
 from itertools import zip_longest
@@ -30,7 +30,6 @@ import pandas as pd
 import numpy as np
 
 import torch
-import torch.nn.functional as F
 
 # For dealing with excel dates and dataframes
 excel_offset = pd.Timestamp('1899-12-30 00:00:00')

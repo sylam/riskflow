@@ -117,6 +117,7 @@ mapping = {
                                         'values': ['Yes', 'No']},
             'Gradient': {'widget': 'Dropdown', 'description': 'Gradient', 'value': 'No', 'values': ['Yes', 'No']},
             'Greeks': {'widget': 'Dropdown', 'description': 'Greeks', 'value': 'No', 'values': ['First', 'No']},
+            'Antithetic': {'widget': 'Dropdown', 'description': 'Antithetic', 'value': 'No', 'values': ['Yes', 'No']},            
             'Base_Time_Grid': {'widget': 'Text', 'description': 'Base Time Grid',
                                'value': '0d 2d 1w(1w) 3m(1m) 2y(3m)'},
             'Dynamic_Scenario_Dates': {'widget': 'Dropdown', 'description': 'Dynamic Scenario Dates',
@@ -160,8 +161,8 @@ mapping = {
         },
         'types': {
             'CreditMonteCarlo': ['Base_Date', 'Currency', 'Base_Time_Grid', 'Deflation_Interest_Rate', 'Percentile',  
-                                 'MCMC_Simulations', 'Simulation_Batches', 'Batch_Size', 'Random_Seed', 'Calc_Scenarios', 
-                                 'Dynamic_Scenario_Dates', 'Generate_Cashflows', 'Credit_Valuation_Adjustment', 
+                                 'MCMC_Simulations', 'Simulation_Batches', 'Batch_Size', 'Random_Seed', 'Antithetic', 
+                                 'Calc_Scenarios', 'Dynamic_Scenario_Dates', 'Generate_Cashflows', 'Credit_Valuation_Adjustment', 
                                  'Funding_Valuation_Adjustment', 'Collateral_Valuation_Adjustment'],
             'BaseValuation': ['Base_Date', 'Currency', 'MCMC_Simulations', 'Greeks']
         }
@@ -511,7 +512,7 @@ mapping = {
                             'MtMCrossCurrencySwapDeal', 'FXTARFOptionDeal']),
             'New Energy Derivative': ('default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption']),
             'New Equity Derivative': ('default', ['EquitySwapLeg', 'EquityForwardDeal', 'EquityOptionDeal', 'EquityBinaryOption',
-                                                  'QEDI_CustomAutoCallSwap', 'EquitySwapletListDeal',
+                                                  'QEDI_CustomAutoCallSwap', 'QEDI_CustomAutoCallSwap_V2', 'EquitySwapletListDeal',
                                                   'EquityBarrierOption', 'EquityDiscreteExplicitAsianOption']),
             'New Credit Derivative': ('default', ['DealDefaultSwap'])
         },
@@ -566,6 +567,7 @@ mapping = {
 										'Strike_Price', 'Option_On_Forward', 'Settlement_Style', 'Option_Style', 'Payoff_Currency',
 										'Payoff_Type', 'Equity', 'Equity_Volatility', 'Barrier', 'Price_Fixing', 'Autocall_Thresholds',
                                         'Autocall_Coupons', 'Barrier_date'],
+            'QEDI_CustomSwap.Fields': ['Forecast_Rate', 'Floating_Margin', 'Reset_Frequency'],
             'EquitySwapLeg.Fields': ['Accrual_Calendars', 'Adjustment_Method', 'Dividend_Timing', 'Equity',
                                      'Equity_Volatility', 'Equity_Known_Prices', 'Effective_Date', 'First_Coupon_Date',
                                      'Known_Dividends', 'Maturity_Date', 'Payment_Calendars', 'Payment_Frequency',
@@ -782,7 +784,9 @@ mapping = {
             'SwaptionDeal':
                 ['Admin', 'SwaptionDeal.Fields', 'SwaptionDeal.Pay', 'SwaptionDeal.Receive'],
             'QEDI_CustomAutoCallSwap':
-                ['Admin', 'QEDI_CustomAutoCallSwap.Fields']
+                ['Admin', 'QEDI_CustomAutoCallSwap.Fields'],
+            'QEDI_CustomAutoCallSwap_V2':
+                ['Admin', 'QEDI_CustomSwap.Fields', 'QEDI_CustomAutoCallSwap.Fields']                
         },
 
         # instrument fields
@@ -858,7 +862,7 @@ mapping = {
             'Use_Known_Rate': {'widget': 'Dropdown', 'description': 'Use Known Rate', 'value': 'No',
                                'values': ['Yes', 'No']},
             'Known_Rate': {'widget': 'Float', 'description': 'Known Rate', 'value': 0, 'obj': 'Percent'},
-            'Barrier': {'widget': 'Float', 'description': 'Barrier', 'value': 0, 'obj': 'Percent'},
+            'Barrier': {'widget': 'Float', 'description': 'Barrier', 'value': 0},
             'Upfront_Date': {'widget': 'DatePicker', 'description': 'Upfront Date',
                              'value': default['DatePicker']},
             'Upfront': {'widget': 'Float', 'description': 'Upfront', 'value': 0, 'obj': 'Percent'},
