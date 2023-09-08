@@ -262,25 +262,25 @@ if __name__ == '__main__':
 
     env = ''
     paths = {}
-    for folder in ['JSON', 'temp', 'JSON_PFE', 'Input_JSON', 'CVA_JSON', 'FVA_JSON', 'CVA', 'PFE', 'PFE_UAT', 'Upgrade']:
+    for folder in ['JSON', 'COLLVA', 'CVA_SARB', 'Input_JSON', 'CVA_JSON',
+                   'Autocall_PreTrade', 'FVA_JSON', 'CVA', 'PFE', 'PFE_UAT', 'Upgrade']:
         paths[folder] = rf.getpath(
             [os.path.join('Y:\\CollVA', folder),
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
-             os.path.join('Z:\\', folder),
-             os.path.join('S:\\Riskflow', folder),
+             os.path.join('Z:\\CVA_JSON\\TEST', folder),
+             os.path.join('R:\\Riskflow', folder),
              # os.path.join('S:\\CCR_PFE_EE_NetCollateral', folder),
-             os.path.join('S:\\CCR_Tagged', folder),
+             os.path.join('S:\\Riskflow\\TEST', folder),
              os.path.join('N:\\Archive', folder)])
 
     # path_json = paths['FVA_JSON']
-    path_json = paths['CVA']
+    path_json = paths['CVA_SARB']
     # path = paths['CVA_UAT']
     # path = paths['CVA']
     path = paths['PFE']
 
-    # rundate = '2022-10-12'
-    # rundate = '2023-03-13'
-    rundate = '2023-07-21'
+    # rundate = '2023-07-18'
+    rundate = '2023-05-31'
     # calibrate_PFE(path, rundate)
     # bootstrap(path_json, '', reuse_cal=True)
     # bootstrap('Z:\\', rundate, reuse_cal=False)
@@ -323,11 +323,11 @@ if __name__ == '__main__':
 
     # for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Soc_Gen_Paris_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris*.json')):
+    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_PTF_1001_Non*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_CS_Int_London_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Goldman_Sachs_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
-    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Investec_Life_Limited_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
@@ -397,7 +397,7 @@ if __name__ == '__main__':
 
         for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             # if i['Instrument'].field['Reference'] != 'USDIBLIX12DIGIPUT18189230%20280629':
-            # if i['Instrument'].field['Reference'] != '137431103':
+            # if i['Instrument'].field['Reference'] != '137335521':
             if False and not i['Instrument'].field['Object'].startswith('QEDI'):
             # if not i['Instrument'].field['Reference'].startswith('ZARSPI'):
                 i['Ignore'] = 'True'

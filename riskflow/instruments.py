@@ -339,7 +339,7 @@ class Deal(object):
 
     def generate(self, shared, time_grid, deal_data):
         raise Exception('generate in class {} not implemented yet for deal {}'.format(
-            self.__class__.__name__, deal_data.Instrument.field.get('Reference')))
+            self.__class__.__name__, self.field.get('Reference')))
 
 
 class NettingCollateralSet(Deal):
@@ -2690,8 +2690,7 @@ class QEDI_CustomAutoCallSwap(Deal):
             mtm = pricing.pv_MC_AutoCallSwap(
                 shared, time_grid, deal_data, spot, moneyness) * fx_rep
         else:
-            logging.error('AutoCall not priced due to missing equity model for {}'.format(
-                deal_data.Instrument.field['Equity']))
+            logging.error('AutoCall not priced due to missing equity model for {}'.format(self.field['Equity']))
             mtm = spot.new_zeros(deal_time.shape[0], shared.simulation_batch)
 
         return mtm
@@ -2712,7 +2711,6 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
 
     def calc_dependencies(
             self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid, calendars):
-
         field_index = super(QEDI_CustomAutoCallSwap_V2, self).calc_dependencies(
             base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid, calendars)
 
@@ -2724,6 +2722,9 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
 
         # get the daycount for this forward rate
         daycount = field_index['Forward'][0][utils.FACTOR_INDEX_Daycount]
+        if 'Reset_Frequency' not in self.field:
+            logging.warning('Reset Frequency not specified - assuming 3M')
+            self.field['Reset_Frequency'] = pd.DateOffset(months=3)
 
         # get the full set of floating dates
         floating_pay_dates = [x[0] for x in self.field['Autocall_Floating']]
@@ -2739,7 +2740,7 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
                                start, start, end, daycount((end - start).days),
                                self.field['Reset_Frequency'], 'ACT_365', None, 0.0, 'No',
                                utils.Percent(
-                                   100.0 * (reset_val/daycount((end - start).days) - self.field['Margin'].amount)
+                                   100.0 * (reset_val / daycount((end - start).days) - self.field['Margin'].amount)
                                    if start < base_date else 0.0)
                            ]],
                            'Margin': self.field['Margin']}
@@ -2786,11 +2787,15 @@ class EquityBarrierOption(Deal):
                           calendars):
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Equity': utils.check_rate_name(self.field['Equity'])}
-        field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
-            field['Currency']
+        field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency'])
+        field['Discount_Rate'] = utils.check_rate_name(
+            self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
         field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
 
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'Payoff_Currency': get_fxrate_factor(
+                           field['Payoff_Currency'], static_offsets, stochastic_offsets),
+                       'SettleCurrency': self.field['Payoff_Currency'],
                        'Discount': get_discount_factor(
                            field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
@@ -2802,7 +2807,24 @@ class EquityBarrierOption(Deal):
                            field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
                        'Barrier_Monitoring': 0.5826 * np.sqrt(
                            (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0),
-                       'Expiry': (self.field['Expiry_Date'] - base_date).days}
+                       'Expiry': (self.field['Expiry_Date'] - base_date).days,
+                       'Strike_Price': self.field['Strike_Price'],
+                       'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
+                       'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0
+                       }
+
+        if field['Payoff_Currency'] != field['Currency']:
+            fx_lookup = tuple(sorted([field['Currency'][0], field['Payoff_Currency'][0]]))
+            field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
+            field_index['{}ImpliedCorrelation'.format(self.field['Payoff_Type'])] = get_implied_correlation(
+                ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors)
+
+            if self.field['Payoff_Type'] == 'Compo':
+                # needed to calculate fx forwards
+                field_index['Local'] = get_fx_and_zero_rate_factor(
+                    field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+                field_index['Other'] = get_fx_and_zero_rate_factor(
+                    field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         # discrete barrier monitoring requires adjusting the barrier by 0.58
         # ( -(scipy.special.zetac(0.5)+1)/np.sqrt(2.0*np.pi) ) * sqrt (monitoring freq)
@@ -2811,31 +2833,45 @@ class EquityBarrierOption(Deal):
 
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        nominal = deal_data.Instrument.field['Units']
-        payoff_currency = deal_data.Instrument.field['Payoff_Currency']
-
-        eq_zer_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Equity_Zero'], deal_time[:-1], shared)
-        eq_div_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Dividend_Yield'], deal_time[:-1], shared)
-
+        nominal = self.field['Units']
+        payoff_currency = self.field['Payoff_Currency']
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
+        fx_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
 
-        # need to adjust if there's just 1 timepoint - i.e. base reval
-        if time_grid.mtm_time_grid.size > 1:
-            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
+        # check the current value of the spot price
+        spot_now = spot[0].mean()
+
+        if (self.field['Barrier_Type'] == 'Up_And_In' and spot_now > self.field['Barrier_Price']) or (
+            self.field['Barrier_Type'] == 'Down_And_In' and spot_now < self.field['Barrier_Price']):
+            # this has already knocked in and is a regular european option
+            forward = utils.calc_eq_forward(
+                deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
+                deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
+            moneyness = spot / self.field['Strike_Price']
+
+            pv = pricing.pv_european_option(
+                shared, time_grid, deal_data, nominal, moneyness, forward)
         else:
-            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+            eq_zer_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Equity_Zero'], deal_time[:-1], shared)
+            eq_div_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Dividend_Yield'], deal_time[:-1],
+                                                           shared)
+            # need to adjust if there's just 1 timepoint - i.e. base reval
+            if time_grid.mtm_time_grid.size > 1:
+                tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
+            else:
+                tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
 
-        b = torch.squeeze(
-            eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+            b = torch.squeeze(
+                eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
+                eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
-        fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
+            # check that the spot has a defined shape
+            if spot.shape[1] != b.shape[1]:
+                spot = spot.tile(len(deal_time), b.shape[1])
 
-        # check that the spot has a defined shape
-        if spot.shape[1] != b.shape[1]:
-            spot = spot.tile(len(deal_time), b.shape[1])
+            pv = pricing.pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)
 
-        pv = pricing.pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)
         mtm = pv * fx_rep
 
         return mtm
@@ -3170,8 +3206,8 @@ class FXOneTouchOption(Deal):
 
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        nominal = deal_data.Instrument.field['Cash_Payoff']
-        payoff_currency = deal_data.Instrument.payoff_ccy
+        nominal = self.field['Cash_Payoff']
+        payoff_currency = self.payoff_ccy
         fx_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0],
                                      shared.Report_Currency, deal_time, shared)
 
@@ -3265,8 +3301,8 @@ class FXBarrierOption(Deal):
 
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        nominal = deal_data.Instrument.field['Underlying_Amount']
-        payoff_currency = deal_data.Instrument.payoff_ccy
+        nominal = self.field['Underlying_Amount']
+        payoff_currency = self.payoff_ccy
 
         curr_curve = utils.calc_time_grid_curve_rate(
             deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
@@ -3346,8 +3382,8 @@ class FXPartialTimeBarrierOption(Deal):
 
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        nominal = deal_data.Instrument.field['Underlying_Amount']
-        payoff_currency = deal_data.Instrument.payoff_ccy
+        nominal = self.field['Underlying_Amount']
+        payoff_currency = self.payoff_ccy
 
         curr_curve = utils.calc_time_grid_curve_rate(
             deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)

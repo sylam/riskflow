@@ -801,7 +801,7 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
             forwardfx = utils.calc_fx_forward(
                 factor_dep['Local'], factor_dep['Other'],
                 tenor_in_days, deal_time, shared)
-            vol = torch.sqrt(
+            vols = torch.sqrt(
                 fx_vols * fx_vols + 2.0 * fx_vols * vols * factor_dep['CompoImpliedCorrelation'] + vols * vols)
             forward = forward * forwardfx
 
@@ -991,7 +991,6 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
 
 
 def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
-
     def sim_autocall(S, isBarrierDate, isFixingDate, isFloatDate, floating, threshold, coupon, terminationDate):
         avg = 0.0
         averageCounter = 0.0
@@ -1102,7 +1101,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                        sim_resets[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
         delta_end = (sim_resets[:, utils.RESET_INDEX_End_Day] -
                      sim_resets[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
-        reset_weights = (sim_resets[:, utils.RESET_INDEX_Weight] /
+        reset_weights = shared.one.new_tensor(sim_resets[:, utils.RESET_INDEX_Weight] /
                          sim_resets[:, utils.RESET_INDEX_Accrual]).reshape(-1, 1, 1)
 
         reset_values = torch.expm1(
@@ -1178,8 +1177,9 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                 reset_block = resets.schedule[reset_offset:]
                 future_starts = reset_block[offset:, utils.RESET_INDEX_Start_Day] - time_slice
                 future_ends = reset_block[offset:, utils.RESET_INDEX_End_Day] - time_slice
-                future_weights = (reset_block[offset:, utils.RESET_INDEX_Weight]
-                                  / reset_block[offset:, utils.RESET_INDEX_Accrual]).reshape(1, -1, 1)
+                future_weights = shared.one.new_tensor(
+                    reset_block[offset:, utils.RESET_INDEX_Weight] /
+                    reset_block[offset:,utils.RESET_INDEX_Accrual]).reshape(1, -1, 1)
                 future_resets = torch.expm1(forward_block.gather_weighted_curve(
                     shared, future_ends, future_starts)) * future_weights
 
