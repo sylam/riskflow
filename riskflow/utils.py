@@ -989,6 +989,94 @@ class TensorBlock(object):
         return {t: DtT[index] for t, index in zip(time_points, indices)}
 
 
+# date generation utils
+
+def cds_dates(base, num_months):
+    base_month = base.month
+    initial = pd.DateOffset(months=(3 - base_month % 3) % 3, day=20)
+    months = pd.DateOffset(months=3)
+    last_date = (base + initial) if base.day < 20 else (base + initial + months)
+    res = [last_date]
+
+    while last_date < base + pd.DateOffset(months=num_months):
+        last_date = last_date + months
+        res.append(last_date)
+
+    return res
+
+
+def calc_cds_rates(R, survival, discount, base_date, CDS_tenors, bump=0.01 * 0.01):
+
+    def calc_par_cds(S_j, cds_tenor, delta=0.0, start_time=None, end_time=None):
+        if delta:
+            S_vals = S_j.copy()
+            S_vals[start_time: end_time] += delta * S_ti[start_time: end_time]
+        else:
+            S_vals = S_j
+
+        h = (S_vals[1:] - S_vals[:-1]) / (S_ti[1:] - S_ti[:-1])
+        S = np.exp(-S_vals)
+        F = D * S
+        V_prot = ((F[:-1] - F[1:]) * h) / (h + f)
+
+        cds_pay_dates = cds_dates(base_date, int(cds_tenor * 12))
+        # insert the previous standard date (3 months prior)
+        cds_pay_dates.insert(0, cds_pay_dates[0] - pd.DateOffset(months=3))
+        tau = np.array([survival[FACTOR_INDEX_Daycount]((x - base_date).days) for x in cds_pay_dates])
+        alpha = tau[1:] - tau[:-1]
+        n = S_ti.searchsorted(tau[1:])
+        v_fee = -tau[0]
+        prev_n = 0
+
+        for alpha_j, prev_tau, n_j in zip(alpha, tau[:-1], n):
+            sub_i = slice(prev_n, n_j)
+            sub_i_p1 = slice(prev_n + 1, n_j + 1)
+            h_plus_f = h[sub_i] + f[sub_i]
+            A_j = ((1 + h_plus_f * (S_ti[sub_i] - prev_tau)) * F[sub_i] - (
+                    1 + h_plus_f * (S_ti[sub_i_p1] - prev_tau)) * F[sub_i_p1]) * h[sub_i] / h_plus_f ** 2
+            v_fee += alpha_j * D[n_j] * S[n_j] + A_j.sum()
+            prev_n = n_j
+
+        v_prot = (1.0 - R) * V_prot[:n_j].sum()
+        return v_prot / v_fee, n[-1]
+
+    max_cds_dates = cds_dates(base_date, int(max(CDS_tenors) * 12))
+    time_to_add = [survival[FACTOR_INDEX_Daycount]((x - base_date).days) for x in max_cds_dates]
+
+    S_proc = survival[FACTOR_INDEX_Process]
+    D_proc = discount[FACTOR_INDEX_Process]
+    S_factor = S_proc.factor if hasattr(S_proc, 'factor') else S_proc
+    D_factor = D_proc.factor if hasattr(D_proc, 'factor') else D_proc
+
+    # calculate the piecewise hazard rate, forward rate and survival and discount curves
+    S_ti = np.union1d(S_factor.get_tenor(), time_to_add)
+    D_vals = D_factor.current_value(S_ti) * S_ti
+    f = (D_vals[1:] - D_vals[:-1]) / (S_ti[1:] - S_ti[:-1])
+    D = np.exp(-D_vals)
+
+    S_vals_0 = S_factor.current_value(S_ti)
+    CDS_rates = {}
+    for tenor in CDS_tenors:
+        CDS_rates[tenor] = calc_par_cds(S_vals_0, tenor)
+
+    if bump:
+        T = 0
+        S_j = [S_vals_0]
+
+        for k, v in CDS_rates.items():
+            delta_j = scipy.optimize.brentq(
+                lambda x: calc_par_cds(S_j[-1], k, delta=x, start_time=T, end_time=v[1] + 1)[0] - (v[0] + bump), -0.1,
+                0.1)
+
+            S_j.append(S_j[-1].copy())
+            S_j[-1][T: v[1] + 1] += delta_j * S_ti[T: v[1] + 1]
+            T = v[1] + 1
+
+        return {k: v[0] for k, v in CDS_rates.items()}, S_ti, S_j
+    else:
+        return {k: v[0] for k, v in CDS_rates.items()}
+
+
 # dataframe manipulation
 
 def filter_data_frame(df, from_date, to_date, rate=None):

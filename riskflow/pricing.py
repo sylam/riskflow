@@ -991,6 +991,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
 
 
 def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
+
     def sim_autocall(S, isBarrierDate, isFixingDate, isFloatDate, floating, threshold, coupon, terminationDate):
         avg = 0.0
         averageCounter = 0.0
@@ -1101,8 +1102,9 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                        sim_resets[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
         delta_end = (sim_resets[:, utils.RESET_INDEX_End_Day] -
                      sim_resets[:, utils.RESET_INDEX_Reset_Day]).reshape(-1, 1)
-        reset_weights = shared.one.new_tensor(sim_resets[:, utils.RESET_INDEX_Weight] /
-                         sim_resets[:, utils.RESET_INDEX_Accrual]).reshape(-1, 1, 1)
+        reset_weights = shared.one.new_tensor(
+            sim_resets[:, utils.RESET_INDEX_Weight] /
+            sim_resets[:, utils.RESET_INDEX_Accrual]).reshape(-1, 1, 1)
 
         reset_values = torch.expm1(
             old_resets.gather_weighted_curve(shared, delta_end, delta_start)) * reset_weights \
@@ -1179,7 +1181,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                 future_ends = reset_block[offset:, utils.RESET_INDEX_End_Day] - time_slice
                 future_weights = shared.one.new_tensor(
                     reset_block[offset:, utils.RESET_INDEX_Weight] /
-                    reset_block[offset:,utils.RESET_INDEX_Accrual]).reshape(1, -1, 1)
+                    reset_block[offset:, utils.RESET_INDEX_Accrual]).reshape(1, -1, 1)
                 future_resets = torch.expm1(forward_block.gather_weighted_curve(
                     shared, future_ends, future_starts)) * future_weights
 
@@ -2163,6 +2165,7 @@ def pv_credit_cashflows(shared, time_grid, deal_data):
 
         interest = (cashflows.tn[cash_index, utils.CASHFLOW_INDEX_FixedRate] *
                     cashflows.tn[cash_index, utils.CASHFLOW_INDEX_Year_Frac])
+
         # note the minus sign here
         premium = -(interest[cash_index] * cashflows.tn[cash_index, utils.CASHFLOW_INDEX_Nominal]).reshape(1, -1, 1)
         pv_premium = premium * survival_T * Dt_T

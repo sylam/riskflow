@@ -848,6 +848,11 @@ class Credit_Monte_Carlo(Calculation):
                 for k, v in data.items():
                     grad[k] = v.astype(np.float64) / self.params['Simulation_Batches']
                 self.output.setdefault(result, self.gradients_as_df(grad, display_val=True))
+            elif result == 'CS01':
+                columns = pd.MultiIndex.from_arrays(
+                    [data['Par_CDS'].keys(), data['Par_CDS'].values()], names=['Tenor', 'Par CDS'])
+                self.output.setdefault(result, pd.DataFrame(columns=columns, index=data['Tenor'], data=np.transpose(
+                    [x - data['Shifted_Log_Prob'][0] for x in data['Shifted_Log_Prob'][1:]])))
             elif result in ['grad_cva_hessian']:
                 self.output.setdefault(result, self.gradients_as_df(
                     data.astype(np.float64) / self.params['Simulation_Batches']))
@@ -1078,6 +1083,19 @@ class Credit_Monte_Carlo(Calculation):
                         output['grad_cva'] = sensitivity.report_grad()
                         # store the size of the Gradient
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
+
+                        # now fetch the CDS tenors and calculate the CDS spreads
+                        CDS_tenors = self.params.get('Credit_Valuation_Adjustment', {}).get('CDS_Tenors')
+                        if not CDS_tenors:
+                            CDS_tenors = [.5, 1, 3, 5, 10]
+
+                        # calculate cds sensitivities
+                        CDS_rates, shifted_tenor, shifted_curves = utils.calc_cds_rates(
+                            recovery, survival[0], discount[0], self.params['Base_Date'], CDS_tenors)
+
+                        output['CS01'] = {'Par_CDS': CDS_rates,
+                                          'Tenor': shifted_tenor,
+                                          'Shifted_Log_Prob': shifted_curves}
 
                         if hessian:
                             # calculate the hessian matrix - warning - make sure you have enough memory
