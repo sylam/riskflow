@@ -229,6 +229,18 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
     if overrides is not None:
         update_dict(params_mc, overrides)
 
+    # check sensitivity to CDS tenors - may be overridden above
+    if CVA and cva_sect.get('CDS_Tenors'):
+        # add extra tenors to the survival probability curve and interpolate it to calculate CDS rates
+        survivalprob = context.params['Price Factors']['SurvivalProb.{}'.format(cva_sect['Counterparty'])]
+        daycount = lambda time_in_days: utils.get_day_count_accrual(
+            params_mc['Base_Date'], time_in_days, utils.DAYCOUNT_ACT365)
+        to_add = [daycount((x - params_mc['Base_Date']).days) for x in
+                  utils.cds_dates(params_mc['Base_Date'], max(cva_sect.get('CDS_Tenors')) * 12)]
+        new_terms = np.union1d(to_add, survivalprob['Curve'].array[:, 0])
+        survivalprob['Curve'].array = np.array(
+            list(zip(new_terms, np.interp(new_terms, *survivalprob['Curve'].array.T))))
+
     calc = construct_calculation('Credit_Monte_Carlo', context, device=device, prec=prec)
     if LegacyFVA:
         return calc, params_mc

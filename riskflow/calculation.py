@@ -1086,16 +1086,14 @@ class Credit_Monte_Carlo(Calculation):
 
                         # now fetch the CDS tenors and calculate the CDS spreads
                         CDS_tenors = self.params.get('Credit_Valuation_Adjustment', {}).get('CDS_Tenors')
-                        if not CDS_tenors:
-                            CDS_tenors = [.5, 1, 3, 5, 10]
+                        if CDS_tenors:
+                            # calculate cds sensitivities
+                            CDS_rates, shifted_tenor, shifted_curves = utils.calc_cds_rates(
+                                recovery, survival[0], discount[0], self.params['Base_Date'], CDS_tenors)
 
-                        # calculate cds sensitivities
-                        CDS_rates, shifted_tenor, shifted_curves = utils.calc_cds_rates(
-                            recovery, survival[0], discount[0], self.params['Base_Date'], CDS_tenors)
-
-                        output['CS01'] = {'Par_CDS': CDS_rates,
-                                          'Tenor': shifted_tenor,
-                                          'Shifted_Log_Prob': shifted_curves}
+                            output['CS01'] = {'Par_CDS': CDS_rates,
+                                              'Tenor': shifted_tenor,
+                                              'Shifted_Log_Prob': shifted_curves}
 
                         if hessian:
                             # calculate the hessian matrix - warning - make sure you have enough memory
