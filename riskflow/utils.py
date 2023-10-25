@@ -391,12 +391,13 @@ class CurveTenor(object):
         self.tensor_cache = {}
 
     def get_index(self, tenor_points_in_years):
-        clipped_points = tenor_points_in_years.clip(self.min, self.max)
         if isinstance(tenor_points_in_years, torch.Tensor):
+            clipped_points = tenor_points_in_years.clip(self.min, self.max)
             tenor = self.tensor_cache.setdefault('tenor', tenor_points_in_years.new(self.tenor))
             delta = self.tensor_cache.setdefault('delta', tenor_points_in_years.new(self.delta))
             index = torch.searchsorted(tenor, clipped_points, right=True) - 1
         else:
+            clipped_points = np.clip(tenor_points_in_years, self.min, self.max)
             tenor = self.tenor
             delta = self.delta
             index = tenor.searchsorted(clipped_points, side='right') - 1

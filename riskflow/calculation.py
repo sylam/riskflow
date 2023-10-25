@@ -1086,7 +1086,7 @@ class Credit_Monte_Carlo(Calculation):
 
                         # now fetch the CDS tenors and calculate the CDS spreads
                         CDS_tenors = self.params.get('Credit_Valuation_Adjustment', {}).get('CDS_Tenors')
-                        if CDS_tenors:
+                        if CDS_tenors and recovery < 1.0:
                             # calculate cds sensitivities
                             CDS_rates, shifted_tenor, shifted_curves = utils.calc_cds_rates(
                                 recovery, survival[0], discount[0], self.params['Base_Date'], CDS_tenors)
