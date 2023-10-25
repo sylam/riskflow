@@ -61,8 +61,7 @@ FACTOR_INDEX_Moneyness_Index = 2
 FACTOR_INDEX_Expiry_Index = 3
 FACTOR_INDEX_VolTenor_Index = 4
 FACTOR_INDEX_Flat_Index = 4
-FACTOR_INDEX_Surface_Flat_Moneyness_Index = 5
-FACTOR_INDEX_Surface_Flat_Expiry_Index = 6
+FACTOR_INDEX_Surface_Flat_Index = 5
 
 # cashflow codes 
 CASHFLOW_INDEX_Start_Day = 0
@@ -389,17 +388,26 @@ class CurveTenor(object):
         self.min = min_tenor
         self.max = max_tenor
         self.max_index = max(points.shape[0] - 1, 0)
+        self.tensor_cache = {}
 
     def get_index(self, tenor_points_in_years):
-        clipped_points = np.clip(tenor_points_in_years, self.min, self.max)
-        index = self.tenor.searchsorted(clipped_points, side='right') - 1
+        clipped_points = tenor_points_in_years.clip(self.min, self.max)
+        if isinstance(tenor_points_in_years, torch.Tensor):
+            tenor = self.tensor_cache.setdefault('tenor', tenor_points_in_years.new(self.tenor))
+            delta = self.tensor_cache.setdefault('delta', tenor_points_in_years.new(self.delta))
+            index = torch.searchsorted(tenor, clipped_points, right=True) - 1
+        else:
+            tenor = self.tenor
+            delta = self.delta
+            index = tenor.searchsorted(clipped_points, side='right') - 1
+
         index_next = (index + 1).clip(0, self.max_index)
 
         if self.type == 'Dividend':
-            alpha = (1.0 / self.tenor[index].clip(min=1e-5) -
-                     1.0 / clipped_points) / self.delta[index]
+            alpha = (1.0 / tenor[index].clip(min=1e-5) -
+                     1.0 / clipped_points) / delta[index]
         else:
-            alpha = (clipped_points - self.tenor[index]) / self.delta[index]
+            alpha = (clipped_points - tenor[index]) / delta[index]
 
         return index, index_next, alpha
 
@@ -853,7 +861,7 @@ class CurveTensor(object):
     def interp_value(self):
         if self.alpha is not None:
             return self.interp_obj.tensor[self.index] * (1 - self.alpha) + \
-                   self.interp_obj.tensor[self.index_next] * self.alpha
+                self.interp_obj.tensor[self.index_next] * self.alpha
         else:
             return self.interp_obj.tensor[self.index]
 
@@ -1006,7 +1014,6 @@ def cds_dates(base, num_months):
 
 
 def calc_cds_rates(R, survival, discount, base_date, CDS_tenors, bump=0.01 * 0.01):
-
     def calc_par_cds(S_j, cds_tenor, delta=0.0, start_time=None, end_time=None):
         if delta:
             S_vals = S_j.copy()
@@ -1294,18 +1301,15 @@ def update_tenors(base_date, all_factors):
         elif factor.type in ThreeDimensionalFactors:
             if factor.type == 'ForwardPriceVol':
                 # can interpolate dynamically when needed
-                moneyness_map, expiry_index_map = [], []
-                for delivery_expiry_points in risk_factor.index_map.values():
-                    expiry_map, exp_index = [], []
-                    for exp_day, expiry_points in delivery_expiry_points.items():
-                        expiry_map.append(tenor_diff(expiry_points))
-                        exp_index.append(exp_day)
-                    expiry_index_map.append(tenor_diff(exp_index))
-                    moneyness_map.append(expiry_map)
-                # store the moneyness and expiry first
-                all_tenors[factor] = [tenor_diff(risk_factor.get_moneyness()),
-                                      tenor_diff(risk_factor.get_expiry()),
-                                      tenor_diff(risk_factor.get_tenor()), moneyness_map, expiry_index_map]
+                expiry_map = []
+                for expiry_points in risk_factor.index_map[risk_factor.EXPIRY_INDEX]:
+                    expiry_map.append(tenor_diff(expiry_points[0]))
+                moneyness_map = []
+                for moneyness_points in risk_factor.index_map[risk_factor.MONEYNESS_INDEX]:
+                    moneyness_map.append(tenor_diff(moneyness_points[0]))
+                # store the moneyness, expiry and tenor points
+                all_tenors[factor] = [moneyness_map, expiry_map,
+                                      tenor_diff(risk_factor.get_tenor()), risk_factor.index_map]
             else:
                 # full surface defined - do not interpolate dynamically
                 for dim_index, data in enumerate(
@@ -1331,7 +1335,7 @@ def gather_interp_matrix(mtm, deal_time_dep, shared):
         if deal_time_dep.t_alpha is None:
             deal_time_dep.t_alpha = mtm.new(deal_time_dep.alpha)
         return mtm[deal_time_dep.index] * (1 - deal_time_dep.t_alpha) + \
-               mtm[deal_time_dep.index_next] * deal_time_dep.t_alpha
+            mtm[deal_time_dep.index_next] * deal_time_dep.t_alpha
     else:
         return mtm[deal_time_dep.index]
 
@@ -1659,101 +1663,68 @@ def calc_tenor_cap_time_grid_vol_rate(code, moneyness, expiry, tenor, shared, ca
     return shared.t_Buffer[key_code]
 
 
-def calc_delivery_time_grid_vol_rate(code, moneyness, expiry, delivery, time_grid, shared, calc_std=False):
-    key_code = ('vol3d_energy', tuple([x[:2] for x in code]),
-                tuple(expiry.ravel()), tuple(time_grid[:, TIME_GRID_MTM]),
-                tuple(delivery.ravel()), calc_std)
+def calc_delivery_time_grid_vol_rate(code, moneyness, expiry, delivery, time_grid, shared):
+    # can't cache this function as moneyness is generally stochastic
+    vol_spread = None
 
+    for rate in code:
+        # Only static moneyness/expiry vol surfaces are supported for now
+        if rate[FACTOR_INDEX_Stoch]:
+            raise Exception("Stochastic vol surfaces not yet implemented")
+        else:
+            vol_spread = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
+            break
+
+    index_map = code[0][FACTOR_INDEX_Surface_Flat_Index]
+    tenor_index = code[0][FACTOR_INDEX_VolTenor_Index]
+    expiry_index = code[0][FACTOR_INDEX_Expiry_Index]
     money_index = code[0][FACTOR_INDEX_Moneyness_Index]
 
-    if key_code not in shared.t_Buffer:
-        vol_spread = None
+    # need to know the moneyness offset for a particular expiry offset
+    expiry_offset = np.cumsum([0] + [x.tenor.size for x in expiry_index])
+    t_index, t_index_next, alpha = tenor_index.get_index(delivery)
+    alpha_tensor = vol_spread.new(alpha).unsqueeze(2)
 
-        for rate in code:
-            # Only static moneyness/expiry vol surfaces are supported for now
-            if rate[FACTOR_INDEX_Stoch]:
-                raise Exception("Stochastic vol surfaces not yet implemented")
-            else:
-                vol_spread = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
-                break
+    space = []
+    tenor_cache = {}
+    for current_tenor_index in [t_index, t_index_next]:
+        result = []
+        for tenor_sub_index, exp, mon in zip(current_tenor_index, expiry, moneyness):
+            expiry_tenor_map = [expiry_index[to].get_index(e) for to, e in zip(tenor_sub_index, exp)]
+            time_slice = []
+            for tenor_offset, (e_index, e_index_next, e_alpha) in zip(tenor_sub_index, expiry_tenor_map):
+                tenor_exp_key = (tenor_offset, e_index, e_index_next)
+                if tenor_exp_key not in tenor_cache:
+                    if expiry_index[tenor_offset].tenor.size > 1:
+                        # need to interpolate the expiry
+                        moneyness_00 = expiry_offset[tenor_offset] + e_index
+                        moneyness_01 = expiry_offset[tenor_offset] + e_index_next
 
-        # get the moneyness from the flat surface
-        moneyness_slice_size = np.array([len(x) for x in code[0][FACTOR_INDEX_Surface_Flat_Moneyness_Index]])
-        moneyness_slice_index = np.append(0, moneyness_slice_size.cumsum())[:-1]
-        moneyness_slice = []
+                        m_prior = vol_spread[slice(*index_map[2][moneyness_00][1:])]
+                        m_next = vol_spread[slice(*index_map[2][moneyness_01][1:])]
 
-        for delivery_index, expiry_index, vol_index in zip(
-                code[0][FACTOR_INDEX_Surface_Flat_Moneyness_Index],
-                code[0][FACTOR_INDEX_Surface_Flat_Expiry_Index], moneyness_slice_index):
-            # get the expiry index
-            index_expiry, index_expiry_p1, alpha = expiry_index.get_index(expiry)
-            alpha_exp = vol_spread.new(alpha)
+                        # grab 2 moneyness layers
+                        m_index_1, m_index_next_1, m_alpha_1 = money_index[moneyness_00].get_index(mon)
+                        m_index_2, m_index_next_2, m_alpha_2 = money_index[moneyness_01].get_index(mon)
 
-            # get the delivery index per expiry
-            index_del_00 = [[np.clip(np.searchsorted(
-                delivery_index[int(y[0])].tenor, y[1], side='right') - 1, 0, delivery_index[int(y[0])].max_index)
-                             for y in x] for x in np.dstack((index_expiry, delivery))]
-            index_del_01 = [[np.clip(
-                y[0] + 1, 0, delivery_index[int(y[1])].max_index) for y in x]
-                for x in np.dstack((index_del_00, index_expiry))]
-            index_del_10 = [[np.clip(np.searchsorted(
-                delivery_index[int(y[0])].tenor, y[1], side='right') - 1, 0, delivery_index[int(y[0])].max_index)
-                             for y in x] for x in np.dstack((index_expiry_p1, delivery))]
-            index_del_11 = [[np.clip(
-                y[0] + 1, 0, delivery_index[int(y[1])].max_index) for y in x]
-                for x in np.dstack((index_del_10, index_expiry_p1))]
+                        exp_prior = m_prior[m_index_1] * (1 - m_alpha_1) + m_prior[m_index_next_1] * m_alpha_1
+                        exp_next = m_next[m_index_2] * (1 - m_alpha_2) + m_next[m_index_next_2] * m_alpha_2
+                        tenor_cache[tenor_exp_key] = exp_prior * (1 - e_alpha) + exp_next * e_alpha
 
-            # get the interpolation factors
-            alpha_del_0 = vol_spread.new(np.vstack(
-                [[np.clip((y[1] - delivery_index[int(y[2])].tenor[int(y[0])])
-                          / delivery_index[int(y[2])].delta[int(y[0])], 0, 1.0)
-                  for y in x] for x in np.dstack((index_del_00, delivery, index_expiry))]))
+                    else:
+                        # go straight to moneyness
+                        moneyness_0 = expiry_offset[tenor_offset]
+                        m_slice = vol_spread[slice(*index_map[2][moneyness_0][1:])]
+                        m_index, m_index_next, m_alpha = money_index[moneyness_0].get_index(mon)
+                        tenor_cache[tenor_exp_key] = m_slice[m_index] * (1 - m_alpha) + m_slice[m_index_next] * m_alpha
 
-            alpha_del_1 = vol_spread.new(np.vstack(
-                [[np.clip((y[1] - delivery_index[int(y[2])].tenor[int(y[0])])
-                          / delivery_index[int(y[2])].delta[int(y[0])], 0, 1.0)
-                  for y in x] for x in np.dstack((index_del_10, delivery, index_expiry_p1))]))
+                time_slice.append(tenor_cache[tenor_exp_key])
+            result.append(torch.stack(time_slice))
+        space.append(result)
 
-            delivery_slice_size = np.array([x.tenor.size for x in delivery_index])
-            delivery_slice_index = vol_index + np.append(0, delivery_slice_size.cumsum())
+    interpolated_vols = [prior * (1 - a) + next * a for prior, next, a in zip(space[0], space[1], alpha_tensor)]
 
-            index_00 = delivery_slice_index[index_expiry] + np.vstack(index_del_00)
-            index_01 = delivery_slice_index[index_expiry] + np.vstack(index_del_01)
-            index_10 = delivery_slice_index[index_expiry_p1] + np.vstack(index_del_10)
-            index_11 = delivery_slice_index[index_expiry_p1] + np.vstack(index_del_11)
-
-            moneyness_slice.append(
-                (1.0 - alpha_exp) * (1.0 - alpha_del_0) * vol_spread[index_00] +
-                (1.0 - alpha_exp) * alpha_del_0 * vol_spread[index_01] +
-                alpha_exp * (1.0 - alpha_del_1) * vol_spread[index_10] +
-                alpha_exp * alpha_del_1 * vol_spread[index_11])
-
-        shared.t_Buffer[key_code] = torch.stack(moneyness_slice)
-
-    surface = shared.t_Buffer[key_code]
-
-    clipped_moneyness = torch.clamp(moneyness, min=money_index.min, max=money_index.max)
-
-    flat_moneyness = clipped_moneyness.reshape(-1, 1)
-    # move the moneyness to a tensor
-    money_index_t = moneyness.new(np.append(money_index.tenor, [np.inf]))
-    money_index_d = moneyness.new(np.append(money_index.delta, [1.0]))
-
-    cmp = (flat_moneyness >= money_index_t).type(torch.int32)
-    index = (cmp[:, 1:] - cmp[:, :-1]).argmin(axis=1)
-    alpha = (torch.squeeze(flat_moneyness) - money_index_t[index]) / money_index_d[index]
-
-    tenor_surface = surface.transpose(0, 1).reshape(-1, surface.shape[2])
-    vol_index = index.reshape(-1, shared.simulation_batch)
-    vol_index_next = torch.clamp(vol_index + 1, max=money_index.max_index)
-    vol_alpha = alpha.reshape(-1, shared.simulation_batch, 1)
-
-    surface_offset = index.new((np.arange(surface.shape[1]) * surface.shape[0]).reshape(-1, 1))
-
-    vols = tenor_surface[vol_index + surface_offset] * (1.0 - vol_alpha) + \
-           tenor_surface[vol_index_next + surface_offset] * vol_alpha
-
-    return vols.transpose(1, 2)
+    return torch.stack(interpolated_vols)
 
 
 def hermite_interpolation_tensor(t, rate_tensor):

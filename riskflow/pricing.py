@@ -1458,20 +1458,19 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
     mtm_list = []
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    # discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
     daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
 
     # first precalc all past resets
     samples = factor_dep['Cashflow'].get_resets(shared.one)
     known_samples = samples.known_resets(shared.simulation_batch)
     start_idx = samples.get_start_index(deal_time)
-    sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
-                                   (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
-                                    deal_time[:, utils.TIME_GRID_MTM].max())]
-    fx_spot = utils.calc_fx_cross(factor_dep['ForwardFX'][0],
-                                  factor_dep['CashFX'][0], sim_samples, shared)
-    fx_rep = utils.calc_fx_cross(factor_dep['Payoff_Currency'], shared.Report_Currency,
-                                 deal_time, shared)
+    sim_samples = samples.schedule[
+        (samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+        (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <= deal_time[:, utils.TIME_GRID_MTM].max())]
+    fx_spot = utils.calc_fx_cross(
+        factor_dep['ForwardFX'][0], factor_dep['CashFX'][0], sim_samples, shared)
+    fx_rep = utils.calc_fx_cross(
+        factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
     all_samples = utils.calc_time_grid_curve_rate(factor_dep['ForwardPrice'], sim_samples, shared)
 
     sample_values = all_samples.gather_weighted_curve(
@@ -1517,15 +1516,13 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
 
             # needed for vol lookup
             sample_block = daycount_fn(
-                sample_t.np[:, utils.RESET_INDEX_Start_Day].reshape(1, -1))
-
-            delivery_block = daycount_fn(
-                sample_t.np[:, utils.RESET_INDEX_End_Day] - factor_dep['Basedate']
-            ).reshape(1, -1)
-
-            sample_tenor = daycount_fn(
                 sample_t.np[:, utils.RESET_INDEX_Start_Day].reshape(1, -1)
                 - t_block[:, utils.TIME_GRID_MTM, np.newaxis])
+
+            delivery_block = daycount_fn(
+                sample_t.np[:, utils.RESET_INDEX_End_Day].reshape(1, -1) - factor_dep['Basedate']
+                - t_block[:, utils.TIME_GRID_MTM, np.newaxis]
+            )
 
             M1 = torch.sum(sample_ft, axis=1)
             strike_bar = factor_dep['Strike'] - average
@@ -1547,7 +1544,7 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
                 vol2 += fx_vols * fx_vols + 2.0 * fx_vols * ref_vols * factor_dep['ImpliedCorrelation']
 
             product_t = sample_ft * torch.exp(
-                vol2.new(np.expand_dims(sample_tenor, axis=2)) * vol2)
+                sample_ft.new(np.expand_dims(sample_block, axis=2)) * vol2)
 
             # do an exclusive cumsum on axis=1
             sum_t = F.pad(torch.cumsum(product_t[:, :-1], axis=1), [0, 0, 1, 0, 0, 0])

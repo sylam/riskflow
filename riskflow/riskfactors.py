@@ -970,7 +970,7 @@ class ForwardPriceVol(Factor3D):
 
     def __init__(self, param):
         self.flat = None
-        self.index_map = OrderedDict()
+        self.index_map = {}
         super(ForwardPriceVol, self).__init__(param)
 
     def get_vols(self):
@@ -979,13 +979,30 @@ class ForwardPriceVol(Factor3D):
         # get the surface
         surface = self.param['Surface'].array
         # Sort by moneyness, then expiry
-        self.sorted_vol = surface[np.lexsort((surface[:, self.TENOR_INDEX],
-                                              surface[:, self.EXPIRY_INDEX], surface[:, self.MONEYNESS_INDEX]))]
+        self.sorted_vol = surface[np.lexsort(
+            (surface[:, self.MONEYNESS_INDEX], surface[:, self.EXPIRY_INDEX], surface[:, self.TENOR_INDEX]))]
         # store an index for each expiry
         self.index_map.clear()
-        for element in self.sorted_vol:
-            self.index_map.setdefault(element[self.MONEYNESS_INDEX], OrderedDict()).setdefault(
-                element[self.EXPIRY_INDEX], []).append(element[self.TENOR_INDEX])
+
+        # store the offsets of all the tenor indices
+        self.index_map[self.TENOR_INDEX] = np.append(
+            self.sorted_vol[:, self.TENOR_INDEX].searchsorted(self.get_tenor()), len(surface))
+
+        for start, end in zip(
+                self.index_map[self.TENOR_INDEX][:-1], self.index_map[self.TENOR_INDEX][1:]):
+            expiry_valid = np.unique(self.sorted_vol[start:end, self.EXPIRY_INDEX]) if end > start else np.array([
+                self.sorted_vol[start, self.EXPIRY_INDEX]])
+            self.index_map.setdefault(self.EXPIRY_INDEX, []).append((expiry_valid, start, end))
+
+        for expiry in self.index_map[self.EXPIRY_INDEX]:
+            idx_start, idx_end = expiry[1:]
+            starts = np.append(
+                idx_start + self.sorted_vol[idx_start: idx_end, self.EXPIRY_INDEX].searchsorted(expiry[0]), idx_end)
+            for start, end in zip(starts[:-1], starts[1:]):
+                moneyness_valid = self.sorted_vol[start: end, self.MONEYNESS_INDEX] if end > start else np.array([
+                    self.sorted_vol[start, self.MONEYNESS_INDEX]])
+                self.index_map.setdefault(self.MONEYNESS_INDEX, []).append((moneyness_valid, start, end))
+
         self.flat = self.sorted_vol[:, 3]
 
         for moneyness in self.moneyness:
@@ -1006,8 +1023,9 @@ class ForwardPriceVol(Factor3D):
         if tenors is not None:
             interp_vols = []
             if self.expiry.size > 1 and self.moneyness.size > 1:
-                interpolator = [RectBivariateSpline(self.expiry, self.tenor, vol.reshape(self.expiry.size, -1), kx=1, ky=1)
-                                for vol in self.vols.reshape(self.moneyness.size, -1)]
+                interpolator = [
+                    RectBivariateSpline(self.expiry, self.tenor, vol.reshape(self.expiry.size, -1), kx=1, ky=1)
+                    for vol in self.vols.reshape(self.moneyness.size, -1)]
 
                 for tenor in tenors:
                     index = np.clip(self.moneyness.searchsorted(
@@ -1016,7 +1034,8 @@ class ForwardPriceVol(Factor3D):
                     val = np.interp(
                         tenor[self.MONEYNESS_INDEX], self.moneyness[[index, index_p1]],
                         np.dstack([interpolator[index](tenor[self.EXPIRY_INDEX], tenor[self.TENOR_INDEX]),
-                                   interpolator[index_p1](tenor[self.EXPIRY_INDEX], tenor[self.TENOR_INDEX])]).flatten())
+                                   interpolator[index_p1](tenor[self.EXPIRY_INDEX],
+                                                          tenor[self.TENOR_INDEX])]).flatten())
                     interp_vols.append(val)
                 return np.array(interp_vols)
             elif self.expiry.size > 1:

@@ -254,7 +254,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         exposure = {
             'EE': np.mean(exposure, axis=1),
             'ENE': np.mean(neg_exposure, axis=1)}
-        percentiles = calc_params.get('Percentile', '95').replace(' ', '')
+        percentiles = params_mc.get('Percentile', '95').replace(' ', '')
         if percentiles:
             extra = {'PFE_{}'.format(x): np.percentile(mtm, int(x), axis=1) for x in percentiles.split(',')}
             exposure.update(extra)

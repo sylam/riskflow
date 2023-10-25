@@ -254,7 +254,7 @@ if __name__ == '__main__':
     pd.set_option("display.max_rows", 500, "display.max_columns", 20)
 
     # set the visible GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+    # os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
     # set the log level
     os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
@@ -273,13 +273,13 @@ if __name__ == '__main__':
              os.path.join('S:\\Riskflow\\TEST', folder),
              os.path.join('N:\\Archive', folder)])
 
-    # path_json = paths['FVA_JSON']
-    path_json = paths['CVA']
+    # path_json = paths['CVA']
+    path_json = paths['PFE']
     # path = paths['CVA_UAT']
     # path = paths['CVA']
     path = paths['PFE']
 
-    rundate = '2023-09-15'
+    rundate = '2023-10-06'
     # rundate = '2023-05-31'
     # calibrate_PFE(path, rundate)
     # bootstrap(path_json, '', reuse_cal=True)
@@ -312,7 +312,7 @@ if __name__ == '__main__':
         'GBP': {'FVA@Equity': {'collateral': 0, 'funding': 10}, 'FVA@Income': {'collateral': 0, 'funding': 65}},
         'ZAR': {'FVA@Equity': {'collateral': -10, 'funding': 15}, 'FVA@Income': {'collateral': -10, 'funding': 15}}}
 
-    curves = {'USD': {'collateral': 'USD-OIS', 'funding': 'USD-LIBOR-3M'},
+    curves = {'USD': {'collateral': 'USD-OIS-STATIC-OLD', 'funding': 'USD-SOFR-CAS'},
               'EUR': {'collateral': 'EUR-EONIA', 'funding': 'EUR-EURIBOR-3M'},
               'GBP': {'collateral': 'GBP-SONIA', 'funding': 'GBP-SONIA'},
               'ZAR': {'collateral': 'ZAR-SWAP', 'funding': 'ZAR-SWAP'}}
@@ -321,25 +321,44 @@ if __name__ == '__main__':
         'USD': {'collateral': 'USD-SOFR', 'funding': 'USD-LIBOR-3M'},
         'EUR': {'collateral': 'EUR-ESTR', 'funding': 'EUR-EURIBOR-3M'}}
 
-    # for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
+        # for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Soc_Gen_Paris_*.json')):
-    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_CS_Int_London_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Goldman_Sachs_Int_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
+    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Investec_Life_Limited_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Deutsche_Bank_AG_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_AutoX__Pty__Ltd_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_ZAR_CrB_Tiger_Consumer_Brands_Limited_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_FVA_CrB_IBL_ICIB_BSF_ED_HQLA_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Redefine_Properties_Limited*.json')):
 
         # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Standard_Bank_*.json')):
         # for json in glob.glob(os.path.join(path_json, rundate, '*otus*.json')):
         cx.load_json(json, compress=True)
+
         try:
+            sofr = cx.current_cfg.params['Price Factors']['InterestRate.USD-SOFR']['Curve'].array
+            cas = cx.current_cfg.params['Price Factors']['InterestRate.USD-SOFR.USD-SOFR3M_CAS']['Curve'].array
+            cas_curve = list(zip(sofr[:, 0], sofr[:, 1] + np.interp(sofr[:, 0], *cas.T)))
+
+            cx.current_cfg.params['Price Factors']['InterestRate.USD-SOFR-CAS'] = {
+                'Day_Count': 'ACT_365',
+                'Currency': 'USD',
+                'Curve': rf.utils.Curve([], cas_curve),
+                'Sub_Type': 'None',
+                'Property_Aliases': None,
+                'Interpolation': 'Hermite'}
+
+            # check if we have a sofr model for usd
+            if 'PCAInterestRateModel.USD-SOFR-CAS' not in cx.current_cfg.params['Price Models']:
+                cx.current_cfg.params['Price Models'][
+                    'PCAInterestRateModel.USD-SOFR-CAS'] = cx.current_cfg.params['Price Models'][
+                    'PCAInterestRateModel.USD-SOFR']
+
             if 'GBMAssetPriceModel.EUR_SX5E' not in cx.current_cfg.params['Price Models']:
                 cx.current_cfg.params['Price Models']['GBMAssetPriceModel.EUR_SX5E'] = cx.current_cfg.params[
                     'Price Models']['GBMAssetPriceModel.EUR_SX5EEX']
@@ -372,7 +391,7 @@ if __name__ == '__main__':
         # ns.field['Collateral_Assets']['Cash_Collateral'][0]['Collateral_Rate'] = 'USD-OIS'
         # ns.field['Collateral_Assets']['Cash_Collateral'] = []
         # ns.field['Collateral_Call_Frequency']=pd.DateOffset(weeks=1)
-        # ns.field['Collateralized'] = 'True'
+        ns.field['Collateralized'] = 'False'
 
         overrides = {
             'Calc_Scenarios': 'No',
@@ -385,9 +404,9 @@ if __name__ == '__main__':
             'Antithetic': 'Yes',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
             'Batch_Size': 1024,
-            'Simulation_Batches': 2,
+            'Simulation_Batches': 1,
             # 'COLLVA': {'Gradient': 'Yes'},
-            'CVA': {'Gradient': 'Yes', 'Hessian': 'No'}
+            # 'CVA': {'Gradient': 'Yes', 'CDS_Tenors': [0.5, 1, 3, 5, 10], 'Hessian': 'No'}
         }
 
         if ns.field['Collateralized'] == 'True':
@@ -398,23 +417,35 @@ if __name__ == '__main__':
         for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             # if i['Instrument'].field['Reference'] != 'USDIBLIX12DIGIPUT18189230%20280629':
             # if i['Instrument'].field['Reference'] != '137335521':
-            if False and not i['Instrument'].field['Object'].startswith('QEDI'):
-            # if not i['Instrument'].field['Reference'].startswith('ZARSPI'):
+            # if False and not i['Instrument'].field['Object'].startswith('QEDI'):
+            # if not str(i['Instrument'].field['Reference']).startswith('143248847'):
+            if not str(i['Instrument'].field['Reference']).startswith('132208115'):
                 i['Ignore'] = 'True'
             else:
                 i['Ignore'] = 'False'
 
-        # calculation_currency = 'USD'
+        calculation_currency = 'USD'
+        logging.getLogger().setLevel(logging.DEBUG)
 
-        calc, out = cx.Base_Valuation(overrides={'Currency': 'ZAR'})
+        # calc, out = cx.Base_Valuation(overrides={'Currency': 'ZAR'})
+
         for i in range(3):
             # cx.stress_config(['InterestRate', 'InflationRate'])
             calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
             print(i, 'stress', out['Results']['cva'])
+
+            delta_surv = out['Results']['grad_cva'].loc[
+                ('SurvivalProb.ACWA_Power_SolarReserve_Redstone_So')].reset_index()[
+                ['Tenor', 'Gradient']].set_index('Tenor')
+
+            test = out['Results']['CS01'].groupby(
+                delta_surv.index[np.searchsorted(
+                    delta_surv.index, out['Results']['CS01'].index, side='right') - 1]).mean()
+            delta = test.min() * delta_surv.loc[test.min().index]['Gradient'].values.reshape(-1, 1)
+
             cx.restore_config()
             calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
             print(i, 'restore', out['Results']['cva'])
-
 
         # cx.stress_config(['ForwardPrice'])
 
