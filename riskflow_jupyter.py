@@ -15,7 +15,7 @@ from IPython.display import display  # Used to display widgets in the notebook
 # riskflow specific stuff
 import riskflow as rf
 # load the widgets - might be able to use more native objects instead of unicode text - TODO!
-from riskflow_widgets import FileChooser, Tree, Table, Flot, Three, to_json
+from riskflow_widgets import FileDragUpload, Tree, Table, Flot, Three, to_json
 
 
 def load_table_from_vol(vol):
@@ -100,7 +100,8 @@ class TreePanel(metaclass=ABCMeta):
         self.tree.observe(self._on_selected_changed, 'selected')
         self.tree.observe(self._on_created_changed, 'created')
         self.tree.observe(self._on_deleted_changed, 'deleted')
-        # self.tree.on_displayed(self._on_displayed)
+        self.tree.observe(self._on_ignore_toggle, 'ignore')
+
         # default layout for the widgets
         self.default_layout = widgets.Layout(min_height='30px')
 
@@ -221,7 +222,7 @@ class TreePanel(metaclass=ABCMeta):
                         data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
                                      field, item, widget_type in zip(headings, flow, widgets)])
                     return_value = to_json(data)
-                elif field_name in ['Price_Fixing', 'Autocall_Thresholds', 'Autocall_Coupons']:
+                elif field_name in ['Price_Fixing', 'Autocall_Thresholds', 'Autocall_Coupons', 'Autocall_Floating']:
                     headings = ['Date', 'Value']
                     widgets = ['DatePicker', 'Float']
                     data = []
@@ -237,7 +238,7 @@ class TreePanel(metaclass=ABCMeta):
                         data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
                                      field, item, widget_type in zip(headings, flow, widgets)])
                     return_value = to_json(data)
-                
+
                 else:
                     raise Exception('Unknown Array Field type {0}'.format(field_name))
             elif isinstance(obj, pd.DateOffset):
@@ -256,7 +257,8 @@ class TreePanel(metaclass=ABCMeta):
         # update an existing factor
         rate_type = rf.utils.check_rate_name(section_name)[0]
         field_name = field_meta['description'].replace(' ', '_')
-        if section_name in config and field_name in config[section_name]:
+
+        if config.get(section_name) is not None and field_name in config[section_name]:
             # return the value in the config obj
             obj = config[section_name][field_name]
             return get_repr(obj, field_name, field_meta['value'])
@@ -273,7 +275,7 @@ class TreePanel(metaclass=ABCMeta):
 
     def define_input(self, label, widget_elements):
         # label this container
-        wig = [widgets.HTML(value=self.get_label(label))]
+        wig = [widgets.HTML(value=self.get_label(label))] if label else []
 
         for field_name, element in widget_elements.items():
             # skip this element if it's not visible
@@ -289,7 +291,15 @@ class TreePanel(metaclass=ABCMeta):
                 new_label = label + [
                     element['description']] if isinstance(label, list) else [element['description']]
                 w = self.define_input([x.replace(' ', '_') for x in new_label], element['sub_fields'])
+                # uncomment this if you want to use accordians (can hide fields)
+                # raw_w = self.define_input([], element['sub_fields'])                
+                # w = widgets.Accordion(children=[raw_w])
+                # w.set_title(0, element['description'].replace(' ', '_'))
+                # w.selected_index=None
             elif element['widget'] == 'Flot':
+                if element['value'] == 0.0:
+                    element['value'] = element['default']
+
                 w = Flot(description=element['description'],
                          hot_settings=to_json(element.get('hot_settings', {})),
                          flot_settings=to_json(element.get('flot_settings', {})),
@@ -309,7 +319,7 @@ class TreePanel(metaclass=ABCMeta):
                               'minSpareRows': 1,
                               'startRows': 1,
                               'startCols': len(element['col_names']),
-                              'width': element.get('width', 400),
+                              'width': element.get('width', 600),
                               'height': element.get('height', 200)
                           }),
                           value=element['value']
@@ -370,6 +380,15 @@ class TreePanel(metaclass=ABCMeta):
             self.tree.unobserve(self._on_deleted_changed, 'deleted')
             self.tree.deleted = ''
             self.tree.observe(self._on_deleted_changed, 'deleted')
+
+    def _on_ignore_toggle(self, change):
+        if self.tree.ignore:
+            # print 'delete',val
+            self.ignore(change['new'])
+            # reset the deleted flag
+            self.tree.unobserve(self._on_ignore_toggle, 'ignore')
+            self.tree.ignore = ''
+            self.tree.observe(self._on_ignore_toggle, 'ignore')
 
     def show(self):
         display(self.main_container)
@@ -561,7 +580,7 @@ class PortfolioPage(TreePanel):
         # tree widget data
         self.tree = Tree(
             plugins=["contextmenu", "sort", "types", "search", "unique"],
-            settings=to_json({'contextmenu': context_menu, 'events': ['create', 'delete']}),
+            settings=to_json({'contextmenu': context_menu, 'events': ['create', 'delete', 'ignore']}),
             type_data=to_json(type_data),
             value=to_json(self.tree_data)
         )
@@ -636,13 +655,20 @@ class PortfolioPage(TreePanel):
         reference = key[-1][key[-1].find('.') + 1:]
         parent = self.data[key][DealCache.Parent]
 
-        print(key, parent)
+        # print(key, parent)
         # delete the deal
         parent['Children'].remove(self.data[key][DealCache.Deal])
         # decrement the count
         self.data[key[:-1]][DealCache.Count][reference] -= 1
         # delte the view data
         del self.data[key]
+
+    def ignore(self, values):
+        for val in values:
+            key = tuple(val[1:])
+            reference = key[-1][key[-1].find('.') + 1:]
+            self.data[key][DealCache.Deal]['Ignore'] = 'True' if val[0] else 'False'
+            # print(self.data[key][DealCache.Deal])
 
 
 class RiskFactorsPage(TreePanel):
@@ -1013,16 +1039,18 @@ class RiskFactorsPage(TreePanel):
 
 
 class CalculationPage(TreePanel):
-    def __init__(self, config):
+    def __init__(self, config, default_rundate):
         super(CalculationPage, self).__init__(config)
+        self.default_rundate = default_rundate
         self.output = {}
 
     def get_label(self, label):
         """
         :param label: a list of text describing this calculation.
-        :return: just prints the last 2 labels as the section and subsection header
+        :return: just prints the last label as the subsection header
         """
-        return '<h4>{0}:</h4><i>{1}</i>'.format(*label[-2:])
+
+        return '<h4>{0}:</h4>'.format(label[-1])
 
     def parse_config(self):
 
@@ -1102,14 +1130,14 @@ class CalculationPage(TreePanel):
             out = {}
             for k, v in sorted(results.items(), key=lambda x: x[0][::-1]):
                 filename_field = './tmp/{}.{}.csv'.format(key, k)
-                link = {'widget': 'HTML', 'value': '<a href="{}" title="Click to Download">Download {}</a>'.format(filename_field, k)}
+                link = {'widget': 'HTML',
+                        'value': '<a href="{}" title="Click to Download">Download {}</a>'.format(filename_field, k)}
                 if isinstance(v, pd.DataFrame):
                     # date index
                     if v.index.dtype.type == np.datetime64:
                         # clip the columns if there are too many to display
                         clipped_cols = v.columns[:8]
-                        label_name = k.replace('_', ' ') if len(v.columns)<=8 else 'First {} Columns'.format(len(clipped_cols))  
-                        Widget = {'widget': 'Flot', 'description': label_name,
+                        Widget = {'widget': 'Flot', 'description': '',
                                   'hot_settings': {
                                       'columns': [{}] +
                                                  [{"type": "numeric",
@@ -1119,15 +1147,16 @@ class CalculationPage(TreePanel):
                                   'flot_settings': {'xaxis': {'mode': "time", 'timeBase': "milliseconds"}},
                                   'value': to_json(
                                       [{'label': c, 'data': [[x, y] for x, y in zip(v.index.view(np.int64) // 1000000,
-                                                                                    v[c].values)]} for c in clipped_cols])
+                                                                                    v[c].values)]} for c in
+                                       clipped_cols])
                                   }
                     else:
                         # multiindex not yet supported
                         r = v.reset_index()
                         dtypes = r.dtypes
                         r = r.replace({np.nan: None})
-                        Widget = {'widget': 'Table', 'description': k.replace('_', ' '),
-                                  'width': 650,
+                        Widget = {'widget': 'Table', 'description': '',
+                                  'width': 700,
                                   'height': 300,
                                   'sub_types': [{"type": "numeric",
                                                  "numericFormat": {"pattern": "0,0.0000"}}
@@ -1136,21 +1165,25 @@ class CalculationPage(TreePanel):
                                   'obj': ['Float' if x.type in [np.float32, np.float64] else 'Text' for x in dtypes],
                                   'value': to_json([x[-1].tolist() for x in r.iterrows()])
                                   }
-                                  
+
+                    os.makedirs(os.path.dirname(filename_field), exist_ok=True)
                     with open(filename_field, 'wt') as fp:
-                        v.to_csv(fp)                        
+                        v.to_csv(fp)
                     subfields = {k: Widget, 'link': link}
-                    widget = {'widget': 'Container', 'description': k.replace('_', ' '), 'value': subfields, 'sub_fields': subfields}
-                            
+                    widget = {'widget': 'Container', 'description': k.replace('_', ' '), 'value': subfields,
+                              'sub_fields': subfields}
+
                 elif isinstance(v, float):
                     widget = {'widget': 'Float', 'description': k.replace('_', ' '), 'value': v}
-                    
+
                 elif isinstance(v, dict):
-                    if k=='scenarios':
+                    if k == 'scenarios':
                         multi_index = pd.MultiIndex.from_tuples(
-                            reduce(operator.concat, [[(k2,)+ v1 for v1 in v2.index] for k2,v2 in v.items()]), names = ['factor', 'tenor', 'scenario'])
+                            reduce(operator.concat, [[(k2,) + v1 for v1 in v2.index] for k2, v2 in v.items()]),
+                            names=['factor', 'tenor', 'scenario'])
                     else:
-                        multi_index = pd.MultiIndex.from_tuples(reduce(operator.concat, [[(k2, v1) for v1 in v2.index] for k2,v2 in v.items()]))
+                        multi_index = pd.MultiIndex.from_tuples(
+                            reduce(operator.concat, [[(k2, v1) for v1 in v2.index] for k2, v2 in v.items()]))
                     df = pd.concat(v.values()).set_index(multi_index)
                     with open(filename_field, 'wt') as fp:
                         df.to_csv(fp)
@@ -1221,12 +1254,17 @@ class CalculationPage(TreePanel):
     def create(self, val):
         key = val[0]
         calc_type = key[:key.find('.')]
-        reference = key[key.find('.') + 1:]
+        # reference = key[key.find('.') + 1:]
         # print(key, calc_type, reference)
         # load defaults for the new riskfactor
+        default_frames = copy.deepcopy(self.calculation_fields.get(calc_type))
+        # set the default_date if defined
+        if not default_frames['Base_Date']['value'] and self.default_rundate is not None:
+            default_frames['Base_Date']['value'] = self.default_rundate
         self.data[key] = {
-            'frames': copy.deepcopy(self.calculation_fields.get(calc_type)),
-            'calc': calc_type, 'output': {}
+            'frames': default_frames,
+            'calc': calc_type,
+            'output': {}
         }
 
     def delete(self, val):
@@ -1240,17 +1278,22 @@ class Workbench(object):
     Needs to be able to load and save config files/trade files (in JSON)
     '''
 
-    def __init__(self, path='', path_transform={}, file_transform={}):
+    def __init__(self, path_transform={}, file_transform={}, stressed=False, default_rundate=None):
 
         def select_json(chooser):
+            logging.root.name = 'WorkBench'
             self.context.file_map = {k: v for k, v in self.file_transform.items() if k}
             self.context.path_map = {k: v for k, v in self.path_transform.items() if k}
-            logging.info('loading {}'.format(chooser.selected))
-            self.context.load_json(chooser.selected, compress=self.compress_json.value)
+            file_data = chooser['new'][0]
+            logging.info('loading {}'.format(file_data.name))
+            self.context.load_json(
+                (file_data['content'].tobytes().decode('utf-8'), file_data.name),
+                compress=self.compress_json.value
+            )
             self.reload()
             # select the portfolio index
             self.tabs.selected_index = 1
-            logging.info('{} loaded'.format(chooser.selected))
+            logging.info('{} loaded'.format(file_data.name))
 
         def make_new_map(map_type, map_data):
 
@@ -1292,23 +1335,23 @@ class Workbench(object):
             buttons = widgets.HBox(children=[add_map, del_map])
             return widgets.VBox(children=[frame, buttons])
 
-        self.context = rf.Context()
-        self.path = path
+        self.context = rf.StressedContext() if stressed else rf.Context()
         self.path_transform = path_transform
         self.file_transform = file_transform
+        self.default_rundate = default_rundate
 
         # load the file selectors
 
         self.path_map = make_new_map('Path', self.path_transform)
         self.file_map = make_new_map('File', self.file_transform)
-        self.json_file = FileChooser(path, title='Load JSON File', filter_pattern='*.json')        
-        self.json_file.register_callback(select_json)
+        self.json_file = FileDragUpload(accept='.json')
+        self.json_file.observe(select_json, names='value')
         self.compress_json = widgets.Checkbox(
             value=False, description='Compress deals', disabled=False, indent=False)
         self.filename = widgets.VBox(children=[self.path_map, self.file_map, widgets.HBox(
             children=[self.json_file, self.compress_json])], layout=widgets.Layout(border='5px outset black'),
-            _dom_classes=['mainframe'])
-            
+                                     _dom_classes=['mainframe'])
+
         # the main containers/widgets
         self.main = None
         self.log_area = widgets.Textarea()
@@ -1320,19 +1363,20 @@ class Workbench(object):
 
         self.log = logging.getLogger()
         self.log.handlers = []
-        self.log.setLevel(logging.DEBUG)
+        self.log.setLevel(logging.INFO)
         self.log.addHandler(self.loghandler)
+
         # build the UI
         self.portfolio = PortfolioPage(self.context)
         self.factors = RiskFactorsPage(self.context)
-        self.calculations = CalculationPage(self.context)
+        self.calculations = CalculationPage(self.context, self.default_rundate)
 
         self.tabs = widgets.Tab(children=[self.filename,
                                           self.portfolio.main_container,
                                           self.factors.main_container,
                                           self.calculations.main_container])
 
-        self.tabs.set_title(0, 'JSON File')
+        self.tabs.set_title(0, 'Load JSON')
         self.tabs.set_title(1, 'Portfolio')
         self.tabs.set_title(2, 'Price Factors')
         self.tabs.set_title(3, 'Calculations')
@@ -1346,7 +1390,7 @@ class Workbench(object):
     def reload(self):
         self.portfolio = PortfolioPage(self.context)
         self.factors = RiskFactorsPage(self.context)
-        self.calculations = CalculationPage(self.context)
+        self.calculations = CalculationPage(self.context, self.default_rundate)
 
         self.tabs.children = [self.filename, self.portfolio.main_container,
                               self.factors.main_container, self.calculations.main_container]

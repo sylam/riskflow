@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 # load up some useful data types
-from collections import OrderedDict, namedtuple, defaultdict
+from collections import namedtuple, defaultdict
 # import the risk factors (also known as price factors)
 from .riskfactors import construct_factor
 # import the stochastic processes
@@ -48,7 +48,6 @@ class Aggregation(object):
 
 class DealStructure(object):
     def __init__(self, obj, deal_level_mtm=False):
-        # parent object - note that all parent objects MUST have an aggregate method that can aggregate partitions
         self.obj = utils.DealDataType(Instrument=obj, Factor_dep=None, Time_dep=None, Calc_res=None)
         # gather a list of deal dependencies
         self.dependencies = []
@@ -74,8 +73,8 @@ class DealStructure(object):
 
         return deal_time_dep
 
-    def add_deal_to_structure(self, base_date, deal, static_offsets, stochastic_offsets, all_factors,
-                              all_tenors, time_grid, calendars):
+    def add_deal_to_structure(self, base_date, deal, static_offsets, stochastic_offsets,
+                              all_factors, all_tenors, time_grid, calendars, stats):
         """
         The logic is as follows: a structure contains deals - a set of deals are netted off and then the rules that the
         structure itself contains is applied.
@@ -90,12 +89,14 @@ class DealStructure(object):
                                            base_date, static_offsets, stochastic_offsets,
                                            all_factors, all_tenors, time_grid, calendars),
                                        Time_dep=deal_time_dep,
-                                       Calc_res=OrderedDict() if self.deal_level_mtm else None))
+                                       Calc_res={} if self.deal_level_mtm else None))
+                stats['Deals loaded'] = stats.setdefault('Deals loaded', 0) + 1
             except Exception as e:
                 logging.error('{0} {1} - Skipped'.format(deal.field['Object'], e.args))
+                stats['Deals Skipped'] = stats.setdefault('Deals Skipped', 0) + 1
 
     def add_structure_to_structure(self, struct, base_date, static_offsets, stochastic_offsets,
-                                   all_factors, all_tenors, time_grid, calendars):
+                                   all_factors, all_tenors, time_grid, calendars, stats):
         # get the dependencies
         struct_time_dep = self.calc_time_dependency(base_date, struct.obj.Instrument, time_grid)
         try:
@@ -106,11 +107,13 @@ class DealStructure(object):
                         base_date, static_offsets, stochastic_offsets,
                         all_factors, all_tenors, time_grid, calendars),
                     Time_dep=struct_time_dep,
-                    Calc_res=OrderedDict() if self.deal_level_mtm else None)
+                    Calc_res={} if self.deal_level_mtm else None)
             # Structure object representing a netted set of cashflows
             self.sub_structures.append(struct)
+            stats['Structs loaded'] = stats.setdefault('Structs loaded', 0) + 1
         except Exception as e:
             logging.error('{0} {1} - Skipped'.format(struct.obj.Instrument.field['Object'], e.args))
+            stats['Structs Skipped'] = stats.setdefault('Structs Skipped', 0) + 1
 
     def resolve_structure(self, shared, time_grid):
         """
@@ -168,15 +171,15 @@ class Calculation(object):
         self.device = device
 
         # the risk factor data
-        self.static_factors = OrderedDict()
-        self.static_ofs = OrderedDict()
-        self.stoch_factors = OrderedDict()
-        self.stoch_ofs = OrderedDict()
+        self.static_factors = {}
+        self.static_ofs = {}
+        self.stoch_factors = {}
+        self.stoch_ofs = {}
         self.all_factors = {}
         self.all_tenors = {}
 
         # these are used for implied calibration        
-        self.implied_ofs = OrderedDict()
+        self.implied_ofs = {}
 
         self.base_date = None
 
@@ -271,33 +274,27 @@ class Calculation(object):
         return df
 
     def set_deal_structures(self, deals, output, num_scenarios, batch_size, tagging=None, deal_level_mtm=False):
-        partitioning = False
+
         for node in deals:
             # get the instrument
             instrument = node['Instrument']
             # should we skip it?
             if node.get('Ignore') == 'True':
+                self.calc_stats['Ignored'] = self.calc_stats.setdefault('Ignored', 0) + 1
                 continue
-            # apply a tag if provided (used for partitioning)
-            if tagging:
-                instrument.field['Tags'] = tagging(instrument.field)
-                partitioning = True
+
             # logging info
             logging.root.name = instrument.field.get('Reference', '<undefined>')
             if node.get('Children'):
                 struct = DealStructure(instrument, deal_level_mtm=deal_level_mtm)
                 self.set_deal_structures(node['Children'], struct, num_scenarios, batch_size, tagging, deal_level_mtm)
-                output.add_structure_to_structure(struct, self.base_date, self.static_ofs, self.stoch_ofs,
-                                                  self.all_factors, self.all_tenors, self.time_grid,
-                                                  self.config.holidays)
+                output.add_structure_to_structure(
+                    struct, self.base_date, self.static_ofs, self.stoch_ofs, self.all_factors,
+                    self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
                 continue
 
             output.add_deal_to_structure(self.base_date, instrument, self.static_ofs, self.stoch_ofs, self.all_factors,
-                                         self.all_tenors, self.time_grid, self.config.holidays)
-
-        # check if we need to partition this structure
-        if partitioning:
-            output.build_partitions()
+                                         self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
 
 
 class CMC_State(utils.Calculation_State):
@@ -509,7 +506,7 @@ class Credit_Monte_Carlo(Calculation):
         # used to store any jacobian matrices
         self.jacobians = {}
         # implied factors
-        self.implied_factors = OrderedDict()
+        self.implied_factors = {}
         # we represent the calc as a combination of static, stochastic and implied parameters
         self.stoch_var = []
         self.static_var = []
@@ -518,9 +515,9 @@ class Credit_Monte_Carlo(Calculation):
         # potentially store the full list of variables
         self.all_var = None
 
-        self.stoch_ofs = OrderedDict()
-        self.static_ofs = OrderedDict()
-        self.implied_ofs = OrderedDict()
+        self.stoch_ofs = {}
+        self.static_ofs = {}
+        self.implied_ofs = {}
 
     def update_factors(self, params, base_date):
         dependent_factors, stochastic_factors, implied_factors, reset_dates, settlement_currencies = \
@@ -554,7 +551,7 @@ class Credit_Monte_Carlo(Calculation):
                 price_model.type, factor_obj,
                 self.config.params['Price Models'][utils.check_tuple_name(price_model)], implied_obj)
 
-        self.static_factors = OrderedDict()
+        self.static_factors = {}
         for price_factor in set(dependent_factors).difference(stochastic_factors.values()):
             try:
                 self.static_factors.setdefault(
@@ -571,8 +568,8 @@ class Credit_Monte_Carlo(Calculation):
 
         # get the tenor offset (if any)
         tenor_offset = params.get('Tenor_Offset', 0.0)
-        # check if we need gradients for any xVA
-        greeks = bool(np.any([params[x].get('Gradient', 'No') == 'Yes' for x in params.keys() if x.endswith('VA')]))
+        # check if we need gradients for any sub calc
+        greeks = bool(np.any([params[k].get('Gradient', 'No') == 'Yes' for k, v in params.items() if type(v) == dict]))
         sensitivities = params.get('Gradient_Variables', 'All')
 
         # now get the stochastic risk factors ready - these will be generated from the price models
@@ -581,7 +578,7 @@ class Credit_Monte_Carlo(Calculation):
             if key.type not in utils.DimensionLessFactors:
                 # check if there are any implied factors linked here
                 if hasattr(value, 'implied'):
-                    vars = OrderedDict()
+                    vars = {}
                     calc_grad = greeks and sensitivities in ['All', 'Implied']
                     self.implied_ofs.setdefault(key, len(self.implied_var))
                     for param_name, param_value in value.implied.current_value().items():
@@ -697,12 +694,12 @@ class Credit_Monte_Carlo(Calculation):
         mtms = [report(x, self.numscenarios, len(tag_headings)) for x in deals]
         time_grid = base_results['Netting'].sub_structures[0].obj.Time_dep.deal_time_grid
         days = self.time_grid.time_grid[:, 1][time_grid]
-        funding = construct_factor(utils.Factor('InterestRate', (discount_curves['funding'],)),
-                                   self.config.params['Price Factors'],
-                                   self.config.params['Price Factor Interpolation'])
-        collateral = construct_factor(utils.Factor('InterestRate', (discount_curves['collateral'],)),
-                                      self.config.params['Price Factors'],
-                                      self.config.params['Price Factor Interpolation'])
+        funding = construct_factor(
+            utils.Factor('InterestRate', (discount_curves['funding'],)),
+            self.config.params['Price Factors'], self.config.params['Price Factor Interpolation'])
+        collateral = construct_factor(
+            utils.Factor('InterestRate', (discount_curves['collateral'],)),
+            self.config.params['Price Factors'], self.config.params['Price Factor Interpolation'])
         delta_t = np.diff(days)
         all_spread = {k: {} for k in spreads.keys()}
 
@@ -730,7 +727,7 @@ class Credit_Monte_Carlo(Calculation):
 
         # prepare the correlation matrix (and the offsets of each stochastic process)
         correlation_factors = []
-        self.process_ofs = OrderedDict()
+        self.process_ofs = {}
         for key, value in self.stoch_factors.items():
             proc_corr_type, proc_corr_factors = value.correlation_name
             for sub_factors in proc_corr_factors:
@@ -839,11 +836,11 @@ class Credit_Monte_Carlo(Calculation):
                 self.output.setdefault('scenarios', scen)
             elif result == 'cashflows':
                 self.output.setdefault('cashflows', {k: pd.concat(v, axis=1) for k, v in data.items()})
-            elif result in ['cva', 'collva', 'fva']:
+            elif result in ['cva', 'collva', 'fva', 'legacy_fva']:
                 self.output.setdefault(result, np.array(data, dtype=np.float64).mean())
             elif result == 'collva_t':
                 self.output.setdefault(result, np.array(data, dtype=np.float64).mean(axis=0))
-            elif result in ['grad_cva', 'grad_collva', 'grad_fva']:
+            elif result in ['grad_cva', 'grad_collva', 'grad_fva', 'grad_legacy_fva']:
                 grad = {}
                 for k, v in data.items():
                     grad[k] = v.astype(np.float64) / self.params['Simulation_Batches']
@@ -939,13 +936,15 @@ class Credit_Monte_Carlo(Calculation):
             final_run = run == self.params['Simulation_Batches'] - 1
 
             # now calculate all the valuation adjustments (if necessary)
-            if 'COLLVA' in params and 'Funding' in shared_mem.t_Credit:
+
+            if params.get('Collateral_Valuation_Adjustment', {}).get(
+                    'Calculate', 'No') == 'Yes' and 'Funding' in shared_mem.t_Credit:
 
                 tensors['collva_t'] = torch.mean(shared_mem.t_Credit['Funding'], axis=1)
                 tensors['collateral'] = shared_mem.t_Credit['Collateral']
                 tensors['collva'] = torch.sum(tensors['collva_t'])
 
-                if params['COLLVA'].get('Gradient', 'No') == 'Yes':
+                if params['Collateral_Valuation_Adjustment'].get('Gradient', 'No') == 'Yes':
                     # calculate all the derivatives of fva
                     sensitivity = SensitivitiesEstimator(tensors['collva'], self.all_var)
 
@@ -954,18 +953,59 @@ class Credit_Monte_Carlo(Calculation):
                         # store the size of the Gradient
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
-            if 'FVA' in params:
+            if 'LegacyFVA' in params:
                 time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
                 mtm_grid = self.time_grid.mtm_time_grid[time_grid]
 
-                funding = get_interest_factor(utils.check_rate_name(params['FVA']['Funding_Cost_Interest_Curve']),
-                                              self.static_ofs, self.stoch_ofs, self.all_tenors)
-                riskfree = get_interest_factor(utils.check_rate_name(params['FVA']['Risk_Free_Curve']),
-                                               self.static_ofs, self.stoch_ofs, self.all_tenors)
+                funding = get_interest_factor(
+                    utils.check_rate_name('{}.FUNDING'.format(params['LegacyFVA']['Funding_Curve'])),
+                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                collateral = get_interest_factor(
+                    utils.check_rate_name('{}.COLLATERAL'.format(params['LegacyFVA']['Collateral_Curve'])),
+                    self.static_ofs, self.stoch_ofs, self.all_tenors)
 
-                if params['FVA'].get('Counterparty'):
-                    survival = get_survival_factor(utils.check_rate_name(params['FVA']['Counterparty']),
-                                                   self.static_ofs, self.stoch_ofs, self.all_tenors)
+                discount_funding = utils.calc_time_grid_curve_rate(
+                    funding, self.time_grid.time_grid[time_grid], shared_mem)
+                discount_collateral = utils.calc_time_grid_curve_rate(
+                    collateral, self.time_grid.time_grid[time_grid], shared_mem)
+                delta_scen_t = np.append(np.diff(mtm_grid), 0).reshape(-1, 1)
+                discount_collateral_t0 = utils.calc_time_grid_curve_rate(collateral, np.zeros((1, 3)), shared_mem)
+
+                Dc_over_f_tT_m1 = torch.expm1(
+                    torch.squeeze(discount_funding.gather_weighted_curve(shared_mem, delta_scen_t) -
+                                  discount_collateral.gather_weighted_curve(shared_mem, delta_scen_t), axis=1)
+                )
+
+                Dc0_T = torch.exp(
+                    -torch.squeeze(
+                        discount_collateral_t0.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1)), axis=0))
+
+                tensors['legacy_fva'] = (tensors['mtm'] * Dc_over_f_tT_m1 * Dc0_T).mean(axis=1).sum()
+
+                if params['LegacyFVA'].get('Gradient', 'No') == 'Yes':
+                    # calculate all the derivatives of fva
+                    sensitivity = SensitivitiesEstimator(tensors['legacy_fva'], self.all_var)
+
+                    if final_run:
+                        output['grad_legacy_fva'] = sensitivity.report_grad()
+                        # store the size of the Gradient
+                        self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
+
+            if params.get('Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
+                time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
+                mtm_grid = self.time_grid.mtm_time_grid[time_grid]
+
+                funding = get_interest_factor(
+                    utils.check_rate_name(params['Funding_Valuation_Adjustment']['Funding_Cost_Interest_Curve']),
+                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                riskfree = get_interest_factor(
+                    utils.check_rate_name(params['Funding_Valuation_Adjustment']['Risk_Free_Curve']),
+                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+
+                if params['Funding_Valuation_Adjustment'].get('Counterparty'):
+                    survival = get_survival_factor(
+                        utils.check_rate_name(params['Funding_Valuation_Adjustment']['Counterparty']),
+                        self.static_ofs, self.stoch_ofs, self.all_tenors)
                     surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), shared_mem)
                     St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
                         shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), axis=0)
@@ -976,7 +1016,7 @@ class Credit_Monte_Carlo(Calculation):
                 DF_rf = torch.squeeze(torch.exp(-deflation.gather_weighted_curve(
                     shared_mem, mtm_grid.reshape(1, -1))), axis=0)
 
-                if params['FVA'].get('Deflate_Stochastically', 'No') == 'Yes':
+                if params['Funding_Valuation_Adjustment'].get('Deflate_Stochastically', 'No') == 'Yes':
                     Vk_plus_ti = torch.relu(tensors['mtm'] * DF_rf)
                     Vk_minus_ti = torch.relu(-tensors['mtm'] * DF_rf)
                     Vk_star_ti_p = (Vk_plus_ti[1:] + Vk_plus_ti[:-1]) / 2
@@ -1002,7 +1042,7 @@ class Credit_Monte_Carlo(Calculation):
 
                 tensors['fva'] = FCA - FBA
 
-                if params['FVA'].get('Gradient', 'No') == 'Yes':
+                if params['Funding_Valuation_Adjustment'].get('Gradient', 'No') == 'Yes':
                     # calculate all the derivatives of fva
                     sensitivity = SensitivitiesEstimator(tensors['fva'], self.all_var)
 
@@ -1011,15 +1051,15 @@ class Credit_Monte_Carlo(Calculation):
                         # store the size of the Gradient
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
-            if 'CVA' in params:
-                discount = get_interest_factor \
-                    (utils.check_rate_name(params['Deflation_Interest_Rate']),
-                     self.static_ofs, self.stoch_ofs, self.all_tenors)
+            if params.get('Credit_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
+                discount = get_interest_factor(
+                    utils.check_rate_name(params['Deflation_Interest_Rate']),
+                    self.static_ofs, self.stoch_ofs, self.all_tenors)
                 survival = get_survival_factor(
-                    utils.check_rate_name(params['CVA']['Counterparty']),
+                    utils.check_rate_name(params['Credit_Valuation_Adjustment']['Counterparty']),
                     self.static_ofs, self.stoch_ofs, self.all_tenors)
                 recovery = get_recovery_rate(
-                    utils.check_rate_name(params['CVA']['Counterparty']), self.all_factors)
+                    utils.check_rate_name(params['Credit_Valuation_Adjustment']['Counterparty']), self.all_factors)
                 # only looks at the first netting set - should be fine . . .
                 time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
 
@@ -1027,7 +1067,7 @@ class Credit_Monte_Carlo(Calculation):
                 mtm_grid = self.time_grid.mtm_time_grid[time_grid]
                 delta_scen_t = np.hstack((0.0, np.diff(mtm_grid)))
 
-                if params['CVA']['Deflate_Stochastically'] == 'Yes':
+                if params['Credit_Valuation_Adjustment']['Deflate_Stochastically'] == 'Yes':
                     zero = utils.calc_time_grid_curve_rate(
                         discount, self.time_grid.time_grid[time_grid], shared_mem)
                     Dt_T = torch.exp(-torch.squeeze(zero.gather_weighted_curve(
@@ -1039,7 +1079,7 @@ class Credit_Monte_Carlo(Calculation):
 
                 pv_exposure = torch.relu(tensors['mtm'] * Dt_T)
 
-                if params['CVA']['Stochastic_Hazard_Rates'] == 'Yes':
+                if params['Credit_Valuation_Adjustment']['Stochastic_Hazard_Rates'] == 'Yes':
                     surv = utils.calc_time_grid_curve_rate(
                         survival, self.time_grid.time_grid[time_grid], shared_mem)
                     St_T = torch.exp(-torch.cumsum(torch.squeeze(surv.gather_weighted_curve(
@@ -1054,7 +1094,7 @@ class Credit_Monte_Carlo(Calculation):
                 tensors['cva'] = (1.0 - recovery) * (
                         0.5 * (pv_exposure[1:] + pv_exposure[:-1]) * prob).mean(axis=1).sum()
 
-                if params['CVA'].get('Gradient', 'No') == 'Yes':
+                if params['Credit_Valuation_Adjustment'].get('Gradient', 'No') == 'Yes':
                     # potentially fetch ir jacobian matrices for base curves
                     base_ir_curves = [x for x in self.stoch_ofs.keys() if
                                       x.type == 'InterestRate' and len(x.name) == 1]
@@ -1075,7 +1115,7 @@ class Credit_Monte_Carlo(Calculation):
                             pass
 
                     # calculate all the derivatives of cva
-                    hessian = params['CVA'].get('Hessian', 'No') == 'Yes'
+                    hessian = params['Credit_Valuation_Adjustment'].get('Hessian', 'No') == 'Yes'
                     sensitivity = SensitivitiesEstimator(
                         tensors['cva'], self.all_var, create_graph=hessian)
 
@@ -1085,7 +1125,7 @@ class Credit_Monte_Carlo(Calculation):
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
                         # now fetch the CDS tenors and calculate the CDS spreads
-                        CDS_tenors = self.params.get('Credit_Valuation_Adjustment', {}).get('CDS_Tenors')
+                        CDS_tenors = params.get('Credit_Valuation_Adjustment', {}).get('CDS_Tenors')
                         if CDS_tenors and recovery < 1.0:
                             # calculate cds sensitivities
                             CDS_rates, shifted_tenor, shifted_curves = utils.calc_cds_rates(
@@ -1160,7 +1200,7 @@ class Base_Revaluation(Calculation):
         # prepare the risk factor output matrix . .
         self.static_var = []
         self.static_values = []
-        self.static_ofs = OrderedDict()
+        self.static_ofs = {}
 
     def update_factors(self, params, base_date):
         dependent_factors, stochastic_factors, implied_factors, reset_dates, settlement_currencies = \
@@ -1169,7 +1209,7 @@ class Base_Revaluation(Calculation):
         # update the time grid
         self.update_time_grid(base_date)
 
-        self.static_factors = OrderedDict()
+        self.static_factors = {}
         for price_factor in dependent_factors:
             try:
                 self.static_factors.setdefault(
@@ -1247,8 +1287,8 @@ class Base_Revaluation(Calculation):
             block = []
             greeks = {}
             for sub_struct in n.sub_structures:
-                data = OrderedDict(parent + [(field, sub_struct.obj.Instrument.field.get(field, 'Root'))
-                                             for field in ['Reference', 'Object']])
+                data = dict(parent + [(field, sub_struct.obj.Instrument.field.get(field, 'Root'))
+                                      for field in ['Reference', 'Object']])
                 format_row(sub_struct.obj, data, sub_struct.obj.Calc_res, greeks)
                 block.append(data)
                 sub_block, sub_greeks = check_prices(
@@ -1260,8 +1300,8 @@ class Base_Revaluation(Calculation):
 
             valuations = [deal.Calc_res for deal in n.dependencies]
             for deal, val in zip(n.dependencies, valuations):
-                data = OrderedDict(parent + [(field, deal.Instrument.field.get(field, '?'))
-                                             for field in ['Reference', 'Object']])
+                data = dict(parent + [(field, deal.Instrument.field.get(field, '?'))
+                                      for field in ['Reference', 'Object']])
                 format_row(deal, data, val, greeks)
                 block.append(data)
 

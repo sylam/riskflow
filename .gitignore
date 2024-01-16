@@ -2,6 +2,8 @@
 /dist/
 /riskflow.egg-info/
 /site/
+/tmp/
 /function_test.py
 /.idea/riskflow.iml
 /interface.py
+/LegacyFVA.py

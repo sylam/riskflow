@@ -1441,7 +1441,12 @@ class StructuredDeal(Deal):
         return pricing.interpolate(net_mtm, shared, time_grid, deal_data, interpolate_grid=False)
 
     def generate(self, shared, time_grid, deal_data):
-        return shared.one.new_zeros(1, 1)
+        return shared.one.new_zeros(1,1)
+
+
+class StructuredDealBreakClause(StructuredDeal):
+    def __init__(self, params, valuation_options):
+        super(StructuredDealBreakClause, self).__init__(params, valuation_options)
 
 
 class SwapInterestDeal(Deal):
@@ -1799,11 +1804,13 @@ class YieldInflationCashflowListDeal(Deal):
         }
 
         inflation_factor, index_factor = get_inflation_index_objects(field['Index'], field['PriceIndex'], all_factors)
-        field_index['IndexMethod'] = utils.CASHFLOW_IndexMethodLookup[inflation_factor.get_reference_name()]
+        reference_name = 'IndexReference{}{}M'.format(
+            self.field['Index_Reference']['Reference_Type'], int(self.field['Index_Reference']['Months_Lag']))
+        field_index['IndexMethod'] = utils.CASHFLOW_IndexMethodLookup[reference_name]
 
         field_index['Cashflows'], field_index['Base_Resets'], field_index['Final_Resets'] = utils.make_index_cashflows(
             base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, self.field['Cashflows'],
-            inflation_factor, index_factor, self.field.get('Settlement_Date'))
+            inflation_factor, index_factor, self.field.get('Settlement_Date'), reference_name)
 
         field_index['SettleCurrency'] = self.field['Currency']
         field_index['Settlement_Date'] = (self.field.get('Settlement_Date') -
@@ -2740,10 +2747,10 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
                                start, start, end, daycount((end - start).days),
                                self.field['Reset_Frequency'], 'ACT_365', None, 0.0, 'No',
                                utils.Percent(
-                                   100.0 * (reset_val / daycount((end - start).days) - self.field['Margin'].amount)
-                                   if start < base_date else 0.0)
+                                   100.0 * (reset_val / daycount((end - start).days) -
+                                            self.field['Floating_Margin'].amount) if start < base_date else 0.0)
                            ]],
-                           'Margin': self.field['Margin']}
+                           'Margin': self.field['Floating_Margin']}
                           for start, end, (_, reset_val) in zip(
                              floating_pay_dates[:-1], floating_pay_dates[1:], self.field['Autocall_Floating'])]
                      }
@@ -2755,6 +2762,7 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
 
 class EquityBarrierOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
+                     'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
@@ -2853,14 +2861,11 @@ class EquityBarrierOption(Deal):
             pv = pricing.pv_european_option(
                 shared, time_grid, deal_data, nominal, moneyness, forward)
         else:
-            eq_zer_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Equity_Zero'], deal_time[:-1], shared)
-            eq_div_curve = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Dividend_Yield'], deal_time[:-1],
-                                                           shared)
-            # need to adjust if there's just 1 timepoint - i.e. base reval
-            if time_grid.mtm_time_grid.size > 1:
-                tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
-            else:
-                tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+            eq_zer_curve = utils.calc_time_grid_curve_rate(
+                deal_data.Factor_dep['Equity_Zero'], deal_time, shared)
+            eq_div_curve = utils.calc_time_grid_curve_rate(
+                deal_data.Factor_dep['Dividend_Yield'], deal_time, shared)
+            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
 
             b = torch.squeeze(
                 eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
@@ -3006,23 +3011,22 @@ class EquitySwapletListDeal(Deal):
         field_index = {}
         self.isQuanto = field['Equity_Currency'] != field['Currency']
 
-        field_index['PrincipleNotShares'] = 1 if self.field['Amount_Type'] == 'Principal' else 0
+        field_index['PrincipleNotShares'] = 1 if self.field.get('Amount_Type', 'Principal') == 'Principal' else 0
         field_index['SettleCurrency'] = self.field['Currency']
 
+        field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
+        field_index['Discount'] = get_discount_factor(
+            field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+        field_index['Equity'] = get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets)
+        field_index['Dividend_Yield'] = get_dividend_rate_factor(
+            field['Equity'], static_offsets, stochastic_offsets, all_tenors)
+        field_index['Equity_Zero'] = get_equity_zero_rate_factor(
+            field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+        field_index['Flows'] = utils.make_equity_swaplet_cashflows(
+            base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, self.field['Cashflows'])
+
         if self.isQuanto:
-            # TODO - Deal with Quanto swaps
-            pass
-        else:
-            field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
-            field_index['Discount'] = get_discount_factor(
-                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-            field_index['Equity'] = get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets)
-            field_index['Dividend_Yield'] = get_dividend_rate_factor(
-                field['Equity'], static_offsets, stochastic_offsets, all_tenors)
-            field_index['Equity_Zero'] = get_equity_zero_rate_factor(
-                field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-            field_index['Flows'] = utils.make_equity_swaplet_cashflows(
-                base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, self.field['Cashflows'])
+            logging.warning("Quanto deal. TODO!!!!!!!")
 
         return field_index
 
@@ -3240,6 +3244,7 @@ class FXOneTouchOption(Deal):
 
 class FXBarrierOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
+                     'Payoff_Currency': ['FxRate'],
                      'Underlying_Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'FX_Volatility': ['FXVol']}
@@ -3274,13 +3279,18 @@ class FXBarrierOption(Deal):
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Payoff_Currency': utils.check_rate_name(self.payoff_ccy),
                  'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency'])}
+
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
         field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
 
-        field_index = {'Currency': get_fx_and_zero_rate_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+        field_index = {
+            'Currency': get_fx_and_zero_rate_factor(
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Payoff_Currency': get_fx_and_zero_rate_factor(
+                field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Discount': get_discount_factor(
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Underlying_Currency': get_fx_and_zero_rate_factor(
@@ -3294,6 +3304,9 @@ class FXBarrierOption(Deal):
             'settlement_currency': 1.0,
             'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])}
 
+        if field['Payoff_Currency'] != field['Currency']:
+            logging.warning("Quanto deal. TODO!!!!!!!")
+
         # discrete barrier monitoring requires adjusting the barrier by 0.58
         # ( -(scipy.special.zetac(0.5)+1)/np.sqrt(2.0*np.pi) ) * sqrt (monitoring freq)
 
@@ -3305,19 +3318,14 @@ class FXBarrierOption(Deal):
         payoff_currency = self.payoff_ccy
 
         curr_curve = utils.calc_time_grid_curve_rate(
-            deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
+            deal_data.Factor_dep['Currency'][1], deal_time, shared)
         und_curr_curve = utils.calc_time_grid_curve_rate(
-            deal_data.Factor_dep['Underlying_Currency'][1], deal_time[:-1], shared)
+            deal_data.Factor_dep['Underlying_Currency'][1], deal_time, shared)
 
-        spot = utils.calc_fx_cross(deal_data.Factor_dep['Underlying_Currency'][0],
-                                   deal_data.Factor_dep['Currency'][0], deal_time, shared)
+        spot = utils.calc_fx_cross(
+            deal_data.Factor_dep['Underlying_Currency'][0], deal_data.Factor_dep['Currency'][0], deal_time, shared)
 
-        # need to adjust if there's just 1 timepoint - i.e. base reval
-        if time_grid.mtm_time_grid.size > 1:
-            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
-        else:
-            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
-
+        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
         b = torch.squeeze(
             curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
             und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
@@ -3674,6 +3682,11 @@ class FXOptionDeal(Deal):
         return mtm
 
 
+class FXEuropeanOption(FXOptionDeal):
+    def __init__(self, params, valuation_options):
+        super(FXEuropeanOption, self).__init__(params, valuation_options)
+    
+
 class DealDefaultSwap(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
@@ -3739,7 +3752,7 @@ class DealDefaultSwap(Deal):
             'Discount': get_discount_factor(
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Name': get_survival_factor(field['Name'], static_offsets, stochastic_offsets, all_tenors),
-            'Recovery_Rate': get_recovery_rate(field['Name'], all_factors)
+            'Recovery_Rate': float(get_recovery_rate(field['Name'], all_factors))
         }
 
         pay_rate = self.field['Pay_Rate'] / 100.0 if isinstance(
@@ -3976,10 +3989,10 @@ class EnergySingleOption(Deal):
                              'Period_End': self.field['Period_End'],
                              'Volume': 1.0,
                              'Fixed_Price': self.field['Strike'],
-                             'Realized_Average': self.field['Realized_Average'],
+                             'Realized_Average': self.field['Realized_Average'] or 0.0,
                              'FX_Period_Start': self.field['FX_Period_Start'],
                              'FX_Period_End': self.field['FX_Period_End'],
-                             'FX_Realized_Average': self.field['FX_Realized_Average']}
+                             'FX_Realized_Average': self.field['FX_Realized_Average'] or 0.0}
 
         field_index = {}
         reference_factor, forward_factor = get_reference_factor_objects(field['Reference_Type'], all_factors)

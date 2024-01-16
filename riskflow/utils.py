@@ -1211,15 +1211,20 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_p
         stddev = vol.clamp(min=1e-5) * np.sqrt(tenor)
         strike = max(X, 1e-5) if isinstance(X, float) else X.clamp(min=1e-5)
     else:
-        guard = vol.new_tensor(tenor > 0.0, dtype=torch.bool)
-        tau = np.sqrt(tenor.clip(0.0, np.inf))
+        tenor_np = tenor.clip(min=0.0)
+        tau_key = ('tenor', tenor_np.shape + tuple(tenor_np.flatten()))
+        if tau_key not in shared.t_Buffer:
+            shared.t_Buffer[tau_key] = vol.new(np.sqrt(tenor_np))
+
+        tau = shared.t_Buffer[tau_key]
+        guard = tau > 0.0
 
         if len(guard.shape) > 1:
             guard = torch.unsqueeze(guard, axis=2)
-            sigma = vol * vol.new(np.expand_dims(tau, 2))
+            sigma = vol * torch.unsqueeze(tau, axis=2)
         else:
             guard = torch.unsqueeze(guard, axis=1)
-            sigma = vol * vol.new(tau.reshape(-1, 1))
+            sigma = vol * tau.reshape(-1, 1)
 
         stddev = sigma.clamp(min=1e-5)
         strike = X
@@ -2188,7 +2193,7 @@ def generate_float_cashflows(reference_date, time_grid, reset_dates, nominal, am
         else:
             reset_days = pd.date_range(reference_date + pd.DateOffset(days=int(cashflow[CASHFLOW_INDEX_Start_Day])),
                                        reference_date + pd.DateOffset(days=int(cashflow[CASHFLOW_INDEX_End_Day])),
-                                       freq=reset_frequency, closed='left')
+                                       freq=reset_frequency, inclusive='left')
             reset_tenor = reset_frequency if next(iter(reset_tenor.kwds.values())) == 0.0 else reset_tenor
 
         for reset_day in reset_days:
@@ -2272,18 +2277,18 @@ def make_fixed_cashflows(reference_date, position, cashflows, settlement_date):
 def make_sampling_data(reference_date, time_grid, samples):
     all_resets = []
     reset_scenario_offsets = []
-    D = float(sum([x[2] for x in samples]))
+    D = float(sum([x[-1] for x in samples]))
 
     for sample in sorted(samples):
         Reset_Day = (sample[0] - reference_date).days
         Start_Day = Reset_Day
         End_Day = Reset_Day
-        Weight = sample[2] / D
+        Weight = sample[-1] / D
         Time_Grid, Scenario = time_grid.get_scenario_offset(Reset_Day)
         # only add a reset if its in the past
         all_resets.append(
             [Time_Grid, Reset_Day, -1, Start_Day, End_Day, Weight,
-             sample[1] if sample[0] < reference_date else 0.0, 0.0])
+             sample[-2] if sample[0] < reference_date else 0.0, 0.0])
         reset_scenario_offsets.append(Scenario)
 
     return TensorResets(all_resets, reset_scenario_offsets)
@@ -2388,8 +2393,8 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
     return cashflows
 
 
-def make_index_cashflows(base_date, time_grid, position, cashflows, price_index, index_rate, settlement_date,
-                         isBond=True):
+def make_index_cashflows(base_date, time_grid, position, cashflows, price_index, index_rate,
+                         settlement_date, reference_name, isBond=True):
     """
     Generates a vector of index-linked cashflows from a data source given the price_index and index_rate price factors.
     """
@@ -2479,10 +2484,10 @@ def make_index_cashflows(base_date, time_grid, position, cashflows, price_index,
                  Pay_Date if settlement_date is None else -(settlement_date - base_date).days])
 
             if isBond:
-                locals()[price_index.param['Reference_Name']](base_reference_date, base_date,
-                                                              base_resets, base_scenario_offsets)
-                locals()[price_index.param['Reference_Name']](final_reference_date, base_date,
-                                                              final_resets, final_scenario_offsets)
+                locals()[reference_name](
+                    base_reference_date, base_date, base_resets, base_scenario_offsets)
+                locals()[reference_name](
+                    final_reference_date, base_date, final_resets, final_scenario_offsets)
 
     # set the cashflows
     cashflows = TensorCashFlows(sorted(cash), cashflow_reset_offsets)
@@ -2508,7 +2513,7 @@ def make_index_cashflows(base_date, time_grid, position, cashflows, price_index,
         for eval_time in time_grid.time_grid[:, TIME_GRID_MTM]:
             actual_time = base_date + pd.DateOffset(days=eval_time)
 
-            locals()[price_index.param['Reference_Name']](
+            locals()[reference_name](
                 actual_time, index_rate.param['Last_Period_Start'], time_resets, time_scenario_offsets)
 
         cashflows.set_resets(time_resets, time_scenario_offsets)
@@ -2616,7 +2621,7 @@ def make_energy_cashflows(reference_date, time_grid, position, cashflows, refere
                 Time_Grid, Scenario = time_grid.get_scenario_offset(Start_Day)
                 # only add a reset if its in the past
                 r.append([Time_Grid, Reset_Day, -1, Start_Day, End_Day, Weight,
-                          cashflow['Realized_Average'], cashflow['FX_Realized_Average']])
+                          cashflow['Realized_Average'] or 0.0, cashflow['FX_Realized_Average'] or 0.0])
                 reset_scenario_offsets.append(Scenario)
 
             # attach the reset_offsets to the cashflow

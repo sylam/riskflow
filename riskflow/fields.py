@@ -567,7 +567,7 @@ mapping = {
 										'Strike_Price', 'Option_On_Forward', 'Settlement_Style', 'Option_Style', 'Payoff_Currency',
 										'Payoff_Type', 'Equity', 'Equity_Volatility', 'Barrier', 'Price_Fixing', 'Autocall_Thresholds',
                                         'Autocall_Coupons', 'Barrier_date'],
-            'QEDI_CustomSwap.Fields': ['Forecast_Rate', 'Floating_Margin', 'Reset_Frequency'],
+            'QEDI_CustomSwap.Fields': ['Forecast_Rate', 'Floating_Margin', 'Reset_Frequency', 'Autocall_Floating'],
             'EquitySwapLeg.Fields': ['Accrual_Calendars', 'Adjustment_Method', 'Dividend_Timing', 'Equity',
                                      'Equity_Volatility', 'Equity_Known_Prices', 'Effective_Date', 'First_Coupon_Date',
                                      'Known_Dividends', 'Maturity_Date', 'Payment_Calendars', 'Payment_Frequency',
@@ -810,7 +810,17 @@ mapping = {
                                 'DateValueList',
                             'col_names':
                                 ['Date', 'Value']
-                            },                            
+                            },
+            'Autocall_Floating': {'widget': 'Table', 'description': 'Autocall Floating', 'value': 'null',
+                            'sub_types':
+                                [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                                 {'type': 'numeric', 'numericFormat': num_format['currency']}
+                                 ],
+                            'obj':
+                                'DateValueList',
+                            'col_names':
+                                ['Date', 'Value']
+                            },                                               
             'Autocall_Coupons': {'widget': 'Table', 'description': 'Autocall Coupons', 'value': 'null',
                             'sub_types':
                                 [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},

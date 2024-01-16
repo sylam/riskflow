@@ -273,13 +273,13 @@ if __name__ == '__main__':
              os.path.join('S:\\Riskflow\\TEST', folder),
              os.path.join('N:\\Archive', folder)])
 
-    # path_json = paths['CVA']
     path_json = paths['PFE']
+    # path_json = paths['PFE']
     # path = paths['CVA_UAT']
     # path = paths['CVA']
     path = paths['PFE']
 
-    rundate = '2023-10-06'
+    rundate = '2023-11-29'
     # rundate = '2023-05-31'
     # calibrate_PFE(path, rundate)
     # bootstrap(path_json, '', reuse_cal=True)
@@ -326,12 +326,12 @@ if __name__ == '__main__':
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_CS_Int_London_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Goldman_Sachs_Int_*.json')):
-    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
+    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Investec_Life_Limited_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Deutsche_Bank_AG_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris__*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_AutoX__Pty__Ltd_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_FVA_CrB_IBL_ICIB_BSF_ED_HQLA_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Redefine_Properties_Limited*.json')):
@@ -340,34 +340,6 @@ if __name__ == '__main__':
         # for json in glob.glob(os.path.join(path_json, rundate, '*otus*.json')):
         cx.load_json(json, compress=True)
 
-        try:
-            sofr = cx.current_cfg.params['Price Factors']['InterestRate.USD-SOFR']['Curve'].array
-            cas = cx.current_cfg.params['Price Factors']['InterestRate.USD-SOFR.USD-SOFR3M_CAS']['Curve'].array
-            cas_curve = list(zip(sofr[:, 0], sofr[:, 1] + np.interp(sofr[:, 0], *cas.T)))
-
-            cx.current_cfg.params['Price Factors']['InterestRate.USD-SOFR-CAS'] = {
-                'Day_Count': 'ACT_365',
-                'Currency': 'USD',
-                'Curve': rf.utils.Curve([], cas_curve),
-                'Sub_Type': 'None',
-                'Property_Aliases': None,
-                'Interpolation': 'Hermite'}
-
-            # check if we have a sofr model for usd
-            if 'PCAInterestRateModel.USD-SOFR-CAS' not in cx.current_cfg.params['Price Models']:
-                cx.current_cfg.params['Price Models'][
-                    'PCAInterestRateModel.USD-SOFR-CAS'] = cx.current_cfg.params['Price Models'][
-                    'PCAInterestRateModel.USD-SOFR']
-
-            if 'GBMAssetPriceModel.EUR_SX5E' not in cx.current_cfg.params['Price Models']:
-                cx.current_cfg.params['Price Models']['GBMAssetPriceModel.EUR_SX5E'] = cx.current_cfg.params[
-                    'Price Models']['GBMAssetPriceModel.EUR_SX5EEX']
-            if 'EquityPriceVol.USD_SPX.ZAR' not in cx.current_cfg.params['Price Factors']:
-                cx.current_cfg.params['Price Factors']['EquityPriceVol.USD_SPX.ZAR'] = cx.current_cfg.params[
-                    'Price Factors']['EquityPriceVol.USD_SPX.USD']
-        except:
-            pass
-
         # if 'HullWhite2FactorModelParameters.USD-OIS' not in cx.current_cfg.params['Price Factors']:
         #     cx.current_cfg.params['Price Factors']['HullWhite2FactorModelParameters.USD-OIS'] = cx.current_cfg.params[
         #         'Price Factors']['HullWhite2FactorModelParameters.USD-SOFR']
@@ -375,12 +347,6 @@ if __name__ == '__main__':
         if not cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             print('no children for crb {} - skipping'.format(json))
             continue
-
-        # Update any missing models
-        try:
-            cx.current_cfg.params['Price Factors'].update(md.params['Price Factors'])
-        except:
-            pass
 
         # grab the netting set
         ns = cx.current_cfg.deals['Deals']['Children'][0]['Instrument']
@@ -401,12 +367,13 @@ if __name__ == '__main__':
             'Random_Seed': '1',
             'Generate_Cashflows': 'Yes',
             'Currency': 'ZAR',
-            'Antithetic': 'Yes',
+            # 'Antithetic': 'Yes',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
-            'Batch_Size': 1024,
+            'Batch_Size': 512,
             'Simulation_Batches': 1,
-            # 'COLLVA': {'Gradient': 'Yes'},
-            # 'CVA': {'Gradient': 'Yes', 'CDS_Tenors': [0.5, 1, 3, 5, 10], 'Hessian': 'No'}
+            # 'Collateral_Valuation_Adjustment': {'Calculate': 'Yes', 'Gradient': 'Yes'},
+            # 'Credit_Valuation_Adjustment': {'Calculate': 'Yes', 'Gradient': 'Yes',
+            # 'CDS_Tenors': [0.5, 1, 3, 5, 10], 'Hessian': 'No'}
         }
 
         if ns.field['Collateralized'] == 'True':
@@ -417,9 +384,9 @@ if __name__ == '__main__':
         for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             # if i['Instrument'].field['Reference'] != 'USDIBLIX12DIGIPUT18189230%20280629':
             # if i['Instrument'].field['Reference'] != '137335521':
-            # if False and not i['Instrument'].field['Object'].startswith('QEDI'):
-            # if not str(i['Instrument'].field['Reference']).startswith('143248847'):
-            if not str(i['Instrument'].field['Reference']).startswith('132208115'):
+            # if i['Instrument'].field['Object'].startswith('QEDI'):
+            if not str(i['Instrument'].field['Reference']).startswith('139403713'):
+            # if not str(i['Instrument'].field['Reference']).startswith('132208115'):
                 i['Ignore'] = 'True'
             else:
                 i['Ignore'] = 'False'
@@ -432,7 +399,7 @@ if __name__ == '__main__':
         for i in range(3):
             # cx.stress_config(['InterestRate', 'InflationRate'])
             calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
-            print(i, 'stress', out['Results']['cva'])
+            # print(i, 'stress', out['Results']['cva'])
 
             delta_surv = out['Results']['grad_cva'].loc[
                 ('SurvivalProb.ACWA_Power_SolarReserve_Redstone_So')].reset_index()[

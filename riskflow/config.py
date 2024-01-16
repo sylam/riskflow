@@ -618,22 +618,30 @@ class Context(object):
                 dependent_factor_tenors[reporting_factor] = reset_dates
 
             # check if we need to fetch survival data for CVA
-            if options.get('CVA'):
+            if options.get('Credit_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
                 dependent_factors.update(get_rates(
-                    utils.Factor('SurvivalProb', utils.check_rate_name(options['CVA']['Counterparty'])),
+                    utils.Factor('SurvivalProb', utils.check_rate_name(
+                        options['Credit_Valuation_Adjustment']['Counterparty'])),
                     {})
                 )
             # check if we need to fetch curve data for FVA
-            if options.get('FVA'):
+            if options.get('Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
                 # add curves
-                add_interest_rate(options['FVA']['Funding_Cost_Interest_Curve'])
-                add_interest_rate(options['FVA']['Risk_Free_Curve'])
+                add_interest_rate(options['Funding_Valuation_Adjustment']['Funding_Cost_Interest_Curve'])
+                add_interest_rate(options['Funding_Valuation_Adjustment']['Risk_Free_Curve'])
 
                 # need to weight the FVA by the survival prob of the counterparty (if defined)
-                if 'Counterparty' in options['FVA']:
+                if 'Counterparty' in options['Funding_Valuation_Adjustment']:
                     dependent_factors.update(get_rates(
-                        utils.Factor('SurvivalProb', utils.check_rate_name(options['FVA']['Counterparty'])), {})
+                        utils.Factor('SurvivalProb', utils.check_rate_name(
+                            options['Funding_Valuation_Adjustment']['Counterparty'])), {})
                     )
+            # legacy FVA calculation (need to remove once done)
+            if options.get('LegacyFVA'):
+                # add curves
+                add_interest_rate('{}.FUNDING'.format(options['LegacyFVA']['Funding_Curve']))
+                add_interest_rate('{}.COLLATERAL'.format(options['LegacyFVA']['Collateral_Curve']))
+
             # Check deflation
             if options.get('Deflation_Interest_Rate'):
                 add_interest_rate(options['Deflation_Interest_Rate'])
@@ -759,7 +767,7 @@ class Context(object):
             for col in self.archive.columns:
                 self.archive_columns.setdefault(col.split(',')[0], []).append(col)
 
-    def read_json(self, filename):
+    def read_json(self, filedata):
 
         def as_internal(dct):
             if '.Curve' in dct:
@@ -791,10 +799,15 @@ class Context(object):
                 return ModelParams((dct['.ModelParams']['modeldefaults'], dct['.ModelParams']['modelfilters']))
             return dct
 
-        with open(filename, 'rt') as f:
-            self.last_file_loaded = filename
-            self.file_ref = os.path.splitext(os.path.split(self.last_file_loaded)[-1])[0]
-            data = json.load(f, object_hook=as_internal)
+        if isinstance(filedata, tuple):
+            self.last_file_loaded = filedata[1]
+            self.file_ref = filedata[1]
+            data = json.loads(filedata[0], object_hook=as_internal)
+        else:
+            with open(filedata, 'rt') as f:
+                self.last_file_loaded = filedata
+                self.file_ref = os.path.splitext(os.path.split(self.last_file_loaded)[-1])[0]
+                data = json.load(f, object_hook=as_internal)
 
         return data
 

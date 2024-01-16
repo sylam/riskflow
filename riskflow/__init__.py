@@ -134,7 +134,7 @@ def run_baseval(context, prec=torch.float64, overrides=None):
     return calc, out
 
 
-def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, CollVA=False, LegacyFVA=False):
+def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False):
     """
     Runs a credit monte carlo calculation on the provided context
     :param context: a Context object
@@ -148,9 +148,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
     from .calculation import construct_calculation
     calc_params = context.deals.get('Calculation',
                                     {'Base_Date': context.params['System Parameters']['Base_Date'],
-                                     'Base_Time_Grid': '0d 2d 1w(1w) 1m(1m) 3m(3m)',
-                                     'Deflation_Interest_Rate': 'ZAR-SWAP',
-                                     'Currency': 'ZAR'})
+                                     'Base_Time_Grid': '0d 2d 1w(1w) 1m(1m) 3m(3m)'})
 
     # check if the gpu is available
     if torch.cuda.is_available():
@@ -164,33 +162,43 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
     time_grid = str(calc_params['Base_Time_Grid'])
 
-    params_mc = {'calc_name': ('cmc',), 'Time_grid': time_grid, 'Run_Date': rundate,
+    params_mc = {'Time_grid': time_grid, 'Run_Date': rundate,
                  'Tenor_Offset': 0.0, 'Batch_Size': 1024, 'Simulation_Batches': 1}
+
     params_mc.update(calc_params)
 
-    if CVA:
-        # defaults
-        context.params['Price Factors']['SurvivalProb.DEFAULT'] = {
-            'Recovery_Rate': 0.5,
-            'Curve': utils.Curve(
-                [], [[0.0, 0.0], [.5, .01], [1, .02], [3, .07], [5, .15], [10, .35], [20, .71], [30, 1.0]]),
-            'Property_Aliases': None}
-        default_cva = {'Deflate_Stochastically': 'Yes', 'Stochastic_Hazard_Rates': 'No',
-                       'Counterparty': 'DEFAULT', 'Gradient': 'No', 'Hessian': 'No'}
-        cva_sect = context.deals.get('Calculation', {'Credit_Valuation_Adjustment': default_cva}).get(
-            'Credit_Valuation_Adjustment', default_cva)
-        params_mc['CVA'] = cva_sect
+    if overrides is not None:
+        update_dict(params_mc, overrides)
 
-    if FVA:
-        default_fva = {'Funding_Interest_Curve': 'ZAR-SWAP.FUNDING',
-                       'Risk_Free_Curve': 'ZAR-SWAP.OIS',
-                       'Stochastic_Funding': 'Yes',
-                       'Gradient': 'No'}
-        fva_sect = context.deals.get('Calculation', {'Funding_Valuation_Adjustment': default_fva}).get(
-            'Funding_Valuation_Adjustment', default_fva)
-        params_mc['FVA'] = fva_sect
+    if params_mc.get('Credit_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
+        cva_sect = params_mc['Credit_Valuation_Adjustment']
+        if cva_sect.get('CDS_Tenors'):
+            # add extra tenors to the survival probability curve and interpolate it to calculate CDS rates
+            survivalprob = context.params['Price Factors']['SurvivalProb.{}'.format(cva_sect['Counterparty'])]
+            daycount = lambda time_in_days: utils.get_day_count_accrual(
+                params_mc['Base_Date'], time_in_days, utils.DAYCOUNT_ACT365)
+            to_add = [daycount((x - params_mc['Base_Date']).days) for x in
+                      utils.cds_dates(params_mc['Base_Date'], max(cva_sect.get('CDS_Tenors')) * 12)]
+            new_terms = np.union1d(to_add, survivalprob['Curve'].array[:, 0])
+            survivalprob['Curve'].array = np.array(
+                list(zip(new_terms, np.interp(new_terms, *survivalprob['Curve'].array.T))))
 
-    if CollVA and 'Collateral_Valuation_Adjustment' in context.deals['Calculation']:
+    if 'LegacyFVA' in params_mc:
+        legacy_fva_sect = params_mc['LegacyFVA']
+        # get the agreement currency
+        calc_currency = calc_params['Currency']
+        collateral_curve = legacy_fva_sect['Collateral_Curve']
+        funding_curve = legacy_fva_sect['Funding_Curve']
+
+        collateral_curve = '{}.COLLATERAL'.format(collateral_curve)
+        context.params['Price Factors']['InterestRate.{}'.format(collateral_curve)] = makeflatcurve(
+            calc_currency, legacy_fva_sect['Collateral_Spread'])
+
+        funding_curve = '{}.FUNDING'.format(funding_curve)
+        context.params['Price Factors']['InterestRate.{}'.format(funding_curve)] = makeflatcurve(
+            calc_currency, legacy_fva_sect['Funding_Spread'])
+
+    if params_mc.get('Collateral_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
         # setup collva calc
         ns = context.deals['Deals']['Children'][0]['Instrument'].field
         collva_sect = context.deals['Calculation']['Collateral_Valuation_Adjustment']
@@ -223,23 +231,6 @@ def run_cmc(context, prec=torch.float32, overrides=None, CVA=False, FVA=False, C
         elif len(ns['Collateral_Assets']['Cash_Collateral']) > 1:
             # make sure we just take the first definition
             ns['Collateral_Assets']['Cash_Collateral'] = [ns['Collateral_Assets']['Cash_Collateral'][0]]
-
-        params_mc['COLLVA'] = collva_sect
-
-    if overrides is not None:
-        update_dict(params_mc, overrides)
-
-    # check sensitivity to CDS tenors - may be overridden above
-    if CVA and cva_sect.get('CDS_Tenors'):
-        # add extra tenors to the survival probability curve and interpolate it to calculate CDS rates
-        survivalprob = context.params['Price Factors']['SurvivalProb.{}'.format(cva_sect['Counterparty'])]
-        daycount = lambda time_in_days: utils.get_day_count_accrual(
-            params_mc['Base_Date'], time_in_days, utils.DAYCOUNT_ACT365)
-        to_add = [daycount((x - params_mc['Base_Date']).days) for x in
-                  utils.cds_dates(params_mc['Base_Date'], max(cva_sect.get('CDS_Tenors')) * 12)]
-        new_terms = np.union1d(to_add, survivalprob['Curve'].array[:, 0])
-        survivalprob['Curve'].array = np.array(
-            list(zip(new_terms, np.interp(new_terms, *survivalprob['Curve'].array.T))))
 
     calc = construct_calculation('Credit_Monte_Carlo', context, device=device, prec=prec)
     if LegacyFVA:
@@ -368,13 +359,7 @@ class Context:
             raise Exception('Unknown Calculation {}'.format(self.current_cfg.deals['Calculation']['Object']))
 
     def Credit_Monte_Carlo(self, overrides=None):
-        FVA = self.current_cfg.deals['Calculation'].get(
-            'Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes'
-        CollVA = self.current_cfg.deals['Calculation'].get(
-            'Collateral_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes'
-        CVA = self.current_cfg.deals['Calculation'].get(
-            'Credit_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes'
-        return run_cmc(self.current_cfg, overrides=overrides, CVA=CVA, FVA=FVA, CollVA=CollVA)
+        return run_cmc(self.current_cfg, overrides=overrides)
 
     def Base_Valuation(self, overrides=None):
         return run_baseval(self.current_cfg, overrides=overrides)

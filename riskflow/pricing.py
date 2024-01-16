@@ -192,7 +192,7 @@ def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
         return mtm
 
 
-def getbarrierpayoff(direction, eta, phi, strike, barrier):
+def getbarrierpayoff(direction, eta, phi, strike, H):
     '''
     Function to generate the barrier payoff function using these formulae:
     (import sympy with the necessary symbols to see how to derive the code below)
@@ -214,7 +214,7 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
     This is for single Barrier options and based on Merton, Reiner and Rubinstein.
     '''
 
-    def barrier_option(sigma, expiry, cash_rebate, b, r, spot):
+    def barrier_option(sigma, expiry, cash_rebate, b, r, spot, barrier):
 
         sigma2 = sigma * sigma
         vol = sigma * torch.sqrt(expiry)
@@ -232,16 +232,16 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
         expiry_r = expiry * r
 
         if direction == BARRIER_IN:
-            if ((phi == OPTION_CALL and eta == BARRIER_UP and strike > barrier) or
-                    (phi == OPTION_PUT and eta == BARRIER_DOWN and strike <= barrier)):
+            if ((phi == OPTION_CALL and eta == BARRIER_UP and strike > H) or
+                    (phi == OPTION_PUT and eta == BARRIER_DOWN and strike <= H)):
                 # A+E
                 return (cash_rebate * (
                         (0.5 * torch.erfc(eta_scale * (-vol + y2)) - 1.0) * torch.exp(2 * log_bar * mu) +
                         0.5 * torch.erfc(eta_scale * (vol - x2))) - phi * (
                                 spot * (0.5 * torch.erfc(phi_scale * x1) - 1.0) * torch.exp(b * expiry) +
                                 0.5 * strike * torch.erfc(phi_scale * (vol - x1)))) * torch.exp(-expiry_r)
-            elif ((phi == OPTION_CALL and eta == BARRIER_UP and strike <= barrier) or
-                  (phi == OPTION_PUT and eta == BARRIER_DOWN and strike > barrier)):
+            elif ((phi == OPTION_CALL and eta == BARRIER_UP and strike <= H) or
+                  (phi == OPTION_PUT and eta == BARRIER_DOWN and strike > H)):
                 # B-C+D+E
                 return (cash_rebate * (
                         (0.5 * torch.erfc(eta_scale * (-vol + y2)) - 1.0) * torch.exp(2 * log_bar * mu) +
@@ -255,8 +255,8 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
                             -expiry_r + 2 * log_bar * mu) * torch.erfc(eta_scale * (vol - y1)) -
                                 0.5 * strike * torch.exp(-expiry_r + 2 * log_bar * mu) * torch.erfc(
                             eta_scale * (vol - y2))) * torch.exp(expiry_r)) * torch.exp(-expiry_r)
-            elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike > barrier) or
-                  (phi == OPTION_CALL and eta == BARRIER_DOWN and strike <= barrier)):
+            elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike > H) or
+                  (phi == OPTION_CALL and eta == BARRIER_DOWN and strike <= H)):
                 # A-B+D+E
                 return (cash_rebate * ((0.5 * torch.erfc(eta_scale * (-vol + y2)) - 1.0) * torch.exp(
                     2 * log_bar * mu) + 0.5 * torch.erfc(eta_scale * (vol - x2))) - phi * (
@@ -268,8 +268,8 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
                     phi_scale * (vol - x1))) + phi * (spot * (0.5 * torch.erfc(
                     phi_scale * x2) - 1.0) * torch.exp(b * expiry) + 0.5 * strike * torch.erfc(
                     phi_scale * (vol - x2)))) * torch.exp(-expiry_r)
-            elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike <= barrier) or
-                  (phi == OPTION_CALL and eta == BARRIER_DOWN and strike > barrier)):
+            elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike <= H) or
+                  (phi == OPTION_CALL and eta == BARRIER_DOWN and strike > H)):
                 # C+ E
                 return (cash_rebate * ((0.5 * torch.erfc(eta_scale * (-vol + y2)) - 1.0) * torch.exp(
                     2 * log_bar * mu) + 0.5 * torch.erfc(eta_scale * (vol - x2))) - phi * (spot * (
@@ -277,14 +277,14 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
                         mu + 1)) + 0.5 * strike * torch.exp(-expiry_r + 2 * log_bar * mu) * torch.erfc(eta_scale * (
                         vol - y1))) * torch.exp(expiry_r)) * torch.exp(-expiry_r)
         else:
-            if ((phi == OPTION_CALL and eta == BARRIER_UP and strike > barrier) or
-                    (phi == OPTION_PUT and eta == BARRIER_DOWN and strike <= barrier)):
+            if ((phi == OPTION_CALL and eta == BARRIER_UP and strike > H) or
+                    (phi == OPTION_PUT and eta == BARRIER_DOWN and strike <= H)):
                 # F
                 return -cash_rebate * ((0.5 * torch.erfc(eta_scale * z) - 1.0) * torch.exp(2 * lam * log_bar) -
                                        0.5 * torch.erfc(eta_scale * (2 * lam * vol - z))) * torch.exp(
                     -log_bar * (lam - mu))
-            elif ((phi == OPTION_CALL and eta == BARRIER_UP and strike <= barrier) or
-                  (phi == OPTION_PUT and eta == BARRIER_DOWN and strike > barrier)):
+            elif ((phi == OPTION_CALL and eta == BARRIER_UP and strike <= H) or
+                  (phi == OPTION_PUT and eta == BARRIER_DOWN and strike > H)):
                 # A - B + C - D + F
                 return (-cash_rebate * ((0.5 * torch.erfc(eta_scale * z) - 1.0) * torch.exp(2 * lam * log_bar)
                                         - 0.5 * torch.erfc(eta_scale * (2 * lam * vol - z))) * torch.exp(expiry_r)
@@ -300,8 +300,8 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
                                 0.5 * torch.erfc(phi_scale * x2) - 1.0) * torch.exp(b * expiry) - 0.5 * strike *
                                torch.erfc(phi_scale * (vol - x1)) + 0.5 * strike * torch.erfc(phi_scale * (vol - x2)))
                         * torch.exp(log_bar * (lam - mu))) * torch.exp(-expiry_r - log_bar * (lam - mu))
-            elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike > barrier) or
-                  (phi == OPTION_CALL and eta == BARRIER_DOWN and strike <= barrier)):
+            elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike > H) or
+                  (phi == OPTION_CALL and eta == BARRIER_DOWN and strike <= H)):
                 # B - D + F
                 return (-cash_rebate * ((0.5 * torch.erfc(eta_scale * z) - 1.0) * torch.exp(2 * lam * log_bar)
                                         - 0.5 * torch.erfc(eta_scale * (2 * lam * vol - z))) * torch.exp(expiry_r) +
@@ -314,8 +314,8 @@ def getbarrierpayoff(direction, eta, phi, strike, barrier):
                             b * expiry) + 0.5 * strike * torch.erfc(phi_scale * (vol - x2))) * torch.exp(
                             log_bar * (lam - mu))) * torch.exp(
                     -expiry_r - log_bar * (lam - mu))
-            elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike <= barrier) or
-                  (phi == OPTION_CALL and eta == BARRIER_DOWN and strike > barrier)):
+            elif ((phi == OPTION_PUT and eta == BARRIER_UP and strike <= H) or
+                  (phi == OPTION_CALL and eta == BARRIER_DOWN and strike > H)):
                 # A-C+F
                 return (-cash_rebate * ((0.5 * torch.erfc(eta_scale * z) - 1.0) * torch.exp(2 * lam * log_bar)
                                         - 0.5 * torch.erfc(eta_scale * (2 * lam * vol - z))) * torch.exp(expiry_r) +
@@ -423,6 +423,23 @@ def getpartialbarrierpayoff(isKnockIn, eta, phi, spot, strike, barrier, startBar
         return pv
 
 
+def calc_vol_adjustment(factor_dep, moneyness, expiry, vols, shared):
+    # check if this is a compo or quanto deal
+
+    atm_moneyness = torch.ones_like(moneyness)
+    fx_vols = utils.calc_time_grid_vol_rate(
+        factor_dep['FXVol'], atm_moneyness, expiry, shared)
+
+    if 'QuantoImpliedCorrelation' in factor_dep:
+        # quanto fx deal
+        atm_vol = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], atm_moneyness, expiry, shared)
+        return {'vol': vols, 'b_adj': -atm_vol * fx_vols * factor_dep['QuantoImpliedCorrelation']}
+    else:
+        compo_vols = torch.sqrt(
+            fx_vols * fx_vols + 2.0 * fx_vols * vols * factor_dep['CompoImpliedCorrelation'] + vols * vols)
+        return {'vol': compo_vols, 'b_adj': 0.0}
+
+
 def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
                       tau, payoff_currency, invert_moneyness=False, use_forwards=False):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
@@ -440,85 +457,81 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
     cash_rebate = deal_data.Instrument.field['Cash_Rebate']
 
     # get the zero curve
-    discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time[:-1], shared)
+    discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
 
     expiry = daycount_fn(tau)
-    need_spot_at_expiry = deal_time.shape[0] - expiry.size
-    spot_prior, spot_at = torch.split(spot, (expiry.size, need_spot_at_expiry))
     # cache the expiry tenors
     expiry_years_key = ('Expiry_Years', tuple(expiry))
     if expiry_years_key not in factor_dep:
         factor_dep[expiry_years_key] = spot.new(expiry.reshape(-1, 1))
 
     expiry_years = factor_dep[expiry_years_key]
+    forward = spot * torch.exp(b * expiry_years)
 
     if use_forwards:
-        forward = spot_prior * torch.exp(b * expiry_years)
         moneyness = strike / forward if invert_moneyness else forward / strike
     else:
-        moneyness = strike / spot_prior if invert_moneyness else spot_prior / strike
+        moneyness = strike / spot if invert_moneyness else spot / strike
 
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
-    if factor_dep['Barrier_Monitoring']:
-        adj_barrier = barrier * torch.exp(
-            (2.0 * (barrier > spot[0][0]).type(shared.one.dtype) - 1.0) * sigma * factor_dep['Barrier_Monitoring'])
-    else:
-        adj_barrier = barrier
+    if factor_dep['Payoff_Currency'] != factor_dep['Currency']:
+        # need quanto/compo adjustments
+        adj = calc_vol_adjustment(factor_dep, moneyness, expiry, sigma, shared)
+        sigma = adj['vol']
+        b = b + adj['b_adj']
 
-    # get the payoff function - should be adj_barrier not barrier - TODO
     barrierOption = getbarrierpayoff(direction, eta, phi, strike, barrier)
+    r = torch.squeeze(discounts.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
-    r = torch.squeeze(discounts.gather_weighted_curve(
-        shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+    mtm_list = []
+    prev_touched = 0.0
 
-    raw_payoff = barrierOption(
-        sigma, expiry_years, cash_rebate / nominal, b, r, spot_prior)
+    for index, (raw_sig, exp, b_t, r_t, s_t, f_t, cash_index) in enumerate(zip(
+            sigma, expiry_years, b, r, spot, forward, deal_data.Time_dep.deal_time_grid)):
 
-    # check if this was an out barrier and there was a rebate payable (in which case, clamp the payoff)
-    if direction == BARRIER_OUT and cash_rebate:
-        raw_payoff = raw_payoff.clamp(max=cash_rebate / nominal)
+        # barrier options are very sensitive to vols - so we clamp them to 5%
+        sig = raw_sig.clamp(min=0.05)
 
-    barrier_payoff = buy_or_sell * nominal * raw_payoff
-
-    if need_spot_at_expiry:
-        # work out barrier
         if eta == BARRIER_UP:
-            touched = (spot[:-1] < barrier) & (spot[1:] > barrier)
+            touched = (prev_touched + (s_t > barrier)).clip(max=1.0)
         else:
-            touched = (spot[:-1] > barrier) & (spot[1:] < barrier)
+            touched = (prev_touched + (s_t < barrier)).clip(max=1.0)
 
-        # barrier payoff
-        barrier_touched = F.pad((torch.cumsum(touched, axis=0) > 0).type(shared.one.dtype), [0, 0, 1, 0])
-        first_touch = barrier_touched[1:] - barrier_touched[:-1]
-        # final payoff
-        payoff_at = buy_or_sell * torch.relu(phi * (spot_at - strike))
+        if (1 - touched).any() and expiry[index] > 0:
+            if factor_dep['Barrier_Monitoring']:
+                barrier_t = barrier * torch.exp(
+                    (2.0 * (barrier > s_t) - 1.0) * sig * factor_dep['Barrier_Monitoring'])
+            else:
+                barrier_t = barrier
+
+            payoff = buy_or_sell * nominal * barrierOption(
+                sig, exp, cash_rebate / nominal, b_t, r_t, s_t, barrier_t)
+        else:
+            payoff = 0.0
+
+        barrier_part = (1.0 - touched) * payoff
 
         if direction == BARRIER_IN:
-            forward = spot_prior * torch.exp(b * expiry_years)
-            payoff_prior = utils.black_european_option(
-                forward, strike, sigma, expiry, buy_or_sell, phi, shared) * torch.exp(-r * expiry_years)
-            european_part = barrier_touched * (nominal * torch.cat([payoff_prior, payoff_at], axis=0))
-            barrier_part = (1.0 - barrier_touched) * F.pad(
-                barrier_payoff, [0, 0, 0, 1], value=buy_or_sell * cash_rebate)
-            combined = european_part + barrier_part
-            # settle cashflows (can only happen at the end)
-            cash_settle(shared, payoff_currency, deal_data.Time_dep.deal_time_grid[-1], combined[-1])
+            # barrier ? and in
+            payoff_european = utils.black_european_option(
+                f_t, strike, sig, expiry[index], buy_or_sell, phi, shared) * torch.exp(-r_t * exp)
+            european_part = touched * (nominal * payoff_european)
+            rebate_part = buy_or_sell * cash_rebate * (1 - touched) if expiry[index] == 0.0 else 0.0
+            mtm_list.append(rebate_part + european_part + barrier_part)
         else:
-            # barrier out
-            barrier_part = (1.0 - barrier_touched) * torch.cat([barrier_payoff, nominal * payoff_at], axis=0)
-            rebate_part = buy_or_sell * cash_rebate * first_touch
-            combined = F.pad(buy_or_sell * cash_rebate * first_touch, [0, 0, 1, 0]) + barrier_part
-            # settle cashflows (The one at expiry)
-            cash_settle(shared, payoff_currency, deal_data.Time_dep.deal_time_grid[-1], barrier_part[-1])
-            # settle cashflows (The potential rebate knockout)
-            if cash_rebate:
-                for cash_index, cash in zip(deal_data.Time_dep.deal_time_grid[1:], rebate_part):
-                    cash_settle(shared, payoff_currency, cash_index, cash)
-    else:
-        combined = barrier_payoff
+            # barrier ? and out
+            rebate_part = buy_or_sell * cash_rebate * (touched - prev_touched)
+            mtm_list.append(rebate_part + barrier_part)
+            # settle cashflows (The potential rebate)
+            if cash_rebate and expiry[index] > 0.0:
+                cash_settle(shared, payoff_currency, cash_index, rebate_part)
 
-    return combined
+        prev_touched = touched
+
+    # settle cashflows (The one at expiry)
+    cash_settle(shared, payoff_currency, deal_data.Time_dep.deal_time_grid[-1], mtm_list[-1])
+    return torch.stack(mtm_list)
 
 
 def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
@@ -991,7 +1004,6 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
 
 
 def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
-
     def sim_autocall(S, isBarrierDate, isFixingDate, isFloatDate, floating, threshold, coupon, terminationDate):
         avg = 0.0
         averageCounter = 0.0
@@ -1194,7 +1206,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                 # need to reshape this for the mcmc pricing
                 floating_leg = torch.unsqueeze(all_int, axis=-1)
         else:
-            # not used - set it the the spot_block
+            # not used - set it to the spot_block
             floating_leg = spot_block
 
         # sometimes the autocall kicks out early for this batch - skip redundant calcs
@@ -1598,7 +1610,7 @@ def pricer_cap(all_resets, t_cash, factor_dep, expiries, tenor, shared):
             all_resets - t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1))
 
     all_int = t_cash[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * payoff
-    margin = 0.0
+    margin = shared.one.new_zeros(len(t_cash))
 
     return all_int, margin
 
@@ -1619,7 +1631,7 @@ def pricer_floor(all_resets, t_cash, factor_dep, expiries, tenor, shared):
             t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1) - all_resets)
 
     all_int = t_cash[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * payoff
-    margin = 0.0
+    margin = shared.one.new_zeros(len(t_cash))
 
     return all_int, margin
 
@@ -1768,6 +1780,8 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
                 # check if there are a different number of resets per cashflow
                 if cash_counts.min() != cash_counts.max():
                     interest = F.pad(all_int, [0, 0, 0, 1, 0, 0])
+                    # nom = torch.ones_like(reset_cashflows.tn[:, utils.CASHFLOW_INDEX_Nominal])
+                    # nominal = F.pad(nom, [0, 1])
                     nominal = F.pad(reset_cashflows.tn[:, utils.CASHFLOW_INDEX_Nominal], [0, 1])
                     margin = F.pad(all_margin, [0, 1])
                 else:
