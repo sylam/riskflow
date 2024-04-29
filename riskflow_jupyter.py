@@ -222,7 +222,7 @@ class TreePanel(metaclass=ABCMeta):
                         data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
                                      field, item, widget_type in zip(headings, flow, widgets)])
                     return_value = to_json(data)
-                elif field_name in ['Price_Fixing', 'Autocall_Thresholds', 'Autocall_Coupons', 'Autocall_Floating']:
+                elif field_name in ['Price_Fixing', 'Autocall_Thresholds', 'Autocall_Coupons', 'Autocall_Floating', 'Barrier_Dates']:
                     headings = ['Date', 'Value']
                     widgets = ['DatePicker', 'Float']
                     data = []
@@ -230,15 +230,6 @@ class TreePanel(metaclass=ABCMeta):
                         data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
                                      field, item, widget_type in zip(headings, flow, widgets)])
                     return_value = to_json(data)
-                elif field_name == 'Barrier_Dates':
-                    headings = ['Date', 'Value']
-                    widgets = ['DatePicker', 'Float']
-                    data = []
-                    for flow in [obj]:
-                        data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
-                                     field, item, widget_type in zip(headings, flow, widgets)])
-                    return_value = to_json(data)
-
                 else:
                     raise Exception('Unknown Array Field type {0}'.format(field_name))
             elif isinstance(obj, pd.DateOffset):
@@ -335,8 +326,7 @@ class TreePanel(metaclass=ABCMeta):
             else:
                 raise Exception('Unknown widget field')
 
-            if element['widget'] != 'Container':
-                # add an observer to any non-containter widget
+            if element['widget'] not in  ['Container', 'HTML']:
                 w.observe(self.generate_handler(field_name, widget_elements, label), 'value')
 
             wig.append(w)
@@ -365,7 +355,7 @@ class TreePanel(metaclass=ABCMeta):
 
     def _on_created_changed(self, change):
         if self.tree.created:
-            # print 'create',val
+            # logging.info('create {}'.format(change['new']))
             self.create(change['new'])
             # reset the created flag
             self.tree.unobserve(self._on_created_changed, 'created')
@@ -374,7 +364,7 @@ class TreePanel(metaclass=ABCMeta):
 
     def _on_deleted_changed(self, change):
         if self.tree.deleted:
-            # print 'delete',val
+            # logging.info('delete {}'.format(change['new']))
             self.delete(change['new'])
             # reset the deleted flag
             self.tree.unobserve(self._on_deleted_changed, 'deleted')
@@ -383,7 +373,7 @@ class TreePanel(metaclass=ABCMeta):
 
     def _on_ignore_toggle(self, change):
         if self.tree.ignore:
-            # print 'delete',val
+            # logging.info('ignore {}'.format(change['new']))
             self.ignore(change['new'])
             # reset the deleted flag
             self.tree.unobserve(self._on_ignore_toggle, 'ignore')
@@ -846,13 +836,15 @@ class RiskFactorsPage(TreePanel):
 
         return handleEvent
 
-    def create(self, val):
+    def create(self, key):
+        val = key[0]
         factor_type = val[:val.find('.')]
         # load defaults for the new riskfactor
         self.data[val] = {'Factor': copy.deepcopy(self.new_factor['Factor'].get(factor_type)),
                           'Process': copy.deepcopy(self.new_factor['Process'].get(factor_type))}
 
-    def delete(self, val):
+    def delete(self, key):
+        val = key[0]
         factor = rf.utils.check_rate_name(val)
         # delete the factor
         if val in self.config.params['Price Factors']:
@@ -909,7 +901,7 @@ class RiskFactorsPage(TreePanel):
         # label this container
         wig = [widgets.HTML(value='<h4>Correlation:</h4>')]
 
-        w = Table(description="Matrix",
+        w = Table(description='',
                   settings=to_json(
                       {
                           'columns': [{"type": "numeric",
@@ -918,6 +910,7 @@ class RiskFactorsPage(TreePanel):
                           'startRows': num_factors,
                           'rowHeaders': correlation_factors,
                           'colHeaders': correlation_factors,
+                          'rowHeaderWidth': 250,
                           'width': 700,
                           'height': 300
                       }),
@@ -1092,7 +1085,7 @@ class CalculationPage(TreePanel):
 
         self.tree_data = [{"text": "Calculations",
                            "type": "root",
-                           "state": {"opened": True, "selected": False},
+                           "state": {"opened": True, "selected": True},
                            "children": calculation_to_add}]
 
         type_data = {"root": {"valid_children": ["default"]},
@@ -1131,7 +1124,7 @@ class CalculationPage(TreePanel):
             for k, v in sorted(results.items(), key=lambda x: x[0][::-1]):
                 filename_field = './tmp/{}.{}.csv'.format(key, k)
                 link = {'widget': 'HTML',
-                        'value': '<a href="{}" title="Click to Download">Download {}</a>'.format(filename_field, k)}
+                        'value': '<a href="{}" title="Right Click (Save link as) to Download">Download {}</a>'.format(filename_field, k)}
                 if isinstance(v, pd.DataFrame):
                     # date index
                     if v.index.dtype.type == np.datetime64:
@@ -1205,17 +1198,21 @@ class CalculationPage(TreePanel):
             # update the parameters for the current calculation
             rf.update_dict(self.config.deals['Calculation'], param)
             # get the output
-            calc_obj, calc_output = self.context.run_job()
-            # all calculations provide stats
-            output = make_container('Stats', make_float_widgets(calc_output['Stats']))
-            # now look at the results and find suitable widgets
-            output.update(make_container('Output', make_results(calc_output['Results'])))
-            # flag the gui that we have output
-            frame['output'] = output
-            # trigger redraw
-            self._on_selected_changed({'new': selection})
-            # store the output
-            self.output[key] = calc_output
+            try:
+                calc_obj, calc_output = self.context.run_job()
+                # all calculations provide stats
+                output = make_container('Stats', make_float_widgets(calc_output['Stats']))
+                # now look at the results and find suitable widgets
+                output.update(make_container('Output', make_results(calc_output['Results'])))
+                # flag the gui that we have output
+                frame['output'] = output
+                # trigger redraw
+                self._on_selected_changed({'new': selection})
+                # store the output
+                self.output[key] = calc_output
+            except Exception as e:
+                logging.root.name = key
+                logging.error('Cannot execute calculation - {}'.format(e.args))
 
         return click
 
@@ -1286,14 +1283,19 @@ class Workbench(object):
             self.context.path_map = {k: v for k, v in self.path_transform.items() if k}
             file_data = chooser['new'][0]
             logging.info('loading {}'.format(file_data.name))
-            self.context.load_json(
-                (file_data['content'].tobytes().decode('utf-8'), file_data.name),
-                compress=self.compress_json.value
-            )
-            self.reload()
-            # select the portfolio index
-            self.tabs.selected_index = 1
-            logging.info('{} loaded'.format(file_data.name))
+            try:
+                self.context.load_json(
+                    (file_data['content'].tobytes().decode('utf-8'), file_data.name),
+                    compress=self.compress_json.value
+                )
+                self.reload()
+                # select the portfolio index
+                self.tabs.selected_index = 1
+            except:
+                logging.error('{} is not a valid riskflow JSON file'.format(file_data.name))
+            else:
+                logging.info('{} loaded'.format(file_data.name))
+
 
         def make_new_map(map_type, map_data):
 

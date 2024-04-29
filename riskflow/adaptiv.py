@@ -21,7 +21,7 @@ import calendar
 
 # import parsing libraries
 from pyparsing import *
-from xml.etree.ElementTree import ElementTree, Element, iterparse
+from xml.etree.ElementTree import ElementTree, Element, SubElement, iterparse, tostring
 
 # useful types
 from collections import OrderedDict
@@ -45,7 +45,6 @@ try:
 
 except ImportError:
     import csv
-
 
     # define dummy objects for parsing with PyPy
     class DateOffset(object):
@@ -123,7 +122,8 @@ def drawobj(obj):
                         temp += ['[' + drawobj(sub_value) + ']']
                 buffer += ['='.join([key, '[%s]' % (
                     ','.join(temp) if key in ['InstantaneousDrift', 'InstantaneousVols', 'Eigenvectors', 'Resets',
-                                              'Points', 'Instrument_Definitions'] else ''.join(temp))])]
+                                              'Points', 'Instrument_Definitions', 'Energy_Futures_Options']
+                    else ''.join(temp))])]
             elif isinstance(value, tuple):
                 buffer += ['='.join([key, '.'.join(value)])]
             elif isinstance(value, DateOffset):
@@ -166,7 +166,8 @@ class AdaptivContext(Context):
                  'Script_Base_Scenario_Multiplier': 1,
                  'Correlations_Healing_Method': 'Eigenvalue_Raising',
                  'Grouping_File': ''
-                 }
+                 },
+            'Price Factor Interpolation': ModelParams(),
         })
 
         # make sure that there are no default calibration mappings
@@ -188,6 +189,38 @@ class AdaptivContext(Context):
                 for line in recon:
                     for offset in offsets:
                         self.sourcemtm.setdefault(header[offset], {}).setdefault(line[0], line[offset])
+
+    def parse_output_results(self, data, ccy):
+        results = Element('Results')
+        header = SubElement(results, 'Header')
+        calc_type = SubElement(header, 'CalcType')
+        calc_type.text = 'Credit Monte Carlo'
+        series = SubElement(results, 'Series')
+        x_axis = SubElement(series, 'XAxis', Type='Date', Label='Date')
+        y_axis = SubElement(series, 'YAxis', Type='Float', Label=ccy)
+
+        # Iterate over the data and create SeriesItem elements
+        for index, (column, items) in enumerate(data.T.iterrows()):
+            if 'PFE' in column:
+                name = 'Bank Exposure ({}%)'.format(column[4:])
+            elif column == 'EE':
+                name = 'Bank Expected Exposure'
+            else:
+                continue
+            value = items.max()
+            series_item = SubElement(
+                series, 'SeriesItem', Name=name, Index=str(index), InitialState='On',
+                SeriesType='XYPlot', LineStyle='Solid', Value='{:.0f}'.format(value),
+                Description='Maximum value {:,.3f}'.format(value))
+            x_values = [str((x-utils.excel_offset).days) for x in items.index]
+            y_values = ['{:.2f}'.format(x) for x in items.values]
+            x = SubElement(series_item, 'X')
+            x.text = ','.join(x_values)
+            y = SubElement(series_item, 'Y')
+            y.text = ','.join(y_values)
+
+        # Create the XML tree and return it
+        return tostring(results, encoding='utf-8').decode('utf-8')
 
     def parse_calibration_file(self, filename):
         """
@@ -496,6 +529,8 @@ class AdaptivContext(Context):
         price_fac = Keyword("<Price Factors>")
         model_cfg = Keyword("<Model Configuration>")
         sys_param = Keyword("<System Parameters>")
+        market_jac = Keyword("<Market Price Jacobians>")
+        price_sub = Keyword("<Price Factor Substitution>")
 
         # reserved words
         where = Keyword("where").suppress()
@@ -518,7 +553,7 @@ class AdaptivContext(Context):
 
         ident = Word(alphas, alphas + nums + "_-")
         desc = Word(alphas+',', alphas+nums+", ()/%_-.").setName('Description')
-        arbstring = Word(alphas+nums+'_', alphas+nums+"/*_ :+-()%&#$").setName('ArbString')
+        arbstring = Word(alphas+nums+'_', alphas+nums+"/*_ :+-()%&#@$").setName('ArbString')
         namedId = Group(delimitedList(arbstring, delim='.', combine=False)).setName('namedId').setParseAction(pushName)
         integer = (Word("+-" + nums, nums) + ~decimal).setName('int').setParseAction(pushInt)
         fnumber = Combine(Word("+-" + nums, nums) + Optional(decimal + Optional(Word(nums))) + Optional(
@@ -573,6 +608,8 @@ class AdaptivContext(Context):
         section = ((correl_sec + ZeroOrMore(correl)) |
                    (sys_param + OneOrMore(system)) |
                    (bootstrap + ZeroOrMore(todo)) |
+                   (market_jac + ZeroOrMore(todo)) |
+                   (price_sub + ZeroOrMore(todo)) |
                    (valuation + OneOrMore(param)) |
                    ((model_cfg | factor_int) + ZeroOrMore(modelcfg)) |
                    ((price_fac | price_mod | market_p) + ZeroOrMore(line))).setParseAction(pushSection)

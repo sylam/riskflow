@@ -552,6 +552,7 @@ class Context(object):
                             'ReferenceVol': [('ForwardPriceVol', 'ForwardPriceVol'),
                                              ('ReferencePrice', 'ReferencePrice')],
                             'InflationRate': [('Price_Index', 'PriceIndex')],
+                            'CommodityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')],
                             'EquityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')]}
 
         # nested fields need to include all their children

@@ -48,9 +48,9 @@ def bootstrap(path, rundate, reuse_cal=True):
     from riskflow.adaptiv import AdaptivContext
 
     context = AdaptivContext()
-    # cal_file = 'CVAMarketData_Calibrated_New.json'
+    cal_file = 'CVAMarketData_Calibrated_New.json'
     # cal_file = 'CVAMarketData_test.json'
-    cal_file = 'CVAMarketData_TST.json'
+    # cal_file = 'CVAMarketData_TST.json'
     if reuse_cal and os.path.isfile(os.path.join(path, rundate, cal_file)):
         # context.parse_json(os.path.join(path, rundate, cal_file))
         context.parse_json(os.path.join(path, rundate, 'CVAMarketData_TST.json'))
@@ -67,7 +67,7 @@ def bootstrap(path, rundate, reuse_cal=True):
 
     context.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
     context.params['System Parameters'][
-        'Swaption_Premiums'] = 'T:\\OTHER\\ICE\\Archive\\IR_Volatility_Swaption_2022-02-22_0000_LON.csv'
+        'Swaption_Premiums'] = 'T:\\OTHER\\ICE\\Archive\\IR_Volatility_Swaption_{}_0000_LON.csv'.format(rundate)
     # for mp in list(context.params['Market Prices'].keys()):
     #     if mp.startswith('HullWhite2FactorInterestRateModelPrices') and not (
     #             mp.endswith('AUD-AONIA') or mp.endswith('ZAR-JIBAR-3M')):
@@ -268,9 +268,9 @@ if __name__ == '__main__':
             [os.path.join('Y:\\CollVA', folder),
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
              # os.path.join('Z:\\CVA_JSON\\TEST', folder),
-             os.path.join('R:\\Riskflow', folder),
+             os.path.join('S:\\Riskflow', folder),
              # os.path.join('S:\\CCR_PFE_EE_NetCollateral', folder),
-             os.path.join('S:\\Riskflow\\TEST', folder),
+             # os.path.join('S:\\Riskflow', folder),
              os.path.join('N:\\Archive', folder)])
 
     path_json = paths['PFE']
@@ -279,8 +279,10 @@ if __name__ == '__main__':
     # path = paths['CVA']
     path = paths['PFE']
 
-    rundate = '2023-11-29'
+    # rundate = '2024-03-26'
+    rundate = '2024-04-22'
     # rundate = '2023-05-31'
+
     # calibrate_PFE(path, rundate)
     # bootstrap(path_json, '', reuse_cal=True)
     # bootstrap('Z:\\', rundate, reuse_cal=False)
@@ -321,24 +323,36 @@ if __name__ == '__main__':
         'USD': {'collateral': 'USD-SOFR', 'funding': 'USD-LIBOR-3M'},
         'EUR': {'collateral': 'EUR-ESTR', 'funding': 'EUR-EURIBOR-3M'}}
 
-        # for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'Combination*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Soc_Gen_Paris_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_CS_Int_London_*.json')):
+    # for json in glob.glob(os.path.join('C:\\Users\\shuaib.osman\\Downloads\\autocalls', '153899419.json')):
+    for json in glob.glob(os.path.join('C:\\Users\\shuaib.osman\\Downloads', 'InputAAJ_CrB_UBS_AG_Zurich_*.json')):
+    # for json in glob.glob(os.path.join('Z:\\', 'baesval_158795766.json')):
+
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Goldman_Sachs_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
-    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Investec_Life_Limited_*.json')):
+    ## for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_StanChart_Ldn_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris__*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris_*.json')):
+
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_National_Home_Builders_Registration_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_AutoX__Pty__Ltd_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Citibank_NA_NY_*.json')):
+    # for json in glob.glob(os.path.join('C:\\Users\\shuaib.osman\\Downloads', 'InputAAJ_CrB_Citibank_NA_NY_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_FirstRand_Bank_Ltd_*.json')):
+
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_FVA_CrB_IBL_ICIB_BSF_ED_HQLA_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Redefine_Properties_Limited*.json')):
 
         # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Standard_Bank_*.json')):
         # for json in glob.glob(os.path.join(path_json, rundate, '*otus*.json')):
         cx.load_json(json, compress=True)
+        short_date = ''.join(rundate[2:].split('-')[::-1])
+        cx.stressed_config_file = "\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData\\CVAMarketDataBackup\\CVAMarketData_Calibrated_Vega_{}.json".format(short_date)
 
         # if 'HullWhite2FactorModelParameters.USD-OIS' not in cx.current_cfg.params['Price Factors']:
         #     cx.current_cfg.params['Price Factors']['HullWhite2FactorModelParameters.USD-OIS'] = cx.current_cfg.params[
@@ -357,7 +371,7 @@ if __name__ == '__main__':
         # ns.field['Collateral_Assets']['Cash_Collateral'][0]['Collateral_Rate'] = 'USD-OIS'
         # ns.field['Collateral_Assets']['Cash_Collateral'] = []
         # ns.field['Collateral_Call_Frequency']=pd.DateOffset(weeks=1)
-        ns.field['Collateralized'] = 'False'
+        # ns.field['Collateralized'] = 'False'
 
         overrides = {
             'Calc_Scenarios': 'No',
@@ -366,14 +380,16 @@ if __name__ == '__main__':
             # 'Time_grid': '0d 2d 1w(1w) 3m(1m)',
             'Random_Seed': '1',
             'Generate_Cashflows': 'Yes',
-            'Currency': 'ZAR',
+            'Currency': 'USD',
+            'Percentile': '95, 99',
             # 'Antithetic': 'Yes',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
+            'Base_Time_Grid': '0d 2d 1w(1w) 3m(1m) 2y(3m)',
             'Batch_Size': 512,
             'Simulation_Batches': 1,
             # 'Collateral_Valuation_Adjustment': {'Calculate': 'Yes', 'Gradient': 'Yes'},
-            # 'Credit_Valuation_Adjustment': {'Calculate': 'Yes', 'Gradient': 'Yes',
-            # 'CDS_Tenors': [0.5, 1, 3, 5, 10], 'Hessian': 'No'}
+            'Credit_Valuation_Adjustment':
+                {'Calculate': 'No', 'Gradient': 'Yes', 'CDS_Tenors': [0.5, 1, 3, 5, 10], 'Hessian': 'No'}
         }
 
         if ns.field['Collateralized'] == 'True':
@@ -382,49 +398,39 @@ if __name__ == '__main__':
             overrides['Dynamic_Scenario_Dates'] = 'No'
 
         for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
-            # if i['Instrument'].field['Reference'] != 'USDIBLIX12DIGIPUT18189230%20280629':
-            # if i['Instrument'].field['Reference'] != '137335521':
-            # if i['Instrument'].field['Object'].startswith('QEDI'):
-            if not str(i['Instrument'].field['Reference']).startswith('139403713'):
-            # if not str(i['Instrument'].field['Reference']).startswith('132208115'):
+            if False and not str(i['Instrument'].field['Reference']) in ['159083172']:#, '154727676', '158079450']:
                 i['Ignore'] = 'True'
             else:
                 i['Ignore'] = 'False'
 
         calculation_currency = 'USD'
         logging.getLogger().setLevel(logging.DEBUG)
+        # cx.current_cfg.params['Price Factors']['Correlation.EquityPrice.JPY_NKY_BBG.JPY/FxRate.JPY.ZAR'] = {
+        #     'Property_Aliases': '', 'Value': -0.4}
+        #  calc, out = cx.Base_Valuation(overrides={'Currency': 'USD'})
 
-        # calc, out = cx.Base_Valuation(overrides={'Currency': 'ZAR'})
-
-        for i in range(3):
-            # cx.stress_config(['InterestRate', 'InflationRate'])
+        for i in range(2):
             calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
-            # print(i, 'stress', out['Results']['cva'])
+            print(i, 'CVA', out['Results']['cva'])
 
-            delta_surv = out['Results']['grad_cva'].loc[
-                ('SurvivalProb.ACWA_Power_SolarReserve_Redstone_So')].reset_index()[
+            # cx.stress_config(['InterestRate', 'InflationRate'])
+            cds_spread = 'SurvivalProb.{}'.format(calc.params['Credit_Valuation_Adjustment']['Counterparty'])
+            delta_surv = out['Results']['grad_cva'].loc[cds_spread].reset_index()[
                 ['Tenor', 'Gradient']].set_index('Tenor')
 
             test = out['Results']['CS01'].groupby(
                 delta_surv.index[np.searchsorted(
                     delta_surv.index, out['Results']['CS01'].index, side='right') - 1]).mean()
-            delta = test.min() * delta_surv.loc[test.min().index]['Gradient'].values.reshape(-1, 1)
 
+            cx.stress_config(['ForwardPrice'])
+            calc2, out2 = cx.Credit_Monte_Carlo(overrides=overrides)
+            print(i, 'CVA', out2['Results']['cva'])
+            # delta = test.min() * delta_surv.loc[test.min().index]['Gradient'].values.reshape(-1, 1)
             cx.restore_config()
-            calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
-            print(i, 'restore', out['Results']['cva'])
 
         # cx.stress_config(['ForwardPrice'])
-
-        calc, out1 = cx.Credit_Monte_Carlo(overrides=overrides)
-        cx.restore_config()
-        cx.stress_config(['InterestRate', 'InflationRate'])
-        calc, out2 = cx.Credit_Monte_Carlo(overrides=overrides)
-        cx.restore_config()
-        calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
-        calc, params = rf.run_cmc(
-            cx.current_cfg, overrides=overrides, CVA=False, FVA=False, CollVA=False, LegacyFVA=True)
-        del params['CVA']
+        # del params['CVA']
+        calc, params = rf.run_cmc(cx.current_cfg, overrides=overrides, LegacyFVA=True)
         partial_FVA = calc.calc_individual_FVA(
             params, spreads=spreads[calculation_currency], discount_curves=curves[calculation_currency])
 
@@ -456,7 +462,7 @@ if __name__ == '__main__':
         if 'Funding_Valuation_Adjustment' in cx.current_cfg.deals['Calculation']:
             del cx.current_cfg.deals['Calculation']['Funding_Valuation_Adjustment']
 
-        calc, out = cx.Base_Valuation()
+        # calc, out = cx.Base_Valuation()
         # calc, out = cx.run_job(overrides)
         # out['Results']['collateral_profile'].to_csv(outfile)
         # calc, out = cx.Base_Valuation()

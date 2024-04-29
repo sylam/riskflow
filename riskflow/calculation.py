@@ -300,7 +300,7 @@ class Calculation(object):
 class CMC_State(utils.Calculation_State):
     def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, one, mcmc_sims,
                  report_currency, nomodel='Constant'):
-        super(CMC_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel)
+        super(CMC_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size)
         # these are tensors
         self.t_PreCalc = {}
         self.t_cholesky = cholesky
@@ -308,7 +308,6 @@ class CMC_State(utils.Calculation_State):
         self.t_Scenario_Buffer = [None] * num_stoch_factors
         self.t_Credit = {}
         # these are shared parameter states
-        self.simulation_batch = batch_size
         self.sobol = {}
         # idea is to reuse quasi rng numbers where applicable (but still using enough randomness)
         self.t_quasi_rng = {}
@@ -682,8 +681,14 @@ class Credit_Monte_Carlo(Calculation):
             empty = ','.join(['None'] * num_tags)
             tags = deal.Instrument.field.get('Tags', empty)
             expiry = max(deal.Instrument.get_reval_dates()).strftime('%Y-%m-%d')
-            return [deal.Instrument.field['Reference'], expiry] + (tags if isinstance(tags, list) else [empty])[
-                0].split(',') + [np.sum(deal.Calc_res['MTM'], axis=0) / num_scenario]
+            mtm_ccy = deal.Instrument.field.get('Currency', 'N/A')
+            try:
+                refmtm = float(deal.Instrument.field.get('MtM', 0.0))
+            except ValueError:
+                refmtm = 0.0
+            return [deal.Instrument.field['Reference'], expiry, refmtm, mtm_ccy] + (
+                tags if isinstance(tags, list) else [empty])[0].split(',') + [
+                np.sum(deal.Calc_res['MTM'], axis=0) / num_scenario]
 
         # Ask for deal level mtm's
         params['DealLevel'] = True
@@ -719,7 +724,8 @@ class Credit_Monte_Carlo(Calculation):
                     calc_approx_fva(mtm[-1], days, spread, delta_t, collateral) for name, spread in output])
 
         return pd.DataFrame(
-            results, columns=['Reference', 'Expiry'] + tag_headings + ['MTM'] + [x[0] for x in output])
+            results, columns=['Reference', 'Expiry', 'Ref_Mtm', 'Mtm_CCy'] + tag_headings +
+                             ['MTM'] + [x[0] for x in output])
 
     def get_cholesky_decomp(self):
         # create the correlation matrix
@@ -791,7 +797,7 @@ class Credit_Monte_Carlo(Calculation):
     def __init_shared_mem(self, seed, nomodel, reporting_currency, mcmc_sim, calc_greeks=None):
         # set the random seed
         torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
+        # torch.cuda.manual_seed(seed)
 
         # check if we need to report gradients
         if calc_greeks is not None:
@@ -853,9 +859,13 @@ class Credit_Monte_Carlo(Calculation):
             elif result in ['grad_cva_hessian']:
                 self.output.setdefault(result, self.gradients_as_df(
                     data.astype(np.float64) / self.params['Simulation_Batches']))
-            elif result == 'mtm':
+            elif result in ['mtm', 'collateral']:
                 dates = np.array(sorted(self.time_grid.mtm_dates))[
                     self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid]
+                self.output.setdefault(result, pd.DataFrame(
+                    np.concatenate(data, axis=-1).astype(np.float64), index=dates))
+            elif result == 'gross_mtm':
+                dates = np.array(sorted(self.time_grid.mtm_dates))
                 self.output.setdefault(result, pd.DataFrame(
                     np.concatenate(data, axis=-1).astype(np.float64), index=dates))
             else:
@@ -931,17 +941,19 @@ class Credit_Monte_Carlo(Calculation):
 
             # construct the valuations
             tensors['mtm'] = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
+            # check if collateral was simulated
+            if 'Collateral' in shared_mem.t_Credit:
+                tensors['collateral'] = shared_mem.t_Credit['Collateral']
+                tensors['gross_mtm'] = shared_mem.t_Credit['GrossMTM']
 
             # is this the final run?
             final_run = run == self.params['Simulation_Batches'] - 1
 
             # now calculate all the valuation adjustments (if necessary)
-
             if params.get('Collateral_Valuation_Adjustment', {}).get(
                     'Calculate', 'No') == 'Yes' and 'Funding' in shared_mem.t_Credit:
 
                 tensors['collva_t'] = torch.mean(shared_mem.t_Credit['Funding'], axis=1)
-                tensors['collateral'] = shared_mem.t_Credit['Collateral']
                 tensors['collva'] = torch.sum(tensors['collva_t'])
 
                 if params['Collateral_Valuation_Adjustment'].get('Gradient', 'No') == 'Yes':
@@ -1169,7 +1181,7 @@ class Credit_Monte_Carlo(Calculation):
 
 class Base_Reval_State(utils.Calculation_State):
     def __init__(self, static_buffer, one, mcmc_sims, report_currency, calc_greeks, gamma, nomodel='Constant'):
-        super(Base_Reval_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel)
+        super(Base_Reval_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel, 1)
         self.calc_greeks = calc_greeks
         self.gamma = gamma
 

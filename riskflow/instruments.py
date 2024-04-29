@@ -171,6 +171,12 @@ def get_implied_correlation(rate1, rate2, all_factors):
     return implied_correlation.current_value()[0] if implied_correlation else 0.0
 
 
+def get_commodity_rate_factor(fieldname, static_offsets, stochastic_offsets):
+    """Read the index of the Equity rate price factor"""
+    return [calc_factor_index(utils.Factor('CommodityPrice', fieldname),
+                              static_offsets, stochastic_offsets)]
+
+
 def get_equity_rate_factor(fieldname, static_offsets, stochastic_offsets):
     """Read the index of the Equity rate price factor"""
     return [calc_factor_index(utils.Factor('EquityPrice', fieldname),
@@ -208,6 +214,13 @@ def get_equity_zero_rate_factor(fieldname, static_offsets, stochastic_offsets, a
     """Read the equity's interest rate price factor"""
     equity_factor = all_factors.get(utils.Factor('EquityPrice', fieldname))
     ir_curve = (equity_factor.factor if hasattr(equity_factor, 'factor') else equity_factor).get_repo_curve_name()
+    return get_interest_factor(ir_curve, static_offsets, stochastic_offsets, all_tenors)
+
+
+def get_commodity_zero_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors, all_factors):
+    """Read the equity's interest rate price factor"""
+    commodity_factor = all_factors.get(utils.Factor('CommodityPrice', fieldname))
+    ir_curve = (commodity_factor.factor if hasattr(commodity_factor, 'factor') else commodity_factor).get_repo_curve_name()
     return get_interest_factor(ir_curve, static_offsets, stochastic_offsets, all_tenors)
 
 
@@ -340,6 +353,24 @@ class Deal(object):
     def generate(self, shared, time_grid, deal_data):
         raise Exception('generate in class {} not implemented yet for deal {}'.format(
             self.__class__.__name__, self.field.get('Reference')))
+
+    def check_payoff_type(self, field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors):
+        '''
+        Check if this is a compo or quanto option. Note - this only works for equity derivates. Needs to be
+        extended to other asset classes
+        '''
+        if 'Payoff_Type' in self.field and field['Payoff_Currency'] != field['Currency']:
+            corr_sign, fx_lookup = utils.check_fx_name([field['Currency'][0], field['Payoff_Currency'][0]])
+            field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
+            field_index['{}ImpliedCorrelation'.format(self.field['Payoff_Type'])] = get_implied_correlation(
+                ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors) * corr_sign
+
+            if self.field['Payoff_Type'] == 'Compo':
+                # needed to calculate fx forwards
+                field_index['Local'] = get_fx_and_zero_rate_factor(
+                    field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+                field_index['Other'] = get_fx_and_zero_rate_factor(
+                    field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
 
 
 class NettingCollateralSet(Deal):
@@ -642,7 +673,7 @@ class NettingCollateralSet(Deal):
                 'Funding_Rate') else None
 
             # apparently this should default to the base currency not the agreement currency,
-            # but I think this is a better default..
+            # but I think this is a better default.
             field['Balance_Currency'] = utils.check_rate_name(self.field['Balance_Currency']) if self.field.get(
                 'Balance_Currency') else field['Agreement_Currency']
 
@@ -777,7 +808,7 @@ class NettingCollateralSet(Deal):
                 call_mask[np.searchsorted(time_grid.mtm_time_grid, mod_call_dates)] = 2
                 call_mask -= 1
 
-            # store the mask    
+            # store the mask
             field_index['call_mask'] = call_mask
 
             if self.options['Forward_Looking_Closeout']:
@@ -852,7 +883,7 @@ class NettingCollateralSet(Deal):
                     equity_col.Currency, time_grid.time_grid, shared) * utils.calc_time_grid_spot_rate(
                     equity_col.Collateral, time_grid.time_grid, shared)
 
-            # calc the collateral amount    
+            # calc the collateral amount
             fx_base = utils.calc_time_grid_spot_rate(shared.Report_Currency, time_grid.time_grid, shared)
             fx_agreement = utils.calc_time_grid_spot_rate(factor_dep['Agreement_Currency'], time_grid.time_grid, shared)
             H = self.field['Credit_Support_Amounts']['Received_Threshold'].value() * fx_agreement
@@ -938,7 +969,7 @@ class NettingCollateralSet(Deal):
             min_Bt = F.pad(min_Bt, [0, 0, 0, 1])
 
             # Store results
-            shared.t_Credit['Gross MTM'] = Vte
+            shared.t_Credit['GrossMTM'] = accum
             shared.t_Credit['Collateral'] = Bte * Ste / fx_base
 
             # The net MTM of the netting set
@@ -1036,9 +1067,10 @@ class MtMCrossCurrencySwapDeal(Deal):
 
         if not self.child_map:
             for index, child in enumerate(child_dependencies):
-                # check if there are compounding resets - if so, remove it
+                # check if there are compounding resets - if so, regroup them
+                # (groupsize -1 means group resets per cashflow - not 1 cashflow 1 reset)
                 child.Factor_dep['Cashflows'] = utils.compress_no_compounding(
-                    child.Factor_dep['Cashflows'], groupsize=1, check_resets=False)
+                    child.Factor_dep['Cashflows'], groupsize=-1, check_resets=False)
                 # make the child price to the same grid as the parent
                 child.Time_dep.assign(deal_data.Time_dep)
                 # work out which leg is which
@@ -1048,6 +1080,9 @@ class MtMCrossCurrencySwapDeal(Deal):
                     child.Factor_dep['Cashflows'].add_mtm_payments(
                         factor_dep['base_date'], self.field['Principal_Exchange'],
                         self.field['Effective_Date'], daycount)
+                    # make sure we calculate future fx reset dates correctly
+                    child.Factor_dep['Cashflows'].set_future_fx_resets(
+                        deal_time[:, utils.TIME_GRID_MTM].max(), time_grid)
                     self.child_map.setdefault('MTM', child)
                 else:
                     daycount = self.field.get(factor_dep['Other'] + '_Day_Count', 'ACT_365')
@@ -1065,8 +1100,8 @@ class MtMCrossCurrencySwapDeal(Deal):
             self.child_map['MTM'].Factor_dep['Currency'][0], deal_time, shared)
 
         if self.child_map['Static'].Factor_dep.get('Forward'):
-            static_leg = pricing.pv_float_cashflow_list(shared, time_grid, self.child_map['Static'],
-                                                        pricing.pricer_float_cashflows)
+            static_leg = pricing.pv_float_cashflow_list(
+                shared, time_grid, self.child_map['Static'], pricing.pricer_float_cashflows)
         else:
             static_leg = pricing.pv_fixed_cashflows(shared, time_grid, self.child_map['Static'])
 
@@ -1391,7 +1426,7 @@ class FXForwardDeal(Deal):
             shared, self.field['Sell_Currency'], deal_data.Time_dep.deal_time_grid[-1], self.field['Sell_Amount'])
 
         return self.field['Buy_Amount'] * FX_Buy_rep * buy_discount_rate - \
-               self.field['Sell_Amount'] * FX_Sell_rep * sell_discount_rate
+            self.field['Sell_Amount'] * FX_Sell_rep * sell_discount_rate
 
 
 class StructuredDeal(Deal):
@@ -1441,7 +1476,7 @@ class StructuredDeal(Deal):
         return pricing.interpolate(net_mtm, shared, time_grid, deal_data, interpolate_grid=False)
 
     def generate(self, shared, time_grid, deal_data):
-        return shared.one.new_zeros(1,1)
+        return shared.one.new_zeros(1, 1)
 
 
 class StructuredDealBreakClause(StructuredDeal):
@@ -2404,10 +2439,10 @@ class EquityDiscreteExplicitAsianOption(Deal):
         }
 
         if field['Payoff_Currency'] != field['Currency']:
-            fx_lookup = tuple(sorted([field['Currency'][0], field['Payoff_Currency'][0]]))
+            corr_sign, fx_lookup = utils.check_fx_name([field['Currency'][0], field['Payoff_Currency'][0]])
             field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
             field_index['{}ImpliedCorrelation'.format(self.field['Payoff_Type'])] = get_implied_correlation(
-                ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors)
+                ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors) * corr_sign
             logging.warning("Quanto deal. TODO!!!!!!!")
             if self.field['Payoff_Type'] == 'Compo':
                 # needed to calculate fx forwards
@@ -2436,6 +2471,98 @@ class EquityDiscreteExplicitAsianOption(Deal):
         return mtm
 
 
+class EquityBarrierBinaryOption(Deal):
+    factor_fields = {'Currency': ['FxRate'],
+                     'Payoff_Currency': ['FxRate'],
+                     'Equity': ['EquityPrice', 'DividendRate'],
+                     'Discount_Rate': ['DiscountRate'],
+                     'Equity_Volatility': ['EquityPriceVol']}
+    documentation = ('FX and Equity', ['A vanilla option described [here](Definitions#european-options)'])
+
+    def __init__(self, params, valuation_options):
+        super(EquityBarrierBinaryOption, self).__init__(params, valuation_options)
+
+    def reset(self, calendars):
+        super(EquityBarrierBinaryOption, self).reset()
+        self.payoff_ccy = self.field['Payoff_Currency'] if 'Payoff_Currency' in self.field \
+            else self.field['Currency']
+        barrierdates = set([x[0] for x in self.field['Barrier_Dates']])
+        self.add_reval_dates(barrierdates.union({self.field['Expiry_Date']}), self.field['Payoff_Currency'])
+
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
+        field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency']) if self.field[
+            'Payoff_Currency'] else field['Currency']
+        field['Discount_Rate'] = utils.check_rate_name(
+            self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
+        field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
+
+        # add the expiry to the barrier dates
+        all_dates = sorted(
+            set([x[0] for x in self.field['Barrier_Dates']]).union([self.field['Expiry_Date']])
+        )
+
+        # create lookups
+        ab = dict(self.field.get('Barrier_Dates', []))
+
+        field_index = {
+            'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+            'Payoff_Currency': get_fxrate_factor(field['Payoff_Currency'], static_offsets, stochastic_offsets),
+            'SettleCurrency': self.field['Payoff_Currency'],
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+            'Equity_Zero': get_equity_zero_rate_factor(
+                field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Dividend_Yield': get_dividend_rate_factor(
+                field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+            'Volatility': get_equity_price_vol_factor(
+                field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Observation_Dates': utils.make_fixing_data(
+                base_date, time_grid, [[x, 0] for x in all_dates]),
+            'Barrier_Dates': [ab.get(x, -1) for x in all_dates],
+            'Strike_Price': self.field['Strike_Price'],
+            'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
+            'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
+            'Expiry': (self.field['Expiry_Date'] - base_date).days
+        }
+
+        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+
+        return field_index
+
+    def generate(self, shared, time_grid, deal_data):
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+
+        payoff_currency = self.payoff_ccy
+        spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
+        fx_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
+
+        eq_zer_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Equity_Zero'], deal_time, shared)
+        eq_div_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Dividend_Yield'], deal_time, shared)
+        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+
+        b = torch.squeeze(
+            eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
+            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+
+        # check that the spot has a defined shape
+        if spot.shape[1] != b.shape[1]:
+            spot = spot.tile(len(deal_time), b.shape[1])
+
+        pv = pricing.pv_discrete_barrier_option(
+            shared, time_grid, deal_data, spot, b, tau, isdigital=True)
+
+        mtm = pv * fx_rep
+
+        return mtm
+
+
 class EquityBinaryOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Payoff_Currency': ['FxRate'],
@@ -2447,11 +2574,11 @@ class EquityBinaryOption(Deal):
 
     def __init__(self, params, valuation_options):
         super(EquityBinaryOption, self).__init__(params, valuation_options)
-        self.payoff_ccy = self.field['Payoff_Currency'] if 'Payoff_Currency' in self.field \
-            else self.field['Currency']
 
     def reset(self, calendars):
         super(EquityBinaryOption, self).reset()
+        self.payoff_ccy = self.field['Payoff_Currency'] if 'Payoff_Currency' in self.field \
+            else self.field['Currency']
         self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
@@ -2483,18 +2610,7 @@ class EquityBinaryOption(Deal):
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
-        if field['Payoff_Currency'] != field['Currency']:
-            fx_lookup = tuple(sorted([field['Currency'][0], field['Payoff_Currency'][0]]))
-            field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
-            field_index['{}ImpliedCorrelation'.format(self.field['Payoff_Type'])] = get_implied_correlation(
-                ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors)
-
-            if self.field['Payoff_Type'] == 'Compo':
-                # needed to calculate fx forwards
-                field_index['Local'] = get_fx_and_zero_rate_factor(
-                    field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-                field_index['Other'] = get_fx_and_zero_rate_factor(
-                    field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 
@@ -2526,12 +2642,12 @@ class EquityOptionDeal(Deal):
 
     def __init__(self, params, valuation_options):
         super(EquityOptionDeal, self).__init__(params, valuation_options)
-        self.payoff_ccy = self.field['Payoff_Currency'] if 'Payoff_Currency' in self.field \
-            else self.field['Currency']
         self.path_dependent = self.field['Option_Style'] == 'American'
 
     def reset(self, calendars):
         super(EquityOptionDeal, self).reset()
+        self.payoff_ccy = self.field['Payoff_Currency'] if 'Payoff_Currency' in self.field \
+            else self.field['Currency']
         self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def add_grid_dates(self, parser, base_date, grid):
@@ -2577,18 +2693,7 @@ class EquityOptionDeal(Deal):
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
-        if field['Payoff_Currency'] != field['Currency']:
-            fx_lookup = tuple(sorted([field['Currency'][0], field['Payoff_Currency'][0]]))
-            field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
-            field_index['{}ImpliedCorrelation'.format(self.field['Payoff_Type'])] = get_implied_correlation(
-                ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors)
-
-            if self.field['Payoff_Type'] == 'Compo':
-                # needed to calculate fx forwards
-                field_index['Local'] = get_fx_and_zero_rate_factor(
-                    field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-                field_index['Other'] = get_fx_and_zero_rate_factor(
-                    field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 
@@ -2636,6 +2741,7 @@ class QEDI_CustomAutoCallSwap(Deal):
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Payoff_Currency': utils.check_rate_name(self.field['Payoff_Currency']),
                  'Equity': utils.check_rate_name(self.field['Equity'])}
+
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
         field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
@@ -2682,6 +2788,8 @@ class QEDI_CustomAutoCallSwap(Deal):
             'Barrier_Dates': [ab.get(x, -1) for x in all_dates],
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
+
+        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 
@@ -2735,7 +2843,19 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
 
         # get the full set of floating dates
         floating_pay_dates = [x[0] for x in self.field['Autocall_Floating']]
-        floating_pay_dates = [min(floating_pay_dates) - self.field['Reset_Frequency']] + floating_pay_dates
+        # need to add the previous date to calculate the reset
+        prev_floating_date = min(floating_pay_dates) - self.field['Reset_Frequency']
+        if prev_floating_date == base_date:
+            # there's an issue if the prev_float_date is the same as the base date
+            prev_floating_date = prev_floating_date - pd.offsets.Day(1)
+        floating_pay_dates = [prev_floating_date] + floating_pay_dates
+        # hack - please get this fixed at source
+        if (self.field['Expiry_Date'] - floating_pay_dates[-1]).days > 10:
+            terminal_floating_date = max(floating_pay_dates) + self.field['Reset_Frequency']
+            self.field['Autocall_Floating'].append([terminal_floating_date, 0.0])
+            floating_pay_dates.append(terminal_floating_date)
+            logging.warning('Autocall Floating date more than 10 days away from expiry - adding last date {}'.format(
+                terminal_floating_date))
 
         cashflows = {'Items':
                          [{'Accrual_Start_Date': start,
@@ -2760,6 +2880,122 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
         return field_index
 
 
+class EquityOneTouchOption(Deal):
+    factor_fields = {'Currency': ['FxRate'],
+                     'Payoff_Currency': ['FxRate'],
+                     'Equity': ['EquityPrice', 'DividendRate'],
+                     'Discount_Rate': ['DiscountRate'],
+                     'Equity_Volatility': ['EquityPriceVol']}
+
+    documentation = ('FX and Equity', [
+        'A path dependent Equity Option described [here](#one-touch-and-no-touch-binary-options-and-rebates)'])
+
+    def __init__(self, params, valuation_options):
+        super(EquityOneTouchOption, self).__init__(params, valuation_options)
+        self.path_dependent = True
+
+    def reset(self, calendars):
+        super(EquityOneTouchOption, self).reset()
+        self.payoff_ccy = self.field['Payoff_Currency'] if self.field['Payoff_Currency'] in self.field \
+            else self.field['Currency']
+        self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
+
+    def add_grid_dates(self, parser, base_date, grid):
+        # only if the payoff is american (Touch) should we add potential payoff dates
+        if self.field['Payment_Timing'] == 'Touch':
+            if isinstance(grid, str):
+                grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
+                self.reval_dates.update(grid_dates)
+                self.settlement_currencies.setdefault(self.payoff_ccy, set()).update(grid_dates)
+            else:
+                # this is called if the grid is fully defined i.e. a set of dates
+                for curr, cash_flow in self.settlement_currencies.items():
+                    last_pmt = max(cash_flow)
+                    delta = set([x for x in grid if x < last_pmt])
+                    self.settlement_currencies[curr].update(delta)
+                    self.reval_dates.update(delta)
+
+    def add_reval_date_offset(self, offset, relative_to_settlement=True):
+        # don't add any extra reval dates if this is a touch option
+        if relative_to_settlement:
+            if self.field['Payment_Timing'] != 'Touch':
+                for curr, fixings in self.settlement_currencies.items():
+                    new_dates = [x + pd.DateOffset(days=offset) for x in fixings]
+                    self.reval_dates.update(new_dates)
+        else:
+            fixings = reduce(
+                set.union, [{x + pd.DateOffset(days=ofs) for ofs in offset}
+                            for x in self.reval_dates])
+            self.reval_dates.update(fixings)
+
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Payoff_Currency': utils.check_rate_name(self.payoff_ccy),
+                 'Equity': utils.check_rate_name(self.field['Equity'])}
+
+        field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
+            field['Currency']
+        field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
+
+        field_index = {'Currency': get_fx_and_zero_rate_factor(
+            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'SettleCurrency': self.payoff_ccy,
+            'Payoff_Currency': get_fxrate_factor(
+                field['Payoff_Currency'], static_offsets, stochastic_offsets),
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+            'Equity_Zero': get_equity_zero_rate_factor(
+                field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Dividend_Yield': get_dividend_rate_factor(
+                field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+            'Volatility': get_equity_price_vol_factor(
+                field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Expiry': (self.field['Expiry_Date'] - base_date).days}
+
+        if self.field.get('Barrier_Dates', []):
+            average_days = np.mean(
+                [x.days for x in np.diff(sorted(set([x[0] for x in sorted(self.field['Barrier_Dates'])])))])
+            field_index['Barrier_Monitoring'] = 0.5826 * np.sqrt(average_days / 365.0)
+        else:
+            field_index['Barrier_Monitoring'] = 0.5826 * np.sqrt(
+                (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0)
+
+        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+
+        return field_index
+
+    def generate(self, shared, time_grid, deal_data):
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        nominal = self.field['Cash_Payoff']
+        payoff_currency = self.payoff_ccy
+        spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
+        fx_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
+
+        eq_zer_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Equity_Zero'], deal_time, shared)
+        eq_div_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Dividend_Yield'], deal_time, shared)
+        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+
+        b = torch.squeeze(
+            eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
+            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+
+        # check that the spot has a defined shape
+        if spot.shape[1] != b.shape[1]:
+            spot = spot.tile(len(deal_time), b.shape[1])
+
+        pv = pricing.pv_one_touch_option(
+            shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)
+
+        mtm = pv * fx_rep
+
+        return mtm
+
+
 class EquityBarrierOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Payoff_Currency': ['FxRate'],
@@ -2771,11 +3007,17 @@ class EquityBarrierOption(Deal):
 
     def __init__(self, params, valuation_options):
         super(EquityBarrierOption, self).__init__(params, valuation_options)
+        self.payoff_ccy = self.field['Payoff_Currency'] if 'Payoff_Currency' in self.field \
+            else self.field['Currency']
         self.path_dependent = True
 
     def reset(self, calendars):
         super(EquityBarrierOption, self).reset()
-        self.add_reval_dates({self.field['Expiry_Date']}, self.field['Payoff_Currency'])
+        if self.field.get('Barrier_Dates', []):
+            barrierdates = set([x[0] for x in self.field['Barrier_Dates']])
+            self.add_reval_dates(barrierdates.union({self.field['Expiry_Date']}), self.payoff_ccy)
+        else:
+            self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def add_grid_dates(self, parser, base_date, grid):
         # a cash rebate is paid on touch if the option knocks out
@@ -2783,7 +3025,7 @@ class EquityBarrierOption(Deal):
             if isinstance(grid, str):
                 grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
                 self.reval_dates.update(grid_dates)
-                self.settlement_currencies.setdefault(self.field['Payoff_Currency'], set()).update(grid_dates)
+                self.settlement_currencies.setdefault(self.payoff_ccy, set()).update(grid_dates)
             else:
                 for curr, cash_flow in self.settlement_currencies.items():
                     last_pmt = max(cash_flow)
@@ -2795,7 +3037,8 @@ class EquityBarrierOption(Deal):
                           calendars):
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Equity': utils.check_rate_name(self.field['Equity'])}
-        field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency'])
+        field['Payoff_Currency'] = utils.check_rate_name(self.payoff_ccy)
+
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
         field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
@@ -2803,7 +3046,7 @@ class EquityBarrierOption(Deal):
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
                        'Payoff_Currency': get_fxrate_factor(
                            field['Payoff_Currency'], static_offsets, stochastic_offsets),
-                       'SettleCurrency': self.field['Payoff_Currency'],
+                       'SettleCurrency': self.payoff_ccy,
                        'Discount': get_discount_factor(
                            field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
@@ -2813,73 +3056,126 @@ class EquityBarrierOption(Deal):
                            field['Equity'], static_offsets, stochastic_offsets, all_tenors),
                        'Volatility': get_equity_price_vol_factor(
                            field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
-                       'Barrier_Monitoring': 0.5826 * np.sqrt(
-                           (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0),
                        'Expiry': (self.field['Expiry_Date'] - base_date).days,
                        'Strike_Price': self.field['Strike_Price'],
                        'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
                        'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0
                        }
 
-        if field['Payoff_Currency'] != field['Currency']:
-            fx_lookup = tuple(sorted([field['Currency'][0], field['Payoff_Currency'][0]]))
-            field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
-            field_index['{}ImpliedCorrelation'.format(self.field['Payoff_Type'])] = get_implied_correlation(
-                ('EquityPrice',) + field['Equity_Volatility'], ('FxRate',) + fx_lookup, all_factors)
+        if self.field.get('Barrier_Dates', []):
+            # add the expiry to the barrier dates
+            all_dates = sorted(
+                set([x[0] for x in self.field['Barrier_Dates']]).union([self.field['Expiry_Date']])
+            )
+            # create lookups
+            ab = dict(self.field.get('Barrier_Dates', []))
+            field_index['Observation_Dates'] = utils.make_fixing_data(
+                base_date, time_grid, [[x, 0] for x in all_dates])
+            field_index['Barrier_Dates'] = [ab.get(x, -1) for x in all_dates]
+        else:
+            field_index['Barrier_Monitoring'] = 0.5826 * np.sqrt(
+                (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0)
 
-            if self.field['Payoff_Type'] == 'Compo':
-                # needed to calculate fx forwards
-                field_index['Local'] = get_fx_and_zero_rate_factor(
-                    field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-                field_index['Other'] = get_fx_and_zero_rate_factor(
-                    field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-
-        # discrete barrier monitoring requires adjusting the barrier by 0.58
-        # ( -(scipy.special.zetac(0.5)+1)/np.sqrt(2.0*np.pi) ) * sqrt (monitoring freq)
+        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         nominal = self.field['Units']
-        payoff_currency = self.field['Payoff_Currency']
+        payoff_currency = self.payoff_ccy
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
         fx_rep = utils.calc_fx_cross(
             deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
 
-        # check the current value of the spot price
-        spot_now = spot[0].mean()
+        eq_zer_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Equity_Zero'], deal_time, shared)
+        eq_div_curve = utils.calc_time_grid_curve_rate(
+            deal_data.Factor_dep['Dividend_Yield'], deal_time, shared)
+        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
 
-        if (self.field['Barrier_Type'] == 'Up_And_In' and spot_now > self.field['Barrier_Price']) or (
-            self.field['Barrier_Type'] == 'Down_And_In' and spot_now < self.field['Barrier_Price']):
-            # this has already knocked in and is a regular european option
-            forward = utils.calc_eq_forward(
-                deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
-                deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
-            moneyness = spot / self.field['Strike_Price']
+        b = torch.squeeze(
+            eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
+            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
 
-            pv = pricing.pv_european_option(
-                shared, time_grid, deal_data, nominal, moneyness, forward)
+        # check that the spot has a defined shape
+        if spot.shape[1] != b.shape[1]:
+            spot = spot.tile(len(deal_time), b.shape[1])
+
+        if 'Barrier_Dates' in deal_data.Factor_dep:
+            pv = pricing.pv_discrete_barrier_option(
+                shared, time_grid, deal_data, spot, b, tau, isdigital=False)
         else:
-            eq_zer_curve = utils.calc_time_grid_curve_rate(
-                deal_data.Factor_dep['Equity_Zero'], deal_time, shared)
-            eq_div_curve = utils.calc_time_grid_curve_rate(
-                deal_data.Factor_dep['Dividend_Yield'], deal_time, shared)
-            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
-
-            b = torch.squeeze(
-                eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-                eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
-
-            # check that the spot has a defined shape
-            if spot.shape[1] != b.shape[1]:
-                spot = spot.tile(len(deal_time), b.shape[1])
-
-            pv = pricing.pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)
+            pv = pricing.pv_barrier_option(
+                shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)
 
         mtm = pv * fx_rep
 
         return mtm
+
+
+class CommodityForwardDeal(Deal):
+    factor_fields = {'Currency': ['FxRate'],
+                     'Commodity': ['CommodityPrice'],
+                     'Reference_Type': ['ReferencePrice'],
+                     'Discount_Rate': ['DiscountRate']}
+
+    documentation = ('Energy', ['Described [here](Definitions#forwards)'])
+
+    def __init__(self, params, valuation_options):
+        super(CommodityForwardDeal, self).__init__(params, valuation_options)
+
+    def reset(self, calendars):
+        super(CommodityForwardDeal, self).reset()
+        self.add_reval_dates({self.field['Maturity_Date']}, self.field['Currency'])
+
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'Commodity': utils.check_rate_name(self.field['Commodity']),
+                 'Reference_Type': utils.check_rate_name(self.field['Reference_Type'])}
+
+        field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
+            field['Currency']
+
+        field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+                       'Discount': get_discount_factor(
+                           field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'Commodity_Zero': get_commodity_zero_rate_factor(
+                           field['Commodity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'Expiry': (self.field['Maturity_Date'] - base_date).days}
+
+        reference_factor, forward_factor = get_reference_factor_objects(field['Reference_Type'], all_factors)
+        field_index['base_index'] = (base_date-utils.excel_offset).days
+        field_index['ForwardPrice'], field_index['ForwardFX'], field_index['CashFX'] = get_forwardprice_factor(
+            field['Currency'], static_offsets, stochastic_offsets, all_tenors,
+            all_factors, reference_factor, forward_factor, base_date)
+
+        return field_index
+
+    def generate(self, shared, time_grid, deal_data):
+        factor_dep = deal_data.Factor_dep
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+        forward_curve = utils.calc_time_grid_curve_rate(factor_dep['ForwardPrice'], deal_time, shared)
+        spot_date_index = np.array([[factor_dep['base_index']+x[1]] for x in deal_time])
+        energy_spot = forward_curve.gather_weighted_curve(shared, spot_date_index, multiply_by_time=False)
+        T_t = factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM].reshape(-1, 1)
+        curve_grid = utils.calc_time_grid_curve_rate(factor_dep['Commodity_Zero'], deal_time, shared)
+        forward = torch.squeeze(energy_spot * torch.exp(curve_grid.gather_weighted_curve(shared, T_t)), axis=1)
+        fx_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
+        nominal = (1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0) * self.field['Units']
+
+        discount_rates = torch.squeeze(utils.calc_discount_rate(
+            discount, (factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1), shared),
+            axis=1)
+
+        cash = nominal * forward
+
+        # store the settled cashflow
+        pricing.cash_settle(shared, self.field['Currency'], deal_data.Time_dep.deal_time_grid[-1], cash[-1])
+
+        return cash * discount_rates * fx_rep
 
 
 class EquityForwardDeal(Deal):
@@ -2923,6 +3219,7 @@ class EquityForwardDeal(Deal):
         forward = utils.calc_eq_forward(
             factor_dep['Equity'], factor_dep['Equity_Zero'],
             factor_dep['Dividend_Yield'], factor_dep['Expiry'], deal_time, shared)
+
         fx_rep = utils.calc_fx_cross(
             factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
         nominal = (1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0) * self.field['Units']
@@ -3137,6 +3434,7 @@ class EquitySwapLeg(Deal):
 
 class FXOneTouchOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
+                     'Payoff_Currency': ['FxRate'],
                      'Underlying_Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'FX_Volatility': ['FXVol']}
@@ -3150,8 +3448,8 @@ class FXOneTouchOption(Deal):
 
     def reset(self, calendars):
         super(FXOneTouchOption, self).reset()
-        self.payoff_ccy = self.field[self.field['Payoff_Currency']] if self.field['Payoff_Currency'] in self.field \
-            else self.field['Payoff_Currency']
+        self.payoff_ccy = self.field['Payoff_Currency'] if 'Payoff_Currency' in self.field \
+            else self.field['Currency']
         self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def add_grid_dates(self, parser, base_date, grid):
@@ -3216,18 +3514,14 @@ class FXOneTouchOption(Deal):
                                      shared.Report_Currency, deal_time, shared)
 
         curr_curve = utils.calc_time_grid_curve_rate(
-            deal_data.Factor_dep['Currency'][1], deal_time[:-1], shared)
+            deal_data.Factor_dep['Currency'][1], deal_time, shared)
         und_curr_curve = utils.calc_time_grid_curve_rate(
-            deal_data.Factor_dep['Underlying_Currency'][1], deal_time[:-1], shared)
+            deal_data.Factor_dep['Underlying_Currency'][1], deal_time, shared)
 
         spot = utils.calc_fx_cross(deal_data.Factor_dep['Underlying_Currency'][0],
                                    deal_data.Factor_dep['Currency'][0], deal_time, shared)
 
-        # need to adjust if there's just 1 timepoint - i.e. base reval
-        if time_grid.mtm_time_grid.size > 1:
-            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])[:-1]
-        else:
-            tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
+        tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
 
         b = torch.squeeze(
             curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
@@ -3257,8 +3551,8 @@ class FXBarrierOption(Deal):
 
     def reset(self, calendars):
         super(FXBarrierOption, self).reset()
-        self.payoff_ccy = self.field[self.field['Payoff_Currency']] if self.field['Payoff_Currency'] in self.field \
-            else self.field['Payoff_Currency']
+        self.payoff_ccy = self.field['Payoff_Currency'] if 'Payoff_Currency' in self.field \
+            else self.field['Currency']
         self.add_reval_dates({self.field['Expiry_Date']}, self.payoff_ccy)
 
     def add_grid_dates(self, parser, base_date, grid):
@@ -3685,7 +3979,7 @@ class FXOptionDeal(Deal):
 class FXEuropeanOption(FXOptionDeal):
     def __init__(self, params, valuation_options):
         super(FXEuropeanOption, self).__init__(params, valuation_options)
-    
+
 
 class DealDefaultSwap(Deal):
     factor_fields = {'Currency': ['FxRate'],

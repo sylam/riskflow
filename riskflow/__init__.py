@@ -84,7 +84,6 @@ def load_market_data(rundate, path, json_name='MarketData.json', calendar_name='
     :param rundate: folder inside path where the marketdata file resides
     :param path: root folder for the marketdata, calendar and trades
     :param json_name: name of the marketdata json file (default MarketData.json)
-    :param cva_default: loads a survival curve with recovery 50% (useful for testing)
     :return: a context object with the data and calendars loaded
     """
 
@@ -140,9 +139,6 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False):
     :param context: a Context object
     :param overrides: a dictionary of overrides to replace the context's  calculation parameters
     :param prec: the numerical precision to use (default float32)
-    :param CVA: calculates CVA
-    :param FVA:  calculates FVA
-    :param CollVA:  calculates CollVA
     :return: a tuple containing the calculation object, output dictionary and exposure profile
     """
     from .calculation import construct_calculation
@@ -160,7 +156,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False):
         device = torch.device("cpu")
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
-    time_grid = str(calc_params['Base_Time_Grid'])
+    time_grid = str(calc_params.get('Base_Time_Grid', '0d 2d 1w(1w) 1m(1m) 3m(3m)'))
 
     params_mc = {'Time_grid': time_grid, 'Run_Date': rundate,
                  'Tenor_Offset': 0.0, 'Batch_Size': 1024, 'Simulation_Batches': 1}
@@ -391,7 +387,7 @@ class StressedContext(Context):
 
     def calc_stress_config(self, rate_group):
         '''
-        :param rate_type: Rate type
+        :param rate_group: Rate group (InterestRate, FxRate etc.)
         :return:
         '''
         # check if the stressed file is loaded

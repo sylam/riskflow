@@ -45,14 +45,12 @@ date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwd
 class RiskNeutralInterestRate_State(utils.Calculation_State):
     def __init__(self, batch_size, device, dtype, nomodel='Constant'):
         super(RiskNeutralInterestRate_State, self).__init__(
-            None, torch.ones([1, 1], dtype=dtype, device=device), 2048, None, nomodel)
+            None, torch.ones([1, 1], dtype=dtype, device=device), 2048, None, nomodel, batch_size)
         # these are tensors
         self.t_PreCalc = {}
         self.t_random_batch = None
         self.batch_index = 0
         self.t_Scenario_Buffer = None
-        # these are shared parameter states
-        self.simulation_batch = batch_size
 
     @property
     def t_random_numbers(self):
@@ -391,15 +389,21 @@ class CSForwardPriceModelParameters(object):
         Checks for Declining variance in the ATM vols of the relevant price factor and corrects accordingly.
         '''
 
+        def B(a, t):
+            return (1.0 - np.exp(-a * t)) / a if a != 0 else t
+
+        def V(sigma, alpha, T, S):
+            return sigma * sigma * np.exp(-2.0 * alpha * S) * B(2.0 * alpha, T)
+
         def calc_error(x, options):
             sigma, alpha = x
-            B = lambda a, t: (1.0 - np.exp(-a * t)) / a
-            V = lambda T, S: sigma * sigma * np.exp(-2.0 * alpha * S) * B(2.0 * alpha, T)
             error = 0.0
+
             for option in options:
+                discount = np.exp(-option['r'] * option['T'])
                 error += option['Weight'] * (option['Premium'] - utils.black_european_option_price(
-                    option['Forward'], option['Strike'], option['r'], V(option['T'], option['S']), option['T'],
-                    option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0)) ** 2
+                    option['Forward'], option['Strike'], 0.0, np.sqrt(V(sigma, alpha, option['T'], option['S'])),
+                    1.0, option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0) * discount) ** 2
             return error
 
         for market_price, implied_params in market_prices.items():
@@ -442,37 +446,47 @@ class CSForwardPriceModelParameters(object):
                     r = discount.current_value(t)
                     if quote_type == 'Implied_Volatility':
                         sigma = vol_surface.current_value([[t, d, 1.0]])[0] if not option['Quoted_Market_Value'] else \
-                        option['Quoted_Market_Value']
+                            option['Quoted_Market_Value']
                         sigma += vol_surface.delta
                     else:
                         logging.error('quote_type {} not supported yet'.format(quote_type))
                         continue
 
-                    option['Strike'] = forward.current_value(expiry_excel) if not option['Strike'] else option['Strike']
-                    option['Forward'] = forward.current_value(settlement_excel)
+                    option['Strike'] = forward_at_exp if not option['Strike'] else option['Strike']
+                    option['Forward'] = forward_at_settle
                     option['r'] = r
                     option['S'] = d
                     option['T'] = t
+                    option['sigma'] = sigma
                     option['Premium'] = utils.black_european_option_price(
                         option['Forward'], option['Strike'], r, sigma, t,
                         option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0)
-                    logging.info(
-                        'Commodity {} forward {}, strike {}, expiry {}'.format(
-                            implied_params['instrument']['Energy'], option['Forward'],
-                            option['Strike'], option['Expiry_Date']))
 
                 result = scipy.optimize.minimize(
                     calc_error, (0.5, 0.1),
                     args=(implied_params['instrument']['Energy_Futures_Options'],),
-                    bounds=[(0.001, 2.5), (0.001, 2.0)])
+                    bounds=[(0.001, 2.5), (-1, 2.0)])
+
+                # log the results
+                for option in implied_params['instrument']['Energy_Futures_Options']:
+                    vol = np.sqrt(V(result.x[0], result.x[1], option['T'], option['S']) / option['T'])
+                    discount = np.exp(-option['r'] * option['T'])
+                    fitted_premium = utils.black_european_option_price(
+                        option['Forward'], option['Strike'], 0.0,
+                        np.sqrt(V(result.x[0], result.x[1], option['T'], option['S'])),
+                        1.0, option['Units'], 1.0 if option['Option_Type'] == 'Call' else -1.0) * discount
+                    err = (fitted_premium - option['Premium']) ** 2
+                    logging.info(
+                        'Commodity {} strike {}, expiry {}, vol {}, c_vol {}, premium {}, c_premium {}, err {}'.format(
+                            implied_params['instrument']['Energy'], option['Strike'], option['Expiry_Date'],
+                            option['sigma'], vol, option['Premium'], fitted_premium, err))
 
                 price_param = utils.Factor(self.__class__.__name__, market_factor.name)
-                # model_param = utils.Factor('GBMAssetPriceTSModelImplied', market_factor.name)
 
                 price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
                     [('Property_Aliases', None),
-                     ('Sigma', result.x[1]),
-                     ('Alpha', result.x[0])])
+                     ('Sigma', result.x[0]),
+                     ('Alpha', result.x[1])])
 
 
 class GBMAssetPriceTSModelParameters(object):
@@ -750,7 +764,7 @@ class RiskNeutralInterestRateModel(object):
                 # minimize
                 result = None
                 num_optimizers = len(optimizers)
-                for op_loop in range(2 * num_optimizers):
+                for op_loop in range(num_optimizers):
                     optim = optimizers[op_loop % num_optimizers]
                     x0 = result['x'] if result is not None else optim[1]
                     if optim[0] == 'basin':
@@ -927,7 +941,7 @@ scipy.optimize.leastsq.html) are used.',
         # HullWhite2FactorInterestRateModelPrices
         self.market_factor_type = 'HullWhite2FactorModelPrices'
         self.sigma_bounds = (1e-5, 0.09)
-        self.alpha_bounds = (1e-5, 2.4)
+        self.alpha_bounds = (-0.5, 2.4)
         self.corr_bounds = (-.95, 0.95)
 
     def calc_jacobians(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):

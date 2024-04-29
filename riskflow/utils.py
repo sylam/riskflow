@@ -18,7 +18,8 @@
 
 import calendar
 import functools
-from functools import reduce
+import traceback
+from functools import reduce, wraps
 from collections import namedtuple, OrderedDict
 from typing import Tuple, List
 
@@ -189,6 +190,24 @@ class InstrumentExpired(Exception):
         self.message = message
 
 
+def log_exception(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except KeyError as k:
+            # we are okay to pass keyerrors back to the calling code
+            raise
+        except Exception as e:
+            # Log the exception with traceback and context
+            logging.error(f"An error occurred in function '{func.__name__}': {e}")
+            logging.error(traceback.format_exc())
+            # Re-raise the exception
+            raise
+
+    return wrapper
+
+
 # Defined types - things like percentages, basis points etc.
 
 class Descriptor:
@@ -302,9 +321,6 @@ class DateList:
     def __init__(self, data):
         self.data = OrderedDict(data)
         self.dates = set()
-
-    def last(self):
-        return self.data.values()[-1] if self.data.values() else 0.0
 
     def __str__(self):
         return '\\'.join(
@@ -420,13 +436,15 @@ class Calculation_State(object):
     should inherit from this calculation state and extend accordingly
     """
 
-    def __init__(self, static_buffer, unit, mcmc_sims, report_currency: List[Tuple[bool, int]], nomodel: str):
+    def __init__(self, static_buffer, unit, mcmc_sims, report_currency: List[Tuple[bool, int]],
+                 nomodel: str, simulation_batch: int):
         # these are tensors
         self.t_Buffer = {}
         self.t_Static_Buffer = static_buffer
         # storing a unit tensor allows the dtype and device to be encoded in the calculation state
         self.one = unit
-        self.simulation_batch = 1
+        self.fillvalue = unit.new_zeros((0, 1, simulation_batch))
+        self.simulation_batch = simulation_batch
         self.Report_Currency = report_currency
         self.t_Cashflows = None
         # these are shared parameter states
@@ -434,7 +452,7 @@ class Calculation_State(object):
         self.MCMC_sims = mcmc_sims
 
 
-# often we need a numpy array and it's tensor equivalent at the same time
+# often we need a numpy array and its tensor equivalent at the same time
 class DualArray:
     def __init__(self, tensor, ndarray):
         self.np = ndarray
@@ -477,7 +495,11 @@ class TensorSchedule(object):
             self.reinitialize(unit)
 
         if 'dual' not in self.cache:
-            merged = np.concatenate((self.schedule, self.offsets), axis=1)
+            if len(self.schedule) < len(self.offsets):
+                raise Exception('Schedule and offset mismatch')
+                merged = np.concatenate((self.schedule, self.offsets[:len(self.schedule)]), axis=1)
+            else:
+                merged = np.concatenate((self.schedule, self.offsets), axis=1)
             self.cache['dual'] = DualArray(self.unit.new_tensor(merged), merged)
         return self.cache['dual'][index:]
 
@@ -614,6 +636,29 @@ class TensorResets(TensorSchedule):
                                    for x in self.schedule if filter_fn(x[filter_index])]
         return self.cache[key]
 
+    def get_simulated_resets(self, max_time, forward, shared):
+        within_horizon = (self.offsets > -1) & (self.schedule[:, RESET_INDEX_Reset_Day] <= max_time)
+        sim_resets = self.dual()[within_horizon]
+        known_resets = self.known_resets(shared.simulation_batch)
+        old_resets = calc_time_grid_curve_rate(
+            forward, sim_resets.np[:, :RESET_INDEX_Scenario + 1], shared)
+        delta_start = (sim_resets.np[:, RESET_INDEX_Start_Day] -
+                       sim_resets.np[:, RESET_INDEX_Reset_Day]).reshape(-1, 1)
+        delta_end = (sim_resets.np[:, RESET_INDEX_End_Day] -
+                     sim_resets.np[:, RESET_INDEX_Reset_Day]).reshape(-1, 1)
+        reset_weights = (sim_resets.tn[:, RESET_INDEX_Weight] /
+                         sim_resets.tn[:, RESET_INDEX_Accrual]).reshape(-1, 1, 1)
+
+        reset_values = torch.expm1(
+            old_resets.gather_weighted_curve(shared, delta_end, delta_start)) * reset_weights \
+            if sim_resets.np.any() else shared.fillvalue
+
+        # fetch all fixed resets
+        return torch.squeeze(
+            torch.concat(
+                [shared.fillvalue if not known_resets else torch.stack(known_resets), reset_values], axis=0)
+            , axis=1)
+
     def split_block_resets(self, reset_offset, t, date_offset=0):
         all_resets = self.schedule[reset_offset:]
         future_resets = np.searchsorted(all_resets[:, RESET_INDEX_Reset_Day] - date_offset, t)
@@ -748,15 +793,13 @@ class TensorCashFlows(TensorSchedule):
         return self.Resets.reinitialize(unit)
 
     def known_fx_resets(self, num_scenarios, index=CASHFLOW_INDEX_FXResetValue,
-                        filter_index=RESET_INDEX_Reset_Day):
+                        filter_index=CASHFLOW_INDEX_FXResetDate):
 
-        # note that we use the RESET_INDEX_Reset_Day for determining known FX resets
-        # we only use CASHFLOW_INDEX_FXResetDate for future FX Resets - it's a little confusing
-        if self.Resets.cache.get(('known_fx_resets', num_scenarios)) is None:
-            self.Resets.cache[('known_fx_resets', num_scenarios)] = [
+        if self.cache.get(('known_fx_resets', num_scenarios)) is None:
+            self.cache[('known_fx_resets', num_scenarios)] = [
                 self.Resets.unit.new_full((1, num_scenarios), x[index])
-                for x, r in zip(self.schedule, self.Resets.schedule) if r[filter_index] < 0.0]
-        return self.Resets.cache.get(('known_fx_resets', num_scenarios))
+                for x in self.schedule if x[filter_index] < 0.0]
+        return self.cache.get(('known_fx_resets', num_scenarios))
 
     def get_par_swap_rate(self, base_date, ir_curve):
         """Used to calculate the par swap rate for these cashflows given an interest rate curve"""
@@ -790,7 +833,8 @@ class TensorCashFlows(TensorSchedule):
             last_cashflow[CASHFLOW_INDEX_End_Day] - last_cashflow[CASHFLOW_INDEX_Start_Day] + 1, daycount_code)
 
     def set_resets(self, schedule, offsets, isFloat=False):
-        self.Resets = FloatTensorResets(schedule, offsets) if isFloat else TensorResets(schedule, offsets)
+        # self.Resets = FloatTensorResets(schedule, offsets) if isFloat else TensorResets(schedule, offsets)
+        self.Resets = TensorResets(schedule, offsets)
 
     def overwrite_rate(self, attribute_index, value):
         """
@@ -799,6 +843,16 @@ class TensorCashFlows(TensorSchedule):
         for cashflow in self.schedule:
             cashflow[attribute_index] = value
         self.cache = None
+
+    def set_future_fx_resets(self, max_time, time_grid):
+        FXResets = []
+        valid = (self.schedule[:, CASHFLOW_INDEX_FXResetDate] <= max_time) & (
+                self.schedule[:, CASHFLOW_INDEX_FXResetDate] >= 0)
+        for cashflow in self.schedule:
+            Reset_Day = cashflow[CASHFLOW_INDEX_FXResetDate]
+            Time_Grid, Scenario = time_grid.get_scenario_offset(Reset_Day)
+            FXResets.append([Time_Grid, Reset_Day, Scenario])
+        self.FXResets = np.array(FXResets)[valid]
 
     def add_mtm_payments(self, base_date, principal_exchange, effective_date, day_count):
         ''' MTM CCIRS's only need a zero marker for the nominal should the effective date be in the future '''
@@ -1450,8 +1504,8 @@ def calc_eq_forward(equity, repo, div_yield, T, time_grid, shared, only_diag=Fal
                 calc_spot_forward(repo, T, time_grid, shared, only_diag) -
                 calc_spot_forward(div_yield, T, time_grid, shared, only_diag))
         else:
-            drift = torch.ones([time_grid.shape[0], 1 if only_diag else T_t.size, 1],
-                               dtype=shared.one.dtype)
+            drift = shared.one.new_ones(
+                [time_grid.shape[0], 1 if only_diag else T_t.size, 1])
 
         shared.t_Buffer[key_code] = spot * torch.squeeze(drift, axis=1) \
             if T_scalar else torch.unsqueeze(spot, axis=1) * drift
@@ -1951,7 +2005,7 @@ def calc_statistics(data_frame, method='Log', num_business_days=252.0, frequency
         # get rid of any infs
         theta.replace([np.inf, -np.inf], np.nan, inplace=True)
 
-        # ignore any outlier greater then 2 std deviations from the median
+        # ignore any outlier greater than 2 std deviations from the median
         median = theta.median()
         theta[np.abs(theta - median) > (2 * theta.std())] = np.nan
 
@@ -1979,7 +2033,7 @@ def traverse_dependents(x, adj):
 
 def topological_sort(graph_unsorted):
     """
-    Repeatedly go through all of the nodes in the graph, moving each of
+    Repeatedly go through all the nodes in the graph, moving each of
     the nodes that has all its edges resolved, onto a sequence that
     forms our sorted graph. A node has all of its edges resolved and
     can be moved once all the nodes its edges point to, have been moved
@@ -2104,6 +2158,13 @@ def check_scope_name(factor):
         str.maketrans({'#': '_', ':': '_', ' ': '_', '(': '_', '/': '_', '+': '_', '%': '_', '*': '_', ')': '_'}))
 
 
+def check_fx_name(fx_correlation):
+    """FX rates must be sorted alphabetically - however, often we need correlations with non-alphabetical fx rates.
+    In this case, we need to know we're actually using the reverse pair (i.e. -1) as opposed to the sorted name"""
+    ccy1, ccy2 = fx_correlation
+    return (1.0, (ccy1, ccy2)) if ccy1 < ccy2 else (-1.0, (ccy2, ccy1))
+
+
 def check_tensor_name(name, scope):
     return '/'.join(name.split('/')[:2] + [scope]).translate(
         str.maketrans({'#': '_', ':': '_', ' ': '_', '(': '_', '+': '_', ')': '_'}))
@@ -2209,7 +2270,7 @@ def generate_float_cashflows(reference_date, time_grid, reset_dates, nominal, am
             if closest_date is not None:
                 min_date = closest_date if min_date is None else max(min_date, closest_date)
 
-            # only add a reset if its in the past
+            # only add a reset if it's in the past
             r.append([Time_Grid, Reset_Day, -1, Start_Day, End_Day, Weight,
                       Value / 100.0 if reset_day < reference_date else 0.0, Accrual])
             reset_scenario_offsets.append(Scenario)
@@ -2558,7 +2619,7 @@ def make_float_cashflows(reference_date, time_grid, position, cashflows):
                 Accrual = reset[3]
                 Weight = 1.0 / len(cashflow['Resets'])
                 Time_Grid, Scenario = time_grid.get_scenario_offset(Reset_Day)
-                # only add a reset if its in the past
+                # only add a reset if it's in the past
                 r.append([Time_Grid, Reset_Day, -1, Start_Day, End_Day, Weight,
                           reset[-1].amount if reset[0] < reference_date else 0.0, Accrual])
                 reset_scenario_offsets.append(Scenario)
@@ -2824,57 +2885,88 @@ def compress_deal_data(deals):
 
 
 def compress_no_compounding(cashflows, groupsize, check_resets=True):
+    '''
+
+    :param cashflows: cashflows to compress
+    :param groupsize: -1 to keep all resets (and just regroup them), otherwise, sample this many groups per cashflow
+    :param check_resets: make sure all resets are in the future
+    :return: the compressed cashflows if we can approximate many resets by fewer groups otherwise, return the
+            original cashflows
+
+    Needs more Testing - !TODO!
+    '''
     cash_pmts, cash_index, cash_counts = np.unique(
         cashflows.schedule[:, CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
 
-    if (cashflows.offsets[:, 0] == 1).all() and (cash_counts > groupsize).any():
-        # can compress
-        cash, cashflow_reset_offsets = [], []
-        all_resets, reset_scenario_offsets = [], []
-        for pay_day, index, num_cf in zip(*[cash_pmts, cash_index, cash_counts]):
-            cashflow_schedule = cashflows.schedule[index:index + num_cf]
-            cashflow_offsets = cashflows.offsets[index:index + num_cf]
-            reset_offset = cashflows.offsets[index:index + num_cf, 1]
-            nominals = np.unique(cashflow_schedule[:, CASHFLOW_INDEX_Nominal])
-            margins = np.unique(cashflow_schedule[:, CASHFLOW_INDEX_FloatMargin])
-            if nominals.size <= groupsize and margins.size <= groupsize and (check_resets and not (
-                    cashflows.Resets[reset_offset, RESET_INDEX_Reset_Day] < 0).any() or not check_resets):
+    if (cashflows.offsets[:, 0] == 1).all():
+        if (cash_counts > abs(groupsize)).any():
+            # can compress
+            cash, cashflow_reset_offsets = [], []
+            all_resets, reset_scenario_offsets = [], []
+            for pay_day, index, num_cf in zip(*[cash_pmts, cash_index, cash_counts]):
+                cashflow_schedule = cashflows.schedule[index:index + num_cf]
+                cashflow_offsets = cashflows.offsets[index:index + num_cf]
+                reset_offset = cashflows.offsets[index:index + num_cf, 1]
+                nominals = np.unique(cashflow_schedule[:, CASHFLOW_INDEX_Nominal])
+                margins = np.unique(cashflow_schedule[:, CASHFLOW_INDEX_FloatMargin])
 
-                # we can compress this
-                for cash_group, ofs_group in zip(*map(
-                        lambda x: np.array_split(x, groupsize), [cashflow_schedule, cashflow_offsets])):
+                if groupsize == -1 and nominals.size == 1 and margins.size == 1:
+                    # we can compress this
                     cash.append(
-                        [cash_group[0, CASHFLOW_INDEX_Start_Day],
-                         cash_group[-1, CASHFLOW_INDEX_End_Day],
+                        [cashflow_schedule[0, CASHFLOW_INDEX_Start_Day],
+                         cashflow_schedule[-1, CASHFLOW_INDEX_End_Day],
                          pay_day,
-                         cash_group[:, CASHFLOW_INDEX_Year_Frac].sum(),
-                         # not strictly correct - need to break this up - TODO
-                         cash_group[:, CASHFLOW_INDEX_Nominal].mean(),
-                         cash_group[:, CASHFLOW_INDEX_FixedAmt].sum(),
-                         # not strictly correct - need to break this up - TODO
-                         cash_group[:, CASHFLOW_INDEX_FloatMargin].mean(),
-                         cash_group[0, CASHFLOW_INDEX_FXResetDate],
-                         cash_group[0, CASHFLOW_INDEX_FXResetValue]])
+                         cashflow_schedule[:, CASHFLOW_INDEX_Year_Frac].sum(),
+                         cashflow_schedule[:, CASHFLOW_INDEX_Nominal].mean(),
+                         cashflow_schedule[:, CASHFLOW_INDEX_FixedAmt].sum(),
+                         cashflow_schedule[:, CASHFLOW_INDEX_FloatMargin].mean(),
+                         cashflow_schedule[0, CASHFLOW_INDEX_FXResetDate],
+                         cashflow_schedule[0, CASHFLOW_INDEX_FXResetValue]])
 
-                    reset_index = ofs_group[ofs_group[:, 1].size // 2, 1]
+                    cashflow_reset_offsets.append([num_cf, index, 1])
+                    all_resets.extend(cashflows.Resets[reset_offset].tolist())
+                    reset_scenario_offsets.extend(cashflows.Resets.offsets[reset_offset].tolist())
 
-                    cashflow_reset_offsets.append([1, len(all_resets), 0])
-                    reset_scenario_offsets.append(cashflows.Resets.offsets[reset_index])
-                    all_resets.append(cashflows.Resets[reset_index].tolist())
+                elif nominals.size <= groupsize and margins.size <= groupsize and (check_resets and not (
+                        cashflows.Resets[reset_offset, RESET_INDEX_Reset_Day] < 0).any() or not check_resets):
+                    # we can compress this
+                    for cash_group, ofs_group in zip(*map(
+                            lambda x: np.array_split(x, groupsize), [cashflow_schedule, cashflow_offsets])):
+                        cash.append(
+                            [cash_group[0, CASHFLOW_INDEX_Start_Day],
+                             cash_group[-1, CASHFLOW_INDEX_End_Day],
+                             pay_day,
+                             cash_group[:, CASHFLOW_INDEX_Year_Frac].sum(),
+                             # not strictly correct - need to break this up - TODO
+                             cash_group[:, CASHFLOW_INDEX_Nominal].mean(),
+                             cash_group[:, CASHFLOW_INDEX_FixedAmt].sum(),
+                             # not strictly correct - need to break this up - TODO
+                             cash_group[:, CASHFLOW_INDEX_FloatMargin].mean(),
+                             cash_group[0, CASHFLOW_INDEX_FXResetDate],
+                             cash_group[0, CASHFLOW_INDEX_FXResetValue]])
+
+                        reset_index = ofs_group[ofs_group[:, 1].size // 2, 1]
+                        cashflow_reset_offsets.append([1, len(all_resets), 0])
+                        reset_scenario_offsets.append(cashflows.Resets.offsets[reset_index])
+                        all_resets.append(cashflows.Resets[reset_index].tolist())
+
+                else:
+                    # copy as is
+                    cash.extend(cashflow_schedule.tolist())
+                    all_resets.extend(cashflows.Resets[reset_offset].tolist())
+                    reset_scenario_offsets.extend(cashflows.Resets.offsets[reset_offset].tolist())
+                    cashflow_reset_offsets.extend(cashflows.offsets[index:index + num_cf].tolist())
+
+            approx_cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
+            approx_cashflows.set_resets(all_resets, reset_scenario_offsets, isFloat=True)
+            if cashflows.Resets.count() == approx_cashflows.Resets.count():
+                logging.warning('Cashflows rebased from {} resets'.format(cashflows.Resets.count()))
             else:
-                # copy as is
-                cash.extend(cashflow_schedule.tolist())
-                all_resets.extend(cashflows.Resets[reset_offset].tolist())
-                reset_scenario_offsets.extend(cashflows.Resets.offsets[reset_offset].tolist())
-                cashflow_reset_offsets.extend(cashflows.offsets[index:index + num_cf].tolist())
+                logging.warning('Cashflows reduced from {} resets to {} resets'.format(
+                    cashflows.Resets.count(), approx_cashflows.Resets.count()))
+            return approx_cashflows
 
-        approx_cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
-        approx_cashflows.set_resets(all_resets, reset_scenario_offsets, isFloat=True)
-        logging.warning('Cashflows reduced from {} resets to {} resets'.format(
-            cashflows.Resets.count(), approx_cashflows.Resets.count()))
-        return approx_cashflows
-    else:
-        return cashflows
+    return cashflows
 
 
 if __name__ == '__main__':

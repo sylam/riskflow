@@ -17,6 +17,7 @@
 ########################################################################
 
 # import standard libraries
+import logging
 import itertools
 import numpy as np
 import pandas as pd
@@ -31,7 +32,9 @@ factor_interp_map = {
     'HermiteInterpolationCurveGetValue': 'Hermite',
     'LinearInterFlatExtrapCurveGetValue': 'Linear',
     'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT',
-    'HermiteRTInterpolationCurveGetValue': 'HermiteRT'
+    'HermiteRTInterpolationCurveGetValue': 'HermiteRT',
+    'NaturalCubicSplineCurveInterLinearExtrap': 'Hermite',
+    'LogNaturalCubicSplineCurveInterFlatExtrap': 'HermiteRT'
 }
 
 
@@ -352,6 +355,20 @@ class EquityPrice(Factor0D):
 
     def get_currency(self):
         return utils.check_rate_name(self.param['Currency'])
+
+
+class CommodityPrice(EquityPrice):
+    """
+    This is just the commodity description. We don't use the price defined here
+    we instead use the forwardPrice linked to the reference price. We just need this object
+    to read the carry curve and the currency
+    """
+    field_desc = ('Commodity',
+                  ['- **Currency**: String',
+                   '- **Interest_Rate**: String representing the equity repo curve',
+                   '- **Spot**:Spot rate in the specified *Currency*'])
+    def __init__(self, param):
+        super(CommodityPrice, self).__init__(param)
 
 
 class ForwardPriceSample(Factor0D):
@@ -786,7 +803,17 @@ class HullWhite2FactorModelParameters(Factor1D):
     def get_quanto_correlation(self, corr, vols):
         C = self.get_instantaneous_correlation()
         if C is not None:
-            s1, s2, p = vols[0][-1], vols[1][-1], corr[0]
+            # we calculate the average value of the vol curves
+            s1 = sum([x * y for x, y in zip(
+                np.diff(self.param['Sigma_1'].array[:, 0]),
+                (vols[0][:-1] + vols[0][1:]) / 2)]) / self.param['Sigma_1'].array[-1, 0] if len(
+                self.param['Sigma_1'].array) > 1 else vols[0][0]
+            s2 = sum([x * y for x, y in zip(
+                np.diff(self.param['Sigma_2'].array[:, 0]),
+                (vols[1][:-1] + vols[1][1:]) / 2)]) / self.param['Sigma_2'].array[-1, 0] if len(
+                self.param['Sigma_2'].array) > 1 else vols[1][0]
+            # s1, s2, p = vols[0][-1], vols[1][-1], corr[0]
+            p = corr[0]
             scale = C / (s1 ** 2 + s2 ** 2 + 2.0 * p * s1 * s2) ** .5
             return [scale * (s1 + p * s2), scale * (p * s1 + s2)]
         else:
@@ -1051,9 +1078,12 @@ class ForwardPriceVol(Factor3D):
         return self.sorted_vol[:, :3]
 
 
+@utils.log_exception
 def construct_factor(factor, price_factors, factor_interp):
     # now lookup the params of the factor
     price_factor = price_factors[utils.check_tuple_name(factor)]
+    # change the logging name in case there are any errors
+    logging.root.name = '.'.join(factor.name)
     # check the interpolation on interest Rates - can add more methods/price factors as desired
     if factor.type == 'InterestRate':
         interp_method = factor_interp.search(factor, price_factor, True)
