@@ -1631,6 +1631,7 @@ mapping = {
                                         ['Date', 'Amount']
                                     },
             'Equity': {'widget': 'Text', 'description': 'Equity', 'value': '', 'obj': 'Tuple'},  # tuple
+            'Commodity': {'widget': 'Text', 'description': 'Commodity', 'value': '', 'obj': 'Tuple'},  # tuple
             'Receive_Discount_Rate': {'widget': 'Text', 'description': 'Receive Discount Rate', 'value': '',
                                       'obj': 'Tuple'},  # tuple
             'Pay_Penultimate_Coupon_Date': {'widget': 'DatePicker', 'description': 'Pay Penultimate Coupon Date',

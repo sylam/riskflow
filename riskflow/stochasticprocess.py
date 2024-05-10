@@ -262,7 +262,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         # calc vols
         vol_tenor = self.implied.param['Vol'].array[:, 0]
         self.V = torch.unsqueeze(integrate_piecewise_linear(
-            (calc_vol, 1.0), shared, time_grid.time_grid_years, vol_tenor, implied_tensor['Vol']), axis=1)
+            (calc_vol, 1.0), shared, time_grid.time_grid_years, vol_tenor, implied_tensor['Vol']), dim=1)
         # calc the incremental vol
         self.delta_vol = F.pad(torch.sqrt(self.V[1:] - self.V[:-1]), (0, 0, 1, 0))
         self.delta_scen_t = np.insert(np.diff(time_grid.scen_time_grid), 0, 0).reshape(-1, 1)
@@ -276,7 +276,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
             self.C = torch.unsqueeze(integrate_piecewise_linear(
                 (cal_quanto_fx_vol, 1.0), shared, time_grid.time_grid_years,
                 vol_tenor, implied_tensor['Vol'], self.quanto_fx_tenor, implied_tensor['Quanto_FX_Volatility']),
-                axis=1)
+                dim=1)
             self.rho = implied_tensor['Quanto_FX_Correlation']
         else:
             self.C = 0.0
@@ -317,7 +317,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
 
     def generate(self, shared_mem):
         f1 = torch.cumsum(
-            self.delta_vol * shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], axis=0)
+            self.delta_vol * shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], dim=0)
 
         rt = utils.calc_time_grid_curve_rate(self.r_t, self.scen_grid, shared_mem)
         qt = utils.calc_time_grid_curve_rate(self.q_t, self.scen_grid, shared_mem)
@@ -325,7 +325,7 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         rt_rates = rt.gather_weighted_curve(shared_mem, self.delta_scen_t)
         qt_rates = qt.gather_weighted_curve(shared_mem, self.delta_scen_t)
 
-        drift = torch.cumsum(torch.squeeze(rt_rates - qt_rates, axis=1), axis=0)
+        drift = torch.cumsum(torch.squeeze(rt_rates - qt_rates, dim=1), dim=0)
 
         return self.spot * torch.exp(drift - self.rho * self.C - 0.5 * self.V + f1)
 
@@ -380,7 +380,7 @@ class GBMPriceIndexModel(StochasticProcess):
 
     def generate(self, shared_mem):
         f1 = torch.cumsum(self.drift + self.vol *
-                          shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], axis=0)
+                          shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], dim=0)
         return self.spot * torch.exp(f1)
 
 
@@ -548,7 +548,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
 
             # all together now
             AtT += rho[i][j] * torch.matmul(
-                torch.cat([first_part, second_part, third_part], axis=1),
+                torch.cat([first_part, second_part, third_part], dim=1),
                 torch.stack([BtT[j] * BtT[i], BtT[i] / alpha[j], BtT[j] / alpha[i]]))
 
         t_CtT = torch.stack(CtT).T
@@ -592,10 +592,10 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
 
     def calc_factors(self, factor1, factor1and2):
         f1 = torch.unsqueeze(
-            (torch.cumsum(factor1 * self.F1, axis=0) - self.KtT[0] + self.HtT[0]) * self.YtT[0], axis=1)
+            (torch.cumsum(factor1 * self.F1, dim=0) - self.KtT[0] + self.HtT[0]) * self.YtT[0], dim=1)
         f2 = torch.unsqueeze(
-            (torch.cumsum(torch.sum(factor1and2 * self.F2, axis=0), axis=0) - self.KtT[1] + self.HtT[1]) * self.YtT[1],
-            axis=1)
+            (torch.cumsum(torch.sum(factor1and2 * self.F2, dim=0), dim=0) - self.KtT[1] + self.HtT[1]) * self.YtT[1],
+            dim=1)
         return f1, f2
 
     @property
@@ -922,11 +922,11 @@ class CSForwardPriceModel(StochasticProcess):
                     2.0 * implied_tensor['Alpha'])
             var = torch.square(implied_tensor['Sigma']) * torch.exp(
                 -2.0 * implied_tensor['Alpha'] * tensor.new(tenors)) * var_adj
-            delta_var = torch.diff(F.pad(var, [0, 0, 1, 0]), axis=0)
+            delta_var = torch.diff(F.pad(var, [0, 0, 1, 0]), dim=0)
             safe_delta = torch.where(delta_var > 0.0, delta_var, torch.ones_like(delta_var))
             vol = torch.where(delta_var > 0.0, torch.sqrt(safe_delta), torch.zeros_like(delta_var))
-            self.vol = torch.unsqueeze(vol, axis=2)
-            self.drift = torch.unsqueeze(-0.5 * var, axis=2)
+            self.vol = torch.unsqueeze(vol, dim=2)
+            self.drift = torch.unsqueeze(-0.5 * var, dim=2)
 
     @property
     def correlation_name(self):
@@ -935,9 +935,9 @@ class CSForwardPriceModel(StochasticProcess):
     def generate(self, shared_mem):
         z_portion = torch.unsqueeze(
             shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
-            axis=1) * self.vol
+            dim=1) * self.vol
 
-        return self.initial_curve * torch.exp(self.drift + torch.cumsum(z_portion, axis=0))
+        return self.initial_curve * torch.exp(self.drift + torch.cumsum(z_portion, dim=0))
 
 
 class CSImpliedForwardPriceModel(CSForwardPriceModel):

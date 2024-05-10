@@ -352,7 +352,7 @@ class CMC_State(utils.Calculation_State):
         ).reshape(num_factors, time_grid.scen_time_grid.size, -1)
 
         if use_antithetic:
-            self.t_random_numbers = torch.concat([correlated_sample, -correlated_sample], axis=-1)
+            self.t_random_numbers = torch.concat([correlated_sample, -correlated_sample], dim=-1)
         else:
             self.t_random_numbers = correlated_sample
 
@@ -953,7 +953,7 @@ class Credit_Monte_Carlo(Calculation):
             if params.get('Collateral_Valuation_Adjustment', {}).get(
                     'Calculate', 'No') == 'Yes' and 'Funding' in shared_mem.t_Credit:
 
-                tensors['collva_t'] = torch.mean(shared_mem.t_Credit['Funding'], axis=1)
+                tensors['collva_t'] = torch.mean(shared_mem.t_Credit['Funding'], dim=1)
                 tensors['collva'] = torch.sum(tensors['collva_t'])
 
                 if params['Collateral_Valuation_Adjustment'].get('Gradient', 'No') == 'Yes':
@@ -985,12 +985,12 @@ class Credit_Monte_Carlo(Calculation):
 
                 Dc_over_f_tT_m1 = torch.expm1(
                     torch.squeeze(discount_funding.gather_weighted_curve(shared_mem, delta_scen_t) -
-                                  discount_collateral.gather_weighted_curve(shared_mem, delta_scen_t), axis=1)
+                                  discount_collateral.gather_weighted_curve(shared_mem, delta_scen_t), dim=1)
                 )
 
                 Dc0_T = torch.exp(
                     -torch.squeeze(
-                        discount_collateral_t0.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1)), axis=0))
+                        discount_collateral_t0.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1)), dim=0))
 
                 tensors['legacy_fva'] = (tensors['mtm'] * Dc_over_f_tT_m1 * Dc0_T).mean(axis=1).sum()
 
@@ -1020,13 +1020,13 @@ class Credit_Monte_Carlo(Calculation):
                         self.static_ofs, self.stoch_ofs, self.all_tenors)
                     surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), shared_mem)
                     St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
-                        shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), axis=0)
+                        shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), dim=0)
                 else:
                     St_T = torch.ones((1, 1), dtype=self.dtype, device=self.device)
 
                 deflation = utils.calc_time_grid_curve_rate(riskfree, np.zeros((1, 3)), shared_mem)
                 DF_rf = torch.squeeze(torch.exp(-deflation.gather_weighted_curve(
-                    shared_mem, mtm_grid.reshape(1, -1))), axis=0)
+                    shared_mem, mtm_grid.reshape(1, -1))), dim=0)
 
                 if params['Funding_Valuation_Adjustment'].get('Deflate_Stochastically', 'No') == 'Yes':
                     Vk_plus_ti = torch.relu(tensors['mtm'] * DF_rf)
@@ -1043,11 +1043,11 @@ class Credit_Monte_Carlo(Calculation):
 
                     delta_fund_rf = torch.squeeze(
                         torch.exp(discount_fund.gather_weighted_curve(shared_mem, delta_scen_t)) -
-                        torch.exp(discount_rf.gather_weighted_curve(shared_mem, delta_scen_t)), axis=1) * St_T
+                        torch.exp(discount_rf.gather_weighted_curve(shared_mem, delta_scen_t)), dim=1) * St_T
 
-                    FCA_t = torch.sum(delta_fund_rf[1:] * Vk_star_ti_p, axis=0)
+                    FCA_t = torch.sum(delta_fund_rf[1:] * Vk_star_ti_p, dim=0)
                     FCA = torch.mean(FCA_t)
-                    FBA_t = torch.sum(delta_fund_rf[1:] * Vk_star_ti_m, axis=0)
+                    FBA_t = torch.sum(delta_fund_rf[1:] * Vk_star_ti_m, dim=0)
                     FBA = torch.mean(FBA_t)
                 else:
                     pass
@@ -1083,11 +1083,11 @@ class Credit_Monte_Carlo(Calculation):
                     zero = utils.calc_time_grid_curve_rate(
                         discount, self.time_grid.time_grid[time_grid], shared_mem)
                     Dt_T = torch.exp(-torch.squeeze(zero.gather_weighted_curve(
-                        shared_mem, delta_scen_t.reshape(-1, 1))).cumsum(axis=0))
+                        shared_mem, delta_scen_t.reshape(-1, 1))).cumsum(dim=0))
                 else:
                     zero = utils.calc_time_grid_curve_rate(discount, np.zeros((1, 3)), shared_mem)
                     Dt_T = torch.squeeze(torch.exp(
-                        -zero.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1))), axis=0)
+                        -zero.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1))), dim=0)
 
                 pv_exposure = torch.relu(tensors['mtm'] * Dt_T)
 
@@ -1095,12 +1095,12 @@ class Credit_Monte_Carlo(Calculation):
                     surv = utils.calc_time_grid_curve_rate(
                         survival, self.time_grid.time_grid[time_grid], shared_mem)
                     St_T = torch.exp(-torch.cumsum(torch.squeeze(surv.gather_weighted_curve(
-                        shared_mem, delta_scen_t.reshape(-1, 1), multiply_by_time=False), axis=1),
-                        axis=0))
+                        shared_mem, delta_scen_t.reshape(-1, 1), multiply_by_time=False), dim=1),
+                        dim=0))
                 else:
                     surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), shared_mem)
                     St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
-                        shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), axis=0)
+                        shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), dim=0)
 
                 prob = St_T[:-1] - St_T[1:]
                 tensors['cva'] = (1.0 - recovery) * (

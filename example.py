@@ -280,7 +280,7 @@ if __name__ == '__main__':
     path = paths['PFE']
 
     # rundate = '2024-03-26'
-    rundate = '2024-04-22'
+    rundate = '2024-04-29'
     # rundate = '2023-05-31'
 
     # calibrate_PFE(path, rundate)
@@ -328,11 +328,12 @@ if __name__ == '__main__':
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_CS_Int_London_*.json')):
     # for json in glob.glob(os.path.join('C:\\Users\\shuaib.osman\\Downloads\\autocalls', '153899419.json')):
-    for json in glob.glob(os.path.join('C:\\Users\\shuaib.osman\\Downloads', 'InputAAJ_CrB_UBS_AG_Zurich_*.json')):
+    # for json in glob.glob(os.path.join('C:\\Users\\shuaib.osman\\Downloads', 'InputAAJ_CrB_UBS_AG_Zurich_*.json')):
     # for json in glob.glob(os.path.join('Z:\\', 'baesval_158795766.json')):
 
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Goldman_Sachs_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Sanlam_Life_Insurance_*.json')):
     ## for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_StanChart_Ldn_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
@@ -341,7 +342,7 @@ if __name__ == '__main__':
 
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_National_Home_Builders_Registration_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_AutoX__Pty__Ltd_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Citibank_NA_NY_*.json')):
+    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Citibank_NA_NY_*.json')):
     # for json in glob.glob(os.path.join('C:\\Users\\shuaib.osman\\Downloads', 'InputAAJ_CrB_Citibank_NA_NY_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_FirstRand_Bank_Ltd_*.json')):
 
@@ -385,7 +386,7 @@ if __name__ == '__main__':
             # 'Antithetic': 'Yes',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
             'Base_Time_Grid': '0d 2d 1w(1w) 3m(1m) 2y(3m)',
-            'Batch_Size': 512,
+            'Batch_Size': 16,
             'Simulation_Batches': 1,
             # 'Collateral_Valuation_Adjustment': {'Calculate': 'Yes', 'Gradient': 'Yes'},
             'Credit_Valuation_Adjustment':
@@ -398,11 +399,14 @@ if __name__ == '__main__':
             overrides['Dynamic_Scenario_Dates'] = 'No'
 
         for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
-            if False and not str(i['Instrument'].field['Reference']) in ['159083172']:#, '154727676', '158079450']:
+            # if True and not str(i['Instrument'].field['Reference']) in ['152748052']:#, '154727676', '158079450']:
+            if True and not str(i['Instrument'].field['Object']) in ['FXNonDeliverableForward']:  # , '154727676', '158079450']:
                 i['Ignore'] = 'True'
             else:
                 i['Ignore'] = 'False'
 
+        ns.field['Opening_Balance'] = 0.0
+        ns.field['Collateral_Assets']['Cash_Collateral'][0]['Amount'] = 1.0
         calculation_currency = 'USD'
         logging.getLogger().setLevel(logging.DEBUG)
         # cx.current_cfg.params['Price Factors']['Correlation.EquityPrice.JPY_NKY_BBG.JPY/FxRate.JPY.ZAR'] = {

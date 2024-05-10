@@ -23,9 +23,6 @@ import calendar
 from pyparsing import *
 from xml.etree.ElementTree import ElementTree, Element, SubElement, iterparse, tostring
 
-# useful types
-from collections import OrderedDict
-
 # needed types
 from . import utils
 from .config import ModelParams, Context
@@ -66,18 +63,18 @@ except ImportError:
 
 def copy_dict(source_dict, diffs):
     """Returns a copy of source_dict, updated with the new key-value pairs in diffs."""
-    result = OrderedDict(source_dict)
+    result = source_dict.copy()
     result.update(diffs)
     return result
 
 
 def parse_market_prices(prices):
     market_prices = {}
-    for rate, data in OrderedDict(prices).items():
-        market_prices[rate] = {'instrument': OrderedDict((k, v) for k, v in data.items() if k != 'Points')}
+    for rate, data in dict(prices).items():
+        market_prices[rate] = {'instrument': dict((k, v) for k, v in data.items() if k != 'Points')}
         children = market_prices[rate].setdefault('Children', [])
         for point in data.get('Points', []):
-            children.append({'quote': OrderedDict((k, v) for k, v in point.items() if k != 'Deal'),
+            children.append({'quote': dict((k, v) for k, v in point.items() if k != 'Deal'),
                              'instrument': point['Deal']})
     return market_prices
 
@@ -93,7 +90,7 @@ def format_market_prices(data):
 
 
 def drawobj(obj):
-    """Tries to emulate a human readable format"""
+    """Tries to emulate a human-readable format"""
     buffer = []
     if isinstance(obj, list):
         for value in obj:
@@ -235,7 +232,7 @@ class AdaptivContext(Context):
                 self.archive = pd.read_csv(elem.text, skiprows=3, sep='\t', index_col=0)
             elif elem.tag == 'Calibrations':
                 for calibration in elem:
-                    param = OrderedDict(self.lineparser.parseString(calibration.text).asList())
+                    param = dict(self.lineparser.parseString(calibration.text).asList())
                     calibration_config = construct_calibration_config(calibration.attrib, param)
                     self.calibration_process_map.setdefault(calibration_config.model, calibration_config)
 
@@ -248,7 +245,7 @@ class AdaptivContext(Context):
     def parse_market_file(self, filename):
         '''Parses the AA marketdata .dat file in filename'''
 
-        self.params = OrderedDict()
+        self.params = {}
         self.parser.parseFile(filename)
 
     def parse_trade_file(self, filename, calc_filename=None):
@@ -272,7 +269,7 @@ class AdaptivContext(Context):
                 # process the tag
                 if elem.text and elem.text.strip() != '':
                     # get the field data
-                    fields = OrderedDict(self.lineparser.parseString(elem.text).asList())
+                    fields = dict(self.lineparser.parseString(elem.text).asList())
                     # check if we can amend it with sourceMTM's
                     if self.sourcemtm and 'Reference' in fields:
                         fields['MtM'] = self.sourcemtm['AA Base Valuation'].get(fields['Reference'])
@@ -312,14 +309,14 @@ class AdaptivContext(Context):
         if calc_filename is not None:
             with open(calc_filename, 'rt') as f:
                 calc_data = f.read()
-                self.deals['Calculation'] = OrderedDict(self.lineparser.parseString(calc_data).asList())
+                self.deals['Calculation'] = dict(self.lineparser.parseString(calc_data).asList())
 
     def write_trade_file(self, filename):
         def amend(xml_parent, internal_deals):
             for node in internal_deals:
                 instrument = node['Instrument']
                 deal = Element('Deal')
-                fields = OrderedDict(
+                fields = dict(
                     [(k, v) for k, v in sorted(instrument.field.items(), key=lambda x: -1 if x[0] == 'Object' else 0)])
 
                 if node.get('Ignore'):
@@ -418,7 +415,7 @@ class AdaptivContext(Context):
             return (toks[0], None if len(toks) == 1 else toks[1])
 
         def pushChain(strg, loc, toks):
-            return OrderedDict({toks[0]: toks[1]})
+            return dict({toks[0]: toks[1]})
 
         def pushSinglePeriod(strg, loc, toks):
             return (Context.offset_lookup[toks[1]], toks[0])
@@ -428,13 +425,13 @@ class AdaptivContext(Context):
             return DateOffset(**ofs)
 
         def pushID(strg, loc, toks):
-            entry = OrderedDict()
+            entry = {}
             for k, v in toks[1:]:
                 entry[k] = v
             return toks[0], entry
 
         def pushParam(strg, loc, toks):
-            entry = OrderedDict([('Valuation', toks[1])])
+            entry = dict([('Valuation', toks[1])])
             for k, v in toks[2:]:
                 entry[k] = v
             return toks[0], entry
@@ -465,9 +462,9 @@ class AdaptivContext(Context):
             return utils.CreditSupportList(toks.asList())
 
         def pushObj(strg, loc, toks):
-            obj = OrderedDict()
+            obj = {}
             for token in toks.asList():
-                if isinstance(token, OrderedDict) or isinstance(token, list) or isinstance(token, str) or isinstance(
+                if isinstance(token, dict) or isinstance(token, list) or isinstance(token, str) or isinstance(
                         token, utils.Curve):
                     obj.setdefault('_obj', []).append(token)
                 else:
@@ -504,7 +501,7 @@ class AdaptivContext(Context):
                 market_prices = parse_market_prices(toks[1:])
                 self.params.setdefault(toks[0][1:-1], market_prices)
             else:
-                self.params.setdefault(toks[0][1:-1], OrderedDict(toks[1:]))
+                self.params.setdefault(toks[0][1:-1], dict(toks[1:]))
             return toks[0][1:-1]
 
         def pushCorrel(strg, loc, toks):

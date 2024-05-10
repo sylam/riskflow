@@ -17,15 +17,12 @@
 ########################################################################
 
 import calendar
-import functools
 import traceback
 from functools import reduce, wraps
 from collections import namedtuple, OrderedDict
 from typing import Tuple, List
 
 import logging
-from itertools import zip_longest
-
 import scipy.stats
 import pandas as pd
 import numpy as np
@@ -627,13 +624,11 @@ class TensorResets(TensorSchedule):
         if self.cache.get(key) is None:
             if include_today:
                 # we only include today if we are dealing with equity resets
-                filter_fn = lambda x: x <= 0.0
                 self.cache[key] = [self.unit.new_full((1, num_scenarios), x[index])
-                                   for x in self.schedule if filter_fn(x[filter_index]) and x[index] > 0]
+                                   for x in self.schedule if x[filter_index] <= 0.0 and x[index] > 0]
             else:
-                filter_fn = lambda x: x < 0.0
                 self.cache[key] = [self.unit.new_full((1, num_scenarios), x[index])
-                                   for x in self.schedule if filter_fn(x[filter_index])]
+                                   for x in self.schedule if x[filter_index] < 0.0]
         return self.cache[key]
 
     def get_simulated_resets(self, max_time, forward, shared):
@@ -656,8 +651,8 @@ class TensorResets(TensorSchedule):
         # fetch all fixed resets
         return torch.squeeze(
             torch.concat(
-                [shared.fillvalue if not known_resets else torch.stack(known_resets), reset_values], axis=0)
-            , axis=1)
+                [shared.fillvalue if not known_resets else torch.stack(known_resets), reset_values], dim=0)
+            , dim=1)
 
     def split_block_resets(self, reset_offset, t, date_offset=0):
         all_resets = self.schedule[reset_offset:]
@@ -677,99 +672,6 @@ class TensorResets(TensorSchedule):
                 groups.append(group.reinitialize(self.unit))
             self.cache[('groups', group_size)] = groups
         return self.cache.get(('groups', group_size))
-
-
-class FloatTensorResets(TensorSchedule):
-    def __init__(self, schedule, offsets):
-        super(FloatTensorResets, self).__init__(schedule, offsets)
-        # Assign the offsets directly to the resets
-        self.schedule[:, RESET_INDEX_Scenario] = self.offsets
-        # split all resets between known (-1) or simulated (>=0)
-        self.known_simulated = self.offsets.clip(-1, 0)
-        # all known and simulated resets are stacked here
-        self.all_resets = None
-        self.stack_index = []
-
-    def known_resets(self, num_scenarios):
-        if self.cache.get(('known_resets', num_scenarios)) is None:
-            known_resets = []
-            groups = np.where(np.diff(np.concatenate(([0], self.known_simulated, [0]))))[0].reshape(-1, 2)
-            for group in groups:
-                known_resets.append([self.unit.new_full((1, num_scenarios), x[RESET_INDEX_Value])
-                                     for x in self.schedule[group[0]: group[1]] if x[RESET_INDEX_Reset_Day] < 0.0])
-            self.cache[('known_resets', num_scenarios)] = known_resets
-        return self.cache[('known_resets', num_scenarios)]
-
-    def stack(self, known_resets, reset_values, fillvalue):
-        self.all_resets = [
-            torch.squeeze(torch.cat([
-                fillvalue if known is fillvalue else torch.stack(known), simulated], axis=0), axis=1)
-            for known, simulated in zip_longest(known_resets, reset_values, fillvalue=fillvalue)]
-        self.stack_index = np.cumsum(np.append([0], [x.shape[0] for x in self.all_resets]))
-
-    def sim_resets(self, max_time):
-        if self.cache.get(('sim_resets', max_time)) is None:
-            # cache the weights
-            self.cache['weights'] = self.unit.new_tensor(
-                self.schedule[:, RESET_INDEX_Weight] / self.schedule[:, RESET_INDEX_Accrual])
-
-            sim_resets = []
-            sim_weights = []
-            groups = np.where(np.diff(np.concatenate(([-1], self.known_simulated, [-1]))))[0].reshape(-1, 2)
-            for group in groups:
-                sim_group = self.schedule[group[0]:group[1]]
-                within_horizon = np.where(sim_group[:, RESET_INDEX_Reset_Day] <= max_time)[0]
-                if within_horizon.size:
-                    sim_resets.append(sim_group[within_horizon])
-                    sim_weights.append(self.cache['weights'][within_horizon])
-
-            self.cache[('sim_resets', max_time)] = (sim_resets, sim_weights)
-        return self.cache[('sim_resets', max_time)]
-
-    def raw_sim_resets(self, max_time, filter_index=RESET_INDEX_Reset_Day):
-        return self.schedule[(self.offsets > -1) & (self.schedule[:, filter_index] <= max_time)]
-
-    def split_block_resets(self, reset_offset, t, date_offset=0):
-        reset_days = self.schedule[reset_offset:, RESET_INDEX_Reset_Day] - date_offset
-        reset_groups = np.append(
-            np.where(np.diff(np.concatenate(([-np.inf], reset_days, [np.inf]))) < 0)[0], reset_days.size)
-
-        # only bring in relevant past resets
-        if reset_offset:
-            old_index_offset = self.stack_index.searchsorted(reset_offset, side='right')
-            old_reset_index = reset_offset - self.stack_index[old_index_offset - 1]
-            old_resets = [self.all_resets[old_index_offset - 1][old_reset_index:]
-                          if old_reset_index else self.all_resets[old_index_offset - 1]] + \
-                         self.all_resets[old_index_offset:]
-        else:
-            old_resets = self.all_resets
-
-        reset_blocks = []
-        reset_weights = []
-        future_resets = []
-        start_index = 0
-
-        for end_index in reset_groups:
-            reset_blocks.append(self.schedule[reset_offset + start_index:reset_offset + end_index])
-            reset_weights.append(self.cache['weights'][reset_offset + start_index:reset_offset + end_index])
-            future_reset = np.searchsorted(reset_days[start_index:end_index], t)
-            future_resets.append(future_reset)
-            start_index = end_index
-
-        if len(future_resets) > 1:
-            # multiple reset groups
-            logging.warning('!! Multiple reset groups defined !! ({} groups)'.format(len(future_resets)))
-            reset_state = [np.unique(future_reset, return_counts=True) for future_reset in future_resets]
-            if functools.reduce(lambda x, y: x.size == y.size and (x == y).all(), [x[1] for x in reset_state]):
-                # can be compressed
-                return reset_state[0][1], (old_resets, reset_blocks, reset_weights, [x[0] for x in reset_state])
-            else:
-                # do not compress
-                return np.ones_like(t, dtype=np.int64), (old_resets, reset_blocks, reset_weights, future_resets)
-        else:
-            # Just one reset group - compress it
-            reset_offset, reset_counts = np.unique(future_resets[0], return_counts=True)
-            return reset_counts, (old_resets, reset_blocks, reset_weights, [reset_offset])
 
 
 class TensorCashFlows(TensorSchedule):
@@ -832,8 +734,7 @@ class TensorCashFlows(TensorSchedule):
             reference_date + pd.offsets.Day(last_cashflow[CASHFLOW_INDEX_End_Day]),
             last_cashflow[CASHFLOW_INDEX_End_Day] - last_cashflow[CASHFLOW_INDEX_Start_Day] + 1, daycount_code)
 
-    def set_resets(self, schedule, offsets, isFloat=False):
-        # self.Resets = FloatTensorResets(schedule, offsets) if isFloat else TensorResets(schedule, offsets)
+    def set_resets(self, schedule, offsets):
         self.Resets = TensorResets(schedule, offsets)
 
     def overwrite_rate(self, attribute_index, value):
@@ -1046,7 +947,7 @@ class TensorBlock(object):
         return self.local_cache[local_cache_key]
 
     def reduce_deflate(self, delta_scen_t, time_points, shared):
-        DtT = torch.exp(-torch.squeeze(self.gather_weighted_curve(shared, delta_scen_t)).cumsum(axis=0))
+        DtT = torch.exp(-torch.squeeze(self.gather_weighted_curve(shared, delta_scen_t)).cumsum(dim=0))
         # we need the index just prior - note this needs to be checked in the calling code
         indices = self.time_grid[:, TIME_GRID_MTM].searchsorted(time_points) - 1
         return {t: DtT[index] for t, index in zip(time_points, indices)}
@@ -1205,29 +1106,35 @@ def ApproxBivN(P, Q, rho):
 
     c1 = -1.0950081470333
     c2 = -0.75651138383854
+    r2 = 1.4142135623730951
     ma2c2 = 1.0 - a * a * c2
-    sq_ma2c2 = torch.sqrt(ma2c2)
+    two_sq_ma2c2 = 2.0 * torch.sqrt(ma2c2)
     a2c1_2 = a * a * c1 * c1
-    q_part = np.sqrt(2) * (Q - a * c2 * (a * Q + b))
-    root4_p = torch.exp((a2c1_2 + 2 * b * (np.sqrt(2) * c1 + b * c2)) / (4.0 * ma2c2)) / (4.0 * sq_ma2c2)
-    root4_m = torch.exp((a2c1_2 - 2 * b * (np.sqrt(2) * c1 - b * c2)) / (4.0 * ma2c2)) / (4.0 * sq_ma2c2)
-    erf2_p = torch.erf((q_part + a * c1) / (2.0 * sq_ma2c2))
-    erf2_m = torch.erf((q_part - a * c1) / (2.0 * sq_ma2c2))
-    erf_p1 = (np.sqrt(2) * b) / (2 * a * sq_ma2c2)
-    erf_p2 = (a * a * c1) / (2 * a * sq_ma2c2)
+    q_part = r2 * (Q - a * c2 * (a * Q + b))
+    root4_p = torch.exp((a2c1_2 + 2 * b * (r2 * c1 + b * c2)) / (4.0 * ma2c2)) / (2.0 * two_sq_ma2c2)
+    root4_m = torch.exp((a2c1_2 - 2 * b * (r2 * c1 - b * c2)) / (4.0 * ma2c2)) / (2.0 * two_sq_ma2c2)
+    erf2_p = torch.erf((q_part + a * c1) / two_sq_ma2c2)
+    erf2_m = torch.erf((q_part - a * c1) / two_sq_ma2c2)
+    erf_p1 = (r2 * b) / (a * two_sq_ma2c2)
+    erf_p2 = (a * a * c1) / (a * two_sq_ma2c2)
     erf1 = torch.erf(erf_p1 + erf_p2)
     erf3 = torch.erf(erf_p1 - erf_p2)
-
-    cas1 = .5 * (torch.erf(Q / np.sqrt(2)) + torch.erf(b / (np.sqrt(2) * a))) + root4_m * (
-            1.0 - erf3) - root4_p * (erf2_m + erf1)
-    cas2 = root4_m * (1 + erf2_p)
-    cas3 = .5 * (1 + torch.erf(Q / np.sqrt(2))) - root4_p * (1.0 + erf2_m)
-    cas4 = .5 * (1 - torch.erf(b / (np.sqrt(2) * a))) - root4_p * (1.0 - erf1) + root4_m * (erf2_p + erf3)
-
     final = norm_cdf(P) * norm_cdf(Q)
-    for c, f in zip([cas1, cas2, cas3, cas4], [case1, case2, case3, case4]):
+
+    for c, f in enumerate([case1, case2, case3, case4]):
         if f.any():
-            final[f] = c[f]
+            if c == 0:
+                case = .5 * (
+                        torch.erf(Q / r2) + torch.erf(b / (r2 * a))) + root4_m * (
+                               1.0 - erf3) - root4_p * (erf2_m + erf1)
+            elif c == 1:
+                case = root4_m * (1 + erf2_p)
+            elif c == 2:
+                case = .5 * (1 + torch.erf(Q / r2)) - root4_p * (1.0 + erf2_m)
+            else:
+                case = .5 * (1 - torch.erf(b / (r2 * a))) - root4_p * (1.0 - erf1) + root4_m * (erf2_p + erf3)
+
+            final[f] = case[f]
 
     return final
 
@@ -1274,10 +1181,10 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_p
         guard = tau > 0.0
 
         if len(guard.shape) > 1:
-            guard = torch.unsqueeze(guard, axis=2)
-            sigma = vol * torch.unsqueeze(tau, axis=2)
+            guard = torch.unsqueeze(guard, dim=2)
+            sigma = vol * torch.unsqueeze(tau, dim=2)
         else:
-            guard = torch.unsqueeze(guard, axis=1)
+            guard = torch.unsqueeze(guard, dim=1)
             sigma = vol * tau.reshape(-1, 1)
 
         stddev = sigma.clamp(min=1e-5)
@@ -1471,12 +1378,12 @@ def calc_realized_dividends(s_t0, repo, div_yield, div_reset_stack, shared):
     # Calculate exp(sr) * (1 - exp(-sq))
     sr_minus_sq = torch.stack([
         torch.exp(torch.squeeze(calc_spot_forward(
-            repo, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True), axis=1)
+            repo, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True), dim=1)
         ) * (1.0 - torch.exp(
             -torch.squeeze(calc_spot_forward(
-                div_yield, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True), axis=1))
+                div_yield, div_resets[:, RESET_INDEX_End_Day], div_resets, shared, True), dim=1))
              )
-        for div_resets in div_reset_stack], axis=1)
+        for div_resets in div_reset_stack], dim=1)
 
     return s_t0 * sr_minus_sq
 
@@ -1507,8 +1414,8 @@ def calc_eq_forward(equity, repo, div_yield, T, time_grid, shared, only_diag=Fal
             drift = shared.one.new_ones(
                 [time_grid.shape[0], 1 if only_diag else T_t.size, 1])
 
-        shared.t_Buffer[key_code] = spot * torch.squeeze(drift, axis=1) \
-            if T_scalar else torch.unsqueeze(spot, axis=1) * drift
+        shared.t_Buffer[key_code] = spot * torch.squeeze(drift, dim=1) \
+            if T_scalar else torch.unsqueeze(spot, dim=1) * drift
 
     return shared.t_Buffer[key_code]
 
@@ -1537,8 +1444,8 @@ def calc_fx_forward(local, other, T, time_grid, shared, only_diag=False):
             else:
                 drift = fx_spot.new_ones([time_grid.shape[0], 1 if only_diag else T_t.size, 1])
 
-            shared.t_Buffer[key_code] = fx_spot * torch.squeeze(drift, axis=1) \
-                if T_scalar else torch.unsqueeze(fx_spot, axis=1) * drift
+            shared.t_Buffer[key_code] = fx_spot * torch.squeeze(drift, dim=1) \
+                if T_scalar else torch.unsqueeze(fx_spot, dim=1) * drift
         else:
             shared.t_Buffer[key_code] = shared.one
 
@@ -1580,7 +1487,7 @@ def gather_flat_surface(flat_surface, code, expiry, shared, calc_std):
 
         surface = time_modifier * torch.sum(
             flat_surface.take(tenor_money_indices) * tenor_money_alpha * (1.0 - alpha) +
-            flat_surface.take(tenor_money_indices_next) * tenor_money_alpha_next * alpha, axis=1)
+            flat_surface.take(tenor_money_indices_next) * tenor_money_alpha_next * alpha, dim=1)
 
         shared.t_Buffer[time_code] = (surface.reshape(-1), tenor_diff(new_moneyness_tenor))
 
@@ -1619,7 +1526,7 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
 
     cmp = (flat_moneyness >= moneyness_t).type(torch.int32)
     index = (cmp[:, 1:] - cmp[:, :-1]).argmin(axis=1)
-    alpha = (torch.squeeze(flat_moneyness, axis=1) - moneyness_t[index]) / moneyness_d[index]
+    alpha = (torch.squeeze(flat_moneyness, dim=1) - moneyness_t[index]) / moneyness_d[index]
 
     expiry_indices = np.arange(expiry.size).astype(np.int32)
     expiry_offsets = shared.one.new_tensor(
@@ -1802,14 +1709,14 @@ def hermite_interpolation_tensor(t, rate_tensor):
             (rate_diff[:, -2] * time_diff[:, -1, :]) / time_diff[:, -2, :] -
             (rate_diff[:, -1] * (2.0 * t[:, -1, :] - t[:, -2, :] - t[:, -3, :])) / time_diff[:, -1, :])
 
-    ri = torch.cat([torch.unsqueeze(r_1, axis=1), r_i, torch.unsqueeze(r_n, axis=1)], axis=1)
+    ri = torch.cat([torch.unsqueeze(r_1, dim=1), r_i, torch.unsqueeze(r_n, dim=1)], dim=1)
 
     # zero
-    zero = torch.unsqueeze(torch.zeros_like(r_1), axis=1)
+    zero = torch.unsqueeze(torch.zeros_like(r_1), dim=1)
     # calc g_i
-    gi = torch.cat([time_diff * ri[:, :-1, :] - rate_diff, zero], axis=1)
+    gi = torch.cat([time_diff * ri[:, :-1, :] - rate_diff, zero], dim=1)
     # calc c_i
-    ci = torch.cat([2.0 * rate_diff - time_diff * (ri[:, :-1, :] + ri[:, 1:, :]), zero], axis=1)
+    ci = torch.cat([2.0 * rate_diff - time_diff * (ri[:, :-1, :] + ri[:, 1:, :]), zero], dim=1)
 
     return gi, ci
 
@@ -2160,7 +2067,7 @@ def check_scope_name(factor):
 
 def check_fx_name(fx_correlation):
     """FX rates must be sorted alphabetically - however, often we need correlations with non-alphabetical fx rates.
-    In this case, we need to know we're actually using the reverse pair (i.e. -1) as opposed to the sorted name"""
+    In this case, we need to know we're actually using the reverse pair (i.e. -1*rho) as opposed to the sorted name"""
     ccy1, ccy2 = fx_correlation
     return (1.0, (ccy1, ccy2)) if ccy1 < ccy2 else (-1.0, (ccy2, ccy1))
 
@@ -2284,7 +2191,7 @@ def generate_float_cashflows(reference_date, time_grid, reset_dates, nominal, am
         all_resets.extend(r)
 
     cashflows = TensorCashFlows(cashflow_schedule, cashflow_reset_offsets)
-    cashflows.set_resets(all_resets, reset_scenario_offsets, isFloat=True)
+    cashflows.set_resets(all_resets, reset_scenario_offsets)
 
     return cashflows
 
@@ -2630,7 +2537,7 @@ def make_float_cashflows(reference_date, time_grid, position, cashflows):
             all_resets.extend(r)
 
     cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
-    cashflows.set_resets(all_resets, reset_scenario_offsets, isFloat=True)
+    cashflows.set_resets(all_resets, reset_scenario_offsets)
 
     return cashflows
 
@@ -2958,7 +2865,7 @@ def compress_no_compounding(cashflows, groupsize, check_resets=True):
                     cashflow_reset_offsets.extend(cashflows.offsets[index:index + num_cf].tolist())
 
             approx_cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
-            approx_cashflows.set_resets(all_resets, reset_scenario_offsets, isFloat=True)
+            approx_cashflows.set_resets(all_resets, reset_scenario_offsets)
             if cashflows.Resets.count() == approx_cashflows.Resets.count():
                 logging.warning('Cashflows rebased from {} resets'.format(cashflows.Resets.count()))
             else:

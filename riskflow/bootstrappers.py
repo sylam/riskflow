@@ -30,7 +30,6 @@ import torch
 # Internal modules
 from . import utils, pricing, instruments, riskfactors, stochasticprocess
 
-from scipy.stats import norm
 import scipy.optimize
 
 curve_jacobian_class = namedtuple('shared_mem', 't_Buffer t_Static_Buffer \

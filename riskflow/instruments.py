@@ -849,21 +849,21 @@ class NettingCollateralSet(Deal):
                 T = sorted(shared.t_Cashflows[curr].keys())
                 for index, pad in enumerate(np.diff([-1] + T + [time_grid.time_grid.shape[0]]) - 1):
                     if index < len(T):
-                        cashflow_at_index = torch.unsqueeze(shared.t_Cashflows[curr][T[index]], axis=0)
+                        cashflow_at_index = torch.unsqueeze(shared.t_Cashflows[curr][T[index]], dim=0)
                         Ci.append(F.pad(cashflow_at_index, [0, 0, pad, 0]))
 
-                base_Ci = torch.cat(Ci, axis=0)
+                base_Ci = torch.cat(Ci, dim=0)
                 # pad the last bit
                 C_base += F.pad(utils.calc_time_grid_spot_rate(
                     fx_factor, time_grid.time_grid[:-pad], shared) * base_Ci, [0, 0, 0, pad])
 
             if not self.options['Exclude_Paid_Today']:
                 C_block = C_base[:-1]
-                Cf_Rec = F.pad(torch.cumsum(torch.relu(C_block), axis=0), [0, 0, 1, 0])
-                Cf_Pay = F.pad(torch.cumsum(torch.relu(-C_block), axis=0), [0, 0, 1, 0])
+                Cf_Rec = F.pad(torch.cumsum(torch.relu(C_block), dim=0), [0, 0, 1, 0])
+                Cf_Pay = F.pad(torch.cumsum(torch.relu(-C_block), dim=0), [0, 0, 1, 0])
             else:
-                Cf_Rec = torch.cumsum(torch.relu(C_base), axis=0)
-                Cf_Pay = torch.cumsum(torch.relu(-C_base), axis=0)
+                Cf_Rec = torch.cumsum(torch.relu(C_base), dim=0)
+                Cf_Pay = torch.cumsum(torch.relu(-C_base), dim=0)
 
             # calc collateral values
             St = torch.zeros_like(accum)
@@ -894,8 +894,8 @@ class NettingCollateralSet(Deal):
             Vt = accum * fx_base
 
             if self.options['Exclude_Paid_Today']:
-                mtm_today_adj = torch.cat([Cf_Rec[0].reshape(1, -1), Cf_Rec[1:] - Cf_Rec[:-1]], axis=0) - \
-                                torch.cat([Cf_Pay[0].reshape(1, -1), Cf_Pay[1:] - Cf_Rec[:-1]], axis=0)
+                mtm_today_adj = torch.cat([Cf_Rec[0].reshape(1, -1), Cf_Rec[1:] - Cf_Rec[:-1]], dim=0) - \
+                                torch.cat([Cf_Pay[0].reshape(1, -1), Cf_Pay[1:] - Cf_Rec[:-1]], dim=0)
                 Vt -= mtm_today_adj
 
             At = factor_dep['Independent_Amount'] * fx_agreement + (Vt - H) * (Vt > H) + (Vt - G) * (Vt < G)
@@ -989,12 +989,12 @@ class NettingCollateralSet(Deal):
 
                 Dc_over_f_tT_m1 = torch.expm1(
                     torch.squeeze(discount_funding.gather_weighted_curve(shared, delta_scen_t) -
-                                  discount_collateral.gather_weighted_curve(shared, delta_scen_t), axis=1)
+                                  discount_collateral.gather_weighted_curve(shared, delta_scen_t), dim=1)
                 )
 
                 Dc0_T = torch.exp(
                     -torch.squeeze(discount_collateral_t0.gather_weighted_curve(
-                        shared, mtm_grid.reshape(1, -1)), axis=0))
+                        shared, mtm_grid.reshape(1, -1)), dim=0))
 
                 shared.t_Credit['Funding'] = shared.t_Credit['Collateral'] * cash_rep * Dc_over_f_tT_m1 * Dc0_T
 
@@ -1234,7 +1234,7 @@ class FXNonDeliverableForward(Deal):
             utils.calc_discount_rate(
                 discount,
                 (factor_dep['Maturity'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1), shared),
-            axis=1)
+            dim=1)
         try:
             cash = (buy_forward * self.field['Buy_Amount'] - sell_forward * self.field['Sell_Amount'])
         except:
@@ -1315,8 +1315,8 @@ class FXSwapDeal(Deal):
             NearSell_rep = utils.calc_fx_cross(
                 factor_dep['NearSellFX'], shared.Report_Currency, near_deal_time, shared)
 
-            near_sell_discount_rate = torch.squeeze(utils.calc_discount_rate(near_sell_discount, near, shared), axis=1)
-            near_buy_discount_rate = torch.squeeze(utils.calc_discount_rate(near_buy_discount, near, shared), axis=1)
+            near_sell_discount_rate = torch.squeeze(utils.calc_discount_rate(near_sell_discount, near, shared), dim=1)
+            near_buy_discount_rate = torch.squeeze(utils.calc_discount_rate(near_buy_discount, near, shared), dim=1)
 
             mtm_near = self.field['Near_Buy_Amount'] * near_buy_discount_rate * NearBuy_rep - \
                        self.field['Near_Sell_Amount'] * near_sell_discount_rate * NearSell_rep
@@ -1343,9 +1343,9 @@ class FXSwapDeal(Deal):
             deal_data.Time_dep.fetch_index_by_day(factor_dep['Maturity']), -self.field['Far_Sell_Amount'])
 
         far_buy_discount_rate = torch.squeeze(
-            utils.calc_discount_rate(near_sell_discount, remaining_tenor, shared), axis=1)
+            utils.calc_discount_rate(near_sell_discount, remaining_tenor, shared), dim=1)
         far_sell_discount_rate = torch.squeeze(
-            utils.calc_discount_rate(near_buy_discount, remaining_tenor, shared), axis=1)
+            utils.calc_discount_rate(near_buy_discount, remaining_tenor, shared), dim=1)
 
         mtm += self.field['Far_Buy_Amount'] * far_buy_discount_rate * FX_NearSell_rep - \
                self.field['Far_Sell_Amount'] * far_sell_discount_rate * FX_NearBuy_rep
@@ -1416,8 +1416,8 @@ class FXForwardDeal(Deal):
         sell_discount = utils.calc_time_grid_curve_rate(factor_dep['SellDiscount'], deal_time, shared)
         remaining_tenor = (factor_dep['Maturity'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1)
 
-        buy_discount_rate = torch.squeeze(utils.calc_discount_rate(buy_discount, remaining_tenor, shared), axis=1)
-        sell_discount_rate = torch.squeeze(utils.calc_discount_rate(sell_discount, remaining_tenor, shared), axis=1)
+        buy_discount_rate = torch.squeeze(utils.calc_discount_rate(buy_discount, remaining_tenor, shared), dim=1)
+        sell_discount_rate = torch.squeeze(utils.calc_discount_rate(sell_discount, remaining_tenor, shared), dim=1)
 
         # settle the cash
         pricing.cash_settle(
@@ -1694,7 +1694,7 @@ class FixedCashflowDeal(Deal):
             utils.calc_discount_rate(
                 discount, (factor_dep['Payment_Date'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1),
                 shared),
-            axis=1)
+            dim=1)
 
         mtm = factor_dep['Amount'] * discount_rates * fx_rep
 
@@ -1893,7 +1893,7 @@ class CapDeal(Deal):
             # price the child
             mtm_list.append(child.Instrument.calculate(shared, time_grid, child))
 
-        mtm = torch.sum(torch.stack(mtm_list), axis=0)
+        mtm = torch.sum(torch.stack(mtm_list), dim=0)
 
         # return the interpolated value (without interpolating the time_grid)
         return pricing.interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=False)
@@ -1971,7 +1971,7 @@ class FloorDeal(Deal):
             # price the child
             mtm_list.append(child.Instrument.calculate(shared, time_grid, child))
 
-        mtm = torch.sum(torch.stack(mtm_list), axis=0)
+        mtm = torch.sum(torch.stack(mtm_list), dim=0)
 
         # return the interpolated value (without interpolating the time_grid)
         return pricing.interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=False)
@@ -2241,7 +2241,7 @@ class SwaptionDeal(Deal):
 
             if Ut_swap.shape[0]:
                 Ut_mask = Ut_swap * (Ut_swap[0] >= 0)
-                mtm = FX_rep * torch.cat([value, buysell * Ut_mask], axis=0)
+                mtm = FX_rep * torch.cat([value, buysell * Ut_mask], dim=0)
             else:
                 mtm = FX_rep * value
 
@@ -2549,7 +2549,7 @@ class EquityBarrierBinaryOption(Deal):
 
         b = torch.squeeze(
             eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), dim=1)
 
         # check that the spot has a defined shape
         if spot.shape[1] != b.shape[1]:
@@ -2738,9 +2738,11 @@ class QEDI_CustomAutoCallSwap(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        field = {'Currency': utils.check_rate_name(self.field['Currency']),
-                 'Payoff_Currency': utils.check_rate_name(self.field['Payoff_Currency']),
-                 'Equity': utils.check_rate_name(self.field['Equity'])}
+        field = {
+            'Currency': utils.check_rate_name(self.field['Currency']),
+            'Payoff_Currency': utils.check_rate_name(self.field['Payoff_Currency']),
+            'Equity': utils.check_rate_name(self.field['Equity'])
+        }
 
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
@@ -2762,6 +2764,12 @@ class QEDI_CustomAutoCallSwap(Deal):
         at = dict(self.field['Autocall_Thresholds'])
         af = dict(self.field.get('Autocall_Floating', []))
         ab = dict(self.field.get('Barrier_Dates', []))
+
+        # check if the dates are less than or equal to the expiry date
+        if max(all_dates) > self.field['Expiry_Date']:
+            logging.warning('AutoCall has max pricing date {} > Expiry Date {} for underlying {}'.format(
+                max(all_dates).strftime('%Y-%m-%d'), self.field['Expiry_Date'].strftime('%Y-%m-%d'),
+                self.field['Equity']))
 
         field_index = {
             'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
@@ -2845,17 +2853,15 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
         floating_pay_dates = [x[0] for x in self.field['Autocall_Floating']]
         # need to add the previous date to calculate the reset
         prev_floating_date = min(floating_pay_dates) - self.field['Reset_Frequency']
-        if prev_floating_date == base_date:
+        # if prev_floating_date == base_date:
             # there's an issue if the prev_float_date is the same as the base date
-            prev_floating_date = prev_floating_date - pd.offsets.Day(1)
+        #    prev_floating_date = prev_floating_date - pd.offsets.Day(1)
         floating_pay_dates = [prev_floating_date] + floating_pay_dates
-        # hack - please get this fixed at source
-        if (self.field['Expiry_Date'] - floating_pay_dates[-1]).days > 10:
-            terminal_floating_date = max(floating_pay_dates) + self.field['Reset_Frequency']
-            self.field['Autocall_Floating'].append([terminal_floating_date, 0.0])
-            floating_pay_dates.append(terminal_floating_date)
-            logging.warning('Autocall Floating date more than 10 days away from expiry - adding last date {}'.format(
-                terminal_floating_date))
+
+        # check if the last floating date is past the expiry of the option
+        if max(floating_pay_dates) > self.field['Expiry_Date']:
+            logging.warning('Last autocall floating date {} runs past expiry {} - clipping to expiry'.format(
+                max(floating_pay_dates).strftime('%Y-%m-%d'), self.field['Expiry_Date'].strftime('%Y-%m-%d')))
 
         cashflows = {'Items':
                          [{'Accrual_Start_Date': start,
@@ -2982,7 +2988,7 @@ class EquityOneTouchOption(Deal):
 
         b = torch.squeeze(
             eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), dim=1)
 
         # check that the spot has a defined shape
         if spot.shape[1] != b.shape[1]:
@@ -3096,7 +3102,7 @@ class EquityBarrierOption(Deal):
 
         b = torch.squeeze(
             eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+            eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), dim=1)
 
         # check that the spot has a defined shape
         if spot.shape[1] != b.shape[1]:
@@ -3162,13 +3168,13 @@ class CommodityForwardDeal(Deal):
         energy_spot = forward_curve.gather_weighted_curve(shared, spot_date_index, multiply_by_time=False)
         T_t = factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM].reshape(-1, 1)
         curve_grid = utils.calc_time_grid_curve_rate(factor_dep['Commodity_Zero'], deal_time, shared)
-        forward = torch.squeeze(energy_spot * torch.exp(curve_grid.gather_weighted_curve(shared, T_t)), axis=1)
+        forward = torch.squeeze(energy_spot * torch.exp(curve_grid.gather_weighted_curve(shared, T_t)), dim=1)
         fx_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
         nominal = (1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0) * self.field['Units']
 
         discount_rates = torch.squeeze(utils.calc_discount_rate(
             discount, (factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1), shared),
-            axis=1)
+            dim=1)
 
         cash = nominal * forward
 
@@ -3226,7 +3232,7 @@ class EquityForwardDeal(Deal):
 
         discount_rates = torch.squeeze(utils.calc_discount_rate(
             discount, (factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]).reshape(-1, 1), shared),
-            axis=1)
+            dim=1)
 
         cash = nominal * (forward - self.field['Forward_Price'])
 
@@ -3525,7 +3531,7 @@ class FXOneTouchOption(Deal):
 
         b = torch.squeeze(
             curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-            und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+            und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), dim=1)
 
         pv = pricing.pv_one_touch_option(
             shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency,
@@ -3622,7 +3628,7 @@ class FXBarrierOption(Deal):
         tau = (deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
         b = torch.squeeze(
             curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-            und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+            und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), dim=1)
 
         fx_rep = utils.calc_fx_cross(
             deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
@@ -3705,7 +3711,7 @@ class FXPartialTimeBarrierOption(Deal):
 
         b = torch.squeeze(
             curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
-            und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), axis=1)
+            und_curr_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), dim=1)
 
         fx_rep = utils.calc_fx_cross(
             deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
