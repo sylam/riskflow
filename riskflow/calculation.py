@@ -162,7 +162,7 @@ class Calculation(object):
 
     def __init__(self, config, prec=torch.float32, device=torch.device('cpu')):
         """
-        Construct a new calculation - all calculations must setup their own tensors.
+        Construct a new calculation - all calculations must set up their own tensors.
         """
 
         self.config = config
@@ -273,7 +273,7 @@ class Calculation(object):
 
         return df
 
-    def set_deal_structures(self, deals, output, num_scenarios, batch_size, tagging=None, deal_level_mtm=False):
+    def set_deal_structures(self, deals, output, deal_level_mtm=False):
 
         for node in deals:
             # get the instrument
@@ -287,7 +287,7 @@ class Calculation(object):
             logging.root.name = instrument.field.get('Reference', '<undefined>')
             if node.get('Children'):
                 struct = DealStructure(instrument, deal_level_mtm=deal_level_mtm)
-                self.set_deal_structures(node['Children'], struct, num_scenarios, batch_size, tagging, deal_level_mtm)
+                self.set_deal_structures(node['Children'], struct, deal_level_mtm)
                 output.add_structure_to_structure(
                     struct, self.base_date, self.static_ofs, self.stoch_ofs, self.all_factors,
                     self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
@@ -299,7 +299,7 @@ class Calculation(object):
 
 class CMC_State(utils.Calculation_State):
     def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, one, mcmc_sims,
-                 report_currency, nomodel='Constant'):
+                 report_currency, seed, job_id, num_jobs, nomodel='Constant'):
         super(CMC_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size)
         # these are tensors
         self.t_PreCalc = {}
@@ -312,6 +312,11 @@ class CMC_State(utils.Calculation_State):
         # idea is to reuse quasi rng numbers where applicable (but still using enough randomness)
         self.t_quasi_rng = {}
         self.t_quasi_rng_batch = {}
+        # set the random seed - seed each job by its offset
+        torch.manual_seed(seed+job_id)
+        # needed if we are running across multiple gpu's
+        self.job_id = job_id
+        self.num_jobs = num_jobs
 
     def quasi_rng(self, dimension, sample_size):
         # may need to parameterize these
@@ -518,7 +523,7 @@ class Credit_Monte_Carlo(Calculation):
         self.static_ofs = {}
         self.implied_ofs = {}
 
-    def update_factors(self, params, base_date):
+    def update_factors(self, params, base_date, job_id, num_jobs):
         dependent_factors, stochastic_factors, implied_factors, reset_dates, settlement_currencies = \
             self.config.calculate_dependencies(params, base_date, self.input_time_grid)
 
@@ -618,10 +623,11 @@ class Credit_Monte_Carlo(Calculation):
                 self.static_var.append((key, torch.tensor(
                     current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
 
-        # setup the device and allocate memory
+        # set up the device and allocate memory
         shared_mem = self.__init_shared_mem(
-            params['Random_Seed'], params.get('NoModel', 'Constant'),
-            params['Currency'], params.get('MCMC_Simulations', 2048), calc_greeks=sensitivities if greeks else None)
+            int(params['Random_Seed']), params.get('NoModel', 'Constant'),
+            params['Currency'], params.get('MCMC_Simulations', 2048),
+            job_id, num_jobs, calc_greeks=sensitivities if greeks else None)
 
         # calculate a reverse lookup for the tenors and store the daycount code
         self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
@@ -794,11 +800,7 @@ class Credit_Monte_Carlo(Calculation):
         # return the cholesky decomp
         return torch.linalg.cholesky(correlation_matrix)
 
-    def __init_shared_mem(self, seed, nomodel, reporting_currency, mcmc_sim, calc_greeks=None):
-        # set the random seed
-        torch.manual_seed(seed)
-        # torch.cuda.manual_seed(seed)
-
+    def __init_shared_mem(self, seed, nomodel, reporting_currency, mcmc_sim, job_id, num_jobs, calc_greeks=None):
         # check if we need to report gradients
         if calc_greeks is not None:
             implied_vars = list(itertools.chain(*[x.items() for x in self.implied_var]))
@@ -814,8 +816,8 @@ class Credit_Monte_Carlo(Calculation):
         # Now create a shared state with the cholesky decomp
         shared_mem = CMC_State(
             self.get_cholesky_decomp(), len(self.stoch_factors), [x[-1] for x in self.static_var], self.batch_size,
-            torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim,
-            get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs))
+            torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
+                utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs), seed, job_id, num_jobs)
 
         return shared_mem
 
@@ -891,36 +893,31 @@ class Credit_Monte_Carlo(Calculation):
 
         return self.output
 
-    def execute(self, params):
+    def execute(self, params, job_id=0, num_jobs=1):
         # get the rundate
         base_date = pd.Timestamp(params['Run_Date'])
-        # check if we need to produce a slideshow (i.e. documentation)
-        if params.get('Generate_Slideshow', 'No') == 'Yes':
-            # we need to generate scenarios to draw pictures . . .
-            params['Calc_Scenarios'] = 'Yes'
-            # set the name of this calculation
-            self.name = params['calc_name'][0]
 
         # Define the base and scenario grids
         self.input_time_grid = params['Time_grid']
-        self.numscenarios = params['Batch_Size'] * params['Simulation_Batches']
+        # needed if we are using multiprocessing across gpu's
+        self.batch_size = params['Batch_Size'] // num_jobs
+        self.numscenarios = self.batch_size * params['Simulation_Batches']
 
         # store the params
         self.params = params
         # set the name of the root logger to this netting set (makes tracking errors easier)
         logging.root.name = self.config.deals.get('Attributes', {'Reference': 'root'}).get('Reference', 'root')
-        self.batch_size = params['Batch_Size']
+
         # store the stats for the batches
-        self.calc_stats['Batch_Size'] = params['Batch_Size']
+        self.calc_stats['Batch_Size'] = self.batch_size
         self.calc_stats['Simulation_Batches'] = params['Simulation_Batches']
         self.calc_stats['Random_Seed'] = params['Random_Seed']
         # update the factors and obtain shared state
-        shared_mem = self.update_factors(params, base_date)
-        # setup the all instruments
+        shared_mem = self.update_factors(params, base_date, job_id, num_jobs)
+        # set up the all instruments
         self.netting_sets = DealStructure(Aggregation('root'))
         self.set_deal_structures(
-            self.config.deals['Deals']['Children'], self.netting_sets, self.numscenarios,
-            params['Batch_Size'], tagging=None, deal_level_mtm=params.get('DealLevel', False))
+            self.config.deals['Deals']['Children'], self.netting_sets, deal_level_mtm=params.get('DealLevel', False))
         # clear the output
         output = defaultdict(list)
         # reset the tensors - used for storing simulation data
@@ -1211,7 +1208,6 @@ class Base_Revaluation(Calculation):
 
         # prepare the risk factor output matrix . .
         self.static_var = []
-        self.static_values = []
         self.static_ofs = {}
 
     def update_factors(self, params, base_date):
@@ -1234,14 +1230,19 @@ class Base_Revaluation(Calculation):
         self.all_factors = self.static_factors
 
         calc_grad = params.get('Greeks', 'No') != 'No'
-        # and then get the the static risk factors ready - these will just be looked up
+        # and then get the static risk factors ready - these will just be looked up
         for key, value in self.static_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 # record the offset of this risk factor
                 self.static_ofs.setdefault(key, len(self.static_var))
                 current_val = value.current_value()
-                self.static_var.append((key, torch.tensor(
-                    current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
+                if isinstance(current_val, dict):
+                    for k, v in current_val.items():
+                        self.static_var.append((utils.Factor(key.type, key.name+(k,)), torch.tensor(
+                            v, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
+                else:
+                    self.static_var.append((key, torch.tensor(
+                        current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
 
         # setup the device and allocate memory
         shared_mem = self.__init_shared_mem(params['Currency'], params.get('MCMC_Simulations', 8 * 4096), calc_grad)
@@ -1350,7 +1351,7 @@ class Base_Revaluation(Calculation):
         self.calc_stats['Deal_Setup_Time'] = time.monotonic()
         self.netting_sets = DealStructure(Aggregation('root'), deal_level_mtm=True)
         self.set_deal_structures(
-            self.config.deals['Deals']['Children'], self.netting_sets, 1, 1, deal_level_mtm=True)
+            self.config.deals['Deals']['Children'], self.netting_sets, deal_level_mtm=True)
 
         # record the (pure python) dependency setup time
         self.calc_stats['Deal_Setup_Time'] = time.monotonic() - self.calc_stats['Deal_Setup_Time']

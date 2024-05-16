@@ -791,7 +791,7 @@ class HullWhite2FactorModelParametersJacobian(Factor1D):
 
 class HullWhite2FactorModelParameters(Factor1D):
     """
-    Represents the Bootstrapped implied parameters for a hull-white 2 factor model
+    Represents the Bootstrapped implied parameters for a hull-white 2-factor model
     """
 
     def __init__(self, param):
@@ -857,12 +857,49 @@ class HullWhite2FactorModelParameters(Factor1D):
 
         if self.get_instantaneous_correlation() is None and (
                 'Quanto_FX_Correlation_1' in self.param and 'Quanto_FX_Correlation_2' in self.param):
-            # needs to be looked up if there's not instantaneous correlation - otherwise it's calculated
+            # needs to be looked up if there's no instantaneous correlation - otherwise it's calculated
             params['Quanto_FX_Correlation_1'] = np.array([self.param['Quanto_FX_Correlation_1']])
             params['Quanto_FX_Correlation_2'] = np.array([self.param['Quanto_FX_Correlation_2']])
 
             if include_quanto:
                 params['Quanto_FX_Volatility'] = self.param['Quanto_FX_Volatility'].array[:, 1]
+
+        return params
+
+
+class SVISkew(Factor1D):
+    """
+    Represents the Bootstrapped implied parameters for a hull-white 2-factor model
+    """
+
+    def __init__(self, param):
+        super(SVISkew, self).__init__(param)
+
+    @staticmethod
+    def get_day_count():
+        """hardcode the daycount for dividend rates to act/365"""
+        return utils.DAYCOUNT_ACT365
+
+    def get_tenor(self):
+        """Gets the tenor points stored in the Curve attributes"""
+        return np.unique([self.param[x].array[:, 0] for x in ['a', 'b', 'rho', 'm', 'sigma']])
+
+    def get_tenor_indices(self):
+        tau = self.get_tenor().reshape(-1, 1)
+        return {'a': tau,
+                'b': tau,
+                'rho': tau,
+                'm': tau,
+                'sigma': tau}
+
+    def current_value(self, tenors=None):
+        """Returns the parameters of the SVI factor model as a dictionary"""
+
+        params = dict([('a', self.param['a'].array[:, 1]),
+                       ('b', self.param['b'].array[:, 1]),
+                       ('rho', self.param['rho'].array[:, 1]),
+                       ('m', self.param['m'].array[:, 1]),
+                       ('sigma', self.param['sigma'].array[:, 1])])
 
         return params
 

@@ -28,6 +28,7 @@ import logging
 import numpy as np
 import pandas as pd
 import collections.abc
+import torch.multiprocessing as mp
 
 from ._version import version_info, __version__
 from . import fields
@@ -133,9 +134,13 @@ def run_baseval(context, prec=torch.float64, overrides=None):
     return calc, out
 
 
-def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False):
+def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False, job_id=0, num_jobs=1, res_queue=None):
     """
     Runs a credit monte carlo calculation on the provided context
+    :param res_queue: If not None, returns the results in this queue
+    :param num_jobs: number of jobs spawned - usually just 1 (i.e. the parent)
+    :param job_id: used if multiprocessing is set (index of this process in a group of workers)
+    :param LegacyFVA: True if all we want is a way to calculate an FVA per deal
     :param context: a Context object
     :param overrides: a dictionary of overrides to replace the context's  calculation parameters
     :param prec: the numerical precision to use (default float32)
@@ -150,7 +155,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False):
     if torch.cuda.is_available():
         # make sure we try to be deterministic as possible
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-        device = torch.device("cuda:0")
+        device = torch.device("cuda", job_id)
         torch.cuda.empty_cache()
     else:
         device = torch.device("cpu")
@@ -232,7 +237,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False):
     if LegacyFVA:
         return calc, params_mc
     else:
-        out = calc.execute(params_mc)
+        out = calc.execute(params_mc, job_id, num_jobs)
         # summarize the results for easy review
         mtm = out['Results']['mtm']
         exposure = mtm.clip(0.0, np.inf)
@@ -259,7 +264,10 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False):
 
             out['Results']['collateral_profile'] = coll
 
-        return calc, out
+        if res_queue is not None:
+            res_queue.put({'Results': out['Results'], 'Stats': out['Stats']})
+        else:
+            return calc, out
 
 
 class Context:
@@ -345,17 +353,50 @@ class Context:
         # return this object
         return self
 
-    def run_job(self, overrides=None):
+    def run_job(self, overrides=None, runparallel=False):
         # check what calc we should run
         if self.current_cfg.deals['Calculation']['Object'] == 'CreditMonteCarlo':
-            return self.Credit_Monte_Carlo(overrides)
+            return self.Credit_Monte_Carlo(overrides, runparallel)
         elif self.current_cfg.deals['Calculation']['Object'] == 'BaseValuation':
             return self.Base_Valuation(overrides)
         else:
             raise Exception('Unknown Calculation {}'.format(self.current_cfg.deals['Calculation']['Object']))
 
-    def Credit_Monte_Carlo(self, overrides=None):
-        return run_cmc(self.current_cfg, overrides=overrides)
+    def Credit_Monte_Carlo(self, overrides=None, runparallel=False):
+        if runparallel:
+            num_workers = torch.cuda.device_count()
+            results = mp.Queue()
+            workers = [mp.Process(target=run_cmc, args=(
+                self.current_cfg, torch.float32, overrides, False, i, num_workers, results))
+                            for i in range(num_workers)]
+
+            # start all children
+            for w in workers:
+                w.start()
+
+            # now collate the results
+            post_processing = []
+            for i in range(num_workers):
+                post_processing.append(results.get())
+
+            # close the queue
+            results.close()
+
+            # terminate all worker processes
+            for w in workers:
+                w.join()
+                if w.is_alive():
+                    w.close()
+
+            post_results = {}
+            for output in post_processing:
+                data = dict(output)
+                for k, v in data.items():
+                    post_results.setdefault(k, []).append(v)
+            # return the results
+            return post_results
+        else:
+            return run_cmc(self.current_cfg, overrides=overrides)
 
     def Base_Valuation(self, overrides=None):
         return run_baseval(self.current_cfg, overrides=overrides)
