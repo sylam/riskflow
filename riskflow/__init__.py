@@ -60,6 +60,20 @@ def getpath(pathlist):
             return path
 
 
+def summarize_data(data, percentiles):
+    pos_exposure = data.clip(0.0, np.inf)
+    neg_exposure = data.clip(-np.inf, 0.0)
+
+    exposure = {
+        'EE': np.mean(pos_exposure, axis=1),
+        'ENE': np.mean(neg_exposure, axis=1)}
+
+    if percentiles:
+        extra = {'PFE_{}'.format(x): np.percentile(data, int(x), axis=1) for x in percentiles.split(',')}
+        exposure.update(extra)
+
+    return pd.DataFrame(exposure)
+
 def set_collateral(cfg, Agreement_Currency, Balance_Currency, Opening_Balance, Received_Threshold=0.0,
                    Posted_Threshold=0.0, Minimum_Received=100000.0, Minimum_Posted=100000.0, Liquidation_Period=10.0):
     """
@@ -238,35 +252,15 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False, job_id
         return calc, params_mc
     else:
         out = calc.execute(params_mc, job_id, num_jobs)
-        # summarize the results for easy review
-        mtm = out['Results']['mtm']
-        exposure = mtm.clip(0.0, np.inf)
-        neg_exposure = mtm.clip(-np.inf, 0.0)
-
-        exposure = {
-            'EE': np.mean(exposure, axis=1),
-            'ENE': np.mean(neg_exposure, axis=1)}
-        percentiles = params_mc.get('Percentile', '95').replace(' ', '')
-        if percentiles:
-            extra = {'PFE_{}'.format(x): np.percentile(mtm, int(x), axis=1) for x in percentiles.split(',')}
-            exposure.update(extra)
-
-        res = pd.DataFrame(exposure)
-        out['Results']['exposure_profile'] = res
-
-        # check if we have collva
-        if 'collva_t' in out['Results']:
-            collateral = out['Results']['collateral']
-            collva = out['Results']['collva_t']
-            coll = pd.DataFrame({
-                'Collateral(5%)': np.percentile(collateral, 5, axis=1),
-                'Expected': np.mean(collateral, axis=1), 'Cost': collva}, index=mtm.index)
-
-            out['Results']['collateral_profile'] = coll
 
         if res_queue is not None:
+            # parent process must summarize data
             res_queue.put({'Results': out['Results'], 'Stats': out['Stats']})
         else:
+            # summarize the results for easy review
+            out['Results']['exposure_profile'] = summarize_data(
+                out['Results']['mtm'], params_mc.get('Percentile', '95').replace(' ', ''))
+
             return calc, out
 
 

@@ -172,17 +172,13 @@ class Calculation(object):
 
         # the risk factor data
         self.static_factors = {}
-        self.static_ofs = {}
+        self.static_var = {}
         self.stoch_factors = {}
-        self.stoch_ofs = {}
+        self.stoch_var = {}
         self.all_factors = {}
         self.all_tenors = {}
 
-        # these are used for implied calibration        
-        self.implied_ofs = {}
-
         self.base_date = None
-
         self.tenor_size = None
         self.tenor_offset = None
 
@@ -289,11 +285,11 @@ class Calculation(object):
                 struct = DealStructure(instrument, deal_level_mtm=deal_level_mtm)
                 self.set_deal_structures(node['Children'], struct, deal_level_mtm)
                 output.add_structure_to_structure(
-                    struct, self.base_date, self.static_ofs, self.stoch_ofs, self.all_factors,
+                    struct, self.base_date, self.static_var, self.stoch_var, self.all_factors,
                     self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
                 continue
 
-            output.add_deal_to_structure(self.base_date, instrument, self.static_ofs, self.stoch_ofs, self.all_factors,
+            output.add_deal_to_structure(self.base_date, instrument, self.static_var, self.stoch_var, self.all_factors,
                                          self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
 
 
@@ -305,7 +301,7 @@ class CMC_State(utils.Calculation_State):
         self.t_PreCalc = {}
         self.t_cholesky = cholesky
         self.t_random_numbers = None
-        self.t_Scenario_Buffer = [None] * num_stoch_factors
+        self.t_Scenario_Buffer = {}
         self.t_Credit = {}
         # these are shared parameter states
         self.sobol = {}
@@ -512,16 +508,10 @@ class Credit_Monte_Carlo(Calculation):
         # implied factors
         self.implied_factors = {}
         # we represent the calc as a combination of static, stochastic and implied parameters
-        self.stoch_var = []
-        self.static_var = []
-        self.implied_var = []
+        self.implied_var = {}
 
         # potentially store the full list of variables
         self.all_var = None
-
-        self.stoch_ofs = {}
-        self.static_ofs = {}
-        self.implied_ofs = {}
 
     def update_factors(self, params, base_date, job_id, num_jobs):
         dependent_factors, stochastic_factors, implied_factors, reset_dates, settlement_currencies = \
@@ -584,12 +574,11 @@ class Credit_Monte_Carlo(Calculation):
                 if hasattr(value, 'implied'):
                     vars = {}
                     calc_grad = greeks and sensitivities in ['All', 'Implied']
-                    self.implied_ofs.setdefault(key, len(self.implied_var))
                     for param_name, param_value in value.implied.current_value().items():
                         factor_name = utils.Factor(value.implied.__class__.__name__, key.name + (param_name,))
                         vars[factor_name] = torch.tensor(
                             param_value, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
-                    self.implied_var.append(vars)
+                    self.implied_var[key] = vars
 
                 # check the daycount for the tenor_offset
                 if tenor_offset:
@@ -600,13 +589,13 @@ class Credit_Monte_Carlo(Calculation):
                     factor_tenor_offset = 0.0
 
                 # record the offset of this risk factor
-                self.stoch_ofs.setdefault(key, len(self.stoch_var))
                 current_val = value.factor.current_value(offset=factor_tenor_offset)
                 calc_grad = greeks and sensitivities in ['All', 'Factors']
-                self.stoch_var.append((key, torch.tensor(
-                    current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
+                self.stoch_var[key] = torch.tensor(
+                    current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
 
         # and then get the static risk factors ready - these will just be looked up
+        calc_grad = greeks and sensitivities in ['All', 'Factors']
         for key, value in self.static_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 # check the daycount for the tenor_offset
@@ -617,11 +606,14 @@ class Credit_Monte_Carlo(Calculation):
                 else:
                     factor_tenor_offset = 0.0
                 # record the offset of this risk factor
-                self.static_ofs.setdefault(key, len(self.static_var))
                 current_val = value.current_value(offset=factor_tenor_offset)
-                calc_grad = greeks and sensitivities in ['All', 'Factors']
-                self.static_var.append((key, torch.tensor(
-                    current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
+                if isinstance(current_val, dict):
+                    for k, v in current_val.items():
+                        self.static_var[utils.Factor(key.type, key.name+(k,))] = torch.tensor(
+                            v, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
+                else:
+                    self.static_var[key] = torch.tensor(
+                        current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
 
         # set up the device and allocate memory
         shared_mem = self.__init_shared_mem(
@@ -635,16 +627,14 @@ class Credit_Monte_Carlo(Calculation):
         # now initialize all stochastic factors
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
-                implied_index = self.implied_ofs.get(key, -1)
-                if implied_index > -1:
-                    implied_tensor = {k.name[-1]: v for k, v in self.implied_var[implied_index].items()}
-                    value.link_references(implied_tensor, self.implied_var, self.implied_ofs, self.implied_factors)
+                if key in self.implied_var:
+                    implied_tensor = {k.name[-1]: v for k, v in self.implied_var[key].items()}
+                    value.link_references(implied_tensor, self.implied_var, self.implied_factors)
                 else:
                     implied_tensor = None
                 value.precalculate(
                     base_date, ScenarioTimeGrid(dependent_factors[key], self.time_grid, base_date),
-                    self.stoch_var[self.stoch_ofs[key]][1], shared_mem, self.process_ofs[key],
-                    implied_tensor=implied_tensor)
+                    self.stoch_var[key], shared_mem, self.process_ofs[key], implied_tensor=implied_tensor)
                 if not value.params_ok:
                     logging.warning('Stochastic factor {} has been modified'.format(utils.check_scope_name(key)))
 
@@ -652,7 +642,7 @@ class Credit_Monte_Carlo(Calculation):
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 # precalculate any values for the stochastic process
-                value.calc_references(key, self.static_ofs, self.stoch_ofs, self.all_tenors, self.all_factors)
+                value.calc_references(key, self.static_var, self.stoch_var, self.all_tenors, self.all_factors)
 
         return shared_mem
 
@@ -667,7 +657,7 @@ class Credit_Monte_Carlo(Calculation):
             scenario_dates = self.config.parse_grid(
                 base_date, max(dynamic_dates), self.input_time_grid, past_max_date=True)
 
-        # setup the scenario and base time grids
+        # set up the scenario and base time grids
         self.time_grid = utils.TimeGrid(scenario_dates, mtm_dates, base_mtm_dates)
         self.base_date = base_date
         self.reset_dates = reset_dates
@@ -803,21 +793,21 @@ class Credit_Monte_Carlo(Calculation):
     def __init_shared_mem(self, seed, nomodel, reporting_currency, mcmc_sim, job_id, num_jobs, calc_greeks=None):
         # check if we need to report gradients
         if calc_greeks is not None:
-            implied_vars = list(itertools.chain(*[x.items() for x in self.implied_var]))
+            implied_vars = list(itertools.chain(*[x.items() for x in self.implied_var.values()]))
             if calc_greeks == 'Implied':
                 self.all_var = implied_vars
             elif calc_greeks == 'Factors':
                 self.all_var = self.stoch_var + self.static_var
             else:
-                self.all_var = implied_vars + self.stoch_var + self.static_var
+                self.all_var = implied_vars + list(self.stoch_var.items()) + list(self.static_var.items())
             # build our index
             self.make_factor_index(self.all_var)
 
         # Now create a shared state with the cholesky decomp
         shared_mem = CMC_State(
-            self.get_cholesky_decomp(), len(self.stoch_factors), [x[-1] for x in self.static_var], self.batch_size,
+            self.get_cholesky_decomp(), len(self.stoch_factors), self.static_var, self.batch_size,
             torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
-                utils.check_rate_name(reporting_currency), self.static_ofs, self.stoch_ofs), seed, job_id, num_jobs)
+                utils.check_rate_name(reporting_currency), self.static_var, self.stoch_var), seed, job_id, num_jobs)
 
         return shared_mem
 
@@ -927,14 +917,14 @@ class Credit_Monte_Carlo(Calculation):
         self.calc_stats[execution_label] = time.monotonic()
 
         for run in range(self.params['Simulation_Batches']):
-            start_run = time.monotonic()
+
             # need to refresh random numbers and zero out buffers
             shared_mem.reset(
                 self.num_factors, self.time_grid, use_antithetic=params.get('Antithetic', 'No') == 'Yes')
 
             # simulate the price factors
             for key, value in self.stoch_factors.items():
-                shared_mem.t_Scenario_Buffer[self.stoch_ofs[key]] = value.generate(shared_mem)
+                shared_mem.t_Scenario_Buffer[key] = value.generate(shared_mem)
 
             # construct the valuations
             tensors['mtm'] = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
@@ -968,10 +958,10 @@ class Credit_Monte_Carlo(Calculation):
 
                 funding = get_interest_factor(
                     utils.check_rate_name('{}.FUNDING'.format(params['LegacyFVA']['Funding_Curve'])),
-                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                    self.static_var, self.stoch_var, self.all_tenors)
                 collateral = get_interest_factor(
                     utils.check_rate_name('{}.COLLATERAL'.format(params['LegacyFVA']['Collateral_Curve'])),
-                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                    self.static_var, self.stoch_var, self.all_tenors)
 
                 discount_funding = utils.calc_time_grid_curve_rate(
                     funding, self.time_grid.time_grid[time_grid], shared_mem)
@@ -1006,15 +996,15 @@ class Credit_Monte_Carlo(Calculation):
 
                 funding = get_interest_factor(
                     utils.check_rate_name(params['Funding_Valuation_Adjustment']['Funding_Cost_Interest_Curve']),
-                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                    self.static_var, self.stoch_var, self.all_tenors)
                 riskfree = get_interest_factor(
                     utils.check_rate_name(params['Funding_Valuation_Adjustment']['Risk_Free_Curve']),
-                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                    self.static_var, self.stoch_var, self.all_tenors)
 
                 if params['Funding_Valuation_Adjustment'].get('Counterparty'):
                     survival = get_survival_factor(
                         utils.check_rate_name(params['Funding_Valuation_Adjustment']['Counterparty']),
-                        self.static_ofs, self.stoch_ofs, self.all_tenors)
+                        self.static_var, self.stoch_var, self.all_tenors)
                     surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), shared_mem)
                     St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
                         shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), dim=0)
@@ -1063,10 +1053,10 @@ class Credit_Monte_Carlo(Calculation):
             if params.get('Credit_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
                 discount = get_interest_factor(
                     utils.check_rate_name(params['Deflation_Interest_Rate']),
-                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                    self.static_var, self.stoch_var, self.all_tenors)
                 survival = get_survival_factor(
                     utils.check_rate_name(params['Credit_Valuation_Adjustment']['Counterparty']),
-                    self.static_ofs, self.stoch_ofs, self.all_tenors)
+                    self.static_var, self.stoch_var, self.all_tenors)
                 recovery = get_recovery_rate(
                     utils.check_rate_name(params['Credit_Valuation_Adjustment']['Counterparty']), self.all_factors)
                 # only looks at the first netting set - should be fine . . .
@@ -1105,7 +1095,7 @@ class Credit_Monte_Carlo(Calculation):
 
                 if params['Credit_Valuation_Adjustment'].get('Gradient', 'No') == 'Yes':
                     # potentially fetch ir jacobian matrices for base curves
-                    base_ir_curves = [x for x in self.stoch_ofs.keys() if
+                    base_ir_curves = [x for x in self.stoch_var.keys() if
                                       x.type == 'InterestRate' and len(x.name) == 1]
                     self.jacobians = {}
                     for ir_factor in base_ir_curves:
@@ -1165,7 +1155,7 @@ class Credit_Monte_Carlo(Calculation):
             if self.params.get('Calc_Scenarios', 'No') == 'Yes':
                 for key, value in self.stoch_factors.items():
                     output.setdefault('scenarios', {}).setdefault(key, []).append(
-                        shared_mem.t_Scenario_Buffer[self.stoch_ofs[key]].cpu().detach().numpy())
+                        shared_mem.t_Scenario_Buffer[key].cpu().detach().numpy())
 
         self.calc_stats[execution_label] = time.monotonic() - self.calc_stats[execution_label]
 
@@ -1207,8 +1197,7 @@ class Base_Revaluation(Calculation):
                                           gpus riskneutral precision simulation_batch Report_Currency')
 
         # prepare the risk factor output matrix . .
-        self.static_var = []
-        self.static_ofs = {}
+        self.static_var = {}
 
     def update_factors(self, params, base_date):
         dependent_factors, stochastic_factors, implied_factors, reset_dates, settlement_currencies = \
@@ -1233,18 +1222,16 @@ class Base_Revaluation(Calculation):
         # and then get the static risk factors ready - these will just be looked up
         for key, value in self.static_factors.items():
             if key.type not in utils.DimensionLessFactors:
-                # record the offset of this risk factor
-                self.static_ofs.setdefault(key, len(self.static_var))
                 current_val = value.current_value()
                 if isinstance(current_val, dict):
                     for k, v in current_val.items():
-                        self.static_var.append((utils.Factor(key.type, key.name+(k,)), torch.tensor(
-                            v, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
+                        self.static_var[utils.Factor(key.type, key.name+(k,))] = torch.tensor(
+                            v, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
                 else:
-                    self.static_var.append((key, torch.tensor(
-                        current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)))
+                    self.static_var[key] = torch.tensor(
+                        current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
 
-        # setup the device and allocate memory
+        # set up the device and allocate memory
         shared_mem = self.__init_shared_mem(params['Currency'], params.get('MCMC_Simulations', 8 * 4096), calc_grad)
 
         # calculate a reverse lookup for the tenors and store the daycount code
@@ -1267,13 +1254,13 @@ class Base_Revaluation(Calculation):
         # now decide what we want to calculate greeks with respect to
         all_vars_concat = None
         if calc_greeks:
-            all_vars_concat = [x for x in self.static_var if x[0] != base_currency]
-            self.make_factor_index(self.static_var)
+            all_vars_concat = [x for x in self.static_var.items() if x[0] != base_currency]
+            self.make_factor_index(list(self.static_var.items()))
 
         # allocate memory on the device
         return Base_Reval_State(
-            [x[-1] for x in self.static_var], torch.ones([1, 1], dtype=self.dtype, device=self.device),
-            mcmc_sim, get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_ofs, {}),
+            self.static_var, torch.ones([1, 1], dtype=self.dtype, device=self.device),
+            mcmc_sim, get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_var, {}),
             all_vars_concat, self.params['Greeks'] == 'All')
 
     def report(self):

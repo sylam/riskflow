@@ -41,6 +41,25 @@ def cash_settle(shared, currency, time_index, value):
         shared.t_Cashflows[currency][time_index] += value
 
 
+def calc_moneyness(strike, spot, forward, deal_data, use_forward=False, invert_moneyness=False):
+    '''
+    Deals with different ways of calculating moneyness - either spot/strike, forward/strike
+    or for svi surfaces, log(strike/forward) etc.
+    :param use_forward: use the forward to calculate moneyness (otherwise use the spot)
+    :param invert_moneyness: if true, calculate moneyness as strike / forward (or spot)
+    :param strike: strike value
+    :param spot: spot price tensor
+    :param forward: forward price tensor
+    :param deal_data: Deal_data struct containing deal specific data
+    :return: the moneyness amount to apply to the deal
+    '''
+    if deal_data.Factor_dep.get('SVI', False):
+        return torch.log(strike/forward)
+    else:
+        forward_or_spot = forward if use_forward else spot
+        return strike/forward_or_spot if invert_moneyness else forward_or_spot/strike
+
+
 class SensitivitiesEstimator(object):
     """ Implements the AAD sensitivities (both first and second derivatives)"""
 
@@ -530,11 +549,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
 
     expiry_years = factor_dep[expiry_years_key]
     forward = spot * torch.exp(b * expiry_years)
-
-    if use_forwards:
-        moneyness = strike / forward if invert_moneyness else forward / strike
-    else:
-        moneyness = strike / spot if invert_moneyness else spot / strike
+    moneyness = calc_moneyness(strike, spot, forward, deal_data, use_forwards, invert_moneyness)
 
     for index, (discount_block, spot_block, moneyness_block) in enumerate(
             utils.split_counts([discount, spot, moneyness], counts, shared)):
@@ -613,12 +628,7 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
 
     expiry_years = factor_dep[expiry_years_key]
     forward = spot * torch.exp(b * expiry_years)
-
-    if use_forwards:
-        moneyness = strike / forward if invert_moneyness else forward / strike
-    else:
-        moneyness = strike / spot if invert_moneyness else spot / strike
-
+    moneyness = calc_moneyness(strike, spot, forward, deal_data, use_forwards, invert_moneyness)
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     if 'Payoff_Currency' in factor_dep and factor_dep['Payoff_Currency'] != factor_dep['Currency']:
@@ -703,12 +713,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
 
     expiry_years = factor_dep[expiry_years_key]
     forward = spot * torch.exp(b * expiry_years)
-
-    if use_forwards:
-        moneyness = barrier / forward if invert_moneyness else forward / barrier
-    else:
-        moneyness = barrier / spot if invert_moneyness else spot / barrier
-
+    moneyness = calc_moneyness(barrier, spot, forward, deal_data, use_forwards, invert_moneyness)
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     if 'Payoff_Currency' in factor_dep and ['Payoff_Currency'] != factor_dep['Currency']:
@@ -1443,9 +1448,8 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
             dim=0)
 
         strike_bar = factor_dep['Strike'] - average.reshape(1, -1).expand(counts[index], -1)
-        moneyness_block = forward_block if use_forwards else spot_block
-        moneyness = (strike_bar / normalize) / moneyness_block if invert_moneyness else moneyness_block / (
-                strike_bar / normalize)
+        moneyness = calc_moneyness(
+            strike_bar / normalize, spot_block, forward_block, deal_data, use_forwards, invert_moneyness)
         vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, daycount_fn(tenor_block), shared)
 
         product_t = sample_ft * torch.exp(

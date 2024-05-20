@@ -871,6 +871,7 @@ class SVISkew(Factor1D):
     """
     Represents the Bootstrapped implied parameters for a hull-white 2-factor model
     """
+    named_params = ['a', 'b', 'rho', 'm', 'sigma']
 
     def __init__(self, param):
         super(SVISkew, self).__init__(param)
@@ -882,24 +883,15 @@ class SVISkew(Factor1D):
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attributes"""
-        return np.unique([self.param[x].array[:, 0] for x in ['a', 'b', 'rho', 'm', 'sigma']])
+        return np.unique([self.param[x].array[:, 0] for x in self.named_params])
 
     def get_tenor_indices(self):
         tau = self.get_tenor().reshape(-1, 1)
-        return {'a': tau,
-                'b': tau,
-                'rho': tau,
-                'm': tau,
-                'sigma': tau}
+        return {x: tau for x in self.named_params}
 
-    def current_value(self, tenors=None):
+    def current_value(self, tenors=None, offset=0):
         """Returns the parameters of the SVI factor model as a dictionary"""
-
-        params = dict([('a', self.param['a'].array[:, 1]),
-                       ('b', self.param['b'].array[:, 1]),
-                       ('rho', self.param['rho'].array[:, 1]),
-                       ('m', self.param['m'].array[:, 1]),
-                       ('sigma', self.param['sigma'].array[:, 1])])
+        params = {x: self.param[x].array[:, 1] for x in self.named_params}
 
         return params
 

@@ -1501,7 +1501,6 @@ def gather_surface_interp(surface, code, expiry, shared, calc_std):
     if time_code not in shared.t_Buffer:
         expiry_tenor = code[FACTOR_INDEX_Expiry_Index]
         index, index_next, alpha = expiry_tenor.get_index(expiry)
-
         time_modifier = np.sqrt(expiry) if calc_std else 1.0
         alpha = surface.new(alpha).reshape(-1, 1)
 
@@ -1511,57 +1510,75 @@ def gather_surface_interp(surface, code, expiry, shared, calc_std):
 
 
 def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
-    # work out the moneyness - this is a way to fake np.searchsorted - clean this up
-    surface, moneyness_tenor = shared.t_Buffer[key_code]
-    max_index = np.prod(surface.shape) - 1
-    # make sure it's in range of our vol surface
-    clipped_moneyness = torch.clamp(
-        moneyness, min=moneyness_tenor.min, max=moneyness_tenor.max)
-
-    flat_moneyness = clipped_moneyness.reshape(-1, 1)
-
-    # copy the indices to tensors
-    moneyness_t = moneyness.new(np.append(moneyness_tenor.tenor, [np.inf]))
-    moneyness_d = moneyness.new(np.append(moneyness_tenor.delta, [1.0]))
-
-    cmp = (flat_moneyness >= moneyness_t).type(torch.int32)
-    index = (cmp[:, 1:] - cmp[:, :-1]).argmin(axis=1)
-    alpha = (torch.squeeze(flat_moneyness, dim=1) - moneyness_t[index]) / moneyness_d[index]
-
-    expiry_indices = np.arange(expiry.size).astype(np.int32)
-    expiry_offsets = shared.one.new_tensor(
-        np.array([expiry_indices * moneyness_tenor.tenor.size]),
-        dtype=torch.int32).T.expand(-1, shared.simulation_batch).reshape(-1)
-
-    reshape = True
-    if expiry_offsets.shape != index.shape:
-        reshape = False
-        vol_index = index + expiry_offsets[:index.shape[0]]
+    if key_code[0] == 'vol_time_grid' and key_code[FACTOR_INDEX_Offset][0][0] == 'sviskew':
+        surface, expiry_tenor, calc_std = shared.t_Buffer[key_code]
+        time_modifier = np.sqrt(expiry).reshape(-1, 1) if calc_std else 1.0
+        index, index_next, alpha = expiry_tenor.get_index(expiry)
+        alpha = shared.one.new(alpha.reshape(-1, 1))
+        k_m_prior = moneyness - surface['m'][index]
+        var_prior = surface['a'][index] + surface['b'][index] * (
+            surface['rho'][index] * k_m_prior + torch.sqrt(k_m_prior ** 2 + surface['sigma'][index] ** 2))
+        k_m_post = moneyness - surface['m'][index_next]
+        var_post = surface['a'][index_next] + surface['b'][index_next] * (
+            surface['rho'][index_next] * k_m_post + torch.sqrt(k_m_post ** 2 + surface['sigma'][index_next] ** 2))
+        variance = var_prior * (1 - alpha) + var_post * alpha
+        return torch.sqrt(variance) * time_modifier
     else:
-        vol_index = index + expiry_offsets
+        surface, moneyness_tenor = shared.t_Buffer[key_code]
+        max_index = np.prod(surface.shape) - 1
+        index, _, alpha = moneyness_tenor.get_index(moneyness.reshape(-1))
+        expiry_indices = np.arange(expiry.size).astype(np.int32)
+        expiry_index_key = ('expiry_tenor', tuple(expiry_indices), moneyness_tenor.tenor.size)
 
-    vol_index_next = torch.clamp(vol_index + 1, 0, max_index)
-    vols = surface[vol_index] * (1.0 - alpha) + surface[vol_index_next] * alpha
+        if expiry_index_key not in shared.t_Buffer:
+            shared.t_Buffer[expiry_index_key] = shared.one.new_tensor(
+            np.array([expiry_indices * moneyness_tenor.tenor.size]),
+            dtype=torch.int32).T.expand(-1, shared.simulation_batch).reshape(-1)
 
-    return vols.reshape(-1, shared.simulation_batch) if reshape else vols.reshape(-1, 1)
+        expiry_offsets = shared.t_Buffer[expiry_index_key]
+        reshape = True
+        if expiry_offsets.shape != index.shape:
+            reshape = False
+            vol_index = index + expiry_offsets[:index.shape[0]]
+        else:
+            vol_index = index + expiry_offsets
+
+        vol_index_next = torch.clamp(vol_index + 1, 0, max_index)
+        vols = surface[vol_index] * (1.0 - alpha) + surface[vol_index_next] * alpha
+
+        return vols.reshape(-1, shared.simulation_batch) if reshape else vols.reshape(-1, 1)
 
 
 def calc_time_grid_vol_rate(code, moneyness, expiry, shared, calc_std=False):
-    key_code = ('vol2d', tuple([x[:2] for x in code]), tuple(expiry), calc_std)
+    keys = []
+    for rate in code:
+        if isinstance(rate[FACTOR_INDEX_Offset], list):
+            keys.append(('sviskew', tuple(rate[:1] + tuple(rate[1]))))
+        else:
+            keys.append(('vol2d', rate[:2]))
+
+        key_code = ('vol_time_grid', tuple(keys), tuple(expiry), calc_std)
 
     if key_code not in shared.t_Buffer:
         spread = None
-
+        # We only support one vol stack at the moment - but can extend this to 2 or more
         for rate in code:
             # Only static moneyness/expiry vol surfaces are supported for now
             if rate[FACTOR_INDEX_Stoch]:
                 raise Exception("Stochastic vol surfaces not yet implemented")
             else:
-                spread = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
+                if isinstance(rate[FACTOR_INDEX_Offset], list):
+                    spread = {x.name[-1]: shared.t_Static_Buffer[x].reshape(-1, 1) for x in rate[FACTOR_INDEX_Offset]}
+                else:
+                    spread = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
                 break
 
-        shared.t_Buffer[key_code] = gather_flat_surface(
-            spread, code[0], expiry, shared, calc_std)
+        # either interpolate a flat vol surface or a svi vol skew
+        if isinstance(code[0][FACTOR_INDEX_Offset], list):
+            shared.t_Buffer[key_code] = (spread, code[0][FACTOR_INDEX_Tenor_Index], calc_std)
+        else:
+            shared.t_Buffer[key_code] = gather_flat_surface(
+                spread, code[0], expiry, shared, calc_std)
 
     return calc_moneyness_vol_rate(moneyness, expiry, key_code, shared)
 

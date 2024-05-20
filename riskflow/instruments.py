@@ -23,7 +23,7 @@ from collections import OrderedDict
 from functools import reduce
 
 # utility functions and constants
-from . import utils, pricing
+from . import utils, pricing, riskfactors
 
 # specific modules
 import numpy as np
@@ -62,12 +62,23 @@ def generate_dates_forward(end_date, start_date, date_offset, bus_day=None, clip
     return pd.DatetimeIndex(dates)
 
 
+def calc_multi_factor_index(field, params, static_offsets, stochastic_offsets, all_tenors):
+    fullnames = [utils.Factor(field.type, field.name + (param,)) for param in params]
+    if static_offsets.get(fullnames[0]) is not None:
+        index = [False]
+    elif stochastic_offsets.get(fullnames[0]) is not None:
+        index = [True]
+    else:
+        raise Exception('Cannot find {}'.format(utils.check_tuple_name(field)))
+    return tuple(index + [fullnames] + all_tenors.get(field, []))
+
+
 def calc_factor_index(field, static_offsets, stochastic_offsets, all_tenors={}):
     """Utility function to determine if a factor is static or stochastic and returns its offset in the scenario block"""
     if static_offsets.get(field) is not None:
-        return tuple([False, static_offsets[field]] + all_tenors.get(field, []))
+        return tuple([False, field] + all_tenors.get(field, []))
     elif stochastic_offsets.get(field) is not None:
-        return tuple([True, stochastic_offsets[field]] + all_tenors.get(field, []))
+        return tuple([True, field] + all_tenors.get(field, []))
     else:
         raise Exception('Cannot find {}'.format(utils.check_tuple_name(field)))
 
@@ -118,8 +129,7 @@ def get_inflation_index_objects(inflation_name, index_name, all_factors):
 
 def get_fxrate_factor(fieldname, static_offsets, stochastic_offsets):
     """Read the index of the FX rate price factor"""
-    return [calc_factor_index(utils.Factor('FxRate', fieldname),
-                              static_offsets, stochastic_offsets)]
+    return [calc_factor_index(utils.Factor('FxRate', fieldname), static_offsets, stochastic_offsets)]
 
 
 def get_fxrate_spot(fieldname, static_offsets, stochastic_offsets, all_factors):
@@ -139,7 +149,7 @@ def get_forwardprice_factor(cashflow_currency, static_offsets, stochastic_offset
     include the excel_date version of the base_date"""
 
     forward_price = reference_factor.get_forwardprice()
-    # note that in future we could stack forwardprices together
+    # note that in future we could stack forward prices together
     forward_offset = [calc_factor_index(
         utils.Factor('ForwardPrice', forward_price), static_offsets, stochastic_offsets, all_tenors)]
     forward_fx_ofs = get_fx_and_zero_rate_factor(
@@ -275,8 +285,8 @@ def get_equity_price_vol_factor(fieldname, static_offsets, stochastic_offsets, a
 
 def get_svi_factor(fieldname, static_offsets, stochastic_offsets, all_tenors):
     """Read the index of the SVI price factor"""
-    return [calc_factor_index(utils.Factor('SVISkew', fieldname), static_offsets,
-                              stochastic_offsets, all_tenors)]
+    return [calc_multi_factor_index(utils.Factor('SVISkew', fieldname),
+                                    riskfactors.SVISkew.named_params, static_offsets, stochastic_offsets, all_tenors)]
 
 
 def get_interest_vol_factor(fieldname, tenor, static_offsets, stochastic_offsets, all_tenors):
@@ -360,11 +370,24 @@ class Deal(object):
         raise Exception('generate in class {} not implemented yet for deal {}'.format(
             self.__class__.__name__, self.field.get('Reference')))
 
-    def check_payoff_type(self, field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors):
+    def check_option_data(self, field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors):
         '''
-        Check if this is a compo or quanto option. Note - this only works for equity derivates. Needs to be
-        extended to other asset classes
+        Check if this is a compo or quanto option. Note - this only works for equity derivatives. Needs to be
+        extended to other asset classes - TODO!
+        Also checks the vol surface - either we have an Equity_Volatility or an Equity_SVISkew field
         '''
+        if 'Equity_Volatility' in self.field:
+            field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
+            field_index['Volatility'] = get_equity_price_vol_factor(
+                field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors)
+        elif 'Equity_SVISkew' in self.field:
+            field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_SVISkew'])
+            field_index['Volatility'] = get_svi_factor(
+                field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors)
+            field_index['SVI'] = True
+        else:
+            raise Exception('Volatility field not recognised')
+
         if 'Payoff_Type' in self.field and field['Payoff_Currency'] != field['Currency']:
             corr_sign, fx_lookup = utils.check_fx_name([field['Currency'][0], field['Payoff_Currency'][0]])
             field_index['FXVol'] = get_fx_vol_factor(fx_lookup, static_offsets, stochastic_offsets, all_tenors)
@@ -2401,6 +2424,7 @@ class EquityDiscreteExplicitAsianOption(Deal):
                      'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
+                     'Equity_SVISkew': ['SVISkew'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
     documentation = ('FX and Equity', ['A path independent option described [here](#discrete-asian-options)'])
@@ -2482,6 +2506,7 @@ class EquityBarrierBinaryOption(Deal):
                      'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
+                     'Equity_SVISkew': ['SVISkew'],
                      'Equity_Volatility': ['EquityPriceVol']}
     documentation = ('FX and Equity', ['A vanilla option described [here](Definitions#european-options)'])
 
@@ -2524,8 +2549,6 @@ class EquityBarrierBinaryOption(Deal):
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors),
-            'Volatility': get_equity_price_vol_factor(
-                field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Observation_Dates': utils.make_fixing_data(
                 base_date, time_grid, [[x, 0] for x in all_dates]),
             'Barrier_Dates': [ab.get(x, -1) for x in all_dates],
@@ -2535,7 +2558,7 @@ class EquityBarrierBinaryOption(Deal):
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
-        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+        self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 
@@ -2609,15 +2632,13 @@ class EquityBinaryOption(Deal):
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors),
-            'Volatility': get_equity_price_vol_factor(
-                field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Strike_Price': self.field['Strike_Price'],
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
             'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
-        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+        self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 
@@ -2630,7 +2651,7 @@ class EquityBinaryOption(Deal):
         forward = utils.calc_eq_forward(
             deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
             deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
-        moneyness = spot / deal_data.Factor_dep['Strike_Price']
+        moneyness = pricing.calc_moneyness(deal_data.Factor_dep['Strike_Price'], spot, forward, deal_data)
 
         mtm = pricing.pv_european_option(
             shared, time_grid, deal_data, self.field['Cash_Payoff'], moneyness, forward, binary=True) * fx_rep
@@ -2695,29 +2716,12 @@ class EquityOptionDeal(Deal):
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
             'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
             'Option_Style': self.field['Option_Style'],
-            'Expiry': (self.field['Expiry_Date'] - base_date).days,
-            'SVI': False
+            'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
-        if 'Equity_Volatility' in self.field:
-            field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
-            field_index['Volatility'] = get_equity_price_vol_factor(
-                field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors)
-        else:
-            field['Equity_SVI'] = utils.check_rate_name(self.field['Equity_SVISkew'])
-            field_index['Volatility'] = get_svi_factor(
-                field['Equity_SVI'], static_offsets, stochastic_offsets, all_tenors)
-            field_index['SVI'] = True
-
-        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+        self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
-
-    def calc_moneyness(self, spot, forward, deal_data):
-        if deal_data.Factor_dep.get('SVI', False):
-            return torch.log(deal_data.Factor_dep['Strike_Price']/forward)
-        else:
-            return spot / deal_data.Factor_dep['Strike_Price']
 
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
@@ -2728,7 +2732,7 @@ class EquityOptionDeal(Deal):
         forward = utils.calc_eq_forward(
             deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
             deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
-        moneyness = self.calc_moneyness (spot, forward, deal_data)
+        moneyness = pricing.calc_moneyness(deal_data.Factor_dep['Strike_Price'], spot, forward, deal_data)
 
         if deal_data.Factor_dep['Option_Style'] == 'European':
             mtm = pricing.pv_european_option(
@@ -2805,8 +2809,6 @@ class QEDI_CustomAutoCallSwap(Deal):
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors),
-            'Volatility': get_equity_price_vol_factor(
-                field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Strike_Price': self.field['Strike_Price'],
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
             'Barrier': self.field.get('Barrier', 0.0) * self.field['Strike_Price'],
@@ -2820,7 +2822,7 @@ class QEDI_CustomAutoCallSwap(Deal):
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
 
-        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+        self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 
@@ -2830,7 +2832,10 @@ class QEDI_CustomAutoCallSwap(Deal):
             deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
 
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
-        moneyness = spot / deal_data.Factor_dep['Strike_Price']
+        forward = utils.calc_eq_forward(
+            deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
+            deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
+        moneyness = pricing.calc_moneyness(deal_data.Factor_dep['Strike_Price'], spot, forward, deal_data)
 
         if spot.shape[0] == deal_time.shape[0]:
             mtm = pricing.pv_MC_AutoCallSwap(
@@ -2966,7 +2971,7 @@ class EquityOneTouchOption(Deal):
 
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
-        field['FX_Volatility'] = utils.check_rate_name(self.field['FX_Volatility'])
+        field['Equity_Volatility'] = utils.check_rate_name(self.field['Equity_Volatility'])
 
         field_index = {'Currency': get_fx_and_zero_rate_factor(
             field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
@@ -2992,7 +2997,7 @@ class EquityOneTouchOption(Deal):
             field_index['Barrier_Monitoring'] = 0.5826 * np.sqrt(
                 (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0)
 
-        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+        self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 
@@ -3085,8 +3090,6 @@ class EquityBarrierOption(Deal):
                            field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Dividend_Yield': get_dividend_rate_factor(
                            field['Equity'], static_offsets, stochastic_offsets, all_tenors),
-                       'Volatility': get_equity_price_vol_factor(
-                           field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
                        'Expiry': (self.field['Expiry_Date'] - base_date).days,
                        'Strike_Price': self.field['Strike_Price'],
                        'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
@@ -3107,7 +3110,7 @@ class EquityBarrierOption(Deal):
             field_index['Barrier_Monitoring'] = 0.5826 * np.sqrt(
                 (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0)
 
-        self.check_payoff_type(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+        self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 
@@ -3229,7 +3232,6 @@ class EquityForwardDeal(Deal):
                  'Equity': utils.check_rate_name(self.field['Equity'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
-        # field['Equity_Volatility']		= utils.check_rate_name(self.field['Equity_Volatility'])
 
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
                        'Discount': get_discount_factor(

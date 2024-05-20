@@ -117,7 +117,7 @@ class StochasticProcess(object):
         self.param = param
         self.params_ok = True
 
-    def link_references(self, implied_tensor, implied_var, implied_ofs, implied_factors):
+    def link_references(self, implied_tensor, implied_var, implied_factors):
         """link market variables across different risk factors"""
         pass
 
@@ -282,11 +282,11 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
             self.C = 0.0
             self.rho = 0.0
 
-    def link_references(self, implied_tensor, implied_var, implied_ofs, implied_factors):
+    def link_references(self, implied_tensor, implied_var, implied_factors):
         """link market variables across different risk factors"""
         if self.factor_type == 'EquityPrice':
-            fx_implied_index = implied_ofs.get(utils.Factor('FxRate', self.factor.get_currency()))
-            if fx_implied_index is not None:
+            fx_implied_index = utils.Factor('FxRate', self.factor.get_currency())
+            if fx_implied_index in implied_var:
                 FXImplied_vol_factor = utils.Factor(
                     'GBMAssetPriceTSModelParameters', self.factor.get_currency() + ('Vol',))
                 # now set the Quanto_FX_Volatility to the same vol as the fx rate
@@ -454,10 +454,10 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         self.implied = implied_factor
         self.cache = {}
 
-    def link_references(self, implied_tensor, implied_var, implied_ofs, implied_factors):
+    def link_references(self, implied_tensor, implied_var, implied_factors):
         """link market variables across different risk factors"""
-        fx_implied_index = implied_ofs.get(utils.Factor('FxRate', self.factor.get_currency()))
-        if fx_implied_index is not None:
+        fx_implied_index = utils.Factor('FxRate', self.factor.get_currency())
+        if fx_implied_index in implied_var:
             FXImplied_vol_factor = utils.Factor(
                 'GBMAssetPriceTSModelParameters', self.factor.get_currency() + ('Vol',))
             # now set the Quanto_FX_Volatility to the same vol as the fx rate
