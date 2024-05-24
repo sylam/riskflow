@@ -42,14 +42,15 @@ date_fmt = lambda x: ''.join(['{0}{1}'.format(v, date_desc[k]) for k, v in x.kwd
 
 
 class RiskNeutralInterestRate_State(utils.Calculation_State):
-    def __init__(self, batch_size, device, dtype, nomodel='Constant'):
+    def __init__(self, scenario_keys, batch_size, device, dtype, nomodel='Constant'):
         super(RiskNeutralInterestRate_State, self).__init__(
             None, torch.ones([1, 1], dtype=dtype, device=device), 2048, None, nomodel, batch_size)
         # these are tensors
         self.t_PreCalc = {}
+        self.scenario_keys = scenario_keys
         self.t_random_batch = None
         self.batch_index = 0
-        self.t_Scenario_Buffer = None
+        self.t_Scenario_Buffer = {}
 
     @property
     def t_random_numbers(self):
@@ -139,7 +140,7 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
     # cater for shifted lognormal vols
     shift_parameter = vol_surface.BlackScholesDisplacedShiftValue / 100.0
     for instrument in instrument_definitions:
-        # setup the instrument
+        # set up the instrument
         effective = base_date + instrument['Start']
         maturity = effective + instrument['Tenor']
         exp_days = (effective - base_date).days
@@ -617,7 +618,7 @@ class RiskNeutralInterestRateModel(object):
         def loss(implied_var):
             # first, reset the shared_mem
             shared_mem.reset(self.num_batches, numfactors, time_grid)
-            # now setup the calc
+            # now set up the calc
             process.precalculate(base_date, time_grid, stoch_var, shared_mem, 0, implied_tensor=implied_var)
             tensor_swaptions = {}
             # needed to interpolate the zero curve
@@ -653,21 +654,27 @@ class RiskNeutralInterestRateModel(object):
                       for k, swap in market_swaps.items()}
             return calibrated_swaptions, errors
 
+        # set up the stochastic factors
+        stochastic_factors = {ir_factor: process}
         # calculate a reverse lookup for the tenors and store the daycount code
-        all_tenors = utils.update_tenors(base_date, {ir_factor: process})
-        # calculate the curve index
-        curve_index = [instruments.calc_factor_index(ir_factor, {}, {ir_factor: 0}, all_tenors)]
-        # calculate the reduced tenor curve index - note it's the same as above but in the next scenario index (1)
-        curve_index_reduced = [instruments.calc_factor_index(ir_factor, {}, {ir_factor: 1}, all_tenors)]
+        all_tenors = utils.update_tenors(base_date, stochastic_factors)
+        # calculate the curve indices
+        index_keys = {'full': utils.Factor(ir_factor.type, ir_factor.name + ('full',)),
+                      'reduced': utils.Factor(ir_factor.type, ir_factor.name + ('reduced',))}
+        # calculate the tenor curve index
+        c_index = instruments.calc_factor_index(ir_factor, {}, stochastic_factors, all_tenors)
+        # now edit the curve indices with the correct names - one reduced, one full
+        curve_index = [(c_index[utils.FACTOR_INDEX_Stoch], index_keys['full']) + c_index[2:]]
+        curve_index_reduced = [(c_index[utils.FACTOR_INDEX_Stoch], index_keys['reduced']) + c_index[2:]]
         # calc the market swap rates and instrument_definitions    
         market_swaps, benchmarks = create_market_swaps(
             base_date, time_grid, curve_index, vol_surface, process.factor,
             implied_params['instrument']['Instrument_Definitions'], ir_factor.name)
         # number of random factors to use
         numfactors = process.num_factors()
-        # setup a common context - we leave out the random numbers and pass it in explicitly below
-        shared_mem = RiskNeutralInterestRate_State(self.batch_size, self.device, self.prec)
-        # setup the variables
+        # set up a common context - we leave out the random numbers and pass it in explicitly below
+        shared_mem = RiskNeutralInterestRate_State(index_keys, self.batch_size, self.device, self.prec)
+        # set up the variables
         implied_var = {}
         stoch_var = torch.tensor(
             process.factor.current_value(), device=self.device, dtype=self.prec, requires_grad=jac)
@@ -726,7 +733,7 @@ class RiskNeutralInterestRateModel(object):
                 implied_obj, process, vol_tenors = self.implied_process(
                     base_currency, price_factors, price_models, ir_curve, rate)
 
-                # setup the time grid
+                # set up the time grid
                 time_grid = utils.TimeGrid(mtm_dates, mtm_dates, mtm_dates)
                 # add a delta of 10 days to the time_grid_years (without changing the scenario grid
                 # this is needed for stochastically deflating the exposure later on

@@ -50,16 +50,17 @@ DAYCOUNT_ACTACTICMA = 5
 
 # factor codes
 FACTOR_INDEX_Stoch = 0  # either True for stochastic or False for static
-FACTOR_INDEX_Offset = 1  # index into the corresponding tensor list
-FACTOR_INDEX_Tenor_Index = 2  # Actual tenor array and its delta
-FACTOR_INDEX_Daycount = 3  # daycount code
-FACTOR_INDEX_Process = 4  # Stochastic process code
-FACTOR_INDEX_ExcelCalcDate = 3
-FACTOR_INDEX_Moneyness_Index = 2
-FACTOR_INDEX_Expiry_Index = 3
-FACTOR_INDEX_VolTenor_Index = 4
-FACTOR_INDEX_Flat_Index = 4
-FACTOR_INDEX_Surface_Flat_Index = 5
+FACTOR_INDEX_Offset = 1  # index to get the factor name
+FACTOR_INDEX_SubType = 2  # index to get the factor subtype (if any)
+# these are indices to get the tenors relevant to interpolate the risk factor in question
+FACTOR_INDEX_Tenor_Index = 3
+FACTOR_INDEX_Daycount = 4  # daycount code
+FACTOR_INDEX_ExcelCalcDate = 4
+FACTOR_INDEX_Moneyness_Index = 3
+FACTOR_INDEX_Expiry_Index = 4
+FACTOR_INDEX_VolTenor_Index = 5
+FACTOR_INDEX_Flat_Index = 5
+FACTOR_INDEX_Surface_Flat_Index = 6
 
 # cashflow codes 
 CASHFLOW_INDEX_Start_Day = 0
@@ -969,7 +970,7 @@ def cds_dates(base, num_months):
     return res
 
 
-def calc_cds_rates(R, survival, discount, base_date, CDS_tenors, bump=0.01 * 0.01):
+def calc_cds_rates(R, survival, discount, base_date, CDS_tenors, all_factors, bump=0.01 * 0.01):
     def calc_par_cds(S_j, cds_tenor, delta=0.0, start_time=None, end_time=None):
         if delta:
             S_vals = S_j.copy()
@@ -1006,8 +1007,8 @@ def calc_cds_rates(R, survival, discount, base_date, CDS_tenors, bump=0.01 * 0.0
     max_cds_dates = cds_dates(base_date, int(max(CDS_tenors) * 12))
     time_to_add = [survival[FACTOR_INDEX_Daycount]((x - base_date).days) for x in max_cds_dates]
 
-    S_proc = survival[FACTOR_INDEX_Process]
-    D_proc = discount[FACTOR_INDEX_Process]
+    S_proc = all_factors[survival[FACTOR_INDEX_Offset]]
+    D_proc = all_factors[discount[FACTOR_INDEX_Offset]]
     S_factor = S_proc.factor if hasattr(S_proc, 'factor') else S_proc
     D_factor = D_proc.factor if hasattr(D_proc, 'factor') else D_proc
 
@@ -1242,7 +1243,8 @@ def update_tenors(base_date, all_factors):
     for factor, factor_obj in all_factors.items():
         risk_factor = factor_obj.factor if hasattr(factor_obj, 'factor') else factor_obj
 
-        if factor.type in OneDimensionalFactors:
+        if factor.type in OneDimensionalFactors or (
+                factor.type in TwoDimensionalFactors and risk_factor.get_subtype() == 'SVI'):
             tenor_points = risk_factor.get_tenor()
 
             if factor.type == 'DividendRate':
@@ -1253,7 +1255,7 @@ def update_tenors(base_date, all_factors):
                 tenor_data = tenor_diff(tenor_points)
 
             daycount = risk_factor.get_day_count()
-            all_tenors[factor] = [tenor_data, daycount_fn(base_date, daycount), factor_obj]
+            all_tenors[factor] = [tenor_data, daycount_fn(base_date, daycount)]
 
         # this is a surface of some kind
         elif factor.type in TwoDimensionalFactors:
@@ -1552,7 +1554,7 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
 def calc_time_grid_vol_rate(code, moneyness, expiry, shared, calc_std=False):
     keys = []
     for rate in code:
-        if isinstance(rate[FACTOR_INDEX_Offset], list):
+        if rate[FACTOR_INDEX_SubType] == 'SVI':
             keys.append(('sviskew', tuple(rate[:1] + tuple(rate[1]))))
         else:
             keys.append(('vol2d', rate[:2]))
@@ -1567,14 +1569,14 @@ def calc_time_grid_vol_rate(code, moneyness, expiry, shared, calc_std=False):
             if rate[FACTOR_INDEX_Stoch]:
                 raise Exception("Stochastic vol surfaces not yet implemented")
             else:
-                if isinstance(rate[FACTOR_INDEX_Offset], list):
+                if rate[FACTOR_INDEX_SubType] == 'SVI':
                     spread = {x.name[-1]: shared.t_Static_Buffer[x].reshape(-1, 1) for x in rate[FACTOR_INDEX_Offset]}
                 else:
                     spread = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
                 break
 
         # either interpolate a flat vol surface or a svi vol skew
-        if isinstance(code[0][FACTOR_INDEX_Offset], list):
+        if code[0][FACTOR_INDEX_SubType] == 'SVI':
             shared.t_Buffer[key_code] = (spread, code[0][FACTOR_INDEX_Tenor_Index], calc_std)
         else:
             shared.t_Buffer[key_code] = gather_flat_surface(

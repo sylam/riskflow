@@ -53,7 +53,7 @@ def calc_moneyness(strike, spot, forward, deal_data, use_forward=False, invert_m
     :param deal_data: Deal_data struct containing deal specific data
     :return: the moneyness amount to apply to the deal
     '''
-    if deal_data.Factor_dep.get('SVI', False):
+    if deal_data.Factor_dep['Volatility'][0][utils.FACTOR_INDEX_SubType] == 'SVI':
         return torch.log(strike/forward)
     else:
         forward_or_spot = forward if use_forward else spot
@@ -571,7 +571,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         vols = utils.calc_time_grid_vol_rate(
             factor_dep['Volatility'], moneyness_block, expiry, shared)
 
-        if factor_dep['Payoff_Currency'] != factor_dep['Currency']:
+        if factor_dep.get('Check_Payoff_Type', False):
             # need quanto/compo adjustments
             adj = calc_vol_adjustment(factor_dep, moneyness_block, expiry, vols, shared)
             vols = adj['vol']
@@ -631,7 +631,7 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
     moneyness = calc_moneyness(strike, spot, forward, deal_data, use_forwards, invert_moneyness)
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
-    if 'Payoff_Currency' in factor_dep and factor_dep['Payoff_Currency'] != factor_dep['Currency']:
+    if factor_dep.get('Check_Payoff_Type', False):
         # need quanto/compo adjustments
         adj = calc_vol_adjustment(factor_dep, moneyness, expiry, sigma, shared)
         sigma = adj['vol']
@@ -716,7 +716,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
     moneyness = calc_moneyness(barrier, spot, forward, deal_data, use_forwards, invert_moneyness)
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
-    if 'Payoff_Currency' in factor_dep and ['Payoff_Currency'] != factor_dep['Currency']:
+    if factor_dep.get('Check_Payoff_Type', False):
         # need quanto/compo adjustments
         adj = calc_vol_adjustment(factor_dep, moneyness, expiry, sigma, shared)
         sigma = adj['vol']
@@ -961,7 +961,8 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
     expiry = discount.code[0][utils.FACTOR_INDEX_Daycount](tenor_in_days)
     vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
-    # check if this is a compo or quanto deal
+    # check if this is a compo or quanto deal - need to clean this up to use factor_dep.get('Check_Payoff_Type')
+    # TODO!
     if 'FXVol' in factor_dep:
         atm_moneyness = torch.ones_like(moneyness)
         fx_vols = utils.calc_time_grid_vol_rate(
@@ -1316,7 +1317,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         vols = utils.calc_time_grid_vol_rate(
             factor_dep['Volatility'], moneyness_block, expiry, shared)
 
-        if factor_dep['Payoff_Currency'] != factor_dep['Currency']:
+        if factor_dep.get('Check_Payoff_Type', False):
             # need quanto/compo adjustments
             adj = calc_vol_adjustment(factor_dep, moneyness_block, expiry, vols, shared)
             vols = adj['vol']
@@ -1432,16 +1433,13 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         t_block = discount_block.time_grid
         sample_index_t = start_index[index]
         tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
-
+        # remaining tenor
+        tau = daycount_fn(tenor_block)
         sample_ts = carry_block.new(
             daycount_fn(dual_samples.np[sample_index_t:, utils.RESET_INDEX_End_Day].reshape(1, -1) -
                         t_block[:, utils.TIME_GRID_MTM, np.newaxis]))
 
         weight_t = dual_samples.tn[sample_index_t:, utils.RESET_INDEX_Weight].reshape(1, -1, 1)
-        sample_ft = weight_t * torch.exp(
-            torch.unsqueeze(carry_block, dim=1) * torch.unsqueeze(sample_ts, dim=2))
-        M1 = torch.sum(sample_ft, dim=1)
-
         normalize = dual_samples.tn[sample_index_t:, utils.RESET_INDEX_Weight].sum()
         average = torch.sum(
             all_samples[:sample_index_t] * dual_samples.tn[:sample_index_t, utils.RESET_INDEX_Weight].reshape(-1, 1),
@@ -1450,7 +1448,17 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         strike_bar = factor_dep['Strike'] - average.reshape(1, -1).expand(counts[index], -1)
         moneyness = calc_moneyness(
             strike_bar / normalize, spot_block, forward_block, deal_data, use_forwards, invert_moneyness)
-        vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, daycount_fn(tenor_block), shared)
+        vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, tau, shared)
+
+        if factor_dep.get('Check_Payoff_Type', False):
+            # need quanto/compo adjustments
+            adj = calc_vol_adjustment(factor_dep, moneyness, tau, vols, shared)
+            vols = adj['vol']
+            carry_block = carry_block + adj['b_adj']
+
+        sample_ft = weight_t * torch.exp(
+            torch.unsqueeze(carry_block, dim=1) * torch.unsqueeze(sample_ts, dim=2))
+        M1 = torch.sum(sample_ft, dim=1)
 
         product_t = sample_ft * torch.exp(
             torch.unsqueeze(sample_ts, dim=2) * torch.unsqueeze(vols * vols, dim=1))

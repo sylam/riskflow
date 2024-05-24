@@ -627,7 +627,8 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
                 self.drift[:, :reduced_tenor_index], self.BtT[0][:reduced_tenor_index],
                 self.BtT[1][:reduced_tenor_index], factor1, factor2, self.factor_tenor[:reduced_tenor_index])
 
-            return full_grid_curve, partial_grid_curve
+            return {shared_mem.scenario_keys['full']: full_grid_curve,
+                    shared_mem.scenario_keys['reduced']: partial_grid_curve}
         else:
             return sim_curve(self.drift, self.BtT[0], self.BtT[1], factor1, factor2, self.factor_tenor)
 

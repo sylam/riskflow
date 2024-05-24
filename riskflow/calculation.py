@@ -285,12 +285,13 @@ class Calculation(object):
                 struct = DealStructure(instrument, deal_level_mtm=deal_level_mtm)
                 self.set_deal_structures(node['Children'], struct, deal_level_mtm)
                 output.add_structure_to_structure(
-                    struct, self.base_date, self.static_var, self.stoch_var, self.all_factors,
+                    struct, self.base_date, self.static_factors, self.stoch_factors, self.all_factors,
                     self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
                 continue
 
-            output.add_deal_to_structure(self.base_date, instrument, self.static_var, self.stoch_var, self.all_factors,
-                                         self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
+            output.add_deal_to_structure(self.base_date, instrument, self.static_factors, self.stoch_factors,
+                                         self.all_factors, self.all_tenors, self.time_grid, self.config.holidays,
+                                         self.calc_stats)
 
 
 class CMC_State(utils.Calculation_State):
@@ -642,7 +643,7 @@ class Credit_Monte_Carlo(Calculation):
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 # precalculate any values for the stochastic process
-                value.calc_references(key, self.static_var, self.stoch_var, self.all_tenors, self.all_factors)
+                value.calc_references(key, self.static_factors, self.stoch_factors, self.all_tenors, self.all_factors)
 
         return shared_mem
 
@@ -807,7 +808,8 @@ class Credit_Monte_Carlo(Calculation):
         shared_mem = CMC_State(
             self.get_cholesky_decomp(), len(self.stoch_factors), self.static_var, self.batch_size,
             torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
-                utils.check_rate_name(reporting_currency), self.static_var, self.stoch_var), seed, job_id, num_jobs)
+                utils.check_rate_name(reporting_currency), self.static_factors, self.stoch_factors),
+            seed, job_id, num_jobs)
 
         return shared_mem
 
@@ -958,10 +960,10 @@ class Credit_Monte_Carlo(Calculation):
 
                 funding = get_interest_factor(
                     utils.check_rate_name('{}.FUNDING'.format(params['LegacyFVA']['Funding_Curve'])),
-                    self.static_var, self.stoch_var, self.all_tenors)
+                    self.static_factors, self.stoch_factors, self.all_tenors)
                 collateral = get_interest_factor(
                     utils.check_rate_name('{}.COLLATERAL'.format(params['LegacyFVA']['Collateral_Curve'])),
-                    self.static_var, self.stoch_var, self.all_tenors)
+                    self.static_factors, self.stoch_factors, self.all_tenors)
 
                 discount_funding = utils.calc_time_grid_curve_rate(
                     funding, self.time_grid.time_grid[time_grid], shared_mem)
@@ -996,10 +998,10 @@ class Credit_Monte_Carlo(Calculation):
 
                 funding = get_interest_factor(
                     utils.check_rate_name(params['Funding_Valuation_Adjustment']['Funding_Cost_Interest_Curve']),
-                    self.static_var, self.stoch_var, self.all_tenors)
+                    self.static_factors, self.stoch_factors, self.all_tenors)
                 riskfree = get_interest_factor(
                     utils.check_rate_name(params['Funding_Valuation_Adjustment']['Risk_Free_Curve']),
-                    self.static_var, self.stoch_var, self.all_tenors)
+                    self.static_factors, self.stoch_factors, self.all_tenors)
 
                 if params['Funding_Valuation_Adjustment'].get('Counterparty'):
                     survival = get_survival_factor(
@@ -1053,10 +1055,10 @@ class Credit_Monte_Carlo(Calculation):
             if params.get('Credit_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
                 discount = get_interest_factor(
                     utils.check_rate_name(params['Deflation_Interest_Rate']),
-                    self.static_var, self.stoch_var, self.all_tenors)
+                    self.static_factors, self.stoch_factors, self.all_tenors)
                 survival = get_survival_factor(
                     utils.check_rate_name(params['Credit_Valuation_Adjustment']['Counterparty']),
-                    self.static_var, self.stoch_var, self.all_tenors)
+                    self.static_factors, self.stoch_factors, self.all_tenors)
                 recovery = get_recovery_rate(
                     utils.check_rate_name(params['Credit_Valuation_Adjustment']['Counterparty']), self.all_factors)
                 # only looks at the first netting set - should be fine . . .
@@ -1128,7 +1130,8 @@ class Credit_Monte_Carlo(Calculation):
                         if CDS_tenors and recovery < 1.0:
                             # calculate cds sensitivities
                             CDS_rates, shifted_tenor, shifted_curves = utils.calc_cds_rates(
-                                recovery, survival[0], discount[0], self.params['Base_Date'], CDS_tenors)
+                                recovery, survival[0], discount[0], self.params['Base_Date'],
+                                CDS_tenors, self.all_factors)
 
                             output['CS01'] = {'Par_CDS': CDS_rates,
                                               'Tenor': shifted_tenor,
@@ -1260,7 +1263,7 @@ class Base_Revaluation(Calculation):
         # allocate memory on the device
         return Base_Reval_State(
             self.static_var, torch.ones([1, 1], dtype=self.dtype, device=self.device),
-            mcmc_sim, get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_var, {}),
+            mcmc_sim, get_fxrate_factor(utils.check_rate_name(reporting_currency), self.static_factors, {}),
             all_vars_concat, self.params['Greeks'] == 'All')
 
     def report(self):

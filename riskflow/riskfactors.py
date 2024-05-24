@@ -48,6 +48,9 @@ class Factor0D(object):
     def bump(self, amount, relative=True):
         self.delta = self.param['Spot'] * amount if relative else amount
 
+    def get_subtype(self):
+        return None
+
     def get_delta(self):
         return self.delta
 
@@ -98,6 +101,9 @@ class Factor1D(object):
     def get_delta(self):
         return self.delta.mean()
 
+    def get_subtype(self):
+        return self.param.get('Sub_Type')
+
     def check_interpolation(self):
         if self.param.get('Interpolation') == 'HermiteRT':
             g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1] * self.tenors)
@@ -133,16 +139,28 @@ class Factor1D(object):
 
 class Factor2D(object):
     """Represents a risk factor that's a surface (2D) - Currently this is only vol surfaces"""
-
+    svi_params = ['a', 'b', 'rho', 'm', 'sigma']
     def __init__(self, param):
         # default empty surfaces to 1%
-        if not param['Surface'].array.any():
-            param['Surface'].array = np.array([[0, 0, 0.01]])
+        if 'Surface' not in param or not param['Surface'].array.any():
+            param['Surface'] = utils.Curve([], [[0, 0, 0.01]])
 
         self.param = param
         self.flat = None
-        self.index_map = OrderedDict()
+        self.index_map = {}
         self.update()
+
+    @staticmethod
+    def get_day_count():
+        """hardcode the daycount for dividend rates to act/365"""
+        return utils.DAYCOUNT_ACT365
+
+    def get_subtype(self):
+        return self.param.get('Surface_Type', 'Explicit')
+
+    def get_tenor(self):
+        """Gets the tenor points stored in the Curve attributes"""
+        return np.unique([self.param[x].array[:, 0] for x in self.svi_params])
 
     def update(self):
         self.moneyness = self.get_moneyness()
@@ -178,20 +196,26 @@ class Factor2D(object):
 
     def get_tenor_indices(self):
         '''
-        returns the shortened sorted vol surface indices - Moneyness and Expiry
-        use np.array(list(itertools.product(self.expiry,self.moneyness))) for all possible indices
-        
+        returns the shortened sorted vol surface indices - Moneyness and Expiry if this is an Explict Vol surface
+        Otherwise return the SVI params
         The return value of this method again needs to be defined when called with current_value
         '''
-        return self.sorted_vol[:, :2]
+        if self.get_subtype() == 'SVI':
+            tau = self.get_tenor().reshape(-1, 1)
+            return {x: tau for x in self.svi_params}
+        else:
+            return self.sorted_vol[:, :2]
 
     def current_value(self, tenors=None, offset=0.0):
         """Returns the value of the vol surface"""
-        if tenors is not None and self.expiry.size > 1 and self.moneyness.size > 1:
-            interpolator = RectBivariateSpline(self.expiry, self.moneyness, self.vols, kx=1, ky=1)
-            return np.array([interpolator(y + offset, x)[0][0] for x, y in tenors])
+        if self.get_subtype() == 'SVI':
+            return {x: self.param[x].array[:, 1] for x in self.svi_params}
+        else:
+            if tenors is not None and self.expiry.size > 1 and self.moneyness.size > 1:
+                interpolator = RectBivariateSpline(self.expiry, self.moneyness, self.vols, kx=1, ky=1)
+                return np.array([interpolator(y + offset, x)[0][0] for x, y in tenors])
 
-        return self.flat
+            return self.flat
 
 
 class Factor3D(object):
@@ -218,6 +242,10 @@ class Factor3D(object):
     def get_expiry(self):
         """Gets the expiry points stored in the Surface attribute"""
         return np.unique(self.param['Surface'].array[:, self.EXPIRY_INDEX])
+
+    def get_subtype(self):
+        '''Can be extended to different types of vol surfaces'''
+        return None
 
     def get_tenor(self):
         """Gets the tenor points stored in the Surface attribute"""
@@ -863,35 +891,6 @@ class HullWhite2FactorModelParameters(Factor1D):
 
             if include_quanto:
                 params['Quanto_FX_Volatility'] = self.param['Quanto_FX_Volatility'].array[:, 1]
-
-        return params
-
-
-class SVISkew(Factor1D):
-    """
-    Represents the Bootstrapped implied parameters for a hull-white 2-factor model
-    """
-    named_params = ['a', 'b', 'rho', 'm', 'sigma']
-
-    def __init__(self, param):
-        super(SVISkew, self).__init__(param)
-
-    @staticmethod
-    def get_day_count():
-        """hardcode the daycount for dividend rates to act/365"""
-        return utils.DAYCOUNT_ACT365
-
-    def get_tenor(self):
-        """Gets the tenor points stored in the Curve attributes"""
-        return np.unique([self.param[x].array[:, 0] for x in self.named_params])
-
-    def get_tenor_indices(self):
-        tau = self.get_tenor().reshape(-1, 1)
-        return {x: tau for x in self.named_params}
-
-    def current_value(self, tenors=None, offset=0):
-        """Returns the parameters of the SVI factor model as a dictionary"""
-        params = {x: self.param[x].array[:, 1] for x in self.named_params}
 
         return params
 

@@ -204,7 +204,7 @@ mapping = {
             "ConvenienceYield":
                 ["Curve", "Currency", "Property_Aliases"],
             "EquityPriceVol":
-                ["Surface", "ATM_Vol", "Smile", "Property_Aliases"],
+                ["Surface_Type", "Surface", "Moneyness_Rule", "a", "b", "rho", "m", "sigma", "Property_Aliases"],
             "FuturesPrice":
                 ["Price", "Property_Aliases"],
             "InterestYieldVol":
@@ -257,6 +257,10 @@ mapping = {
             'Fixing_Curve': {'widget': 'Flot', 'description': 'Fixing Curve', 'value': default['Flot']},
             'Day_Count': {'widget': 'Dropdown', 'description': 'Day Count', 'value': 'ACT_365',
                           'values': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360', 'ACT_ACT_ICMA']},
+            'Surface_Type': {'widget': 'Dropdown', 'description': 'Surface Type', 'value': 'Explicit',
+                             'values': ['Explicit', 'SVI']},
+            'Moneyness_Rule': {'widget': 'Dropdown', 'description': 'Moneyness Rule', 'value': 'Sticky_Moneyness',
+                               'values': ['Sticky_Moneyness', 'Sticky_Delta']},
             'Domestic_Currency': {'widget': 'Text', 'description': 'Domestic Currency', 'value': ''},
             'Floor': {'widget': 'Text', 'description': 'Floor', 'value': '<undefined>'},
             'ForwardPrice': {'widget': 'Text', 'description': 'ForwardPrice', 'value': '', 'obj': 'Tuple'},
@@ -284,8 +288,12 @@ mapping = {
             'Quanto_FX_Correlation_2': {'widget': 'Float', 'description': 'Quanto FX Correlation 2', 'value': 0},
             'Alpha_1': {'widget': 'Float', 'description': 'Alpha 1', 'value': 0},
             'Alpha_2': {'widget': 'Float', 'description': 'Alpha 2', 'value': 0},
-            'Quanto_FX_Volatility': {'widget': 'Flot', 'description': 'Quanto FX Volatility',
-                                     'value': default['Flot']},
+            'Quanto_FX_Volatility': {'widget': 'Flot', 'description': 'Quanto FX Volatility', 'value': default['Flot']},
+            'a': {'widget': 'Flot', 'description': 'a', 'value': default['Flot']},
+            'b': {'widget': 'Flot', 'description': 'b', 'value': default['Flot']},
+            'rho': {'widget': 'Flot', 'description': 'rho', 'value': default['Flot']},
+            'm': {'widget': 'Flot', 'description': 'm', 'value': default['Flot']},
+            'sigma': {'widget': 'Flot', 'description': 'sigma', 'value': default['Flot']},
             'Sigma_1': {'widget': 'Flot', 'description': 'Sigma 1', 'value': default['Flot']},
             'Sigma_2': {'widget': 'Flot', 'description': 'Sigma 2', 'value': default['Flot']},
             'Minimum_Recovery_Rate': {'widget': 'Text', 'description': 'Minimum Recovery Rate', 'value': '<undefined>'},
