@@ -19,7 +19,6 @@
 
 # import standard libraries
 import logging
-from collections import OrderedDict
 from functools import reduce
 
 # utility functions and constants
@@ -704,7 +703,7 @@ class NettingCollateralSet(Deal):
                 field['Balance_Currency'], static_offsets, stochastic_offsets)
 
             # get the settlement currencies loaded
-            field_index['Settlement_Currencies'] = OrderedDict()
+            field_index['Settlement_Currencies'] = {}
             for currency in time_grid.CurrencyMap.keys():
                 field_index['Settlement_Currencies'].setdefault(
                     currency, get_fxrate_factor(utils.check_rate_name(currency), static_offsets, stochastic_offsets))

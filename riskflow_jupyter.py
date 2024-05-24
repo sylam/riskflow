@@ -18,7 +18,7 @@ import riskflow as rf
 from riskflow_widgets import FileDragUpload, Tree, Table, Flot, Three, to_json
 
 
-def load_table_from_vol(vol):
+def load_table_from_vol(vol, svi_sampler=np.linspace(-3, 3, 21)):
     '''
     :param vol: a riskfactor representing an array of 2d or 3d surfaces in the
                 'param' dict (usually stored as the 'Surface' key)
@@ -42,7 +42,13 @@ def load_table_from_vol(vol):
         ).tolist()
 
     if vol.__class__.__name__ in rf.utils.TwoDimensionalFactors:
-        return make_table(vol.param['Surface'].array)
+        if vol.get_subtype() == 'SVI':
+            data = vol.current_value(svi_sampler).array
+            logging.info('SVI {}'.format(len(data)))
+        else:
+            data = vol.param['Surface'].array
+            logging.info('Explicit {}'.format(len(data)))
+        return make_table(data)
     elif vol.__class__.__name__ in rf.utils.ThreeDimensionalFactors:
         vol_space = {}
         for t in vol.get_tenor():
@@ -151,10 +157,12 @@ class TreePanel(metaclass=ABCMeta):
         def get_repr(obj, field_name, default_val):
 
             if isinstance(obj, rf.utils.Curve):
-                if obj.meta and obj.meta[0] != 'Integrated':
+                # {}, FXVol, FXVol.AUD.JPY, <class 'riskflow.utils.Curve'>
+                if field_name=='Surface':
                     # need to use a threeview
-                    t = getattr(rf.riskfactors, rate_type)({field_name: obj})
-                    vol_space = load_table_from_vol(t)
+                    v = getattr(rf.riskfactors, rate_type)(config[section_name])
+                    logging.info('Surface {} {}'.format(section_name, v.get_subtype()))
+                    vol_space = load_table_from_vol(v)
                     return_value = to_json(vol_space)
                 else:
                     return_value = to_json([{'label': 'Rate', 'data': [[x, y] for x, y in obj.array]}])

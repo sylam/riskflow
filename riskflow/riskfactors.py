@@ -209,6 +209,17 @@ class Factor2D(object):
     def current_value(self, tenors=None, offset=0.0):
         """Returns the value of the vol surface"""
         if self.get_subtype() == 'SVI':
+            # "tenors" here is actually sampled moneyness for SVI surfaces - we already have tenors
+            if tenors is not None:
+                surf = []
+                # moneyness, expiry, vol
+                for t, a, b, rho, m, sigma in np.array(
+                        [self.get_tenor()]+[self.param[x].array[:, 1] for x in self.svi_params]).T:
+                    x = (tenors-m)
+                    variance = a + b * (rho * x + np.sqrt(x**2 + sigma**2))
+                    surf.extend([[m, t, v] for m, v in zip(tenors, np.sqrt(variance))])
+                return utils.Curve([2, 'default'], surf)
+
             return {x: self.param[x].array[:, 1] for x in self.svi_params}
         else:
             if tenors is not None and self.expiry.size > 1 and self.moneyness.size > 1:

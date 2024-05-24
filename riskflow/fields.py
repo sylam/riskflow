@@ -213,7 +213,7 @@ mapping = {
                 ["Price_Index", "Seasonal_Adjustment", "Reference_Name", "Day_Count", "Accrual_Calendar", "Currency",
                  "Curve", "Property_Aliases"],
             "FXVol":
-                ["Surface", "ATM_Vol", "Smile", "Property_Aliases"],
+                ["Surface", "Moneyness_Rule", "Property_Aliases"],
             "EquityPrice":
                 ["Issuer", "Respect_Default", "Jump_Level", "Currency", "Interest_Rate", "Spot", "Property_Aliases"],
             "FxRate":
@@ -251,7 +251,6 @@ mapping = {
         # field types for the various risk factors - need to explicitly mention all of them
         'fields': {
             'Accrual_Calendar': {'widget': 'Text', 'description': 'Accrual Calendar', 'value': ''},
-            'ATM_Vol': {'widget': 'Text', 'description': 'ATM Vol', 'value': ''},
             'Currency': {'widget': 'Text', 'description': 'Currency', 'value': ''},
             'Curve': {'widget': 'Flot', 'description': 'Curve', 'value': default['Flot']},
             'Fixing_Curve': {'widget': 'Flot', 'description': 'Fixing Curve', 'value': default['Flot']},
@@ -313,7 +312,6 @@ mapping = {
             'Recovery_Rate': {'widget': 'BoundedFloat', 'description': 'Recovery Rate', 'value': 0.4, 'min': 0.0,
                               'max': 1.0},
             'Seasonal_Adjustment': {'widget': 'Text', 'description': 'Seasonal Adjustment', 'value': ''},
-            'Smile': {'widget': 'Text', 'description': 'Smile', 'value': ''},
             'Spot': {'widget': 'Float', 'description': 'Spot', 'value': 0},
             'Price': {'widget': 'Float', 'description': 'Price', 'value': 0},
             'Surface': {'widget': 'Three', 'description': 'Surface', 'value': default['Surface']},
