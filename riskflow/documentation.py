@@ -20,22 +20,20 @@
 # standard imports
 import os
 import inspect
+import importlib
 import operator
 
-from collections import OrderedDict
 from functools import reduce
 
 
-def fetch_module_documentation(module_name, attribute='documentation'):
-    document_mapping = OrderedDict()
-    for class_name, doc in [(x[0], getattr(x[1], attribute))
-                            for x in inspect.getmembers(__import__(module_name),
-                                                        lambda x: inspect.isclass(x)
-                                                                  and hasattr(x, attribute)
-                                                                  and getattr(x, attribute))]:
-        document_mapping.setdefault(doc[0], []).append((class_name, doc[1]))
+def fetch_module_documentation(module_name, attribute='documentation', package='riskflow'):
+    document_mapping = {}
+    module = importlib.import_module(module_name, package=package)
+    for class_name, cls in inspect.getmembers(module, lambda x: inspect.isclass(x) and hasattr(x, attribute)):
+        doc = getattr(cls, attribute)
+        if doc:
+            document_mapping.setdefault(doc[0], []).append((class_name, doc[1]))
     return document_mapping
-
 
 class ConstructMarkdown(object):
     """
@@ -44,7 +42,7 @@ class ConstructMarkdown(object):
     """
 
     mkdown = {'Theory':
-        OrderedDict([
+        dict([
             ('Definitions',
              ['## Price Factors',
               '',
@@ -238,7 +236,7 @@ class ConstructMarkdown(object):
               'Inflation rate price factors are similar to interest rate price factors but have an associated price',
               'index factor.'])
         ]),
-        'Valuation': OrderedDict([
+        'Valuation': dict([
             ('Definitions',
              ['For a given valuation date $t$, expiry date $T$, and time remaining to expiry $\\tau$ (i.e. $(T-t)$),',
               'the interest rate and carry are defined as',
@@ -831,7 +829,7 @@ class ConstructMarkdown(object):
               'portfolio against the realized market value of the collateral held.',
               ])
         ]),
-        'Boostrapping': OrderedDict([
+        'Boostrapping': dict([
             ('General',
              ['Market Data needs to be calibrated to their corresponding price models in order to construct',
               'a risk neutral calibration. Bootstrapping is the general term used to fit models to data via',
@@ -852,7 +850,7 @@ class ConstructMarkdown(object):
             ('FX and Equity', ['']),
             ('Interest Rates', [''])
         ]),
-        'JSON': OrderedDict([
+        'JSON': dict([
             ('General',
              [
                  'All data types used in RiskFlow are the standard JSON types (string, float, integers) with the exception',
@@ -898,7 +896,7 @@ class ConstructMarkdown(object):
             ('Inflation', ['']),
             ('Credit', [''])
         ]),
-        'API': OrderedDict([
+        'API': dict([
             ('Data',
              ['There are two fundemental data files that need to be setup prior to performing any calculations viz.',
               'Market Data and Trade Data files:',
@@ -1733,7 +1731,7 @@ class ConstructMarkdown(object):
         if not os.path.isdir(subdocdir):
             os.mkdir(subdocdir)
 
-        mdfiles = OrderedDict()
+        mdfiles = {}
         for k, v in self.mkdown[section].items():
             doc = v[:] + ['', '---', '']
             md_file = k.replace(' ', '_') + '.md'
@@ -1758,12 +1756,12 @@ class ConstructMarkdown(object):
                 f.write('\n'.join(method()))
 
         # fetch the embedded documentation:
-        docs = OrderedDict([('Theory', self.fetchdocumentation('Theory', 'stochasticprocess')),
-                            ('Valuation', self.fetchdocumentation('Valuation', 'instruments')),
-                            ('Boostrapping', self.fetchdocumentation('Boostrapping', 'bootstrappers')),
-                            ('API', self.fetchdocumentation('API', 'calculation')),
-                            ('JSON Structures', self.fetchdocumentation('JSON', 'riskfactors', 'field_desc'))
-                            ])
+        docs = dict([('Theory', self.fetchdocumentation('Theory', '.stochasticprocess')),
+                     ('Valuation', self.fetchdocumentation('Valuation', '.instruments')),
+                     ('Boostrapping', self.fetchdocumentation('Boostrapping', '.bootstrappers')),
+                     ('API', self.fetchdocumentation('API', '.calculation')),
+                     ('JSON Structures', self.fetchdocumentation('JSON', '.riskfactors', 'field_desc'))
+                     ])
 
         # finally the config file
         with open(os.path.join(self.project_dir, 'mkdocs.yml'), 'wt') as f:
