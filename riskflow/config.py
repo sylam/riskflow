@@ -459,13 +459,6 @@ class Context(object):
                     if linked_factor.type in nested_fields:
                         update_nested_rates(linked_factor, rates_to_add)
 
-                    linked_factor_data = self.params['Price Factors'][utils.check_tuple_name(linked_factor)]
-                    if factor.type in subtype_fields and linked_factor_data.get(
-                            'Sub_Type') in subtype_fields[factor.type]:
-                        for subtype_field in subtype_fields[factor.type][linked_factor_data['Sub_Type']]:
-                            sub_field = utils.Factor(
-                                linked_factor.type, utils.check_rate_name(linked_factor_data[subtype_field]))
-                            update_nested_rates(sub_field, rates_to_add)
 
             if factor.type in nested_fields:
                 update_nested_rates(factor, rates_to_add)
