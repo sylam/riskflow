@@ -31,6 +31,7 @@ factor_interp_map = {
     'CubicSplineCurveInterpolation': 'Hermite',
     'HermiteInterpolationCurveGetValue': 'Hermite',
     'LinearInterFlatExtrapCurveGetValue': 'Linear',
+    'LogLinearCurveInterpolation': 'LinearRT',
     'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT',
     'HermiteRTInterpolationCurveGetValue': 'HermiteRT',
     'NaturalCubicSplineCurveInterLinearExtrap': 'Hermite',
@@ -107,10 +108,12 @@ class Factor1D(object):
     def check_interpolation(self):
         if self.param.get('Interpolation') == 'HermiteRT':
             g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1] * self.tenors)
-            return ('HermiteRT', g, c)
+            return 'HermiteRT', g, c
         elif self.param.get('Interpolation') == 'Hermite':
             g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1])
-            return ('Hermite', g, c)
+            return 'Hermite', g, c
+        elif self.param.get('Interpolation') == 'LinearRT':
+            return ('LinearRT',)
         else:
             return ('Linear',)
 
@@ -122,7 +125,7 @@ class Factor1D(object):
         tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
             self.tenors.min(), self.tenors.max())
 
-        if self.interpolation[0] != 'Linear':
+        if self.interpolation[0] in ['HermiteRT', 'Hermite']:
             index = np.searchsorted(self.tenors, tenors, side='right') - 1
             index_next = np.clip(index + 1, 0, self.tenors.size - 1)
             dt = np.clip(self.tenors[index_next] - self.tenors[index], 1 / 365.0, np.inf)
@@ -133,6 +136,8 @@ class Factor1D(object):
             val = rate[index] * (1.0 - m) + m * rate[index_next] + m * (
                     1.0 - m) * g[index] + m * m * (1.0 - m) * c[index]
             return val / denom
+        elif self.interpolation[0] == 'LinearRT':
+            return np.interp(tenors, self.tenors, self.tenors * bumped_val)/tenors
         else:
             return np.interp(tenors, self.tenors, bumped_val)
 
@@ -140,6 +145,7 @@ class Factor1D(object):
 class Factor2D(object):
     """Represents a risk factor that's a surface (2D) - Currently this is only vol surfaces"""
     svi_params = ['a', 'b', 'rho', 'm', 'sigma']
+
     def __init__(self, param):
         # default empty surfaces to 1%
         if 'Surface' not in param or not param['Surface'].array.any():
@@ -214,9 +220,9 @@ class Factor2D(object):
                 surf = []
                 # moneyness, expiry, vol
                 for t, a, b, rho, m, sigma in np.array(
-                        [self.get_tenor()]+[self.param[x].array[:, 1] for x in self.svi_params]).T:
-                    x = (tenors-m)
-                    variance = a + b * (rho * x + np.sqrt(x**2 + sigma**2))
+                        [self.get_tenor()] + [self.param[x].array[:, 1] for x in self.svi_params]).T:
+                    x = (tenors - m)
+                    variance = a + b * (rho * x + np.sqrt(x ** 2 + sigma ** 2))
                     surf.extend([[m, t, v] for m, v in zip(tenors, np.sqrt(variance))])
                 return utils.Curve([2, 'default'], surf)
 
@@ -406,6 +412,7 @@ class CommodityPrice(EquityPrice):
                   ['- **Currency**: String',
                    '- **Interest_Rate**: String representing the equity repo curve',
                    '- **Spot**:Spot rate in the specified *Currency*'])
+
     def __init__(self, param):
         super(CommodityPrice, self).__init__(param)
 
@@ -581,11 +588,39 @@ class SurvivalProb(Factor1D):
         """hardcode the daycount for Survival Probability rates to act/365"""
         return utils.DAYCOUNT_ACT365
 
+    def check_interpolation(self):
+        if self.param.get('Interpolation') == 'Linear':
+            return ('Linear',)
+        else:
+            return ('LinearExtrapolate',)
+
     def get_day_count_accrual(self, ref_date, time_in_days):
         return utils.get_day_count_accrual(ref_date, time_in_days, self.get_day_count())
 
     def recovery_rate(self):
         return self.param.get('Recovery_Rate')
+
+    def current_value(self, tenor_index=None, offset=0.0):
+        """Returns the value of the rate at each tenor point (if set) else returns what's
+        stored in the Curve parameter"""
+        bumped_val = self.param['Curve'].array[:, 1] + self.delta
+
+        if self.interpolation[0] == 'Linear':
+            tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
+                self.tenors.min(), self.tenors.max())
+            return np.interp(tenors, self.tenors, bumped_val)
+        else:
+            # get the tenors - make sure we clip the min range (we can extrapolate linearly)
+            tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
+                min=self.tenors.min())
+            max_tenor = tenors.max(initial=0)
+
+            if max_tenor > self.tenors.max():
+                point_at_inf = max_tenor * bumped_val[-1] / self.tenors[-1]
+                # return a linearly extrapolated surface
+                return np.interp(tenors, np.append(self.tenors, max_tenor), np.append(bumped_val, point_at_inf))
+            else:
+                return np.interp(tenors, self.tenors, bumped_val)
 
 
 class InterestRate(Factor1D):
@@ -1124,7 +1159,7 @@ def construct_factor(factor, price_factors, factor_interp):
     # change the logging name in case there are any errors
     logging.root.name = '.'.join(factor.name)
     # check the interpolation on interest Rates - can add more methods/price factors as desired
-    if factor.type == 'InterestRate':
+    if factor.type in ['InterestRate', 'InflationRate']:
         interp_method = factor_interp.search(factor, price_factor, True)
         price_factor['Interpolation'] = factor_interp_map.get(interp_method, 'Linear')
     return globals().get(factor.type)(price_factor)

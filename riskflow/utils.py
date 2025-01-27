@@ -35,7 +35,6 @@ excel_offset = pd.Timestamp('1899-12-30 00:00:00')
 
 def array_type(x): return np.array(x)
 
-
 # Days in year - could set this to 365.0 or 365.25 if you want that bit extra time
 DAYS_IN_YEAR = 365.25
 
@@ -539,8 +538,14 @@ class TimeGrid(object):
         self.scenario_dates = scenario_dates
         self.base_MTM_dates = base_MTM_dates
         self.CurrencyMap = {}
+        self.report_index = None
         self.mtm_dates = MTM_dates
         self.date_lookup = dict([(x, i) for i, x in enumerate(sorted(MTM_dates))])
+
+    def set_report_dates(self, base_date, report_dates):
+        report_days = [(x - base_date).days for x in sorted(report_dates)]
+        self.report_index = (self.mtm_time_grid.searchsorted(
+            report_days, side='right') - 1).clip(0, self.mtm_time_grid.size - 1)
 
     def calc_time_grid(self, time_in_days):
         dvt = np.concatenate(([1], np.diff(self.scen_time_grid), [1]))
@@ -594,7 +599,7 @@ class TimeGrid(object):
             dynamic_dates = self.base_time_grid.union([self.date_lookup[x] for x in dates])
         except KeyError as e:
             # if there is at least one reset date in the set of dates, then return it, else the deal has expired
-            r = [self.date_lookup[x] for x in dates if x in self.date_lookup]
+            r = [self.date_lookup.get(x, max(self.date_lookup.values())) for x in dates]
             if r:
                 dynamic_dates = self.base_time_grid.union(r)
             else:
@@ -606,8 +611,8 @@ class TimeGrid(object):
 
         # now construct the full deal grid
         deal_time_grid = np.array(sorted(dynamic_dates))
-        # find the last dynamic date - should be the expiry date
-        expiry = self.date_lookup[max(dates)]
+        # find the last dynamic date - should be the expiry date or the end of the grid
+        expiry = self.date_lookup.get(max(dates), max(self.date_lookup.values()))
         # calculate the interpolation points etc.
         return DealTimeDependencies(self.mtm_time_grid, deal_time_grid[deal_time_grid <= expiry])
 
@@ -877,6 +882,8 @@ class CurveTensor(object):
 
                     val = (1 - self.alpha) * val + self.alpha * val_t1
             else:
+                if curve_tenor.type == 'LinearRT':
+                    mult = mult / tenors.clamp(curve_tenor.min, curve_tenor.max)
                 # default to linear
                 val = tensor[i00,] * t_w1 + tensor[i01,] * t_w2
 
@@ -1079,6 +1086,10 @@ def norm_cdf(x):
     return 0.5 * (torch.erfc(x * -0.7071067811865475))
 
 
+def norm_icdf(x):
+    return 1.4142135623730951 * torch.erfinv(2.0 * x - 1.0)
+
+
 def BivN(P, Q, rho):
     from scipy.stats import multivariate_normal
     mvn = np.vectorize(lambda x: multivariate_normal(cov=[[1.0, x], [x, 1.0]]))
@@ -1249,7 +1260,7 @@ def update_tenors(base_date, all_factors):
 
             if factor.type == 'DividendRate':
                 tenor_data = tenor_diff(tenor_points, 'Dividend')
-            elif factor.type == 'InterestRate':
+            elif factor.type in ['InterestRate', 'InflationRate']:
                 tenor_data = tenor_diff(tenor_points, risk_factor.interpolation[0])
             else:
                 tenor_data = tenor_diff(tenor_points)
@@ -1519,36 +1530,30 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
         alpha = shared.one.new(alpha.reshape(-1, 1))
         k_m_prior = moneyness - surface['m'][index]
         var_prior = surface['a'][index] + surface['b'][index] * (
-            surface['rho'][index] * k_m_prior + torch.sqrt(k_m_prior ** 2 + surface['sigma'][index] ** 2))
+                surface['rho'][index] * k_m_prior + torch.sqrt(k_m_prior ** 2 + surface['sigma'][index] ** 2))
         k_m_post = moneyness - surface['m'][index_next]
         var_post = surface['a'][index_next] + surface['b'][index_next] * (
-            surface['rho'][index_next] * k_m_post + torch.sqrt(k_m_post ** 2 + surface['sigma'][index_next] ** 2))
+                surface['rho'][index_next] * k_m_post + torch.sqrt(k_m_post ** 2 + surface['sigma'][index_next] ** 2))
         variance = var_prior * (1 - alpha) + var_post * alpha
         return torch.sqrt(variance) * time_modifier
     else:
         surface, moneyness_tenor = shared.t_Buffer[key_code]
         max_index = np.prod(surface.shape) - 1
-        index, _, alpha = moneyness_tenor.get_index(moneyness.reshape(-1))
+        index, _, alpha = moneyness_tenor.get_index(moneyness)
         expiry_indices = np.arange(expiry.size).astype(np.int32)
         expiry_index_key = ('expiry_tenor', tuple(expiry_indices), moneyness_tenor.tenor.size)
 
         if expiry_index_key not in shared.t_Buffer:
             shared.t_Buffer[expiry_index_key] = shared.one.new_tensor(
-            np.array([expiry_indices * moneyness_tenor.tenor.size]),
-            dtype=torch.int32).T.expand(-1, shared.simulation_batch).reshape(-1)
+                np.array([expiry_indices * moneyness_tenor.tenor.size]),
+                dtype=torch.int32).T
 
         expiry_offsets = shared.t_Buffer[expiry_index_key]
-        reshape = True
-        if expiry_offsets.shape != index.shape:
-            reshape = False
-            vol_index = index + expiry_offsets[:index.shape[0]]
-        else:
-            vol_index = index + expiry_offsets
+        vol_index = index + expiry_offsets
 
         vol_index_next = torch.clamp(vol_index + 1, 0, max_index)
         vols = surface[vol_index] * (1.0 - alpha) + surface[vol_index_next] * alpha
-
-        return vols.reshape(-1, shared.simulation_batch) if reshape else vols.reshape(-1, 1)
+        return vols
 
 
 def calc_time_grid_vol_rate(code, moneyness, expiry, shared, calc_std=False):
@@ -1559,7 +1564,7 @@ def calc_time_grid_vol_rate(code, moneyness, expiry, shared, calc_std=False):
         else:
             keys.append(('vol2d', rate[:2]))
 
-        key_code = ('vol_time_grid', tuple(keys), tuple(expiry), calc_std)
+    key_code = ('vol_time_grid', tuple(keys), tuple(expiry), calc_std)
 
     if key_code not in shared.t_Buffer:
         spread = None
@@ -1745,20 +1750,24 @@ def make_curve_tensor(tensor, curve_component, time_grid, shared):
                 tuple(tensor.shape))
 
     if key_code not in shared.t_Buffer:
-        if key_code[0] in ['HermiteRT', 'Hermite']:
+        # check if we are using all the tenor points
+        if key_code[0] != 'Linear':
             curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index].tenor
-            # check if we are using all the tenor points
             if curve_tenor.size != tensor.shape[1]:
                 t = tensor.new(curve_tenor[:tensor.shape[1]]).reshape(1, -1, 1)
             else:
                 t = tensor.new(curve_tenor).reshape(1, -1, 1)
 
+        if key_code[0] in ['HermiteRT', 'Hermite']:
             mod_tenor = tensor
             if curve_component[FACTOR_INDEX_Tenor_Index].type == 'HermiteRT':
                 mod_tenor = tensor * t
 
             g, c = hermite_interpolation_tensor(t, mod_tenor)
             shared.t_Buffer[key_code] = Interpolation(mod_tenor, [g, c])
+
+        elif key_code[0] == 'LinearRT':
+            shared.t_Buffer[key_code] = Interpolation(tensor * t, [])
         else:
             shared.t_Buffer[key_code] = Interpolation(tensor, [])
 
@@ -1815,65 +1824,110 @@ def calc_time_grid_spot_rate(rate, time_grid, shared):
 
     return shared.t_Buffer[key_code]
 
-
 def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
-    factor_tenor = factor.get_tenor()
+    def prepare_tenors(factor_tenor, time_grid, extrapolate):
+        """Prepare tenor grid with optional extrapolation."""
+        tnr = factor_tenor.copy()
+        amended_tensor = tensor
+        if extrapolate:
+            max_tenor = time_grid.max() + factor_tenor.max()
+            tnr = np.append(tnr, max_tenor)
+            # flat extrapolated gradient
+            point_at_inf = tensor[-1:] + max_tenor * (tensor[-1:] - tensor[-2:-1]) / (
+                        factor_tenor[-1] - factor_tenor[-2])
+            amended_tensor = torch.cat([tensor, point_at_inf])
 
-    tnr, tnr_d = factor_tenor, np.hstack((np.diff(factor_tenor), [1]))
-    max_dim = factor_tenor.size - 1
+        tnr_d = np.diff(factor_tenor, append=factor_tenor.max()+1)
+        return tensor.new(tnr), tensor.new(tnr_d), amended_tensor
 
-    # calculate the tenors and indices used for lookups
-    ten_t1 = np.array([np.clip(
-        np.searchsorted(factor_tenor, t, side='right') - 1, 0, max_dim) for t in time_grid_years])
+    def scale_for_rt(tnr, tensor, is_rt):
+        """Scale tensor for rate*time interpolation."""
+        if is_rt:
+            return tensor * tnr
+        return tensor
 
-    ten_t = np.array([np.clip(
-        np.searchsorted(factor_tenor, factor_tenor + t, side='right') - 1, 0, max_dim) for t in time_grid_years])
+    def calculate_interp_params(tnr, tnr_d, time_grid):
+        """Vectorized calculation of interpolation indices and weights."""
+        #get the max index
+        max_tnr_index = tnr.size()[0] - 1
+        # Batch calculate all time + tenor combinations
+        time_tenor = time_grid.view(-1, 1) + tnr.view(1, -1)
 
-    ten_t1_next = np.clip(ten_t1 + 1, 0, max_dim)
-    ten_t_next = np.clip(ten_t + 1, 0, max_dim)
+        # Find interpolation indices
+        left_idx = (torch.searchsorted(tnr, time_tenor, right=True) - 1).clamp(min=0)
+        right_idx = (left_idx + 1).clamp(max=max_tnr_index)
 
-    ten_tv = np.clip(np.array([factor_tenor + t for t in time_grid_years]), 0, factor_tenor.max())
-    alpha_1 = tensor.new((ten_tv - tnr[ten_t]) / tnr_d[ten_t])
-    alpha_2 = tensor.new((time_grid_years - tnr[ten_t1]).clip(0, np.inf) / tnr_d[ten_t1])
+        left_time_idx = (torch.searchsorted(tnr, time_grid, right=True) - 1).clamp(min=0)
+        right_time_idx = (left_time_idx + 1).clamp(max=max_tnr_index)
 
-    # make tensor indices
-    ten_t_next = tensor.new_tensor(ten_t_next, dtype=torch.int64)
-    ten_t = tensor.new_tensor(ten_t, dtype=torch.int64)
-    ten_t1_next = tensor.new_tensor(ten_t1_next, dtype=torch.int64)
-    ten_t1 = tensor.new_tensor(ten_t1, dtype=torch.int64)
+        alpha_1 = (time_tenor.clamp(max=tnr.max()) - tnr[left_idx]) / tnr_d[left_idx]
+        alpha_2 = (time_grid - tnr[left_time_idx]).clamp(min=0.0) / tnr_d[left_time_idx]
 
-    if factor.interpolation[0].startswith('Hermite'):
-        t = tensor.new(tnr.reshape(1, -1, 1))
-        time_tenor_tenor = tensor.new(time_grid_years.reshape(-1, 1) + tnr)
-        time_grid_tensor = tensor.new(time_grid_years)
+        return (alpha_1, left_idx, right_idx), (alpha_2, left_time_idx, right_time_idx)
 
-        # calculate the normalization factor for hermite
-        norm = (time_tenor_tenor if mul_time else 1.0, time_grid_tensor if mul_time else 1.0)
-        if factor.interpolation[0] == 'HermiteRT':
-            mod = tensor.reshape(1, -1, 1) * t
-            norm = (norm[0] / time_tenor_tenor.clamp(tnr.min(), tnr.max()),
-                    norm[1] / time_grid_tensor.clamp(tnr.min(), tnr.max()))
-        else:
-            mod = tensor.reshape(1, -1, 1)
+    def hermite_interpolation(tensor, tnr, indices_t, indices_time, time_grid, is_rt, mul_time):
+        """Handle Hermite interpolation variants."""
+        # Calculate Hermite coefficients
+        t = tnr.view(1, -1, 1)
+        time_grid_tenor = time_grid.view(-1, 1) + tnr.view(1, -1)
+        norm = (time_grid_tenor if mul_time else 1.0, time_grid if mul_time else 1.0)
+        if is_rt:
+            norm = (norm[0] / time_grid_tenor.clamp(tnr.min(), tnr.max()),
+                    norm[1] / time_grid.clamp(tnr.min(), tnr.max()))
+        g, c = [torch.squeeze(x) for x in hermite_interpolation_tensor(t, tensor.reshape(1, -1, 1))]
 
-        g, c = [torch.squeeze(x) for x in hermite_interpolation_tensor(t, mod)]
-        sq = torch.squeeze(mod)
+        # Interpolate values
+        alpha_1, ten_t, ten_t_next = indices_t
+        alpha_2, ten_t1, ten_t1_next = indices_time
+        val = calc_hermite_curve(alpha_1, g[ten_t], c[ten_t], tensor[ten_t], tensor[ten_t_next])
+        val_t = calc_hermite_curve(alpha_2, g[ten_t1], c[ten_t1], tensor[ten_t1], tensor[ten_t1_next])
+        return val * norm[0] - (val_t * norm[1]).reshape(-1, 1)
 
-        val = calc_hermite_curve(alpha_1, g[ten_t], c[ten_t], sq[ten_t], sq[ten_t_next])
-        val_t = calc_hermite_curve(alpha_2, g[ten_t1], c[ten_t1], sq[ten_t1], sq[ten_t1_next])
+    def linear_interpolation(tensor, tnr, indices_t, indices_time, time_grid, is_rt, mul_time, extrapolate):
+        """Handle linear interpolation variants."""
+        alpha_1, ten_t, ten_t_next = indices_t
+        alpha_2, ten_t1, ten_t1_next = indices_time
+
+        # Linear interpolation
+        val = alpha_1 * tensor[ten_t_next] + (1 - alpha_1) * tensor[ten_t]
+        val_t = alpha_2 * tensor[ten_t1_next] + (1 - alpha_2) * tensor[ten_t1]
+
+        if extrapolate:
+            tnr = tnr[:-1]
+
+        time_grid_tenor = time_grid.view(-1, 1) + tnr.view(1, -1)
+        norm = (time_grid_tenor if mul_time else 1.0, time_grid if mul_time else 1.0)
+
+        if is_rt:
+            norm = (norm[0] / time_grid_tenor.clamp(tnr.min(), tnr.max()),
+                    norm[1] / time_grid.clamp(tnr.min(), tnr.max()))
 
         return val * norm[0] - (val_t * norm[1]).reshape(-1, 1)
+
+    """Compute interpolated forward curves with support for multiple interpolation methods."""
+    # Configuration
+    interp_method = factor.interpolation[0]
+    is_rt = interp_method.endswith('RT')
+    is_hermite = interp_method.startswith('Hermite')
+    is_linear = 'Linear' in interp_method
+    extrapolate = 'Extrapolate' in interp_method
+
+    # Preprocess tensors
+    factor_tenor = factor.get_tenor()
+    time_grid = tensor.new(time_grid_years)
+    tnr, tnr_d, tensor = prepare_tenors(factor_tenor, time_grid_years, extrapolate)
+
+    # Handle RT scaling
+    tensor = scale_for_rt(tnr, tensor, is_rt)
+
+    # Calculate interpolation indices and weights
+    indices_t, indices_time = calculate_interp_params(tnr, tnr_d, time_grid)
+
+    # Perform interpolation
+    if is_hermite:
+        return hermite_interpolation(tensor, tnr, indices_t, indices_time, time_grid, is_rt, mul_time)
     else:
-        fwd1 = alpha_1 * tensor.take(ten_t_next) + (1 - alpha_1) * tensor.take(ten_t)
-        fwd2 = alpha_2 * tensor.take(ten_t1_next) + (1 - alpha_2) * tensor.take(ten_t1)
-
-        if mul_time:
-            time_tenor_tenor = tensor.new(time_grid_years.reshape(-1, 1) + tnr)
-            time_grid_tensor = tensor.new(time_grid_years)
-
-            return fwd1 * time_tenor_tenor - (fwd2 * time_grid_tensor).reshape(-1, 1)
-        else:
-            return fwd1 - fwd2.reshape(-1, 1)
+        return linear_interpolation(tensor, tnr, indices_t, indices_time, time_grid, is_rt, mul_time, extrapolate)
 
 
 def PCA(matrix, num_redim=0):
@@ -2337,7 +2391,7 @@ def make_energy_fixed_cashflows(reference_date, position, cashflows):
     return TensorCashFlows(cash, dummy_resets)
 
 
-def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
+def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows, current_spot):
     """
     Generates a vector of equity cashflows from a data source.
     """
@@ -2363,9 +2417,20 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows):
                 # Need to use this reset to estimate future dividends
                 Time_Grid, Scenario = time_grid.get_scenario_offset(max(Reset_Day, 0))
 
-                # only add a reset if its in the past
+                # only add a reset if it's in the past - if its 0, then replace it with the current spot
+                if Start_Day <= 0:
+                    known_price = cashflow.get('Known_' + reset + '_Price', 0.0)
+                    if Start_Day == 0 and not known_price:
+                        logging.warning(
+                            'Known_{}_Price not set at base_date - setting to current spot'.format(reset))
+                        reset_price = current_spot
+                    else:
+                        reset_price = known_price
+                else:
+                    reset_price = 0.0
+
                 r.append([Time_Grid, Reset_Day, -1, Start_Day, Start_Day, Weight,
-                          cashflow.get('Known_' + reset + '_Price') if Start_Day <= 0 else 0.0,
+                          reset_price,
                           cashflow.get('Known_' + reset + '_FX_Rate', 0.0) if Start_Day <= 0 else 0.0])
                 reset_scenario_offsets.append(Scenario)
 
@@ -2804,6 +2869,45 @@ def compress_deal_data(deals):
         for k, v in eq_compressed.items():
             all_other.extend(v)
             all_other.extend(ir_compressed[k])
+
+        reduced_deals = all_other
+
+    # now try and compress ir_swaps - not ideal looking for ',Swap,' in tags - TODO!
+    ir_swaps = [x for x in reduced_deals if x['Instrument'].field['Object'] == 'StructuredDeal'
+                and ',Swap,' in x['Instrument'].field['Tags'][0]]
+
+    # switched off - need to test and improve this
+    if False and ir_swaps and len(ir_swaps) > 200:
+        logging.info('Compressing {} IR Swaps'.format(len(ir_swaps)))
+        float_unders = {}
+        fixed_unders = {}
+        swap_refs = [x['Instrument'].field['Reference'] for x in ir_swaps]
+        all_ir_swap, all_other = filter_deals(reduced_deals, swap_refs)
+
+        # first load all compressible deals
+        for structure in all_ir_swap:
+            tags = tuple(structure['Instrument'].field['Tags'])
+            for k in structure['Children']:
+                key = tuple(
+                    sorted([(field, value) for field, value in k['Instrument'].field.items()
+                            if field not in ['Reference', 'Tags', 'Buy_Sell', 'Cashflows']])) + (tags,)
+
+                if k['Instrument'].field['Object'] == 'CFFloatingInterestListDeal':
+                    float_unders.setdefault(key, []).append(k)
+                else:
+                    fixed_unders.setdefault(key, []).append(k)
+
+        fixed_compressed = []
+        for k, unders in fixed_unders.items():
+            fixed_compressed.extend(compress_CFFixedInterestListDeal(unders, k[-1], use_ref_as_tag=True))
+
+        float_compressed = []
+        for k, unders in float_unders.items():
+            float_compressed.extend(compress_CFFloatingInterestListDeal(unders, k[-1], use_ref_as_tag=True))
+
+        # add it and continue
+        all_other.extend(fixed_compressed)
+        all_other.extend(float_compressed)
 
         reduced_deals = all_other
 

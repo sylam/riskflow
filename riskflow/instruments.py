@@ -218,7 +218,8 @@ def get_equity_zero_rate_factor(fieldname, static_offsets, stochastic_offsets, a
 def get_commodity_zero_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors, all_factors):
     """Read the equity's interest rate price factor"""
     commodity_factor = all_factors.get(utils.Factor('CommodityPrice', fieldname))
-    ir_curve = (commodity_factor.factor if hasattr(commodity_factor, 'factor') else commodity_factor).get_repo_curve_name()
+    ir_curve = (
+        commodity_factor.factor if hasattr(commodity_factor, 'factor') else commodity_factor).get_repo_curve_name()
     return get_interest_factor(ir_curve, static_offsets, stochastic_offsets, all_tenors)
 
 
@@ -350,6 +351,10 @@ class Deal(object):
         else:
             return self.reval_dates
 
+    def get_report_dates(self, time_grid, base_date):
+        # sometimes we need to adjust the reval dates for netting sets etc.
+        return self.get_reval_dates()
+
     def finalize_dates(self, parser, base_date, grid, node_children, node_resets, node_settlements):
         if self.path_dependent:
             self.add_grid_dates(parser, base_date, grid if node_children is None else node_resets)
@@ -389,8 +394,8 @@ class Deal(object):
                     field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
                 field_index['Other'] = get_fx_and_zero_rate_factor(
                     field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-            else:
-                field_index['Check_Payoff_Type'] = False
+        else:
+            field_index['Check_Payoff_Type'] = False
 
 
 class NettingCollateralSet(Deal):
@@ -597,18 +602,29 @@ class NettingCollateralSet(Deal):
             if calendar:
                 self.calendar = calendar['businessday']
 
+    def calc_liquidation_settlement_dates(self, date, base_date):
+        if self.options['Forward_Looking_Closeout']:
+            tl = date + pd.DateOffset(days=self.field['Settlement_Period'])
+            ts = date
+        else:
+            tl = max(date - pd.DateOffset(days=self.field['Liquidation_Period']), base_date)
+            ts = max(date - pd.DateOffset(days=self.field['Settlement_Period'] + self.field['Liquidation_Period']),
+                     base_date)
+        return ts, tl
+
+    def get_report_dates(self, time_grid, base_date):
+        mtm_dates = set(self.get_reval_dates()).union({base_date})
+        if self.field.get('Collateralized', 'False') == 'True':
+            reval_dates = []
+            for date in sorted([x for x in time_grid.mtm_dates if x <= max(mtm_dates)]):
+                ts, tl = self.calc_liquidation_settlement_dates(date, base_date)
+                if ts in time_grid.mtm_dates and tl in time_grid.mtm_dates:
+                    reval_dates.append(date)
+        else:
+            reval_dates = sorted([x for x in time_grid.mtm_dates if x <= max(mtm_dates)])
+        return reval_dates
+
     def finalize_dates(self, parser, base_date, grid, node_children, node_resets, node_settlements):
-
-        def calc_liquidation_settlement_dates(date):
-            if self.options['Forward_Looking_Closeout']:
-                tl = date + pd.DateOffset(days=self.field['Settlement_Period'])
-                ts = date
-            else:
-                tl = max(date - pd.DateOffset(days=self.field['Liquidation_Period']), base_date)
-                ts = max(date - pd.DateOffset(days=self.field['Settlement_Period'] + self.field['Liquidation_Period']),
-                         base_date)
-            return ts, tl
-
         # have to reset the original instrument and let the children nodes determine the outcome
         if self.field.get('Collateralized', 'False') == 'True':
             # update each child element with extra reval dates
@@ -651,7 +667,7 @@ class NettingCollateralSet(Deal):
             full_grid = grid_dates.union({x for x in node_resets if x >= base_date})
 
             for t in sorted(full_grid):
-                ts, tl = calc_liquidation_settlement_dates(t)
+                ts, tl = self.calc_liquidation_settlement_dates(t, base_date)
                 node_additions.update({t, ts, tl})
 
             # now set the reval dates
@@ -659,7 +675,7 @@ class NettingCollateralSet(Deal):
             self.reval_dates = set()
 
             for date in sorted(fresh_grid):
-                ts, tl = calc_liquidation_settlement_dates(date)
+                ts, tl = self.calc_liquidation_settlement_dates(date, base_date)
                 if ts in fresh_grid and tl in fresh_grid:
                     self.reval_dates.add(date)
 
@@ -815,7 +831,12 @@ class NettingCollateralSet(Deal):
                 'Base_Collateral_Call_Date') else base_date
             call_freq = self.field['Collateral_Call_Frequency'] if self.field.get(
                 'Collateral_Call_Frequency') else pd.DateOffset(days=1)
-            call_dates = np.array([(x - base_date).days for x in sorted(self.get_reval_dates())])
+
+            # normally this would just be the reval dates, but if we have more than 1 netting set,
+            # then we need to include the global (time_grid.mtm_dates) set of dates
+            reval_dates = self.get_report_dates(time_grid, base_date)
+
+            call_dates = np.array([(x - base_date).days for x in reval_dates])
             call_mask = np.ones(time_grid.mtm_time_grid.size, dtype=np.int32)
 
             if call_freq.kwds != {'days': 1}:
@@ -860,8 +881,9 @@ class NettingCollateralSet(Deal):
         # calc v^t = v(te) + C(ts,te) - min(B(u); ts<=u<=tl}S(te)
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        logging.info('Netting set {}'.format(self.field.get('Reference')))
 
-        if self.field.get('Collateralized', 'False') == 'True' and hasattr(shared, 't_Credit'):
+        if self.field.get('Collateralized', 'False') == 'True' and shared.simulation_batch > 1:
             C_base = 0.0
 
             for curr, fx_factor in factor_dep['Settlement_Currencies'].items():
@@ -874,8 +896,9 @@ class NettingCollateralSet(Deal):
 
                 base_Ci = torch.cat(Ci, dim=0)
                 # pad the last bit
+                padded_time_grid = time_grid.time_grid[:-pad] if pad else time_grid.time_grid
                 C_base += F.pad(utils.calc_time_grid_spot_rate(
-                    fx_factor, time_grid.time_grid[:-pad], shared) * base_Ci, [0, 0, 0, pad])
+                    fx_factor, padded_time_grid, shared) * base_Ci, [0, 0, 0, pad])
 
             if not self.options['Exclude_Paid_Today']:
                 C_block = C_base[:-1]
@@ -885,33 +908,37 @@ class NettingCollateralSet(Deal):
                 Cf_Rec = torch.cumsum(torch.relu(C_base), dim=0)
                 Cf_Pay = torch.cumsum(torch.relu(-C_base), dim=0)
 
+            # The time_grid is global (across all potential netting sets) - the local grid is just this netting set
+            local_time_grid = time_grid.time_grid[
+                time_grid.time_grid[:, utils.TIME_GRID_MTM] <= deal_time[-1][utils.TIME_GRID_MTM]]
             # calc collateral values
-            St = torch.zeros_like(accum)
+            St = shared.one.new_zeros(len(local_time_grid), shared.simulation_batch)
+            local_accum = accum[:len(local_time_grid)]
 
             for cash_col in factor_dep['Cash_Collateral']:
-                St += (1.0 - cash_col.Haircut) * cash_col.Amount * utils.calc_time_grid_spot_rate(
-                    cash_col.Currency, time_grid.time_grid, shared)
+                St = St + (1.0 - cash_col.Haircut) * cash_col.Amount * utils.calc_time_grid_spot_rate(
+                    cash_col.Currency, local_time_grid, shared)
 
             for bond_col in factor_dep['Bond_Collateral']:
                 bond = pricing.pv_fixed_cashflows(shared, time_grid, bond_col.Collateral, settle_cash=False)
-                padding = time_grid.time_grid.shape[0] - bond.shape[0]
-                St += (1.0 - bond_col.Haircut) * utils.calc_time_grid_spot_rate(
-                    bond_col.Currency, time_grid.time_grid, shared) * F.pad(bond, [0, 0, 0, padding])
+                padding = local_time_grid.shape[0] - bond.shape[0]
+                St = St + (1.0 - bond_col.Haircut) * utils.calc_time_grid_spot_rate(
+                    bond_col.Currency, local_time_grid, shared) * F.pad(bond, [0, 0, 0, padding])
 
             for equity_col in factor_dep['Equity_Collateral']:
-                St += (1.0 - equity_col.Haircut) * equity_col.Amount * utils.calc_time_grid_spot_rate(
-                    equity_col.Currency, time_grid.time_grid, shared) * utils.calc_time_grid_spot_rate(
-                    equity_col.Collateral, time_grid.time_grid, shared)
+                St = St + (1.0 - equity_col.Haircut) * equity_col.Amount * utils.calc_time_grid_spot_rate(
+                    equity_col.Currency, local_time_grid, shared) * utils.calc_time_grid_spot_rate(
+                    equity_col.Collateral, local_time_grid, shared)
 
             # calc the collateral amount
-            fx_base = utils.calc_time_grid_spot_rate(shared.Report_Currency, time_grid.time_grid, shared)
-            fx_agreement = utils.calc_time_grid_spot_rate(factor_dep['Agreement_Currency'], time_grid.time_grid, shared)
+            fx_base = utils.calc_time_grid_spot_rate(shared.Report_Currency, local_time_grid, shared)
+            fx_agreement = utils.calc_time_grid_spot_rate(factor_dep['Agreement_Currency'], local_time_grid, shared)
             H = self.field['Credit_Support_Amounts']['Received_Threshold'].value() * fx_agreement
             G = self.field['Credit_Support_Amounts']['Posted_Threshold'].value() * fx_agreement
             min_received = self.field['Credit_Support_Amounts']['Minimum_Received'].value()
             min_posted = self.field['Credit_Support_Amounts']['Minimum_Posted'].value()
 
-            Vt = accum * fx_base
+            Vt = local_accum * fx_base
 
             if self.options['Exclude_Paid_Today']:
                 mtm_today_adj = torch.cat([Cf_Rec[0].reshape(1, -1), Cf_Rec[1:] - Cf_Rec[:-1]], dim=0) - \
@@ -949,9 +976,10 @@ class NettingCollateralSet(Deal):
             Bt = torch.stack(Sim_Bt)
 
             # now calculate the collateral account and Net exposure
-            fx_base = utils.calc_time_grid_spot_rate(shared.Report_Currency, deal_time, shared)
+            report_time = local_time_grid[factor_dep['Te']]
+            fx_base = utils.calc_time_grid_spot_rate(shared.Report_Currency, report_time, shared)
 
-            Vte = accum[factor_dep['Te']] * fx_base
+            Vte = local_accum[factor_dep['Te']] * fx_base
 
             if self.options['Exclude_Paid_Today']:
                 mtm_today_adj = (Cf_Rec[factor_dep['Te']] -
@@ -987,23 +1015,20 @@ class NettingCollateralSet(Deal):
 
             # zero out the last row
             min_Bt = F.pad(min_Bt, [0, 0, 0, 1])
-
-            # Store results
-            shared.t_Credit['GrossMTM'] = accum
-            shared.t_Credit['Collateral'] = Bte * Ste / fx_base
+            expected_collateral = Bte * Ste / fx_base
 
             # The net MTM of the netting set
             net_accum = (Vte + C_ts_te - min_Bt * Ste) / fx_base
 
             if len(factor_dep['Cash_Collateral']) == 1 and factor_dep['Cash_Collateral'][0].Collateral_Rate is not None:
                 cash_col = factor_dep['Cash_Collateral'][0]
-                cash_rep = utils.calc_time_grid_spot_rate(cash_col.Currency, deal_time, shared) / fx_base
-                mtm_grid = deal_time[:, utils.TIME_GRID_MTM]
+                cash_rep = utils.calc_time_grid_spot_rate(cash_col.Currency, report_time, shared) / fx_base
+                mtm_grid = report_time[:, utils.TIME_GRID_MTM]
 
                 # calculate collateral valuation adjustment
                 delta_scen_t = np.append(np.diff(mtm_grid), 0).reshape(-1, 1)
-                discount_funding = utils.calc_time_grid_curve_rate(cash_col.Funding_Rate, deal_time, shared)
-                discount_collateral = utils.calc_time_grid_curve_rate(cash_col.Collateral_Rate, deal_time, shared)
+                discount_funding = utils.calc_time_grid_curve_rate(cash_col.Funding_Rate, report_time, shared)
+                discount_collateral = utils.calc_time_grid_curve_rate(cash_col.Collateral_Rate, report_time, shared)
                 discount_collateral_t0 = utils.calc_time_grid_curve_rate(
                     cash_col.Collateral_Rate, np.zeros((1, 3)), shared)
 
@@ -1016,12 +1041,22 @@ class NettingCollateralSet(Deal):
                     -torch.squeeze(discount_collateral_t0.gather_weighted_curve(
                         shared, mtm_grid.reshape(1, -1)), dim=0))
 
-                shared.t_Credit['Funding'] = shared.t_Credit['Collateral'] * cash_rep * Dc_over_f_tT_m1 * Dc0_T
+                funding = expected_collateral * cash_rep * Dc_over_f_tT_m1 * Dc0_T
+                shared.save_results(deal_data.Calc_res, {'Funding': funding})
 
-            return net_accum
+            # Store results - with appropriate padding
+            padding = time_grid.report_index.size - net_accum.shape[0]
+            gross_padding = time_grid.mtm_time_grid.size - local_accum.shape[0]
+            final_mtm = F.pad(net_accum, [0, 0, 0, padding]) if padding else net_accum
+            shared.save_results(
+                deal_data.Calc_res, {
+                    'Collateral': F.pad(expected_collateral, [0, 0, 0, padding]) if padding else expected_collateral,
+                    'GrossMTM': F.pad(local_accum, [0, 0, 0, gross_padding]) if gross_padding else local_accum,
+                    'Value': final_mtm
+                })
+            return final_mtm
         else:
-            # copy the mtm
-            return accum
+            return pricing.interpolate(accum, shared, time_grid, deal_data)
 
 
 class MtMCrossCurrencySwapDeal(Deal):
@@ -2436,7 +2471,6 @@ class EquityDiscreteExplicitAsianOption(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Equity': utils.check_rate_name(self.field['Equity']),
                  'Equity_Volatility': utils.check_rate_name(self.field['Equity_Volatility'])}
@@ -2768,15 +2802,15 @@ class QEDI_CustomAutoCallSwap(Deal):
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
 
-        # merge all the dates
-        all_dates = sorted(
-            reduce(set.union, [
-                set([x[0] for x in self.field['Autocall_Coupons']]),
-                set([x[0] for x in self.field['Price_Fixing']]),
+        coupon_dates = [x[0] for x in self.field['Autocall_Coupons']]
+        fixing_dates = [x[0] for x in self.field['Price_Fixing']]
+
+        # merge all the dates - except fixings - those will be added later
+        all_dates = reduce(set.union, [
+                set(coupon_dates),
                 set([x[0] for x in self.field.get('Barrier_Dates', [])]),
                 set([x[0] for x in self.field.get('Autocall_Floating', [])])
             ])
-        )
 
         # create lookups
         pf = dict(self.field['Price_Fixing'])
@@ -2790,6 +2824,15 @@ class QEDI_CustomAutoCallSwap(Deal):
             logging.warning('AutoCall has max pricing date {} > Expiry Date {} for underlying {}'.format(
                 max(all_dates).strftime('%Y-%m-%d'), self.field['Expiry_Date'].strftime('%Y-%m-%d'),
                 self.field['Equity']))
+
+        # the most common case is that there is no averaging - i.e. just a single fixing on a coupon date
+        # also check that the barrier dates correspond with the coupon dates
+        # we can then get a much faster calc ready
+        pf_dates = [x for x in pf if x >= base_date]
+        ac_dates = [x for x in ac if x >= base_date]
+        no_averaging = len(pf_dates) == len(ac_dates) and np.all(
+            [f <= c for f, c in zip(pf_dates, ac_dates)]) and not np.any(
+            [x not in coupon_dates for x in ab if x >= base_date])
 
         field_index = {
             'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
@@ -2807,15 +2850,37 @@ class QEDI_CustomAutoCallSwap(Deal):
             'Strike_Price': self.field['Strike_Price'],
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
             'Barrier': self.field.get('Barrier', 0.0) * self.field['Strike_Price'],
-            'Fixings': utils.make_fixing_data(
-                base_date, time_grid, [[x, pf.get(x, -1)] for x in all_dates]),
-            'Price_Fixing': [pf.get(x, -1) for x in all_dates],
-            'Autocall_Thresholds': [at.get(x, -1) for x in all_dates],
-            'Autocall_Floating': [af.get(x, -1) for x in all_dates],
-            'Autocall_Coupons': [ac.get(x, -1) for x in all_dates],
-            'Barrier_Dates': [ab.get(x, -1) for x in all_dates],
             'Expiry': (self.field['Expiry_Date'] - base_date).days
         }
+
+        if no_averaging:
+            all_dates = sorted(all_dates)
+            # move the threshold dates to the coupon dates
+            tl = {c: at[t] for c, t in zip(ac, at)}
+            field_index.update({
+                'Fixings': utils.make_fixing_data(
+                    base_date, time_grid, [[x, pf.get(x, -1)] for x in all_dates]),
+                'Price_Fixing': utils.make_fixing_data(base_date, time_grid, [[x, pf[x]] for x in fixing_dates]),
+                'Coupon_Fixing': utils.make_fixing_data(base_date, time_grid, [[x, ac[x]] for x in coupon_dates]),
+                'Autocall_Thresholds': [tl.get(x, -1) for x in all_dates],
+                'no_averaging': True
+            })
+        else:
+            all_dates = sorted(all_dates.union(fixing_dates))
+            field_index.update({
+                'Fixings': utils.make_fixing_data(
+                    base_date, time_grid, [[x, pf.get(x, -1)] for x in all_dates]),
+                'Price_Fixing': [pf.get(x, -1) for x in all_dates],
+                'Autocall_Thresholds': [at.get(x, -1) for x in all_dates],
+                'no_averaging': False
+            })
+            logging.warning('Autocall involves averaging - running older pricing model')
+
+        field_index.update({
+            'Barrier_Dates': [ab.get(x, -1) for x in all_dates],
+            'Autocall_Floating': [af.get(x, -1) for x in all_dates],
+            'Autocall_Coupons': [ac.get(x, -1) for x in all_dates]
+        })
 
         self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
@@ -2877,14 +2942,9 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
         # need to add the previous date to calculate the reset
         prev_floating_date = min(floating_pay_dates) - self.field['Reset_Frequency']
         # if prev_floating_date == base_date:
-            # there's an issue if the prev_float_date is the same as the base date
+        # there's an issue if the prev_float_date is the same as the base date
         #    prev_floating_date = prev_floating_date - pd.offsets.Day(1)
         floating_pay_dates = [prev_floating_date] + floating_pay_dates
-
-        # check if the last floating date is past the expiry of the option
-        if max(floating_pay_dates) > self.field['Expiry_Date']:
-            logging.warning('Last autocall floating date {} runs past expiry {} - clipping to expiry'.format(
-                max(floating_pay_dates).strftime('%Y-%m-%d'), self.field['Expiry_Date'].strftime('%Y-%m-%d')))
 
         cashflows = {'Items':
                          [{'Accrual_Start_Date': start,
@@ -3176,10 +3236,14 @@ class CommodityForwardDeal(Deal):
                        'Expiry': (self.field['Maturity_Date'] - base_date).days}
 
         reference_factor, forward_factor = get_reference_factor_objects(field['Reference_Type'], all_factors)
-        field_index['base_index'] = (base_date-utils.excel_offset).days
+        field_index['base_index'] = (base_date - utils.excel_offset).days
         field_index['ForwardPrice'], field_index['ForwardFX'], field_index['CashFX'] = get_forwardprice_factor(
             field['Currency'], static_offsets, stochastic_offsets, all_tenors,
             all_factors, reference_factor, forward_factor, base_date)
+
+        # check if this leg is a forward (else spot)
+        field_index['Forward_Date'] = (
+                self.field['Forward_Date'] - base_date).days if self.field.get('Forward_Date') else 0
 
         return field_index
 
@@ -3188,9 +3252,10 @@ class CommodityForwardDeal(Deal):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
         forward_curve = utils.calc_time_grid_curve_rate(factor_dep['ForwardPrice'], deal_time, shared)
-        spot_date_index = np.array([[factor_dep['base_index']+x[1]] for x in deal_time])
+        remaining_tenor = np.array([max(x[utils.TIME_GRID_MTM], factor_dep['Forward_Date']) for x in deal_time])
+        spot_date_index = (factor_dep['base_index'] + remaining_tenor).reshape(-1, 1)
         energy_spot = forward_curve.gather_weighted_curve(shared, spot_date_index, multiply_by_time=False)
-        T_t = factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM].reshape(-1, 1)
+        T_t = factor_dep['Expiry'] - remaining_tenor.reshape(-1, 1)
         curve_grid = utils.calc_time_grid_curve_rate(factor_dep['Commodity_Zero'], deal_time, shared)
         forward = torch.squeeze(energy_spot * torch.exp(curve_grid.gather_weighted_curve(shared, T_t)), dim=1)
         fx_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
@@ -3336,7 +3401,8 @@ class EquitySwapletListDeal(Deal):
 
         field_index = {}
         self.isQuanto = field['Equity_Currency'] != field['Currency']
-
+        # get the current spot
+        current_spot = get_equity_spot(field['Equity'], static_offsets, stochastic_offsets, all_factors)
         field_index['PrincipleNotShares'] = 1 if self.field.get('Amount_Type', 'Principal') == 'Principal' else 0
         field_index['SettleCurrency'] = self.field['Currency']
 
@@ -3349,7 +3415,7 @@ class EquitySwapletListDeal(Deal):
         field_index['Equity_Zero'] = get_equity_zero_rate_factor(
             field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors)
         field_index['Flows'] = utils.make_equity_swaplet_cashflows(
-            base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, self.field['Cashflows'])
+            base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, self.field['Cashflows'], current_spot)
 
         if self.isQuanto:
             logging.warning("Quanto deal. TODO!!!!!!!")
@@ -3401,6 +3467,7 @@ class EquitySwapLeg(Deal):
             self.field['Equity_Known_Prices'] else (None, None)
         start_dividend_sum = self.field['Known_Dividends'].sum_range(base_date, self.field['Effective_Date']) if \
             self.field['Known_Dividends'] else 0.0
+        current_price = get_equity_spot(field['Equity'], static_offsets, stochastic_offsets, all_factors)
 
         # sometimes the equity price is listed but in the past - need to check for this
         if self.field['Equity_Known_Prices']:
@@ -3411,7 +3478,6 @@ class EquitySwapLeg(Deal):
                     max(earlier_dates)] if earlier_dates else (None, None)
             # if the end price is not provided, use the current spot price as a proxy
             if end_prices == (None, None):
-                current_price = get_equity_spot(field['Equity'], static_offsets, stochastic_offsets, all_factors)
                 fx_reset = 1.0 if field['Currency'] == field['Payoff_Currency'] else get_fxrate_spot(
                     field['Currency'], static_offsets, stochastic_offsets, all_factors) / get_fxrate_spot(
                     field['Payoff_Currency'], static_offsets, stochastic_offsets, all_factors)
@@ -3454,7 +3520,7 @@ class EquitySwapLeg(Deal):
             field_index['Equity_Zero'] = get_equity_zero_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors)
             field_index['Flows'] = utils.make_equity_swaplet_cashflows(
-                base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, field['cashflow'])
+                base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, field['cashflow'], current_price)
 
         return field_index
 
@@ -4206,7 +4272,7 @@ class FloatingEnergyDeal(Deal):
             'FX_Sampling_Type': utils.check_rate_name(
                 self.field['FX_Sampling_Type']) if self.field['FX_Sampling_Type'] else None,
             'Reference_Type': utils.check_rate_name(self.field['Reference_Type'])
-            }
+        }
 
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
@@ -4311,7 +4377,6 @@ class EnergySingleOption(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-
         field = {
             'Currency': utils.check_rate_name(self.field['Currency']),
             'Sampling_Type': utils.check_rate_name(self.field['Sampling_Type']),
@@ -4377,7 +4442,7 @@ class EnergySingleOption(Deal):
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
-        return pricing.pv_energy_option(shared, time_grid, deal_data, self.field['Volume'])
+            return pricing.pv_energy_option(shared, time_grid, deal_data, self.field['Volume'])
 
 
 def construct_instrument(param, all_valuation_options):

@@ -15,10 +15,6 @@
 # You should have received a copy of the GNU General Public License
 # along with RiskFlow.  If not, see <http://www.gnu.org/licenses/>.
 ########################################################################
-from collections import OrderedDict
-
-# specific modules
-from itertools import zip_longest
 
 import numpy as np
 import torch
@@ -37,7 +33,7 @@ OPTION_CALL = 1.0
 
 def cash_settle(shared, currency, time_index, value):
     # need to check if the time_index
-    if shared.t_Cashflows is not None and time_index in shared.t_Cashflows[currency]:
+    if shared.t_Cashflows is not None and time_index in shared.t_Cashflows.get(currency, []):
         shared.t_Cashflows[currency][time_index] += value
 
 
@@ -54,10 +50,10 @@ def calc_moneyness(strike, spot, forward, deal_data, use_forward=False, invert_m
     :return: the moneyness amount to apply to the deal
     '''
     if deal_data.Factor_dep['Volatility'][0][utils.FACTOR_INDEX_SubType] == 'SVI':
-        return torch.log(strike/forward)
+        return torch.log(strike / forward)
     else:
         forward_or_spot = forward if use_forward else spot
-        return strike/forward_or_spot if invert_moneyness else forward_or_spot/strike
+        return strike / forward_or_spot if invert_moneyness else forward_or_spot / strike
 
 
 class SensitivitiesEstimator(object):
@@ -72,8 +68,8 @@ class SensitivitiesEstimator(object):
         # run the backward pass
         value.backward(retain_graph=True, create_graph=create_graph)
         # store associated gradients
-        self.params = OrderedDict([(key, tensor) for key, tensor in params if tensor.grad is not None])
-        self.grad = OrderedDict([(key, tensor.grad) for key, tensor in self.params.items()])
+        self.params = {key: tensor for key, tensor in params if tensor.grad is not None}
+        self.grad = {key: tensor.grad for key, tensor in self.params.items()}
         self.flat_grad = self.flatten(list(self.grad.values()))
         self.device = self.flat_grad.device
         self.dtype = self.flat_grad.dtype
@@ -81,16 +77,9 @@ class SensitivitiesEstimator(object):
         self.P = len(self.flat_grad)
 
     def report_grad(self):
-        return OrderedDict([(utils.check_scope_name(factor),
-                             tensor.cpu().detach().numpy()) for factor, tensor in self.grad.items()])
+        return {utils.check_scope_name(factor): tensor.cpu().detach().numpy() for factor, tensor in self.grad.items()}
 
     def report_hessian(self, allow_unused=False):
-
-        def calc_Hv(x):
-            X = self.flat_grad.new(x.T)
-            f = [self.get_Hv_op(v) for v in X]
-            return torch.stack(f).cpu().detach().numpy().T.astype(np.float64)
-
         h_op = self.get_H_op(allow_unused)
         hessian = np.zeros((self.P, self.P))
 
@@ -187,13 +176,8 @@ def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
 
     # check if we want to store the mtm value for this instrument
     if deal_data.Calc_res is not None:
-        # mtm_np = mtm.cpu().detach().numpy().astype(np.float64)
-        mtm_np = mtm.detach().cpu().numpy().astype(np.float64)
-        deal_data.Calc_res['Value'] = mtm_np
-        # store the mtm as an array
-        deal_data.Calc_res.setdefault('MTM', []).append(mtm_np.sum(axis=1))
-        # if shared.calc_greeks is not None:
-        #    greeks(shared, deal_data, mtm)
+        shared.save_results(deal_data.Calc_res, {'Value': mtm})
+        # deal_data.Calc_res.setdefault('MTM', []).append(mtm_np.sum(axis=1))
 
     if mtm.shape != (1, 1) and mtm.shape[0] < time_grid.mtm_time_grid.size:
         # pad it with zeros and return
@@ -435,10 +419,8 @@ def getpartialbarrierpayoff(isKnockIn, eta, phi, spot, strike, barrier, startBar
 
 def calc_vol_adjustment(factor_dep, moneyness, expiry, vols, shared):
     # check if this is a compo or quanto deal
-
     atm_moneyness = torch.ones_like(moneyness)
-    fx_vols = utils.calc_time_grid_vol_rate(
-        factor_dep['FXVol'], atm_moneyness, expiry, shared)
+    fx_vols = utils.calc_time_grid_vol_rate(factor_dep['FXVol'], atm_moneyness, expiry, shared)
 
     if 'QuantoImpliedCorrelation' in factor_dep:
         # quanto fx deal
@@ -448,6 +430,26 @@ def calc_vol_adjustment(factor_dep, moneyness, expiry, vols, shared):
         compo_vols = torch.sqrt(
             fx_vols * fx_vols + 2.0 * fx_vols * vols * factor_dep['CompoImpliedCorrelation'] + vols * vols)
         return {'vol': compo_vols, 'b_adj': 0.0}
+
+
+def smooth_max(x, k, eps=0.01):
+    return torch.where(x < k - eps, torch.zeros_like(x), torch.where(
+        x > k + eps, x - k, (-k * x + 0.5 * x ** 2 + eps * x + 0.5 * (k - eps) ** 2) / (2 * eps)))
+
+
+def smooth_relu(x, eps=0.005):
+    return torch.where(x < - eps, torch.zeros_like(x), torch.where(
+        x > eps, x, (0.5 * x ** 2 + eps * x + 0.5 * eps ** 2) / (2 * eps)))
+
+
+def smooth_heaviside_up(x, k, eps=0.01):
+    return torch.where(x < k - eps, torch.zeros_like(x),
+                       torch.where(x > k + eps, torch.ones_like(x), 0.5 + (x - k) / (2.0 * eps)))
+
+
+def smooth_heaviside_down(x, k, eps=0.01):
+    return torch.where(x < k - eps, torch.ones_like(x),
+                       torch.where(x > k + eps, torch.zeros_like(x), 0.5 + (k - x) / (2.0 * eps)))
 
 
 def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
@@ -460,18 +462,18 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
 
         for t in range(tMax):
             if isBarrierDate[t] > 0.0:
-                breachEvent = (
-                        (eta == BARRIER_UP) * (S[t] > barrier) +
-                        (eta == BARRIER_DOWN) * (S[t] < barrier))
+                breachEvent = smooth_heaviside_up(
+                    S[t], barrier) if eta == BARRIER_UP else smooth_heaviside_down(S[t], barrier)
                 # rebate = (direction == BARRIER_OUT) * (breached == 0) & breachEvent
                 # mtm_list[t] = cash_rebate * rebate
                 breached = breached + breachEvent
 
         # digital payoff
         if isdigital:
-            payoff = 1.0 * ((S[-1] < strike) if phi == OPTION_PUT else (S[-1] > strike))
+            payoff = smooth_heaviside_down(
+                S[-1], strike) if phi == OPTION_PUT else smooth_heaviside_up(S[-1], strike)
         else:
-            payoff = F.relu(strike - S[-1]) if phi == OPTION_PUT else F.relu(S[-1] - strike)
+            payoff = smooth_relu((strike - S[-1]) if phi == OPTION_PUT else (S[-1] - strike))
 
         # pay at expiry
         if direction == BARRIER_IN:
@@ -495,7 +497,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         mcmc = []
         for s, r, sigma in zip(spot_prices, drift, vol):
             if sobol:
-                z = shared.quasi_rng(shared.simulation_batch, num_samples * num_sims).T.reshape(
+                z = shared.quasi_rng(shared.simulation_batch, num_samples * num_sims)[0].T.reshape(
                     num_samples, shared.simulation_batch, -1)
             else:
                 z = torch.randn([num_samples, shared.simulation_batch, num_sims],
@@ -757,7 +759,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
                         torch.erfc(eta_scale * d1) + torch.exp(2.0 * mu * log_vol) * torch.erfc(eta_scale * d2))
 
             elif deal_data.Instrument.field['Payment_Timing'] == 'Touch':
-                lamb = torch.sqrt(torch.relu(mu * mu + 2.0 * r_t))
+                lamb = torch.sqrt(smooth_relu(mu * mu + 2.0 * r_t))
                 lambroot = lamb * root_tau
                 d1 = lambroot - barrovert
                 d2 = -lambroot - barrovert
@@ -923,17 +925,22 @@ def pv_american_option(shared, time_grid, deal_data, nominal, moneyness, spot, f
     # calculate the barrier
     B_0 = K * torch.maximum(safe_r / r_b, torch.ones_like(safe_r))
     B_inf = K * beta / (beta - 1)
-    h_tau = -(b * tau + 2 * vol) * (B_0 / (B_inf - B_0))
-    I = B_0 + (B_inf - B_0) * (1 - torch.exp(h_tau))
-    safe_S = torch.min(S - 1e-6, I)
 
-    C_BS = (I - K) * torch.exp(torch.log(safe_S / I) * beta) * (1.0 - phi(beta, I, I))
-    x = phi(1.0, I, I)
-    y = phi(1.0, K, I)
-    C_BS += safe_S * (x - y)
-    x = phi(0.0, K, I)
-    y = phi(0.0, I, I)
-    C_BS += K * (x - y)
+    # check if the strike is > 0
+    if K > 0.0:
+        h_tau = -(b * tau + 2 * vol) * (B_0 / (B_inf - B_0))
+        I = B_0 + (B_inf - B_0) * (1 - torch.exp(h_tau))
+        safe_S = torch.min(S - 1e-6, I)
+        C_BS = (I - K) * torch.exp(torch.log(safe_S / I) * beta) * (1.0 - phi(beta, I, I))
+        x = phi(1.0, I, I)
+        y = phi(1.0, K, I)
+        C_BS += safe_S * (x - y)
+        x = phi(0.0, K, I)
+        y = phi(0.0, I, I)
+        C_BS += K * (x - y)
+    else:
+        I = B_0
+        C_BS = B_0
 
     Black = utils.black_european_option(
         S * torch.exp(b * tau), K, vol, 1.0, 1.0, 1.0, shared) * torch.exp(-r * tau)
@@ -942,10 +949,16 @@ def pv_american_option(shared, time_grid, deal_data, nominal, moneyness, spot, f
 
     theo_price = (b >= r) * Black + (b < r) * ((S < I) * C_BS + (S >= I) * (S - K))
     early_exercise = (b < r) * (S >= I)
-    value = factor_dep['Buy_Sell'] * nominal * theo_price * ~(early_exercise.cumsum(axis=0) > 0)
+
+    # check the first knockout
+    knocked_out = early_exercise.cumsum(axis=0) > 0
+    first_knockout = torch.concat([knocked_out[0].reshape(1, -1), knocked_out[1:] ^ knocked_out[:-1]])
+    # make sure we are still in force today
+    knocked_out[0] = False
+    value = factor_dep['Buy_Sell'] * nominal * theo_price * ~knocked_out
 
     # handle cashflows
-    exercise_val = factor_dep['Buy_Sell'] * nominal * (S - K) * early_exercise
+    exercise_val = factor_dep['Buy_Sell'] * nominal * (S - K) * first_knockout
     for t, cashflows in zip(deal_data.Time_dep.deal_time_grid, exercise_val):
         if cashflows.any():
             cash_settle(shared, factor_dep['SettleCurrency'], t, cashflows)
@@ -1071,7 +1084,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
         mcmc = []
         for s, r, sigma in zip(spot_prices, drift, vol):
             if sobol:
-                z = shared.quasi_rng(shared.simulation_batch, num_samples * num_sims).T.reshape(
+                z = shared.quasi_rng(shared.simulation_batch, num_samples * num_sims)[0].T.reshape(
                     num_samples, shared.simulation_batch, -1)
             else:
                 z = torch.randn([num_samples, shared.simulation_batch, num_sims],
@@ -1204,7 +1217,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
                 sumOfSpots = 0.0
                 averageCounter = 0.0
-                termination = inforce * (avg >= threshold[t] * strike)
+                termination = inforce * smooth_heaviside_up(avg, threshold[t] * strike)
                 mtm_list[resetTime] += termination * fx * (rebate + coupon[t])
                 terminationDate = (1 - termination) * terminationDate + termination * resetTime
                 breachEvent = (1 - termination) * breachEvent
@@ -1217,34 +1230,126 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
         return mtm_list.mean(axis=2)
 
-    def sim_spot(spot_prices, vols, times, carry, offset, terminationDate, sobol=False, num_sims=1024 * 4):
+    def sim_spot(spot_prices, vols, times, carry, offset, terminationDate, discount_rates,
+                 t_block, fixings, t_tenor, last_fixing, sobol=False, num_sims=1024 * 4):
+
         timesteps, num_samples = times.shape
-        dt = times.unsqueeze(axis=2)
-        var = (vols * vols).unsqueeze(axis=1) * dt
-        # store params in tensors
-        drift = carry * dt - 0.5 * var
-        # not strictly speaking correct, but we need to do this to prevent gradients from blowing up
-        vol = torch.sqrt(var.clamp(min=1e-4))
 
         isBarrierDate = BarrierDates[offset:]
-        isFixingDate = FixingDates[offset:]
         isFloatingDate = Floating[offset:]
         threshold = Threshold[offset:]
         coupon = Coupon[offset:]
 
-        mcmc = []
-        for s, r, sigma, floating in zip(spot_prices, drift, vol, floating_leg):
-            if sobol:
-                z = shared.quasi_rng(shared.simulation_batch, num_samples * num_sims).T.reshape(
-                    num_samples, shared.simulation_batch, -1)
-            else:
-                z = torch.randn([num_samples, shared.simulation_batch, num_sims],
-                                dtype=shared.one.dtype, device=shared.one.device)
-            f1 = (r.unsqueeze(axis=2) + sigma.unsqueeze(axis=2) * z).cumsum(axis=0)
-            mcmc_spot = s.reshape(1, -1, 1) * torch.exp(f1)
-            val = sim_autocall(
-                mcmc_spot, isBarrierDate, isFixingDate, isFloatingDate, floating, threshold, coupon, terminationDate)
-            mcmc.append(val)
+        # if there is exactly 1 fixing per coupon date, then there is no averaging
+        if factor_dep['no_averaging']:
+            fx = isQuanto * (fixFXRate - 1.0) + 1.0
+            mcmc = []
+            for t, tau, df, s, v, carry_rate, delta_t, full_t, floating in zip(
+                    t_block, t_tenor, discount_rates, spot_prices, vols, carry, times, fixings, floating_leg):
+
+                reduced_samples = len(delta_t)
+                # reduced samples can be zero if there's just the floating leg left
+                if reduced_samples:
+                    if sobol:
+                        u = shared.quasi_rng(shared.simulation_batch, reduced_samples * num_sims)[1].T.reshape(
+                            reduced_samples, shared.simulation_batch, -1)
+                    else:
+                        u = torch.rand([reduced_samples, shared.simulation_batch, num_sims],
+                                       dtype=shared.one.dtype, device=shared.one.device)
+                if last_fixing is None:
+                    Sj = torch.unsqueeze(s, 1)
+                    fixing_aligned = True
+                else:
+                    Sj = torch.unsqueeze(all_eq_samples[last_fixing], 1)
+                    fixing_aligned = False
+
+                P = torch.zeros((shared.simulation_batch, num_sims), dtype=shared.one.dtype, device=shared.one.device)
+                L = torch.ones((shared.simulation_batch, num_sims), dtype=shared.one.dtype, device=shared.one.device)
+                # which simulations are still alive?
+                q = terminationDate != -1
+                # update the Live matrix
+                L[q[:, 0]] = 0.0
+                # set the correct shapes for discounting and vols
+                D = df.unsqueeze(2)
+                vol = v.unsqueeze(1)
+
+                coupon_index = 0
+
+                for j, (coup, thresh, FloatingDate, barrier) in enumerate(
+                        zip(coupon, threshold, isFloatingDate, isBarrierDate)):
+
+                    if FloatingDate > 0:
+                        P = P + L * fx * -FloatingDate * D[j]
+
+                    if coup > 0:
+                        K = thresh * strike
+                        dt = delta_t[coupon_index] if fixing_aligned else 0.0
+                        if dt > 0:
+                            forward_carry = ((carry_rate[coupon_index] * full_t[coupon_index] -
+                            carry_rate[coupon_index - 1] * full_t[coupon_index - 1]) / delta_t[coupon_index] \
+                                if coupon_index > 0 else carry_rate[coupon_index]).reshape(-1, 1)
+                            vol_dt = vol * torch.sqrt(dt)
+                            p = utils.norm_cdf(
+                                (torch.log(K / Sj) - (forward_carry - 0.5 * vol * vol) * dt) / vol_dt)
+                        else:
+                            p = (K > Sj) * 1.0
+                            if tau == 0.0:
+                                terminationDate[(terminationDate == -1) & (p == 0)] = reduced_samples
+
+                        P = P + fx * (1 - p) * L * coup * D[j]
+                        L = p * L
+
+                        if fixing_aligned:
+                            Sj = Sj * (torch.exp(
+                                (forward_carry - 0.5 * vol * vol) * dt + vol_dt * utils.norm_icdf(
+                                    p * u[coupon_index])) if dt > 0 else 1.0)
+
+                            coupon_index += 1
+                        else:
+                            fixing_aligned = True
+
+                    if barrier > 0:
+                        # don't like this - this is a discontinuity
+                        breach = 1.0 * (Sj <= putBarrier)
+                        P = P + L * D[j] * fx * breach * (rebate - (1.0 - Sj / strike))
+
+                    if tau == 0.0:
+                        cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(
+                            time_grid.mtm_time_grid, t[utils.TIME_GRID_MTM]), P.mean(axis=1))
+
+                mcmc.append(P.mean(axis=1))
+        else:
+            isFixingDate = FixingDates[offset:]
+            dt = times.unsqueeze(axis=2)
+            var = (vols * vols).unsqueeze(axis=1) * dt
+            # store params in tensors
+            drift = carry * dt - 0.5 * var
+            # not strictly speaking correct, but we need to do this to prevent gradients from blowing up
+            vol = torch.sqrt(var.clamp(min=1e-4))
+
+            mcmc = []
+            for t, tau, D, s, r, sigma, floating in zip(
+                    t_block, t_tenor, discount_rates, spot_prices, drift, vol, floating_leg):
+                if sobol:
+                    z = shared.quasi_rng(shared.simulation_batch, num_samples * num_sims)[0].T.reshape(
+                        num_samples, shared.simulation_batch, -1)
+                else:
+                    z = torch.randn([num_samples, shared.simulation_batch, num_sims],
+                                    dtype=shared.one.dtype, device=shared.one.device)
+                f1 = (r.unsqueeze(axis=2) + sigma.unsqueeze(axis=2) * z).cumsum(axis=0)
+                mcmc_spot = s.reshape(1, -1, 1) * torch.exp(f1)
+                val = sim_autocall(
+                    mcmc_spot, isBarrierDate, isFixingDate, isFloatingDate, floating, threshold, coupon,
+                    terminationDate)
+                pv = (val * D).sum(axis=0)
+                mcmc.append(pv)
+
+                # settle potential cashflows
+                if tau == 0.0:
+                    cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(
+                        time_grid.mtm_time_grid, t[utils.TIME_GRID_MTM]), pv)
+            # if the last cashflow wasnt 0 then the autocall hasn't knocked out yet
+            terminationDate = -1.0 * (terminationDate == -1) * (pv != 0.0).reshape(-1, 1)
 
         return torch.stack(mcmc)
 
@@ -1262,6 +1367,29 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
     dual_samples = samples.dual()
     start_index, counts = np.unique(start_idx, return_counts=True)
 
+    if factor_dep['no_averaging']:
+        # resets could be prior to the coupon date - need to store this
+        equity_samples = factor_dep['Price_Fixing'].reinitialize(shared.one)
+        coupon_samples = factor_dep['Coupon_Fixing'].reinitialize(shared.one)
+        eq_start_idx = equity_samples.get_start_index(deal_time)
+        cp_start_idx = coupon_samples.get_start_index(deal_time)
+        # grab the known fixings and join with any potential simulated fixings
+        known_resets = equity_samples.known_resets(shared.simulation_batch)
+        sim_samples = equity_samples.schedule[
+            (equity_samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+            (equity_samples.schedule[:, utils.RESET_INDEX_Reset_Day] <= deal_time[:, utils.TIME_GRID_MTM].max())]
+        past_samples = utils.calc_time_grid_spot_rate(
+            deal_data.Factor_dep['Equity'], sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
+        all_eq_samples = torch.cat(
+            [torch.cat(known_resets, dim=0), past_samples], dim=0) if known_resets else past_samples
+        # need to get the index of the fixing and the equity
+        fixing_indices = counts.cumsum() - 1
+        eq_start_index = eq_start_idx[fixing_indices]
+        cp_start_index = cp_start_idx[fixing_indices]
+        coupon_equity_index = equity_samples.schedule[:, utils.RESET_INDEX_Reset_Day].searchsorted(
+            coupon_samples.schedule[:, utils.RESET_INDEX_Reset_Day], 'right') - 1
+        coupon_equity_index = np.append(coupon_equity_index, coupon_equity_index[-1] + 1)
+
     # make sure we can price the floating leg (if present)
     if 'Forward' in factor_dep:
         resets = factor_dep['Cashflows'].get_resets(shared.one)
@@ -1277,7 +1405,8 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
     # params for the autocallable
     BarrierDates = [1 if x != -1 else -1 for x in factor_dep['Barrier_Dates']]
-    FixingDates = [1 if x != -1 else -1 for x in factor_dep['Price_Fixing']]
+    if not factor_dep['no_averaging']:
+        FixingDates = [1 if x != -1 else -1 for x in factor_dep['Price_Fixing']]
     Threshold = factor_dep['Autocall_Thresholds']
     Floating = factor_dep['Autocall_Floating']
     Coupon = factor_dep['Autocall_Coupons']
@@ -1302,9 +1431,12 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
         t_block = discount_block.time_grid
         sample_index_t = start_index[index]
+
         tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
-        fixings = (dual_samples.np[np.newaxis, sample_index_t:, utils.RESET_INDEX_End_Day] -
-                   t_block[:, utils.TIME_GRID_MTM, np.newaxis])
+        all_fixings = (dual_samples.np[np.newaxis, sample_index_t:, utils.RESET_INDEX_End_Day] -
+                       t_block[:, utils.TIME_GRID_MTM, np.newaxis])
+        fixings = (factor_dep['Price_Fixing'].schedule[np.newaxis, eq_start_index[index]:, utils.RESET_INDEX_End_Day] -
+                   t_block[:, utils.TIME_GRID_MTM, np.newaxis]) if factor_dep['no_averaging'] else all_fixings
 
         drifts = utils.calc_eq_drift(
             deal_data.Factor_dep['Equity_Zero'], deal_data.Factor_dep['Dividend_Yield'],
@@ -1324,7 +1456,8 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
             drifts = drifts + torch.unsqueeze(adj['b_adj'], 1)
 
         sample_ts = drifts.new(
-            np.hstack([fixing_block[:, 0, np.newaxis], np.diff(fixing_block, axis=1)]))
+            np.hstack([fixing_block[:, 0, np.newaxis], np.diff(fixing_block, axis=1)])
+        ) if fixing_block.any() else fixing_block
 
         if 'Forward' in factor_dep:
             cashflows = factor_dep['Cashflows'].merged(shared.one, cash_start_index[sample_index_t])
@@ -1365,22 +1498,27 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
             # not used - set it to the spot_block
             floating_leg = spot_block
 
+        # calc the discount rates
+        discount_rates = utils.calc_discount_rate(discount_block, all_fixings, shared)
         # sometimes the autocall kicks out early for this batch - skip redundant calcs
         if terminationDate.any():
-            theo_cashflow = nominal * sim_spot(
-                spot_block, vols, sample_ts, drifts, sample_index_t, terminationDate,
-                sobol=sobol, num_sims=shared.MCMC_sims)
+            if factor_dep['no_averaging']:
+                fixing_index = coupon_equity_index[cp_start_index[index]]
+                last_fixing = None if fixing_index == eq_start_index[index] else fixing_index
+            else:
+                last_fixing = None
+            theo_cashflow = sim_spot(
+                spot_block, vols, sample_ts, drifts, sample_index_t, terminationDate, discount_rates,
+                t_block, fixing_block, all_fixings[:, 0], last_fixing, sobol=sobol, num_sims=shared.MCMC_sims)
         else:
             theo_cashflow = torch.zeros_like(drifts)
-
-        discount_rates = utils.calc_discount_rate(discount_block, fixings, shared)
-
-        theo_price = (theo_cashflow * discount_rates).sum(axis=1)
-        # settle potential cashflows
-        cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(
-            time_grid.mtm_time_grid, t_block[-1][utils.TIME_GRID_MTM]), theo_cashflow[-1][0])
-        # if the last cashflow was 0 then the autocall hasn't knocked out yet
-        terminationDate = -1.0 * (terminationDate == -1) * (theo_cashflow[-1][0] == 0.0).reshape(-1, 1)
+        theo_price = nominal * theo_cashflow
+        # theo_price = (theo_cashflow * discount_rates).sum(axis=1)
+        # # settle potential cashflows
+        # cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(
+        #     time_grid.mtm_time_grid, t_block[-1][utils.TIME_GRID_MTM]), theo_cashflow[-1][0])
+        # # if the last cashflow was 0 then the autocall hasn't knocked out yet
+        # terminationDate = -1.0 * (terminationDate == -1) * (theo_cashflow[-1][0] == 0.0).reshape(-1, 1)
         mtm_list.append(theo_price)
 
     # mtm in reporting currency
@@ -1611,7 +1749,7 @@ def pv_discrete_double_asian_option(shared, time_grid, deal_data, nominal, spot,
         else:
             lambdas = [alpha * all_sample.sum(axis=0) for alpha, all_sample in zip(alphas, all_samples)]
             K_bar = factor_dep['Alpha_0'] * factor_dep['Strike'] - lambdas[0] + lambdas[1]
-            theo_price = factor_dep['Buy_Sell'] * torch.relu(-factor_dep['Option_Type'] * K_bar)
+            theo_price = factor_dep['Buy_Sell'] * smooth_relu(-factor_dep['Option_Type'] * K_bar)
 
         discount_rates = torch.squeeze(
             utils.calc_discount_rate(discount_block, tenor_block.reshape(-1, 1), shared),
@@ -1710,11 +1848,9 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
 
             # Note - need to allow for compo deals
             if 'FXCompoVol' in factor_dep:
-                fx_vols = torch.unsqueeze(
-                    utils.calc_time_grid_vol_rate(
-                        factor_dep['FXCompoVol'], vol2.new_ones(1),
-                        sample_block.reshape(-1), shared),
-                    dim=0)
+                fx_vols = torch.stack(
+                    [utils.calc_time_grid_vol_rate(factor_dep['FXCompoVol'], ones.reshape(-1, 1), sb, shared)
+                     for ones, sb in zip(vol2.new_ones(*sample_block.shape), sample_block)])
                 vol2 += fx_vols * fx_vols + 2.0 * fx_vols * ref_vols * factor_dep['ImpliedCorrelation']
 
             product_t = sample_ft * torch.exp(
@@ -1732,8 +1868,8 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
                 factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
         else:
             forward_p = average.reshape(1, -1)
-            theo_price = factor_dep['Buy_Sell'] * torch.relu(factor_dep['Option_Type'] * (
-                    forward_p - factor_dep['Strike']))
+            theo_price = factor_dep['Buy_Sell'] * smooth_relu(
+                factor_dep['Option_Type'] * (forward_p - factor_dep['Strike']))
 
         discount_rates = torch.squeeze(
             utils.calc_discount_rate(discount_block, tenor_block, shared), dim=1)
@@ -1768,7 +1904,7 @@ def pricer_cap(all_resets, t_cash, factor_dep, expiries, tenor, shared):
             all_resets, t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1),
             vols, expiry, 1.0, 1.0, shared)
     else:
-        payoff = torch.relu(
+        payoff = smooth_relu(
             all_resets - t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1))
 
     all_int = t_cash[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * payoff
@@ -1789,7 +1925,7 @@ def pricer_floor(all_resets, t_cash, factor_dep, expiries, tenor, shared):
             all_resets, t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1),
             vols, expiry, 1.0, -1.0, shared)
     else:
-        payoff = torch.relu(
+        payoff = smooth_relu(
             t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1) - all_resets)
 
     all_int = t_cash[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * payoff
@@ -1896,9 +2032,10 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
 
             time_ofs += size
 
-            if all_resets.shape[1] != cashflows.np.shape[0]:
+            if all_resets.shape[1] != reset_cashflows.np.shape[0]:
                 # check if the resets need to be averaged (compounded) before being applied
-                reset_split = tuple(factor_dep['Cashflows'].offsets[start_index[index]:, 0])
+                reset_per_cashflows = factor_dep['Cashflows'].offsets[start_index[index]:, 0]
+                reset_split = tuple(reset_per_cashflows[reset_per_cashflows > 0])
                 all_resets = torch.stack(
                     [((torch.prod(1.0 + r * b[:, utils.RESET_INDEX_Accrual].reshape(1, -1, 1), 1) - 1) /
                       b[:, utils.RESET_INDEX_Accrual].sum())

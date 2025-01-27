@@ -164,7 +164,7 @@ mapping = {
                                  'MCMC_Simulations', 'Simulation_Batches', 'Batch_Size', 'Random_Seed', 'Antithetic', 
                                  'Calc_Scenarios', 'Dynamic_Scenario_Dates', 'Generate_Cashflows', 'Credit_Valuation_Adjustment', 
                                  'Funding_Valuation_Adjustment', 'Collateral_Valuation_Adjustment'],
-            'BaseValuation': ['Base_Date', 'Currency', 'MCMC_Simulations', 'Greeks']
+            'BaseValuation': ['Base_Date', 'Currency', 'MCMC_Simulations', 'Random_Seed', 'Greeks']
         }
     },
     'System': {
@@ -514,7 +514,7 @@ mapping = {
                             'YieldInflationCashflowListDeal']),
             'New FX Derivative': (
                 'default', ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'SwapCurrencyDeal',
-                            'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption',
+                            'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption', 'FXSwapDeal'
                             'MtMCrossCurrencySwapDeal', 'FXTARFOptionDeal']),
             'New Energy Derivative': (
                 'default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption', 'CommodityForwardDeal']),
@@ -542,6 +542,10 @@ mapping = {
             'CFFixedInterestListDeal.Fields': ['Fixed_Cashflows', 'Settlement_Style', 'Is_Defaultable',
                                                'Settlement_Amount', 'Calendars', 'Settlement_Amount_Is_Clean',
                                                'Rate_Currency'],
+            'FXSwapDeal.Fields': ['Near_Settlement_Date', 'Far_Settlement_Date', 'Near_Buy_Far_Sell_Ccy',
+                                  'Near_Sell_Far_Buy_Ccy', 'Near_Buy_Far_Sell_Discount_Rate',
+                                  'Near_Sell_Far_Buy_Discount_Rate', 'Near_Buy_Amount', 'Near_Sell_Amount',
+                                  'Far_Buy_Amount', 'Far_Sell_Amount'],
             'FixedCashflowDeal.Fields': ['Currency', 'Discount_Rate', 'Calendars', 'Amount', 'Payment_Date'],
             'YieldInflationCashflowListDeal.Fields': ['Index', 'Index_Reference', 'Real_Yield_Cashflows', 'Calendars',
                                                       'Is_Forward_Deal'],
@@ -592,7 +596,7 @@ mapping = {
             'EquityForwardDeal.Fields': ['Forward_Price', 'Buy_Sell', 'Payoff_Type', 'Equity_Volatility',
                                          'Maturity_Date', 'Equity', 'Units', 'Currency', 'Discount_Rate',
                                          'Payoff_Currency'],
-            'CommodityForwardDeal.Fields': ['Buy_Sell', 'Payoff_Type', 
+            'CommodityForwardDeal.Fields': ['Buy_Sell', 'Payoff_Type', 'Forward_Date',
                                          'Maturity_Date', 'Commodity', 'Units', 'Currency', 'Discount_Rate',
                                          'Payoff_Currency', 'Reference_Type'],
             'EquityOptionDeal.Fields': ['Settlement_Style', 'Strike_Price', 'Buy_Sell', 'Payoff_Type', 'Option_Type',
@@ -795,6 +799,8 @@ mapping = {
                 ['Admin', 'FXBarrierOption.Fields'],
             'FXDiscreteExplicitAsianOption':
                 ['Admin', 'FXDiscreteExplicitAsianOption.Fields'],
+            'FXSwapDeal':
+                ['Admin', 'FXSwapDeal.Fields'],
             'FloorDeal':
                 ['Admin', 'FloorDeal.Fields'],
             'SwapBasisDeal':
@@ -810,9 +816,22 @@ mapping = {
             'QEDI_CustomAutoCallSwap_V2':
                 ['Admin', 'QEDI_CustomSwap.Fields', 'QEDI_CustomAutoCallSwap.Fields']
         },
-
         # instrument fields
         'fields': {
+            'Near_Settlement_Date': {
+                'widget': 'DatePicker', 'description': 'Near Settlement Date', 'value': default['DatePicker']},
+            'Far_Settlement_Date': {
+                'widget': 'DatePicker', 'description': 'Far Settlement Date', 'value': default['DatePicker']},
+            'Near_Buy_Far_Sell_Ccy': {'widget': 'Text', 'description': 'Near Buy Far Sell Ccy', 'value': ''},  # tuple,
+            'Near_Sell_Far_Buy_Ccy': {'widget': 'Text', 'description': 'Near Sell Far Buy Ccy', 'value': ''},  # tuple,
+            'Near_Buy_Far_Sell_Discount_Rate': {
+                'widget': 'Text', 'description': 'Near Buy Far Sell Discount Rate', 'value': '', 'obj': 'Tuple'}, # tuple,
+            'Near_Sell_Far_Buy_Discount_Rate': {
+                'widget': 'Text', 'description': 'Near Sell Far Buy Discount Rate', 'value': '', 'obj': 'Tuple'}, # tuple,
+            'Near_Buy_Amount': {'widget': 'Float', 'description': 'Near Buy Amount', 'value': 0.0},
+            'Near_Sell_Amount': {'widget': 'Float', 'description': 'Near Sell Amount', 'value': 0.0},
+            'Far_Buy_Amount': {'widget': 'Float', 'description': 'Far Buy Amount', 'value': 0.0},
+            'Far_Sell_Amount': {'widget': 'Float', 'description': 'Far Sell Amount', 'value': 0.0},
             'Price_Fixing': {'widget': 'Table', 'description': 'Price Fixing', 'value': 'null',
                             'sub_types':
                                 [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
@@ -1692,8 +1711,8 @@ mapping = {
             'Receive_Index_Frequency': {'widget': 'Text', 'description': 'Receive Index Frequency', 'value': '0M',
                                         'obj': 'Period'},
             'Receive_Index_Calendars': {'widget': 'Text', 'description': 'Receive Index Calendars', 'value': ''},
-            'Maturity_Date': {'widget': 'DatePicker', 'description': 'Maturity Date',
-                              'value': default['DatePicker']},
+            'Maturity_Date': {'widget': 'DatePicker', 'description': 'Maturity Date', 'value': default['DatePicker']},
+            'Forward_Date': {'widget': 'DatePicker', 'description': 'Forward Date', 'value': default['DatePicker']},
             'Receive_Interest_Rate': {'widget': 'Text', 'description': 'Receive Interest Rate', 'value': '',
                                       'obj': 'Tuple'},  # tuple
             'Pay_Index_Offset': {'widget': 'Integer', 'description': 'Pay Index Offset', 'value': 0},

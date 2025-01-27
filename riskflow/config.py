@@ -87,8 +87,8 @@ class ModelParams(object):
             'HullWhite2FactorImpliedInterestRateModel': 'HullWhite2FactorModelParameters'
         }
 
-        self.modeldefaults = OrderedDict()
-        self.modelfilters = OrderedDict()
+        self.modeldefaults = {}
+        self.modelfilters = {}
         if state:
             defaults, filters = state
             for factor, model in defaults.items():
@@ -160,7 +160,11 @@ class CustomJsonEncoder(json.JSONEncoder):
         elif isinstance(obj, utils.Basis):
             return_value = {'.Basis': 10000.0 * obj.amount}
         elif isinstance(obj, utils.Offsets):
-            return_value = {'.Offsets': obj.data}
+            grid = []
+            for x in obj.data:
+                w = [''.join(['{}{}'.format(v, Context.reverse_offset[k]) for k, v in obj.kwds.items()]) for obj in x]
+                grid.append({'.DateOffset': w[0]} if len(w) == 1 else {'.DateOffset': w[0], '.Offset': w[1]})
+            return {'.Grid': grid}
         elif isinstance(obj, utils.CreditSupportList):
             return_value = {'.CreditSupportList': [[rating, value] for rating, value in obj.data.items()]}
         elif isinstance(obj, utils.DateEqualList):
@@ -169,7 +173,8 @@ class CustomJsonEncoder(json.JSONEncoder):
         elif isinstance(obj, utils.DateList):
             return_value = {'.DateList': [[date.strftime('%Y-%m-%d'), value] for date, value in obj.data.items()]}
         elif isinstance(obj, DateOffset):
-            return_value = {'.DateOffset': obj.kwds}
+            return_value = {'.DateOffset': ''.join(
+                ['{}{}'.format(v, Context.reverse_offset[k]) for k, v in obj.kwds.items()])}
         elif isinstance(obj, Timestamp):
             return_value = {'.Timestamp': obj.strftime("%Y-%m-%d")}
         else:
@@ -427,6 +432,10 @@ class Context(object):
         Returns the dependant factors, the stochastic models, the full list of
         reset dates and optionally the potential currency settlements
         """
+        def update_nested_rates(factor, rates_to_add):
+            for i in range(1, len(factor.name) + 1):
+                rates_to_add.update({utils.Factor(factor.type, factor.name[:i]): [
+                    utils.Factor(factor.type, factor.name[:i - 1])] if i > 1 else []})
 
         def get_rates(factor, instrument):
             rates_to_add = {factor: []}
@@ -448,14 +457,18 @@ class Context(object):
 
                     # check that we include any nested factors
                     if linked_factor.type in nested_fields:
-                        for i in range(1, len(linked_factor.name) + 1):
-                            rates_to_add.update({utils.Factor(linked_factor.type, linked_factor.name[:i]): [
-                                utils.Factor(linked_factor.type, linked_factor.name[:i - 1])] if i > 1 else []})
+                        update_nested_rates(linked_factor, rates_to_add)
+
+                    linked_factor_data = self.params['Price Factors'][utils.check_tuple_name(linked_factor)]
+                    if factor.type in subtype_fields and linked_factor_data.get(
+                            'Sub_Type') in subtype_fields[factor.type]:
+                        for subtype_field in subtype_fields[factor.type][linked_factor_data['Sub_Type']]:
+                            sub_field = utils.Factor(
+                                linked_factor.type, utils.check_rate_name(linked_factor_data[subtype_field]))
+                            update_nested_rates(sub_field, rates_to_add)
 
             if factor.type in nested_fields:
-                for i in range(1, len(factor.name) + 1):
-                    rates_to_add.update({utils.Factor(factor.type, factor.name[:i]): [
-                        utils.Factor(factor.type, factor.name[:i - 1])] if i > 1 else []})
+                update_nested_rates(factor, rates_to_add)
 
             if factor.type in conditional_fields:
                 for conditional_factor in conditional_fields[factor.type](

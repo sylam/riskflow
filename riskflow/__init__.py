@@ -22,6 +22,7 @@ __all__ = ['version_info', '__version__', '__author__', '__license__', 'Context'
            'set_collateral', 'load_market_data', 'run_baseval', 'run_cmc', 'update_dict']
 
 import os
+import json
 import torch
 import pathlib
 import logging
@@ -34,6 +35,7 @@ from ._version import version_info, __version__
 from . import fields
 from . import utils
 from .adaptiv import AdaptivContext
+from .config import CustomJsonEncoder
 
 
 def update_dict(d, u):
@@ -69,7 +71,7 @@ def summarize_data(data, percentiles):
         'ENE': np.mean(neg_exposure, axis=1)}
 
     if percentiles:
-        extra = {'PFE_{}'.format(x): np.percentile(data, int(x), axis=1) for x in percentiles.split(',')}
+        extra = {'PFE_{}'.format(x): np.percentile(data, float(x), axis=1) for x in percentiles.split(',')}
         exposure.update(extra)
 
     return pd.DataFrame(exposure)
@@ -346,6 +348,38 @@ class Context:
         self.current_cfg = cfg
         # return this object
         return self
+
+    def save_json(self, json_filename):
+        '''
+        Quick and dirty method to save a JSON back to file - experimental - not fully implemented
+        :param json_filename:
+        :return: None (saves the job to JSON file)
+        '''
+
+        cfg = self.current_cfg
+        md, cal = list(self.holiday_cfg_cache.items())[0]
+        final_json = {
+            "Calc":
+                {
+                    "Calculation": cfg.deals['Calculation'],
+                    "Deals": {
+                        "Tag_Titles": cfg.deals['Attributes']['Tag_Titles'],
+                        "Reference": cfg.deals['Attributes']['Reference'],
+                        "Deals": cfg.deals['Deals']
+                        },
+                    "MergeMarketData": {
+                        "MarketDataFile": md,
+                        "ExplicitMarketData": {
+                            "System Parameters": {},
+                            "Price Factors": cfg.params['Price Factors']
+                        }
+                    },
+                    "CalendDataFile": cal
+                }
+            }
+
+        with open(json_filename, 'wt') as f:
+            f.write(json.dumps(final_json, separators=(',', ':'), cls=CustomJsonEncoder))
 
     def run_job(self, overrides=None, runparallel=False):
         # check what calc we should run

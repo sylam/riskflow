@@ -801,6 +801,11 @@ class HWHazardRateModel(StochasticProcess):
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         alpha = self.param['Alpha']
         factor_tenor = self.factor.get_tenor()
+
+        # store randomnumber id's
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
         time_grid_years = np.array([self.factor.get_day_count_accrual(
             ref_date, t) for t in time_grid.scen_time_grid])
 
@@ -808,27 +813,31 @@ class HWHazardRateModel(StochasticProcess):
         self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared, mul_time=False)
         Bt = ((1.0 - np.exp(-alpha * time_grid_years)) / alpha).reshape(-1, 1)
         B2t = ((1.0 - np.exp(-2.0 * alpha * time_grid_years)) / alpha).reshape(-1, 1)
-        self.BtT = ((1.0 - np.exp(-alpha * factor_tenor)) / alpha).reshape(1, -1)
-        self.AtT = np.square(self.param['Sigma']) * self.BtT * (self.BtT * B2t + (Bt * Bt))
-        var = (np.square(self.param['Sigma']) / (2.0 * alpha)) * (
-                1.0 - np.exp(-2.0 * alpha * time_grid_years))
-        vol = np.sqrt(np.diff(np.insert(var, 0, 0, axis=0), axis=0))
+        sigma2 = self.param['Sigma'] ** 2
+        BtT = ((1.0 - np.exp(-alpha * factor_tenor)) / alpha).reshape(1, -1)
+        AtT = sigma2 * BtT * (0.5 * BtT * B2t + Bt ** 2)
 
-        with tf.name_scope(self.__class__.__name__):
-            delta_Bt = np.diff(np.insert(Bt, 0, 0)).reshape(-1, 1)
-            self.f1 = tf.cumsum(shared.t_random_numbers[process_ofs, :time_grid.scen_time_grid.size] *
-                                vol.reshape(-1, 1) + self.param['Sigma'] * self.param['Lambda'] * delta_Bt, axis=0,
-                                name='F1')
+        # OU variance
+        var = (1.0 / (2.0 * alpha)) * (1.0 - np.exp(-2.0 * alpha * time_grid_years))
+        delta_var = np.diff(np.insert(var, 0, 0, axis=0), axis=0)
+        self.delta_vol = shared.one.new_tensor(np.sqrt(delta_var).reshape(-1, 1))
+
+        # convert to tensors
+        self.AtT = shared.one.new_tensor(AtT)
+        self.BtT = shared.one.new_tensor(BtT)
+        self.fwd_component = torch.unsqueeze(self.fwd_curve + 0.5 * self.AtT, dim=2)
+        self.Bt = shared.one.new_tensor(Bt) if self.param['Lambda'] else 0.0
 
     @property
     def correlation_name(self):
         return 'HullWhiteProcess', [()]
 
     def generate(self, shared_mem):
-        with tf.name_scope(self.__class__.__name__):
-            stoch_component = self.BtT.reshape(1, -1, 1) * tf.expand_dims(self.f1, 1)
-            fwd_component = tf.expand_dims(self.fwd_curve + 0.5 * self.AtT, 2)
-            return fwd_component + stoch_component
+        f1 = (shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon] * self.delta_vol).cumsum(dim=0)
+        # add market price of risk (if non-zero):
+        f1 = f1 + self.param['Lambda']*self.Bt
+        stoch_component = self.param['Sigma'] * torch.unsqueeze(self.BtT, dim=2) * torch.unsqueeze(f1, dim=1)
+        return self.fwd_component + stoch_component
 
 
 class HWHazardRateCalibration(object):
@@ -970,7 +979,7 @@ class CSForwardPriceCalibration(object):
 
 
 class PCAInterestRateModel(StochasticProcess):
-    """The Principle Component Analysis model for interest rate curves Stochastic Process - defines the python
+    """The Principal Component Analysis model for interest rate curves Stochastic Process - defines the python
     interface and the low level cuda code"""
 
     documentation = (
