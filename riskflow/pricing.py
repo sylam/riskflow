@@ -2433,6 +2433,7 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
 def pv_credit_cashflows(shared, time_grid, deal_data):
     mtm_list = []
     factor_dep = deal_data.Factor_dep
+    daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
 
     cash_start_idx = factor_dep['Cashflows'].get_cashflow_start_index(deal_time)
@@ -2451,23 +2452,28 @@ def pv_credit_cashflows(shared, time_grid, deal_data):
         # payment times            
         time_block = discount_block.time_grid[:, utils.TIME_GRID_MTM]
         future_pmts = cash_pmts.reshape(1, -1) - time_block.reshape(-1, 1)
-        start_pmts = (cash_sts.reshape(1, -1) - time_block.reshape(-1, 1)).clip(0, np.inf)
+        start_pmts = (cash_sts.reshape(1, -1) - time_block.reshape(-1, 1))
 
         Dt_T = utils.calc_discount_rate(discount_block, future_pmts, shared)
-        Dt_Tm1 = utils.calc_discount_rate(discount_block, start_pmts, shared)
+        Dt_Tm1 = utils.calc_discount_rate(discount_block, start_pmts.clip(min=0), shared)
 
         survival_T = utils.calc_discount_rate(surv_block, future_pmts, shared, multiply_by_time=False)
-        survival_t = utils.calc_discount_rate(surv_block, start_pmts, shared, multiply_by_time=False)
+        survival_t = utils.calc_discount_rate(surv_block, start_pmts.clip(min=0), shared, multiply_by_time=False)
 
         interest = (cashflows.tn[cash_index, utils.CASHFLOW_INDEX_FixedRate] *
                     cashflows.tn[cash_index, utils.CASHFLOW_INDEX_Year_Frac])
 
+        marginal_PD = survival_t - survival_T
+        past_accrual = cashflows.tn.new(
+            daycount_fn(-start_pmts.clip(max=0))) / cashflows.tn[cash_index, utils.CASHFLOW_INDEX_Year_Frac]
+        adjustment = (past_accrual + 0.5 * (1-past_accrual)).unsqueeze(dim=2)
+
         # note the minus sign here
         premium = -(interest[cash_index] * cashflows.tn[cash_index, utils.CASHFLOW_INDEX_Nominal]).reshape(1, -1, 1)
-        pv_premium = premium * survival_T * Dt_T
+        pv_premium = premium * (survival_T + adjustment * marginal_PD) * Dt_T
         pv_credit = (1.0 - factor_dep['Recovery_Rate']) * cashflows.tn[
             cash_index, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1) * 0.5 * (
-                            Dt_T + Dt_Tm1) * (survival_t - survival_T)
+                            Dt_T + Dt_Tm1) * marginal_PD
 
         # settle any cashflows
         cash_settle(shared, factor_dep['SettleCurrency'],

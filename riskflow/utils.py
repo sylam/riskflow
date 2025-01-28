@@ -1837,7 +1837,7 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
                         factor_tenor[-1] - factor_tenor[-2])
             amended_tensor = torch.cat([tensor, point_at_inf])
 
-        tnr_d = np.diff(factor_tenor, append=factor_tenor.max()+1)
+        tnr_d = np.diff(tnr, append=tnr.max()+1)
         return tensor.new(tnr), tensor.new(tnr_d), amended_tensor
 
     def scale_for_rt(tnr, tensor, is_rt):
@@ -1894,6 +1894,7 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
 
         if extrapolate:
             tnr = tnr[:-1]
+            val = val[:, :-1]
 
         time_grid_tenor = time_grid.view(-1, 1) + tnr.view(1, -1)
         norm = (time_grid_tenor if mul_time else 1.0, time_grid if mul_time else 1.0)
