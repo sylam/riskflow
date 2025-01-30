@@ -4147,6 +4147,7 @@ class DealDefaultSwap(Deal):
         field_index = {
             'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
             'SettleCurrency': self.field['Currency'],
+            'Accrue_Fee': self.field.get('Accrue_Fee', 'No') == 'Yes',
             'Discount': get_discount_factor(
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Name': get_survival_factor(field['Name'], static_offsets, stochastic_offsets, all_tenors),

@@ -2435,7 +2435,6 @@ def pv_credit_cashflows(shared, time_grid, deal_data):
     factor_dep = deal_data.Factor_dep
     daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-
     cash_start_idx = factor_dep['Cashflows'].get_cashflow_start_index(deal_time)
 
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
@@ -2464,9 +2463,12 @@ def pv_credit_cashflows(shared, time_grid, deal_data):
                     cashflows.tn[cash_index, utils.CASHFLOW_INDEX_Year_Frac])
 
         marginal_PD = survival_t - survival_T
-        past_accrual = cashflows.tn.new(
-            daycount_fn(-start_pmts.clip(max=0))) / cashflows.tn[cash_index, utils.CASHFLOW_INDEX_Year_Frac]
-        adjustment = (past_accrual + 0.5 * (1-past_accrual)).unsqueeze(dim=2)
+        if factor_dep['Accrue_Fee']:
+            past_accrual = cashflows.tn.new(
+                daycount_fn(-start_pmts.clip(max=0))) / cashflows.tn[cash_index, utils.CASHFLOW_INDEX_Year_Frac]
+            adjustment = (past_accrual + 0.5 * (1-past_accrual)).unsqueeze(dim=2)
+        else:
+            adjustment = 0.0
 
         # note the minus sign here
         premium = -(interest[cash_index] * cashflows.tn[cash_index, utils.CASHFLOW_INDEX_Nominal]).reshape(1, -1, 1)
