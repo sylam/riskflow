@@ -1,5 +1,5 @@
 ########################################################################
-# Copyright (C)  Shuaib Osman (sosman@investec.co.za)
+# Copyright (C)  Shuaib Osman (vretiel@gmail.com)
 # This file is part of RiskFlow.
 #
 # RiskFlow is free software: you can redistribute it and/or modify
@@ -2116,7 +2116,8 @@ def get_fieldname(field, obj):
     """Needed to evaluate nested fields - e.g. collateral fields"""
     if isinstance(field, tuple):
         if len(field) == 1:
-            return [element.get(field[0]) for element in obj if element.get(field[0])]
+            return [obj[field[0]]] if field[0] in obj else [
+                element.get(field[0]) for element in obj if element.get(field[0])]
         else:
             return get_fieldname(field[1:], obj[field[0]] if obj.get(field[0]) else ({} if len(field) > 2 else [{}]))
     else:

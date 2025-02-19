@@ -577,11 +577,11 @@ mapping = {
                                          'Receive_Index_Calendars', 'Receive_Discount_Rate',
                                          'Receive_Payment_Calendars', 'Receive_Reset_Type', 'Receive_Rate_Constant',
                                          'Receive_Fixed_Rate', 'Receive_Payment_Offset'],
-            'QEDI_CustomAutoCallSwap.Fields': ['Currency', 'Discount_Rate', 'Buy_Sell', 'Expiry_Date', 'Units',
-                                               'Option_Type', 'Strike_Price', 'Option_On_Forward', 'Settlement_Style',
-                                               'Option_Style', 'Payoff_Currency', 'Payoff_Type', 'Equity',
-                                               'Equity_Volatility', 'Barrier', 'Price_Fixing', 'Autocall_Thresholds',
-                                               'Autocall_Coupons', 'Barrier_Dates'],
+            'EquityOptionBase.Fields': ['Buy_Sell', 'Currency', 'Discount_Rate', 'Equity', 'Equity_Volatility',
+                                        'Expiry_Date', 'Option_Type', 'Payoff_Currency', 'Strike_Price', 'Dividends'],
+            'QEDI_CustomAutoCallSwap.Fields': ['Price_Fixing', 'Settlement_Style', 'Option_On_Forward', 'Barrier',
+                                               'Option_Style', 'Units', 'Barrier_Dates', 'Autocall_Coupons',
+                                               'Autocall_Thresholds', 'Payoff_Type'],
             'QEDI_CustomSwap.Fields': ['Forecast_Rate', 'Floating_Margin', 'Reset_Frequency', 'Autocall_Floating'],
             'EquitySwapLeg.Fields': ['Accrual_Calendars', 'Adjustment_Method', 'Dividend_Timing', 'Equity',
                                      'Equity_Volatility', 'Equity_Known_Prices', 'Effective_Date', 'First_Coupon_Date',
@@ -599,21 +599,11 @@ mapping = {
             'CommodityForwardDeal.Fields': ['Buy_Sell', 'Payoff_Type', 'Forward_Date',
                                          'Maturity_Date', 'Commodity', 'Units', 'Currency', 'Discount_Rate',
                                          'Payoff_Currency', 'Reference_Type'],
-            'EquityOptionDeal.Fields': ['Settlement_Style', 'Strike_Price', 'Buy_Sell', 'Payoff_Type', 'Option_Type',
-                                        'Equity_Volatility', 'Option_Style', 'Expiry_Date', 'Forward_Price_Date',
-                                        'Equity', 'Units', 'Option_On_Forward', 'Currency', 'Discount_Rate',
-                                        'Payoff_Currency'],
-            'EquityBinaryOption.Fields': ['Strike_Price', 'Buy_Sell', 'Option_Type',
-                                          'Equity_Volatility', 'Expiry_Date', 'Settlement_Date', 'Payoff_Currency',
-                                          'Equity', 'Cash_Payoff', 'Currency', 'Discount_Rate', 'Payoff_Currency'],
-            'EquityBarrierBinaryOption.Fields': ['Strike_Price', 'Buy_Sell', 'Option_Type', 'Barrier_Type',
-                                                 'Equity_Volatility', 'Expiry_Date', 'Settlement_Date',
-                                                 'Payoff_Currency', 'Equity', 'Cash_Payoff', 'Currency',
-                                                 'Barrier_Dates', 'Discount_Rate', 'Payoff_Currency'],
-            'EquityDiscreteExplicitAsianOption.Fields': ['Strike_Price', 'Buy_Sell', 'Payoff_Type', 'Option_Type',
-                                                         'Equity_Volatility', 'Expiry_Date', 'Equity', 'Units',
-                                                         'Currency', 'Discount_Rate', 'Payoff_Currency',
-                                                         'Sampling_Data'],
+            'EquityOptionDeal.Fields': ['Settlement_Style', 'Option_On_Forward', 'Option_Style', 'Units',
+                                        'Forward_Price_Date', 'Payoff_Type'],
+            'EquityBinaryOption.Fields': ['Cash_Payoff', 'Settlement_Date'],
+            'EquityBarrierBinaryOption.Fields': ['Barrier_Dates', 'Cash_Payoff', 'Barrier_Type', 'Settlement_Date'],
+            'EquityDiscreteExplicitAsianOption.Fields': ['Units', 'Sampling_Data', 'Payoff_Type'],
             'FloorDeal.Fields': ['Reset_Type', 'Penultimate_Coupon_Date', 'Index_Day_Count', 'Buy_Sell',
                                  'Index_Frequency', 'Payment_Calendars', 'Discount_Rate', 'Forecast_Rate',
                                  'Index_Tenor', 'Index_Calendars', 'Known_Rates', 'Maturity_Date', 'Payment_Timing',
@@ -643,10 +633,8 @@ mapping = {
                                        'Barrier_Price', 'Cash_Rebate', 'Strike_Price', 'Underlying_Currency',
                                        'Buy_Sell', 'Option_Type', 'Barrier_Type', 'Expiry_Date', 'FX_Volatility',
                                        'Discount_Rate', 'Currency'],
-            'EquityBarrierOption.Fields': ['Units', 'Barrier_Monitoring_Frequency', 'Barrier_Dates', 'Payoff_Currency',
-                                           'Payoff_Type', 'Barrier_Price', 'Cash_Rebate', 'Strike_Price', 'Equity',
-                                           'Buy_Sell', 'Option_Type', 'Barrier_Type', 'Expiry_Date',
-                                           'Equity_Volatility', 'Discount_Rate', 'Currency'],
+            'EquityBarrierOption.Fields': ['Cash_Rebate', 'Units', 'Barrier_Dates', 'Barrier_Monitoring_Frequency',
+                                           'Barrier_Type', 'Barrier_Price', 'Payoff_Type'],
             'SwapCurrencyDeal.Pay': ['Pay_Discount_Rate', 'Pay_Principal', 'Pay_Amortisation', 'Pay_First_Coupon_Date',
                                      'Pay_Index_Day_Count', 'Pay_Reset_Type', 'Pay_Penultimate_Coupon_Date',
                                      'Pay_Day_Count', 'Pay_Index_Publication_Calendars', 'Pay_Interest_Frequency',
@@ -768,15 +756,15 @@ mapping = {
             'CommodityForwardDeal':
                 ['Admin', 'CommodityForwardDeal.Fields'],
             'EquityOptionDeal':
-                ['Admin', 'EquityOptionDeal.Fields'],
+                ['Admin', 'EquityOptionBase.Fields', 'EquityOptionDeal.Fields'],
             'EquityBinaryOption':
-                ['Admin', 'EquityBinaryOption.Fields'],
+                ['Admin', 'EquityOptionBase.Fields', 'EquityBinaryOption.Fields'],
             'EquityBarrierOption':
-                ['Admin', 'EquityBarrierOption.Fields'],
+                ['Admin', 'EquityOptionBase.Fields', 'EquityBarrierOption.Fields'],
             'EquityBarrierBinaryOption':
-                ['Admin', 'EquityBarrierBinaryOption.Fields'],
+                ['Admin', 'EquityOptionBase.Fields', 'EquityBarrierBinaryOption.Fields'],
             'EquityDiscreteExplicitAsianOption':
-                ['Admin', 'EquityDiscreteExplicitAsianOption.Fields'],
+                ['Admin', 'EquityOptionBase.Fields', 'EquityDiscreteExplicitAsianOption.Fields'],
             'FloatingEnergyDeal':
                 ['Admin', 'FloatingEnergyDeal.Fields'],
             'FixedEnergyDeal':
@@ -812,9 +800,9 @@ mapping = {
             'SwaptionDeal':
                 ['Admin', 'SwaptionDeal.Fields', 'SwaptionDeal.Pay', 'SwaptionDeal.Receive'],
             'QEDI_CustomAutoCallSwap':
-                ['Admin', 'QEDI_CustomAutoCallSwap.Fields'],
+                ['Admin', 'EquityOptionBase.Fields', 'QEDI_CustomAutoCallSwap.Fields'],
             'QEDI_CustomAutoCallSwap_V2':
-                ['Admin', 'QEDI_CustomSwap.Fields', 'QEDI_CustomAutoCallSwap.Fields']
+                ['Admin', 'EquityOptionBase.Fields', 'QEDI_CustomSwap.Fields', 'QEDI_CustomAutoCallSwap.Fields']
         },
         # instrument fields
         'fields': {
@@ -906,13 +894,13 @@ mapping = {
                                 'DateEqualList',
                             'col_names':
                                 ['Date', 'Date', 'Value']
-                            },                                      
+                            },
             'Months_Lag': {'widget': 'Integer', 'description': 'Months Lag', 'value': 1},
             'Quarters_Lag': {'widget': 'Integer', 'description': 'Quarters Lag', 'value': 0},
             'Quarter_Reference_Month': {'widget': 'Integer', 'description': 'Quarter Reference Month', 'value': 1},
             'Reference_Day': {'widget': 'Integer', 'description': 'Reference Day', 'value': 1},
             'Days_In_Period': {'widget': 'Integer', 'description': 'Days In Period', 'value': 0},
-            'Index_Reference_Type' : {'widget': 'Dropdown', 'description': 'Reference Type', 'value': 'Interpolated',
+            'Index_Reference_Type': {'widget': 'Dropdown', 'description': 'Reference Type', 'value': 'Interpolated',
                                'values': ['Single', 'Interpolated', 'Average']},
             'Index_Reference': {
                 'widget': 'Container', 'description': 'Index Reference',
@@ -1656,6 +1644,7 @@ mapping = {
                                         ['Date', 'Amount']
                                     },
             'Equity': {'widget': 'Text', 'description': 'Equity', 'value': '', 'obj': 'Tuple'},  # tuple
+            'Dividends': {'widget': 'Text', 'description': 'Dividends', 'value': '', 'obj': 'Tuple'},  # tuple
             'Commodity': {'widget': 'Text', 'description': 'Commodity', 'value': '', 'obj': 'Tuple'},  # tuple
             'Receive_Discount_Rate': {'widget': 'Text', 'description': 'Receive Discount Rate', 'value': '',
                                       'obj': 'Tuple'},  # tuple

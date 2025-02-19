@@ -1,5 +1,5 @@
 ########################################################################
-# Copyright (C)  Shuaib Osman (sosman@investec.co.za)
+# Copyright (C)  Shuaib Osman (vretiel@gmail.com)
 # This file is part of RiskFlow.
 #
 # RiskFlow is free software: you can redistribute it and/or modify
@@ -403,6 +403,7 @@ class NettingCollateralSet(Deal):
     factor_fields = {'Agreement_Currency': ['FxRate'],
                      'Funding_Rate': ['DiscountRate'],
                      'Balance_Currency': ['FxRate'],
+                     ('Credit_Support_Amounts', 'Counterparty'): ['SurvivalProb'],
                      ('Collateral_Assets', 'Cash_Collateral', 'Currency'): ['FxRate'],
                      ('Collateral_Assets', 'Cash_Collateral', 'Funding_Rate'): ['InterestRate'],
                      ('Collateral_Assets', 'Cash_Collateral', 'Collateral_Rate'): ['InterestRate'],
@@ -411,8 +412,25 @@ class NettingCollateralSet(Deal):
                      ('Collateral_Assets', 'Bond_Collateral', 'Discount_Rate'): ['InterestRate']
                      }
 
-    documentation = ('Collateral',
-                     ['The general approach to simulating collateral is as follows:',
+    documentation = ('Container', [
+                      'Collateral agreements (CSA\'s) are represented using a container instrument called a netting ',
+                      'collateral set. The idea is to first model the effect of an uncollateralized net portfolio ',
+                      '$V(t)$ and then, per scenario, transform this to a collateralized portfolio $\\hat V(t)$.',
+                      '',
+                      'In addition to posting and recieving collateral there are still two residual risks viz.',
+                      '',
+                      '### Settlement Risk',
+                      '',
+                      'This arises when counterparty default occurs unexpectantly. Potentially, a party may make ',
+                      'payment (or post collateral) to the counterparty without receiving the corresponding collateral',
+                      '(or payment) in return.',
+                      '',
+                      '### Liquidity risk',
+                      '',
+                      'This refers to the basis risk between the market cost of closing out or replacing the counterparty',
+                      'portfolio against the realized market value of the collateral held.',
+                      '',
+                      'The general approach to simulating collateral is as follows:',
                       '',
                       'Define:',
                       '',
@@ -702,6 +720,15 @@ class NettingCollateralSet(Deal):
         field = {}
         field_index = {}
 
+        if 'Credit_Support_Amounts' in self.field and self.field['Credit_Support_Amounts'].get('Counterparty'):
+            try:
+                field_index['Survival_Prob'] = get_survival_factor(
+                    utils.check_rate_name(self.field['Credit_Support_Amounts']['Counterparty']),
+                    static_offsets, stochastic_offsets, all_tenors)
+            except:
+                # if it's missing make the Survival_Prob None (so that later we can set it to 1)
+                field_index['Survival_Prob'] = None
+
         # only set this up if this is a collateralized deal
         if self.field.get('Collateralized', 'False') == 'True':
             field['Agreement_Currency'] = utils.check_rate_name(self.field['Agreement_Currency'])
@@ -883,6 +910,15 @@ class NettingCollateralSet(Deal):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         logging.info('Netting set {}'.format(self.field.get('Reference')))
 
+        # check if we need to scale by survival
+        surv = None
+        if shared.calc_options.get('Scale_by_Survival'):
+            if factor_dep.get('Survival_Prob'):
+                surv = utils.calc_time_grid_curve_rate(factor_dep['Survival_Prob'], np.zeros((1, 3)), shared)
+            else:
+                logging.warning('Survival Probability for Netting set {} not found - Setting to 1.0'.format(
+                    self.field.get('Reference')))
+
         if self.field.get('Collateralized', 'False') == 'True' and shared.simulation_batch > 1:
             C_base = 0.0
 
@@ -1044,6 +1080,12 @@ class NettingCollateralSet(Deal):
                 funding = expected_collateral * cash_rep * Dc_over_f_tT_m1 * Dc0_T
                 shared.save_results(deal_data.Calc_res, {'Funding': funding})
 
+            if surv:
+                St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
+                    shared, report_time[:, utils.TIME_GRID_MTM].reshape(1, -1), multiply_by_time=False)
+                                               ), dim=0)
+                net_accum = net_accum * St_T
+
             # Store results - with appropriate padding
             padding = time_grid.report_index.size - net_accum.shape[0]
             gross_padding = time_grid.mtm_time_grid.size - local_accum.shape[0]
@@ -1056,7 +1098,11 @@ class NettingCollateralSet(Deal):
                 })
             return final_mtm
         else:
-            return pricing.interpolate(accum, shared, time_grid, deal_data)
+            St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
+                shared, time_grid.time_grid[:, utils.TIME_GRID_MTM].reshape(-1, 1), multiply_by_time=False)), dim=0
+                                 ) if surv else shared.one
+
+            return pricing.interpolate(accum, shared, time_grid, deal_data) * St_T
 
 
 class MtMCrossCurrencySwapDeal(Deal):
@@ -1491,9 +1537,22 @@ class StructuredDeal(Deal):
     # dependent price factors for this instrument
     factor_fields = {'Currency': ['FxRate']}
 
-    required_fields = {
-        'Currency': 'ID of the FX rate price factor used to define the settlement currency. For example, USD.'
-    }
+    documentation = ('Container', [
+        'A structured deal consists of multiple individual deals. In credit exposure calculations, ',
+        'it is treated as a single deal since the values of the underlying deals are netted together. ',
+        'For instance, an interest rate swap can be viewed as a structured deal made up of two swap legs.',
+        'Let $C$ represent the currency of the structured deal, while $C_i$ denotes the currency of the $i^{th}$ ',
+        'underlying deal. The currency of the structured deal is determined by its *Currency* property',
+        '',
+        'The value of the structured deal in currency $C$ at time $t$ is',
+        '',
+        '$$\\delta \\sum_i V_i(t) X_i(t),$$',
+        '',
+        'where',
+        '',
+        '- $V_i$ is the value of the $i^{th}$ underlying deal in currency $C_i$',
+        '- $X_i$ is the price of currency $C_i$ in currency $C$',
+        '- $\\delta$ is 1 if the deal is a **Buy** else -1 if the deal is a **Sell**'])
 
     def __init__(self, params, valuation_options):
         super(StructuredDeal, self).__init__(params, valuation_options)
@@ -1680,6 +1739,16 @@ class CFFixedInterestListDeal(Deal):
 class CFFixedListDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate']}
+
+    documentation = (
+        'Interest Rates',
+        ['The value of a fixed cashflow list deal at valuation date t is',
+         '',
+         '$$\\delta \\sum_i C_i D(t, T_i)[t \\leq T_i], $$',
+         '',
+         '$C_i$ is the fixed amount and $T_i$ is the payment date of the $i^{th}$ cashflow in the list and ',
+         '$\\delta$ is 1 if the deal is a **Buy** else -1 if the deal is a **Sell**']
+    )
 
     def __init__(self, params, valuation_options):
         super(CFFixedListDeal, self).__init__(params, valuation_options)
@@ -1926,6 +1995,9 @@ class CapDeal(Deal):
                      'Forecast_Rate_Volatility': ['InterestRateVol', 'InterestYieldVol'],
                      'Discount_Rate_Volatility': ['InterestRateVol', 'InterestYieldVol']}
 
+    documentation = (
+        'Interest Rates', ['A series of caplets as described [here](#floating-interest-cashflows)'])
+
     def __init__(self, params, valuation_options):
         super(CapDeal, self).__init__(params, valuation_options)
 
@@ -2004,13 +2076,16 @@ class FloorDeal(Deal):
                      'Forecast_Rate_Volatility': ['InterestRateVol', 'InterestYieldVol'],
                      'Discount_Rate_Volatility': ['InterestRateVol', 'InterestYieldVol']}
 
+    documentation = (
+        'Interest Rates', ['A series of floorlets as described [here](#floating-interest-cashflows)'])
+
     def __init__(self, params, valuation_options):
         super(FloorDeal, self).__init__(params, valuation_options)
 
     def reset(self, calendars):
         super(FloorDeal, self).reset()
-        self.resetdates = generate_dates_backward(self.field['Maturity_Date'], self.field['Effective_Date'],
-                                                  self.field['Payment_Interval'])
+        self.resetdates = generate_dates_backward(
+            self.field['Maturity_Date'], self.field['Effective_Date'], self.field['Payment_Interval'])
         self.add_reval_dates(self.resetdates, self.field['Currency'])
         # this swap could be quantoed
         self.isQuanto = None
@@ -2455,6 +2530,7 @@ class EquityDiscreteExplicitAsianOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
+                     'Dividends': ['DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
@@ -2477,6 +2553,8 @@ class EquityDiscreteExplicitAsianOption(Deal):
 
         field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency']) if self.field[
             'Payoff_Currency'] else field['Currency']
+        field['Dividends'] = utils.check_rate_name(self.field['Dividends']) if self.field.get(
+            'Dividends') else field['Equity']
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
 
@@ -2490,7 +2568,7 @@ class EquityDiscreteExplicitAsianOption(Deal):
             'Equity_Zero': get_equity_zero_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
-                field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+                field['Dividends'], static_offsets, stochastic_offsets, all_tenors),
             'Expiry': (self.field['Expiry_Date'] - base_date).days,
             'Volatility': get_equity_price_vol_factor(
                 field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
@@ -2526,8 +2604,10 @@ class EquityBarrierBinaryOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
+                     'Dividends': ['DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
+
     documentation = ('FX and Equity', ['A vanilla option described [here](Definitions#european-options)'])
 
     def __init__(self, params, valuation_options):
@@ -2548,6 +2628,8 @@ class EquityBarrierBinaryOption(Deal):
 
         field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency']) if self.field[
             'Payoff_Currency'] else field['Currency']
+        field['Dividends'] = utils.check_rate_name(self.field['Dividends']) if self.field.get(
+            'Dividends') else field['Equity']
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
 
@@ -2569,7 +2651,7 @@ class EquityBarrierBinaryOption(Deal):
             'Equity_Zero': get_equity_zero_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
-                field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+                field['Dividends'], static_offsets, stochastic_offsets, all_tenors),
             'Volatility': get_equity_price_vol_factor(
                 field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Observation_Dates': utils.make_fixing_data(
@@ -2619,6 +2701,7 @@ class EquityBinaryOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
+                     'Dividends': ['DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
@@ -2641,6 +2724,8 @@ class EquityBinaryOption(Deal):
 
         field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency']) if self.field[
             'Payoff_Currency'] else field['Currency']
+        field['Dividends'] = utils.check_rate_name(self.field['Dividends']) if self.field.get(
+            'Dividends') else field['Equity']
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
 
@@ -2654,7 +2739,7 @@ class EquityBinaryOption(Deal):
             'Equity_Zero': get_equity_zero_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
-                field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+                field['Dividends'], static_offsets, stochastic_offsets, all_tenors),
             'Volatility': get_equity_price_vol_factor(
                 field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Strike_Price': self.field['Strike_Price'],
@@ -2688,6 +2773,7 @@ class EquityOptionDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
+                     'Dividends': ['DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
@@ -2724,6 +2810,8 @@ class EquityOptionDeal(Deal):
 
         field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency']) if self.field[
             'Payoff_Currency'] else field['Currency']
+        field['Dividends'] = utils.check_rate_name(self.field['Dividends']) if self.field.get(
+            'Dividends') else field['Equity']
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
 
@@ -2737,7 +2825,7 @@ class EquityOptionDeal(Deal):
             'Equity_Zero': get_equity_zero_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
-                field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+                field['Dividends'], static_offsets, stochastic_offsets, all_tenors),
             'Volatility': get_equity_price_vol_factor(
                 field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Strike_Price': self.field['Strike_Price'],
@@ -2776,10 +2864,18 @@ class QEDI_CustomAutoCallSwap(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
+                     'Dividends': ['DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity', ['An exotic option described [here](Definitions#QEDI-options)'])
+    documentation = ('FX and Equity',
+                     ['An exotic Equity option described',
+                      '[here](https://www.math.uni-frankfurt.de/~harrach/publications/StableDiffs.pdf).',
+                      '',
+                      'Note that the code has been adjusted to deal with Quanto Payoffs (if necessary) ',
+                      'and only supports a single stock sample per coupon payoff (Averaging is possible ',
+                      'if the distribution of the mean can be provided - TODO)'
+                      ])
 
     def __init__(self, params, valuation_options):
         super(QEDI_CustomAutoCallSwap, self).__init__(params, valuation_options)
@@ -2801,16 +2897,18 @@ class QEDI_CustomAutoCallSwap(Deal):
 
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
+        field['Dividends'] = utils.check_rate_name(self.field['Dividends']) if self.field.get(
+            'Dividends') else field['Equity']
 
         coupon_dates = [x[0] for x in self.field['Autocall_Coupons']]
         fixing_dates = [x[0] for x in self.field['Price_Fixing']]
 
         # merge all the dates - except fixings - those will be added later
         all_dates = reduce(set.union, [
-                set(coupon_dates),
-                set([x[0] for x in self.field.get('Barrier_Dates', [])]),
-                set([x[0] for x in self.field.get('Autocall_Floating', [])])
-            ])
+            set(coupon_dates),
+            set([x[0] for x in self.field.get('Barrier_Dates', [])]),
+            set([x[0] for x in self.field.get('Autocall_Floating', [])])
+        ])
 
         # create lookups
         pf = dict(self.field['Price_Fixing'])
@@ -2844,7 +2942,7 @@ class QEDI_CustomAutoCallSwap(Deal):
             'Equity_Zero': get_equity_zero_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
-                field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+                field['Dividends'], static_offsets, stochastic_offsets, all_tenors),
             'Volatility': get_equity_price_vol_factor(
                 field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Strike_Price': self.field['Strike_Price'],
@@ -2915,7 +3013,13 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
                      'Forecast_Rate': ['InterestRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity', ['An exotic option described [here](Definitions#QEDI-options-v2)'])
+    documentation = ('FX and Equity',
+                     ['An exotic Equity option described',
+                      '[here](https://www.math.uni-frankfurt.de/~harrach/publications/StableDiffs.pdf).',
+                      '',
+                      'This version of the autocallable option has an embedded swap leg that pays at regular ',
+                      'intervals instead of a premium upfront.'
+                      ])
 
     def __init__(self, params, valuation_options):
         super(QEDI_CustomAutoCallSwap_V2, self).__init__(params, valuation_options)
@@ -3089,6 +3193,7 @@ class EquityBarrierOption(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Payoff_Currency': ['FxRate'],
                      'Equity': ['EquityPrice', 'DividendRate'],
+                     'Dividends': ['DividendRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
@@ -3132,6 +3237,8 @@ class EquityBarrierOption(Deal):
 
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
+        field['Dividends'] = utils.check_rate_name(self.field['Dividends']) if self.field.get(
+            'Dividends') else field['Equity']
 
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
                        'Payoff_Currency': get_fxrate_factor(
@@ -3143,7 +3250,7 @@ class EquityBarrierOption(Deal):
                        'Equity_Zero': get_equity_zero_rate_factor(
                            field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Dividend_Yield': get_dividend_rate_factor(
-                           field['Equity'], static_offsets, stochastic_offsets, all_tenors),
+                           field['Dividends'], static_offsets, stochastic_offsets, all_tenors),
                        'Volatility': get_equity_price_vol_factor(
                            field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
                        'Expiry': (self.field['Expiry_Date'] - base_date).days,
@@ -3210,7 +3317,26 @@ class CommodityForwardDeal(Deal):
                      'Reference_Type': ['ReferencePrice'],
                      'Discount_Rate': ['DiscountRate']}
 
-    documentation = ('Energy', ['Described [here](Definitions#forwards)'])
+    documentation = ('Energy',
+                     ['Here we fund a commodity at one rate that might be different to the implied ',
+                      'carry on the commodity forward curve. This could happen if you can earn a yield on a physical ',
+                      'commodity different to what the general market can provide. The forward Deal expires at time $T$',
+                      '',
+                      'At time $t$, we read the simulated value of the reference type called $S_t$ and lookup the ',
+                      'attached simulated commodity zero rate from the CommodityPrice price factor $r_t$',
+                      '',
+                      'The mtm of this deal is thus:',
+                      '',
+                      '$$ S_t\\exp(r_t-d_t)(T-t) $$',
+                      '',
+                      'where',
+                      '$r_t$ is the simulated zero rate at time $t$ indexed at time T-t',
+                      '$d_t$ is the simulated discount rate at time $t$ indexed at time T-t',
+                      '',
+                      'If Forward Date is specified (call it $f$), then instead of reading the simulated value as $S_t$ ',
+                      'at time $t$, we read the simulated value at time $max(t, f)$. The formula above is then applied ',
+                      'as usual.'
+                      ])
 
     def __init__(self, params, valuation_options):
         super(CommodityForwardDeal, self).__init__(params, valuation_options)
@@ -3821,121 +3947,6 @@ class FXPartialTimeBarrierOption(Deal):
 
 
 class FXTARFOptionDeal(Deal):
-    '''
-    Python implementation of the following UDMC pricing function
-
-    [StructuredProductsDealPackage]FObject:udmcTRFPayoff
-    # ------------------------------------------
-    # PAYOFF EXPRESSION
-    # Target Redemption Forward
-    #
-    # Features:
-    # - KI Barrier on "down side", only local not with "memory"
-    # ------------------------------------------
-
-    # PARAMETERS
-    param double targetValue;
-    param double barrier;
-    param int targetAdjustment;
-    param matrix(double) notional1;
-    param matrix(double) notional2;
-    param double strike;
-    param double accumulatedValue;
-    param int isCallOption;
-    param matrix(double) timeSteps;
-    param int invertedTarget;
-
-    # PROCESS
-    process matrix(double) S;
-
-    # LOCAL VARIABLES
-    double callOrPut = 2.0 * isCallOption - 1.0;
-    double accumulated = accumulatedValue;
-    int barrierIsHit = 1;
-    double intrinsicValue = 0.0;
-    double intrinsicValueInverted = 0.0;
-    double adjustedStrike = 0.0;
-    double barrierIntrinsic = 0.0;
-    int tMax = length(timeSteps);
-    int t = 0;
-    int terminationEvent = 0;
-    double settlementValue = 0.0;
-    double previousAccumulated = accumulatedValue;
-    double accumulatedVsTarget = 0.0;
-    double zeroComparison = 0.00000001;
-    double notionalAdjustmentFactor = 1.0;
-    double settlementNotional = 1.0;
-
-    # MAIN LOOP
-    terminationEvent = 0;
-    accumulated = accumulatedValue;
-
-    for t = 0 to tMax
-    {
-            if (not terminationEvent)
-            {
-                  previousAccumulated = accumulated;
-                  intrinsicValue = (S[t] - strike) * callOrPut;
-                  barrierIsHit = 1;
-
-                  if (intrinsicValue  > 0.0)
-                  {
-                  # The ITM side, which is where we compare to the Target Level.
-                            settlementNotional = notional1[t];
-                            if (invertedTarget)
-                            {
-                                intrinsicValueInverted = (1.0 / S[t] - 1.0 / strike) * callOrPut * (-1.0);
-                                accumulated = accumulated + intrinsicValueInverted;
-                                adjustedStrike = 1.0 / ((1.0 / S[t]) - (targetValue - previousAccumulated) * callOrPut * (-1.0));
-                                notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValueInverted;
-                            }
-                            else
-                            {
-                                accumulated = accumulated + intrinsicValue;
-                                adjustedStrike = S[t] - (targetValue - previousAccumulated) * callOrPut;
-                                notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValue;
-                            };
-
-                            accumulatedVsTarget = targetValue - accumulated;
-                            if (accumulatedVsTarget < zeroComparison)
-                            {
-                                    terminationEvent = 1;
-                                    if(targetAdjustment == 1)
-                                    {
-                                        intrinsicValue = (S[t] - adjustedStrike) * callOrPut;
-                                    }
-                                    else
-                                    {
-                                        if(targetAdjustment == 2)
-                                        {
-                                            settlementNotional = settlementNotional * notionalAdjustmentFactor;
-                                        };
-                                    };
-
-                            };
-                            settlementValue = settlementNotional * intrinsicValue;
-                   }
-                   else
-                   {
-                   # The OTM side, which is where we check against a potential barrier
-                          if (barrier > zeroComparison)
-                          {
-                                  barrierIntrinsic =  (barrier - S[t]) * callOrPut;
-                                  if (barrierIntrinsic < 0.0)
-                                  {
-                                            barrierIsHit = 0;
-                                  };
-                          };
-                          settlementValue = notional2[t] * intrinsicValue * barrierIsHit;
-                    };
-
-                    #CASHFLOW
-                    cashFlow(t, settlementValue);
-            };
-
-    };
-    '''
-
     factor_fields = {'Currency': ['FxRate'],
                      'Underlying_Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
@@ -4174,6 +4185,13 @@ class FRADeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Interest_Rate': ['InterestRate']}
+
+    documentation = ('Interest Rates',
+                     ['A forward rate agreement (FRA) pays the difference between a floating rate and a fixed',
+                      'rate, usually discounted and paid at the start of the rate period.',
+                      '',
+                      'The FRA deal is a special case of a  [floating swap leg](#floating-interest-cashflows)'
+                      ])
 
     def __init__(self, params, valuation_options):
         super(FRADeal, self).__init__(params, valuation_options)
@@ -4443,7 +4461,7 @@ class EnergySingleOption(Deal):
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
-            return pricing.pv_energy_option(shared, time_grid, deal_data, self.field['Volume'])
+        return pricing.pv_energy_option(shared, time_grid, deal_data, self.field['Volume'])
 
 
 def construct_instrument(param, all_valuation_options):

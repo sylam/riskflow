@@ -1,5 +1,5 @@
 ########################################################################
-# Copyright (C)  Shuaib Osman (sosman@investec.co.za)
+# Copyright (C)  Shuaib Osman (vretiel@gmail.com)
 # This file is part of RiskFlow.
 #
 # RiskFlow is free software: you can redistribute it and/or modify
@@ -322,20 +322,22 @@ class Calculation(object):
                     self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
                 continue
 
-            output.add_deal_to_structure(self.base_date, instrument, self.static_factors, self.stoch_factors,
-                                         self.all_factors, self.all_tenors, self.time_grid, self.config.holidays,
-                                         self.calc_stats)
+            output.add_deal_to_structure(
+                self.base_date, instrument, self.static_factors, self.stoch_factors,
+                self.all_factors, self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
 
 
 class CMC_State(utils.Calculation_State):
-    def __init__(self, cholesky, num_stoch_factors, static_buffer, batch_size, one, mcmc_sims,
-                 report_currency, seed, job_id, num_jobs, nomodel='Constant'):
+    def __init__(self, cholesky, static_buffer, batch_size, one, mcmc_sims,
+                 report_currency, seed, job_id, num_jobs, calc_options={}, nomodel='Constant'):
         super(CMC_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size)
         # these are tensors
         self.t_PreCalc = {}
         self.t_cholesky = cholesky
         self.t_random_numbers = None
         self.t_Scenario_Buffer = {}
+        # any calculation specific overrides?
+        self.calc_options = calc_options
         # these are shared parameter states
         self.sobol = {}
         # idea is to reuse quasi rng numbers where applicable (but still using enough randomness)
@@ -411,7 +413,6 @@ class CMC_State(utils.Calculation_State):
 
         # clear the buffers
         self.t_Buffer.clear()
-        # self.t_Credit.clear()
 
 
 class Credit_Monte_Carlo(Calculation):
@@ -442,7 +443,7 @@ class Credit_Monte_Carlo(Calculation):
         '',
         '#### Peak Exposure',
         '',
-        'This is the simulated exposure at percentile $q$ where $0<q<1$ (typically q=.95 or .99).',
+        'This is the simulated exposure at **Percentile** $q$ where $0<q<1$ (typically q=.95 or .99).',
         '',
         '#### Expected Exposure',
         '',
@@ -540,11 +541,27 @@ class Credit_Monte_Carlo(Calculation):
         'where',
         '',
         '- $B_j(t)$ is the number of units of the collateral portfolio for scenario $j$ at time $t$',
-        '- $S_j(t)$ is the base currecy value of one unit of the collateral asset for scenario $j$ at time $t$',
+        '- $S_j(t)$ is the base currency value of one unit of the collateral asset for scenario $j$ at time $t$',
         '- $D_j^c(t)$ is the discount rate for the collateral rate at time t for scenario $j$',
         '- $D_j^f(t)$ is the discount rate for the funding rate at time t for scenario $j$',
         '',
         'Note that only cash collateral is supported presently although this can be extended.'
+        '',
+        'Calculation parameters are extended from the Base Valuation with these new fields:'
+        '',
+        '- **Deflation Interest Rate** - the interest rate price factor to PV the exposure to today',
+        '- **Simulation Batches** - Number of batches to run (each batch is of size **Batch Size**)',
+        '- **Batch Size** - The number of simulations per batch. Smaller Batch sizes are more likely to fit in memory.',
+        '  This needs to be balances with speed - larger batch sizes will run quicker. Total simulations is given by '
+        '  **Simulation Batches** * **Batch Size**. Note that **Batch Size** is usually a power of 2.'
+        '- **Antithetic** - Use antithethic variables - we run twice the number of simulations using the negative of ',
+        '  the random sample for the second run',
+        '- **Calc Scenarios** - return the simulated price factors used in the calculation ',
+        '- **Dynamic Scenario Dates** - Generate scenarios not just on the **Base Time Grid**, but also on all potential ',
+        '  cashflow settlement dates. Needed to accurately calculate liquidity and settlement dynamics on collateralized ',
+        '  portfolios.'
+        '- **Generate Cashflows**',
+        '  return the simulated cashflows during the simulation period'
     ])
 
     def __init__(self, config, **kwargs):
@@ -865,11 +882,16 @@ class Credit_Monte_Carlo(Calculation):
             self.make_factor_index(self.all_var)
 
         # Now create a shared state with the cholesky decomp
+        # check the calculation parameters to see if we need to tweak the calculation a bit:
+        calc_options = {}
+        if self.params.get('Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
+            calc_options['Scale_by_Survival'] = True
+
         shared_mem = CMC_State(
-            self.get_cholesky_decomp(), len(self.stoch_factors), self.static_var, self.batch_size,
+            self.get_cholesky_decomp(), self.static_var, self.batch_size,
             torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
                 utils.check_rate_name(reporting_currency), self.static_factors, self.stoch_factors),
-            seed, job_id, num_jobs)
+            seed, job_id, num_jobs, calc_options)
 
         return shared_mem
 
@@ -1169,17 +1191,6 @@ class Credit_Monte_Carlo(Calculation):
                     utils.check_rate_name(params['Funding_Valuation_Adjustment']['Risk_Free_Curve']),
                     self.static_factors, self.stoch_factors, self.all_tenors)
 
-                if params['Funding_Valuation_Adjustment'].get('Counterparty'):
-                    survival = get_survival_factor(
-                        utils.check_rate_name(params['Funding_Valuation_Adjustment']['Counterparty']),
-                        self.static_factors, self.stoch_factors, self.all_tenors)
-                    surv = utils.calc_time_grid_curve_rate(survival, np.zeros((1, 3)), shared_mem)
-                    St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
-                        shared_mem, self.time_grid.mtm_time_grid[time_grid[:-1]].reshape(1, -1),
-                        multiply_by_time=False)), dim=0)
-                else:
-                    St_T = torch.ones((1, 1), dtype=self.dtype, device=self.device)
-
                 deflation = utils.calc_time_grid_curve_rate(riskfree, np.zeros((1, 3)), shared_mem)
                 DF_rf = torch.squeeze(torch.exp(-deflation.gather_weighted_curve(
                     shared_mem, mtm_grid.reshape(1, -1))), dim=0)
@@ -1189,6 +1200,7 @@ class Credit_Monte_Carlo(Calculation):
                 Vk_star_ti_p = (Vk_plus_ti[1:] + Vk_plus_ti[:-1]) / 2
                 Vk_star_ti_m = (Vk_minus_ti[1:] + Vk_minus_ti[:-1]) / 2
 
+                # note that for FVA, we already scale the exposure matrix by the survival probability
                 if params['Funding_Valuation_Adjustment'].get('Deflate_Stochastically', 'No') == 'Yes':
                     delta_scen_t = np.diff(mtm_grid).reshape(-1, 1)
 
@@ -1201,11 +1213,11 @@ class Credit_Monte_Carlo(Calculation):
 
                     delta_fund_cost_rf = torch.squeeze(
                         torch.exp(discount_fund_cost.gather_weighted_curve(shared_mem, delta_scen_t)) -
-                        torch.exp(discount_rf.gather_weighted_curve(shared_mem, delta_scen_t)), dim=1) * St_T
+                        torch.exp(discount_rf.gather_weighted_curve(shared_mem, delta_scen_t)), dim=1)
 
                     delta_fund_benefit_rf = torch.squeeze(
                         torch.exp(discount_fund_benefit.gather_weighted_curve(shared_mem, delta_scen_t)) -
-                        torch.exp(discount_rf.gather_weighted_curve(shared_mem, delta_scen_t)), dim=1) * St_T
+                        torch.exp(discount_rf.gather_weighted_curve(shared_mem, delta_scen_t)), dim=1)
                 else:
                     zero_fund_cost = utils.calc_time_grid_curve_rate(funding_cost, np.zeros((1, 3)), shared_mem)
                     zero_fund_benefit = utils.calc_time_grid_curve_rate(funding_benefit, np.zeros((1, 3)), shared_mem)
@@ -1219,9 +1231,9 @@ class Credit_Monte_Carlo(Calculation):
                         -zero_rf.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1))), dim=0)
 
                     delta_fund_cost_rf = (
-                        (Dt_T_fund_cost[:-1] / Dt_T_fund_cost[1:]) - (Dt_T_rf[:-1] / Dt_T_rf[1:])) * St_T
+                        (Dt_T_fund_cost[:-1] / Dt_T_fund_cost[1:]) - (Dt_T_rf[:-1] / Dt_T_rf[1:]))
                     delta_fund_benefit_rf = (
-                        (Dt_T_fund_benefit[:-1] / Dt_T_fund_benefit[1:]) - (Dt_T_rf[:-1] / Dt_T_rf[1:])) * St_T
+                        (Dt_T_fund_benefit[:-1] / Dt_T_fund_benefit[1:]) - (Dt_T_rf[:-1] / Dt_T_rf[1:]))
 
                 FCA_t = torch.sum(delta_fund_cost_rf * Vk_star_ti_p, dim=0)
                 FCA = torch.mean(FCA_t)
@@ -1372,12 +1384,17 @@ class Base_Revaluation(Calculation):
     documentation = ('Calculations',
                      ['This applies the valuation models mentioned earlier to the portfolio per deal.',
                       '',
-                      'The only inputs are:',
+                      'The inputs are:',
                       '',
                       '- **Currency** of the output.',
                       '- **Run_Date** at which the marketdata should be applied (i.e. $t_0$)',
+                      '- **MCMC Simulations** the number of Monte Carlo simulations to use for deals that require ',
+                      '  Monte Carlo pricing (e.g. Autocalls, TARF\'s etc.)',
+                      '- **Random Seed** the seed for the Monte Carlo Pricer',
+                      '- **Greeks** calculate all First order sensitivities (partial derivatives) of the portfolio ',
+                      '  with respect to the relevant Price Factors (Default is not to calculate this)',
                       '',
-                      'The output is a dictionary containing the DealStructure and the calculation computation',
+                      'The output is a dictionary containing the DealStructure and the calculation computation ',
                       'statistics.'
                       ])
 

@@ -1,5 +1,5 @@
 ########################################################################
-# Copyright (C)  Shuaib Osman (sosman@investec.co.za)
+# Copyright (C)  Shuaib Osman (vretiel@gmail.com)
 # This file is part of RiskFlow.
 #
 # RiskFlow is free software: you can redistribute it and/or modify
@@ -936,8 +936,6 @@ scipy.optimize.leastsq.html) are used.',
          '',
          '$$\\bar\\rho_1=F(1,\\rho)C$$',
          '$$\\bar\\rho_2=F(\\rho,1)C$$',
-         '',
-         'This is simply assumed to work'
          ]
     )
 
