@@ -65,7 +65,7 @@ class Aggregation(object):
 class DealStructure(object):
     def __init__(self, obj, store_results=False):
         self.obj = utils.DealDataType(
-            Instrument=obj, Factor_dep=None, Time_dep=None, Calc_res={} if store_results else None)
+            Instrument=obj, Factor_dep={}, Time_dep=None, Calc_res={} if store_results else None)
         # gather a list of deal dependencies
         self.dependencies = []
         # maintain a list of container objects
@@ -329,15 +329,14 @@ class Calculation(object):
 
 class CMC_State(utils.Calculation_State):
     def __init__(self, cholesky, static_buffer, batch_size, one, mcmc_sims,
-                 report_currency, seed, job_id, num_jobs, calc_options={}, nomodel='Constant'):
-        super(CMC_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size)
+                 report_currency, seed, job_id, num_jobs, scale_survival=False, nomodel='Constant'):
+        super(CMC_State, self).__init__(
+            static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size)
         # these are tensors
         self.t_PreCalc = {}
         self.t_cholesky = cholesky
         self.t_random_numbers = None
         self.t_Scenario_Buffer = {}
-        # any calculation specific overrides?
-        self.calc_options = calc_options
         # these are shared parameter states
         self.sobol = {}
         # idea is to reuse quasi rng numbers where applicable (but still using enough randomness)
@@ -348,6 +347,8 @@ class CMC_State(utils.Calculation_State):
         # needed if we are running across multiple gpu's
         self.job_id = job_id
         self.num_jobs = num_jobs
+        # do we need to scale the mtm by the survival probability in the final answer?
+        self.scale_survival = scale_survival
 
     def quasi_rng(self, dimension, sample_size):
         # may need to parameterize these
@@ -883,15 +884,15 @@ class Credit_Monte_Carlo(Calculation):
 
         # Now create a shared state with the cholesky decomp
         # check the calculation parameters to see if we need to tweak the calculation a bit:
-        calc_options = {}
+        scale_by_survival = False
         if self.params.get('Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
-            calc_options['Scale_by_Survival'] = True
+            scale_by_survival = True
 
         shared_mem = CMC_State(
             self.get_cholesky_decomp(), self.static_var, self.batch_size,
             torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
                 utils.check_rate_name(reporting_currency), self.static_factors, self.stoch_factors),
-            seed, job_id, num_jobs, calc_options)
+            seed, job_id, num_jobs, scale_by_survival)
 
         return shared_mem
 
@@ -1483,7 +1484,7 @@ class Base_Revaluation(Calculation):
 
             def format_row(deal, data, val, greeks):
                 data['Deal Currency'] = deal.Factor_dep.get(
-                    'Local_Currency', deal.Instrument.field.get('Currency'))
+                    'Local_Currency', deal.Instrument.field.get('Currency', self.params['Currency']))
                 try:
                     data['Ref_MTM'] = float(deal.Instrument.field.get('MtM', 0.0))
                 except ValueError:
@@ -1491,7 +1492,7 @@ class Base_Revaluation(Calculation):
                 for k, v in val.items():
                     if k.startswith('Greeks'):
                         greeks.setdefault(k, []).append(
-                            self.gradients_as_df(v, header=deal.Instrument.field.get('Reference')))
+                            self.gradients_as_df(v, header=deal.Instrument.field.get('Reference'), display_val=True))
                     elif k == 'Value':
                         data[k] = float(v)
                 # update any tags
@@ -1500,6 +1501,10 @@ class Base_Revaluation(Calculation):
 
             block = []
             greeks = {}
+
+            if 'Greeks_First' in n.obj.Calc_res:
+                format_row(n.obj, dict(parent), n.obj.Calc_res, greeks)
+
             for sub_struct in n.sub_structures:
                 data = dict(parent + [(field, sub_struct.obj.Instrument.field.get(field, 'Root'))
                                       for field in ['Reference', 'Object']])
@@ -1571,8 +1576,7 @@ class Base_Revaluation(Calculation):
         # record the graph loading time
         self.calc_stats['Graph_Setup_Time'] = time.monotonic() - self.calc_stats['Graph_Setup_Time']
         # populate the mtm at the netting set
-        ns_obj = self.netting_sets.sub_structures[0].obj
-        ns_obj.Calc_res['Value'] = mtm
+        ns_obj = self.netting_sets.obj
         # make sure the netting set object has a reference and a mtm
         if ns_obj.Instrument.field.get('Reference') is None:
             ns_obj.Instrument.field['Reference'] = self.config.deals['Attributes'].get(

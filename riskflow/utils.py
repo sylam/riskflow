@@ -2116,8 +2116,10 @@ def get_fieldname(field, obj):
     """Needed to evaluate nested fields - e.g. collateral fields"""
     if isinstance(field, tuple):
         if len(field) == 1:
-            return [obj[field[0]]] if field[0] in obj else [
-                element.get(field[0]) for element in obj if element.get(field[0])]
+            try:
+                return [element.get(field[0]) for element in obj if element.get(field[0])]
+            except:
+                return [obj[field[0]]] if obj.get(field[0]) else []
         else:
             return get_fieldname(field[1:], obj[field[0]] if obj.get(field[0]) else ({} if len(field) > 2 else [{}]))
     else:

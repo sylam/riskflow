@@ -912,7 +912,7 @@ class NettingCollateralSet(Deal):
 
         # check if we need to scale by survival
         surv = None
-        if shared.calc_options.get('Scale_by_Survival'):
+        if hasattr(shared, 'scale_survival') and shared.scale_survival:
             if factor_dep.get('Survival_Prob'):
                 surv = utils.calc_time_grid_curve_rate(factor_dep['Survival_Prob'], np.zeros((1, 3)), shared)
             else:
@@ -3323,19 +3323,19 @@ class CommodityForwardDeal(Deal):
                       'commodity different to what the general market can provide. The forward Deal expires at time $T$',
                       '',
                       'At time $t$, we read the simulated value of the reference type called $S_t$ and lookup the ',
-                      'attached simulated commodity zero rate from the CommodityPrice price factor $r_t$',
+                      'attached simulated commodity zero rate from the CommodityPrice price factor $r$',
                       '',
                       'The mtm of this deal is thus:',
                       '',
-                      '$$ S_t\\exp(r_t-d_t)(T-t) $$',
+                      '$$ S_t\\exp(r(t,T)-d(t,T))(T-t) $$',
                       '',
                       'where',
-                      '$r_t$ is the simulated zero rate at time $t$ indexed at time T-t',
-                      '$d_t$ is the simulated discount rate at time $t$ indexed at time T-t',
+                      '$r(t,T)$ is the simulated zero rate at time $t$',
+                      '$d(t,T)$ is the simulated discount rate at time $t$',
                       '',
                       'If Forward Date is specified (call it $f$), then instead of reading the simulated value as $S_t$ ',
                       'at time $t$, we read the simulated value at time $max(t, f)$. The formula above is then applied ',
-                      'as usual.'
+                      'by replacing $t$ with $max(t, f)$.'
                       ])
 
     def __init__(self, params, valuation_options):
@@ -4112,7 +4112,7 @@ class DealDefaultSwap(Deal):
                       '',
                       '$$\\sum_{i=1}^n P_i(1-R)V_i(t)-\\sum_{i=1}^n P_i c\\alpha_i D(t,T_i)S(t,t_i)$$',
                       '',
-                      'where $c$ is the fixed payment rate and',
+                      'where $c$ is the fixed payment rate, $\\alpha_i$ is the day count accrual applicable and',
                       '',
                       '$$V_i(t)=\\frac{\\bar h_i}{f_i+\\bar h_i}\\Big((D(t,\\tilde t_{i-1})S(t,\\tilde t_{i-1})-D(t,\\tilde t_i)S(t,\\tilde t_i)\\Big)$$',
                       '$$\\bar h_i=\\frac{1}{\\tilde t_i-\\tilde t_{i-1}}\\log\\Big(\\frac{S(t,\\tilde t_{i-1})}{S(t,\\tilde t_i)}\\Big)$$',
@@ -4122,7 +4122,22 @@ class DealDefaultSwap(Deal):
                       '',
                       '$$V_i(t)=\\frac{D(t,\\tilde t_{i-1})+D(t,\\tilde t_i)}{2}\\Big(S(t,\\tilde t_{i-1})-S(t,\\tilde t_i)\\Big)$$',
                       '',
-                      'which is accurate for low to moderate rates of default.'
+                      'which is accurate for low to moderate rates of default.',
+                      '',
+                      'It is also possible to include accrued interest for the fee cashflow leg.',
+                      '',
+                      'Instead of calculating all fee cashflows as $P_i c\\alpha_i D(t,T_i)S(t,t_i)$, we modify ',
+                      'the cashflows thus:',
+                      '',
+                      '$$P c\\alpha D(t,T_i) \\big( S(t,t_i) + p^m(\\alpha^A+0.5\\alpha^R) \\big)$$',
+                      '',
+                      'where',
+                      '',
+                      '- $p^m$ is the marginal survival probability - i.e. $S(t,t_i)-S(t,t_{i+1})$',
+                      '- $\\alpha^A$ - length of time period already accrued divided by $\\alpha$',
+                      '- $\\alpha^R$ - length of time period remaining divided by $\\alpha$',
+                      '',
+                      'Note that $\\alpha^A$ becomes 0 and $\\alpha^R$ becomes 1 for cashflows yet to be paid'
                       ])
 
     def __init__(self, params, valuation_options):
