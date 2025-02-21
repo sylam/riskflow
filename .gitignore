@@ -7,3 +7,4 @@
 /.idea/riskflow.iml
 /interface.py
 /LegacyFVA.py
+/conf.py

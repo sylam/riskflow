@@ -60,6 +60,63 @@ $t_2$ are points on the curve with $t_1 \le t \le t_2$, then
 
 $$q(t)=q(t_1)+\Biggl(\frac{1/t_1 - 1/t}{1/t_1 - 1/t_2}\Biggl)(q(t_2)-q(t_1))$$
 
+### Interest and Inflation rate interpolation
+
+#### Hermite Interpolation
+
+The Hermite method addresses the drawbacks of cubic splines while maintaining smoothness. It begins 
+by fixing the slope at each point using a second-degree polynomial between the target point and its 
+two neighbours. Once the slope is established, a third-degree polynomial is adjusted to ensure 
+continuity up to the second degree. This approach allows changes in one section of the curve to affect 
+only its immediate neighbours. However, when using default extrapolation at the long end, a slight 
+drop in forward rates may occur before they become flat.
+
+The formulas for the Hermite method are provided below:
+
+$$r'(t) = (r'_1,, r'_i,, r'_n)$$
+$$r(t)=r_i + m_i(t)\big( r_{i+1} - r_i\big) + m_i(t)\big(1-m_i(t)\big)g_i+m_i^2(t)\big(1-m_i(t)\big)c_i$$
+
+where
+$$m_i(t) = \frac{t-t_i}{t_{i+1}-t_i} $$
+$$g_i = (t_{i+1}-t_i)r'_i - (r_{i+1}-r_i)$$
+$$c_i = 2(r_{i+1}-r_i) -(t_{i+1}-t_i)(r'_i+r'_{i+1})$$
+
+The vector $r'$ is calculated as
+
+$$ r'_i = \frac{1}{t_{i+1} - t_i} \left[ \frac{(r_i - r_{i-1}) (t_{i+1} - t_i)}{(t_i - t_{i-1})} + 
+\frac{(r_{i+1} - r_i) (t_i - t_{i-1})}{t_{i+1} - t_i} \right]$$
+
+Boundry Conditions
+
+$$ r'_1 = \frac{1}{t_3 - t_1} \left[ \frac{(r_2 - r_1) (t_3 + t_2 - 2t_1)}{(t_2 - t_1)} - 
+\frac{(r_3 - r_2) (t_2 - t_1)}{t_3 - t_2} \right]$$
+$$ r'_n = \frac{-1}{t_n-t_{n-2}} \left[ \frac{(r_{n-1} - r_{n-2})(t_n - t_{n-1})}{(t_{n-1} - t_{n-2})} - 
+\frac{(r_n - r_{n-1})(2t_n-t_{n-1}-t_{n-2})}{t_n - t_{n-1}} \right]$$
+
+#### Linear Interpolation
+
+Linear interpolation involves drawing a straight line between two points surrounding the desired date.
+However, linear interpolation is not continuous in its differentials, which means that implied forward
+rates can be discontinuous when the curve is interpolated between spot rates.
+
+$$r(t) = \alpha r_{i + 1} + (1-\alpha)r_i$$
+
+where $t_i < t < t_{i+1}$ and
+
+$$ \alpha = \frac{t - t_i}{t_{i + 1} - t_i} $$
+
+#### RT interpolation
+
+Both Linear and Hermite interpolation can be applied to the rate multiplied by the tenor instead of 
+just the rate. The variations are HermiteRT and LinearRT and they are exactly as described above except 
+instead of interpolating just the rate, we interpolate the rate x tenor
+
+i.e. instead of interpolating:$$r = (r_1,, r_i,, r_n)$$
+
+we interpolate:
+$$r = (r_1t_1,, r_it_i,, r_nt_n)$$
+
+
 ---
 
 
@@ -90,7 +147,7 @@ This can be specified as follows:
 
 $$ \frac{dS(t)}{S(t)} = (r(t)-q(t)-v(t)\sigma(t)\rho) dt + \sigma(t) dW(t)$$
 
-Note that no risk premium curve is captured. Its final form is:
+Note that no risk premium curve is captured. For Equity factors, its final form is:
 
 $$ S(t+\delta) = F(t,t+\delta)exp \Big(\rho(C(t+\delta)-C(t)) -\frac{1}{2}(V(t+\delta)) - V(t))         + \sqrt{V(t+\delta) - V(t)}Z  \Big) $$
 
@@ -111,4 +168,4 @@ In the case that the $S(t)$ represents an FX rate, this can be further simplifie
 
 $$S(t)=S(0)\beta(t)exp\Big(\frac{1}{2}\bar\sigma(t)^2t+\int_0^t\sigma(s)dW(s)\Big)$$
 
-Here $C(t)=\bar\sigma(t)^2t, \beta(t)=exp\Big(\int_0^t(r(s)-q(s))ds\Big), \rho=-1 and v(t)=\sigma(t)$
+Here $C(t)=\bar\sigma(t)^2t, \beta(t)=exp\Big(\int_0^t(r(s)-q(s))ds\Big), \rho=-1$ and $v(t)=\sigma(t)$

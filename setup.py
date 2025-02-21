@@ -17,7 +17,7 @@ setup(
     url='https://github.com/sylam/riskflow',
     license='GPLv3',
     author='shuaib.osman',
-    author_email='shuaib.osman@investec.co.za',
+    author_email='vretiel@gmail.com',
     description='An XVA quantitative library with AAD',
     long_description=long_description,
     long_description_content_type="text/markdown",

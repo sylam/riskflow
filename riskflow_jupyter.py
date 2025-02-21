@@ -44,10 +44,10 @@ def load_table_from_vol(vol, svi_sampler=np.linspace(-3, 3, 21)):
     if vol.__class__.__name__ in rf.utils.TwoDimensionalFactors:
         if vol.get_subtype() == 'SVI':
             data = vol.current_value(svi_sampler).array
-            logging.info('SVI {}'.format(len(data)))
+            # logging.info('SVI {}'.format(len(data)))
         else:
             data = vol.param['Surface'].array
-            logging.info('Explicit {}'.format(len(data)))
+            # logging.info('Explicit {}'.format(len(data)))
         return make_table(data)
     elif vol.__class__.__name__ in rf.utils.ThreeDimensionalFactors:
         vol_space = {}
@@ -161,7 +161,7 @@ class TreePanel(metaclass=ABCMeta):
                 if field_name=='Surface':
                     # need to use a threeview
                     v = getattr(rf.riskfactors, rate_type)(config[section_name])
-                    logging.info('Surface {} {}'.format(section_name, v.get_subtype()))
+                    # logging.info('Surface {} {}'.format(section_name, v.get_subtype()))
                     vol_space = load_table_from_vol(v)
                     return_value = to_json(vol_space)
                 else:
@@ -1411,16 +1411,15 @@ class Workbench(object):
 
 if __name__ == '__main__':
     rundate = '2022-07-07'
+    from conf import PROD_MARKETDATA, UAT_MARKETDATA
     if os.name == 'nt':
         path = os.path.join('U:\\CVA_JSON', rundate)
         path_transform = {
-            '\\\\ICMJHBMVDROPPRD\\AdaptiveAnalytics\\Inbound\\MarketData':
-                '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData'}
+            PROD_MARKETDATA: UAT_MARKETDATA}
     else:
         path = os.path.join('/media/vretiel/3EFA4BCDFA4B7FDF/Media/Data/crstal/CVA_JSON', rundate)
         path_transform = {
-            '//ICMJHBMVDROPPRD/AdaptiveAnalytics/Inbound/MarketData':
-                '/media/vretiel/3EFA4BCDFA4B7FDF/Media/Data/crstal/CVA_JSON'}
+            PROD_MARKETDATA: '/media/vretiel/3EFA4BCDFA4B7FDF/Media/Data/crstal/CVA_JSON'}
 
     cx = rf.Context(
         path_transform=path_transform,

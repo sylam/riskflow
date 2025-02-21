@@ -1099,7 +1099,7 @@ class NettingCollateralSet(Deal):
             return final_mtm
         else:
             St_T = torch.squeeze(torch.exp(-surv.gather_weighted_curve(
-                shared, time_grid.time_grid[:, utils.TIME_GRID_MTM].reshape(-1, 1), multiply_by_time=False)), dim=0
+                shared, time_grid.time_grid[:, utils.TIME_GRID_MTM].reshape(1, -1), multiply_by_time=False)), dim=0
                                  ) if surv else shared.one
 
             return pricing.interpolate(accum, shared, time_grid, deal_data) * St_T

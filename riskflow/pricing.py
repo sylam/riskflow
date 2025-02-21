@@ -672,8 +672,10 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
 
         if direction == BARRIER_IN:
             # barrier ? and in
-            payoff_european = utils.black_european_option(
-                f_t, strike, sig, expiry[index], buy_or_sell, phi, shared) * torch.exp(-r_t * exp)
+            payoff_european = buy_or_sell * (
+                utils.black_european_option(f_t, strike, sig, expiry[index], 1.0, phi, shared) * torch.exp(
+                    -r_t * exp) if expiry[index] else torch.relu(phi * (f_t - strike))
+            )
             european_part = touched * (nominal * payoff_european)
             rebate_part = buy_or_sell * cash_rebate * (1 - touched) if expiry[index] == 0.0 else 0.0
             mtm_list.append(rebate_part + european_part + barrier_part)

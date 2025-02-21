@@ -1,5 +1,5 @@
 ########################################################################
-# Copyright (C)  Shuaib Osman (sosman@investec.co.za)
+# Copyright (C)  Shuaib Osman (vretiel@gmail.com)
 # This file is part of RiskFlow.
 #
 # RiskFlow is free software: you can redistribute it and/or modify
@@ -247,6 +247,7 @@ def compress(data):
 if __name__ == '__main__':
     import glob
     import matplotlib.pyplot as plt
+    from conf import PROD_MARKETDATA, UAT_MARKETDATA
 
     plt.interactive(True)
     # make pandas pretty print
@@ -263,25 +264,29 @@ if __name__ == '__main__':
     env = ''
     paths = {}
     for folder in ['JSON', 'COLLVA', 'CVA_SARB', 'Input_JSON', 'CVA_JSON',
-                   'Autocall_PreTrade', 'FVA_JSON', 'CVA', 'PFE', 'PFE_UAT', 'Upgrade']:
+                   'Autocall_PreTrade', 'FVA_JSON', 'CVA', 'PFE', 'PFE_UAT',
+                   'Upgrade', 'lch_munetzi']:
         paths[folder] = rf.getpath(
             [os.path.join('Y:\\CollVA', folder),
              os.path.join('/media/vretiel/Media/Data/crstal', folder),
-             # os.path.join('Z:\\CVA_JSON\\TEST', folder),
              os.path.join('S:\\Riskflow', folder),
+             os.path.join('R:\\Riskflow\PFE_Credit', folder),
+             os.path.join('Z:\\', folder),
              # os.path.join('S:\\CCR_PFE_EE_NetCollateral', folder),
              # os.path.join('S:\\Riskflow', folder),
              os.path.join('N:\\Archive', folder)])
 
-    path_json = paths['PFE']
-    # path_json = paths['PFE']
+    # path_json = paths['COLLVA']
+    # path_json = paths['Input_JSON']
+    path_json = paths['FVA_JSON']
     # path = paths['CVA_UAT']
     # path = paths['CVA']
     path = paths['PFE']
 
     # rundate = '2024-03-26'
-    rundate = '2024-04-29'
-    # rundate = '2023-05-31'
+    # rundate = '2024-06-14'
+    rundate = '2025-02-20'
+    # rundate = '2024-09-10'
 
     # calibrate_PFE(path, rundate)
     # bootstrap(path_json, '', reuse_cal=True)
@@ -290,19 +295,11 @@ if __name__ == '__main__':
     # empty context
     cx = rf.StressedContext(
         path_transform={
-            '\\\\ICMJHBMVDROPPRD\\AdaptiveAnalytics\\Inbound\\MarketData':
-                '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData',
-            #'\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData\\CVAMarketDataBackup':
-            #    '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData',
-            '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData':
-                '\\\\icmjhbmvdropuat\\AdaptiveAnalytics\\Inbound\\MarketData'
-            # '\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData':
-            #    os.path.join('\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData\\CVA_JSON', rundate),
+            PROD_MARKETDATA: UAT_MARKETDATA,
         },
         file_transform={
             'CVAMarketData_Calibrated.dat': 'CVAMarketData_TST_New.json',
             'CVAMarketData_Calibrated_New.json': 'CVAMarketData_TST_New.json',
-            # 'CVAMarketData_Calibrated_New.json': 'MarketData.json',
             'MarketData.dat': 'MarketData.json'
         })
 
@@ -333,19 +330,35 @@ if __name__ == '__main__':
 
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Goldman_Sachs_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_JPMorgan_Chase_NYK_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Sanlam_Life_Insurance_*.json')):
-    ## for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_NatWest_Markets_Plc_ISDA*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Stanley___Co_Int_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_StanChart_Ldn_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Nedbank_Ltd_ISDA*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Vescom_Twelve_NonISDA*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ABSA_Bank_Jhb_ISDA2*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_ACWA_Power_SolarReserve_Redstone_So_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_UBS_AG_Zurich_ISDA*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Citibank_NA_NY_ISDA*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'ZAR_FVA_Some*.json')):
 
+    for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_ZAR_CrB_Motus_Group_ISDA*')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_ZAR_CrB_ACWA_Power_SolarReserve_Redstone_So_NonISDA*')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_FirstRand_Bank_Ltd_ISDA*.json')):
+
+    # for json in glob.glob(os.path.join('Z:\\', 'InputAAJ_CrB_BNP_Paribas__Paris__ISDA_*.json')):
+    # for json in glob.glob(os.path.join('Z:\\', 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Sygnia_Asset_Management_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Barclays_Plc_Ldn_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_FVA_CrB_BOA_Clearing_*.json')):
+    # for json in glob.glob(os.path.join('Z:\\', 'USD_COLLVA_ALL_{}.json'.format(rundate))):
+    # for json in glob.glob(os.path.join('Z:\\', 'citibank_pfe_after_{}.json'.format(rundate))):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_National_Home_Builders_Registration_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_AutoX__Pty__Ltd_*.json')):
-    for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Citibank_NA_NY_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Citibank_NA_NY_*.json')):
     # for json in glob.glob(os.path.join('C:\\Users\\shuaib.osman\\Downloads', 'InputAAJ_CrB_Citibank_NA_NY_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_FirstRand_Bank_Ltd_*.json')):
-
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_FVA_CrB_IBL_ICIB_BSF_ED_HQLA_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Redefine_Properties_Limited*.json')):
 
@@ -353,15 +366,24 @@ if __name__ == '__main__':
         # for json in glob.glob(os.path.join(path_json, rundate, '*otus*.json')):
         cx.load_json(json, compress=True)
         short_date = ''.join(rundate[2:].split('-')[::-1])
-        cx.stressed_config_file = "\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData\\CVAMarketDataBackup\\CVAMarketData_Calibrated_Vega_{}.json".format(short_date)
+        cx.stressed_config_file = os.path.join(UAT_MARKETDATA, "CVAMarketDataBackup\\CVAMarketData_Calibrated_Vega_{}.json".format(short_date))
 
         # if 'HullWhite2FactorModelParameters.USD-OIS' not in cx.current_cfg.params['Price Factors']:
         #     cx.current_cfg.params['Price Factors']['HullWhite2FactorModelParameters.USD-OIS'] = cx.current_cfg.params[
         #         'Price Factors']['HullWhite2FactorModelParameters.USD-SOFR']
 
+        # if 'HullWhite2FactorModelParameters.ZAR-OIS' not in cx.current_cfg.params['Price Factors']:
+        #     cx.current_cfg.params['Price Factors']['HullWhite2FactorModelParameters.ZAR-OIS'] = cx.current_cfg.params[
+        #         'Price Factors']['HullWhite2FactorModelParameters.ZAR-SWAP']
+
         if not cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             print('no children for crb {} - skipping'.format(json))
             continue
+
+        # test hwhazardratemodel
+        cx.current_cfg.params['Model Configuration'].modeldefaults['SurvivalProb'] = 'HWHazardRateModel'
+        cx.current_cfg.params['Price Models']['HWHazardRateModel.ACWA Power SolarReserve Redstone So'] = {
+            'Alpha': 0.89, 'Sigma': 0.005, 'Lambda': 0.0}
 
         # grab the netting set
         ns = cx.current_cfg.deals['Deals']['Children'][0]['Instrument']
@@ -378,19 +400,30 @@ if __name__ == '__main__':
             'Calc_Scenarios': 'No',
             # 'Run_Date': '2021-10-11',
             # 'Tenor_Offset': 2.0,
-            # 'Time_grid': '0d 2d 1w(1w) 3m(1m)',
-            'Random_Seed': '1',
+            # 'Time_grid': '0d 2d 1w',
+            'Random_Seed': 1,
             'Generate_Cashflows': 'Yes',
-            'Currency': 'USD',
+            'Greeks': 'First',
+            # 'Currency': 'ZAR',
             'Percentile': '95, 99',
             # 'Antithetic': 'Yes',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
-            'Base_Time_Grid': '0d 2d 1w(1w) 3m(1m) 2y(3m)',
-            'Batch_Size': 16,
+            'Batch_Size': 32,
             'Simulation_Batches': 1,
             # 'Collateral_Valuation_Adjustment': {'Calculate': 'Yes', 'Gradient': 'Yes'},
+            'Initial_Margin':
+                {'Calculate': 'No',
+                 'Liquidity_Weights': 'Z:\\IMMCalc\\liquidity_weights2.csv',
+                 'IRS_Weights': 'Z:\\IMMCalc\\ZARIRS.csv',
+                 'Local_Currency': 'ZAR',
+                 'Delta_Factor': 71.4,
+                 'IM_Currency': 'GBP',
+                 'Gradient': 'No'},
+            'Funding_Valuation_Adjustment':
+                {'Calculate': 'Yes',
+                 'Gradient': 'Yes'},
             'Credit_Valuation_Adjustment':
-                {'Calculate': 'No', 'Gradient': 'Yes', 'CDS_Tenors': [0.5, 1, 3, 5, 10], 'Hessian': 'No'}
+                {'Calculate': 'No', 'Gradient': 'No', 'CDS_Tenors': [0.5, 1, 3, 5, 10], 'Hessian': 'No'}
         }
 
         if ns.field['Collateralized'] == 'True':
@@ -398,104 +431,122 @@ if __name__ == '__main__':
         else:
             overrides['Dynamic_Scenario_Dates'] = 'No'
 
-        for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
-            # if True and not str(i['Instrument'].field['Reference']) in ['152748052']:#, '154727676', '158079450']:
-            if True and not str(i['Instrument'].field['Object']) in ['FXNonDeliverableForward']:  # , '154727676', '158079450']:
-                i['Ignore'] = 'True'
-            else:
-                i['Ignore'] = 'False'
+        if False:
+            for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
+            # for i in cx.current_cfg.deals['Deals']['Children']:
+                # if False and not str(i['Instrument'].field['Reference']) in ['141573158']:#, '154727676', '158079450']:
+                # if False and not str(i['Instrument'].field['Object']) in ['FXNonDeliverableForward']:
 
-        ns.field['Opening_Balance'] = 0.0
-        ns.field['Collateral_Assets']['Cash_Collateral'][0]['Amount'] = 1.0
-        calculation_currency = 'USD'
-        logging.getLogger().setLevel(logging.DEBUG)
-        # cx.current_cfg.params['Price Factors']['Correlation.EquityPrice.JPY_NKY_BBG.JPY/FxRate.JPY.ZAR'] = {
-        #     'Property_Aliases': '', 'Value': -0.4}
-        #  calc, out = cx.Base_Valuation(overrides={'Currency': 'USD'})
-
-        for i in range(2):
-            calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
-            print(i, 'CVA', out['Results']['cva'])
-
-            # cx.stress_config(['InterestRate', 'InflationRate'])
-            cds_spread = 'SurvivalProb.{}'.format(calc.params['Credit_Valuation_Adjustment']['Counterparty'])
-            delta_surv = out['Results']['grad_cva'].loc[cds_spread].reset_index()[
-                ['Tenor', 'Gradient']].set_index('Tenor')
-
-            test = out['Results']['CS01'].groupby(
-                delta_surv.index[np.searchsorted(
-                    delta_surv.index, out['Results']['CS01'].index, side='right') - 1]).mean()
-
-            cx.stress_config(['ForwardPrice'])
-            calc2, out2 = cx.Credit_Monte_Carlo(overrides=overrides)
-            print(i, 'CVA', out2['Results']['cva'])
-            # delta = test.min() * delta_surv.loc[test.min().index]['Gradient'].values.reshape(-1, 1)
-            cx.restore_config()
-
-        # cx.stress_config(['ForwardPrice'])
-        # del params['CVA']
-        calc, params = rf.run_cmc(cx.current_cfg, overrides=overrides, LegacyFVA=True)
-        partial_FVA = calc.calc_individual_FVA(
-            params, spreads=spreads[calculation_currency], discount_curves=curves[calculation_currency])
-
-        output = json.replace('json', 'csv')
-        filename = os.path.split(output)[1]
-        outfile = os.path.join('C:\\temp', filename)
-
-        try:
-            assets = list(ns.field['Collateral_Assets'].keys()).pop()
-            if assets is None and ns['Collateralized'] == 'True':
-                assets = 'Cash_Collateral'
-        except:
-            assets = 'Cash_Collateral' if ns.field['Collateralized'] == 'True' else 'None'
-
-        collva_sect = cx.current_cfg.deals['Calculation'].get(
-            'Collateral_Valuation_Adjustment', {'Calculate': 'Yes' if assets == 'Cash_Collateral' else 'No'})
-
-        # sensible defaults
-        collva_sect['Collateral_Curve'] = collva_sect.get(
-            'Collateral_Curve', curves[agreement_currency]['collateral'])
-        collva_sect['Funding_Curve'] = collva_sect.get(
-            'Funding_Curve', curves[agreement_currency]['funding'])
-        collva_sect['Collateral_Spread'] = collva_sect.get(
-            'Collateral_Spread', spreads[agreement_currency]['FVA@Income']['collateral'])
-        collva_sect['Funding_Spread'] = collva_sect.get(
-            'Funding_Spread', spreads[agreement_currency]['FVA@Income']['funding'])
-        cx.current_cfg.deals['Calculation']['Collateral_Valuation_Adjustment'] = collva_sect
-
-        if 'Funding_Valuation_Adjustment' in cx.current_cfg.deals['Calculation']:
-            del cx.current_cfg.deals['Calculation']['Funding_Valuation_Adjustment']
-
-        # calc, out = cx.Base_Valuation()
-        # calc, out = cx.run_job(overrides)
-        # out['Results']['collateral_profile'].to_csv(outfile)
-        # calc, out = cx.Base_Valuation()
-        # out['Results']['mtm'].to_csv(outfile)
-
-        mike_filename = 'N:\\Archive\\PFE\\{}\\{}'.format(rundate, filename.replace('InputAAJ_', ''))
-
-        if False and os.path.exists(mike_filename):
-            mike = pd.read_csv(mike_filename, index_col=0)
-            me = pd.read_csv(outfile, index_col=0)
-            adaptiv = float(mike.head(1)['PFE'])
-            if 0:
-                myval = float(me.head(1)['Value'])
-
-                if adaptiv != 0 and np.abs((adaptiv - myval) / adaptiv).max() > 0.01:
-                    print('Mismatch - Collateralized is {}, '.format(ns.field['Collateralized']), outfile, adaptiv,
-                          myval)
-                    if ns.field['Collateralized'] != 'True':
-                        print('investigate', json)
-            else:
-                common_index = mike.index.intersection(me.index)
-                adaptiv_pfe = mike.reindex(common_index)
-                my_pfe = me.reindex(common_index)
-                abs_error = (my_pfe - adaptiv_pfe).abs()
-                error = ((my_pfe - adaptiv_pfe) / adaptiv_pfe)['PFE'].dropna().abs().max()
-                if error > 0.02:
-                    print('{0:06.2f} Error Mismatch - Crb {1} Collateralized is {2}'.format(
-                        error, json, ns.field['Collateralized']))
+                # 141784934, 153489256
+                # if False and str(i['Instrument'].field['Reference']) in ['169962788', '169962789', '169962790', '169962792']:  # , '154727676', '158079450']:
+                if not str(i['Instrument'].field['Reference']) in ['174288511']:
+                # if False and not str(i['Instrument'].field['Reference']) in ['CrB_BNP_Paribas__Paris__ISDA', 'CrB_Citibank_NA_NY_ISDA']:
+                    i['Ignore'] = 'True'
                 else:
-                    print('Crb {} is within 2%'.format(json))
-        else:
-            print('skipping', mike_filename)
+                    i['Ignore'] = 'False'
+                    # for si in i['Children']:
+                    #     if not str(si['Instrument'].field['Object']) in ['QEDI_CustomAutoCallSwap_V2']:
+                    #         si['Ignore'] = 'True'
+
+        # ns.field['Opening_Balance'] = 0.0
+        # if 'Collateral_Assets' in ns.field:
+        #    ns.field['Collateral_Assets']['Cash_Collateral'][0]['Amount'] = 1.0
+
+        logging.getLogger().setLevel(logging.DEBUG)
+        # calc, out = cx.Base_Valuation(overrides=overrides)
+        if 1:
+            calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
+            collateral = np.sum([
+                np.concatenate(x.obj.Calc_res['Collateral'], axis=-1) for x in calc.netting_sets.sub_structures],
+                axis=0)
+            dates = np.array(sorted(calc.time_grid.mtm_dates))[calc.time_grid.report_index]
+            result = pd.DataFrame(collateral, index=dates)
+
+        if 0:
+            for i in range(2):
+                calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
+                print(i, 'CVA', out['Results']['cva'])
+
+                # cx.stress_config(['InterestRate', 'InflationRate'])
+                cds_spread = rf.utils.check_scope_name(
+                    rf.utils.Factor('SurvivalProb', (calc.params['Credit_Valuation_Adjustment']['Counterparty'],)))
+                delta_surv = out['Results']['grad_cva'].loc[cds_spread].reset_index()[
+                    ['Tenor', 'Gradient']].set_index('Tenor')
+
+                test = out['Results']['CS01'].groupby(
+                    delta_surv.index[np.searchsorted(
+                        delta_surv.index, out['Results']['CS01'].index, side='right') - 1]).mean()
+
+                cx.stress_config(['ForwardPrice'])
+                calc2, out2 = cx.Credit_Monte_Carlo(overrides=overrides)
+                print(i, 'CVA', out2['Results']['cva'])
+                # delta = test.min() * delta_surv.loc[test.min().index]['Gradient'].values.reshape(-1, 1)
+                cx.restore_config()
+
+            # cx.stress_config(['ForwardPrice'])
+            # del params['CVA']
+            calc, params = rf.run_cmc(cx.current_cfg, overrides=overrides, LegacyFVA=True)
+            partial_FVA = calc.calc_individual_FVA(
+                params, spreads=spreads[calculation_currency], discount_curves=curves[calculation_currency])
+
+            output = json.replace('json', 'csv')
+            filename = os.path.split(output)[1]
+            outfile = os.path.join('C:\\temp', filename)
+
+            try:
+                assets = list(ns.field['Collateral_Assets'].keys()).pop()
+                if assets is None and ns['Collateralized'] == 'True':
+                    assets = 'Cash_Collateral'
+            except:
+                assets = 'Cash_Collateral' if ns.field['Collateralized'] == 'True' else 'None'
+
+            collva_sect = cx.current_cfg.deals['Calculation'].get(
+                'Collateral_Valuation_Adjustment', {'Calculate': 'Yes' if assets == 'Cash_Collateral' else 'No'})
+
+            # sensible defaults
+            collva_sect['Collateral_Curve'] = collva_sect.get(
+                'Collateral_Curve', curves[agreement_currency]['collateral'])
+            collva_sect['Funding_Curve'] = collva_sect.get(
+                'Funding_Curve', curves[agreement_currency]['funding'])
+            collva_sect['Collateral_Spread'] = collva_sect.get(
+                'Collateral_Spread', spreads[agreement_currency]['FVA@Income']['collateral'])
+            collva_sect['Funding_Spread'] = collva_sect.get(
+                'Funding_Spread', spreads[agreement_currency]['FVA@Income']['funding'])
+            cx.current_cfg.deals['Calculation']['Collateral_Valuation_Adjustment'] = collva_sect
+
+            if 'Funding_Valuation_Adjustment' in cx.current_cfg.deals['Calculation']:
+                del cx.current_cfg.deals['Calculation']['Funding_Valuation_Adjustment']
+
+            # calc, out = cx.Base_Valuation()
+            # calc, out = cx.run_job(overrides)
+            # out['Results']['collateral_profile'].to_csv(outfile)
+            # calc, out = cx.Base_Valuation()
+            # out['Results']['mtm'].to_csv(outfile)
+
+            mike_filename = 'N:\\Archive\\PFE\\{}\\{}'.format(rundate, filename.replace('InputAAJ_', ''))
+
+            if False and os.path.exists(mike_filename):
+                mike = pd.read_csv(mike_filename, index_col=0)
+                me = pd.read_csv(outfile, index_col=0)
+                adaptiv = float(mike.head(1)['PFE'])
+                if 0:
+                    myval = float(me.head(1)['Value'])
+
+                    if adaptiv != 0 and np.abs((adaptiv - myval) / adaptiv).max() > 0.01:
+                        print('Mismatch - Collateralized is {}, '.format(ns.field['Collateralized']), outfile, adaptiv,
+                              myval)
+                        if ns.field['Collateralized'] != 'True':
+                            print('investigate', json)
+                else:
+                    common_index = mike.index.intersection(me.index)
+                    adaptiv_pfe = mike.reindex(common_index)
+                    my_pfe = me.reindex(common_index)
+                    abs_error = (my_pfe - adaptiv_pfe).abs()
+                    error = ((my_pfe - adaptiv_pfe) / adaptiv_pfe)['PFE'].dropna().abs().max()
+                    if error > 0.02:
+                        print('{0:06.2f} Error Mismatch - Crb {1} Collateralized is {2}'.format(
+                            error, json, ns.field['Collateralized']))
+                    else:
+                        print('Crb {} is within 2%'.format(json))
+            else:
+                print('skipping', mike_filename)
