@@ -761,7 +761,7 @@ class Credit_Monte_Carlo(Calculation):
                 refmtm = 0.0
             return [deal.Instrument.field['Reference'], expiry, refmtm, mtm_ccy] + (
                 tags if isinstance(tags, list) else [empty])[0].split(',') + [
-                np.sum(deal.Calc_res['MTM'], axis=0) / num_scenario]
+                np.sum([x.sum(axis=1) for x in deal.Calc_res['Value']], axis=0) / num_scenario]
 
         # Ask for deal level mtm's
         params['DealLevel'] = True
