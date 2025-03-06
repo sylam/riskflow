@@ -42,13 +42,14 @@ def load_table_from_vol(vol, svi_sampler=np.linspace(-3, 3, 21)):
         ).tolist()
 
     if vol.__class__.__name__ in rf.utils.TwoDimensionalFactors:
-        if vol.get_subtype() == 'SVI':
+        if vol.get_subtype()[0] in ['SVI', 'Skew']:
             data = vol.current_value(svi_sampler).array
             # logging.info('SVI {}'.format(len(data)))
         else:
             data = vol.param['Surface'].array
             # logging.info('Explicit {}'.format(len(data)))
         return make_table(data)
+
     elif vol.__class__.__name__ in rf.utils.ThreeDimensionalFactors:
         vol_space = {}
         for t in vol.get_tenor():
@@ -1016,6 +1017,20 @@ class RiskFactorsPage(TreePanel):
                         else:
                             frames.append(self.define_input((frame_name, ''), {}))
                     elif frame_name == 'Factor':
+                        # filter out unnecessary fields
+                        if key.startswith('EquityPriceVol'):
+                            for sub_field in frame_value.values():
+                                sub_field['isvisible'] = 'True'
+                            if frame_value['Surface_Type']['value'] == 'Explicit':
+                                for sub_field in ["ATM_Ref", "ATM_Vol", "a", "b", "s", "L", "R", "C", "D", "lam", "rho", "m", "sigma"]:
+                                    frame_value[sub_field]['isvisible'] = 'False'
+                            elif frame_value['Surface_Type']['value'] == 'SVI':
+                                for sub_field in ["ATM_Vol", "s", "L", "R", "C", "D", "lam"]:
+                                    frame_value[sub_field]['isvisible'] = 'False'
+                            elif frame_value['Surface_Type']['value'] == 'Skew':
+                                for sub_field in ["a", "b", "m", "sigma"]:
+                                        frame_value[sub_field]['isvisible'] = 'False'
+                                                   
                         frames.append(self.define_input((frame_name, rf.utils.check_tuple_name(factor)), frame_value))
 
                 # need to add a frame for correlations

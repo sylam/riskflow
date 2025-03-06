@@ -144,7 +144,8 @@ class Factor1D(object):
 
 class Factor2D(object):
     """Represents a risk factor that's a surface (2D) - Currently this is only vol surfaces"""
-    svi_params = ['a', 'b', 'rho', 'm', 'sigma']
+    svi_params = ['ATM_Ref', 'a', 'b', 'rho', 'm', 'sigma']
+    skew_params = ['ATM_Vol', 'ATM_Ref', 's', 'L', 'R', 'C', 'D', 'lam', 'rho']
 
     def __init__(self, param):
         # default empty surfaces to 1%
@@ -162,11 +163,14 @@ class Factor2D(object):
         return utils.DAYCOUNT_ACT365
 
     def get_subtype(self):
-        return self.param.get('Surface_Type', 'Explicit')
+        # the subtype is a tuple of the surface_type and the moneyness lookup rule
+        return (self.param.get('Surface_Type', 'Explicit'),
+                self.param.get('Moneyness_Rule', 'Sticky_Moneyness'))
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attributes"""
-        return np.unique([self.param[x].array[:, 0] for x in self.svi_params])
+        params = self.svi_params if self.get_subtype()[0] == 'SVI' else self.skew_params
+        return np.unique([self.param[x].array[:, 0] for x in params])
 
     def update(self):
         self.moneyness = self.get_moneyness()
@@ -203,23 +207,26 @@ class Factor2D(object):
     def get_tenor_indices(self):
         '''
         returns the shortened sorted vol surface indices - Moneyness and Expiry if this is an Explict Vol surface
-        Otherwise return the SVI params
+        Otherwise return the SVI or Skew params
         The return value of this method again needs to be defined when called with current_value
         '''
-        if self.get_subtype() == 'SVI':
+        if self.get_subtype()[0] == 'SVI':
             tau = self.get_tenor().reshape(-1, 1)
             return {x: tau for x in self.svi_params}
+        elif self.get_subtype()[0] == 'Skew':
+            tau = self.get_tenor().reshape(-1, 1)
+            return {x: tau for x in self.skew_params}
         else:
             return self.sorted_vol[:, :2]
 
     def current_value(self, tenors=None, offset=0.0):
         """Returns the value of the vol surface"""
-        if self.get_subtype() == 'SVI':
+        if self.get_subtype()[0] == 'SVI':
             # "tenors" here is actually sampled moneyness for SVI surfaces - we already have tenors
             if tenors is not None:
                 surf = []
-                # moneyness, expiry, vol
-                for t, a, b, rho, m, sigma in np.array(
+                # loop over params and calculate the vols
+                for t, atm_ref, a, b, rho, m, sigma in np.array(
                         [self.get_tenor()] + [self.param[x].array[:, 1] for x in self.svi_params]).T:
                     x = (tenors - m)
                     variance = a + b * (rho * x + np.sqrt(x ** 2 + sigma ** 2))
@@ -227,6 +234,50 @@ class Factor2D(object):
                 return utils.Curve([2, 'default'], surf)
 
             return {x: self.param[x].array[:, 1] for x in self.svi_params}
+
+        elif self.get_subtype()[0] == 'Skew':
+            if tenors is not None:
+                surf = []
+                # similar to SVI - this is a parameterized vol surface
+                for t, atm_vol, atm_ref, s, L, R, C, D, lam, rho in np.array(
+                        [self.get_tenor()] + [self.param[x].array[:, 1] for x in self.skew_params]).T:
+
+                    # Left wing
+                    s2LC = s + 2.0 * L * C
+                    gamma = s2LC / (-2.0 * C * lam)
+                    beta = s2LC * (1.0 + 1.0 / lam)
+                    alpha = atm_vol + C * ((s - beta) + C * (L - gamma))
+
+                    # Right wing
+                    s2RD = s + 2.0 * R * D
+                    gamma_r = s2RD / (-2.0 * D * rho)
+                    beta_r = s2RD * (1.0 + 1.0 / rho)
+                    alpha_r = atm_vol + D * ((s - beta_r) + D * (R - gamma_r))
+
+                    regions = [
+                        lambda x: np.ones_like(x) * (alpha + C * (beta * (1.0 + lam) + gamma * (1.0 + lam) ** 2 * C)),
+                        lambda x: alpha + x * (beta + gamma * x),
+                        lambda x: atm_vol + x * (s + L * x),
+                        lambda x: atm_vol + x * (s + R * x),
+                        lambda x: alpha_r + x * (beta_r + gamma_r * x),
+                        lambda x: np.ones_like(x) * (alpha_r + D * (beta_r * (1.0 + rho) + gamma_r * (1.0 + rho) ** 2 * D))
+                    ]
+
+                    conditions = [
+                        (tenors <= (1 + lam) * C),
+                        ((1 + lam) * C < tenors) & (tenors <= C),
+                        (C < tenors) & (tenors <= 0.0),
+                        (0 < tenors) & (tenors <= D),
+                        (D < tenors) & (tenors <= (1 + rho) * D),
+                        ((1 + rho) * D < tenors)
+                    ]
+
+                    vol = np.piecewise(tenors, conditions, regions)
+                    surf.extend([[m, t, v] for m, v in zip(tenors, vol)])
+
+                return utils.Curve([2, 'default'], surf)
+            return {x: self.param[x].array[:, 1] for x in self.skew_params}
+
         else:
             if tenors is not None and self.expiry.size > 1 and self.moneyness.size > 1:
                 interpolator = RectBivariateSpline(self.expiry, self.moneyness, self.vols, kx=1, ky=1)

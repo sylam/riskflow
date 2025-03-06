@@ -35,6 +35,7 @@ excel_offset = pd.Timestamp('1899-12-30 00:00:00')
 
 def array_type(x): return np.array(x)
 
+
 # Days in year - could set this to 365.0 or 365.25 if you want that bit extra time
 DAYS_IN_YEAR = 365.25
 
@@ -1255,7 +1256,7 @@ def update_tenors(base_date, all_factors):
         risk_factor = factor_obj.factor if hasattr(factor_obj, 'factor') else factor_obj
 
         if factor.type in OneDimensionalFactors or (
-                factor.type in TwoDimensionalFactors and risk_factor.get_subtype() == 'SVI'):
+                factor.type in TwoDimensionalFactors and risk_factor.get_subtype()[0] in ['SVI', 'Skew']):
             tenor_points = risk_factor.get_tenor()
 
             if factor.type == 'DividendRate':
@@ -1523,22 +1524,84 @@ def gather_surface_interp(surface, code, expiry, shared, calc_std):
 
 
 def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
-    if key_code[0] == 'vol_time_grid' and key_code[FACTOR_INDEX_Offset][0][0] == 'sviskew':
-        surface, expiry_tenor, calc_std = shared.t_Buffer[key_code]
+    def calc_skew(x, t, atm_vol, s, L, R, C, D, lam, rho):
+        skew_key = ('skew_params', t) + key_code[FACTOR_INDEX_Offset][0]
+
+        if skew_key not in shared.t_Buffer:
+            s2LC = s + 2.0 * L * C
+            gamma = s2LC / (-2.0 * C * lam)
+            beta = s2LC * (1.0 + 1.0 / lam)
+            alpha = atm_vol + C * ((s - beta) + C * (L - gamma))
+
+            # Right wing
+            s2RD = s + 2.0 * R * D
+            gamma_r = s2RD / (-2.0 * D * rho)
+            beta_r = s2RD * (1.0 + 1.0 / rho)
+            alpha_r = atm_vol + D * ((s - beta_r) + D * (R - gamma_r))
+
+            shared.t_Buffer[skew_key] = (gamma, beta, alpha, gamma_r, beta_r, alpha_r)
+
+        gamma, beta, alpha, gamma_r, beta_r, alpha_r = shared.t_Buffer[skew_key]
+
+        # the 6 regions of the skew
+        r1 = torch.ones_like(x) * (alpha + C * (beta * (1.0 + lam) + gamma * (1.0 + lam) ** 2 * C))
+        r2 = alpha + x * (beta + gamma * x)
+        r3 = atm_vol + x * (s + L * x)
+        r4 = atm_vol + x * (s + R * x)
+        r5 = alpha_r + x * (beta_r + gamma_r * x)
+        r6 = torch.ones_like(x) * (alpha_r + D * (beta_r * (1.0 + rho) + gamma_r * (1.0 + rho) ** 2 * D))
+
+        return torch.where(
+            x <= (1 + lam) * C, r1,
+                torch.where(x <= C, r2,
+                            torch.where(x<=0, r3,
+                                        torch.where(x<=D, r4,
+                                                    torch.where(x<(1+rho)*D, r5, r6)
+                                                    )
+                                        )
+                            )
+                )
+
+    if key_code[0] == 'vol_time_grid' and key_code[FACTOR_INDEX_Offset][0][0] in ['SVI', 'Skew']:
+        surface, rate_code, calc_std = shared.t_Buffer[key_code]
+        expiry_tenor = rate_code[FACTOR_INDEX_Tenor_Index]
         time_modifier = np.sqrt(expiry).reshape(-1, 1) if calc_std else 1.0
         index, index_next, alpha = expiry_tenor.get_index(expiry)
         alpha = shared.one.new(alpha.reshape(-1, 1))
-        k_m_prior = moneyness - surface['m'][index]
-        var_prior = surface['a'][index] + surface['b'][index] * (
-                surface['rho'][index] * k_m_prior + torch.sqrt(k_m_prior ** 2 + surface['sigma'][index] ** 2))
-        k_m_post = moneyness - surface['m'][index_next]
-        var_post = surface['a'][index_next] + surface['b'][index_next] * (
-                surface['rho'][index_next] * k_m_post + torch.sqrt(k_m_post ** 2 + surface['sigma'][index_next] ** 2))
-        variance = var_prior * (1 - alpha) + var_post * alpha
-        return torch.sqrt(variance) * time_modifier
+
+        # need to calculate the correct way to query the vol surface
+        if moneyness is None:
+            moneyness = 0.0 * shared.one
+        else:
+            if rate_code[FACTOR_INDEX_SubType][1] == 'Sticky_Strike':
+                atm_ref = surface['ATM_Ref'][index] * (1 - alpha) + surface['ATM_Ref'][index] * alpha
+                moneyness = torch.log(moneyness / atm_ref)
+
+        if rate_code[FACTOR_INDEX_SubType][0] == 'Skew':
+            vol_prior = calc_skew(moneyness, index[0], surface['ATM_Vol'][index], surface['s'][index],
+                                  surface['L'][index], surface['R'][index], surface['C'][index],
+                                  surface['D'][index], surface['lam'][index], surface['rho'][index])
+            vol_post = calc_skew(moneyness, index_next[0], surface['ATM_Vol'][index_next], surface['s'][index_next],
+                                  surface['L'][index_next], surface['R'][index_next], surface['C'][index_next],
+                                  surface['D'][index_next], surface['lam'][index_next], surface['rho'][index_next])
+            vol = vol_prior * (1 - alpha) + vol_post * alpha
+            return vol * time_modifier
+
+        elif rate_code[FACTOR_INDEX_SubType][0] == 'SVI':
+            k_m_prior = moneyness - surface['m'][index]
+            var_prior = surface['a'][index] + surface['b'][index] * (
+                    surface['rho'][index] * k_m_prior + torch.sqrt(k_m_prior ** 2 + surface['sigma'][index] ** 2))
+            k_m_post = moneyness - surface['m'][index_next]
+            var_post = surface['a'][index_next] + surface['b'][index_next] * (
+                    surface['rho'][index_next] * k_m_post + torch.sqrt(
+                k_m_post ** 2 + surface['sigma'][index_next] ** 2))
+            variance = var_prior * (1 - alpha) + var_post * alpha
+            return torch.sqrt(variance) * time_modifier
     else:
         surface, moneyness_tenor = shared.t_Buffer[key_code]
         max_index = np.prod(surface.shape) - 1
+        if moneyness is None:
+            moneyness = shared.one
         index, _, alpha = moneyness_tenor.get_index(moneyness)
         expiry_indices = np.arange(expiry.size).astype(np.int32)
         expiry_index_key = ('expiry_tenor', tuple(expiry_indices), moneyness_tenor.tenor.size)
@@ -1559,8 +1622,8 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
 def calc_time_grid_vol_rate(code, moneyness, expiry, shared, calc_std=False):
     keys = []
     for rate in code:
-        if rate[FACTOR_INDEX_SubType] == 'SVI':
-            keys.append(('sviskew', tuple(rate[:1] + tuple(rate[1]))))
+        if rate[FACTOR_INDEX_SubType][0] in ['SVI', 'Skew']:
+            keys.append((rate[FACTOR_INDEX_SubType][0], tuple(rate[:1] + tuple(rate[1]))))
         else:
             keys.append(('vol2d', rate[:2]))
 
@@ -1574,15 +1637,15 @@ def calc_time_grid_vol_rate(code, moneyness, expiry, shared, calc_std=False):
             if rate[FACTOR_INDEX_Stoch]:
                 raise Exception("Stochastic vol surfaces not yet implemented")
             else:
-                if rate[FACTOR_INDEX_SubType] == 'SVI':
+                if rate[FACTOR_INDEX_SubType][0] in ['SVI', 'Skew']:
                     spread = {x.name[-1]: shared.t_Static_Buffer[x].reshape(-1, 1) for x in rate[FACTOR_INDEX_Offset]}
                 else:
                     spread = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
                 break
 
-        # either interpolate a flat vol surface or a svi vol skew
-        if code[0][FACTOR_INDEX_SubType] == 'SVI':
-            shared.t_Buffer[key_code] = (spread, code[0][FACTOR_INDEX_Tenor_Index], calc_std)
+        # either interpolate a flat vol surface or a svi/skew vol param
+        if code[0][FACTOR_INDEX_SubType][0] in ['SVI', 'Skew']:
+            shared.t_Buffer[key_code] = (spread, code[0], calc_std)
         else:
             shared.t_Buffer[key_code] = gather_flat_surface(
                 spread, code[0], expiry, shared, calc_std)
@@ -1824,6 +1887,7 @@ def calc_time_grid_spot_rate(rate, time_grid, shared):
 
     return shared.t_Buffer[key_code]
 
+
 def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
     def prepare_tenors(factor_tenor, time_grid, extrapolate):
         """Prepare tenor grid with optional extrapolation."""
@@ -1834,10 +1898,10 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
             tnr = np.append(tnr, max_tenor)
             # flat extrapolated gradient
             point_at_inf = tensor[-1:] + max_tenor * (tensor[-1:] - tensor[-2:-1]) / (
-                        factor_tenor[-1] - factor_tenor[-2])
+                    factor_tenor[-1] - factor_tenor[-2])
             amended_tensor = torch.cat([tensor, point_at_inf])
 
-        tnr_d = np.diff(tnr, append=tnr.max()+1)
+        tnr_d = np.diff(tnr, append=tnr.max() + 1)
         return tensor.new(tnr), tensor.new(tnr_d), amended_tensor
 
     def scale_for_rt(tnr, tensor, is_rt):

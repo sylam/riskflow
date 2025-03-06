@@ -40,18 +40,23 @@ def cash_settle(shared, currency, time_index, value):
 def calc_moneyness(strike, spot, forward, deal_data, use_forward=False, invert_moneyness=False):
     '''
     Deals with different ways of calculating moneyness - either spot/strike, forward/strike
-    or for svi surfaces, log(strike/forward) etc.
+    or for svi/skew surfaces, return log(strike/forward) or the strike
     :param use_forward: use the forward to calculate moneyness (otherwise use the spot)
     :param invert_moneyness: if true, calculate moneyness as strike / forward (or spot)
     :param strike: strike value
     :param spot: spot price tensor
     :param forward: forward price tensor
     :param deal_data: Deal_data struct containing deal specific data
-    :return: the moneyness amount to apply to the deal
+    :return: the moneyness ( or information relevant to calculate the moneyness)
     '''
-    if deal_data.Factor_dep['Volatility'][0][utils.FACTOR_INDEX_SubType] == 'SVI':
-        return torch.log(strike / forward)
+    subtype = deal_data.Factor_dep['Volatility'][0][utils.FACTOR_INDEX_SubType]
+    if subtype[0] in ['SVI', 'Skew']:
+        # need to divide the strike by the ATM_Ref (can only be done later)
+        # so we just return the strike here (we know the moneyness rule and will do the rest later)
+        # otherwise, (Sticky_Moneyness) - we return log of strike over forward
+        return strike if subtype[1]=='Sticky_Strike' else torch.log(strike/forward)
     else:
+        # regular 2d vol surface assumed to be sticky_moneyness - need to handle other moneyness rules (TODO!)
         forward_or_spot = forward if use_forward else spot
         return strike / forward_or_spot if invert_moneyness else forward_or_spot / strike
 
@@ -417,19 +422,23 @@ def getpartialbarrierpayoff(isKnockIn, eta, phi, spot, strike, barrier, startBar
         return pv
 
 
-def calc_vol_adjustment(factor_dep, moneyness, expiry, vols, shared):
-    # check if this is a compo or quanto deal
-    atm_moneyness = torch.ones_like(moneyness)
-    fx_vols = utils.calc_time_grid_vol_rate(factor_dep['FXVol'], atm_moneyness, expiry, shared)
+def calc_vol_adjustment(factor_dep, deal_time, expiry, vols, shared):
+    # None means get the ATM vol for this expiry (can change depending on the vol surface type)
+    fx_vols = utils.calc_time_grid_vol_rate(factor_dep['FXVol'], None, expiry, shared)
 
+    # b_adj adjusts the carry on the forward, s_adj is to scale the forward direcyly (as a factor)
     if 'QuantoImpliedCorrelation' in factor_dep:
         # quanto fx deal
-        atm_vol = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], atm_moneyness, expiry, shared)
-        return {'vol': vols, 'b_adj': -atm_vol * fx_vols * factor_dep['QuantoImpliedCorrelation']}
+        atm_vol = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], None, expiry, shared)
+        return {'vol': vols, 'b_adj': -atm_vol * fx_vols * factor_dep['QuantoImpliedCorrelation'], 's_adj': 1.0}
     else:
+        tenor_in_days = factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]
+        forwardfx = utils.calc_fx_forward(
+            factor_dep['Local'], factor_dep['Other'],
+            tenor_in_days, deal_time, shared)
         compo_vols = torch.sqrt(
             fx_vols * fx_vols + 2.0 * fx_vols * vols * factor_dep['CompoImpliedCorrelation'] + vols * vols)
-        return {'vol': compo_vols, 'b_adj': 0.0}
+        return {'vol': compo_vols, 'b_adj': 0.0, 's_adj':forwardfx}
 
 
 def smooth_max(x, k, eps=0.01):
@@ -529,7 +538,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
     eta = BARRIER_DOWN if 'Down' in deal_data.Instrument.field['Barrier_Type'] else BARRIER_UP
     direction = BARRIER_OUT if 'Out' in deal_data.Instrument.field['Barrier_Type'] else BARRIER_IN
     barrier = deal_data.Instrument.field['Barrier_Price']
-    strike = deal_data.Instrument.field['Strike_Price']
+    strike = shared.one * deal_data.Instrument.field['Strike_Price']
     cash_rebate = deal_data.Instrument.field.get('Cash_Rebate', 0.0)
 
     nominal = factor_dep['Buy_Sell'] * (
@@ -575,7 +584,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
 
         if factor_dep.get('Check_Payoff_Type', False):
             # need quanto/compo adjustments
-            adj = calc_vol_adjustment(factor_dep, moneyness_block, expiry, vols, shared)
+            adj = calc_vol_adjustment(factor_dep, deal_time, expiry, vols, shared)
             vols = adj['vol']
             drifts = drifts + torch.unsqueeze(adj['b_adj'], 1)
 
@@ -616,7 +625,7 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
     direction = BARRIER_OUT if 'Out' in deal_data.Instrument.field['Barrier_Type'] else BARRIER_IN
     buy_or_sell = 1.0 if deal_data.Instrument.field['Buy_Sell'] == 'Buy' else -1.0
     barrier = deal_data.Instrument.field['Barrier_Price']
-    strike = deal_data.Instrument.field['Strike_Price']
+    strike = shared.one * deal_data.Instrument.field['Strike_Price']
     cash_rebate = deal_data.Instrument.field['Cash_Rebate']
 
     # get the zero curve
@@ -635,7 +644,7 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
 
     if factor_dep.get('Check_Payoff_Type', False):
         # need quanto/compo adjustments
-        adj = calc_vol_adjustment(factor_dep, moneyness, expiry, sigma, shared)
+        adj = calc_vol_adjustment(factor_dep, deal_time, expiry, sigma, shared)
         sigma = adj['vol']
         b = b + adj['b_adj']
 
@@ -722,7 +731,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
 
     if factor_dep.get('Check_Payoff_Type', False):
         # need quanto/compo adjustments
-        adj = calc_vol_adjustment(factor_dep, moneyness, expiry, sigma, shared)
+        adj = calc_vol_adjustment(factor_dep, deal_time, expiry, sigma, shared)
         sigma = adj['vol']
         b = b + adj['b_adj']
 
@@ -809,7 +818,7 @@ def pv_partial_barrier_option(shared, time_grid, deal_data, nominal,
     phi = OPTION_CALL if deal_data.Instrument.field['Option_Type'] == 'Call' else OPTION_PUT
     buy_or_sell = 1.0 if deal_data.Instrument.field['Buy_Sell'] == 'Buy' else -1.0
     barrier = deal_data.Instrument.field['Barrier_Price']
-    strike = deal_data.Instrument.field['Strike_Price']
+    strike = shared.one * deal_data.Instrument.field['Strike_Price']
     # get the zero curve
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time[:-1], shared)
 
@@ -976,25 +985,12 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
     expiry = discount.code[0][utils.FACTOR_INDEX_Daycount](tenor_in_days)
     vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
-    # check if this is a compo or quanto deal - need to clean this up to use factor_dep.get('Check_Payoff_Type')
-    # TODO!
-    if 'FXVol' in factor_dep:
-        atm_moneyness = torch.ones_like(moneyness)
-        fx_vols = utils.calc_time_grid_vol_rate(
-            factor_dep['FXVol'], atm_moneyness, expiry, shared)
-
-        if 'QuantoImpliedCorrelation' in factor_dep:
-            # quanto fx deal
-            atm_vol = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], atm_moneyness, expiry, shared)
-            forward = forward * torch.exp(
-                -atm_vol * fx_vols * factor_dep['QuantoImpliedCorrelation'] * shared.one.new(expiry.reshape(-1, 1)))
-        else:
-            forwardfx = utils.calc_fx_forward(
-                factor_dep['Local'], factor_dep['Other'],
-                tenor_in_days, deal_time, shared)
-            vols = torch.sqrt(
-                fx_vols * fx_vols + 2.0 * fx_vols * vols * factor_dep['CompoImpliedCorrelation'] + vols * vols)
-            forward = forward * forwardfx
+    # check if this is a compo or quanto deal
+    if factor_dep.get('Check_Payoff_Type', False):
+        # need quanto/compo adjustments
+        adj = calc_vol_adjustment(factor_dep, deal_time, expiry, vols, shared)
+        vols = adj['vol']
+        forward = adj['s_adj'] * forward * torch.exp(adj['b_adj'] * shared.one.new(expiry.reshape(-1, 1)))
 
     if binary:
         theo_price = utils.black_european_option(
@@ -1350,7 +1346,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                 if tau == 0.0:
                     cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(
                         time_grid.mtm_time_grid, t[utils.TIME_GRID_MTM]), pv)
-            # if the last cashflow wasnt 0 then the autocall hasn't knocked out yet
+            # if the last cashflow wasn't 0 then the autocall hasn't knocked out yet
             terminationDate = -1.0 * (terminationDate == -1) * (pv != 0.0).reshape(-1, 1)
 
         return torch.stack(mcmc)
@@ -1453,7 +1449,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
         if factor_dep.get('Check_Payoff_Type', False):
             # need quanto/compo adjustments
-            adj = calc_vol_adjustment(factor_dep, moneyness_block, expiry, vols, shared)
+            adj = calc_vol_adjustment(factor_dep, deal_time, expiry, vols, shared)
             vols = adj['vol']
             drifts = drifts + torch.unsqueeze(adj['b_adj'], 1)
 
@@ -1592,7 +1588,7 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
 
         if factor_dep.get('Check_Payoff_Type', False):
             # need quanto/compo adjustments
-            adj = calc_vol_adjustment(factor_dep, moneyness, tau, vols, shared)
+            adj = calc_vol_adjustment(factor_dep, deal_time, tau, vols, shared)
             vols = adj['vol']
             carry_block = carry_block + adj['b_adj']
 
@@ -1610,19 +1606,25 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         MM_ok = MM.clamp(min=1e-5)
         vol_t = torch.sqrt(MM_ok)
 
-        theo_price = utils.black_european_option(
+        if factor_dep['Digital']:
+            theo_price = utils.black_european_option(
             M1 * spot_block, strike_bar, vol_t, 1.0,
-            factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
+            factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared, cash_payoff=nominal)
+            value = theo_price
+        else:
+            theo_price = utils.black_european_option(
+                M1 * spot_block, strike_bar, vol_t, 1.0,
+                factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
+            value = nominal * theo_price
 
         discount_rates = torch.squeeze(
             utils.calc_discount_rate(discount_block, tenor_block.reshape(-1, 1), shared),
             dim=1)
 
-        cash = nominal * theo_price
-        mtm_list.append(cash * discount_rates)
+        mtm_list.append(value * discount_rates)
 
     # potential cashflows
-    cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], cash[-1])
+    cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], value[-1])
     # mtm in reporting currency
     mtm = torch.cat(mtm_list, dim=0)
 

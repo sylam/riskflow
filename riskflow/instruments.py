@@ -270,23 +270,25 @@ def get_equity_price_vol_factor(fieldname, static_offsets, stochastic_offsets, a
     """Read the index of the Equity Price vol price factor - note we do not support more than 1 vol surface"""
     factor_name = utils.Factor('EquityPriceVol', fieldname)
 
+    def check_surface_type(subtype, factor, stoch):
+        if subtype[0] == 'SVI':
+            fullnames = [utils.Factor(factor_name.type, factor_name.name + (param,))
+                         for param in factor.svi_params]
+            return [tuple([stoch, fullnames, subtype] + all_tenors.get(factor_name, []))]
+        elif subtype[0] == 'Skew':
+            fullnames = [utils.Factor(factor_name.type, factor_name.name + (param,))
+                         for param in factor.skew_params]
+            return [tuple([stoch, fullnames, subtype] + all_tenors.get(factor_name, []))]
+        else:
+            return [tuple([stoch, factor_name, subtype] + all_tenors.get(factor_name, []))]
+
     if static_offsets.get(factor_name) is not None:
         subtype = static_offsets[factor_name].get_subtype()
-        if subtype == 'SVI':
-            fullnames = [utils.Factor(factor_name.type, factor_name.name + (param,))
-                         for param in static_offsets[factor_name].svi_params]
-            return [tuple([False, fullnames, subtype] + all_tenors.get(factor_name, []))]
-        else:
-            return [tuple([False, factor_name, subtype] + all_tenors.get(factor_name, []))]
+        return check_surface_type(subtype, static_offsets[factor_name], False)
     elif stochastic_offsets.get(factor_name) is not None:
         # not yet implemented but doable
         subtype = stochastic_offsets[factor_name].factor.get_subtype()
-        if subtype == 'SVI':
-            fullnames = [utils.Factor(factor_name.type, factor_name.name + (param,))
-                         for param in stochastic_offsets[factor_name].factor.svi_params]
-            return [tuple([True, fullnames, subtype] + all_tenors.get(factor_name, []))]
-        else:
-            return [tuple([True, factor_name, subtype] + all_tenors.get(factor_name, []))]
+        return check_surface_type(subtype, stochastic_offsets[factor_name].factor, True)
     else:
         raise Exception('Cannot find {}'.format(utils.check_tuple_name(factor_name)))
 
@@ -1584,10 +1586,16 @@ class StructuredDeal(Deal):
         return field_index
 
     def post_process(self, accum, shared, time_grid, deal_data, child_dependencies):
-        net_mtm = shared.one.new_zeros(1, 1)
+        # accum should be zero for an empty container like a netting set or another structured deal
+        # but can be nonzero if this structured deal contains other structured deals
+        net_mtm = accum
 
         for child in child_dependencies:
             net_mtm = net_mtm + child.Instrument.calculate(shared, time_grid, child)
+
+        # can add extra logic here to net off cashflows etc. - TODO!
+        if deal_data.Instrument.field.get('Net Cashflows', 'No')=='Yes':
+            pass
 
         # return the interpolated value (without interpolating the time_grid)
         return pricing.interpolate(net_mtm, shared, time_grid, deal_data, interpolate_grid=False)
@@ -2427,6 +2435,7 @@ class FXDiscreteExplicitAsianOption(Deal):
                 field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Volatility': get_fx_vol_factor(
                 field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Digital': self.field.get('Is_Digital', 'No') == 'Yes',
             'Expiry': (self.field['Expiry_Date'] - base_date).days,
             'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
             'Samples': utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data']),
@@ -2570,6 +2579,7 @@ class EquityDiscreteExplicitAsianOption(Deal):
             'Dividend_Yield': get_dividend_rate_factor(
                 field['Dividends'], static_offsets, stochastic_offsets, all_tenors),
             'Expiry': (self.field['Expiry_Date'] - base_date).days,
+            'Digital': self.field.get('Is_Digital', 'No') == 'Yes',
             'Volatility': get_equity_price_vol_factor(
                 field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
             'Samples': utils.make_sampling_data(base_date, time_grid, self.field['Sampling_Data']),
@@ -2670,7 +2680,6 @@ class EquityBarrierBinaryOption(Deal):
     def generate(self, shared, time_grid, deal_data):
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
 
-        payoff_currency = self.payoff_ccy
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
         fx_rep = utils.calc_fx_cross(
             deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
@@ -2757,11 +2766,12 @@ class EquityBinaryOption(Deal):
         fx_rep = utils.calc_fx_cross(
             deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
 
+        strike = deal_data.Factor_dep['Strike_Price'] * shared.one
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
         forward = utils.calc_eq_forward(
             deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
             deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
-        moneyness = pricing.calc_moneyness(deal_data.Factor_dep['Strike_Price'], spot, forward, deal_data)
+        moneyness = pricing.calc_moneyness(strike, spot, forward, deal_data)
 
         mtm = pricing.pv_european_option(
             shared, time_grid, deal_data, self.field['Cash_Payoff'], moneyness, forward, binary=True) * fx_rep
@@ -2844,11 +2854,12 @@ class EquityOptionDeal(Deal):
         fx_rep = utils.calc_fx_cross(
             deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
 
+        strike = deal_data.Factor_dep['Strike_Price'] * shared.one
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
         forward = utils.calc_eq_forward(
             deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
             deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
-        moneyness = pricing.calc_moneyness(deal_data.Factor_dep['Strike_Price'], spot, forward, deal_data)
+        moneyness = pricing.calc_moneyness(strike, spot, forward, deal_data)
 
         if deal_data.Factor_dep['Option_Style'] == 'European':
             mtm = pricing.pv_european_option(
@@ -2989,11 +3000,12 @@ class QEDI_CustomAutoCallSwap(Deal):
         fx_rep = utils.calc_fx_cross(
             deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
 
+        strike = deal_data.Factor_dep['Strike_Price'] * shared.one
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
         forward = utils.calc_eq_forward(
             deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
             deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
-        moneyness = pricing.calc_moneyness(deal_data.Factor_dep['Strike_Price'], spot, forward, deal_data)
+        moneyness = pricing.calc_moneyness(strike, spot, forward, deal_data)
 
         if spot.shape[0] == deal_time.shape[0]:
             mtm = pricing.pv_MC_AutoCallSwap(
