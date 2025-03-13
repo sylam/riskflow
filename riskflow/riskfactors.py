@@ -255,12 +255,13 @@ class Factor2D(object):
                     alpha_r = atm_vol + D * ((s - beta_r) + D * (R - gamma_r))
 
                     regions = [
-                        lambda x: np.ones_like(x) * (alpha + C * (beta * (1.0 + lam) + gamma * (1.0 + lam) ** 2 * C)),
-                        lambda x: alpha + x * (beta + gamma * x),
+                        lambda x: np.ones_like(x) * (alpha + C * (beta * (1.0 + lam) + gamma * (1.0 + lam) ** 2 * C)) if lam else atm_vol + C * (s + L * C),
+                        lambda x: alpha + x * (beta + gamma * x) if lam else atm_vol + C * (s + L * C),
                         lambda x: atm_vol + x * (s + L * x),
                         lambda x: atm_vol + x * (s + R * x),
-                        lambda x: alpha_r + x * (beta_r + gamma_r * x),
-                        lambda x: np.ones_like(x) * (alpha_r + D * (beta_r * (1.0 + rho) + gamma_r * (1.0 + rho) ** 2 * D))
+                        lambda x: alpha_r + x * (beta_r + gamma_r * x) if rho else atm_vol + D * (s + R * D),
+                        lambda x: np.ones_like(x) * (alpha_r + D * (
+                                beta_r * (1.0 + rho) + gamma_r * (1.0 + rho) ** 2 * D)) if rho else atm_vol + D * (s + R * D)
                     ]
 
                     conditions = [

@@ -1542,14 +1542,18 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
             shared.t_Buffer[skew_key] = (gamma, beta, alpha, gamma_r, beta_r, alpha_r)
 
         gamma, beta, alpha, gamma_r, beta_r, alpha_r = shared.t_Buffer[skew_key]
+        lam_ok = lam.all()
+        rho_ok = rho.all()
 
-        # the 6 regions of the skew
-        r1 = torch.ones_like(x) * (alpha + C * (beta * (1.0 + lam) + gamma * (1.0 + lam) ** 2 * C))
-        r2 = alpha + x * (beta + gamma * x)
+        # the 6 regions of the skew - check for 0 lam and rho - hold flat
+        r1 = torch.ones_like(x) * (
+            (alpha + C * (beta * (1.0 + lam) + gamma * (1.0 + lam) ** 2 * C)) if lam_ok else (atm_vol + C * (s + L * C)))
+        r2 = alpha + x * (beta + gamma * x) if lam_ok else atm_vol + C * (s + L * C)
         r3 = atm_vol + x * (s + L * x)
         r4 = atm_vol + x * (s + R * x)
-        r5 = alpha_r + x * (beta_r + gamma_r * x)
-        r6 = torch.ones_like(x) * (alpha_r + D * (beta_r * (1.0 + rho) + gamma_r * (1.0 + rho) ** 2 * D))
+        r5 = alpha_r + x * (beta_r + gamma_r * x) if rho_ok else atm_vol + D * (s + R * D)
+        r6 = torch.ones_like(x) * (
+            (alpha_r + D * (beta_r * (1.0 + rho) + gamma_r * (1.0 + rho) ** 2 * D)) if rho_ok else (atm_vol + D * (s + R * D)))
 
         return torch.where(
             x <= (1 + lam) * C, r1,
@@ -1578,10 +1582,10 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
                 moneyness = torch.log(moneyness / atm_ref)
 
         if rate_code[FACTOR_INDEX_SubType][0] == 'Skew':
-            vol_prior = calc_skew(moneyness, index[0], surface['ATM_Vol'][index], surface['s'][index],
+            vol_prior = calc_skew(moneyness, tuple(index), surface['ATM_Vol'][index], surface['s'][index],
                                   surface['L'][index], surface['R'][index], surface['C'][index],
                                   surface['D'][index], surface['lam'][index], surface['rho'][index])
-            vol_post = calc_skew(moneyness, index_next[0], surface['ATM_Vol'][index_next], surface['s'][index_next],
+            vol_post = calc_skew(moneyness, tuple(index_next), surface['ATM_Vol'][index_next], surface['s'][index_next],
                                   surface['L'][index_next], surface['R'][index_next], surface['C'][index_next],
                                   surface['D'][index_next], surface['lam'][index_next], surface['rho'][index_next])
             vol = vol_prior * (1 - alpha) + vol_post * alpha

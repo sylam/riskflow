@@ -638,6 +638,10 @@ mapping = {
                                         'Barrier_Monitoring_Frequency', 'Barrier_Price', 'Barrier_Type_One',
                                         'Option_Payment_Timing', 'Expiry_Date', 'FX_Volatility', 'Discount_Rate',
                                         'Currency'],
+            'EquityOneTouchOption.Fields': ['Payoff_Currency', 'Equity', 'Buy_Sell', 'Cash_Payoff', 'Payoff_Type',
+                                        'Barrier_Monitoring_Frequency', 'Barrier_Price', 'Barrier_Type_One',
+                                        'Option_Payment_Timing', 'Expiry_Date', 'Equity_Volatility', 'Discount_Rate',
+                                        'Currency'],
             'FXBarrierOption.Fields': ['Underlying_Amount', 'Barrier_Monitoring_Frequency', 'Payoff_Currency',
                                        'Barrier_Price', 'Cash_Rebate', 'Strike_Price', 'Underlying_Currency',
                                        'Buy_Sell', 'Option_Type', 'Barrier_Type', 'Expiry_Date', 'FX_Volatility',
@@ -772,6 +776,8 @@ mapping = {
                 ['Admin', 'EquityOptionBase.Fields', 'EquityBarrierOption.Fields'],
             'EquityBarrierBinaryOption':
                 ['Admin', 'EquityOptionBase.Fields', 'EquityBarrierBinaryOption.Fields'],
+            'EquityOneTouchOption':
+                ['Admin', 'EquityOneTouchOption.Fields'],
             'EquityDiscreteExplicitAsianOption':
                 ['Admin', 'EquityOptionBase.Fields', 'EquityDiscreteExplicitAsianOption.Fields'],
             'FloatingEnergyDeal':

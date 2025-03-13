@@ -538,7 +538,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
     eta = BARRIER_DOWN if 'Down' in deal_data.Instrument.field['Barrier_Type'] else BARRIER_UP
     direction = BARRIER_OUT if 'Out' in deal_data.Instrument.field['Barrier_Type'] else BARRIER_IN
     barrier = deal_data.Instrument.field['Barrier_Price']
-    strike = shared.one * deal_data.Instrument.field['Strike_Price']
+    strike = deal_data.Instrument.field['Strike_Price']
     cash_rebate = deal_data.Instrument.field.get('Cash_Rebate', 0.0)
 
     nominal = factor_dep['Buy_Sell'] * (
@@ -560,7 +560,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
 
     expiry_years = factor_dep[expiry_years_key]
     forward = spot * torch.exp(b * expiry_years)
-    moneyness = calc_moneyness(strike, spot, forward, deal_data, use_forwards, invert_moneyness)
+    moneyness = calc_moneyness(shared.one * strike, spot, forward, deal_data, use_forwards, invert_moneyness)
 
     for index, (discount_block, spot_block, moneyness_block) in enumerate(
             utils.split_counts([discount, spot, moneyness], counts, shared)):
@@ -625,7 +625,7 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
     direction = BARRIER_OUT if 'Out' in deal_data.Instrument.field['Barrier_Type'] else BARRIER_IN
     buy_or_sell = 1.0 if deal_data.Instrument.field['Buy_Sell'] == 'Buy' else -1.0
     barrier = deal_data.Instrument.field['Barrier_Price']
-    strike = shared.one * deal_data.Instrument.field['Strike_Price']
+    strike = deal_data.Instrument.field['Strike_Price']
     cash_rebate = deal_data.Instrument.field['Cash_Rebate']
 
     # get the zero curve
@@ -639,7 +639,7 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
 
     expiry_years = factor_dep[expiry_years_key]
     forward = spot * torch.exp(b * expiry_years)
-    moneyness = calc_moneyness(strike, spot, forward, deal_data, use_forwards, invert_moneyness)
+    moneyness = calc_moneyness(shared.one * strike, spot, forward, deal_data, use_forwards, invert_moneyness)
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     if factor_dep.get('Check_Payoff_Type', False):
@@ -726,7 +726,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
 
     expiry_years = factor_dep[expiry_years_key]
     forward = spot * torch.exp(b * expiry_years)
-    moneyness = calc_moneyness(barrier, spot, forward, deal_data, use_forwards, invert_moneyness)
+    moneyness = calc_moneyness(shared.one * barrier, spot, forward, deal_data, use_forwards, invert_moneyness)
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     if factor_dep.get('Check_Payoff_Type', False):
@@ -766,7 +766,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
                 muroot = mu * root_tau
                 d1 = muroot - barrovert
                 d2 = -muroot - barrovert
-                payoff = torch.exp(-r_t * expiry_years) * 0.5 * (
+                payoff = torch.exp(-r_t * exp) * 0.5 * (
                         torch.erfc(eta_scale * d1) + torch.exp(2.0 * mu * log_vol) * torch.erfc(eta_scale * d2))
 
             elif deal_data.Instrument.field['Payment_Timing'] == 'Touch':
@@ -818,7 +818,7 @@ def pv_partial_barrier_option(shared, time_grid, deal_data, nominal,
     phi = OPTION_CALL if deal_data.Instrument.field['Option_Type'] == 'Call' else OPTION_PUT
     buy_or_sell = 1.0 if deal_data.Instrument.field['Buy_Sell'] == 'Buy' else -1.0
     barrier = deal_data.Instrument.field['Barrier_Price']
-    strike = shared.one * deal_data.Instrument.field['Strike_Price']
+    strike = deal_data.Instrument.field['Strike_Price']
     # get the zero curve
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time[:-1], shared)
 
@@ -826,7 +826,7 @@ def pv_partial_barrier_option(shared, time_grid, deal_data, nominal,
     limit = daycount_fn(tau1)
     need_spot_at_expiry = deal_time.shape[0] - expiry.size
     spot_prior, spot_at = torch.split(spot, (expiry.size, need_spot_at_expiry))
-    moneyness = strike / spot_prior if invert_moneyness else spot_prior / strike
+    moneyness = calc_moneyness(shared.one * strike, spot_prior, spot_prior, deal_data, False, invert_moneyness)
     sigma = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
     if factor_dep['Barrier_Monitoring']:
