@@ -1578,7 +1578,7 @@ def calc_moneyness_vol_rate(moneyness, expiry, key_code, shared):
             moneyness = 0.0 * shared.one
         else:
             if rate_code[FACTOR_INDEX_SubType][1] == 'Sticky_Strike':
-                atm_ref = surface['ATM_Ref'][index] * (1 - alpha) + surface['ATM_Ref'][index] * alpha
+                atm_ref = surface['ATM_Ref'][index] * (1 - alpha) + surface['ATM_Ref'][index_next] * alpha
                 moneyness = torch.log(moneyness / atm_ref)
 
         if rate_code[FACTOR_INDEX_SubType][0] == 'Skew':

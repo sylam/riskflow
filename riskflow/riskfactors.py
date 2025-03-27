@@ -1042,8 +1042,13 @@ class FXVol(Factor2D):
 
 class EquityPriceVol(Factor2D):
     field_desc = ('FX and Equity',
-                  ['- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat',
-                   'extrapolated and linearly interpolated. All Floats.'
+                  ['- **Surface Type**: Can be either "Explicit", "SVI" or "Skew"',
+                   '- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat'
+                   'extrapolated and linearly interpolated. All Floats. Only used if Surface Type is Explicit',
+                   '- **ATM_Ref**: Used by Skew and SVI surfaces',
+                   '- **ATM_Vol**: Used by Skew and SVI surfaces',
+                   '- SVI Parameters - *a*, *b*, *rho*, *m*, *sigma*',
+                   '- Skew Parameters - *s*, *L*, *R*, *C*, *D*, *lam*, *rho*'
                    ])
 
     def __init__(self, param):

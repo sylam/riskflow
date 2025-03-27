@@ -531,38 +531,47 @@ class Credit_Monte_Carlo(Calculation):
         '',
         '### Funding Valuation Adjustment',
         '',
-        'Posting (or recieving) collateral can imply a funding cost (or benefit) when there is a spread between a',
-        'party\'s interal cost of funding and the contractual interest rate paid on the collateral balance. The',
-        'discounted expectation of this cost (or benefit) summed across all time horizons and scenarios constitutes',
+        'Not Posting (or receiving) collateral can imply a funding cost (or benefit) when there is a spread between a',
+        'party\'s interal cost of funding and the rate that would be recieved should the counterparty place collateral.'
+        'The discounted expectation of this cost (or benefit) summed across all time horizons and scenarios constitutes',
         'a funding value adjustment and can be expressed as:',
         '',
-        '$$\\frac{1}{m}\\sum_{j=1}^m \\sum_{k=0}^{T-1} B_j(t_k)S_j(t_k)\\Big(\\frac{D_j^c(t_k,t_{k+1})}'
-        '{D_j^f(t_k,t_{k+1})}-1\\Big)D_j^c(0,t_k),$$',
+        '$$FCA=\\int_{0}^{T} \\Bbb{E}\\Big(max(V(t),0)[f_{fc,C}(t)-f_{rf,C}(t)]SP_C(t)\\Big)dt$$'
+        '$$FBA=\\int_{0}^{T} \\Bbb{E}\\Big(min(V(t),0)[f_{fb,C}(t)-f_{rf,C}(t)]SP_C(t)\\Big)dt$$'
         '',
         'where',
         '',
-        '- $B_j(t)$ is the number of units of the collateral portfolio for scenario $j$ at time $t$',
-        '- $S_j(t)$ is the base currency value of one unit of the collateral asset for scenario $j$ at time $t$',
-        '- $D_j^c(t)$ is the discount rate for the collateral rate at time t for scenario $j$',
-        '- $D_j^f(t)$ is the discount rate for the funding rate at time t for scenario $j$',
+        '- $T$ is the exposure horizon',
+        '- $V(t)$ is the deflated funding profile at time $t$',
+        '- $f_{fc,C}(t)$ and $f_{fb,C}(t)$ is the funding cost and benefit spreads respectively',
+        '- $f_{rf,C}(t)$ is the risk-free rate',
+        '- $SP_C(t)$ is the survival probability of the Counterparty.',
         '',
-        'Note that only cash collateral is supported presently although this can be extended.'
+        'FVA against the counterparty is then calculated as $FVA = FCA + FBA$',
         '',
-        'Calculation parameters are extended from the Base Valuation with these new fields:'
+        'At the bank wide level the $FCA$ and $FBA$ is calculated as:'
         '',
-        '- **Deflation Interest Rate** - the interest rate price factor to PV the exposure to today',
-        '- **Simulation Batches** - Number of batches to run (each batch is of size **Batch Size**)',
-        '- **Batch Size** - The number of simulations per batch. Smaller Batch sizes are more likely to fit in memory.',
-        '  This needs to be balances with speed - larger batch sizes will run quicker. Total simulations is given by '
-        '  **Simulation Batches** * **Batch Size**. Note that **Batch Size** is usually a power of 2.'
-        '- **Antithetic** - Use antithethic variables - we run twice the number of simulations using the negative of ',
+        '$$FCA_{bank}=\\int_{0}^{T} \\Bbb{E}\\Bigg(max\\Big(\\sum_i V(t)SP_{Ci},0\\Big)[f_{fc,C}(t)-f_{rf,C}(t)]\\Bigg)dt$$'
+        '$$FBA_{bank}=\\int_{0}^{T} \\Bbb{E}\\Bigg(min\\Big(\\sum_i V(t)SP_{Ci},0\\Big)[f_{fb,C}(t)-f_{rf,C}(t)]\\Bigg)dt$$'
+        '',
+        'The idea is the same as defined above except that $i$, the counterparty index, sums over all uncollateralized ',
+        'or partially collateralized counterparties (one-way CSA or high threshold CSA).',
+        '',
+        'Calculation parameters are extended from the Base Valuation with these new fields:',
+        '',
+        ' - **Deflation Interest Rate** - the interest rate price factor to PV the exposure to today',
+        ' - **Simulation Batches** - Number of batches to run (each batch is of size **Batch Size**)',
+        ' - **Batch Size** - The number of simulations per batch. Smaller Batch sizes are more likely to fit in memory.'
+        '  This needs to be balanced with speed - larger batch sizes will run quicker.',
+        ' - **Simulation Batches** - Number of batches to run. Total number of sumulations is **Simulation Batches** * '
+        '**Batch Size**. Note that **Batch Size** is usually a power of 2.',
+        ' - **Antithetic** - Use antithethic variables - we run twice the number of simulations using the negative of ',
         '  the random sample for the second run',
-        '- **Calc Scenarios** - return the simulated price factors used in the calculation ',
-        '- **Dynamic Scenario Dates** - Generate scenarios not just on the **Base Time Grid**, but also on all potential ',
-        '  cashflow settlement dates. Needed to accurately calculate liquidity and settlement dynamics on collateralized ',
-        '  portfolios.'
-        '- **Generate Cashflows**',
-        '  return the simulated cashflows during the simulation period'
+        ' - **Calc Scenarios** - return the simulated price factors used in the calculation ',
+        ' - **Dynamic Scenario Dates** - Generate scenarios not just on the **Base Time Grid**, but also on all potential '
+        'cashflow settlement dates. Needed to accurately calculate liquidity and settlement dynamics on collateralized ',
+        'portfolios.',
+        ' - **Generate Cashflows** - returns the simulated cashflows during the simulation period'
     ])
 
     def __init__(self, config, **kwargs):

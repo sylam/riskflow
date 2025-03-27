@@ -426,7 +426,7 @@ def calc_vol_adjustment(factor_dep, deal_time, expiry, vols, shared):
     # None means get the ATM vol for this expiry (can change depending on the vol surface type)
     fx_vols = utils.calc_time_grid_vol_rate(factor_dep['FXVol'], None, expiry, shared)
 
-    # b_adj adjusts the carry on the forward, s_adj is to scale the forward direcyly (as a factor)
+    # b_adj adjusts the carry on the forward, s_adj is to scale the forward directly (as a factor)
     if 'QuantoImpliedCorrelation' in factor_dep:
         # quanto fx deal
         atm_vol = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], None, expiry, shared)
