@@ -160,6 +160,9 @@ class DealStructure(object):
                     continue
                 if structure.obj.Instrument.accum_dependencies and hasattr(shared, 'save_cashflows'):
                     shared.save_cashflows(structure.obj.Calc_res, time_grid)
+                if structure.obj.Instrument.field.get('Reference', 'root').startswith('FLIP'):
+                    logging.warning('Netting set starts with FLIP - inverting MTM')
+                    struct = -struct
                 accum += struct
 
         if self.dependencies and self.obj.Instrument.accum_dependencies:
@@ -1024,7 +1027,12 @@ class Credit_Monte_Carlo(Calculation):
                 shared_mem.t_Scenario_Buffer[key] = value.generate(shared_mem)
 
             # construct the valuations
+
+            # use these lines below to track down any issues that prevent gradients from flowing (debugging only)
+            # with torch.autograd.detect_anomaly():
             tensors['mtm'] = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
+            #    m = tensors['mtm'].mean()
+            #    m.backward()
 
             # is this the final run?
             final_run = run == self.params['Simulation_Batches'] - 1

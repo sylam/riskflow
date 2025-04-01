@@ -3000,12 +3000,12 @@ class QEDI_CustomAutoCallSwap(Deal):
         fx_rep = utils.calc_fx_cross(
             deal_data.Factor_dep['Payoff_Currency'], shared.Report_Currency, deal_time, shared)
 
-        strike = deal_data.Factor_dep['Strike_Price'] * shared.one
+        strike = deal_data.Factor_dep['Strike_Price']
         spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Equity'], deal_time, shared)
         forward = utils.calc_eq_forward(
             deal_data.Factor_dep['Equity'], deal_data.Factor_dep['Equity_Zero'],
             deal_data.Factor_dep['Dividend_Yield'], deal_data.Factor_dep['Expiry'], deal_time, shared)
-        moneyness = pricing.calc_moneyness(strike, spot, forward, deal_data)
+        moneyness = pricing.calc_moneyness(strike * shared.one, spot, forward, deal_data)
 
         if spot.shape[0] == deal_time.shape[0]:
             mtm = pricing.pv_MC_AutoCallSwap(

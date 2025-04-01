@@ -1240,6 +1240,8 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
         # if there is exactly 1 fixing per coupon date, then there is no averaging
         if factor_dep['no_averaging']:
+            # needed for numerical stability
+            eps = torch.finfo(shared.one.dtype).eps
             fx = isQuanto * (fixFXRate - 1.0) + 1.0
             mcmc = []
             for t, tau, df, s, v, carry_rate, delta_t, full_t, floating in zip(
@@ -1266,7 +1268,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                 # which simulations are still alive?
                 q = terminationDate != -1
                 # update the Live matrix
-                L[q[:, 0]] = 0.0
+                L = torch.where(q, torch.zeros_like(L), L)
                 # set the correct shapes for discounting and vols
                 D = df.unsqueeze(2)
                 vol = v.unsqueeze(1)
@@ -1290,25 +1292,26 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                             p = utils.norm_cdf(
                                 (torch.log(K / Sj) - (forward_carry - 0.5 * vol * vol) * dt) / vol_dt)
                         else:
-                            p = (K > Sj) * 1.0
+                            p = torch.where(K > Sj, 1.0, 0.0)
                             if tau == 0.0:
-                                terminationDate[(terminationDate == -1) & (p == 0)] = reduced_samples
+                                terminationDate = torch.where((terminationDate == -1) & (p == 0), reduced_samples, terminationDate)
 
                         P = P + fx * (1 - p) * L * coup * D[j]
                         L = p * L
 
                         if fixing_aligned:
+                            # prevent underflow or overflow
+                            safe_pu = torch.clamp(p * u[coupon_index], min=eps, max=1.0-eps)
+
                             Sj = Sj * (torch.exp(
                                 (forward_carry - 0.5 * vol * vol) * dt + vol_dt * utils.norm_icdf(
-                                    p * u[coupon_index])) if dt > 0 else 1.0)
-
+                                    safe_pu)) if dt > 0 else 1.0)
                             coupon_index += 1
                         else:
                             fixing_aligned = True
 
                     if barrier > 0:
-                        # don't like this - this is a discontinuity
-                        breach = 1.0 * (Sj <= putBarrier)
+                        breach = torch.where(Sj <= putBarrier, 1.0, 0.0)
                         P = P + L * D[j] * fx * breach * (rebate - (1.0 - Sj / strike))
 
                     if tau == 0.0:
@@ -1580,8 +1583,9 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         average = torch.sum(
             all_samples[:sample_index_t] * dual_samples.tn[:sample_index_t, utils.RESET_INDEX_Weight].reshape(-1, 1),
             dim=0)
-
-        strike_bar = factor_dep['Strike'] - average.reshape(1, -1).expand(counts[index], -1)
+        # strike_bar can be negative if the average is higher than the original strike price - need to clamp this.
+        strike_bar = torch.clamp(
+            factor_dep['Strike'] - average.reshape(1, -1).expand(counts[index], -1), min=1e-5)
         moneyness = calc_moneyness(
             strike_bar / normalize, spot_block, forward_block, deal_data, use_forwards, invert_moneyness)
         vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, tau, shared)
