@@ -374,7 +374,7 @@ class FxRate(Factor0D):
     """
     Represents the price of a currency relative to the base currency (snapped at end of day).
     """
-    field_desc = ('FX and Equity',
+    field_desc = ('Fx And Equity',
                   ['- **Interest_Rate**: String. Associated interest rate curve name.',
                    '- **Spot**:Float. Spot rate in base currency.'
                    ])
@@ -438,7 +438,7 @@ class EquityPrice(Factor0D):
     """
     This is just the equity price on a particular end of day
     """
-    field_desc = ('FX and Equity',
+    field_desc = ('Fx And Equity',
                   ['- **Currency**: String',
                    '- **Interest_Rate**: String representing the equity repo curve',
                    '- **Spot**:Spot rate in the specified *Currency*'])
@@ -587,7 +587,7 @@ class DividendRate(Factor1D):
     """
     Represents the Dividend Yield risk factor
     """
-    field_desc = ('FX and Equity',
+    field_desc = ('Fx And Equity',
                   ['- **Currency**: String.',
                    '- **Curve**: *Curve* object specifying the continuous dividend yield'])
 
@@ -1031,7 +1031,7 @@ class CommodityPriceVol(Factor2D):
 
 
 class FXVol(Factor2D):
-    field_desc = ('FX and Equity',
+    field_desc = ('Fx And Equity',
                   ['- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat',
                    'extrapolated and linearly interpolated. All Floats.'
                    ])
@@ -1041,7 +1041,7 @@ class FXVol(Factor2D):
 
 
 class EquityPriceVol(Factor2D):
-    field_desc = ('FX and Equity',
+    field_desc = ('Fx And Equity',
                   ['- **Surface Type**: Can be either "Explicit", "SVI" or "Skew"',
                    '- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat'
                    'extrapolated and linearly interpolated. All Floats. Only used if Surface Type is Explicit',

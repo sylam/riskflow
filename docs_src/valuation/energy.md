@@ -24,12 +24,12 @@ price curve more than once by simply averaging all prices within a reference pri
 not implemented. Currently, each reference price simply looks up a single forward price using the
 fixing curve mapping.
 
-#### Expectations
+### Expectations
 
 The risk-neutral expectation of a sampled price at time $t$ when the sampling date is before the
 forward price date is simply:
 
-$$\Bbb{E}_t (F(t^s,T^f))=F(t,T^f)$$.
+$$\Bbb{E}_t (F(t^s,T^f))=F(t,T^f)$$
 
 After the sampling date, we need to take the sample value into account and the expectation of a fixing
 price with $K$ samples in the past at time $t$ but with $M$ samples still in the future is:
@@ -43,19 +43,19 @@ $$ S^R(t,t_s^s,t_e^s,\mathcal S)=\frac{1}{K}\sum_{i=1}^K K_i F_i^f(t,T_i^f), $$
 where the weight $K_i$ of the $i^{th}$ fixing is given by the number of samples within the fixing
 period and $K$ is the normalization term $\sum_{i=1}^N K_i$.
 
-#### Sample Dates
+### Sample Dates
 
 The set of dates $\mathcal S$ used to compute the reference price is defined by the deal by using a
 **forward price sample** which can then specify business days according to a given calendar.
 
-#### Realized Averages
+### Realized Averages
 
 The realized average price is prorated according to the number of sample dates within the realized
 period (exactly as with unrealized samples). The currency depends on whether **FX Averaging** is
 selected or if the deal is a compo. If the deal is a compo, the realized average is in the
  **payoff currency**, otherwise, it's in the currency of the forward price.
 
-#### FX Averaging
+### FX Averaging
 
 When an energy deal is specified in a currency other than the price factor currency, each price
 sample must be converted to the native (deal) currency
@@ -86,6 +86,7 @@ For valuation date $t$, define $n$ to be the least index for which $t_{n+1}^s\gt
 $t_{N+1}^s=\infty$). Then $S^R(t,t_s^s,t_e^s,\mathcal S)-K=A-\bar K$, where
 
 $$A=\frac{1}{N}\sum_{i=n+1}^N F(t_i^s,T^f)$$
+
 $$\bar K=K-\frac{1}{N}\sum_{i=1}^n F(t_i^s,T^f)$$
 
 If $F_i$ denotes $F(t_i^s,T_i^f)$ ($t_i^s$ is the $i^{th}$ sampling date in the reference period and
@@ -98,7 +99,7 @@ and $\sigma_i^2 (t_i^s-t)$ is the standard deviation of $\log F_i$.
 
 The standard deviation of $A$ at time $t$ (with $t\le T$) is then given by
 
-$$w(t,T,t_s^s,t_e^s,\mathcal S)^2=\log\Big(\frac{M_2}{M_1^2}\Big) $$
+$$w(t,T,t_s^s,t_e^s,\mathcal S)^2=\log\Big(\frac{M_2}{M_1^2}\Big)$$
 
 with $M_1$ and $M_2$ being the first and second moments given by:
 
@@ -117,41 +118,10 @@ moneyness $m$ (and $v=0$ for $u\lt t$).
 
 Spreads on top of reference prices and volatilities are not currently implemented.
 
-#### Composite Deals
+### Composite Deals
 
 Pricing energy composite (compo) deals requires the forward price in payoff currency $F(t,T)X(t,T)$ 
 with the compo-adjusted volatility $\sqrt{\sigma_S^2+\sigma_X^2+2\rho\sigma_S\sigma_x}$ used at
 each sampling date for both the reference price and reference price volatility (during moment matching)
 respectively. The deal currency and the payoff currency must be the same with the **Realized Average**
 expressed in payoff currency.
-
----
-
-
-## EnergySingleOption
-
-A European option on an energy forward contract can be priced using the Black model with a volatility derived
-using the moment matching approach described earlier. Consider a European option with a reference price
-$S^R(t,t_s^s,t_e^s,\mathcal S)$, where $t_s^s$ is the usual start of the sampling period and $t_e^s$ is the
-end of the period and also the expiry date of the option. The value of the option with strike $K$ and
-settlement date $T$ is
-
-$$\mathcal B_\delta (S^R(t,t_s^s,t_e^s,\mathcal S),K,w(t,t_e^s,t_s^s,t_e^s,\mathcal S))D(t,T)$$
-
-where $w(t,t_e^s,t_s^s,t_e^s,\mathcal S)$ is the standard deviation of $S^R(t,t_s^s,t_e^s,\mathcal S)$
-and $\mathcal B_\delta$ is the Black formula.
-
-## FixedEnergyDeal
-
-The time $t$ value of a fixed energy cashflow paid at $T$ indexed to volume $V$ of energy at a fixed price $K$ is
-
-$$V K D(t,T)$$
-
-## FloatingEnergyDeal
-
-The time $t$ value of an energy cashflow paid at $T$ indexed to volume $V$ of energy at a price determined by
-the reference price $S^R$ is
-
-$$V (A S^R(t,t_s^s,t_e^s,\mathcal S)+b)D(t,T)$$
-
-where $A$ is the **Price Multiplier** and $b$ is the **Fixed Basis**.

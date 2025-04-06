@@ -499,11 +499,13 @@ class NettingCollateralSet(Deal):
                       'then the portfolio value at $t$ includes cash paid on $t$ and hence:',
                       '',
                       '$$C_r(t)=\\sum_{t_j<t}\\sum_i X_i(t_j)\\max(0,C^i(t_j))$$',
+                      '',
                       '$$C_p(t)=\\sum_{t_j<t}\\sum_i X_i(t_j)\\max(0,-C^i(t_j))$$',
                       '',
                       'Otherwise (when **Exclude Paid Today** is **Yes**):',
                       '',
                       '$$C_r(t)=\\sum_{t_j\\le t}\\sum_i X_i(t_j)\\max(0,C^i(t_j))$$',
+                      '',
                       '$$C_p(t)=\\sum_{t_j\\le t}\\sum_i X_i(t_j)\\max(0,-C^i(t_j))$$',
                       '',
                       '#### Settlement risk mechanics',
@@ -1269,7 +1271,7 @@ class FXNonDeliverableForward(Deal):
                      'Sell_Currency': ['FxRate'],
                      'Settlement_Currency': ['FxRate']}
 
-    documentation = ('FX and Equity',
+    documentation = ('Fx And Equity',
                      ['An FX non-deliverable forward effectively an FX Forward deal that is cash settled in a',
                       '(potentially) third currency. The deal pays',
                       '',
@@ -1360,7 +1362,7 @@ class FXSwapDeal(Deal):
                      'Near_Sell_Far_Buy_Ccy': ['FxRate'],
                      'Near_Sell_Far_Buy_Discount_Rate': ['DiscountRate']}
 
-    documentation = ('FX and Equity', [
+    documentation = ('Fx And Equity', [
         'An FX swap is a combination of an FX forward deal with near settlement date $t_1$ and',
         'an FX forward deal in the opposite direction with far settlement date $t_2$, where $t_1 < t_2$.',
         'The base-currency value of the FX swap at time $t$, $t \\le t_1$, is',
@@ -1466,7 +1468,7 @@ class FXForwardDeal(Deal):
                      'Sell_Currency': ['FxRate'],
                      'Sell_Discount_Rate': ['DiscountRate']}
 
-    documentation = ('FX and Equity', [
+    documentation = ('Fx And Equity', [
         'An FX forward is an agreement to buy an amount $A$ of one currency in exchange for an amount $B$ of another currency at settlement date $T$.',
         'The value of the deal in base currency at time $t$, ($t \\le T$), is',
         '',
@@ -2004,7 +2006,7 @@ class CapDeal(Deal):
                      'Discount_Rate_Volatility': ['InterestRateVol', 'InterestYieldVol']}
 
     documentation = (
-        'Interest Rates', ['A series of caplets as described [here](#floating-interest-cashflows)'])
+        'Interest Rates', ['A series of caplets as described [here](#capletsfloorlets)'])
 
     def __init__(self, params, valuation_options):
         super(CapDeal, self).__init__(params, valuation_options)
@@ -2085,7 +2087,7 @@ class FloorDeal(Deal):
                      'Discount_Rate_Volatility': ['InterestRateVol', 'InterestYieldVol']}
 
     documentation = (
-        'Interest Rates', ['A series of floorlets as described [here](#floating-interest-cashflows)'])
+        'Interest Rates', ['A series of floorlets as described [here](#capletsfloorlets)'])
 
     def __init__(self, params, valuation_options):
         super(FloorDeal, self).__init__(params, valuation_options)
@@ -2408,7 +2410,7 @@ class FXDiscreteExplicitAsianOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'FX_Volatility': ['FXVol']}
 
-    documentation = ('FX and Equity', ['A path independent option described [here](#discrete-asian-options)'])
+    documentation = ('Fx And Equity', ['A path independent option described [here](#discrete-asian-options)'])
 
     def __init__(self, params, valuation_options):
         super(FXDiscreteExplicitAsianOption, self).__init__(params, valuation_options)
@@ -2473,7 +2475,7 @@ class FXDiscreteExplicitDoubleAsianOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'FX_Volatility': ['FXVol']}
 
-    documentation = ('FX and Equity', ['A path independent option described [here](#discrete-double-asian-options)'])
+    documentation = ('Fx And Equity', ['A path independent option described [here](#discrete-double-asian-options)'])
 
     def __init__(self, params, valuation_options):
         super(FXDiscreteExplicitDoubleAsianOption, self).__init__(params, valuation_options)
@@ -2543,7 +2545,7 @@ class EquityDiscreteExplicitAsianOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity', ['A path independent option described [here](#discrete-asian-options)'])
+    documentation = ('Fx And Equity', ['A path independent option described [here](#discrete-asian-options)'])
 
     def __init__(self, params, valuation_options):
         super(EquityDiscreteExplicitAsianOption, self).__init__(params, valuation_options)
@@ -2618,7 +2620,7 @@ class EquityBarrierBinaryOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity', ['A vanilla option described [here](Definitions#european-options)'])
+    documentation = ('Fx And Equity', ['A vanilla option described [here](definitions.md#european-options)'])
 
     def __init__(self, params, valuation_options):
         super(EquityBarrierBinaryOption, self).__init__(params, valuation_options)
@@ -2714,7 +2716,7 @@ class EquityBinaryOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity', ['A vanilla option described [here](Definitions#european-options)'])
+    documentation = ('Fx And Equity', ['A vanilla option described [here](definitions.md#european-options)'])
 
     def __init__(self, params, valuation_options):
         super(EquityBinaryOption, self).__init__(params, valuation_options)
@@ -2787,7 +2789,7 @@ class EquityOptionDeal(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity', ['A vanilla option described [here](Definitions#european-options)'])
+    documentation = ('Fx And Equity', ['A vanilla option described [here](./definitions#european-options)'])
 
     def __init__(self, params, valuation_options):
         super(EquityOptionDeal, self).__init__(params, valuation_options)
@@ -2879,7 +2881,7 @@ class QEDI_CustomAutoCallSwap(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity',
+    documentation = ('Fx And Equity',
                      ['An exotic Equity option described',
                       '[here](https://www.math.uni-frankfurt.de/~harrach/publications/StableDiffs.pdf).',
                       '',
@@ -3025,7 +3027,7 @@ class QEDI_CustomAutoCallSwap_V2(QEDI_CustomAutoCallSwap):
                      'Forecast_Rate': ['InterestRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity',
+    documentation = ('Fx And Equity',
                      ['An exotic Equity option described',
                       '[here](https://www.math.uni-frankfurt.de/~harrach/publications/StableDiffs.pdf).',
                       '',
@@ -3092,7 +3094,7 @@ class EquityOneTouchOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity', [
+    documentation = ('Fx And Equity', [
         'A path dependent Equity Option described [here](#one-touch-and-no-touch-binary-options-and-rebates)'])
 
     def __init__(self, params, valuation_options):
@@ -3209,7 +3211,7 @@ class EquityBarrierOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity', ['A path dependent option described [here](#single-barrier-options)'])
+    documentation = ('Fx And Equity', ['A path dependent option described [here](#single-barrier-options)'])
 
     def __init__(self, params, valuation_options):
         super(EquityBarrierOption, self).__init__(params, valuation_options)
@@ -3416,7 +3418,7 @@ class EquityForwardDeal(Deal):
                      'Equity': ['EquityPrice', 'DividendRate'],
                      'Discount_Rate': ['DiscountRate']}
 
-    documentation = ('FX and Equity', ['Described [here](Definitions#forwards)'])
+    documentation = ('Fx And Equity', ['Described [here](definitions.md#forwards)'])
 
     def __init__(self, params, valuation_options):
         super(EquityForwardDeal, self).__init__(params, valuation_options)
@@ -3472,7 +3474,7 @@ class EquityDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Equity': ['EquityPrice']}
 
-    documentation = ('FX and Equity', ['Described [here](Definitions#forwards)'])
+    documentation = ('Fx And Equity', ['Described [here](definitions.md#forwards)'])
 
     def __init__(self, params, valuation_options):
         super(EquityDeal, self).__init__(params, valuation_options)
@@ -3513,7 +3515,7 @@ class EquitySwapletListDeal(Deal):
                      'Equity': ['EquityPrice', 'DividendRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('FX and Equity', ['Described [here](#equity-swaps)'])
+    documentation = ('Fx And Equity', ['Described [here](#equity-swaps)'])
 
     def __init__(self, params, valuation_options):
         super(EquitySwapletListDeal, self).__init__(params, valuation_options)
@@ -3572,7 +3574,7 @@ class EquitySwapLeg(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity': ['EquityPrice', 'DividendRate']}
 
-    documentation = ('FX and Equity', ['Described [here](#equity-swaps)'])
+    documentation = ('Fx And Equity', ['Described [here](#equity-swaps)'])
 
     def __init__(self, params, valuation_options):
         super(EquitySwapLeg, self).__init__(params, valuation_options)
@@ -3673,7 +3675,7 @@ class FXOneTouchOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'FX_Volatility': ['FXVol']}
 
-    documentation = ('FX and Equity', [
+    documentation = ('Fx And Equity', [
         'A path dependent FX Option described [here](#one-touch-and-no-touch-binary-options-and-rebates)'])
 
     def __init__(self, params, valuation_options):
@@ -3778,7 +3780,7 @@ class FXBarrierOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'FX_Volatility': ['FXVol']}
 
-    documentation = ('FX and Equity', ['A path dependent FX Option described [here](#single-barrier-options)'])
+    documentation = ('Fx And Equity', ['A path dependent FX Option described [here](#single-barrier-options)'])
 
     def __init__(self, params, valuation_options):
         super(FXBarrierOption, self).__init__(params, valuation_options)
@@ -3878,7 +3880,7 @@ class FXPartialTimeBarrierOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'FX_Volatility': ['FXVol']}
 
-    documentation = ('FX and Equity', ['A partial path dependent FX Option described [here](#partial-barrier-options)'])
+    documentation = ('Fx And Equity', ['A partial path dependent FX Option described [here](#partial-barrier-options)'])
 
     def __init__(self, params, valuation_options):
         super(FXPartialTimeBarrierOption, self).__init__(params, valuation_options)
@@ -3965,7 +3967,7 @@ class FXTARFOptionDeal(Deal):
                      'FX_Volatility': ['FXVol']}
 
     documentation = (
-        'FX and Equity', ['A Monte Carlo Priced FX instrument described [here](Definitions#european-options)'])
+        'Fx And Equity', ['A Monte Carlo Priced FX instrument described [here](./definitions#european-options)'])
 
     def __init__(self, params, valuation_options):
         super(FXTARFOptionDeal, self).__init__(params, valuation_options)
@@ -4045,7 +4047,7 @@ class FXOptionDeal(Deal):
                      'FX_Volatility': ['FXVol']}
 
     documentation = (
-        'FX and Equity', ['A path independent vanilla FX Option described [here](Definitions#european-options)'])
+        'Fx And Equity', ['A path independent vanilla FX Option described [here](./definitions#european-options)'])
 
     def __init__(self, params, valuation_options):
         super(FXOptionDeal, self).__init__(params, valuation_options)
@@ -4127,7 +4129,9 @@ class DealDefaultSwap(Deal):
                       'where $c$ is the fixed payment rate, $\\alpha_i$ is the day count accrual applicable and',
                       '',
                       '$$V_i(t)=\\frac{\\bar h_i}{f_i+\\bar h_i}\\Big((D(t,\\tilde t_{i-1})S(t,\\tilde t_{i-1})-D(t,\\tilde t_i)S(t,\\tilde t_i)\\Big)$$',
+                      '',
                       '$$\\bar h_i=\\frac{1}{\\tilde t_i-\\tilde t_{i-1}}\\log\\Big(\\frac{S(t,\\tilde t_{i-1})}{S(t,\\tilde t_i)}\\Big)$$',
+                      '',
                       '$$f_i=\\frac{1}{\\tilde t_i-\\tilde t_{i-1}}\\log\\Big(\\frac{D(t,\\tilde t_{i-1})}{D(t,\\tilde t_i)}\\Big)$$',
                       '',
                       'Note that this is further approximated by',

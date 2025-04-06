@@ -491,7 +491,7 @@ class CSForwardPriceModelParameters(object):
 
 class GBMAssetPriceTSModelParameters(object):
     documentation = (
-        'FX and Equity',
+        'Fx And Equity',
         ['For Risk Neutral simulation, an integrated curve $\\bar{\\sigma}(t)$ needs to be specified and is',
          'interpreted as the average volatility at time $t$. This is typically obtained from the corresponding',
          'ATM volatility. This is then used to construct a new variance curve $V(t)$ which is defined as',
@@ -926,15 +926,17 @@ scipy.optimize.leastsq.html) are used.',
          '$$dr(t)=r_T(0,t)dt+\\sum_{i=1}^2 (\\theta_i(t)-\\alpha_i x_i(t)- \\bar\\rho_i\\sigma_i v(t))dt+\\sigma_i dW_i(t)$$',
          '',
          'where $W_1(t),W_2(t)$ and $W(t)$ are standard Wiener processes under the rate currency\'s risk neutral measure',
-         'and $r_T(t,T)$ is the partial derivative of the instantaneous forward rate r(t,T) with respect to the maturity.',
+         'and $r_T(t,T)$ is the partial derivative of the instantaneous forward rate r(t,T) with respect to the maturity ',
          'date $T$.'
          '',
          'Define:',
+         '',
          '$$F(u,v)=\\frac{\\sigma_1u+\\sigma_2v}{\\sqrt{\\sigma_1^2+\\sigma_2^2+2\\rho\\sigma_1\\sigma_2}}$$',
          '',
          'Then $\\bar\\rho_1, \\bar\\rho_2$ are assigned:',
          '',
          '$$\\bar\\rho_1=F(1,\\rho)C$$',
+         '',
          '$$\\bar\\rho_2=F(\\rho,1)C$$',
          ]
     )

@@ -16,9 +16,12 @@ Single barrier options are priced with the formulas from Merton, Reiner and Rubi
 combination of the following formulas:
 
 $$ V_1(t)=AS(t)e^{(b-r)\tau}\Phi(\delta x_1)+Be^{-rt}\Phi(\delta x_1-\delta\sigma\sqrt\tau)$$
+
 $$ V_2(t)=AS(T)e^{(b-r)\tau}\Phi(\delta x_2)+Be^{-rt}\Phi(\delta x_2-\delta\sigma\sqrt\tau)$$
+
 $$ V_3(t)=AS(T)e^{(b-r)\tau}\Big(\frac{H}{S(t)}\Big)^{2(\mu+1)} \Phi(\eta y_1)+Be^{-r\tau}
 \Big(\frac{H}{S(t)}\Big)^{2\mu}\Phi(\eta y_1 - \eta\sigma\sqrt\tau)$$
+
 $$ V_4(t)=AS(T)e^{(b-r)\tau}\Big(\frac{H}{S(t)}\Big)^{2(\mu+1)} \Phi(\eta y_2)+Be^{-r\tau}
 \Big(\frac{H}{S(t)}\Big)^{2\mu}\Phi(\eta y_2 - \eta\sigma\sqrt\tau)$$
 
@@ -36,8 +39,11 @@ $$ V_4(t)=AS(T)e^{(b-r)\tau}\Big(\frac{H}{S(t)}\Big)^{2(\mu+1)} \Phi(\eta y_2)+B
 Where $\mu= {(b-\sigma}^2/2)/\sigma^2, \eta=+1$ for down options or $\eta=-1$ for up options, and
 
 $$ x_1=\frac{1}{\sigma\sqrt\tau}\log\Big(\frac{S(t)}{K}\Big)+(1+\mu)\sigma\sqrt\tau$$
+
 $$ x_2=\frac{1}{\sigma\sqrt\tau}\log\Big(\frac{S(t)}{H}\Big)+(1+\mu)\sigma\sqrt\tau$$
+
 $$ y_1=\frac{1}{\sigma\sqrt\tau}\log\Big(\frac{H^2}{S(t)K}\Big)+(1+\mu)\sigma\sqrt\tau$$
+
 $$ y_2=\frac{1}{\sigma\sqrt\tau}\log\Big(\frac{H}{S(t)}\Big)+(1+\mu)\sigma\sqrt\tau$$
 
 ### One touch and No touch Binary Options and Rebates
@@ -63,11 +69,11 @@ minus the value of the no-touch option. If it pays 1 when $S$ touches the barrie
 
 $$\Big(\frac{H}{S(t)}\Big)^{\mu+\lambda}\Phi(\eta z)+\Big(\frac{H}{S(t)}\Big)^{\mu-\lambda}
 \Phi(\eta z-2\eta\lambda\sigma\sqrt\tau))$$
-\Phi(\eta z-2\eta\lambda\sigma\sqrt\tau))$$
 
 with
 
 $$z=\frac{1}{\sigma\sqrt\tau}\log\Big(\frac{H}{S(t)}\Big)+\lambda\sigma\sqrt\tau$$
+
 $$\lambda=\sqrt{\mu^2+\frac{2r}{\sigma^2}}$$
 
 Note that $r$ should be floored at $\frac{-(b/\sigma-\sigma/2)^2}{2}$ for $\lambda$ to be defined.
@@ -76,7 +82,7 @@ One touch and no touch options have strike $H$.
 ### Discontinuous Barrier Sampling
 
 Assuming that barriers are not monitored continuously, an adjustment needs to be made to compensate
-for discrete sampling. The adjustment is that of Broadie, Glasserman and Kou.
+for discrete sampling. The adjustment is that of [Broadie, Glasserman and Kou.](http://www.columbia.edu/~sk75/mfBGK.pdf)
 
 If the barrier is above the asset, the adjusted barrier rate is $He^{\beta\sigma\sqrt\delta}$
 where $\delta$ is the period between observations and $\beta$ is the constant defined by:
@@ -107,8 +113,9 @@ $\omega_i=d_i/D$, and $\bar K$ is the adjusted strike:
 
 $$\bar K=K-\sum_{i=1}^m \omega_i S(t_i).$$
 
-The expectation of $S(t_i)$ under the risk-neutral measure is the forward price $F(t,t_i)$ with the
-expectation of $A$ given by:
+Note that the value of $\bar K$ is clipped to be $>0$ should this value be negative (e.g. small 
+original strike and large sample paths).The expectation of $S(t_i)$ under the risk-neutral measure 
+is the forward price $F(t,t_i)$ with the expectation of $A$ given by:
 
 $$F=\Bbb{E}_t(A)=\sum_{i=m+1}^n \omega_i F(t,t_i).$$
 
@@ -189,94 +196,3 @@ and/or the simulated spot and forward prices along the current scenario path
 **Dividend Timing** is assumed to be **Terminal** i.e. the swaplet pays $\frac{AbH(t_0,t_1)}{S(t_0)^a}$
 at time $T$. Dividend timing could also be continuous (i.e. the dividends are settled on their dividend
 dates) but that is not currently implemented.
-
----
-
-
-## EquityBarrierOption
-
-A path dependent option described [here](#single-barrier-options)
-
-## EquityDiscreteExplicitAsianOption
-
-A path independent option described [here](#discrete-asian-options)
-
-## EquityForwardDeal
-
-Described [here](Definitions#forwards)
-
-## EquityOptionDeal
-
-A vanilla option described [here](Definitions#european-options)
-
-## EquitySwapLeg
-
-Described [here](#equity-swaps)
-
-## EquitySwapletListDeal
-
-Described [here](#equity-swaps)
-
-## FXBarrierOption
-
-A path dependent FX Option described [here](#single-barrier-options)
-
-## FXDiscreteExplicitAsianOption
-
-A path independent option described [here](#discrete-asian-options)
-
-## FXForwardDeal
-
-An FX forward is an agreement to buy an amount $A$ of one currency in exchange for an amount $B$ of another currency at settlement date $T$.
-The value of the deal in base currency at time $t$, ($t \le T$), is
-
-$$A \tilde D(t,T) \tilde X(t)-BD(t,T)X(t)$$
-
-where
-
-- $D$ is the sell currency discount factor
-- $\tilde D$ is the buy currency discount factor
-- $X$ is the price of the sell currency in base currency
-- $\tilde X$ is the price of the buy currency in base currency
-
-## FXNonDeliverableForward
-
-An FX non-deliverable forward effectively an FX Forward deal that is cash settled in a
-(potentially) third currency. The deal pays
-
-$$A \tilde X(t)-BX(t)$$
-
-in **settlement currency** at the **settlement date** $T$ where:
-
-- $A$ is the buy currency
-- $B$ is the sell currency
-- $\tilde X(t)$ is the price of the buy currency in settlement currency
-- $X$ is the price of the sell currency in settlement currency
-
-The value of the deal in settlement currency at time $t$, ($t \le T$), is
-$$ \Big(A \tilde F(t,T)-BF(t,T)\Big)D(t,T),$$
-
-where:
-
-- $\tilde F(t,T)$ is the forward price of the buy currency in settlement currency
-- $F(t,T)$ is the forward price of the sell currency in settlement currency
-
-## FXOneTouchOption
-
-A path dependent FX Option described [here](#one-touch-and-no-touch-binary-options-and-rebates)
-
-## FXOptionDeal
-
-A path independent vanilla FX Option described [here](Definitions#european-options)
-
-## FXSwapDeal
-
-An FX swap is a combination of an FX forward deal with near settlement date $t_1$ and
-an FX forward deal in the opposite direction with far settlement date $t_2$, where $t_1 < t_2$.
-The base-currency value of the FX swap at time $t$, $t \le t_1$, is
-
-$$A_1 \tilde D(t,t_1) \tilde X(t)-B_1 D(t,t_1)X(t) + B_2 \tilde D(t,t_2) \tilde X(t)-A_2 D(t,t_2) \tilde X(t)$$
-
-where $A_1$ ($A_2$) is amount of the buy currency bought (sold) at $t_1$, ($t_2$), and $B_1$ ($B_2$)
-is amount of the sell currency sold (bought) at $t_1$ ($t_2$). Typically, $t_1$ is the spot
-settlement date and $A_2 = A_1$

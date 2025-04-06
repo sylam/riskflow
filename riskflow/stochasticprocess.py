@@ -408,6 +408,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
          'speed $\\alpha_i$ and market price of risk $\\lambda_i$.',
          '',
          'Final form of the model is:',
+         '',
          '$$ D(t,T) = \\frac{D(0,T)}{D(0,t)}exp\\Big(-\\frac{1}{2}\\sum_{i,j=1}^2\\rho_{ij}A_{ij}(t,'
          'T)-\\sum_{i=1}^2B_i(T-t)e^{-\\alpha_it}(Y_i(t) -\\tilde\\rho_i K_i(t) + \\lambda_i H_i('
          't))\\Big) $$',
@@ -431,8 +432,11 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
          '$0=t_0,t_1,t_2...$ corresponds to the simulation grid) is gaussian with zero mean and covariance',
          'Matrix $C_{ij}=\\rho_{ij}(J_{ij}(t_{k+1})-J_{ij}(t_k))$.',
          '',
-         'The cholesky decomposition of $C$ is $$L=\\begin{pmatrix} \\sqrt C_{11} & 0 \\\\ \\frac{C_{12}}{'
-         '\\sqrt C_{11}} & \\sqrt {C_{22}-\\frac{C_{12}^2}{C_{11}} } \\\\ \\end{pmatrix}$$',
+         'The cholesky decomposition of $C$ is',
+         '',
+         '$$L=\\begin{pmatrix} \\sqrt C_{11} & 0 \\\\ \\frac{C_{12}}{\\sqrt C_{11}} & \\sqrt {C_{22}',
+         '-\\frac{C_{12}^2}{C_{11}} } \\\\ \\end{pmatrix}$$',
+         '',
          'The increment is simulated using $LZ$ where $Z$ is a 2D vector of independent normals at',
          'time step $k$.'])
 
@@ -660,10 +664,10 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
         '',
         '- $B(t) = \\frac{(1-e^{-\\alpha t})}{\\alpha}, Y(t)=\\int\\limits_0^t e^{\\alpha s}\\sigma (s) dW$',
         '- $A(t,T)=\\frac{B(T-t)e^{-\\alpha T}}{\\alpha}(2I(t)-(e^{-\\alpha t}+e^{-\\alpha T})J(t))$',
-        '- $H(t) = \\int\\limits_0^t e^{\\alpha s}\\sigma (s)ds $',
-        '- $I(t) = \\int\\limits_0^t e^{\\alpha s}{\\sigma (s)}^2ds $',
-        '- $J(t) = \\int\\limits_0^t e^{2\\alpha s}{\\sigma (s)}^2ds $',
-        '- $K(t) = \\int\\limits_0^t e^{\\alpha s}v(s){\\sigma (s)}ds $',
+        '- $H(t) = \\int\\limits_0^t e^{\\alpha s}\\sigma (s)ds$',
+        '- $I(t) = \\int\\limits_0^t e^{\\alpha s}{\\sigma (s)}^2ds$',
+        '- $J(t) = \\int\\limits_0^t e^{2\\alpha s}{\\sigma (s)}^2ds$',
+        '- $K(t) = \\int\\limits_0^t e^{\\alpha s}v(s){\\sigma (s)}ds$',
         '',
         'The simulation of the random increment $Y(t_{k+1})-Y(t_k)$ (where $0=t_0,t_1,t_2,...$',
         'represents the simulation grid) is normal with zero mean and variance $J(t_{k+1})-J(t_k)$'])
@@ -879,10 +883,13 @@ class CSForwardPriceModel(StochasticProcess):
                       'e^{-\\alpha(T-t)}Y(t)\\Big)$$',
                       '',
                       'Where $Y$ is a standard Ornstein-Uhlenbeck Process with variance:',
+                      '',
                       '$$v(t) = \\frac{1-e^{-2\\alpha t}}{2\\alpha}$$',
                       '',
-                      'The spot rate is given by $$S(t)=F(t,t)=F(0,t)exp\\Big(\\mu t-\\frac{1}{2}\\sigma^2v(t)+'
-                      '\\sigma Y(t)\\Big)$$'])
+                      'The spot rate is given by',
+                      '',
+                      '$$S(t)=F(t,t)=F(0,t)exp\\Big(\\mu t-\\frac{1}{2}\\sigma^2v(t)+\\sigma Y(t)\\Big)$$',
+                      ''])
 
     def __init__(self, factor, param, implied_factor=None):
         super(CSForwardPriceModel, self).__init__(factor, param)
@@ -994,9 +1001,11 @@ class PCAInterestRateModel(StochasticProcess):
          'The stochastic process for the rate at each tenor on the interest rate curve is specified as:',
          '',
          '$$ dr_\\tau = r_\\tau ( u_\\tau  dt + \\sigma_\\tau dY )$$',
+         '',
          '$$ dY_t = -\\alpha Ydt + dZ$$',
          '',
          'with $dY$  a standard Ornstein-Uhlenbeck process and $dZ$ a Brownian motion. It can be shown that:',
+         '',
          '$$ Y(t) \\sim N(0, \\frac{1-e^{-2 \\alpha t}}{2 \\alpha})$$ ',
          '',
          'Currently, only the covarience matrix is used to define the eigenvectors with corresponding weight curves',
@@ -1018,9 +1027,14 @@ class PCAInterestRateModel(StochasticProcess):
          'To simulate the mean rate $R_\\tau(t)$ (note that $R_\\tau(0)=r_\\tau(0)$ ), there are 2 choices:',
          '',
          '**Drift To Forward** where the mean rate is the inital forward rate from $t$ to $t+\\tau$ so that',
-         '$$\\frac{D(0,t+\\tau)}{D(0,t)}=e^{R_\\tau(t)\\tau} $$',
+         '',
+         '$$\\frac{D(0,t+\\tau)}{D(0,t)}=e^{R_\\tau(t)\\tau}$$',
+         '',
          '**Drift To Blend** is a weighted average function of the current rate and a mean reversion level',
-         '$\\Theta_\\tau$ $$R_\\tau(t)=[e^{-\\alpha t}r_\\tau (0) + (1-e^{-\\alpha t})\\Theta_\\tau]$$',
+         '$\\Theta_\\tau$',
+         '',
+         '$$R_\\tau(t)=[e^{-\\alpha t}r_\\tau (0) + (1-e^{-\\alpha t})\\Theta_\\tau]$$',
+         ''
          ])
 
     def __init__(self, factor, param, implied_factor=None):

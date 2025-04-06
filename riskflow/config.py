@@ -196,7 +196,8 @@ class Context(object):
     reverse_offset = {'months': 'M', 'days': 'D', 'years': 'Y', 'weeks': 'W'}
 
     def __init__(self, base_currency='USD'):
-        self.deals = {'Deals': {'Children': []}}
+        self.file_ref = 'root'
+        self.deals = {'Deals': {'Children': []}, 'Calculation':{}, 'Attributes':{}}
         self.calibrations = {'CalibrationConfig': {'MarketDataArchiveFile': {}, 'Calibrations': []}}
         self.calendars = ElementTree(Element('Calendars'))
         self.holidays = {}

@@ -1,9 +1,9 @@
 Let $D(t,T)$ denote the discount factor for the discount rate and $D_f(t,T)$ the discount factor for
 the forecast rate. The currency of the discount rate must be the same as the settlement currency
 (**Currency**). Note that the currency of the forecast rate may in future be different to the
-settelment currency but is currently not implemented.
+settlement currency but is currently not implemented.
 
-The **Distrubution Type** on the volatility price factor can only be set to **Lognormal** currently.
+The **Distribution Type** on the volatility price factor can only be set to **Lognormal** currently.
 This assumes that the price factors are log-normally distributed (hence have implied *Black*
 volatilities). Note that this can be extended to **Normal** resulting in the price factor having
 implied *Bachelier* volatilities.
@@ -40,7 +40,7 @@ In addtion to the Fixed Interest Cashflow, a Floating Interest Cashflow also has
 The cashflow dates must satisfy $T_1\le T_2, t_0\le t_1\lt t_2$ and $t_0\le T$ and the payoff is
 $P(L(t_0)+m)\alpha$ with $L(t)$ is the simply-compounded forward rate at time $t$ given by
 
-$$L(t)=\frac{1}{\alpha_2}\Big(\frac{D_f(t,t_1)}{D_f(t,t_2)}-1\Big),$$
+$$L(t)=\frac{1}{\alpha_2}\Big(\frac{D_f(t,t_1)}{D_f(t,t_2)}-1\Big)$$
 
 where $\alpha_2$ is the accrual year fraction from $t_1$ to $t_2$ using the rate day count convention.
 
@@ -98,7 +98,7 @@ then $T=-\infty$. Cashflow payment dates must be after the settlement date ($T\l
 
 The time $t(>T)$ value of the deal is
 
-$$V(t)=U(t)\delta$$,
+$$V(t)=U(t)\delta$$
 
 where either $\delta=1$ for a **Buy**, else $\delta=-1$ for a **Sell**. If $t\le T$, the deal is
 treated as a forward contract on the underling cashflow list. If $A$ is the accrued interest up to 
@@ -129,7 +129,7 @@ where
 
 The final value of the cashflows with payment date $T_k$ is
 
-$$ \Big(\sum_{i=n(k-1)+1}^{n(k)}K_i+C_i\Big)D(t,T_k)$$
+$$\Big(\sum_{i=n(k-1)+1}^{n(k)}K_i+C_i\Big)D(t,T_k)$$
 
 #### Floating Compounding Cashflow Lists
 
@@ -143,97 +143,11 @@ The compounding method can be:
 **Include Margin** where the $i^{th}$ cashflow pays $P_i I_i(1+I_{i+1})...(1+I_{n(k)})+C_i$ at time
 $T_k$ with a value at $t\le T_k$ of
 
-$$ (P_i I_i(t)(1+I_{i+1}(t))...(1+I_{n(k)}(t))+C_i)D(t,T_k) $$
+$$(P_i I_i(t)(1+I_{i+1}(t))...(1+I_{n(k)}(t))+C_i)D(t,T_k)$$
 
 **Flat** where the $i^{th}$ cashflow pays $P_i I_i(1+J_{i+1})...(1+J_{n(k)})+C_i$ at time $T_k$ with
 $J_i=I_i-m_i\alpha_i$. Its value at $t\le T_k$ is
 
-$$ (P_i I_i(t)(1+J_{i+1}(t))...(1+J_{n(k)}(t))+C_i)D(t,T_k) $$
+$$(P_i I_i(t)(1+J_{i+1}(t))...(1+J_{n(k)}(t))+C_i)D(t,T_k)$$
 
 **None** in which case the $i^{th}$ cashflow pays $P_i I_i+C_i$ at time $T_k$.
-
-
----
-
-
-## CFFixedInterestListDeal
-
-A series of fixed interest cashflows as described [here](#fixed-interest-cashflows)
-
-## CFFloatingInterestListDeal
-
-A series of floating interest cashflows as described [here](#floating-interest-cashflows)
-
-## FixedCashflowDeal
-
-The time $t$ value of a fixed cashflow amount $C$ paid at time $T$ is $D(t,T)C$.
-
-## MtMCrossCurrencySwapDeal
-
-This currency swap adjusts the notional of one leg to capture any changes in the FX Spot rate
-since the last reset. At each reset, the principal of the adjusted leg is set to the principal
-of the unadjusted leg multiplied by the spot FX rate. MtM cross currency swaps are path
-dependent.
-
-The unadjusted leg is either a fixed or floating interest rate list and is valued as such,
-however, the floating adjusted leg is valued as
-
-$$\sum_{i=1}^n(P_i(t)(L_i(t)+m)\alpha_i+A_i(t))D(t,t_i),$$
-
-where
-
-- $A_i(t)=P_i(t)-P_{i+1}(t)$ for $i\lt n$ and $A_n(t)=P_n(t)$
-- $P_i(t)$ is the expected principal $P_i(t)=F(t,t_{i-1})\tilde P_i$,
-- $\tilde P_i$ is the unadjusted leg principal for the $i^{th}$ period.
-- $F(t,T)$ is the forward FX rate for settlement at time $T$.
-
-## SwaptionDeal
-
-Let $t_0, T_1$ and $T_2$ be the **Option Expiry Date**, **Swap Effective Date** and **Swap Maturity Date** respectively of the swaption deal ($t_0 \le T_1 \lt T2$). If the deal is
-cash settled, then let $T$ be the **Settlement Date**.
-
-The value of the underlying swap is
-
-$$U(t)=\delta(V_{float}(t)-V_{fixed}(t))$$
-
-where $V_{float}(t)$ is the value of floating interest rate cashflows, $V_{fixed}(t)$ the
-value of fixed interest cashflows and $\delta$ is either $+1$ for payer swaptions and $-1$
-for receiver swaptions.
-
-If the fixed leg has payments at times $t_2,...,t_n$, then the Present value of a Basis Point is
-
-$$F(t)=\sum_{i=2}^n P_i \alpha_i D(t,t_i)$$
-
-where $P_i$ is the principal amount and $\alpha_i$ is the accrual year fraction for the
-$i^{th}$ fixed interest cashflow. The forward swap rate is
-
-$$s(t)=\frac{V_{float}(t)}{F(t)}.$$
-
-Define the *effective* strike rate as
-
-$$K(t)=\frac{V_{fixed}(t)}{F(t)}$$
-
-Note that presently only zero-margin floating cashflow lists are supported (but this can be
-extended). The value of the underlying swap is given by $U(t)=\delta(s(t)-K(t))F(t)$. If
-both fixed and floating cashflows have the same payment and accrual dates, then $K(t)=r$
-where $r$ is the constant fixed rate on the fixed interest cashflow list.
-
-#### Physically Settled Swaptions
-
-If the **Settlement Style** is **Physical** and $U(t_0)\ge 0$, then the option holder
-receives the underlying swap and the value of the deal for $t\ge t_0$ is $U(t)$. Note that
-physical settlement has significant path dependency.
-
-#### Cash Settled Swaptions
-
-If the **Settlement Style** is **Cash**, then the option holder receives $\max(U(t_0),0)$
-on settlement date $T$. The value of the deal at $t\lt t_0$ is
-$F(t)\mathcal B_\delta(s(r),K(0),\sigma\sqrt{(t_0-t)})D(t_0,T)$. Note that this assumes a
-lognormal distribution of the forecast rate and uses the Black Model as usual.
-
-#### Swap Rate Volatility
-
-Forward starting (where the effective date of the underlying swap is several months or years
-after the option expiry) and  amortizing swaptions are not currently supported. This can be
-extended as needed. Otherwise, $\sigma$ is the volatility of the underlying rate at time $t$
-for expiry $t_0$, tenor $\tau=T_2-T_1$ and strike $K(0)$

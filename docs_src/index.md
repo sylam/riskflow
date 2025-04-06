@@ -1,7 +1,7 @@
 # Welcome to RiskFlow
 
 RiskFlow is a python framework for performing derivatives pricing and related quantitative finance
-by utilizing google's tensorflow library. Riskflow is designed to work either on CPU's or nvidia
+by utilizing Facebook's Pytorch library. Riskflow is designed to work either on CPU's or nvidia
 GPU's via [CUDA](https://developer.nvidia.com/cuda-zone).
 
 ## Features
@@ -9,7 +9,7 @@ GPU's via [CUDA](https://developer.nvidia.com/cuda-zone).
 * Fast prototyping and interactive scripting of new instruments in Python
 * Theoretical documentation for the pricing and simulation of financial derivatives
 * Monte Carlo simulation of a portfolio of trades through time allowing fast $XVA$ calculations
-* Automatic Derivatives for sensitivities calculation via tensorflow
+* Automatic Derivatives for sensitivities calculation via pytorch
 
 ## Motivation
 
@@ -37,8 +37,5 @@ refinement. In addition to adding more assets/pricing functions, there is also t
 - Bootstrapping yield curves from benchmark FRA's and swaps
 - Bootstrapping volatility surfaces for FX and interest rates
 - Incorporating Wrong way risk during the Monte Carlo simulation
-- Calibration of risk neutral price models from market data
-- Non linear interpolation of yield curves/vol surfaces.
-
-Non linear interpolation of yield curves would allow efficient memory storage for GPU's and more
-precise sensitivities to market benchmarks.
+- Better Calibration of risk neutral price models from market data
+- Better handling of RFR's and OIS curves

@@ -34,29 +34,10 @@ $\mathscr l$ calendar months from T.
 - **IndexReferenceInterpolated$\mathscr l$M** (for $\mathscr l$=3 or 4) gives the following
 interpolation of $I((T-\mathscr {l} m)^{(1)})$ and $I((T-(\mathscr {l}-1) m)^{(1)})$:
 
-$$ I_R(T)=I((T-\mathscr {l} m)^{(1)})+\Biggl( \frac{T-T^{(1)}}{(T^{(1)}+1m)-T^{(1)}} \Biggl)\Big(
-I((T-(\mathscr {l}-1) m)^{(1)})-I((T-\mathscr {l}m)^{(1)})\Big)$$.
+$$I_R(T)=I((T-\mathscr {l} m)^{(1)})+\Biggl( \frac{T-T^{(1)}}{(T^{(1)}+1m)-T^{(1)}} \Biggl)\Big(
+I((T-(\mathscr {l}-1) m)^{(1)})-I((T-\mathscr {l}m)^{(1)})\Big)$$
 
 ## Inflation Rates
 
 Inflation rate price factors are similar to interest rate price factors but have an associated price
 index factor.
-
----
-
-
-## GBMPriceIndexModel
-
-The model is specified as follows:
-
-$$ F(t) = exp \Big( (\mu-\frac{\sigma^2}{2})t + \sigma W(t) \Big)$$
-
-Where:
-
-- $\mu$ is the drift of the price index
-- $\sigma$ is the volatility of the price index
-- $W(t)$ is a standard Wiener Process under the real-world measure
-
-Note that the simulation of this model is identical to plain Geometric Brownian Motion with the
-exception of modifying the scenario grid to coincide with allowable publication dates obtained
-by the corresponding Price Index

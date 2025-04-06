@@ -429,7 +429,7 @@ class Credit_Monte_Carlo(Calculation):
         'obtained by taking the following union:',
         '',
         '- The deal\'s maturity date.',
-        '- The dates in the **Base Time Grid** up the the deal\'s maturity date.',
+        '- The dates in the **Time Grid** up to the deal\'s maturity date.',
         '- Deal specific dates such as payment and exercise dates.',
         '',
         'Deal specific dates improve the accuracy of the profile by showing the effect of cashflows, exercises etc.',
@@ -497,7 +497,8 @@ class Credit_Monte_Carlo(Calculation):
         '',
         'Now,',
         '',
-        '$$\\Bbb E(L(\\tau))=\\Bbb E\\Big(\\int_0^T L(t)(-dH(t))\\Big),$$',
+        '$$\\Bbb E(L(\\tau))=\\Bbb E\\Big(\\int_0^T L(t)(-dH(t))\\Big)$$',
+        '',
         '$$H(t)=\\exp\\Big(-\\int_0^t h(u)du\\Big)$$',
         '',
         'where $h(t)$ is the stochastic hazard rate. There are two ways to calculate the expectation:',
@@ -539,8 +540,9 @@ class Credit_Monte_Carlo(Calculation):
         'The discounted expectation of this cost (or benefit) summed across all time horizons and scenarios constitutes',
         'a funding value adjustment and can be expressed as:',
         '',
-        '$$FCA=\\int_{0}^{T} \\Bbb{E}\\Big(max(V(t),0)[f_{fc,C}(t)-f_{rf,C}(t)]SP_C(t)\\Big)dt$$'
-        '$$FBA=\\int_{0}^{T} \\Bbb{E}\\Big(min(V(t),0)[f_{fb,C}(t)-f_{rf,C}(t)]SP_C(t)\\Big)dt$$'
+        '$$FCA=\\int_{0}^{T} \\Bbb{E}\\Big(max(V(t),0)[f_{fc,C}(t)-f_{rf,C}(t)]SP_C(t)\\Big)dt$$',
+        '',
+        '$$FBA=\\int_{0}^{T} \\Bbb{E}\\Big(min(V(t),0)[f_{fb,C}(t)-f_{rf,C}(t)]SP_C(t)\\Big)dt$$',
         '',
         'where',
         '',
@@ -552,10 +554,11 @@ class Credit_Monte_Carlo(Calculation):
         '',
         'FVA against the counterparty is then calculated as $FVA = FCA + FBA$',
         '',
-        'At the bank wide level the $FCA$ and $FBA$ is calculated as:'
+        'At the bank wide level the $FCA$ and $FBA$ is calculated as:',
         '',
-        '$$FCA_{bank}=\\int_{0}^{T} \\Bbb{E}\\Bigg(max\\Big(\\sum_i V(t)SP_{Ci},0\\Big)[f_{fc,C}(t)-f_{rf,C}(t)]\\Bigg)dt$$'
-        '$$FBA_{bank}=\\int_{0}^{T} \\Bbb{E}\\Bigg(min\\Big(\\sum_i V(t)SP_{Ci},0\\Big)[f_{fb,C}(t)-f_{rf,C}(t)]\\Bigg)dt$$'
+        '$$FCA_{bank}=\\int_{0}^{T} \\Bbb{E}\\Bigg(max\\Big(\\sum_i V(t)SP_{Ci},0\\Big)[f_{fc,C}(t)-f_{rf,C}(t)]\\Bigg)dt$$',
+        '',
+        '$$FBA_{bank}=\\int_{0}^{T} \\Bbb{E}\\Bigg(min\\Big(\\sum_i V(t)SP_{Ci},0\\Big)[f_{fb,C}(t)-f_{rf,C}(t)]\\Bigg)dt$$',
         '',
         'The idea is the same as defined above except that $i$, the counterparty index, sums over all uncollateralized ',
         'or partially collateralized counterparties (one-way CSA or high threshold CSA).',
@@ -563,7 +566,6 @@ class Credit_Monte_Carlo(Calculation):
         'Calculation parameters are extended from the Base Valuation with these new fields:',
         '',
         ' - **Deflation Interest Rate** - the interest rate price factor to PV the exposure to today',
-        ' - **Simulation Batches** - Number of batches to run (each batch is of size **Batch Size**)',
         ' - **Batch Size** - The number of simulations per batch. Smaller Batch sizes are more likely to fit in memory.'
         '  This needs to be balanced with speed - larger batch sizes will run quicker.',
         ' - **Simulation Batches** - Number of batches to run. Total number of sumulations is **Simulation Batches** * '
@@ -571,7 +573,7 @@ class Credit_Monte_Carlo(Calculation):
         ' - **Antithetic** - Use antithethic variables - we run twice the number of simulations using the negative of ',
         '  the random sample for the second run',
         ' - **Calc Scenarios** - return the simulated price factors used in the calculation ',
-        ' - **Dynamic Scenario Dates** - Generate scenarios not just on the **Base Time Grid**, but also on all potential '
+        ' - **Dynamic Scenario Dates** - Generate scenarios not just on the **Time Grid**, but also on all potential '
         'cashflow settlement dates. Needed to accurately calculate liquidity and settlement dynamics on collateralized ',
         'portfolios.',
         ' - **Generate Cashflows** - returns the simulated cashflows during the simulation period'
@@ -746,7 +748,7 @@ class Credit_Monte_Carlo(Calculation):
             scenario_dates = self.config.parse_grid(
                 base_date, max(dynamic_dates), self.input_time_grid, past_max_date=True)
 
-        # set up the scenario and base time grids
+        # set up the scenario and time grids
         self.time_grid = utils.TimeGrid(scenario_dates, mtm_dates, base_mtm_dates)
         self.base_date = base_date
         self.reset_dates = reset_dates
@@ -815,7 +817,7 @@ class Credit_Monte_Carlo(Calculation):
     def get_cholesky_decomp(self):
         # create the correlation matrix
         correlation_matrix = np.eye(self.num_factors, dtype=np.float64)
-        logging.root.name = self.config.deals['Attributes']['Reference']
+        logging.root.name = self.config.deals['Attributes'].get('Reference', self.config.file_ref)
         # prepare the correlation matrix (and the offsets of each stochastic process)
         correlation_factors = []
         self.process_ofs = {}
@@ -992,7 +994,7 @@ class Credit_Monte_Carlo(Calculation):
         # store the params
         self.params = params
         # set the name of the root logger to this netting set (makes tracking errors easier)
-        logging.root.name = self.config.deals.get('Attributes', {'Reference': 'root'}).get('Reference', 'root')
+        logging.root.name = self.config.deals['Attributes'].get('Reference', self.config.file_ref)
 
         # store the stats for the batches
         self.calc_stats['Batch_Size'] = self.batch_size
@@ -1470,7 +1472,7 @@ class Base_Revaluation(Calculation):
         return shared_mem
 
     def update_time_grid(self, base_date):
-        # set up the scenario and base time grids
+        # set up the scenario and time grids
         self.time_grid = utils.TimeGrid({base_date}, {base_date}, {base_date})
         self.base_date = base_date
         self.time_grid.set_base_date(base_date)
@@ -1578,7 +1580,7 @@ class Base_Revaluation(Calculation):
         # update the factors
         shared_mem = self.update_factors(params, base_date)
         # set the logging name
-        logging.root.name = self.config.deals.get('Attributes', {'Reference': 'root'}).get('Reference', 'root')
+        logging.root.name = self.config.deals['Attributes'].get('Reference', self.config.file_ref)
         self.calc_stats['Deal_Setup_Time'] = time.monotonic()
         self.netting_sets = DealStructure(Aggregation('root'), store_results=True)
         self.set_deal_structures(
