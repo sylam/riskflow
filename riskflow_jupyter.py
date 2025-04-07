@@ -8,12 +8,14 @@ import numpy as np
 import pandas as pd
 import ipywidgets as widgets
 
+from base64 import b64encode
 from functools import reduce
 from abc import ABCMeta, abstractmethod
-from IPython.display import display  # Used to display widgets in the notebook
+from IPython.display import display, Javascript
 
 # riskflow specific stuff
 import riskflow as rf
+
 # load the widgets - might be able to use more native objects instead of unicode text - TODO!
 from riskflow_widgets import FileDragUpload, Tree, Table, Flot, Three, to_json
 
@@ -1239,6 +1241,29 @@ class CalculationPage(TreePanel):
 
         return click
 
+    def download_config(self, key, output):
+    
+        def trigger_download(text, filename, kind='text/json'):
+            try:
+                content_b64 = b64encode(text.encode('utf-8')).decode('utf-8')
+                data_url = f'data:{kind};charset=utf-8;base64,{content_b64}'
+                js_code = f"""                
+                    var a = document.createElement('a');
+                    a.setAttribute('download', '{filename}');
+                    a.setAttribute('href', '{data_url}');
+                    a.style.display = 'none';
+                    a.click()
+                """
+                with output:
+                    display(Javascript(js_code))
+            except Exception as e:
+                logging.error('Error generating download JS: {e}')
+                
+        def click(widget):
+            trigger_download(self.context.save_json(None), '{}.json'.format(key))
+
+        return click
+
     def calc_frames(self, selection):
         frames = []
         if selection:
@@ -1258,6 +1283,15 @@ class CalculationPage(TreePanel):
                 if frame['output']:
                     output = self.define_input([key, 'Results'], frame['output'])
                     frames.append(output)
+                    # allow saving the calculation
+                    # need an output widget
+                    download_output = widgets.Output()
+                    # hide it
+                    download_output.layout.display = 'none'
+                    save_button = widgets.Button(description='Export', tooltip='Save the Calculation (as JSON)')
+                    save_button.on_click(self.download_config(key, download_output))
+                    # add it to the output
+                    output.children = output.children + (save_button, download_output)
 
         return frames
 

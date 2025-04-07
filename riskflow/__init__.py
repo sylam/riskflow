@@ -357,14 +357,18 @@ class Context:
         '''
 
         cfg = self.current_cfg
-        md, cal = list(self.holiday_cfg_cache.items())[0]
+        try:
+            md, cal = list(self.holiday_cfg_cache.items())[0]
+        except:
+            md, cal = '', ''
+
         final_json = {
             "Calc":
                 {
                     "Calculation": cfg.deals['Calculation'],
                     "Deals": {
-                        "Tag_Titles": cfg.deals['Attributes']['Tag_Titles'],
-                        "Reference": cfg.deals['Attributes']['Reference'],
+                        "Tag_Titles": cfg.deals['Attributes'].get('Tag_Titles', ''),
+                        "Reference": cfg.deals['Attributes'].get('Reference', ''),
                         "Deals": cfg.deals['Deals']
                         },
                     "MergeMarketData": {
@@ -378,8 +382,12 @@ class Context:
                 }
             }
 
-        with open(json_filename, 'wt') as f:
-            f.write(json.dumps(final_json, separators=(',', ':'), cls=CustomJsonEncoder))
+        data = json.dumps(final_json, separators=(',', ':'), cls=CustomJsonEncoder)
+        if json_filename is not None:
+            with open(json_filename, 'wt') as f:
+                f.write(data)
+        else:
+            return data
 
     def run_job(self, overrides=None, runparallel=False):
         # check what calc we should run
