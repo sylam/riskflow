@@ -2931,16 +2931,19 @@ class QEDI_CustomAutoCallSwap(Deal):
         ab = dict(self.field.get('Barrier_Dates', []))
 
         # check if the dates are less than or equal to the expiry date
-        if max(all_dates) > self.field['Expiry_Date']:
-            logging.warning('AutoCall has max pricing date {} > Expiry Date {} for underlying {}'.format(
-                max(all_dates).strftime('%Y-%m-%d'), self.field['Expiry_Date'].strftime('%Y-%m-%d'),
-                self.field['Equity']))
+        # if max(all_dates) > self.field['Expiry_Date']:
+        #     logging.warning('AutoCall has max pricing date {} > Expiry Date {} for underlying {}'.format(
+        #         max(all_dates).strftime('%Y-%m-%d'), self.field['Expiry_Date'].strftime('%Y-%m-%d'),
+        #         self.field['Equity']))
 
         # the most common case is that there is no averaging - i.e. just a single fixing on a coupon date
         # also check that the barrier dates correspond with the coupon dates
         # we can then get a much faster calc ready
-        pf_dates = [x for x in pf if x >= base_date]
+
+        # HACK - need to property align fixings to coupons - assume fixings are no later than a month prior to a coupon
         ac_dates = [x for x in ac if x >= base_date]
+        pf_dates = [x for x in pf if x > min(ac_dates) - pd.DateOffset(months=1)]
+
         no_averaging = len(pf_dates) == len(ac_dates) and np.all(
             [f <= c for f, c in zip(pf_dates, ac_dates)]) and not np.any(
             [x not in coupon_dates for x in ab if x >= base_date])
@@ -2968,6 +2971,10 @@ class QEDI_CustomAutoCallSwap(Deal):
             all_dates = sorted(all_dates)
             # move the threshold dates to the coupon dates
             tl = {c: at[t] for c, t in zip(ac, at)}
+            # check that past fixings are defined
+            if np.any([k <= base_date and v == 0 for k, v in pf.items() if k in pf_dates]):
+                logging.error('AutoCall has past fixing set to 0 - please map the correct fixing')
+
             field_index.update({
                 'Fixings': utils.make_fixing_data(
                     base_date, time_grid, [[x, pf.get(x, -1)] for x in all_dates]),

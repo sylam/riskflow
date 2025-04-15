@@ -170,83 +170,76 @@ mapping = {
     'System': {
         'fields': {
             'Base_Currency': {'widget': 'Text', 'description': 'Base Currency', 'value': ''},
-            'Description': {'widget': 'Text', 'description': 'Description', 'value': ''},
             'Base_Date': {'widget': 'DatePicker', 'description': 'Base Date', 'value': default['DatePicker']},
             'Exclude_Deals_With_Missing_Market_Data': {'widget': 'Dropdown',
                                                        'description': 'Exclude Deals With Missing Market Data',
                                                        'value': 'Yes', 'values': ['Yes', 'No']},
-            'Proxying_Rules_File': {'widget': 'Text', 'description': 'Proxying Rules File', 'value': ''},
-            'Script_Base_Scenario_Multiplier': {'widget': 'Float', 'description': 'Script Base Scenario Multiplier',
-                                                'value': 1},
             'Correlations_Healing_Method': {'widget': 'Dropdown', 'description': 'Correlations Healing Method',
                                             'value': 'Eigenvalue_Raising',
-                                            'values': ['Eigenvalue_Raising', 'Hope_and_Pray']},
-            'Grouping_File': {'widget': 'Text', 'description': 'Grouping File', 'value': ''}
+                                            'values': ['Eigenvalue_Raising', 'Hope_and_Pray']}
         },
         'types': {
             'Config':
-                ['Base_Currency', 'Description', 'Base_Date', 'Exclude_Deals_With_Missing_Market_Data',
-                 'Proxying_Rules_File', 'Script_Base_Scenario_Multiplier', 'Correlations_Healing_Method',
-                 'Grouping_File']
+                ['Base_Currency', 'Base_Date', 'Exclude_Deals_With_Missing_Market_Data',
+                 'Correlations_Healing_Method']
         }
     },
     'Factor': {
         # All supported risk factors - need to append this once new risk factors are developed..
         'types': {
             "Correlation":
-                ["Value", "Property_Aliases"],
+                ["Value"],
             "CommodityPrice":
-                ["Spot", "Currency", "Interest_Rate", "Property_Aliases"],
+                ["Spot", "Currency", "Interest_Rate"],
             "CommodityPriceVol":
-                ["Currency", "Surface", "Property_Aliases"],
+                ["Currency", "Surface"],
             "CSForwardPriceModelParameters":
-                ["Sigma", "Alpha", "Property_Aliases"],
+                ["Sigma", "Alpha"],
             "ConvenienceYield":
-                ["Curve", "Currency", "Property_Aliases"],
+                ["Curve", "Currency"],
             "EquityPriceVol":
                 ["Surface_Type", "Surface", "ATM_Ref", "ATM_Vol", "Moneyness_Rule", "a",
-                 "b", "s", "L", "R", "C", "D", "lam", "rho", "m", "sigma", "Property_Aliases"],
+                 "b", "s", "L", "R", "C", "D", "lam", "rho", "m", "sigma"],
             "FuturesPrice":
-                ["Price", "Property_Aliases"],
+                ["Price"],
             "InterestYieldVol":
-                ["Space", "Property_Aliases"],
+                ["Space"],
             "InflationRate":
                 ["Price_Index", "Seasonal_Adjustment", "Reference_Name", "Day_Count", "Accrual_Calendar", "Currency",
-                 "Curve", "Property_Aliases"],
+                 "Curve"],
             "FXVol":
-                ["Surface", "Moneyness_Rule", "Property_Aliases"],
+                ["Surface", "Moneyness_Rule"],
             "EquityPrice":
-                ["Issuer", "Respect_Default", "Jump_Level", "Currency", "Interest_Rate", "Spot", "Property_Aliases"],
+                ["Issuer", "Respect_Default", "Jump_Level", "Currency", "Interest_Rate", "Spot"],
             "FxRate":
-                ["Domestic_Currency", "Interest_Rate", "Priority", "Spot", "Property_Aliases"],
+                ["Domestic_Currency", "Interest_Rate", "Priority", "Spot"],
             "SurvivalProb":
-                ["Recovery_Rate", "Minimum_Recovery_Rate", "Issuer", "Curve", "Property_Aliases"],
+                ["Recovery_Rate", "Minimum_Recovery_Rate", "Issuer", "Curve"],
             "InterestRate":
-                ["Sub_Type", "Floor", "Day_Count", "Accrual_Calendar", "Currency", "Curve", "Property_Aliases"],
+                ["Sub_Type", "Floor", "Day_Count", "Accrual_Calendar", "Currency", "Curve"],
             "DiscountRate":
-                ["Interest_Rate", "Property_Aliases"],
+                ["Interest_Rate"],
             "HullWhite2FactorModelParameters":
                 ["Quanto_FX_Volatility", "Alpha_1", "Sigma_1", "Quanto_FX_Correlation_1", "Alpha_2", "Sigma_2",
-                 "Quanto_FX_Correlation_2", "Correlation", "Property_Aliases"],
+                 "Quanto_FX_Correlation_2", "Correlation"],
             "GBMAssetPriceTSModelParameters":
-                ["Quanto_FX_Volatility", "Vol", "Quanto_FX_Correlation", "Property_Aliases"],
+                ["Quanto_FX_Volatility", "Vol", "Quanto_FX_Correlation"],
             "PriceIndex":
-                ["Index", "Next_Publication_Date", "Last_Period_Start", "Publication_Period", "Currency",
-                 "Property_Aliases"],
+                ["Index", "Next_Publication_Date", "Last_Period_Start", "Publication_Period", "Currency"],
             "ForwardPrice":
-                ["Currency", "Curve", "Fixings", "Property_Aliases"],
+                ["Currency", "Curve", "Fixings"],
             "ForwardPriceSample":
-                ["Offset", "Holiday_Calendar", "Sampling_Convention", "Property_Aliases"],
+                ["Offset", "Holiday_Calendar", "Sampling_Convention"],
             "ReferencePrice":
-                ["Fixing_Curve", "ForwardPrice", "Property_Aliases"],
+                ["Fixing_Curve", "ForwardPrice"],
             "ReferenceVol":
-                ["ForwardPriceVol", "ReferencePrice", "Property_Aliases"],
+                ["ForwardPriceVol", "ReferencePrice"],
             "ForwardPriceVol":
-                ["Space", "Property_Aliases"],
+                ["Space"],
             "InterestRateVol":
-                ["Space", "Property_Aliases"],
+                ["Space"],
             "DividendRate":
-                ["Floor", "Currency", "Curve", "Property_Aliases"]
+                ["Floor", "Currency", "Curve"]
         },
 
         # field types for the various risk factors - need to explicitly mention all of them
@@ -307,7 +300,6 @@ mapping = {
             'Minimum_Recovery_Rate': {'widget': 'Text', 'description': 'Minimum Recovery Rate', 'value': '<undefined>'},
             'Next_Publication_Date': {'widget': 'DatePicker', 'description': 'Next Publication Date',
                                       'value': default['DatePicker']},
-            'Property_Aliases': {'widget': 'Text', 'description': 'Property Aliases', 'value': ''},
             'Price_Index': {'widget': 'Text', 'description': 'Price Index', 'value': '', 'obj': 'Tuple'},
             'Priority': {'widget': 'Float', 'description': 'Priority', 'value': 3},
             'Publication_Period': {'widget': 'Dropdown', 'description': 'Publication Period', 'value': 'Monthly',
@@ -431,12 +423,11 @@ mapping = {
         # supported types
         'types': {
             "InterestRatePrices":
-                ["Property_Aliases", "Currency", "Spot_Offset", "Zero_Rate_Grid", "Discount_Rate"],
+                ["Currency", "Spot_Offset", "Zero_Rate_Grid", "Discount_Rate"],
             "GBMTSModelPrices":
-                ["Property_Aliases", "Asset_Price_Volatility"],
+                ["Asset_Price_Volatility"],
             "HullWhite2FactorInterestRateModelPrices":
-                ["Property_Aliases", "Swaption_Volatility", "Generate_Instruments", "Generation_Parameters",
-                 "Instrument_Definitions"],
+                ["Swaption_Volatility", "Generate_Instruments", "Generation_Parameters", "Instrument_Definitions"],
             "quote":
                 ["Descriptor", "Use", "Quoted_Market_Value", "DealType", "Quote_Type"]
         },
@@ -496,7 +487,6 @@ mapping = {
             'Descriptor': {'widget': 'Text', 'description': 'Descriptor', 'value': ''},
             'Discount_Rate': {'widget': 'Text', 'description': 'Discount Rate', 'value': ''},
             'Currency': {'widget': 'Text', 'description': 'Currency', 'value': ''},
-            'Property_Aliases': {'widget': 'Text', 'description': 'Property Aliases', 'value': ''},
             'Asset_Price_Volatility': {'widget': 'Text', 'description': 'Asset Price Volatility', 'value': ''},
             'Spot_Offset': {'widget': 'Integer', 'description': 'Spot Offset', 'value': 2},
             'Zero_Rate_Grid': {'widget': 'Text', 'description': 'Zero Rate Grid',

@@ -2615,6 +2615,9 @@ def make_index_cashflows(base_date, time_grid, position, cashflows, price_index,
 
     # set the cashflows
     cashflows = TensorCashFlows(sorted(cash), cashflow_reset_offsets)
+    # check if the paydays are still sorted
+    if (cashflows.schedule[:, CASHFLOW_INDEX_Pay_Day] != sorted(cashflows.schedule[:, CASHFLOW_INDEX_Pay_Day])).any():
+        logging.error("Cashflow Pay Day not in sorted order - check accrual dates")
 
     if isBond:
         mtm_grid = time_grid.time_grid[:, TIME_GRID_MTM]
