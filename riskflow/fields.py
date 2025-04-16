@@ -373,6 +373,11 @@ mapping = {
         },
     },
 
+    # list mapping risk factors to allowable interpolation methods
+    'Interpolation_factor_map': {
+        "InflationRate": ['HermiteRT','Hermite','LinearRT','Linear'],
+        "InterestRate":['HermiteRT','Hermite','LinearRT','Linear']
+    },
     # list mapping risk factors to allowable stochastic processes
     'Process_factor_map': {
         "Correlation": [],

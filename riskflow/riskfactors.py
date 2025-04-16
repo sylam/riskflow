@@ -23,7 +23,6 @@ import numpy as np
 import pandas as pd
 
 from . import utils
-from collections import OrderedDict
 from scipy.interpolate import RectBivariateSpline
 
 # map the names of various factor interpolations to something simpler
@@ -35,7 +34,11 @@ factor_interp_map = {
     'CubicSplineOnXTimesYCurveInterpolation': 'HermiteRT',
     'HermiteRTInterpolationCurveGetValue': 'HermiteRT',
     'NaturalCubicSplineCurveInterLinearExtrap': 'Hermite',
-    'LogNaturalCubicSplineCurveInterFlatExtrap': 'HermiteRT'
+    'LogNaturalCubicSplineCurveInterFlatExtrap': 'HermiteRT',
+    'HermiteRT': 'HermiteRT',
+    'Hermite': 'Hermite',
+    'LinearRT': 'LinearRT',
+    'Linear': 'Linear'
 }
 
 
@@ -563,7 +566,7 @@ class InterestRateJacobian(object):
 
         def approx_benchmark(ir_gradients):
             sensitivities = ir_gradients.reshape(1, -1).dot(self.inverse_jacobian)
-            bench = OrderedDict(list(zip(self.instruments, sensitivities[0])))
+            bench = dict(zip(self.instruments, sensitivities[0]))
             errors = sensitivities.dot(self.jacobian)[0] - ir_gradients
             return bench, errors
 
@@ -897,11 +900,11 @@ class HullWhite2FactorModelParametersJacobian(Factor1D):
     def current_value(self, tenors=None, offset=0.0, include_quanto=False):
         """Returns the parameters of the HW2 factor model as a dictionary"""
 
-        params = OrderedDict([('Alpha_1', np.array([self.param['Alpha_1']])),
-                              ('Alpha_2', np.array([self.param['Alpha_2']])),
-                              ('Correlation', np.array([self.param['Correlation']])),
-                              ('Sigma_1', self.param['Sigma_1'].array[:, 1]),
-                              ('Sigma_2', self.param['Sigma_2'].array[:, 1])])
+        params = dict([('Alpha_1', np.array([self.param['Alpha_1']])),
+                       ('Alpha_2', np.array([self.param['Alpha_2']])),
+                       ('Correlation', np.array([self.param['Correlation']])),
+                       ('Sigma_1', self.param['Sigma_1'].array[:, 1]),
+                       ('Sigma_2', self.param['Sigma_2'].array[:, 1])])
 
         if self.get_instantaneous_correlation() is None and (
                 'Quanto_FX_Correlation_1' in self.param and 'Quanto_FX_Correlation_2' in self.param):
@@ -975,11 +978,11 @@ class HullWhite2FactorModelParameters(Factor1D):
     def current_value(self, tenors=None, offset=0.0, include_quanto=False):
         """Returns the parameters of the HW2 factor model as a dictionary"""
 
-        params = OrderedDict([('Alpha_1', np.array([self.param['Alpha_1']])),
-                              ('Alpha_2', np.array([self.param['Alpha_2']])),
-                              ('Correlation', np.array([self.param['Correlation']])),
-                              ('Sigma_1', self.param['Sigma_1'].array[:, 1]),
-                              ('Sigma_2', self.param['Sigma_2'].array[:, 1])])
+        params = dict([('Alpha_1', np.array([self.param['Alpha_1']])),
+                       ('Alpha_2', np.array([self.param['Alpha_2']])),
+                       ('Correlation', np.array([self.param['Correlation']])),
+                       ('Sigma_1', self.param['Sigma_1'].array[:, 1]),
+                       ('Sigma_2', self.param['Sigma_2'].array[:, 1])])
 
         if self.get_instantaneous_correlation() is None and (
                 'Quanto_FX_Correlation_1' in self.param and 'Quanto_FX_Correlation_2' in self.param):
@@ -1016,8 +1019,8 @@ class PCAMixedFactorModelParameters(Factor1D):
 
     def current_value(self, tenors=None, offset=0.0):
         """Returns the parameters of the mixed factor model as a dictionary"""
-        return OrderedDict([('Reversion_Speed', np.array([self.param['Reversion_Speed']])),
-                            ('Yield_Volatility', self.param['Yield_Volatility'].array[:, 1])])
+        return dict([('Reversion_Speed', np.array([self.param['Reversion_Speed']])),
+                     ('Yield_Volatility', self.param['Yield_Volatility'].array[:, 1])])
 
 
 class CommodityPriceVol(Factor2D):

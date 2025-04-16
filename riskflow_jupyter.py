@@ -568,7 +568,7 @@ class PortfolioPage(TreePanel):
                            "state": {"opened": True, "selected": True},
                            "children": deals_to_append}]
 
-        type_data = {"root": {"icon": "fa fa-folder text-primary", "valid_children": ["group"]},
+        type_data = {"root": {"icon": "fa fa-folder text-primary", "valid_children": ["group", "default"]},
                      "group": {"icon": "fa fa-folder", "valid_children": ["group", "default"]},
                      "default": {"icon": "fa fa-file", "valid_children": []}}
 
@@ -689,12 +689,6 @@ class RiskFactorsPage(TreePanel):
         risk_process_fields = self.load_fields(
             rf.fields.mapping['Process']['types'], rf.fields.mapping['Process']['fields'])
 
-        # only 1 level of config parameters here - unlike the other 2
-        self.sys_config = next(iter(self.load_fields(
-            rf.fields.mapping['System']['types'], rf.fields.mapping['System']['fields']).values()))
-        for value in self.sys_config.values():
-            value['value'] = self.get_value_for_widget(self.config.params, 'System Parameters', value)
-
         possible_risk_process = {}
         for k, v in rf.fields.mapping['Process_factor_map'].items():
             fields_to_add = {}
@@ -746,7 +740,7 @@ class RiskFactorsPage(TreePanel):
         }
 
         # simple lookup to match the params in the config file to the json in the UI
-        self.config_map = {'Factor': 'Price Factors', 'Process': 'Price Models', 'Config': 'System Parameters'}
+        self.config_map = {'Factor': 'Price Factors', 'Process': 'Price Models'}
         # fields to store new objects
         self.new_factor = {'Factor': risk_factor_fields, 'Process': possible_risk_process}
         # set the context menu to all risk factors defined
@@ -827,8 +821,6 @@ class RiskFactorsPage(TreePanel):
             # store the new object with all the usual defaults
             if frame_name == 'Factor':
                 frame_defaults = self.data[self.tree.selected[-1]][frame_name]
-            elif frame_name == 'Config':
-                frame_defaults = self.sys_config
             else:
                 frame_defaults = self.data[self.tree.selected[-1]][frame_name][rate_type]
 
@@ -935,63 +927,6 @@ class RiskFactorsPage(TreePanel):
 
         return widgets.VBox(children=wig)
 
-    def model_config_frame(self):
-
-        def generate_handler(model_config):
-            def handleEvent(change):
-                # update the value in the config object
-                model_config.modeldefaults = {}
-                model_config.modelfilters = {}
-                for config in json.loads(change['new']):
-                    if config and config[0] is not None:
-                        factor, process = config[0].split('.')
-                        if (config[1] is not None) and (config[2] is not None):
-                            filter_on, value = config[1], config[2]
-                            model_config.modelfilters.setdefault(factor, []).append(((filter_on, value), process))
-                            continue
-                        model_config.modeldefaults.setdefault(factor, process)
-
-            return handleEvent
-
-        # label this container
-        wig = [widgets.HTML(value='<h4>Stochastic Process Mapping:</h4>')]
-
-        optionmap = {k: v for k, v in rf.fields.mapping['Process_factor_map'].items() if v}
-        col_types = [{"type": "dropdown",
-                      "source": sorted(
-                          reduce(operator.concat,
-                                 [['{0}.{1}'.format(key, val) for val in values]
-                                  for key, values in optionmap.items()], [])
-                      ),
-                      "strict": True}, {}, {}]
-        model_config = [['{0}.{1}'.format(k, v), None, None] for k, v in
-                        sorted(self.config.params['Model Configuration'].modeldefaults.items())]
-
-        model_config.extend(
-            reduce(operator.concat, [
-                [['{0}.{1}'.format(k, rule[1]), rule[0][0], rule[0][1]] for rule in v]
-                for k, v in sorted(self.config.params['Model Configuration'].modelfilters.items())
-            ], [])
-        )
-
-        w = Table(description="Model Configuration",
-                  settings=to_json({
-                      'columns': col_types,
-                      'startCols': 3,
-                      'colHeaders': ["Risk_Factor.Stochastic_Process", "Where", "Equals"],
-                      'contextMenu': True,
-                      'minSpareRows': 1,
-                      'width': 700,
-                      'height': 300
-                  }),
-                  value=to_json(sorted(model_config) if model_config else [[None, None, None]])
-                  )
-
-        w.observe(generate_handler(self.config.params['Model Configuration']), 'value')
-        wig.append(w)
-
-        return widgets.VBox(children=wig)
-
     def calc_frames(self, selection):
         # riskfactors are only 1 level deep (might want to extend this) - TODO
         frame = None
@@ -1048,13 +983,166 @@ class RiskFactorsPage(TreePanel):
                     if len(sps) > 1:
                         frames.append(self.correlation_frame(sorted(sps)))
 
-        # show the system config screen if there are no factors selected
-        if not frame:
-            frames.append(self.define_input(('Config', ''), self.sys_config))
-            frames.append(self.model_config_frame())
+        return frames
+
+
+class SetupPage(TreePanel):
+    def __init__(self, config):
+        super(SetupPage, self).__init__(config)
+
+    def parse_config(self):
+
+        risk_process_fields = self.load_fields(
+            rf.fields.mapping['Process']['types'], rf.fields.mapping['Process']['fields'])
+
+        # only 1 level of config parameters here - unlike the other 2
+        self.sys_config = next(iter(self.load_fields(
+            rf.fields.mapping['System']['types'], rf.fields.mapping['System']['fields']).values()))
+        for value in self.sys_config.values():
+            value['value'] = self.get_value_for_widget(self.config.params, 'System Parameters', value)
+
+        loaded_data = []
+
+        for key in ['System Parameters', 'Model Configuration', 'Price Factor Interpolation']:
+            loaded_data.append({
+                "text": key,
+                "type": "default",
+                "data": {},
+                "children": []
+            })
+
+        self.tree_data = [{"text": "Settings",
+                           "type": "root",
+                           "state": {"opened": True, "selected": False},
+                           "children": loaded_data}]
+        type_data = {
+            "root": {
+                "icon": "fa fa-folder", "valid_children": ["default"]
+            },
+            "default": {
+                "icon": "fa fa-file", "valid_children": []
+            }
+        }
+
+        # tree widget data
+        self.tree = Tree(
+            plugins=["unique", "types", "search"],
+            settings=to_json({'events': []}),
+            type_data=to_json(type_data),
+            value=to_json(self.tree_data)
+        )
+
+    def get_label(self, label):
+        return '<h4>{0}:</h4><i>{1}</i>'.format(
+            label[0], '' if label[0] in self.config.params else ' - Unsaved')
+
+    def set_value_from_widget(self, frame_name, section_name, field_meta, new_val):
+
+        def set_repr(obj, obj_type):
+            if obj_type == 'Percent':
+                return rf.utils.Percent(100.0 * obj)
+            elif obj_type == 'DatePicker':
+                # might want to make this none by default
+                return pd.Timestamp(obj) if obj else None
+            else:
+                return obj
+
+        field_name = field_meta['description'].replace(' ', '_')
+        obj_type = field_meta.get('obj', field_meta['widget'])
+        config = self.config.params.get(frame_name, "")
+
+        if frame_name in config and field_name in config[section_name]:
+            config[section_name][field_name] = set_repr(new_val, obj_type)
+
+    def generate_handler(self, field_name, widget_elements, label):
+
+        def handleEvent(change):
+            # update the json representation
+            widget_elements[field_name]['value'] = change['new']
+            # update the value in the config object
+            self.set_value_from_widget(label[0], label[1], widget_elements[field_name], change['new'])
+
+        return handleEvent
+
+    def config_frame(self, heading, section_name, fieldmapping, model_setting):
+
+        def generate_handler(model_config):
+            def handleEvent(change):
+                # update the value in the config object
+                model_config.modeldefaults = {}
+                model_config.modelfilters = {}
+                for config in json.loads(change['new']):
+                    if config and config[0] is not None:
+                        factor, process = config[0].split('.')
+                        if (config[1] is not None) and (config[2] is not None):
+                            filter_on, value = config[1], config[2]
+                            model_config.modelfilters.setdefault(factor, []).append(((filter_on, value), process))
+                            continue
+                        model_config.modeldefaults.setdefault(factor, process)
+
+            return handleEvent
+
+        # label this container
+        wig = [widgets.HTML(value='<h4>{}:</h4>'.format(heading))]
+
+        optionmap = {k: v for k, v in rf.fields.mapping[fieldmapping].items() if v}
+        col_types = [{"type": "dropdown",
+                      "source": sorted(
+                          reduce(operator.concat,
+                                 [['{0}.{1}'.format(key, val) for val in values]
+                                  for key, values in optionmap.items()], [])
+                      ),
+                      "strict": True}, {}, {}]
+        model_config = [['{0}.{1}'.format(k, v), None, None] for k, v in
+                        sorted(self.config.params[section_name].modeldefaults.items())]
+
+        model_config.extend(
+            reduce(operator.concat, [
+                [['{0}.{1}'.format(k, rule[1]), rule[0][0], rule[0][1]] for rule in v]
+                for k, v in sorted(self.config.params[section_name].modelfilters.items())
+            ], [])
+        )
+
+        w = Table(description='Model Configuration',
+                  settings=to_json({
+                      'columns': col_types,
+                      'startCols': 3,
+                      'colHeaders': [model_setting, "Where", "Equals"],
+                      'contextMenu': True,
+                      'minSpareRows': 1,
+                      'width': 700,
+                      'height': 300
+                  }),
+                  value=to_json(sorted(model_config) if model_config else [[None, None, None]])
+                  )
+
+        w.observe(generate_handler(self.config.params[section_name]), 'value')
+        wig.append(w)
+        return widgets.VBox(children=wig)
+
+
+    def calc_frames(self, selection):
+        frames = []
+        # riskfactors are only 1 level deep (might want to extend this) - TODO
+        if selection[0]=='System Parameters':
+            frames.append(self.define_input(selection, self.sys_config))
+        elif selection[0]=='Model Configuration':
+            #frames.append(self.model_config_frame())
+            frames.append(self.config_frame(
+                'Stochastic Process Mapping', 'Model Configuration',
+                'Process_factor_map', "Risk_Factor.Interpolation"))
+        elif selection[0] == 'Price Factor Interpolation':
+            frames.append(self.config_frame(
+                'Factor Interpolation Mapping', 'Price Factor Interpolation',
+                'Interpolation_factor_map', "Risk_Factor.Stochastic_Process"))
 
         return frames
 
+    def create(self, newval):
+        pass
+
+    def delete(self, newval):
+        pass
 
 class CalculationPage(TreePanel):
     def __init__(self, config, default_rundate):
@@ -1207,7 +1295,7 @@ class CalculationPage(TreePanel):
                         df.to_csv(fp)
                     widget = link
                 else:
-                    print('output widget for ', k, ' - TODO')
+                    logging.warning('output widget for {}  - TODO'.format(k))
                     continue
 
                 out[k] = widget
@@ -1428,17 +1516,20 @@ class Workbench(object):
         # build the UI
         self.portfolio = PortfolioPage(self.context)
         self.factors = RiskFactorsPage(self.context)
+        self.setup = SetupPage(self.context)
         self.calculations = CalculationPage(self.context, self.default_rundate)
 
         self.tabs = widgets.Tab(children=[self.filename,
+                                          self.setup.main_container,
                                           self.portfolio.main_container,
                                           self.factors.main_container,
                                           self.calculations.main_container])
 
         self.tabs.set_title(0, 'Load JSON')
-        self.tabs.set_title(1, 'Portfolio')
-        self.tabs.set_title(2, 'Price Factors')
-        self.tabs.set_title(3, 'Calculations')
+        self.tabs.set_title(1, 'Settings')
+        self.tabs.set_title(2, 'Portfolio')
+        self.tabs.set_title(3, 'Price Factors')
+        self.tabs.set_title(4, 'Calculations')
 
         # draw a new one
         self.main = widgets.VBox()
@@ -1459,12 +1550,11 @@ class Workbench(object):
 
 
 if __name__ == '__main__':
-    rundate = '2022-07-07'
+    rundate = '2025-04-07'
     from conf import PROD_MARKETDATA, UAT_MARKETDATA
     if os.name == 'nt':
-        path = os.path.join('U:\\CVA_JSON', rundate)
-        path_transform = {
-            PROD_MARKETDATA: UAT_MARKETDATA}
+        path = os.path.join('R:\\RiskFlow\\CVA', rundate)
+        path_transform = {}
     else:
         path = os.path.join('/media/vretiel/3EFA4BCDFA4B7FDF/Media/Data/crstal/CVA_JSON', rundate)
         path_transform = {
@@ -1476,7 +1566,7 @@ if __name__ == '__main__':
             'CVAMarketData_Calibrated.dat': 'CVAMarketData_Calibrated_New.json',
             'MarketData.dat': 'MarketData.json'
         })
-    cx.load_json(os.path.join(path, 'InputAAJ_CrB_JPMorgan_Chase_NYK_ISDA.json'))
+    cx.load_json(os.path.join(path, 'InputAAJ_CrB_Zimbel_Business_Enterprises__Pty__L_ISDA.json'))
     # cx.load_json(os.path.join(path, 'InputAAJ_CrB_BNP_Paribas__Paris__ISDA.json'))
     # cp = CalculationPage(cx)
-    rp = RiskFactorsPage(cx)
+    rp = SetupPage(cx)

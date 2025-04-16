@@ -2971,9 +2971,14 @@ class QEDI_CustomAutoCallSwap(Deal):
             all_dates = sorted(all_dates)
             # move the threshold dates to the coupon dates
             tl = {c: at[t] for c, t in zip(ac, at)}
+
             # check that past fixings are defined
             if np.any([k <= base_date and v == 0 for k, v in pf.items() if k in pf_dates]):
                 logging.error('AutoCall has past fixing set to 0 - please map the correct fixing')
+
+            # check that the thresholds are all positive
+            if min(tl.values()) <= 0.0:
+                logging.error('AutoCall has some thresholds <=0 - please map the correct thresholds')
 
             field_index.update({
                 'Fixings': utils.make_fixing_data(
