@@ -2941,8 +2941,8 @@ class QEDI_CustomAutoCallSwap(Deal):
         # we can then get a much faster calc ready
 
         # HACK - need to property align fixings to coupons - assume fixings are no later than a month prior to a coupon
-        ac_dates = [x for x in ac if x >= base_date]
-        pf_dates = [x for x in pf if x > min(ac_dates) - pd.DateOffset(months=1)]
+        ac_dates = sorted([x for x in ac if x >= base_date])
+        pf_dates = sorted([x for x in pf if x > min(ac_dates) - pd.DateOffset(months=1)])
 
         no_averaging = len(pf_dates) == len(ac_dates) and np.all(
             [f <= c for f, c in zip(pf_dates, ac_dates)]) and not np.any(
@@ -2978,13 +2978,14 @@ class QEDI_CustomAutoCallSwap(Deal):
 
             # check that the thresholds are all positive
             if min(tl.values()) <= 0.0:
-                logging.error('AutoCall has some thresholds <=0 - please map the correct thresholds')
+                logging.error('AutoCall has some thresholds <=0 - please map the correct thresholds (defaulting to 1.0)')
+                tl = {k:v if v else 1.0 for k,v in tl.items()}
 
             field_index.update({
                 'Fixings': utils.make_fixing_data(
                     base_date, time_grid, [[x, pf.get(x, -1)] for x in all_dates]),
-                'Price_Fixing': utils.make_fixing_data(base_date, time_grid, [[x, pf[x]] for x in fixing_dates]),
-                'Coupon_Fixing': utils.make_fixing_data(base_date, time_grid, [[x, ac[x]] for x in coupon_dates]),
+                'Price_Fixing': utils.make_fixing_data(base_date, time_grid, [[x, pf[x]] for x in pf_dates]),
+                'Coupon_Fixing': utils.make_fixing_data(base_date, time_grid, [[x, ac[x]] for x in ac_dates]),
                 'Autocall_Thresholds': [tl.get(x, -1) for x in all_dates],
                 'no_averaging': True
             })
