@@ -2447,6 +2447,12 @@ class FXDiscreteExplicitAsianOption(Deal):
             'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
         }
 
+        # check if any fixings are missing
+        missing_fixings = [x for x in self.field['Sampling_Data'] if x[0] < base_date and not x[1]]
+        if missing_fixings:
+            logging.error('Past fixings not defined - please specify fixings for {}'.format(
+                ', '.join([str(x[0]) for x in missing_fixings])))
+
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
@@ -2589,6 +2595,12 @@ class EquityDiscreteExplicitAsianOption(Deal):
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
             'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0
         }
+
+        # check if any fixings are missing
+        missing_fixings = [x for x in self.field['Sampling_Data'] if x[0] < base_date and not x[1]]
+        if missing_fixings:
+            logging.error('Past fixings not defined - please specify fixings for {}'.format(
+                ', '.join([str(x[0]) for x in missing_fixings])))
 
         self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
