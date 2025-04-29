@@ -22,13 +22,14 @@ Documentation is available at [readthedocs](https://riskflow.readthedocs.io/en/l
 
 ## Usage
 
-There are 2 batch scripts installed :
+There are 3 batch scripts installed :
 
  - RF_Batch runs CVA, CollVA and FVA calculations on a folder of netting sets
- - RF_Bootstrap currently only calculates hull white 2 factor parameters from swaption vols  
+ - RF_Bootstrap currently only calculates hull white 2 factor parameters from swaption vols
+ - RF_Docs generates the documentation from the ./docs_src folder into the ./docs folder
 
 
 ## Known issues
 
-1. Documentation is out of date
+1. Documentation still work in progress
 
