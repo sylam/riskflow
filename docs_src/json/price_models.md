@@ -21,5 +21,4 @@ all price factors have a unique name (internally, vanilla python dictionaries ar
 track of all price factors).
 
 Price Models can be calibrated based on historical data (i.e a large timeseries database) or 
-implied from current market data. A list of the required fields for the various models are as 
-follows:
+implied from current market data. 

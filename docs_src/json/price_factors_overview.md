@@ -88,5 +88,3 @@ Basis spreads are defined as InterestRates but have a subtype specified i.e.
 
 In general, when defining price models, combine the name of the Price Factor with the **Sub_Type** 
 (if the **Sub_Type** is defined for that price factor).
-
-A full list of all the required fields for each Price Factor is defined below:

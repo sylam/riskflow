@@ -14,7 +14,7 @@ Riskflow uses standard JSON as its source of input. The structure of a riskflow 
 
 ## Calculation
 This defines the parameters of the calculation. Parameters are dependent on the calculation type 
-and is documented in more detail later. Note, however, the type of the calculation is provided as 
+and is documented [here](../api_usage/calculations). Note, however, the type of the calculation is provided as 
 an *Object* attribute.
 
 e.g.
@@ -144,9 +144,9 @@ This can become quite a large file if several hundred risk factors are used
 MarketData file for risk neutral calculations (like CVA or FVA) and another for real-world calculations (like PFE).
 
 ### ExplicitMarketData
-Since the data in the marketdata file is usually static (does not contain live market prices), this section acts as an
+Since the data in the marketdata file is static, it cannot contain current market prices. This section acts as an
 override for any section already defined in the MarketDataFile specified above. Typically only the 
-[Price Factors](./price_factors_overview.md) section is defined.
+[Price Factors](./price_factors_overview.md) section would be defined (to contain the latest market data).
 
 ```json
 {
@@ -263,6 +263,17 @@ override for any section already defined in the MarketDataFile specified above. 
   }
 }
 ```
+
+Note that when it comes to exporting any calculation, it is assumed that if a MarketDataFile is specified, then only the 
+*Price Factors* section should be exported (as Price Models, Correlations etc. are assumed to remain unchanged). If a 
+MarketDataFile is not specified, then all sections of the current configuration are exported.
+
+The idea here is to explicitly save model parameters, correlations etc. directly to the MarketDataFile, leave it static, and 
+then define current market prices in the Price Factors section. Of course, for this to work, a MarketDataFile needs to have an 
+empty *Price Factors* section  
+
+This makes working with riskflow JSON files easier as we can load up and cache static MarketDataFile once and only read the 
+trade, calculation and *Price Factor* data per JSON file.    
 
 ## CalendDataFile
 
