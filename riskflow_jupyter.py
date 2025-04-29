@@ -705,7 +705,7 @@ class RiskFactorsPage(TreePanel):
             factor = rf.utils.Factor(raw_factor[0], raw_factor[1:])
             factor_to_append = {}
             process_to_append = {}
-            process_data = possible_risk_process[factor.type].copy()
+            process_data = copy.deepcopy(possible_risk_process[factor.type])
 
             factor_process_map[price_factor] = ''
 
@@ -942,6 +942,7 @@ class RiskFactorsPage(TreePanel):
                 # load the values:
                 for frame_name, frame_value in sorted(frame.items()):
                     if frame_name == 'Process':
+                        logging.info(frame_value)
                         stoch_proc = self.config.params['Model Configuration'].search(
                             factor, self.config.params['Price Factors'].get(key, {}))
                         if stoch_proc:
@@ -1130,11 +1131,11 @@ class SetupPage(TreePanel):
             #frames.append(self.model_config_frame())
             frames.append(self.config_frame(
                 'Stochastic Process Mapping', 'Model Configuration',
-                'Process_factor_map', "Risk_Factor.Interpolation"))
+                'Process_factor_map', "Risk_Factor.Stochastic_Process"))
         elif selection[0] == 'Price Factor Interpolation':
             frames.append(self.config_frame(
                 'Factor Interpolation Mapping', 'Price Factor Interpolation',
-                'Interpolation_factor_map', "Risk_Factor.Stochastic_Process"))
+                'Interpolation_factor_map', "Risk_Factor.Interpolation"))
 
         return frames
 
@@ -1183,7 +1184,7 @@ class CalculationPage(TreePanel):
         if self.config.deals.get('Calculation'):
             calc_type = self.config.deals['Calculation']['Object']
             ref_name = self.config.deals['Attributes'].get('Reference', 'Unknown')
-            key = '{}.{}'.format(calc_type, ref_name)
+            key = self.config.deals['Calculation'].get('calc_name', '{}.{}'.format(calc_type, ref_name))
             calculation_to_add.append({
                 "text": key,
                 "type": "default",
@@ -1542,7 +1543,7 @@ class Workbench(object):
         self.factors = RiskFactorsPage(self.context)
         self.calculations = CalculationPage(self.context, self.default_rundate)
 
-        self.tabs.children = [self.filename, self.portfolio.main_container,
+        self.tabs.children = [self.filename, self.setup.main_container, self.portfolio.main_container,
                               self.factors.main_container, self.calculations.main_container]
 
     def __del__(self):
