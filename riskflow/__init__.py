@@ -309,7 +309,7 @@ class Context:
             # check if there's a stressed marketdata defined (record but don't load it)
             self.stressed_config_file = market_data.get('StressedMarketDataFile')
 
-            if market_data['MarketDataFile'] not in self.config_cache:
+            if market_data['MarketDataFile'] and market_data['MarketDataFile'] not in self.config_cache:
                 new_cfg = self.load_config(self.parse_path(market_data['MarketDataFile']))
 
                 # check if a calendar is loaded
@@ -320,12 +320,14 @@ class Context:
                     self.holiday_cfg_cache[market_data['MarketDataFile']] = data['Calc']['CalendDataFile']
 
                 self.config_cache[market_data['MarketDataFile']] = new_cfg
+            else:
+                self.config_cache[market_data['MarketDataFile']] = AdaptivContext()
 
             cfg = self.config_cache[market_data['MarketDataFile']]
             for section, section_data in market_data['ExplicitMarketData'].items():
                 cfg.params[section].update(section_data)
 
-            if 'CalendDataFile' in data['Calc'] and data['Calc'][
+            if data['Calc'].get('CalendDataFile') and data['Calc'][
                 'CalendDataFile'] != self.holiday_cfg_cache[market_data['MarketDataFile']]:
                 # parse calendar file again
                 cfg.parse_calendar_file(self.parse_path(data['Calc']['CalendDataFile']))
@@ -339,7 +341,9 @@ class Context:
             # try to compress the deal data if possible
             deals = data['Calc']['Deals']['Deals']
             if compress:
-                deals['Children'][0]['Children'] = utils.compress_deal_data(deals['Children'][0]['Children'])
+                for i in deals['Children']:
+                    if 'Children' in i:
+                        i['Children'] = utils.compress_deal_data(i['Children'])
 
             cfg.deals.update({'Deals': deals})
             cfg.deals.update({'Calculation': data['Calc']['Calculation']})
@@ -355,6 +359,10 @@ class Context:
         :param json_filename:
         :return: None (saves the job to JSON file)
         '''
+
+        def write_final_json(out_json, cfg, section):
+            if cfg.params[section]:
+                out_json[section] = cfg.params[section]
 
         cfg = self.current_cfg
         try:
@@ -374,13 +382,23 @@ class Context:
                     "MergeMarketData": {
                         "MarketDataFile": md,
                         "ExplicitMarketData": {
-                            "System Parameters": {},
-                            "Price Factors": cfg.params['Price Factors']
                         }
                     },
                     "CalendDataFile": cal
                 }
             }
+
+        out_json = final_json['Calc']['MergeMarketData']['ExplicitMarketData']
+        if md:
+            # only write out the price factors if the market data is defined
+            write_final_json(out_json, cfg, 'Price Factors')
+        else:
+            # write out everything
+            write_final_json(out_json, cfg, 'System Parameters')
+            write_final_json(out_json, cfg, 'Model Configuration')
+            write_final_json(out_json, cfg, 'Price Factors')
+            write_final_json(out_json, cfg, 'Price Models')
+            write_final_json(out_json, cfg, 'Correlations')
 
         data = json.dumps(final_json, separators=(',', ':'), cls=CustomJsonEncoder)
         if json_filename is not None:

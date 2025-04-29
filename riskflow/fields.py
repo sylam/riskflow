@@ -176,7 +176,7 @@ mapping = {
                                                        'value': 'Yes', 'values': ['Yes', 'No']},
             'Correlations_Healing_Method': {'widget': 'Dropdown', 'description': 'Correlations Healing Method',
                                             'value': 'Eigenvalue_Raising',
-                                            'values': ['Eigenvalue_Raising', 'Hope_and_Pray']}
+                                            'values': ['Eigenvalue_Raising', 'Alternating_Projections']}
         },
         'types': {
             'Config':

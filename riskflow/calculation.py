@@ -115,7 +115,7 @@ class DealStructure(object):
     def finalize_struct(self, base_date, time_grid):
         self.obj.Instrument.set_report_dates(
             reduce(set.union, [set(x.obj.Instrument.get_report_dates(
-                time_grid, base_date)) for x in self.sub_structures])
+                time_grid, base_date)) for x in self.sub_structures], time_grid.mtm_dates)
         )
         # copy across the reporting dates to the time_grid
         time_grid.set_report_dates(base_date, self.obj.Instrument.get_report_dates())

@@ -91,11 +91,14 @@ class ModelParams(object):
         self.modelfilters = {}
         if state:
             defaults, filters = state
-            for factor, model in defaults.items():
-                self.append(factor, (), model)
-            for factor, mappings in filters.items():
-                for condition, model in mappings:
-                    self.append(factor, tuple(condition), model)
+            self.set_state(defaults, filters)
+
+    def set_state(self, defaults, filters):
+        for factor, model in defaults.items():
+            self.append(factor, (), model)
+        for factor, mappings in filters.items():
+            for condition, model in mappings:
+                self.append(factor, tuple(condition), model)
 
     def append(self, price_factor, price_filter, stoch_proc):
         if price_filter == ():
@@ -103,22 +106,8 @@ class ModelParams(object):
         else:
             self.modelfilters.setdefault(price_factor, []).append((price_filter, stoch_proc))
 
-    def write_to_file(self, file_handle):
-        # write out the defaults first, then any filters that apply
-        filters_written = set()
-        for factor, model_name in self.modeldefaults.items():
-            rules = self.modelfilters.get(factor)
-            if rules:
-                for (attrib, value), model in rules:
-                    file_handle.write('{0}={1} where {2} = "{3}"\n'.format(factor, model, attrib, value))
-                filters_written.add(factor)
-            file_handle.write('{0}={1}\n'.format(factor, model_name))
-
-        # make sure we write all the filters out
-        for factor, rules in self.modelfilters.items():
-            if factor not in filters_written:
-                for (attrib, value), model in rules:
-                    file_handle.write('{0}={1} where {2} = "{3}"\n'.format(factor, model, attrib, value))
+    def update(self, modelparams):
+        self.set_state(modelparams.modeldefaults, modelparams.modelfilters)
 
     def additional_factors(self, model, factor):
         add_factor = self.implied_models.get(model)
