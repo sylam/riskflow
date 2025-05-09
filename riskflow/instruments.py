@@ -2801,7 +2801,7 @@ class EquityOptionDeal(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('Fx And Equity', ['A vanilla option described [here](./definitions#european-options)'])
+    documentation = ('Fx And Equity', ['A vanilla option described [here](./definitions.md#european-options)'])
 
     def __init__(self, params, valuation_options):
         super(EquityOptionDeal, self).__init__(params, valuation_options)
@@ -3992,7 +3992,7 @@ class FXTARFOptionDeal(Deal):
                      'FX_Volatility': ['FXVol']}
 
     documentation = (
-        'Fx And Equity', ['A Monte Carlo Priced FX instrument described [here](./definitions#european-options)'])
+        'Fx And Equity', ['A Monte Carlo Priced FX instrument described [here](./definitions.md#european-options)'])
 
     def __init__(self, params, valuation_options):
         super(FXTARFOptionDeal, self).__init__(params, valuation_options)
@@ -4072,7 +4072,7 @@ class FXOptionDeal(Deal):
                      'FX_Volatility': ['FXVol']}
 
     documentation = (
-        'Fx And Equity', ['A path independent vanilla FX Option described [here](./definitions#european-options)'])
+        'Fx And Equity', ['A path independent vanilla FX Option described [here](./definitions.md#european-options)'])
 
     def __init__(self, params, valuation_options):
         super(FXOptionDeal, self).__init__(params, valuation_options)

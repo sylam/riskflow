@@ -14,7 +14,7 @@ Riskflow uses standard JSON as its source of input. The structure of a riskflow 
 
 ## Calculation
 This defines the parameters of the calculation. Parameters are dependent on the calculation type 
-and is documented [here](../api_usage/calculations). Note, however, the type of the calculation is provided as 
+and is documented [here](../api_usage/calculations.md). Note, however, the type of the calculation is provided as 
 an *Object* attribute.
 
 e.g.

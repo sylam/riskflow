@@ -1542,6 +1542,7 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
     # cost of carry
     b = torch.log(forward / spot) / safe_expiry
     # now precalc all past resets
+    eps = torch.finfo(shared.one.dtype).eps
     samples = factor_dep['Samples'].reinitialize(shared.one)
     known_resets = samples.known_resets(shared.simulation_batch)
     start_idx = samples.get_start_index(deal_time)
@@ -1587,7 +1588,7 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         strike_bar = torch.clamp(
             factor_dep['Strike'] - average.reshape(1, -1).expand(counts[index], -1), min=1e-5)
         moneyness = calc_moneyness(
-            strike_bar / normalize, spot_block, forward_block, deal_data, use_forwards, invert_moneyness)
+            strike_bar / normalize.clamp(min=eps), spot_block, forward_block, deal_data, use_forwards, invert_moneyness)
         vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, tau, shared)
 
         if factor_dep.get('Check_Payoff_Type', False):
@@ -1606,9 +1607,9 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         M2 = torch.sum(sample_ft * (product_t + 2.0 * sum_t), dim=1)
 
         # trick to avoid nans in the gradients
-        MM = torch.log(M2) - 2.0 * torch.log(M1)
-        MM_ok = MM.clamp(min=1e-5)
-        vol_t = torch.sqrt(MM_ok)
+        MM = torch.log(M2.clamp(min=eps)) - 2.0 * torch.log(M1.clamp(min=eps))
+        var_t = torch.where((M1>eps) & (M2>eps), MM, 0.0)
+        vol_t = torch.where(var_t > 0.0, torch.sqrt(var_t.clamp(min=eps)), 0.0)
 
         if factor_dep['Digital']:
             theo_price = utils.black_european_option(

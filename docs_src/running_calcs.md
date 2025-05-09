@@ -13,7 +13,7 @@ Notice that the pairing of Risk Factor with a compatible stochastic process is f
   <source src="credit_monte_carlo.mp4" type="video/mp4">
 </video>
 
-The parameters are explained [here](../api_usage/calculations). Of course, there is also the 
+The parameters are explained [here](../api_usage/calculations.md). Of course, there is also the 
 problem of capturing correlations between risk factors. Defining these Correlations and 
 calculating the stochastic process parameters can be eased by loading up a file of 
 historical data.
