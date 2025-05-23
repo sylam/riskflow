@@ -127,11 +127,11 @@ class ConstructMarkdown(object):
         if obj == 'Period': return "String (Period, e.g., '3M', '1Y6M')"
         if obj == 'Tuple': return "String (Dot-separated, e.g., 'USD.EUR')"
         # Link complex types
-        if widget == 'Flot' or (widget == 'Table' and obj == 'DateValueList'): return "JSON Array (See `.Curve` type in [General Types](general_types.md))"
-        if widget == 'Three': return "JSON Object/Array (See `.Surface`/`.Space` type in [General Types](general_types.md))"
-        if obj == 'DateList': return "JSON Array (See `.DateList` type in [General Types](general_types.md))"
-        if obj == 'DateEqualList': return "JSON Array (See `.DateEqualList` type in [General Types](general_types.md))"
-        if obj == 'CreditSupportList': return "JSON Array (See `.CreditSupportList` type in [General Types](general_types.md))"
+        if widget == 'Flot' or (widget == 'Table' and obj == 'DateValueList'): return "JSON Array (See `.Curve` type in [General Types](../general_types.md))"
+        if widget == 'Three': return "JSON Object/Array (See `.Surface`/`.Space` type in [General Types](../general_types.md))"
+        if obj == 'DateList': return "JSON Array (See `.DateList` type in [General Types](../general_types.md))"
+        if obj == 'DateEqualList': return "JSON Array (See `.DateEqualList` type in [General Types](../general_types.md))"
+        if obj == 'CreditSupportList': return "JSON Array (See `.CreditSupportList` type in [General Types](../general_types.md))"
         if widget == 'Table': return "JSON Array of Arrays (See description for column structure)"
         if widget == 'Container': return "JSON Object (Nested Structure)"
         return "String" # Default

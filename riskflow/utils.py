@@ -2721,8 +2721,8 @@ def make_energy_cashflows(reference_date, time_grid, position, cashflows, refere
                  position * cashflow['Volume'], 0.0, cashflow.get('Fixed_Basis', 0.0), 0.0, 0.0])
 
             r = []
-            bunsiness_dates = pd.date_range(cashflow['Period_Start'], cashflow['Period_End'],
-                                            freq=forward_calendar_bday)
+            bunsiness_dates = pd.date_range(
+                cashflow['Period_Start'], cashflow['Period_End'], freq=forward_calendar_bday)
 
             if forwardsample.get_sampling_convention() == 'ForwardPriceSampleDaily':
                 # create daily samples

@@ -691,7 +691,8 @@ class Context(object):
                     if additional_factor:
                         additional_factors.setdefault(factor_model, additional_factor)
                 else:
-                    logging.error(
+                    log_fn = logging.warning if len(factor.name)>1 else logging.error
+                    log_fn(
                         'Risk Factor {0} using stochastic process {1} missing in Price Models section'.format(
                             utils.check_tuple_name(factor), stoch_proc))
 
