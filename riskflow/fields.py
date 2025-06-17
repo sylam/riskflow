@@ -129,7 +129,7 @@ mapping = {
             'Batch_Size': {'widget': 'Integer', 'description': 'Batch Size', 'value': 1024},
             'Random_Seed': {'widget': 'Integer', 'description': 'Random Seed', 'value': 5120},
             'Calc_Scenarios': {'widget': 'Dropdown', 'description': 'Calc Scenarios', 'value': 'No',
-                               'values': ['Yes', 'No']},
+                               'values': ['At_Percentile', 'All', 'No']},
             'Deflation_Interest_Rate': {'widget': 'Text', 'description': 'Deflation Interest Rate',
                                         'value': 'ZAR-SWAP'},
             'Credit_Valuation_Adjustment': {'widget': 'Container', 'description': 'Credit Valuation Adjustment',

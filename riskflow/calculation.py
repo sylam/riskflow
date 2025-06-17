@@ -915,21 +915,49 @@ class Credit_Monte_Carlo(Calculation):
             if result == 'scenarios':
                 scen = {}
                 scenario_date_index = pd.DatetimeIndex(sorted(self.time_grid.scenario_dates))
-                for k, v in data.items():
-                    factor_name = utils.check_tuple_name(k)
-                    values = np.concatenate(v, axis=-1)
-                    if len(values.shape) == 2:
-                        columns = pd.MultiIndex.from_product(
-                            [[0.0], np.arange(values.shape[-1])], names=['tenor', 'scenario'])
-                        scen[factor_name] = pd.DataFrame(values,
-                                                         index=scenario_date_index[:values.shape[0]], columns=columns).T
-                    else:
-                        tenors = self.all_tenors[k][0].tenor
-                        columns = pd.MultiIndex.from_product(
-                            [tenors, np.arange(values.shape[-1])], names=['tenor', 'scenario'])
-                        scen[factor_name] = pd.DataFrame(
-                            values.reshape(values.shape[0], -1),
-                            index=scenario_date_index[:values.shape[0]], columns=columns).T
+                if self.params['Calc_Scenarios']=='At_Percentile':
+                    # calc pfe
+                    dates = np.array(sorted(self.time_grid.mtm_dates))[self.time_grid.report_index]
+                    mtms = pd.DataFrame(np.concatenate(output['mtm'], axis=-1).astype(np.float64), index=dates)
+                    percentiles = self.params.get('Percentile', '95').replace(' ', '').split(',')
+                    profiles = {x: np.percentile(mtms.values, float(x), axis=1) for x in percentiles}
+                    index = {x: np.argmin(np.abs(mtms.values - profiles[x][:, np.newaxis]), axis=1) for x in percentiles}
+
+                    # now only extract the scenarios at percentile points
+                    for factor_key, factor_values in data.items():
+                        factor_name = utils.check_tuple_name(factor_key)
+                        values = np.concatenate(factor_values, axis=-1)  # Shape: (num_rows, num_scenarios)
+                        value_len = values.shape[0]
+                        if len(values.shape) == 2:
+                            columns = pd.MultiIndex.from_product(
+                                [[0.0], percentiles], names=['tenor', 'scenario'])
+                            vals = np.dstack([values[np.arange(value_len), i[:value_len]] for i in index.values()])
+                            scen[factor_name] = pd.DataFrame(
+                                vals.reshape(value_len, -1), index=scenario_date_index[:value_len], columns=columns).T
+                        else:
+                            tenors = self.all_tenors[factor_key][0].tenor
+                            columns = pd.MultiIndex.from_product(
+                                [tenors, percentiles], names=['tenor', 'scenario'])
+                            vals = np.dstack([values[np.arange(value_len), :, i[:value_len]] for i in index.values()])
+                            scen[factor_name] = pd.DataFrame(
+                                vals.reshape(value_len, -1),
+                                index=scenario_date_index[:value_len], columns=columns).T
+                else:
+                    for k, v in data.items():
+                        factor_name = utils.check_tuple_name(k)
+                        values = np.concatenate(v, axis=-1)
+                        if len(values.shape) == 2:
+                            columns = pd.MultiIndex.from_product(
+                                [[0.0], np.arange(values.shape[-1])], names=['tenor', 'scenario'])
+                            scen[factor_name] = pd.DataFrame(
+                                values, index=scenario_date_index[:values.shape[0]], columns=columns).T
+                        else:
+                            tenors = self.all_tenors[k][0].tenor
+                            columns = pd.MultiIndex.from_product(
+                                [tenors, np.arange(values.shape[-1])], names=['tenor', 'scenario'])
+                            scen[factor_name] = pd.DataFrame(
+                                values.reshape(values.shape[0], -1),
+                                index=scenario_date_index[:values.shape[0]], columns=columns).T
                 self.output.setdefault('scenarios', scen)
             elif result == 'cashflows':
                 self.output.setdefault('cashflows', {k: pd.concat(v, axis=1) for k, v in data.items()})
@@ -1373,7 +1401,7 @@ class Credit_Monte_Carlo(Calculation):
                             [v.cpu().detach().numpy() for _, v in sorted(values.items())], index=cash_index))
 
             # add any scenarios if necessary
-            if self.params.get('Calc_Scenarios', 'No') == 'Yes':
+            if self.params.get('Calc_Scenarios', 'No') != 'No':
                 for key, value in self.stoch_factors.items():
                     output.setdefault('scenarios', {}).setdefault(key, []).append(
                         shared_mem.t_Scenario_Buffer[key].cpu().detach().numpy())
