@@ -471,6 +471,9 @@ class TensorSchedule(object):
     def __getitem__(self, x):
         return self.schedule[x]
 
+    def __len__(self):
+        return len(self.schedule)
+
     def count(self):
         return self.schedule.shape[0]
 

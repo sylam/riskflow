@@ -254,16 +254,16 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False, job_id
         return calc, params_mc
     else:
         out = calc.execute(params_mc, job_id, num_jobs)
+        # summarize the results for easy review
+        out['Results']['exposure_profile'] = summarize_data(
+            out['Results']['mtm'], params_mc.get('Percentile', '95').replace(' ', ''))
 
         if res_queue is not None:
             # parent process must summarize data
-            res_queue.put({'Results': out['Results'], 'Stats': out['Stats']})
-        else:
-            # summarize the results for easy review
-            out['Results']['exposure_profile'] = summarize_data(
-                out['Results']['mtm'], params_mc.get('Percentile', '95').replace(' ', ''))
-
-            return calc, out
+            res_queue.put({'Results': out['Results'], 'Stats': out['Stats'], 'Params':params_mc, 'Reference':context.deals['Attributes']['Reference']})
+            
+        return calc, out
+        
 
 
 class Context:

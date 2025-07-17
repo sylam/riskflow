@@ -1016,7 +1016,8 @@ class Credit_Monte_Carlo(Calculation):
         # Define the base and scenario grids
         self.input_time_grid = params['Time_grid']
         # needed if we are using multiprocessing across gpu's
-        self.batch_size = params['Batch_Size'] // num_jobs
+        params['Simulation_Batches'] = params['Simulation_Batches'] // num_jobs
+        self.batch_size = params['Batch_Size']
         self.numscenarios = self.batch_size * params['Simulation_Batches']
 
         # store the params
@@ -1026,7 +1027,7 @@ class Credit_Monte_Carlo(Calculation):
 
         # store the stats for the batches
         self.calc_stats['Batch_Size'] = self.batch_size
-        self.calc_stats['Simulation_Batches'] = params['Simulation_Batches']
+        self.calc_stats['Simulation_Batches'] = self.params['Simulation_Batches']
         self.calc_stats['Random_Seed'] = params['Random_Seed']
 
         # update the factors and obtain shared state
