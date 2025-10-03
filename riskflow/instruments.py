@@ -1902,6 +1902,8 @@ class CFFloatingInterestListDeal(Deal):
         if self.field['Cashflows'].get('Properties'):
             first_prop = self.field['Cashflows']['Properties'][0]
             if first_prop.get('Cap_Multiplier', 0.0) or first_prop.get('Floor_Multiplier', 0.0):
+                if first_prop.get('Digital_Payoff_Rate') is not None:
+                    field_index['Digital_Payoff_Rate'] = first_prop['Digital_Payoff_Rate']
                 field_index['Model'] = pricing.pricer_cap if first_prop.get(
                     'Cap_Multiplier') is not None else pricing.pricer_floor
                 field_index['VolSurface'] = get_interest_vol_factor(

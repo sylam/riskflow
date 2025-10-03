@@ -346,7 +346,7 @@ class CMC_State(utils.Calculation_State):
         self.t_quasi_rng = {}
         self.t_quasi_rng_batch = {}
         # set the random seed - seed each job by its offset
-        torch.manual_seed(seed+job_id)
+        torch.manual_seed(seed + job_id)
         # needed if we are running across multiple gpu's
         self.job_id = job_id
         self.num_jobs = num_jobs
@@ -689,7 +689,7 @@ class Credit_Monte_Carlo(Calculation):
                 current_val = value.current_value(offset=factor_tenor_offset)
                 if isinstance(current_val, dict):
                     for k, v in current_val.items():
-                        self.static_var[utils.Factor(key.type, key.name+(k,))] = torch.tensor(
+                        self.static_var[utils.Factor(key.type, key.name + (k,))] = torch.tensor(
                             v, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
                 else:
                     self.static_var[key] = torch.tensor(
@@ -915,7 +915,7 @@ class Credit_Monte_Carlo(Calculation):
             if result == 'scenarios':
                 scen = {}
                 scenario_date_index = pd.DatetimeIndex(sorted(self.time_grid.scenario_dates))
-                if self.params['Calc_Scenarios']=='At_Percentile':
+                if self.params['Calc_Scenarios'] == 'At_Percentile':
                     # calc pfe
                     dates = np.array(sorted(self.time_grid.mtm_dates))[self.time_grid.report_index]
                     mtms = pd.DataFrame(np.concatenate(output['mtm'], axis=-1).astype(np.float64), index=dates)
@@ -1485,7 +1485,7 @@ class Base_Revaluation(Calculation):
                 current_val = value.current_value()
                 if isinstance(current_val, dict):
                     for k, v in current_val.items():
-                        self.static_var[utils.Factor(key.type, key.name+(k,))] = torch.tensor(
+                        self.static_var[utils.Factor(key.type, key.name + (k,))] = torch.tensor(
                             v, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
                 else:
                     self.static_var[key] = torch.tensor(

@@ -1904,17 +1904,13 @@ def pricer_float_cashflows(all_resets, t_cash, shared):
 def pricer_cap(all_resets, t_cash, factor_dep, expiries, tenor, shared):
     mn_option = all_resets - t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1)
     expiry = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount](expiries)
+    digital_payoff = factor_dep['Digital_Payoff_Rate'] if 'Digital_Payoff_Rate' in factor_dep else 0.0
 
-    if (expiries > 0).any():
-        vols = utils.calc_tenor_cap_time_grid_vol_rate(
-            factor_dep['VolSurface'], mn_option, expiry, tenor, shared)
-
-        payoff = utils.black_european_option(
-            all_resets, t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1),
-            vols, expiry, 1.0, 1.0, shared)
-    else:
-        payoff = smooth_relu(
-            all_resets - t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1))
+    vols = utils.calc_tenor_cap_time_grid_vol_rate(
+        factor_dep['VolSurface'], mn_option, expiry, tenor, shared)
+    payoff = utils.black_european_option(
+        all_resets, t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1),
+        vols, expiry, 1.0, 1.0, shared, cash_payoff=digital_payoff)
 
     all_int = t_cash[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * payoff
     margin = shared.one.new_zeros(len(t_cash))
@@ -1925,17 +1921,13 @@ def pricer_cap(all_resets, t_cash, factor_dep, expiries, tenor, shared):
 def pricer_floor(all_resets, t_cash, factor_dep, expiries, tenor, shared):
     mn_option = all_resets - t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1)
     expiry = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount](expiries)
+    digital_payoff = factor_dep['Digital_Payoff_Rate'] if 'Digital_Payoff_Rate' in factor_dep else 0.0
 
-    if (expiries > 0).any():
-        vols = utils.calc_tenor_cap_time_grid_vol_rate(
-            factor_dep['VolSurface'], mn_option, expiry, tenor, shared)
-
-        payoff = utils.black_european_option(
-            all_resets, t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1),
-            vols, expiry, 1.0, -1.0, shared)
-    else:
-        payoff = smooth_relu(
-            t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1) - all_resets)
+    vols = utils.calc_tenor_cap_time_grid_vol_rate(
+        factor_dep['VolSurface'], mn_option, expiry, tenor, shared)
+    payoff = utils.black_european_option(
+        all_resets, t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1),
+        vols, expiry, 1.0, -1.0, shared, cash_payoff=digital_payoff)
 
     all_int = t_cash[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * payoff
     margin = shared.one.new_zeros(len(t_cash))
