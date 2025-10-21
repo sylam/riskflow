@@ -1575,9 +1575,10 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
         # remaining tenor
         tau = daycount_fn(tenor_block)
-        sample_ts = carry_block.new(
-            daycount_fn(dual_samples.np[sample_index_t:, utils.RESET_INDEX_End_Day].reshape(1, -1) -
-                        t_block[:, utils.TIME_GRID_MTM, np.newaxis]))
+        sample_tau = daycount_fn(
+            dual_samples.np[sample_index_t:, utils.RESET_INDEX_End_Day].reshape(1, -1) -
+            t_block[:, utils.TIME_GRID_MTM, np.newaxis])
+        sample_ts = carry_block.new(sample_tau)
 
         weight_t = dual_samples.tn[sample_index_t:, utils.RESET_INDEX_Weight].reshape(1, -1, 1)
         normalize = dual_samples.tn[sample_index_t:, utils.RESET_INDEX_Weight].sum()
@@ -1589,20 +1590,21 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
             factor_dep['Strike'] - average.reshape(1, -1).expand(counts[index], -1), min=1e-5)
         moneyness = calc_moneyness(
             strike_bar / normalize.clamp(min=eps), spot_block, forward_block, deal_data, use_forwards, invert_moneyness)
-        vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, tau, shared)
+
+        vols = torch.stack([utils.calc_time_grid_vol_rate(
+            factor_dep['Volatility'], mon, s_tau, shared) for mon, s_tau in zip(moneyness, sample_tau)])
 
         if factor_dep.get('Check_Payoff_Type', False):
             # need quanto/compo adjustments
-            adj = calc_vol_adjustment(factor_dep, deal_time, tau, vols, shared)
-            vols = adj['vol']
-            carry_block = carry_block + adj['b_adj']
+            adj = [calc_vol_adjustment(
+                factor_dep, deal_time, s_tau, vol, shared) for s_tau, vol in zip(sample_tau, vols)]
+            vols = torch.stack([x['vol'] for x in adj])
+            carry_block = torch.stack([cb+x['b_adj'] for cb,x in zip(carry_block, adj)])
 
-        sample_ft = weight_t * torch.exp(
-            torch.unsqueeze(carry_block, dim=1) * torch.unsqueeze(sample_ts, dim=2))
+        sample_ft = weight_t * torch.exp(carry_block * torch.unsqueeze(sample_ts, dim=2))
+
         M1 = torch.sum(sample_ft, dim=1)
-
-        product_t = sample_ft * torch.exp(
-            torch.unsqueeze(sample_ts, dim=2) * torch.unsqueeze(vols * vols, dim=1))
+        product_t = sample_ft * torch.exp(torch.unsqueeze(sample_ts, dim=2) * (vols * vols))
         sum_t = F.pad(torch.cumsum(product_t[:, :-1], dim=1), [0, 0, 1, 0, 0, 0])
         M2 = torch.sum(sample_ft * (product_t + 2.0 * sum_t), dim=1)
 
