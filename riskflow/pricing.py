@@ -1600,6 +1600,8 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
                 factor_dep, deal_time, s_tau, vol, shared) for s_tau, vol in zip(sample_tau, vols)]
             vols = torch.stack([x['vol'] for x in adj])
             carry_block = torch.stack([cb+x['b_adj'] for cb,x in zip(carry_block, adj)])
+        else:
+            carry_block = torch.unsqueeze(carry_block, dim=1)
 
         sample_ft = weight_t * torch.exp(carry_block * torch.unsqueeze(sample_ts, dim=2))
 
