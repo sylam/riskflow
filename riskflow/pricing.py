@@ -1573,8 +1573,7 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         t_block = discount_block.time_grid
         sample_index_t = start_index[index]
         tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
-        # remaining tenor
-        tau = daycount_fn(tenor_block)
+
         sample_tau = daycount_fn(
             dual_samples.np[sample_index_t:, utils.RESET_INDEX_End_Day].reshape(1, -1) -
             t_block[:, utils.TIME_GRID_MTM, np.newaxis])
@@ -1585,44 +1584,56 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
         average = torch.sum(
             all_samples[:sample_index_t] * dual_samples.tn[:sample_index_t, utils.RESET_INDEX_Weight].reshape(-1, 1),
             dim=0)
-        # strike_bar can be negative if the average is higher than the original strike price - need to clamp this.
-        strike_bar = torch.clamp(
-            factor_dep['Strike'] - average.reshape(1, -1).expand(counts[index], -1), min=1e-5)
-        moneyness = calc_moneyness(
-            strike_bar / normalize.clamp(min=eps), spot_block, forward_block, deal_data, use_forwards, invert_moneyness)
 
-        vols = torch.stack([utils.calc_time_grid_vol_rate(
-            factor_dep['Volatility'], mon, s_tau, shared) for mon, s_tau in zip(moneyness, sample_tau)])
+        # check if we still need to account for future averages.
+        if sample_tau.size:
+            # strike_bar can be negative if the average is higher than the original strike price - need to clamp this.
+            strike_bar = torch.clamp(
+                factor_dep['Strike'] - average.reshape(1, -1).expand(counts[index], -1), min=1e-5)
+            moneyness = calc_moneyness(
+                strike_bar / normalize.clamp(min=eps), spot_block, forward_block, deal_data, use_forwards,
+                invert_moneyness)
+            # get the vol per sample tau
+            vols = torch.stack([utils.calc_time_grid_vol_rate(
+                factor_dep['Volatility'], mon, s_tau, shared) for mon, s_tau in zip(moneyness, sample_tau)])
+            if factor_dep.get('Check_Payoff_Type', False):
+                # need quanto/compo adjustments
+                adj = [calc_vol_adjustment(
+                    factor_dep, deal_time, s_tau, vol, shared) for s_tau, vol in zip(sample_tau, vols)]
+                vols = torch.stack([x['vol'] for x in adj])
+                carry_block = torch.stack([cb + x['b_adj'] for cb, x in zip(carry_block, adj)])
+            else:
+                carry_block = torch.unsqueeze(carry_block, dim=1)
 
-        if factor_dep.get('Check_Payoff_Type', False):
-            # need quanto/compo adjustments
-            adj = [calc_vol_adjustment(
-                factor_dep, deal_time, s_tau, vol, shared) for s_tau, vol in zip(sample_tau, vols)]
-            vols = torch.stack([x['vol'] for x in adj])
-            carry_block = torch.stack([cb+x['b_adj'] for cb,x in zip(carry_block, adj)])
+            sample_ft = weight_t * torch.exp(carry_block * torch.unsqueeze(sample_ts, dim=2))
+
+            M1 = torch.sum(sample_ft, dim=1)
+            product_t = sample_ft * torch.exp(torch.unsqueeze(sample_ts, dim=2) * (vols * vols))
+            sum_t = F.pad(torch.cumsum(product_t[:, :-1], dim=1), [0, 0, 1, 0, 0, 0])
+            M2 = torch.sum(sample_ft * (product_t + 2.0 * sum_t), dim=1)
+
+            # trick to avoid nans in the gradients
+            MM = torch.log(M2.clamp(min=eps)) - 2.0 * torch.log(M1.clamp(min=eps))
+            var_t = torch.where((M1 > eps) & (M2 > eps), MM, 0.0)
+            vol_t = torch.where(var_t > 0.0, torch.sqrt(var_t.clamp(min=eps)), 0.0)
+            tau = 1.0
+            forward_price = M1 * spot_block
         else:
-            carry_block = torch.unsqueeze(carry_block, dim=1)
-
-        sample_ft = weight_t * torch.exp(carry_block * torch.unsqueeze(sample_ts, dim=2))
-
-        M1 = torch.sum(sample_ft, dim=1)
-        product_t = sample_ft * torch.exp(torch.unsqueeze(sample_ts, dim=2) * (vols * vols))
-        sum_t = F.pad(torch.cumsum(product_t[:, :-1], dim=1), [0, 0, 1, 0, 0, 0])
-        M2 = torch.sum(sample_ft * (product_t + 2.0 * sum_t), dim=1)
-
-        # trick to avoid nans in the gradients
-        MM = torch.log(M2.clamp(min=eps)) - 2.0 * torch.log(M1.clamp(min=eps))
-        var_t = torch.where((M1>eps) & (M2>eps), MM, 0.0)
-        vol_t = torch.where(var_t > 0.0, torch.sqrt(var_t.clamp(min=eps)), 0.0)
+            # We're past the averaging period - we know the intrinsic value
+            strike_bar = factor_dep['Strike']
+            # can't set tau exactly to 0 - it will break the AAD
+            tau = 1e-5
+            vol_t = torch.zeros_like(average)
+            forward_price = average
 
         if factor_dep['Digital']:
             theo_price = utils.black_european_option(
-            M1 * spot_block, strike_bar, vol_t, 1.0,
+            forward_price, strike_bar, vol_t, tau,
             factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared, cash_payoff=nominal)
             value = theo_price
         else:
             theo_price = utils.black_european_option(
-                M1 * spot_block, strike_bar, vol_t, 1.0,
+                forward_price, strike_bar, vol_t, tau,
                 factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
             value = nominal * theo_price
 
