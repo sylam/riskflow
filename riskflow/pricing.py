@@ -918,9 +918,9 @@ def pv_american_option(shared, time_grid, deal_data, nominal, moneyness, spot, f
     vol = sigma * torch.sqrt(tau)
     # adjust if this is a put option
     if factor_dep['Option_Type'] > 0:
-        S, K = spot, factor_dep['Strike_Price']
+        S, K = spot, factor_dep['Strike_Price'] * shared.one
     else:
-        S, K = factor_dep['Strike_Price'], spot
+        S, K = shared.one * factor_dep['Strike_Price'], spot
         r, b = r - b, -b
 
     sigma2 = sigma * sigma
@@ -938,7 +938,7 @@ def pv_american_option(shared, time_grid, deal_data, nominal, moneyness, spot, f
     B_inf = K * beta / (beta - 1)
 
     # check if the strike is > 0
-    if K > 0.0:
+    if (K > 0.0).all():
         h_tau = -(b * tau + 2 * vol) * (B_0 / (B_inf - B_0))
         I = B_0 + (B_inf - B_0) * (1 - torch.exp(h_tau))
         safe_S = torch.min(S - 1e-6, I)
@@ -1011,91 +1011,148 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
 
     return value * discount_rates
 
+def pv_MC_Tarf(shared, time_grid, deal_data, spot):
+    """
+    One-step survival Monte Carlo for TARF (autograd-friendly).
+    - Analytic KO-in-step: adds (1 - p_survive) * remaining_target at each fixing
+    - Survival branch: GBM step with Z ~ N(0,1) truncated at z_max from the PnL barrier
+    - Accrual: only ITM leg contributes to target; OTM affects PV only (and optional knock-in barrier)
+    """
 
-def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
-    def calc_accum_value(accumulated, s, k, C, invertedTarget):
-        if invertedTarget:
+    # --- Accumulated target from past observed fixings --------------------------
+    def calc_accum_value(targetValue, accumulated, s, k, C, inverted):
+        if inverted:
             iv = (1.0 / s - 1.0 / k) * C * (-1.0)
         else:
             iv = (s - k) * C
-        if isinstance(iv, float):
-            return accumulated + iv
-        else:
-            return accumulated + iv.unsqueeze(axis=1)
+        return (accumulated + F.relu(iv).unsqueeze(axis=1)).clamp(max=targetValue)
 
-    def sim_tarf(S, accumulatedValue=0.0):
-        tMax = len(S)
-        zeroComparison = 0.00000001
-        # MAIN LOOP
-        terminationEvent = 1.0 * (targetValue - accumulatedValue < zeroComparison)
-        accumulated = accumulatedValue
-        mtm_list = []
+    def sim_spot_tarf(spot_prices, times, carry, prev_accum, discount_rates,
+                      t_block, fixings, t_tenor, sobol=False, num_sims=1024 * 4):
 
-        for t in range(tMax):
-            previousAccumulated = accumulated
-            intrinsicValue = (S[t] - strike) * callOrPut
-            barrierIsHit = 1
-            positive_iv = 1.0 * (intrinsicValue > 0.0)
-            settlementNotional = notional1[t]
-            if invertedTarget:
-                intrinsicValueInverted = (1.0 / S[t] - 1.0 / strike) * callOrPut * (-1.0)
-                accumulated = accumulated + positive_iv * intrinsicValueInverted
-                adjustedStrike = 1.0 / ((1.0 / S[t]) - (targetValue - previousAccumulated) * callOrPut * (-1.0))
-                notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValueInverted
-            else:
-                accumulated = accumulated + positive_iv * intrinsicValue
-                adjustedStrike = S[t] - (targetValue - previousAccumulated) * callOrPut
-                notionalAdjustmentFactor = (targetValue - previousAccumulated) / intrinsicValue
-
-            accumulatedVsTarget = targetValue - accumulated
-            termination = 1.0 * (accumulatedVsTarget < zeroComparison)
-            if targetAdjustment == 1:
-                intrinsicValue = termination * (S[t] - adjustedStrike) * callOrPut + (
-                        1.0 - termination) * intrinsicValue
-            elif targetAdjustment == 2:
-                settlementNotional = termination * settlementNotional * notionalAdjustmentFactor + (
-                        1.0 - termination) * settlementNotional
-
-            positive_val = settlementNotional * intrinsicValue
-            if barrier > zeroComparison:
-                barrierIntrinsic = (barrier - S[t]) * callOrPut
-                barrierIsHit = 1.0 * (barrierIntrinsic >= 0.0)
-
-            negative_val = notional2[t] * intrinsicValue * barrierIsHit
-            mtm_list.append(
-                (1 - terminationEvent) * (positive_iv * positive_val + (1 - positive_iv) * negative_val))
-            # should be safe to just look at the last termination state as we accumulate state
-            # in general, we should maintain the terminationEvent state (by or'ing successive terminations)
-            terminationEvent = termination
-
-        return torch.stack(mtm_list).mean(axis=2)
-
-    def sim_spot(spot_prices, vols, times, carry, prev_accum, sobol=False, num_sims=1024 * 4):
-        timesteps, num_samples = times.shape
-        dt = times.unsqueeze(axis=2)
-        var = (vols * vols).unsqueeze(axis=1) * dt
-        # store params in tensors
-        drift = carry * dt - 0.5 * var
-        # not strictly speaking correct, but we need to do this to prevent gradients from blowing up
-        vol = torch.sqrt(var.clamp(min=1e-4))
-        strike_plus_epsilon = var.new([[strike + 0.001]])
+        # Styles & shapes follow your autocall implementation
+        eps = torch.finfo(shared.one.dtype).eps
+        # easier to type
+        K = strike
+        # Per-block results
         mcmc = []
-        for s, r, sigma in zip(spot_prices, drift, vol):
-            if sobol:
-                z = shared.quasi_rng(shared.simulation_batch, num_samples * num_sims)[0].T.reshape(
-                    num_samples, shared.simulation_batch, -1)
-            else:
-                z = torch.randn([num_samples, shared.simulation_batch, num_sims],
-                                dtype=shared.one.dtype, device=shared.one.device)
-            f1 = (r.unsqueeze(axis=2) + sigma.unsqueeze(axis=2) * z).cumsum(axis=0)
-            mcmc_spot = s.reshape(1, -1, 1) * torch.exp(f1)
-            val = sim_tarf(
-                torch.where(torch.abs(mcmc_spot - strike) < 1e-4, strike_plus_epsilon, mcmc_spot),
-                prev_accum)
-            mcmc.append(val)
+        # Loop over block rows (same zipped signature you use)
+        for t, tau, D, s, carry_rate, delta_t, full_t in zip(
+                t_block, t_tenor, discount_rates, spot_prices, carry, times, fixings):
+
+            # reduced_samples = number of GBM “substeps” in this coupon/fixing leg
+            reduced_samples = len(delta_t)
+            # calculate the total forward rate
+            forward = s.unsqueeze(0) * torch.exp((carry_rate * delta_t.cumsum(0).unsqueeze(-1)))
+            # calculate the moneyness based on the forwards
+            moneyness = strike / forward if factor_dep['Invert_Moneyness']  else forward / strike
+            vols = torch.stack([utils.calc_time_grid_vol_rate(
+                factor_dep['Volatility'], mon, s_tau, shared) for mon, s_tau in zip(moneyness, tau.reshape(-1, 1))])
+            # RNG (uniforms for truncated draws)
+            if reduced_samples:
+                if sobol:
+                    u = shared.quasi_rng(shared.simulation_batch, reduced_samples * num_sims)[1].T.reshape(
+                        reduced_samples, shared.simulation_batch, -1)
+                else:
+                    u = torch.rand([reduced_samples, shared.simulation_batch, num_sims],
+                                   dtype=shared.one.dtype, device=shared.one.device)
+
+            Sj = torch.unsqueeze(s, 1)  # [batch, 1] as you do
+            # Running PV and survival weight (your P/L pattern)
+            P = shared.one.new_zeros((shared.simulation_batch, num_sims))
+            L = shared.one.new_ones((shared.simulation_batch, num_sims))
+            # Remaining target (R) per path at this block start
+            remaining_target = targetValue-prev_accum
+            # which simulations are still alive?
+            q = remaining_target == 0.0
+            # update the Live matrix
+            L = torch.where(q, torch.zeros_like(L), L)
+            # Update the remaining targets
+            R = (remaining_target * factor_dep['Notional1']).expand_as(P)
+            # Per-fixing notional tensors (broadcastable to [batch, sims])
+            N_itm = torch.as_tensor(notional1, dtype=shared.one.dtype, device=shared.one.device)
+            N_otm = torch.as_tensor(notional2, dtype=shared.one.dtype, device=shared.one.device)
+            if N_itm.ndim == 0: N_itm = N_itm.repeat(reduced_samples)
+            if N_otm.ndim == 0: N_otm = N_otm.repeat(reduced_samples)
+            # Iterate over fixings within this block using your “coupon_index”-like stepper
+            for j in range(reduced_samples):
+                # dt and forward-carry consistent with your autocall code
+                dt = delta_t[j]
+                if dt > 0:
+                    fwd_carry = ((carry_rate[j] * full_t[j] - carry_rate[j - 1] * full_t[j - 1]) / dt
+                                 if j > 0 else carry_rate[j]).reshape(-1, 1)  # [batch,1]
+                    fwd_vol = (torch.sqrt((full_t[j] * vols[j]**2 - full_t[j - 1] * vols[j - 1]**2) / dt)
+                               if j > 0 else vols[j]).T
+                    vol_dt = fwd_vol * torch.sqrt(dt)
+                else:
+                    fwd_carry = torch.zeros_like(Sj)
+                    vol_dt = torch.zeros_like(Sj)
+
+                # ---- ONE-STEP SURVIVAL: compute p_survive via PnL barrier -----------------
+                # Standard accrual: KO within this step if (S_i - K)*cp >= R/N_itm and ITM
+                # => spot-level cap B_pnl = K + (R/N_itm) for cp=+1; inverted has reciprocal form
+                N_i = N_itm[j]
+                if not invertedTarget:
+                    B_pnl = K + (R / N_i) * callOrPut # [batch, sims]
+                else:
+                    # (1/S_i - 1/K)*(-cp) * N_i >= R  =>  1/S_i >= 1/K + (R/N_i)*cp  =>  S_i <= 1 / (1/K + (R/N_i)*cp)
+                    rhs = (1.0 / K) + (R / N_i) * callOrPut
+                    B_pnl = 1.0 / rhs
+
+                # Lognormal cap -> z_max
+                # NOTE: use current Sj as “S_{i-1}”
+                z_max = (torch.log(B_pnl/Sj) - (fwd_carry - 0.5 * fwd_vol * fwd_vol) * dt) / vol_dt
+                PhiB = utils.norm_cdf(z_max)  # = P(Z <= z_max)
+                if (callOrPut > 0):
+                    p = PhiB  # survival = Z <= z_max
+                    Z = utils.norm_icdf(torch.clamp(u[j] * p, eps, 1.0 - eps))
+                else:
+                    p = 1.0 - PhiB  # survival = Z >= z_max
+                    Z = utils.norm_icdf(torch.clamp(PhiB + u[j] * p, eps, 1.0 - eps))
+
+                Dj = D[j].reshape(-1,1)
+                # ---- Analytic KO-in-step contribution -------------------------------------
+                # KO pays the *remaining target* this step, discounted at the j-th discount point
+                P = P + (1.0 - p) * L * R * Dj
+                # GBM increment
+                Sj = Sj * (torch.exp((fwd_carry - 0.5 * fwd_vol * fwd_vol) * dt + vol_dt * Z) if dt > 0 else 1.0)
+                # ---- Economic PV for this fixing -----------------------------------------
+                intr = ((Sj - K) * callOrPut).clamp(max=remaining_target)  # intrinsic
+                itm_mask = (intr > 0.0)  # ITM
+                # Optional knock-in on OTM leg
+                if barrier > 0.0:
+                    barrier_intr = (barrier - Sj) * callOrPut
+                    barrier_hit = (barrier_intr >= 0.0).to(Sj.dtype)
+                else:
+                    barrier_hit = torch.ones_like(Sj)
+                # economic per-fixing cashflow (signed)
+                cf_itm = F.relu(intr) * N_itm[j]  # ≥ 0
+                cf_otm = F.relu(-intr) * N_otm[j] * barrier_hit  # ≤ 0
+                cf_step = L * p * (cf_itm - cf_otm)  # signed
+                # add discounted PV to P
+                P = P + Dj * cf_step
+                # ---- Update remaining target R on survivors ------------------------------
+                if not invertedTarget:
+                    accr = F.relu(intr) * N_itm[j]
+                else:
+                    inv_intr = (1.0 / Sj - 1.0 / K) * (-callOrPut)
+                    accr = F.relu(inv_intr) * N_itm[j]
+
+                R = torch.where(itm_mask, R - accr, R)  # survival construction ensures no overshoot
+                # ---- Update survival weight ----------------------------------------------
+                L = p * L
+                # (Optional) settlement at tau==0
+                if tau[0] == 0.0 and j==0:
+                    settle_cf = (cf_itm - cf_otm)
+                    cash_settle(shared, factor_dep['SettleCurrency'],
+                                np.searchsorted(time_grid.mtm_time_grid, t[utils.TIME_GRID_MTM]),
+                                settle_cf.mean(axis=1))
+            # End-of-block: push mean PV over sims
+            mcmc.append(P.mean(axis=1))
 
         return torch.stack(mcmc)
 
+    # --- Main block loop (mirrors your original) --------------------------------
     mtm_list = []
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
@@ -1113,7 +1170,6 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
     # params for the tarf
     targetValue = deal_data.Instrument.field['TargetLevel']
     barrier = deal_data.Instrument.field.get('Barrier', 0.0)
-    targetAdjustment = factor_dep['targetAdjustment']
 
     num_dates = (samples.schedule[:, utils.RESET_INDEX_Value] == 0).sum()
     notional1 = [factor_dep['Notional1']] * num_dates
@@ -1124,10 +1180,10 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
     callOrPut = factor_dep['Option_Type']
 
     # calculate the correct accumulation to date
-    accumulation = 0.0
+    accumulation = shared.one*0.0
     for sample_val in samples.schedule[:, utils.RESET_INDEX_Value]:
         if sample_val:
-            accumulation += calc_accum_value(accumulation, sample_val, strike, callOrPut, invertedTarget)
+            accumulation += calc_accum_value(targetValue, accumulation, sample_val, strike, callOrPut, invertedTarget)
 
     sobol = False
     # use a quasi random generator if we are simulating a large batch
@@ -1136,44 +1192,36 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, moneyness):
         sobol = True
         shared.reset_qrg()
 
-    for index, (discount_block, spot_block, moneyness_block) in enumerate(
-            utils.split_counts([discount, spot, moneyness], counts, shared)):
-        t_block = discount_block.time_grid
-        sample_index_t = start_index[index]
-        tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]
-        fixings = (dual_samples.np[np.newaxis, sample_index_t:, utils.RESET_INDEX_End_Day] -
-                   t_block[:, utils.TIME_GRID_MTM, np.newaxis])
+    # split vectors into blocks based on start_index/counts
+    for b_idx, (discount_block, spot_block) in enumerate(
+            utils.split_counts([discount, spot], counts, shared)):
 
+        start_index_local = start_index[b_idx]  # used by price_block to index fixings
+
+        # Discounting and settlement (keep your semantics)
+        t_block = discount_block.time_grid
+        fixings = (dual_samples.np[np.newaxis, start_index_local:, utils.RESET_INDEX_End_Day] -
+                   t_block[:, utils.TIME_GRID_MTM, np.newaxis])
         drifts = utils.calc_fx_drift(
             deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
             fixings, t_block, shared, multiply_by_time=False)
         fixing_block = daycount_fn(fixings)
 
-        # note that we're using just 1 vol moneyness - the one at expiry (the last date of the TARF)
-        # this should actually be the moneyness for each settlement date - TODO!
-        vols = utils.calc_time_grid_vol_rate(
-            factor_dep['Volatility'], moneyness_block, daycount_fn(tenor_block), shared)
-
         sample_ts = drifts.new(
             np.hstack([fixing_block[:, 0, np.newaxis], np.diff(fixing_block, axis=1)]))
-        theo_cashflow = factor_dep['Buy_Sell'] * sim_spot(
-            spot_block, vols, sample_ts, drifts, accumulation, sobol=sobol,
-            num_sims=shared.MCMC_sims)
-
         discount_rates = utils.calc_discount_rate(discount_block, fixings, shared)
 
-        theo_price = (theo_cashflow * discount_rates).sum(axis=1)
-        # settle potential cashflows
-        cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(
-            time_grid.mtm_time_grid, t_block[-1][utils.TIME_GRID_MTM]), theo_cashflow[-1][0])
-        # update the accumulated value
-        accumulation += calc_accum_value(accumulation, spot_block[-1], strike, callOrPut, invertedTarget)
+        theo_price = factor_dep['Buy_Sell'] * sim_spot_tarf(
+            spot_block, sample_ts, drifts, accumulation, discount_rates,
+            t_block, fixing_block, fixings, sobol=sobol, num_sims=shared.MCMC_sims)
+
+        # update accumulation with the observed last spot in block
+        accumulation = calc_accum_value(targetValue, accumulation, spot_block[-1], strike, callOrPut, invertedTarget)
 
         mtm_list.append(theo_price)
 
-    # mtm in reporting currency
+    # Reporting currency MTM
     mtm = torch.cat(mtm_list, dim=0)
-
     return mtm
 
 

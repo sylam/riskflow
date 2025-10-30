@@ -617,12 +617,9 @@ mapping = {
                                  'Discount_Rate_Volatility', 'Currency', 'Forecast_Rate_Volatility', 'Index_Offset',
                                  'Principal'],
             'FXTARFOptionDeal.Fields': ['Currency', 'Underlying_Currency', 'Discount_Rate', 'Buy_Sell', 'Expiry_Date',
-                                        'Underlying_Amount', 'Option_Type', 'Strike_Price', 'Option_On_Forward',
-                                        'Settlement_Style', 'Option_Style', 'FX_Volatility', 'Barrier2Condition',
-                                        'Barrier2Memory', 'BarrierCondition', 'BarrierMemory', 'InvertedTarget',
-                                        'LeverageNotional', 'PivotRate', 'PivotRateStrike', 'SettleInCurr2',
-                                        'Strike2', 'Strike2Settle', 'StrikeSettle', 'TargetAdjustment', 'TargetLevel',
-                                        'TARF_ExpiryDates'],
+                                        'Underlying_Amount', 'Option_Type', 'Strike_Price', 'Settlement_Style',
+                                        'Option_Style', 'FX_Volatility', 'InvertedTarget', 'LeverageNotional',
+                                        'TargetAdjustment', 'TargetLevel', 'TARF_ExpiryDates'],
             'FXOptionDeal.Fields': ['Underlying_Amount', 'Settlement_Style', 'Strike_Price', 'Underlying_Currency',
                                     'Buy_Sell', 'Option_Type', 'Option_Style', 'Expiry_Date', 'FX_Volatility',
                                     'Forward_Price_Date', 'Discount_Rate', 'Option_On_Forward', 'Currency'],
@@ -897,13 +894,12 @@ mapping = {
             'TARF_ExpiryDates': {'widget': 'Table', 'description': 'TARF ExpiryDates', 'value': 'null',
                             'sub_types':
                                 [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
-                                 {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                                  {'type': 'numeric', 'numericFormat': num_format['currency']}
                                  ],
                             'obj':
                                 'DateEqualList',
                             'col_names':
-                                ['Date', 'Date', 'Value']
+                                ['Date', 'Value']
                             },
             'Months_Lag': {'widget': 'Integer', 'description': 'Months Lag', 'value': 1},
             'Quarters_Lag': {'widget': 'Integer', 'description': 'Quarters Lag', 'value': 0},

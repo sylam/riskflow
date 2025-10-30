@@ -4034,13 +4034,6 @@ class FXTARFOptionDeal(Deal):
             'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
         }
 
-        if self.field['TargetAdjustment'] == 'Adjust Notional':
-            field_index['targetAdjustment'] = 2
-        elif self.field['TargetAdjustment'] == 'Adjust Strike':
-            field_index['targetAdjustment'] = 1
-        else:
-            field_index['targetAdjustment'] = 0
-
         # needed for reporting
         return field_index
 
@@ -4054,15 +4047,8 @@ class FXTARFOptionDeal(Deal):
             deal_data.Factor_dep['Underlying_Currency'][0],
             deal_data.Factor_dep['Currency'][0], deal_time, shared)
 
-        forward = utils.calc_fx_forward(
-            deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
-            deal_data.Factor_dep['Expiry'], deal_time, shared)
-
-        moneyness = deal_data.Factor_dep['Strike_Price'] / forward if deal_data.Factor_dep['Invert_Moneyness'] \
-            else forward / deal_data.Factor_dep['Strike_Price']
-
         mtm = pricing.pv_MC_Tarf(
-            shared, time_grid, deal_data, spot, moneyness) * FX_rep
+            shared, time_grid, deal_data, spot) * FX_rep
 
         return mtm
 
