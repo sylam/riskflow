@@ -2357,6 +2357,8 @@ class SwaptionDeal(Deal):
         st = (vfloat - vmargin) / pvbp
         Kt = (vfixed - vmargin) / pvbp
         mn = st - Kt
+        # get the vol subtype (distribution_type, shift) tuple - only on the base (first vol factor)
+        dist, shf = factor_dep['VolSurface'][0][utils.FACTOR_INDEX_SubType]
 
         tenor = daycount_fn(factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
 
@@ -2366,7 +2368,7 @@ class SwaptionDeal(Deal):
                 factor_dep['Underlying_Swap_maturity'], shared)
 
             theo_price = utils.black_european_option(
-                st, self.field['Swap_Rate'] / 100.0, vols, tenor, buysell, delta, shared)
+                st, self.field['Swap_Rate'] / 100.0, vols, tenor, buysell, delta, shared, shift=shf.amount)
 
             mtm = FX_rep * pvbp * theo_price
         else:
@@ -2382,7 +2384,7 @@ class SwaptionDeal(Deal):
                 factor_dep['Underlying_Swap_maturity'], shared)
 
             theo_price = utils.black_european_option(
-                spot_option, self.field['Swap_Rate'] / 100.0, vols, expiry, buysell, delta, shared)
+                spot_option, self.field['Swap_Rate'] / 100.0, vols, expiry, buysell, delta, shared, shift=shf.amount)
 
             value = F_option * theo_price
             Ut_swap = delta * mn_swap * F_swap
@@ -4001,14 +4003,24 @@ class FXTARFOptionDeal(Deal):
 
     def reset(self, calendars):
         super(FXTARFOptionDeal, self).reset()
+        # TARF dates are Fixing, then settlement
         self.add_reval_dates(
-            set([x[0] for x in self.field['TARF_ExpiryDates']]), self.field['Currency'])
+           set([x[1] for x in self.field['TARF_ExpiryDates']]), self.field['Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency']),
                  'FX_Volatility': utils.check_rate_name(self.field['FX_Volatility'])}
+
+        # create lookups
+        pf = {x[0]:(x[-1] if (x[-1] is not None) else 0.0) for x in self.field['TARF_ExpiryDates']}
+        sd = [x[1] for x in self.field['TARF_ExpiryDates']]
+
+        # bit of a hack - assume that a fixing is at most a month before it's settlement
+        sd_dates = sorted([x for x in sd if x >= base_date])
+        pf_dates = sorted([x for x in pf if x > min(sd_dates) - pd.DateOffset(months=1)])
+        all_dates = sorted(set(sd_dates).union(set(pf_dates)))
 
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
@@ -4026,7 +4038,9 @@ class FXTARFOptionDeal(Deal):
             'Expiry': (self.field['Expiry_Date'] - base_date).days,
             'Invert_Moneyness': field['Currency'][0] == field['FX_Volatility'][0],
             'Strike_Price': self.field['Strike_Price'],
-            'Fixings': utils.make_fixing_data(base_date, time_grid, self.field['TARF_ExpiryDates']),
+            'Fixings': utils.make_fixing_data(base_date, time_grid, [[x, pf.get(x,-1)] for x in all_dates]),
+            'Price_Fixings': utils.make_fixing_data(base_date, time_grid, [[x, pf[x]] for x in pf_dates]),
+            'Settlement': np.array([(x-base_date).days for x in sd_dates]),
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
             'Option_Type': 1.0 if self.field['Option_Type'] == 'Call' else -1.0,
             'Notional1': self.field['Underlying_Amount'],

@@ -141,6 +141,16 @@ $$ x=ln(\frac{K}{F})$$
 
 $K$ is the option strike price and $F$ is the underlying forward price
 
+### Shifts
+
+A shift value may be defined on Volatility surfaces used to price Caplets/Floorlets and Swaptions. The default value is 0 but should it be defined, it is ignored during volatility interpolation and only used when pricing the interest rate option by adding the shift value to both the Forward and Strike values in the usual Black Formula.
+i.e.
+
+Instead of $\mathcal B_\delta(F,K,\sigma\sqrt{t_0-t})$, we calculate $\mathcal B_\delta(F+s,K+s,\sigma\sqrt{t_0-t})$ 
+
+where $s$ is the shift value. Note that this applies to lognormal Surfaces.
+
+
 ### Skew Surfaces
 
 Skews are built up by nine parameters. These parameters are:

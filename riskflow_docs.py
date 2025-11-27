@@ -22,6 +22,7 @@ import inspect
 import importlib
 import logging
 import json # For formatting default values
+import shutil
 from collections import defaultdict
 from pathlib import Path
 from riskflow import fields
@@ -86,7 +87,8 @@ class ConstructMarkdown(object):
         self.docs_src_dir = self.project_dir / 'docs_src'
         self.doc_build_dir = self.project_dir / 'docs'
         self.package_name = 'riskflow'
-
+        self.static_dirs = ['quickstart', 'running_calcs']
+        # Sub‑folders inside docs_src that must be copied wholesale
         if not self.docs_src_dir.is_dir():
             logging.error(f"'docs_src' directory not found at {self.docs_src_dir}")
             raise FileNotFoundError(f"'docs_src' directory not found at {self.docs_src_dir}")
@@ -456,6 +458,20 @@ class ConstructMarkdown(object):
                      with open(build_path, 'wt', encoding='utf-8') as f: f.write('\n'.join(content))
                      logging.info(f"  Generated: {build_path}")
                  except Exception as e: logging.error(f"  Error writing file {build_path}: {e}")
+        # --- Copy whole static directories (quickstart/, running_calcs/) ---
+
+        for d in self.static_dirs:
+            src_dir = self.docs_src_dir / d
+            dest_dir = self.doc_build_dir / d
+
+            if src_dir.is_dir():
+                # Remove any previous artefacts for a clean copy
+                if dest_dir.exists():
+                    shutil.rmtree(dest_dir)
+                shutil.copytree(src_dir, dest_dir)
+                logging.info(f"  Copied directory: {src_dir}  →  {dest_dir}")
+            else:
+                logging.warning(f"  Static directory not found: {src_dir}")
 
         # --- Generate Section Docs (excluding JSON, handled separately) ---
         for section_key, (display_name, module, attr) in self.SECTIONS.items():

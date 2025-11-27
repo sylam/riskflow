@@ -243,6 +243,9 @@ class Percent:
     def __mul__(self, other):
         return self.amount * other
 
+    def __add__(self, other):
+        return self.amount + other
+
     def __repr__(self):
         return str(self)
 
@@ -1090,6 +1093,10 @@ def norm_cdf(x):
     return 0.5 * (torch.erfc(x * -0.7071067811865475))
 
 
+def norm_pdf(x):
+    return 0.3989422804014327 * torch.exp(-0.5*x*x)
+
+
 def norm_icdf(x):
     return 1.4142135623730951 * torch.erfinv(2.0 * x - 1.0)
 
@@ -1179,8 +1186,16 @@ def Bjerksund_Stensland(A1, A2, B, x1, x2, K, sigma1, sigma2, rho, callOrPut):
 
     return A1 * x1 * norm_cdf(callOrPut * d1) + A2 * x2 * norm_cdf(callOrPut * d2) + B * norm_cdf(callOrPut * d3)
 
+def bachelier(F, X, vol, tenor, buyorsell, callorput, shared):
+    # calculates the bachelier function WITHOUT discounting
 
-def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_payoff=0.0):
+    def bach(gam, mu, sig):
+        mu_per_sig = mu / sig
+        return (mu+gam)*norm_cdf(mu_per_sig)+sig*norm_pdf(mu_per_sig)
+
+    pass
+
+def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_payoff=0.0, shift=0.0):
     # calculates the black function WITHOUT discounting
 
     if isinstance(tenor, float):
@@ -1216,14 +1231,18 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_p
         prem = forward * adjustment
         value = forward * adjustment
     else:
+        # handle shifted vol surfaces
+        if shift:
+            forward = forward + shift
+            strike = strike + shift
         d1 = torch.log(forward / strike) / stddev + 0.5 * stddev
         d2 = d1 - stddev
         if cash_payoff:
             prem = cash_payoff * norm_cdf(callorput * d2)
-            value = cash_payoff * (callorput * (forward - X) > 0) * shared.one
+            value = cash_payoff * (callorput * (forward - strike) > 0) * shared.one
         else:
-            prem = callorput * (forward * norm_cdf(callorput * d1) - X * norm_cdf(callorput * d2))
-            value = torch.relu(callorput * (forward - X))
+            prem = callorput * (forward * norm_cdf(callorput * d1) - strike * norm_cdf(callorput * d2))
+            value = torch.relu(callorput * (forward - strike))
     return buyorsell * torch.where(guard, prem, value)
 
 

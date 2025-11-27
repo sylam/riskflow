@@ -8,64 +8,65 @@ Assume the Market Data file is called *MarketData.json*, the trade data is calle
 calendar file is called *calendars.xml*. Here's how to perform a *Base Revaluation*:
 
 ```python
-import riskflow
+import riskflow as rf
 
+# create a context
+cx      = rf.Context()
 
-#create a calculation context
-cx      = riskflow.Context()
+# load a json 
+# note - the json should contain references to calendars and 
+# a valid marketdata file
 
-#load calendars
-cx.parse_calendar_file('calendars.xml')
+cx.load_json('fxfwd.json')
 
-#load marketdata
-cx.parse_json('MarketData.json')
-
-#load tradedata
-cx.parse_json('fxfwd.json')
-
-#all calculations take a context as an input
-calc 	 = riskflow.calculation.construct_calculation('Base_Revaluation', cx)
-
-#execute the calculation with the following parameters
-out 		= calc.execute ( { 'calc_name':('test1',), 'Run_Date':'2017-08-01',
-'Currency':'ZAR' } )
+# Once loaded, we can provide overrides to the calculation 
+# this returns the results and a reference to the calculation itself
+calc, out = cx.Base_Valuation(overrides={'Run_Date':'2024-08-01', 'Currency':'USD'})
 ```
 
 ```out``` will now contain the stats for the computation in a dictionary with the field
 *Result* containing the results.
 To check the results, use the following code:
 ```python
-out['Results']
+out['Results']['mtm']
 ```
 should return a pandas dataframe and look like:
 ```
 Test	NettingCollateralSet	0.0
 	341	FXNonDeliverableForward	-343.123474121
 ```
-So the market value at 1 August 2017 of the forward is -343 ZAR. If a credit simulation was
-needed, we could reuse the context and construct a new calculation
+
+So the market value at 1 August 2024 of the forward is -343 USD. Note that the 
+output could vary depending on the structure of the json and any tags you may 
+have defined. The results may also contain other outputs (e.g. Sensitivities) so 
+a quick 
 ```python
-#first define the parameters
+dir(out['Results'])
+```
+is recommended to see all the output results. If a credit simulation was
+needed, we could reuse the context and create a new override
+
+```python
+
+# first define the parameters (i.e. the overrides)
 time_grid = '0d 2d 1w(1w) 3m(1m) 2y(3m)'
 
-params 	= { 'calc_name':('test2',), 'Time_grid':time_grid,
-             'Run_Date':'2017-08-01', 'Currency':'ZAR', 'Simulation_Batches':10,
-             'Batch_Size':512, 'Random_Seed':6126, 'Calc_Scenarios':'No'
-             'Generate_Cashflows':'Yes', 'Dynamic_Scenario_Dates': 'Yes'
+params 	= { 'Time_grid':time_grid, 'Run_Date':'2024-08-01', 'Currency':'ZAR', 'Simulation_Batches':2,
+             'Batch_Size':512, 'Random_Seed':6126, 'Calc_Scenarios':'No',
+             'Generate_Cashflows': 'Yes', 'Dynamic_Scenario_Dates': 'Yes'
            }
 
-cmc 	 = riskflow.Calculation.construct_calculation('Credit_Monte_Carlo', cx)
-
-#execute the calculation with the previous parameters
-out 		= cmc.execute ( params )
+# execute the calculation with the new parameters
+calc, out = cx.Credit_Monte_Carlo(overrides=params)
 ```
+
 To see the output, access the ```Results``` key i.e.
 ```python
-out['Results'])
+out['Results']['exposure_profile'])
 ```
 should output
 ```
-				EE         PFE
+             EE         PFE
 2017-08-01    0.000000    0.000000
 2017-08-03    1.809047    0.000000
 2017-08-08   25.414378  201.102859
@@ -78,5 +79,7 @@ should output
 Where **EE** is the Expected Exposure and **PFE** is the Peak Exposure at 95% (the default). Note that
 this returns a pandas dataframe and as such, can be plotted by using the ```.plot()``` method
 (assuming *matplotlib* is installed).
+
+This assumes that all suitable stochastic processes are defined.
 
 ---

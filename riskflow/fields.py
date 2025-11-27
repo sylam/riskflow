@@ -185,7 +185,7 @@ mapping = {
         }
     },
     'Factor': {
-        # All supported risk factors - need to append this once new risk factors are developed..
+        # All supported risk factors - need to append this once new risk factors are developed.
         'types': {
             "Correlation":
                 ["Value"],
@@ -203,7 +203,7 @@ mapping = {
             "FuturesPrice":
                 ["Price"],
             "InterestYieldVol":
-                ["Space"],
+                ["Space", "Shift", "Distribution_Type"],
             "InflationRate":
                 ["Price_Index", "Seasonal_Adjustment", "Reference_Name", "Day_Count", "Accrual_Calendar", "Currency",
                  "Curve"],
@@ -266,6 +266,9 @@ mapping = {
             'Offset': {'widget': 'Integer', 'description': 'Offset', 'value': 0},
             'Value': {'widget': 'Float', 'description': 'Value', 'value': 0},
             'Sigma': {'widget': 'Float', 'description': 'Sigma', 'value': 0},
+            'Shift': {'widget': 'Float', 'description': 'Shift', 'value': 0, 'obj': 'Percent'},
+            'Distribution_Type': {'widget': 'Dropdown', 'description': 'Distribution Type', 'value': 'Lognormal',
+                                  'values': ['Lognormal', 'Normal']},
             'Alpha': {'widget': 'Float', 'description': 'Alpha', 'value': 0},
             'Issuer': {'widget': 'Text', 'description': 'Issuer', 'value': ''},
             'Index': {'widget': 'Flot', 'description': 'Index', 'value': default['Flot']},
@@ -321,7 +324,7 @@ mapping = {
         }
     },
     'Process': {
-        # All supported risk stochastic processes - need to append this once new risk processes are developed..
+        # All supported risk stochastic processes - need to append this once new risk processes are developed.
         'types': {
             "GBMAssetPriceTSModelImplied":
                 ["Risk_Premium"],
@@ -894,12 +897,13 @@ mapping = {
             'TARF_ExpiryDates': {'widget': 'Table', 'description': 'TARF ExpiryDates', 'value': 'null',
                             'sub_types':
                                 [{'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
+                                 {'type': 'date', 'dateFormat': 'YYYY-MM-DD'},
                                  {'type': 'numeric', 'numericFormat': num_format['currency']}
                                  ],
                             'obj':
                                 'DateEqualList',
                             'col_names':
-                                ['Date', 'Value']
+                                ['Fixing Date', 'Settlement Date','Value']
                             },
             'Months_Lag': {'widget': 'Integer', 'description': 'Months Lag', 'value': 1},
             'Quarters_Lag': {'widget': 'Integer', 'description': 'Quarters Lag', 'value': 0},

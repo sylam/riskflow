@@ -307,6 +307,9 @@ class Factor3D(object):
         self.vols = self.get_vols()
         self.tenor_ofs = np.array([0, self.moneyness.size, self.moneyness.size + self.expiry.size])
 
+    def get_subtype(self):
+        return (self.param.get('Distribution_Type', 'Lognormal'), self.param.get('Shift', utils.Percent(0)))
+
     def get_moneyness(self):
         """Gets the moneyness points stored in the Surface attribute"""
         return np.unique(self.param['Surface'].array[:, self.MONEYNESS_INDEX])
@@ -314,10 +317,6 @@ class Factor3D(object):
     def get_expiry(self):
         """Gets the expiry points stored in the Surface attribute"""
         return np.unique(self.param['Surface'].array[:, self.EXPIRY_INDEX])
-
-    def get_subtype(self):
-        '''Can be extended to different types of vol surfaces'''
-        return None
 
     def get_tenor(self):
         """Gets the tenor points stored in the Surface attribute"""
