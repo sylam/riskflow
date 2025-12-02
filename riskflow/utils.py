@@ -1094,7 +1094,7 @@ def norm_cdf(x):
 
 
 def norm_pdf(x):
-    return 0.3989422804014327 * torch.exp(-0.5*x*x)
+    return 0.3989422804014327 * torch.exp(-0.5 * x * x)
 
 
 def norm_icdf(x):
@@ -1186,14 +1186,48 @@ def Bjerksund_Stensland(A1, A2, B, x1, x2, K, sigma1, sigma2, rho, callOrPut):
 
     return A1 * x1 * norm_cdf(callOrPut * d1) + A2 * x2 * norm_cdf(callOrPut * d2) + B * norm_cdf(callOrPut * d3)
 
-def bachelier(F, X, vol, tenor, buyorsell, callorput, shared):
+
+def bachelier_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_payoff=0.0, shift=0.0):
     # calculates the bachelier function WITHOUT discounting
+    # shift is not used but needed to have the same sig as black_european_option
 
-    def bach(gam, mu, sig):
-        mu_per_sig = mu / sig
-        return (mu+gam)*norm_cdf(mu_per_sig)+sig*norm_pdf(mu_per_sig)
+    if isinstance(tenor, float):
+        guard = (vol > 0.0) & (tenor > 0.0)
+        stddev = vol.clamp(min=1e-5) * np.sqrt(max(tenor, 0.0))
+    else:
+        tenor_np = tenor.clip(min=0.0)
+        tau_key = ('tenor', tenor_np.shape + tuple(tenor_np.flatten()))
+        if tau_key not in shared.t_Buffer:
+            shared.t_Buffer[tau_key] = vol.new(np.sqrt(tenor_np))
 
-    pass
+        tau = shared.t_Buffer[tau_key]
+        guard = tau > 0.0
+
+        if len(guard.shape) > 1:
+            guard = torch.unsqueeze(guard, dim=2)
+            sigma = vol * torch.unsqueeze(tau, dim=2)
+        else:
+            guard = torch.unsqueeze(guard, dim=1)
+            sigma = vol * tau.reshape(-1, 1)
+
+        stddev = sigma.clamp(min=1e-5)
+
+    # Degenerate case: zero stddev (should be guarded by clamp, but keep intrinsic as fallback)
+    intrinsic = torch.relu(callorput * (F - X))
+
+    if cash_payoff:
+        # Digital option under Bachelier:
+        # price = cash * N(callorput * d), d = (F - K) / stddev
+        d = (F - X) / stddev
+        prem = cash_payoff * norm_cdf(callorput * d)
+        value = cash_payoff * (callorput * (F - X) > 0) * shared.one
+    else:
+        mu = callorput * (F - X)  # positive when option is in-the-money
+        mu_per_sig = mu / stddev
+        prem = mu * norm_cdf(mu_per_sig) + stddev * norm_pdf(mu_per_sig)
+        value = intrinsic
+
+    return buyorsell * torch.where(guard, prem, value)
 
 def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_payoff=0.0, shift=0.0):
     # calculates the black function WITHOUT discounting

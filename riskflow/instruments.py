@@ -2359,7 +2359,7 @@ class SwaptionDeal(Deal):
         mn = st - Kt
         # get the vol subtype (distribution_type, shift) tuple - only on the base (first vol factor)
         dist, shf = factor_dep['VolSurface'][0][utils.FACTOR_INDEX_SubType]
-
+        pricing_fn = utils.black_european_option if dist == 'Lognormal' else utils.bachelier_european_option
         tenor = daycount_fn(factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM])
 
         if factor_dep['Cash_Settled']:
@@ -2367,7 +2367,7 @@ class SwaptionDeal(Deal):
                 factor_dep['VolSurface'], mn, tenor,
                 factor_dep['Underlying_Swap_maturity'], shared)
 
-            theo_price = utils.black_european_option(
+            theo_price = pricing_fn(
                 st, self.field['Swap_Rate'] / 100.0, vols, tenor, buysell, delta, shared, shift=shf.amount)
 
             mtm = FX_rep * pvbp * theo_price
@@ -2383,7 +2383,7 @@ class SwaptionDeal(Deal):
                 factor_dep['VolSurface'], mn_option, expiry,
                 factor_dep['Underlying_Swap_maturity'], shared)
 
-            theo_price = utils.black_european_option(
+            theo_price = pricing_fn(
                 spot_option, self.field['Swap_Rate'] / 100.0, vols, expiry, buysell, delta, shared, shift=shf.amount)
 
             value = F_option * theo_price
