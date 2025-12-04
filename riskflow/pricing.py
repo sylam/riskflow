@@ -1025,7 +1025,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
             iv = (1.0 / s - 1.0 / k) * C * (-1.0)
         else:
             iv = (s - k) * C
-        return (accumulated + F.relu(iv).unsqueeze(axis=1)).clamp(max=targetValue)
+        return (accumulated + F.relu(iv).reshape(-1,1)).clamp(max=targetValue)
 
     def bs_call_put_fwd(F, K, sdt, D):
         """
@@ -1133,7 +1133,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                     # GBM increment
                     Sj = Sj * (torch.exp((fwd_carry - 0.5 * fwd_vol * fwd_vol) * dt + vol_dt * Z) if dt > 0 else 1.0)
                 else:
-                    Sj = all_samples[-reduced_samples].reshape(-1, 1)
+                    Sj = all_samples[-min(reduced_samples, num_samples)].reshape(-1, 1)
                     p = 1.0
                 # ---- Economic PV for this fixing -----------------------------------------
                 intr = ((Sj - K) * callOrPut).clamp(max=remaining_target)  # intrinsic
@@ -1194,6 +1194,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
         sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
     all_samples = torch.cat(
         [torch.cat(known_resets, dim=0), next_samples], dim=0) if known_resets else next_samples
+    num_samples = len(all_samples)
 
     settle_idx = np.searchsorted(factor_dep['Settlement'], deal_time[:, utils.TIME_GRID_MTM]).astype(np.int64)
     # need to get the index of the fixing and the equity
@@ -1213,7 +1214,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
     acc = shared.one * 0.0
     for sample_val in fx_samples.schedule[:, utils.RESET_INDEX_Value]:
         if sample_val:
-            acc = calc_accum_value(targetValue, acc, sample_val, strike, callOrPut, invertedTarget)
+            acc = calc_accum_value(targetValue, acc, sample_val * shared.one, strike, callOrPut, invertedTarget)
 
     accumulation = [acc]
     for sample_val in next_samples:
