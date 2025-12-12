@@ -145,7 +145,7 @@ class DealStructure(object):
         Resolves the Structure
         """
 
-        accum = 0.0
+        accum = 0.0 * shared.one
 
         if self.sub_structures:
             # process sub structures
@@ -163,7 +163,7 @@ class DealStructure(object):
                 if structure.obj.Instrument.field.get('Reference', 'root').startswith('FLIP'):
                     logging.warning('Netting set starts with FLIP - inverting MTM')
                     struct = -struct
-                accum += struct
+                accum = accum + struct
 
         if self.dependencies and self.obj.Instrument.accum_dependencies:
             # accumulate the mtm's
@@ -172,15 +172,18 @@ class DealStructure(object):
             for deal_data in self.dependencies:
                 logging.root.name = deal_data.Instrument.field.get('Reference', 'root')
                 mtm = deal_data.Instrument.calculate(shared, time_grid, deal_data)
-                deal_tensors += mtm
+                deal_tensors = deal_tensors + mtm
 
-            accum += deal_tensors
+            accum = accum + deal_tensors
 
         # postprocessing code for working out the mtm of all deals, collateralization etc..
         if hasattr(self.obj.Instrument, 'post_process'):
             # the actual answer for this netting set
             logging.root.name = self.obj.Instrument.field.get('Reference', 'root')
-            accum = self.obj.Instrument.post_process(accum, shared, time_grid, self.obj, self.dependencies)
+            try:
+                accum = self.obj.Instrument.post_process(accum, shared, time_grid, self.obj, self.dependencies)
+            except Exception as e:
+                logging.critical('Deal skipped - {}'.format(e.args))
 
         return accum
 

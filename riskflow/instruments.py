@@ -369,10 +369,15 @@ class Deal(object):
         return self.settlement_currencies
 
     def calculate(self, shared, time_grid, deal_data):
-        # generate the theo price
-        mtm = self.generate(shared, time_grid, deal_data)
-        # interpolate it
-        return pricing.interpolate(mtm, shared, time_grid, deal_data)
+        try:
+            # generate the theo price
+            mtm = self.generate(shared, time_grid, deal_data)
+            # interpolate it
+            return pricing.interpolate(mtm, shared, time_grid, deal_data)
+        except Exception as e:
+            logging.critical('Deal {} skipped - {}'.format(
+                deal_data.Instrument.field.get("Reference"), e.args))
+            return 0.0 * shared.one
 
     def generate(self, shared, time_grid, deal_data):
         raise Exception('generate in class {} not implemented yet for deal {}'.format(

@@ -2107,14 +2107,22 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
                 cash_index = reset_cash_index.searchsorted(cash_index)
 
             if mtm_currency:
+                fx_past_index = start_index[index]
+                if cashflows.np[:, utils.CASHFLOW_INDEX_FXResetDate].min() < time_slice.max():
+                    # get the past fx rates - only works if not forward starting
+                    fx_end_index = fx_past_index+1
+                else:
+                    # forward starting
+                    fx_end_index = fx_past_index
+
+                past_fx_resets = old_fx_rates[fx_past_index: fx_end_index].expand(size, -1, -1)
+
                 # now deal with fx rates
                 future_fx_resets = utils.calc_fx_forward(
                     mtm_currency, factor_dep['Currency'],
-                    cashflows.np[1:, utils.CASHFLOW_INDEX_FXResetDate],
+                    cashflows.np[past_fx_resets.shape[1]:, utils.CASHFLOW_INDEX_FXResetDate],
                     discount_block.time_grid[time_ofs:time_ofs + size], shared)
 
-                # past_fx_resets = old_fx_rates[reset_offset:reset_offset + offset].expand(size, -1, -1)
-                past_fx_resets = old_fx_rates[start_index[index]: start_index[index] + 1].expand(size, -1, -1)
                 all_fx_resets = torch.cat([past_fx_resets, future_fx_resets], dim=1)
 
                 # calculate the Nominal in the correct currency
