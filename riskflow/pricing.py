@@ -1944,7 +1944,6 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
 
             M1 = torch.sum(sample_ft, dim=1)
             strike_bar = factor_dep['Strike'] - average
-            forward_p = M1 + average
             moneyness = M1 / strike_bar
             ref_vols = utils.calc_delivery_time_grid_vol_rate(
                 factor_dep['ReferenceVol'], moneyness, sample_block,
@@ -1970,7 +1969,7 @@ def pv_energy_option(shared, time_grid, deal_data, nominal):
             MM_ok = MM.clamp(min=1e-5)
             vol_t = torch.sqrt(MM_ok)
             theo_price = utils.black_european_option(
-                forward_p, strike_bar, vol_t, 1.0,
+                M1, strike_bar, vol_t, 1.0,
                 factor_dep['Buy_Sell'], factor_dep['Option_Type'], shared)
         else:
             forward_p = average.reshape(1, -1)

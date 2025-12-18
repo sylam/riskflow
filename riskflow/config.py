@@ -646,6 +646,7 @@ class Context(object):
             # update the linked factor max tenors
             missing_tenors = {}
             for k, v in dependent_factor_tenors.items():
+                # v = (d for d in v if d is not None)
                 for linked_factor in utils.traverse_dependents(k, dependent_factors):
                     missing_tenors.setdefault(linked_factor, set()).update(v)
 
