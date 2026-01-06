@@ -2131,13 +2131,13 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
             time_ofs += size
 
             if all_resets.shape[1] != reset_cashflows.np.shape[0]:
-                # check if the resets need to be averaged (compounded) before being applied
+                # check if the resets need to be averaged (compounded) before being applied (i.e. OIS)
                 reset_per_cashflows = factor_dep['Cashflows'].offsets[start_index[index]:, 0]
                 reset_split = tuple(reset_per_cashflows[reset_per_cashflows > 0])
+                accrual = reset_block.tn[:, utils.RESET_INDEX_Accrual]  # should align with all_resets dim=1
                 all_resets = torch.stack(
-                    [((torch.prod(1.0 + r * b[:, utils.RESET_INDEX_Accrual].reshape(1, -1, 1), 1) - 1) /
-                      b[:, utils.RESET_INDEX_Accrual].sum())
-                     for r, b in zip(all_resets.split(reset_split, 1), reset_block.tn.split(reset_split))], 1)
+                    [((torch.expm1(torch.log1p(r * b.reshape(1, -1, 1)).sum(dim=1))) / b.sum())
+                     for r, b in zip(all_resets.split(reset_split, 1), accrual.split(reset_split))])
 
             # check if we need extra information to price caps or floors
             if cashflow_pricer in [pricer_cap, pricer_floor]:
@@ -2151,8 +2151,8 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
             else:
                 all_int, all_margin = cashflow_pricer(all_resets, reset_cashflows.tn, shared)
 
-            # handle the common case of no compounding:
-            if mtm_currency is None and factor_dep['CompoundingMethod'] == 'None':
+            # handle the common case of no compounding or OIS compounding
+            if mtm_currency is None and factor_dep['CompoundingMethod'] in ['None', 'OIS']:
                 interest = all_int * reset_cashflows.tn[:, utils.CASHFLOW_INDEX_Nominal].reshape(1, -1, 1)
                 if (cash_counts == 1).all():
                     total = interest

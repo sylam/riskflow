@@ -299,8 +299,11 @@ class Context:
         path, filename = os.path.split(file_path)
         return os.path.join(self.path_map.get(path, path), self.file_map.get(filename, filename))
 
-    def load_json(self, jobfilename, compress=True):
+    def load_json(self, jobfilename, compress=True, valuation_params=None):
         cfg = self.current_cfg
+        # check valuation params
+        if valuation_params is not None:
+            cfg.params['Valuation Configuration'].update(valuation_params)
         # read the raw json data
         data = self.current_cfg.read_json(jobfilename)
 
