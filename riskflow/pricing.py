@@ -2191,7 +2191,9 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
                         total = total + (int_i * nominal[offst].reshape(1, -1, 1)) + total * (
                                 int_i - margin[offst].reshape(1, -1, 1))
                     else:
-                        raise Exception('Floating cashflow list method not implemented')
+                        raise Exception(
+                            'Floating cashflow list method {} not implemented'.format(
+                                factor_dep['CompoundingMethod']))
 
             payments.append(total + cashflows.tn[
                 pmts_offset, utils.CASHFLOW_INDEX_FixedAmt].reshape(1, -1, 1))
