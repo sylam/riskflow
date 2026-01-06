@@ -2137,7 +2137,7 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
                 accrual = reset_block.tn[:, utils.RESET_INDEX_Accrual]  # should align with all_resets dim=1
                 all_resets = torch.stack(
                     [((torch.expm1(torch.log1p(r * b.reshape(1, -1, 1)).sum(dim=1))) / b.sum())
-                     for r, b in zip(all_resets.split(reset_split, 1), accrual.split(reset_split))])
+                     for r, b in zip(all_resets.split(reset_split, 1), accrual.split(reset_split))], 1)
 
             # check if we need extra information to price caps or floors
             if cashflow_pricer in [pricer_cap, pricer_floor]:

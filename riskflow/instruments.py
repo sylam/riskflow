@@ -1892,6 +1892,10 @@ class CFFloatingInterestListDeal(Deal):
 
         field_index['CompoundingMethod'] = self.field['Cashflows'].get('Compounding_Method', 'None')
 
+        # check if the CompoundingMethod is null (None)
+        if field_index['CompoundingMethod'] is None:
+            field_index['CompoundingMethod'] = 'None'
+
         # potentially compress the cashflow list for faster computation
         if field_index['CompoundingMethod'] == 'None' and self.options.get('OIS_Cashflow_Group_Size', 0) > 0:
             field_index['Cashflows'] = utils.compress_no_compounding(
