@@ -1177,10 +1177,6 @@ class MtMCrossCurrencySwapDeal(Deal):
 
         if not self.child_map:
             for index, child in enumerate(child_dependencies):
-                # check if there are compounding resets - if so, regroup them
-                # (groupsize -1 means group resets per cashflow - not 1 cashflow 1 reset)
-                child.Factor_dep['Cashflows'] = utils.compress_no_compounding(
-                    child.Factor_dep['Cashflows'], groupsize=-1, check_resets=False)
                 # make the child price to the same grid as the parent
                 child.Time_dep.assign(deal_data.Time_dep)
                 # work out which leg is which
