@@ -22,9 +22,9 @@ import calendar
 import json
 import logging
 import operator
-# useful types
-from collections import OrderedDict
+
 from functools import reduce
+
 # import parsing libraries
 from typing import Dict, Any, Union
 from xml.etree.ElementTree import ElementTree, Element
@@ -53,7 +53,7 @@ def get_grid_grammar():
         return int(toks[0])
 
     def push_single_period(strg, loc, toks):
-        return Context.offset_lookup[toks[1]], toks[0]
+        return Config.offset_lookup[toks[1]], toks[0]
 
     def push_period(strg, loc, toks):
         ofs = dict(toks.asList())
@@ -117,7 +117,7 @@ class ModelParams(object):
         """
         :param ignore_subtype:
         :param factor: Riskfactor of type utils.Factor
-        :param actual_factor: corresponding dictionary of parameters for the factor loaded from a marketdata context
+        :param actual_factor: corresponding dictionary of parameters for the factor loaded from a marketdata config
         :return: the model associated with the factor (taking any overrides into account)
         """
         price_factor_type = factor.type + ('' if ignore_subtype else self.valid_subtype.get(
@@ -151,7 +151,7 @@ class CustomJsonEncoder(json.JSONEncoder):
         elif isinstance(obj, utils.Offsets):
             grid = []
             for x in obj.data:
-                w = [''.join(['{}{}'.format(v, Context.reverse_offset[k]) for k, v in obj.kwds.items()]) for obj in x]
+                w = [''.join(['{}{}'.format(v, Config.reverse_offset[k]) for k, v in obj.kwds.items()]) for obj in x]
                 grid.append({'.DateOffset': w[0]} if len(w) == 1 else {'.DateOffset': w[0], '.Offset': w[1]})
             return {'.Grid': grid}
         elif isinstance(obj, utils.CreditSupportList):
@@ -163,7 +163,7 @@ class CustomJsonEncoder(json.JSONEncoder):
             return_value = {'.DateList': [[date.strftime('%Y-%m-%d'), value] for date, value in obj.data.items()]}
         elif isinstance(obj, DateOffset):
             return_value = {'.DateOffset': ''.join(
-                ['{}{}'.format(v, Context.reverse_offset[k]) for k, v in obj.kwds.items()])}
+                ['{}{}'.format(v, Config.reverse_offset[k]) for k, v in obj.kwds.items()])}
         elif isinstance(obj, Timestamp):
             return_value = {'.Timestamp': obj.strftime("%Y-%m-%d")}
         else:
@@ -171,7 +171,7 @@ class CustomJsonEncoder(json.JSONEncoder):
         return return_value
 
 
-class Context(object):
+class Config(object):
     """
     Reads (parses) a JSON market data and deals file.
     Also writes out these files once the data has been modified.
@@ -464,28 +464,39 @@ class Context(object):
         def walk_groups(deals, price_factors, factor_tenors):
 
             def get_price_factors(rates_to_add, rate_tenors, instrument):
+
+                def iter_factors(field_name, factor_type):
+                    for raw in utils.get_fieldname(field_name, instrument.field):
+                        values = raw if isinstance(raw, list) else [raw]
+                        for v in values:
+                            yield utils.Factor(factor_type, utils.check_rate_name(v))
+
+                def add_rates_for_factor(factor):
+                    try:
+                        rates_to_add.update(get_rates(factor, instrument))
+                        return
+                    except KeyError as e:
+                        logging.warning("Price Factor %s not found in market data", e)
+
+                    if factor.type != "DiscountRate":
+                        logging.error("Skipping Price Factor")
+                        return
+
+                    logging.info("Creating default Discount %s", factor)
+                    self.params["Price Factors"][utils.check_tuple_name(factor)] = {
+                        'Interest_Rate':".".join(factor.name)}
+                    # try again after creating default
+                    rates_to_add.update(get_rates(factor, instrument))
+
                 reval_dates = instrument.get_reval_dates()
+                max_reval = max(reval_dates) if reval_dates else None
                 for field_name, factor_types in instrument.factor_fields.items():
-                    for field_value in utils.get_fieldname(field_name, instrument.field):
-                        for factor in [utils.Factor(factor_type, utils.check_rate_name(field_value))
-                                       for factor_type in factor_types]:
-                            # store the max tenor for just the factor alone
-                            if reval_dates:
-                                rate_tenors.setdefault(factor, set()).update({max(reval_dates)})
-                            # now look at dependent factors
+                    for factor_type in factor_types:
+                        for factor in iter_factors(field_name, factor_type):
+                            if max_reval is not None:
+                                rate_tenors.setdefault(factor, set()).add(max_reval)
                             if factor not in rates_to_add or factor.type in conditional_fields:
-                                try:
-                                    rates_to_add.update(get_rates(factor, instrument))
-                                except KeyError as e:
-                                    logging.warning('Price Factor {0} not found in market data'.format(e))
-                                    if factor.type == 'DiscountRate':
-                                        logging.info('Creating default Discount {0}'.format(factor))
-                                        self.params['Price Factors'][utils.check_tuple_name(factor)] = OrderedDict(
-                                            [('Interest_Rate', '.'.join(factor.name))])
-                                        # try again
-                                        rates_to_add.update(get_rates(factor, instrument))
-                                    else:
-                                        logging.error('Skipping Price Factor')
+                                add_rates_for_factor(factor)
 
             resets = {base_date}
             children = []
@@ -713,7 +724,7 @@ class Context(object):
             elif '.Descriptor' in dct:
                 return utils.Descriptor(dct['.Descriptor'])
             elif '.DateList' in dct:
-                return utils.DateList(OrderedDict([(Timestamp(date), val) for date, val in dct['.DateList']]))
+                return utils.DateList({Timestamp(date): val for date, val in dct['.DateList']})
             elif '.DateEqualList' in dct:
                 return utils.DateEqualList([[Timestamp(values[0])] + values[1:] for values in dct['.DateEqualList']])
             elif '.CreditSupportList' in dct:
@@ -774,13 +785,14 @@ class Context(object):
             elif '.Percent' in dct:
                 return utils.Percent(dct['.Percent'])
             elif '.Deal' in dct:
-                return construct_instrument(dct['.Deal'], self.params['Valuation Configuration'])
+                # Don't construct the deal just yet wait till we load up the full JSON
+                return utils.DeferredDeal(dct['.Deal'])
             elif '.Basis' in dct:
                 return utils.Basis(dct['.Basis'])
             elif '.Descriptor' in dct:
                 return utils.Descriptor(dct['.Descriptor'])
             elif '.DateList' in dct:
-                return utils.DateList(OrderedDict([(Timestamp(date), val) for date, val in dct['.DateList']]))
+                return utils.DateList({Timestamp(date): val for date, val in dct['.DateList']})
             elif '.DateEqualList' in dct:
                 return utils.DateEqualList([[Timestamp(values[0])] + values[1:] for values in dct['.DateEqualList']])
             elif '.CreditSupportList' in dct:

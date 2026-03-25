@@ -20,7 +20,7 @@ import riskflow as rf
 from riskflow_widgets import FileDragUpload, Tree, Table, Flot, Three, to_json
 
 
-def load_table_from_vol(vol, svi_sampler=np.linspace(-3, 3, 21)):
+def load_table_from_vol(vol, svi_sampler=np.linspace(-3, 3, 21), param='Surface'):
     '''
     :param vol: a riskfactor representing an array of 2d or 3d surfaces in the
                 'param' dict (usually stored as the 'Surface' key)
@@ -46,9 +46,9 @@ def load_table_from_vol(vol, svi_sampler=np.linspace(-3, 3, 21)):
     if vol.__class__.__name__ in rf.utils.TwoDimensionalFactors:
         if vol.get_subtype()[0] in ['SVI', 'Skew']:
             data = vol.current_value(svi_sampler).array
-            # logging.info('SVI {}'.format(len(data)))
+            logging.info('{} {}'.format(vol.get_subtype()[0], len(data)))
         else:
-            data = vol.param['Surface'].array
+            data = vol.param[param].array
             # logging.info('Explicit {}'.format(len(data)))
         return make_table(data)
 
@@ -161,11 +161,11 @@ class TreePanel(metaclass=ABCMeta):
 
             if isinstance(obj, rf.utils.Curve):
                 # {}, FXVol, FXVol.AUD.JPY, <class 'riskflow.utils.Curve'>
-                if field_name=='Surface':
+                if field_name in ['Surface', 'Delta_Surface']:
                     # need to use a threeview
                     v = getattr(rf.riskfactors, rate_type)(config[section_name])
                     # logging.info('Surface {} {}'.format(section_name, v.get_subtype()))
-                    vol_space = load_table_from_vol(v)
+                    vol_space = load_table_from_vol(v, param=field_name)
                     return_value = to_json(vol_space)
                 else:
                     return_value = to_json([{'label': 'Rate', 'data': [[x, y] for x, y in obj.array]}])
@@ -225,6 +225,10 @@ class TreePanel(metaclass=ABCMeta):
                         data.append([get_repr(item, field, rf.fields.default.get(widget_type, default_val)) for
                                      field, item, widget_type in zip(headings, flow, widgets)])
                     return_value = to_json(data)
+                elif field_name == 'Names':
+                    logging.info(obj)
+                    data = [[x] for x in obj]
+                    return_value = to_json(data)
                 elif field_name == 'Sampling_Data':
                     headings = ['Date', 'Price', 'Weight']
                     widgets = ['DatePicker', 'Float', 'Float']
@@ -244,7 +248,7 @@ class TreePanel(metaclass=ABCMeta):
                 else:
                     raise Exception('Unknown Array Field type {0}'.format(field_name))
             elif isinstance(obj, pd.DateOffset):
-                return_value = ''.join(['%d%s' % (v, rf.config.Context.reverse_offset[k]) for k, v in obj.kwds.items()])
+                return_value = ''.join(['%d%s' % (v, rf.config.Config.reverse_offset[k]) for k, v in obj.kwds.items()])
             elif isinstance(obj, pd.Timestamp):
                 # leave datepickers unaltered but convert everything else to a string
                 return_value = obj if field_meta['widget'] == 'DatePicker' else obj.strftime('%Y-%m-%d')
@@ -568,7 +572,7 @@ class PortfolioPage(TreePanel):
                            "state": {"opened": True, "selected": True},
                            "children": deals_to_append}]
 
-        type_data = {"root": {"icon": "fa fa-folder text-primary", "valid_children": ["group", "default"]},
+        type_data = {"root": {"icon": "fa fa-folder text-primary", "valid_children": ["group"]},
                      "group": {"icon": "fa fa-folder", "valid_children": ["group", "default"]},
                      "default": {"icon": "fa fa-file", "valid_children": []}}
 
@@ -954,6 +958,7 @@ class RiskFactorsPage(TreePanel):
                             )
                         else:
                             frames.append(self.define_input((frame_name, ''), {}))
+                            
                     elif frame_name == 'Factor':
                         # filter out unnecessary fields
                         if key.startswith('EquityPriceVol'):
@@ -968,6 +973,11 @@ class RiskFactorsPage(TreePanel):
                             elif frame_value['Surface_Type']['value'] == 'Skew':
                                 for sub_field in ["a", "b", "m", "sigma"]:
                                         frame_value[sub_field]['isvisible'] = 'False'
+                        elif key.startswith('FXVol') or key.startswith('CommodityPriceVol'):
+                            for sub_field in frame_value.values():
+                                sub_field['isvisible'] = 'True'
+                            if frame_value['Surface_Type']['value'] != 'Maltz':
+                                frame_value['Delta_Surface']['isvisible'] = 'False'
                                                    
                         frames.append(self.define_input((frame_name, rf.utils.check_tuple_name(factor)), frame_value))
 

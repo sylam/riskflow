@@ -34,8 +34,8 @@ import torch.multiprocessing as mp
 from ._version import version_info, __version__
 from . import fields
 from . import utils
-from .adaptiv import AdaptivContext
-from .config import CustomJsonEncoder
+from .instruments import construct_instrument
+from .config import CustomJsonEncoder, Config
 
 
 def update_dict(d, u):
@@ -104,7 +104,7 @@ def load_market_data(rundate, path, json_name='MarketData.json', calendar_name='
     :return: a context object with the data and calendars loaded
     """
 
-    config = AdaptivContext()
+    config = Config()
     config.parse_json(os.path.join(path, rundate, json_name))
     if os.path.isfile(os.path.join(path, 'calendars.cal')):
         config.parse_calendar_file(os.path.join(path, calendar_name))
@@ -125,9 +125,10 @@ def run_baseval(context, prec=torch.float64, overrides=None):
     :return: a tuple containing the calculation object and the output dictionary
     """
     from .calculation import construct_calculation
-    calc_params = context.deals.get('Calculation',
-                                    {'Base_Date': context.params['System Parameters']['Base_Date'],
-                                     'Currency': 'ZAR'})
+    calc_params = context.deals.get(
+        'Calculation',
+        {'Base_Date': context.params['System Parameters']['Base_Date'],
+         'Currency': context.params['System Parameters']['Base_Currency']})
 
     # check if the gpu is available
     if torch.cuda.is_available():
@@ -150,22 +151,22 @@ def run_baseval(context, prec=torch.float64, overrides=None):
     return calc, out
 
 
-def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False, job_id=0, num_jobs=1, res_queue=None):
+def run_cmc(context, prec=torch.float32, overrides=None, job_id=0, num_jobs=1, res_queue=None):
     """
     Runs a credit monte carlo calculation on the provided context
     :param res_queue: If not None, returns the results in this queue
     :param num_jobs: number of jobs spawned - usually just 1 (i.e. the parent)
     :param job_id: used if multiprocessing is set (index of this process in a group of workers)
-    :param LegacyFVA: True if all we want is a way to calculate an FVA per deal
     :param context: a Context object
     :param overrides: a dictionary of overrides to replace the context's  calculation parameters
     :param prec: the numerical precision to use (default float32)
     :return: a tuple containing the calculation object, output dictionary and exposure profile
     """
     from .calculation import construct_calculation
-    calc_params = context.deals.get('Calculation',
-                                    {'Base_Date': context.params['System Parameters']['Base_Date'],
-                                     'Base_Time_Grid': '0d 2d 1w(1w) 1m(1m) 3m(3m)'})
+    calc_params = context.deals.get(
+        'Calculation',
+        {'Base_Date': context.params['System Parameters']['Base_Date'],
+         'Currency': context.params['System Parameters']['Base_Currency']})
 
     # check if the gpu is available
     if torch.cuda.is_available():
@@ -177,7 +178,7 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False, job_id
         device = torch.device("cpu")
 
     rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
-    time_grid = str(calc_params.get('Base_Time_Grid', '0d 2d 1w(1w) 1m(1m) 3m(3m)'))
+    time_grid = str(calc_params.get('Time_Grid', '0d 2d 1w(1w) 1m(1m) 3m(3m)'))
 
     params_mc = {'Time_grid': time_grid, 'Run_Date': rundate,
                  'Tenor_Offset': 0.0, 'Batch_Size': 1024, 'Simulation_Batches': 1}
@@ -199,21 +200,6 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False, job_id
             new_terms = np.union1d(to_add, survivalprob['Curve'].array[:, 0])
             survivalprob['Curve'].array = np.array(
                 list(zip(new_terms, np.interp(new_terms, *survivalprob['Curve'].array.T))))
-
-    if 'LegacyFVA' in params_mc:
-        legacy_fva_sect = params_mc['LegacyFVA']
-        # get the agreement currency
-        calc_currency = calc_params['Currency']
-        collateral_curve = legacy_fva_sect['Collateral_Curve']
-        funding_curve = legacy_fva_sect['Funding_Curve']
-
-        collateral_curve = '{}.COLLATERAL'.format(collateral_curve)
-        context.params['Price Factors']['InterestRate.{}'.format(collateral_curve)] = makeflatcurve(
-            calc_currency, legacy_fva_sect['Collateral_Spread'])
-
-        funding_curve = '{}.FUNDING'.format(funding_curve)
-        context.params['Price Factors']['InterestRate.{}'.format(funding_curve)] = makeflatcurve(
-            calc_currency, legacy_fva_sect['Funding_Spread'])
 
     if params_mc.get('Collateral_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
         # setup collva calc
@@ -250,21 +236,17 @@ def run_cmc(context, prec=torch.float32, overrides=None, LegacyFVA=False, job_id
             ns['Collateral_Assets']['Cash_Collateral'] = [ns['Collateral_Assets']['Cash_Collateral'][0]]
 
     calc = construct_calculation('Credit_Monte_Carlo', context, device=device, prec=prec)
-    if LegacyFVA:
-        return calc, params_mc
-    else:
-        out = calc.execute(params_mc, job_id, num_jobs)
-        # summarize the results for easy review
-        out['Results']['exposure_profile'] = summarize_data(
-            out['Results']['mtm'], params_mc.get('Percentile', '95').replace(' ', ''))
+    out = calc.execute(params_mc, job_id, num_jobs)
+    # summarize the results for easy review
+    out['Results']['exposure_profile'] = summarize_data(
+        out['Results']['mtm'], params_mc.get('Percentile', '95').replace(' ', ''))
 
-        if res_queue is not None:
-            # parent process must summarize data
-            res_queue.put({'Results': out['Results'], 'Stats': out['Stats'], 'Params':params_mc, 'Reference':context.deals['Attributes']['Reference']})
-            
-        return calc, out
+    if res_queue is not None:
+        # parent process must summarize data
+        res_queue.put({'Results': out['Results'], 'Stats': out['Stats'], 'Params':params_mc, 'Reference':context.deals['Attributes']['Reference']})
+
+    return calc, out
         
-
 
 class Context:
     def __init__(self, path_transform={}, file_transform={}):
@@ -274,12 +256,12 @@ class Context:
         self.file_map = file_transform
         self.config_cache = {}
         self.holiday_cfg_cache = {}
-        self.current_cfg = AdaptivContext()
+        self.current_cfg = Config()
         # there may be a stressed config file attached to the context
         self.stressed_config_file = None
 
     def load_config(self, path_name):
-        new_cfg = AdaptivContext()
+        new_cfg = Config()
         new_cfg.parse_json(path_name)
 
         # check we need to set the base_date
@@ -299,12 +281,22 @@ class Context:
         path, filename = os.path.split(file_path)
         return os.path.join(self.path_map.get(path, path), self.file_map.get(filename, filename))
 
-    def load_json(self, jobfilename, compress=True, valuation_params=None):
+    def load_json(self, jobfilename, compress=True):
+
+        def resolve_deferred_deals(obj, val_config):
+            if isinstance(obj, utils.DeferredDeal):
+                return construct_instrument(obj.payload, val_config)
+
+            if isinstance(obj, dict):
+                return {k: resolve_deferred_deals(v, val_config) for k, v in obj.items()}
+
+            if isinstance(obj, list):
+                return [resolve_deferred_deals(v, val_config) for v in obj]
+
+            return obj
+
         cfg = self.current_cfg
-        # check valuation params
-        if valuation_params is not None:
-            cfg.params['Valuation Configuration'].update(valuation_params)
-        # read the raw json data
+        # read the raw json data (skips deals) - needs to load later
         data = self.current_cfg.read_json(jobfilename)
 
         if 'MergeMarketData' in data['Calc']:
@@ -312,37 +304,34 @@ class Context:
             # check if there's a stressed marketdata defined (record but don't load it)
             self.stressed_config_file = market_data.get('StressedMarketDataFile')
 
-            if market_data['MarketDataFile'] and market_data['MarketDataFile'] not in self.config_cache:
-                new_cfg = self.load_config(self.parse_path(market_data['MarketDataFile']))
+            if market_data.get('MarketDataFile'):
+                if market_data['MarketDataFile'] not in self.config_cache:
+                    new_cfg = self.load_config(self.parse_path(market_data['MarketDataFile']))
+                    self.config_cache[market_data['MarketDataFile']] = new_cfg
 
-                # check if a calendar is loaded
-                if 'CalendDataFile' in data['Calc']:
-                    # parse calendar file
-                    new_cfg.parse_calendar_file(self.parse_path(data['Calc']['CalendDataFile']))
-                    # store a link
-                    self.holiday_cfg_cache[market_data['MarketDataFile']] = data['Calc']['CalendDataFile']
-
-                self.config_cache[market_data['MarketDataFile']] = new_cfg
+                cfg = self.config_cache[market_data['MarketDataFile']]
+                for section, section_data in market_data['ExplicitMarketData'].items():
+                    cfg.params[section].update(section_data)
             else:
-                self.config_cache[market_data['MarketDataFile']] = AdaptivContext()
+                cfg = Config()
 
-            cfg = self.config_cache[market_data['MarketDataFile']]
-            for section, section_data in market_data['ExplicitMarketData'].items():
-                cfg.params[section].update(section_data)
-
-            if data['Calc'].get('CalendDataFile') and data['Calc'][
-                'CalendDataFile'] != self.holiday_cfg_cache[market_data['MarketDataFile']]:
-                # parse calendar file again
+        if data['Calc'].get('CalendDataFile'):
+            if data['Calc']['CalendDataFile'] not in self.holiday_cfg_cache:
+                # parse calendar file
                 cfg.parse_calendar_file(self.parse_path(data['Calc']['CalendDataFile']))
                 # store a link
-                self.holiday_cfg_cache[market_data['MarketDataFile']] = data['Calc']['CalendDataFile']
+                self.holiday_cfg_cache[data['Calc']['CalendDataFile']] = cfg.holidays
+            cfg.holidays = self.holiday_cfg_cache[data['Calc']['CalendDataFile']]
 
         if 'Deals' in data['Calc']:
             cfg.deals = {'Attributes': {
                 'Tag_Titles': data['Calc']['Deals'].get('Tag_Titles', ''),
                 'Reference': data['Calc']['Deals'].get('Reference')}}
-            # try to compress the deal data if possible
-            deals = data['Calc']['Deals']['Deals']
+            # get the valuation config
+            valuation_config = cfg.params.get('Valuation Configuration', {})
+            # try to compress the deal data if possible (after resolving it)
+            deals = resolve_deferred_deals ( data['Calc']['Deals']['Deals'], valuation_config )
+            # construct the deals - need to nest this - TODO!
             if compress:
                 for i in deals['Children']:
                     if 'Children' in i:
@@ -369,7 +358,7 @@ class Context:
 
         cfg = self.current_cfg
         try:
-            md, cal = list(self.holiday_cfg_cache.items())[0]
+            md, cal = list(self.config_cache.keys())[0], list(self.holiday_cfg_cache.keys())[0]
         except:
             md, cal = '', ''
 

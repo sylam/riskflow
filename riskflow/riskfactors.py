@@ -24,6 +24,9 @@ import pandas as pd
 
 from . import utils
 from scipy.interpolate import RectBivariateSpline
+from scipy.stats import norm
+from scipy.optimize import brentq
+from sortedcontainers import sorteddict
 
 # map the names of various factor interpolations to something simpler
 factor_interp_map = {
@@ -77,8 +80,38 @@ class Factor1D(object):
     def __init__(self, param):
         self.param = param
         self.tenors = self.get_tenor()
+        self.base_date = self.param.get('base_date')
         self.delta = np.zeros_like(self.tenors)
-        self.interpolation = self.check_interpolation()
+
+        # not used unless we interpolate different parts of the curve differently
+        near_interp = self.param.get('Near_Interpolation')  # e.g. 'LinearRT'
+        if near_interp and self.param.get('Near_Date') and self.base_date is not None:
+            near_interp = factor_interp_map.get(near_interp, 'Linear')
+            near_date = self.param['Near_Date']  # implement parse
+            near_tenor = np.clip(
+                utils.get_day_count_accrual(
+                self.base_date, (near_date - self.base_date).days, utils.get_day_count(self.param['Day_Count'])),
+                self.tenors.min(), self.tenors.max()
+            )
+            near_idx_end = self.tenors.searchsorted(near_tenor, side='right') - 1
+            # stack 2 interpolation types split on the near index (note we add 1 to the near tenor)
+            self.interpolation = [(0, near_idx_end, self.check_interpolation(
+                near_interp, self.tenors[:near_idx_end+1],
+                self.param['Curve'].array[:near_idx_end+1, 1])),
+                (near_idx_end, self.tenors.size-1, self.check_interpolation(
+                    self.param.get('Interpolation'), self.tenors[near_idx_end:],
+                    self.param['Curve'].array[near_idx_end:, 1]))
+            ]
+            # self.interpolation = [(0, near_idx_end, self.check_interpolation(
+            #     near_interp, self.tenors, self.param['Curve'].array[:, 1])),
+            #                       (near_idx_end, self.tenors.size - 1,  self.check_interpolation(
+            #         self.param.get('Interpolation'), self.tenors, self.param['Curve'].array[:, 1]))
+            # ]
+        else:
+            # regular interpolation type
+            self.interpolation = [self.check_interpolation(
+                self.param.get('Interpolation'), self.tenors,
+                self.param.get('Curve', utils.Curve([], [(0.0, 0.0)])).array[:, 1])]
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attribute"""
@@ -108,17 +141,35 @@ class Factor1D(object):
     def get_subtype(self):
         return self.param.get('Sub_Type')
 
-    def check_interpolation(self):
-        if self.param.get('Interpolation') == 'HermiteRT':
-            g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1] * self.tenors)
+    def check_interpolation(self, interpolation, tenors, rates):
+        if interpolation == 'HermiteRT':
+            g, c = utils.hermite_interpolation(tenors, rates * tenors)
             return 'HermiteRT', g, c
-        elif self.param.get('Interpolation') == 'Hermite':
-            g, c = utils.hermite_interpolation(self.tenors, self.param['Curve'].array[:, 1])
+        elif interpolation == 'Hermite':
+            g, c = utils.hermite_interpolation(tenors, rates)
             return 'Hermite', g, c
-        elif self.param.get('Interpolation') == 'LinearRT':
+        elif interpolation == 'LinearRT':
             return ('LinearRT',)
         else:
             return ('Linear',)
+
+    @staticmethod
+    def interpolate(tenors, tenor_segment, values, interp):
+        if interp[0] in ['HermiteRT', 'Hermite']:
+            index = np.searchsorted(tenor_segment, tenors, side='right') - 1
+            index_next = np.clip(index + 1, 0, tenor_segment.size - 1)
+            dt = np.clip(tenor_segment[index_next] - tenor_segment[index], 1 / 365.0, np.inf)
+            m = np.clip((tenors - tenor_segment[index]) / dt, 0.0, 1.0)
+            g, c = interp[1:]
+            rate, denom = (values * tenor_segment, tenors) if interp[0] == 'HermiteRT' else (
+                values, 1.0)
+            val = rate[index] * (1.0 - m) + m * rate[index_next] + m * (
+                    1.0 - m) * g[index] + m * m * (1.0 - m) * c[index]
+            return val / denom
+        elif interp[0] == 'LinearRT':
+            return np.interp(tenors, tenor_segment, tenor_segment * values)/tenors
+        else:
+            return np.interp(tenors, tenor_segment, values)
 
     def current_value(self, tenor_index=None, offset=0.0):
         """Returns the value of the rate at each tenor point (if set) else returns what's
@@ -127,22 +178,24 @@ class Factor1D(object):
         # get the tenors - make sure it's in range
         tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
             self.tenors.min(), self.tenors.max())
+        values = []
+        # number of segments
+        nseg = len(self.interpolation)
+        if nseg>1:
+            for k, interp in enumerate(self.interpolation):
+                start_index, end_index, interp_params = interp
+                end_mask = (tenors <= self.tenors[end_index]) if k==nseg-1 else (tenors < self.tenors[end_index])
+                subsegment = tenors[(tenors >= self.tenors[start_index]) & end_mask]
+                # need the prior point as well
+                # sub_tenor = self.tenors
+                # sub_values = bumped_val
+                sub_tenor = self.tenors[start_index:end_index+1]
+                sub_values = bumped_val[start_index:end_index+1]
+                values.append(Factor1D.interpolate(subsegment, sub_tenor, sub_values, interp_params))
 
-        if self.interpolation[0] in ['HermiteRT', 'Hermite']:
-            index = np.searchsorted(self.tenors, tenors, side='right') - 1
-            index_next = np.clip(index + 1, 0, self.tenors.size - 1)
-            dt = np.clip(self.tenors[index_next] - self.tenors[index], 1 / 365.0, np.inf)
-            m = np.clip((tenors - self.tenors[index]) / dt, 0.0, 1.0)
-            g, c = self.interpolation[1:]
-            rate, denom = (bumped_val * self.tenors, tenors) if self.interpolation[0] == 'HermiteRT' else (
-                bumped_val, 1.0)
-            val = rate[index] * (1.0 - m) + m * rate[index_next] + m * (
-                    1.0 - m) * g[index] + m * m * (1.0 - m) * c[index]
-            return val / denom
-        elif self.interpolation[0] == 'LinearRT':
-            return np.interp(tenors, self.tenors, self.tenors * bumped_val)/tenors
+            return np.concatenate(values)
         else:
-            return np.interp(tenors, self.tenors, bumped_val)
+            return Factor1D.interpolate(tenors, self.tenors, bumped_val, self.interpolation[0])
 
 
 class Factor2D(object):
@@ -176,8 +229,36 @@ class Factor2D(object):
         return np.unique([self.param[x].array[:, 0] for x in params])
 
     def update(self):
-        self.moneyness = self.get_moneyness()
         self.expiry = self.get_expiry()
+        if self.get_subtype()[0]=='Malz':
+            # run the malz solver to turn the maltz into a regular log moneyness surface
+            surface = self.param['Delta_Surface'].array
+
+            # Build a dict expiry -> (delta, vol) arrays
+            malz_skews = {}
+            for T in self.expiry:
+                row = surface[surface[:, 1] == T]
+                # row[:,0] = delta, row[:,2] = vol(Δ)
+                # sort by delta for safety
+                idx = np.argsort(row[:, 0])
+                malz_skews[T] = self._prepare_malz_skew({
+                    'delta': row[idx, 0],
+                    'vol': row[idx, 2],
+                }, T)
+
+            # 2) Build an x-grid with adaptive refinement
+            w_table = self._build_maltz_x_grid(malz_skews, self.expiry)
+
+            # store the surface
+            malz_surface = []
+            for i, T in enumerate(self.expiry):
+                w = w_table[T]
+                x_nodes, variance = np.array(w.keys()), np.array(w.values())
+                malz_surface.extend([[x, T, v] for x, v in zip(x_nodes, np.sqrt(variance / T))])
+                # maltz_surface.extend([[x, T, v] for x, v in zip(x_nodes, variance)])
+            self.param['Surface'] = utils.Curve([], malz_surface)
+
+        self.moneyness = self.get_moneyness()
         self.vols = self.get_vols()
         self.tenor_ofs = np.array([len(x) for x in self.index_map.values()])
 
@@ -187,7 +268,170 @@ class Factor2D(object):
 
     def get_expiry(self):
         """Gets the expiry points stored in the Surface attribute"""
-        return np.unique(self.param['Surface'].array[:, 1])
+        # just need to check if the surface type is a Delta surface (for malz)
+        return np.unique(self.param['Delta_Surface' if self.get_subtype()[0] == 'Malz' else 'Surface'].array[:, 1])
+
+    def _compute_w_table(self, malz_skews, expiries, x_nodes):
+        """
+        For each expiry T and each x in x_nodes, compute exact Malz vol sigma(T,x),
+        then return w[i,j] = sigma^2 * T.
+        """
+        w = {T: sorteddict.SortedDict() for T in expiries}
+
+        for T in expiries:
+            for x in x_nodes:
+                sigma = self._maltz_sigma_exact(malz_skews[T], T, x)
+                w[T][x] = sigma * sigma * T
+
+        return w
+
+    def _prepare_malz_skew(self, skew, T):
+        d = np.asarray(skew["delta"], dtype=float)
+        v = np.asarray(skew["vol"], dtype=float)
+
+        # 1) Extract ATM vol from the vendor’s "0.5" node (acts as ATM label here)
+        # (If you have an explicit ATM column, use that instead.)
+        p05_idx = np.where(np.isclose(d, 0.5))[0]
+        m05_idx = np.where(np.isclose(d, -0.5))[0]
+        if p05_idx.size:
+            sigma_atm = float(v[p05_idx[0]])
+        elif m05_idx.size:
+            sigma_atm = float(v[m05_idx[0]])
+        else:
+            raise ValueError("Malz skew missing ATM label (±0.5).")
+
+        # 2) Compute the correct ATM delta magnitude for pct-of-foreign forward
+        delta_atm = 0.5 * np.exp(-0.5 * sigma_atm * sigma_atm * T)
+
+        # 3) Ensure both sides exist, and replace ±0.5 with ±delta_atm
+        new_d = []
+        new_v = []
+        for di, vi in zip(d, v):
+            if np.isclose(di, 0.5):
+                new_d.append(+delta_atm)
+                new_v.append(vi)
+            elif np.isclose(di, -0.5):
+                new_d.append(-delta_atm)
+                new_v.append(vi)
+            else:
+                new_d.append(di)
+                new_v.append(vi)
+
+        d = np.asarray(new_d, dtype=float)
+        v = np.asarray(new_v, dtype=float)
+
+        # If vendor only supplied +0.5 (common), add the mirrored -delta_atm
+        if not np.any(d < 0) or not np.any(np.isclose(d, -delta_atm)):
+            d = np.append(d, -delta_atm)
+            v = np.append(v, sigma_atm)
+
+        # If vendor only supplied -0.5, add +delta_atm
+        if not np.any(d > 0) or not np.any(np.isclose(d, +delta_atm)):
+            d = np.append(d, +delta_atm)
+            v = np.append(v, sigma_atm)
+
+        # 4) Sort
+        idx = np.argsort(d)
+        d, v = d[idx], v[idx]
+
+        # 5) Split wings
+        put_mask = d <= 0.0
+        call_mask = d >= 0.0
+        d_put, v_put = d[put_mask], v[put_mask]
+        d_call, v_call = d[call_mask], v[call_mask]
+
+        return {
+            "d_put": d_put, "v_put": v_put,
+            "d_call": d_call, "v_call": v_call,
+            "sigma_atm": sigma_atm,
+            "delta_atm": delta_atm,
+        }
+
+    def _maltz_sigma_exact(self, skew, T, x):
+        sqrtT = np.sqrt(T)
+        d_put, v_put = skew["d_put"], skew["v_put"]
+        d_call, v_call = skew["d_call"], skew["v_call"]
+
+        sigma_atm = skew['sigma_atm']
+        x_atm = 0.5 * sigma_atm * sigma_atm * T
+        is_call = (x <= x_atm)
+
+        def sigma_skew(delta):
+            if is_call:
+                return np.interp(delta, d_call, v_call)
+            else:
+                return np.interp(delta, d_put, v_put)
+
+        def fwd_delta_pct_foreign_from_sigma(sigma):
+            d1 = (x + 0.5 * sigma * sigma * T) / (sigma * sqrtT) # ln(F/K)=x
+            d2 = d1 - sigma * sqrtT
+            k_over_f = np.exp(-x) # K/F
+            if is_call:
+                return k_over_f * norm.cdf(d2)
+            else:
+                return -k_over_f * norm.cdf(-d2)
+
+        def f(delta):
+            return fwd_delta_pct_foreign_from_sigma(sigma_skew(delta)) - delta
+
+        # bracket limited to available wing deltas
+        if is_call:
+            a = max(0.0, d_call.min())
+            b = d_call.max()  # typically 0.5
+        else:
+            a = d_put.min()  # typically -0.5
+            b = min(0.0, d_put.max())
+
+        fa, fb = f(a), f(b)
+        if fa * fb > 0:
+            delta_star = a if abs(fa) < abs(fb) else b
+        else:
+            delta_star = brentq(f, a, b)
+
+        return sigma_skew(delta_star)
+
+    def _interp_sigma_from_w_row(self, nodes, w_row, T):
+        """
+        Given one expiry row (fixed T), interpolate total variance in x
+        and convert back to sigma.
+        """
+        x_sorted, y_sorted = zip(*w_row.items())
+        interpolated = np.sqrt(np.interp(nodes[:, 0], x_sorted, y_sorted) / T)
+        return np.abs(interpolated - nodes[:,1])
+
+    def _build_maltz_x_grid(self, malz_skews, expiries, tol=1e-4):
+        """
+        Build a global x-grid (log(K/F)) and total variance table w[i,j]
+        that approximates the Malz surface within tol vol error.
+
+        malz_skews[T] = {'delta': array([...]), 'vol': array([...])}
+        expiries: 1D array of T_i (in years)
+        tol: max acceptable |sigma_exact - sigma_interp| at midpoints.
+        """
+        # 1) initial symmetric grid
+        x_grid = np.array([-0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5], dtype=float)
+        # 2) initial exact total variance table
+        w_table = self._compute_w_table(malz_skews, expiries, x_grid)
+
+        for i, T in enumerate(expiries):
+            m = malz_skews[T]
+            w = w_table[T]
+            x_nodes = x_grid.copy()
+            while True:
+                text_x = []
+                for xl, xr in zip(x_nodes[:-1], x_nodes[1:]):
+                    xm = 0.5 * (xl + xr)
+                    text_x.append([xm, self._maltz_sigma_exact(m, T, xm)])
+                candidates = np.array(text_x)
+                err = self._interp_sigma_from_w_row(candidates, w, T)
+                if err.max() > tol:
+                    updates = candidates[np.where(err>tol)[0]]
+                    x_nodes = np.union1d(x_nodes, updates[:,0])
+                    w.update({k:T*v*v for k,v in updates})
+                else:
+                    break
+
+        return w_table
 
     def get_vols(self):
         """Uses flat extrapolation along moneyness and then linear interpolation along expiry"""
@@ -642,8 +886,8 @@ class SurvivalProb(Factor1D):
         """hardcode the daycount for Survival Probability rates to act/365"""
         return utils.DAYCOUNT_ACT365
 
-    def check_interpolation(self):
-        if self.param.get('Interpolation') == 'Linear':
+    def check_interpolation(self, interpolation, tenors, rates):
+        if interpolation == 'Linear':
             return ('Linear',)
         else:
             return ('LinearExtrapolate',)
@@ -654,7 +898,11 @@ class SurvivalProb(Factor1D):
     def recovery_rate(self):
         return self.param.get('Recovery_Rate')
 
-    def current_value(self, tenor_index=None, offset=0.0):
+    def survival(self, tenors, scale = 1.0):
+        H = self.current_value(tenors, offset=0.0, scale=scale)
+        return np.exp(-H)
+
+    def current_value(self, tenor_index=None, offset=0.0, scale = 1.0):
         """Returns the value of the rate at each tenor point (if set) else returns what's
         stored in the Curve parameter"""
         bumped_val = self.param['Curve'].array[:, 1] + self.delta
@@ -662,7 +910,7 @@ class SurvivalProb(Factor1D):
         if self.interpolation[0] == 'Linear':
             tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
                 self.tenors.min(), self.tenors.max())
-            return np.interp(tenors, self.tenors, bumped_val)
+            return scale * np.interp(tenors, self.tenors, bumped_val)
         else:
             # get the tenors - make sure we clip the min range (we can extrapolate linearly)
             tenors = ((np.array(tenor_index) if tenor_index is not None else self.tenors) + offset).clip(
@@ -672,9 +920,9 @@ class SurvivalProb(Factor1D):
             if max_tenor > self.tenors.max():
                 point_at_inf = max_tenor * bumped_val[-1] / self.tenors[-1]
                 # return a linearly extrapolated surface
-                return np.interp(tenors, np.append(self.tenors, max_tenor), np.append(bumped_val, point_at_inf))
+                return scale * np.interp(tenors, np.append(self.tenors, max_tenor), np.append(bumped_val, point_at_inf))
             else:
-                return np.interp(tenors, self.tenors, bumped_val)
+                return scale * np.interp(tenors, self.tenors, bumped_val)
 
 
 class InterestRate(Factor1D):
@@ -1212,16 +1460,19 @@ class ForwardPriceVol(Factor3D):
 
 
 @utils.log_exception
-def construct_factor(factor, price_factors, factor_interp):
+def construct_factor(factor, price_factors, factor_interp, base_date=None):
     # now lookup the params of the factor
-    price_factor = price_factors[utils.check_tuple_name(factor)]
+    pf = price_factors[utils.check_tuple_name(factor)]
     # change the logging name in case there are any errors
     logging.root.name = '.'.join(factor.name)
     # check the interpolation on interest Rates - can add more methods/price factors as desired
+    pf_local = dict(pf)  # shallow copy
     if factor.type in ['InterestRate', 'InflationRate']:
-        interp_method = factor_interp.search(factor, price_factor, True)
-        price_factor['Interpolation'] = factor_interp_map.get(interp_method, 'Linear')
-    return globals().get(factor.type)(price_factor)
+        interp_method = factor_interp.search(factor, pf, True)
+        pf_local.update(
+            {'Interpolation' : factor_interp_map.get(interp_method, 'Linear'),
+             'base_date': base_date})
+    return globals().get(factor.type)(pf_local)
 
 
 if __name__ == '__main__':

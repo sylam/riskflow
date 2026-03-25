@@ -611,13 +611,15 @@ class Credit_Monte_Carlo(Calculation):
         for price_model, price_factor in stochastic_factors.items():
             factor_obj = construct_factor(
                 price_factor, self.config.params['Price Factors'],
-                self.config.params['Price Factor Interpolation'])
+                self.config.params['Price Factor Interpolation'],
+                base_date=base_date)
             implied_factor = implied_factors.get(price_model)
             try:
                 if implied_factor:
                     implied_obj = construct_factor(
                         implied_factor, self.config.params['Price Factors'],
-                        self.config.params['Price Factor Interpolation'])
+                        self.config.params['Price Factor Interpolation'],
+                        base_date=base_date)
                     self.implied_factors[implied_factor] = implied_obj
                 else:
                     implied_obj = None
@@ -634,7 +636,9 @@ class Credit_Monte_Carlo(Calculation):
                 self.static_factors.setdefault(
                     price_factor, construct_factor(
                         price_factor, self.config.params['Price Factors'],
-                        self.config.params['Price Factor Interpolation']))
+                        self.config.params['Price Factor Interpolation'],
+                        base_date=base_date)
+                )
             except KeyError as e:
                 logging.warning('Price Factor {0} missing in market data file - skipping'.format(e.args))
 
@@ -760,62 +764,6 @@ class Credit_Monte_Carlo(Calculation):
         # Set the settlement dates
         self.time_grid.set_currency_settlement(settlement_currencies)
         self.settlement_currencies = settlement_currencies
-
-    def calc_individual_FVA(self, params, spreads, discount_curves):
-
-        def calc_approx_fva(exp_mtm, time_grid, spread, delta_t, collateral):
-            return np.sum([spread[s] * mtm * np.exp(-(t / 365.0) * collateral.current_value(t / 365.0)) for mtm, s, t in
-                           zip(exp_mtm, delta_t, time_grid)])
-
-        def report(deal, num_scenario, num_tags):
-            empty = ','.join(['None'] * num_tags)
-            tags = deal.Instrument.field.get('Tags', empty)
-            expiry = max(deal.Instrument.get_reval_dates()).strftime('%Y-%m-%d')
-            mtm_ccy = deal.Instrument.field.get('Currency', 'N/A')
-            try:
-                refmtm = float(deal.Instrument.field.get('MtM', 0.0))
-            except ValueError:
-                refmtm = 0.0
-            return [deal.Instrument.field['Reference'], expiry, refmtm, mtm_ccy] + (
-                tags if isinstance(tags, list) else [empty])[0].split(',') + [
-                np.sum([x.sum(axis=1) for x in deal.Calc_res['Value']], axis=0) / num_scenario]
-
-        # Ask for deal level mtm's
-        params['DealLevel'] = True
-        tag_headings = self.config.deals['Attributes'].get('Tag_Titles', '').split(',')
-        base_results = self.execute(params)
-        deals = base_results['Netting'].sub_structures[0].dependencies + [
-            y.obj for y in base_results['Netting'].sub_structures[0].sub_structures]
-        mtms = [report(x, self.numscenarios, len(tag_headings)) for x in deals]
-        time_grid = base_results['Netting'].sub_structures[0].obj.Time_dep.deal_time_grid
-        days = self.time_grid.time_grid[:, 1][time_grid]
-        funding = construct_factor(
-            utils.Factor('InterestRate', (discount_curves['funding'],)),
-            self.config.params['Price Factors'], self.config.params['Price Factor Interpolation'])
-        collateral = construct_factor(
-            utils.Factor('InterestRate', (discount_curves['collateral'],)),
-            self.config.params['Price Factors'], self.config.params['Price Factor Interpolation'])
-        delta_t = np.diff(days)
-        all_spread = {k: {} for k in spreads.keys()}
-
-        for k, v in all_spread.items():
-            funding_spread = 0.0001 * spreads[k].get('funding', 0.0)
-            collateral_spread = 0.0001 * spreads[k].get('collateral', 0.0)
-            for s in np.unique(delta_t):
-                v[s] = np.exp((s / 365.0) * ((funding.current_value(s / 365.0) + funding_spread) - (
-                        collateral.current_value(s / 365.0) + collateral_spread))) - 1.0
-
-        results = []
-        output = sorted(all_spread.items())
-
-        for mtm in mtms:
-            results.append(
-                mtm[:-1] + [mtm[-1][0]] + [
-                    calc_approx_fva(mtm[-1], days, spread, delta_t, collateral) for name, spread in output])
-
-        return pd.DataFrame(
-            results, columns=['Reference', 'Expiry', 'Ref_Mtm', 'Mtm_CCy'] + tag_headings +
-                             ['MTM'] + [x[0] for x in output])
 
     def get_cholesky_decomp(self):
         # create the correlation matrix
@@ -1383,9 +1331,11 @@ class Credit_Monte_Carlo(Calculation):
                                 recovery, survival[0], discount[0], self.params['Base_Date'],
                                 CDS_tenors, self.all_factors)
 
-                            output['CS01'] = {'Par_CDS': CDS_rates,
-                                              'Tenor': shifted_tenor,
-                                              'Shifted_Log_Prob': shifted_curves}
+                            output['CS01'] = {
+                                'Par_CDS': CDS_rates,
+                                'Tenor': shifted_tenor,
+                                'Shifted_Log_Prob': shifted_curves
+                            }
 
                         if hessian:
                             # calculate the hessian matrix - warning - make sure you have enough memory
@@ -1475,7 +1425,8 @@ class Base_Revaluation(Calculation):
                 self.static_factors.setdefault(
                     price_factor, construct_factor(
                         price_factor, self.config.params['Price Factors'],
-                        self.config.params['Price Factor Interpolation']))
+                        self.config.params['Price Factor Interpolation'],
+                        base_date=base_date))
             except KeyError as e:
                 logging.warning('Price Factor {0} missing in market data file - skipping'.format(e.args))
 

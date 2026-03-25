@@ -45,42 +45,35 @@ def check_correlation(scenarios, ir_factor, fx_factor):
 
 
 def bootstrap(path, rundate, reuse_cal=True):
-    from riskflow.adaptiv import AdaptivContext
+    from riskflow.config import Config
 
-    context = AdaptivContext()
+    cfg = Config()
     cal_file = 'CVAMarketData_Calibrated_New.json'
-    # cal_file = 'CVAMarketData_test.json'
-    # cal_file = 'CVAMarketData_TST.json'
     if reuse_cal and os.path.isfile(os.path.join(path, rundate, cal_file)):
-        # context.parse_json(os.path.join(path, rundate, cal_file))
-        context.parse_json(os.path.join(path, rundate, 'CVAMarketData_TST.json'))
-        context_tmp = AdaptivContext()
+        cfg.parse_json(os.path.join(path, rundate, 'CVAMarketData_TST.json'))
+        context_tmp = Config()
         context_tmp.parse_json(os.path.join(path, rundate, cal_file))
         for factor in [x for x in context_tmp.params['Price Factors'].keys()
                        if x.startswith('HullWhite2FactorModelParameters') or
                           x.startswith('GBMAssetPriceTSModelParameters')]:
             # override it
-            context.params['Price Factors'][factor] = context_tmp.params['Price Factors'][factor]
+            cfg.params['Price Factors'][factor] = context_tmp.params['Price Factors'][factor]
     else:
         # context.parse_json(os.path.join(path, rundate, cal_file))
-        context.parse_json(os.path.join(path, '', cal_file))
+        cfg.parse_json(os.path.join(path, '', cal_file))
 
-    context.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
-    context.params['System Parameters'][
+    cfg.params['System Parameters']['Base_Date'] = pd.Timestamp(rundate)
+    cfg.params['System Parameters'][
         'Swaption_Premiums'] = 'T:\\OTHER\\ICE\\Archive\\IR_Volatility_Swaption_{}_0000_LON.csv'.format(rundate)
-    # for mp in list(context.params['Market Prices'].keys()):
-    #     if mp.startswith('HullWhite2FactorInterestRateModelPrices') and not (
-    #             mp.endswith('AUD-AONIA') or mp.endswith('ZAR-JIBAR-3M')):
-    #         del context.params['Market Prices'][mp]
 
-    context.parse_calendar_file(os.path.join(path, 'calendars.cal'))
+    cfg.parse_calendar_file(os.path.join(path, 'calendars.cal'))
 
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)-8s %(message)s',
                         datefmt='%m-%d %H:%M')
 
-    context.bootstrap()
-    # context.write_marketdata_json(os.path.join(path, rundate, cal_file))
+    cfg.bootstrap()
+    # cfg.write_marketdata_json(os.path.join(path, rundate, cal_file))
     # context.write_market_file(os.path.join(path, rundate, 'MarketDataCal.dat'))
 
 
@@ -130,7 +123,7 @@ def get_missing_rates(aa, model_factor, from_date, to_date, MDR=500):
 
 def calibrate_PFE(arena_path, rundate, scratch="Z:\\"):
     from riskflow.utils import calc_statistics, excel_offset, filter_data_frame
-    from riskflow.adaptiv import AdaptivContext
+    from riskflow import AdaptivContext
 
     aa = AdaptivContext()
     aa.parse_json(os.path.join(arena_path, rundate, 'MarketData.json'))
@@ -157,8 +150,8 @@ def calibrate_PFE(arena_path, rundate, scratch="Z:\\"):
     # EquityPrice.ZAR_SHAR
     # EquityPrice.ZAR_TFGP
 
-    for i in ['EquityPrice.ZAR_SHAR', 'EquityPrice.ZAR_TFGP']:
-        del to_calibrate[i]
+    #for i in ['EquityPrice.ZAR_SHAR', 'EquityPrice.ZAR_TFGP']:
+    #    del to_calibrate[i]
 
     smoothing_std = 2.15
     # perform an actual calibration - first, clear out the old parameters
@@ -166,6 +159,209 @@ def calibrate_PFE(arena_path, rundate, scratch="Z:\\"):
     # if there are any issues with the data, it will be logged here
     aa.calibrate_factors(
         start_date, end_date, to_calibrate, smooth=smoothing_std, correlation_cuttoff=0.1, overwrite_correlations=True)
+
+# PyTorch implementation of a Geared TARF one-step-survival Monte Carlo pricer
+# with autograd-friendly Greeks.
+#
+# This implements:
+# - Pathwise GBM dynamics for FX spot
+# - One-step survival / truncated-normal sampling against the "PnL barrier"
+#   B_i^{PnL} = K + R_{i-1} / (N_itm * gear * conv)
+# - Analytic KO-in-the-step contribution: (1 - p_i) * R_{i-1}
+# - Survival branch sampling using Z ~ N(0,1) truncated at Z < z_max
+# - Full period cashflows:
+#     * If S_i >= K: profit = (S_i - K) * N_itm * gear  (counts to target)
+#     * If S_i <  K: loss   = (S_i - K) * N_otm         (does NOT count to target)
+#   Target accumulation uses only ITM profit (capped by remaining target)
+# - Early termination when target is hit
+#
+# Greeks (Delta, Vega, Rho_d) are computed with autograd (reverse-mode).
+#
+# Notes:
+# - Units: all cashflows are in domestic currency.
+# - Rates: r_d (domestic), r_f (foreign). Drift mu = r_d - r_f (under domestic measure).
+# - conv can be set to 1.0 if payoff already in domestic units; otherwise include conversion.
+import math
+import torch
+from torch.distributions.normal import Normal
+
+normal = Normal(torch.tensor(0.0), torch.tensor(1.0))
+
+def test_tarf():
+    def price_geared_tarf_autograd(
+        S0: float,
+        K: float,
+        sigma: float,
+        r_d: float,
+        r_f: float,
+        T_years: float,
+        n_fixings: int,
+        N_itm: float,
+        N_otm: float,
+        gear: float = 1.0,
+        target: float = 1.0,
+        conv: float = 1.0,         # FX conversion to domestic (usually 1.0 if quoting domestic/foreign)
+        n_paths: int = 20000,
+        device: str = "cpu",
+        seed: int = 1234,
+        requires_grads=("S0","sigma","r_d"),
+    ):
+        """
+        Returns:
+            price (torch.Scalar): MC price estimate (domestic currency)
+            grads (dict): autograd Greeks for requested inputs
+            debug (dict): misc diagnostics
+        """
+        torch.manual_seed(seed)
+        dt = T_years / n_fixings
+        t_grid = torch.arange(1, n_fixings+1, device=device) * dt
+        disc = torch.exp(-r_d * t_grid)  # discount factors per fixing (vector, used index-wise)
+
+        # Parameters as tensors (enable autograd where requested)
+        S0_t = torch.tensor(float(S0), device=device, requires_grad=("S0" in requires_grads))
+        K_t  = torch.tensor(float(K),  device=device, requires_grad=("K" in requires_grads))
+        sig_t= torch.tensor(float(sigma), device=device, requires_grad=("sigma" in requires_grads))
+        rd_t = torch.tensor(float(r_d), device=device, requires_grad=("r_d" in requires_grads))
+        rf_t = torch.tensor(float(r_f), device=device, requires_grad=("r_f" in requires_grads))
+        N_itm_t = torch.tensor(float(N_itm), device=device)
+        N_otm_t = torch.tensor(float(N_otm), device=device)
+        gear_t = torch.tensor(float(gear), device=device)
+        target_t = torch.tensor(float(target), device=device)
+        conv_t = torch.tensor(float(conv), device=device)
+
+        # Precompute GBM constants
+        mu = rd_t - rf_t
+        drift = (mu - 0.5 * sig_t**2) * dt
+        vol_step = sig_t * math.sqrt(dt)
+
+        # Random uniforms for truncated draws (fixed, no grads)
+        U = torch.rand(n_paths, n_fixings, device=device)
+
+        # Initialize path state
+        S = S0_t.repeat(n_paths)
+        R = target_t.repeat(n_paths)  # remaining target
+        alive = torch.ones(n_paths, dtype=torch.bool, device=device)  # path still running
+        L = torch.ones(n_paths, device=device)  # continuation likelihood weight product
+        pv = torch.zeros(n_paths, device=device)  # accumulated PV
+
+        # Diagnostics
+        ko_step = torch.zeros(n_paths, dtype=torch.int32, device=device)  # 0 if not KO, else step index (1..n_fixings)
+
+        for i in range(n_fixings):
+            # Skip finished paths
+            if not alive.any():
+                break
+
+            # Compute PnL barrier for this step (finite where alive, inf where not alive)
+            # B = K + R / (N_itm*gear*conv)
+            denom = (N_itm_t * gear_t * conv_t)
+            # Avoid division by zero (if N_itm=0, there is no profit accumulation; treat barrier as +inf)
+            safe_denom = torch.where(denom>0, denom, torch.tensor(1e16, device=device))
+            B = K_t + torch.where(denom>0, R / safe_denom, torch.tensor(float('inf'), device=device))
+
+            # Map to z_max under GBM: log(S_i/S_{i-1}) < log(B/S_{i-1})
+            # z_max = [ln(B/S) - drift] / vol_step
+            # Handle cases where B<=0 or B<=S (-> z_max possibly negative/finite), and if B is inf -> z_max = +inf
+            with torch.no_grad():
+                # For non-alive paths, zmax irrelevant; set to +inf to get p=1
+                B_eff = torch.where(alive, B, torch.tensor(float('inf'), device=device))
+            log_ratio = torch.log(B_eff.clamp_min(1e-300)) - torch.log(S.clamp_min(1e-300))
+            # If B is inf, log_ratio inf, zmax inf; that's fine.
+            z_max = (log_ratio - drift) / (vol_step + 1e-16)
+
+            # One-step survival probability p_i = Phi(z_max), clipped to [0,1]
+            p_i = normal.cdf(z_max).clamp(0.0, 1.0)
+
+            # KO in this step: contribute R (remaining target) discounted at this fixing, weighted by (1 - p_i)
+            # Only for alive paths; others contribute zero.
+            ko_weight = (1 - p_i) * L * alive
+            pv = pv + ko_weight * disc[i] * R
+
+            # Survive branch weight update
+            L = L * (p_i + (~alive).float())  # keep L unchanged for dead paths
+
+            # Sample truncated Z for survivors: Z = Phi^{-1}(U * p_i)
+            u = U[:, i]
+            # To avoid nan in icdf when p_i=0, clamp multiplier
+            u_scaled = (u * p_i).clamp(min=1e-12, max=1 - 1e-12)
+            Z = normal.icdf(u_scaled)
+
+            # GBM step for survivors
+            S_next = S * torch.exp(drift + vol_step * Z)
+
+            # Period cashflow for survivors only
+            itm = (S_next >= K_t) & alive
+            otm = (S_next <  K_t) & alive
+
+            # ITM profit (counts to target)
+            profit = (S_next - K_t).clamp_min(0.0) * N_itm_t * gear_t * conv_t
+            # OTM loss (doesn't count to target but affects PV)
+            loss   = (S_next - K_t).clamp_max(0.0) * N_otm_t * conv_t
+
+            # Add survival-branch PV contribution (discount at this fixing)
+            pv = pv + disc[i] * (profit + loss) * (alive.float()) * 1.0  # already weighted via truncated draw & L in measure
+
+            # Update remaining target: subtract only the profit actually realized, but cap at R (can't go negative via survival branch)
+            # By survival construction, profit < R for ITM survivors; OTM survivors earn no profit
+            R = torch.where(itm, R - profit, R)
+
+            # Determine which paths actually KO after this survival step (should be none by construction);
+            # but we mark KO when ko_weight>0 or when R==0 exactly due to numerical rounding.
+            just_ko = (ko_weight > 0) & alive
+            # For numerical edge cases, also KO if R <= tiny after survival ITM
+            just_ko = just_ko | ((R <= 1e-10) & alive)
+            ko_step = torch.where(just_ko & (ko_step==0), torch.tensor(i+1, dtype=torch.int32, device=device), ko_step)
+
+            # Update S and alive flags
+            S = torch.where(alive, S_next, S)
+            alive = alive & (~just_ko)
+
+        # For any paths still alive at final fixing, nothing special (we already booked the last period CF).
+
+        # Monte Carlo average (L is already embedded through truncated sampling + weights in pv)
+        price = pv.mean()
+
+        grads = {}
+        # Compute Greeks for requested inputs
+        if "S0" in requires_grads:
+            (dS0,) = torch.autograd.grad(price, S0_t, retain_graph=True, allow_unused=True)
+            grads["Delta_dS0"] = float(dS0) if dS0 is not None else None
+        if "sigma" in requires_grads:
+            (dSigma,) = torch.autograd.grad(price, sig_t, retain_graph=True, allow_unused=True)
+            grads["Vega_dSigma"] = float(dSigma) if dSigma is not None else None
+        if "r_d" in requires_grads:
+            (dRd,) = torch.autograd.grad(price, rd_t, retain_graph=True, allow_unused=True)
+            grads["Rho_domestic"] = float(dRd) if dRd is not None else None
+
+        debug = {
+            "alive_ratio": float(alive.float().mean()),
+            "avg_ko_step": float((ko_step.float() * (ko_step>0).float()).sum() / ((ko_step>0).float().sum() + 1e-9)),
+        }
+        return price.detach().item(), grads, debug
+
+
+    # --- Quick demo using the example flavor from the document ---
+    S0_demo = 17.30    # spot
+    K_demo  = 17.15    # strike
+    sigma_demo = 0.16  # 16% annualized vol (illustrative)
+    r_d_demo = 0.09    # domestic ZAR rate (illustrative)
+    r_f_demo = 0.05    # USD rate (illustrative)
+    T_years_demo = 0.5 # 6 months
+    n_fix_demo = 6
+    N_itm_demo = 1_000_000.0   # 1m ITM leg
+    N_otm_demo = 2_000_000.0   # 2m OTM leg
+    gear_demo  = 1.0           # "1m/2m" gearing already modeled via dual notional
+    target_demo = 5_000_000.0  # R5 per USD * 1m? In doc it's R5 per USD across notionals; here we take absolute target in ZAR.
+
+    price, greeks, dbg = price_geared_tarf_autograd(
+        S0=S0_demo, K=K_demo, sigma=sigma_demo, r_d=r_d_demo, r_f=r_f_demo,
+        T_years=T_years_demo, n_fixings=n_fix_demo,
+        N_itm=N_itm_demo, N_otm=N_otm_demo, gear=gear_demo, target=target_demo,
+        conv=1.0, n_paths=20000, device="cpu", seed=42,
+        requires_grads=("S0","sigma","r_d"),
+    )
+
+    return price, greeks, dbg
 
 
 def compress(data):
@@ -252,8 +448,8 @@ if __name__ == '__main__':
     plt.interactive(True)
     # make pandas pretty print
     pd.options.display.float_format = '{:,.5f}'.format
-    pd.set_option("display.max_rows", 500, "display.max_columns", 20)
-
+    pd.set_option("display.max_rows", 500, "display.max_columns", 20, 'display.width', 255)
+    # test_tarf()
     # set the visible GPU
     # os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
     # set the log level
@@ -264,12 +460,11 @@ if __name__ == '__main__':
     env = ''
     paths = {}
     for folder in ['JSON', 'COLLVA', 'CVA_SARB', 'Input_JSON', 'CVA_JSON',
-                   'Autocall_PreTrade', 'FVA_JSON', 'CVA', 'PFE', 'PFE_UAT',
+                   'FVA_Merged', 'FVA', 'CVA', 'PFE', 'PFE_UAT',
                    'Upgrade', 'lch_munetzi']:
         paths[folder] = rf.getpath(
-            [os.path.join('Y:\\CollVA', folder),
-             os.path.join('/media/vretiel/Media/Data/crstal', folder),
-             os.path.join('S:\\Riskflow', folder),
+            [os.path.join('R:\\Riskflow', folder),
+             os.path.join('N:\\Archive', folder),
              os.path.join('R:\\Riskflow\PFE_Credit', folder),
              os.path.join('Z:\\', folder),
              # os.path.join('S:\\CCR_PFE_EE_NetCollateral', folder),
@@ -277,15 +472,15 @@ if __name__ == '__main__':
              os.path.join('N:\\Archive', folder)])
 
     # path_json = paths['COLLVA']
-    # path_json = paths['Input_JSON']
-    path_json = paths['FVA_JSON']
+    path_json = paths['FVA']
+    # path_json = paths['FVA_Merged']
     # path = paths['CVA_UAT']
-    # path = paths['CVA']
+    # path_json = paths['CVA']
     path = paths['PFE']
 
     # rundate = '2024-03-26'
     # rundate = '2024-06-14'
-    rundate = '2025-02-20'
+    rundate = '2026-02-12'
     # rundate = '2024-09-10'
 
     # calibrate_PFE(path, rundate)
@@ -312,7 +507,7 @@ if __name__ == '__main__':
         'ZAR': {'FVA@Equity': {'collateral': -10, 'funding': 15}, 'FVA@Income': {'collateral': -10, 'funding': 15}}}
 
     curves = {'USD': {'collateral': 'USD-OIS-STATIC-OLD', 'funding': 'USD-SOFR-CAS'},
-              'EUR': {'collateral': 'EUR-EONIA', 'funding': 'EUR-EURIBOR-3M'},
+              'EUR': {'collateral': 'EUR-ESTR', 'funding': 'EUR-EURIBOR-3M'},
               'GBP': {'collateral': 'GBP-SONIA', 'funding': 'GBP-SONIA'},
               'ZAR': {'collateral': 'ZAR-SWAP', 'funding': 'ZAR-SWAP'}}
 
@@ -341,11 +536,48 @@ if __name__ == '__main__':
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_UBS_AG_Zurich_ISDA*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Citibank_NA_NY_ISDA*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_BNP_Paribas__Paris_*.json')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'ZAR_FVA_Some*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'USD_FVA_ALL_NoWF_Speci*.json')):
 
-    for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_ZAR_CrB_Motus_Group_ISDA*')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_USD_CrB_ED_FIN_PROD_SPECIAL*')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_USD_CrB_Tikim_Ve_Tikim_ISDA*')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'ZAR_FVA_ALL_FULL_NotSpecial*')):
+    # for json in glob.glob(os.path.join('Z:\\tmp','fx_asian.json')):
+    # for json in glob.glob(os.path.join('Z:\\tmp','InputAAJ_CrB_SAPPI_SA_ISDA.json')):
+    for json in glob.glob(os.path.join('Z:\\tmp','discrete_barrier_option_2.json')):
+    # for json in glob.glob(os.path.join('Z:\\tmp','11silver_asian.json')):
+
+    # for json in glob.glob(os.path.join('Z:\\tmp', 'jal2.json')):
+    # for json in glob.glob(os.path.join('Z:\\tmp', 'range_accrual_capfloor_no_shift_2025-11-05.json')):
+    # for json in glob.glob(os.path.join('Z:\\tmp', 'ILB_forward.json')):
+
+    # for json in glob.glob(os.path.join('Z:\\tmp','W_Funding_10_CPY.json')):
+    # for json in glob.glob(os.path.join('Z:\\tmp', 'zaronia_test_2.json')):
+    # for json in glob.glob(os.path.join('Z:\\tmp', 'gold_forward.json')):
+
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_ZAR_CrB_IBL_W_Funding_8_CPY*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Citigroup_G_Mkt_Ldn_*.json')):
+
+    # for json in glob.glob(os.path.join('Z:\\tmp','InputAAJ_CrB_Credit_Agri_Corp_Inv_ISDA.json')):
+    # for json in glob.glob(os.path.join('Z:\\FVA_JSON\\2026-01-05', 'ZAR_FVA_ALL_FULL_NotSpecial.json')):
+
+    # for json in glob.glob(os.path.join('Z:\\tmp','InputAAJ_CrB_Avon_Peaking_Power_ISDA.json')):
+
+    # for json in glob.glob(os.path.join('Z:\\tmp', 'InputAAJ_CrB_Just_Retirement_Life_SA_ISDA.json')):
+    # for json in glob.glob(os.path.join('R:\\RiskFlow\\PFE\\2025-12-02', 'InputAAJ_CrB_SAPPI_SA_ISDA.json')):
+    # for json in glob.glob(os.path.join('R:\\RiskFlow\\FVA_Merged\\2025-12-11', 'ZAR_FVA_ALL_NoWF_NotSpecial.json')):
+    # for json in glob.glob(os.path.join('Z:\\tmp','commodity_asian_passed_dates.json')):
+    # for json in glob.glob(os.path.join('Z:\\tmp','InputJSON_USD_CrB_IBL_ICIB_Bal_Sheet_Fund_Eurodollar_CPY.json')):
+
+    # for json in glob.glob(os.path.join('Z:\\tmp', 'american.json')):
+    # for json in glob.glob(os.path.join('Z:\\tmp','InputJSON_USD_CrB_ED_FIN_PROD_SPECIAL.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'USD_FVA_ALL_FULL_Special*')):
+
+    #for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Citibank_NA_NY_ISDA*')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_African_Infrastructure_Investment_*')):
+
+    # for json in glob.glob(os.path.join(path_json, rundate, 'json_combo_test_162595785_v2*')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_ZAR_CrB_ACWA_Power_SolarReserve_Redstone_So_NonISDA*')):
-    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_FirstRand_Bank_Ltd_ISDA*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Barclays_Plc_Ldn_ISDA*.json')):
 
     # for json in glob.glob(os.path.join('Z:\\', 'InputAAJ_CrB_BNP_Paribas__Paris__ISDA_*.json')):
     # for json in glob.glob(os.path.join('Z:\\', 'InputAAJ_CrB_M_Lynch_Int_Ldn_*.json')):
@@ -361,9 +593,9 @@ if __name__ == '__main__':
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_FirstRand_Bank_Ltd_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputJSON_FVA_CrB_IBL_ICIB_BSF_ED_HQLA_*.json')):
     # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Redefine_Properties_Limited*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Standard_Bank_*.json')):
+    # for json in glob.glob(os.path.join(path_json, rundate, '*otus*.json')):
 
-        # for json in glob.glob(os.path.join(path_json, rundate, 'InputAAJ_CrB_Standard_Bank_*.json')):
-        # for json in glob.glob(os.path.join(path_json, rundate, '*otus*.json')):
         cx.load_json(json, compress=True)
         short_date = ''.join(rundate[2:].split('-')[::-1])
         cx.stressed_config_file = os.path.join(UAT_MARKETDATA, "CVAMarketDataBackup\\CVAMarketData_Calibrated_Vega_{}.json".format(short_date))
@@ -382,7 +614,7 @@ if __name__ == '__main__':
 
         # test hwhazardratemodel
         cx.current_cfg.params['Model Configuration'].modeldefaults['SurvivalProb'] = 'HWHazardRateModel'
-        cx.current_cfg.params['Price Models']['HWHazardRateModel.ACWA Power SolarReserve Redstone So'] = {
+        cx.current_cfg.params['Price Models']['HWHazardRateModel.ITRAXX_MAIN_S44_ZAR_MR_MMR'] = {
             'Alpha': 0.89, 'Sigma': 0.005, 'Lambda': 0.0}
 
         # grab the netting set
@@ -398,17 +630,18 @@ if __name__ == '__main__':
 
         overrides = {
             'Calc_Scenarios': 'No',
-            # 'Run_Date': '2021-10-11',
+            # 'Run_Date': '2025-07-02',
             # 'Tenor_Offset': 2.0,
             # 'Time_grid': '0d 2d 1w',
             'Random_Seed': 1,
             'Generate_Cashflows': 'Yes',
-            'Greeks': 'First',
+            # 'Greeks': 'First',
             # 'Currency': 'ZAR',
-            'Percentile': '95, 99',
+            'Percentile': '95',
             # 'Antithetic': 'Yes',
             # 'Deflation_Interest_Rate': 'ZAR-SWAP',
-            'Batch_Size': 32,
+            'MCMC_Simulations': 2048,
+            'Batch_Size': 256,
             'Simulation_Batches': 1,
             # 'Collateral_Valuation_Adjustment': {'Calculate': 'Yes', 'Gradient': 'Yes'},
             'Initial_Margin':
@@ -420,17 +653,17 @@ if __name__ == '__main__':
                  'IM_Currency': 'GBP',
                  'Gradient': 'No'},
             'Funding_Valuation_Adjustment':
-                {'Calculate': 'Yes',
+                {'Calculate': 'No',
                  'Gradient': 'Yes'},
             'Credit_Valuation_Adjustment':
-                {'Calculate': 'No', 'Gradient': 'No', 'CDS_Tenors': [0.5, 1, 3, 5, 10], 'Hessian': 'No'}
+                {'Calculate': 'No', 'Gradient': 'Yes', 'CDS_Tenors': [0.5, 1, 3, 5, 10], 'Hessian': 'No'}
         }
 
         if ns.field['Collateralized'] == 'True':
             overrides['Dynamic_Scenario_Dates'] = 'Yes'
         else:
             overrides['Dynamic_Scenario_Dates'] = 'No'
-
+        overrides['Dynamic_Scenario_Dates'] = 'Yes'
         if False:
             for i in cx.current_cfg.deals['Deals']['Children'][0]['Children']:
             # for i in cx.current_cfg.deals['Deals']['Children']:
@@ -439,7 +672,7 @@ if __name__ == '__main__':
 
                 # 141784934, 153489256
                 # if False and str(i['Instrument'].field['Reference']) in ['169962788', '169962789', '169962790', '169962792']:  # , '154727676', '158079450']:
-                if not str(i['Instrument'].field['Reference']) in ['174288511']:
+                if not str(i['Instrument'].field['Reference']) in ['211837146']:
                 # if False and not str(i['Instrument'].field['Reference']) in ['CrB_BNP_Paribas__Paris__ISDA', 'CrB_Citibank_NA_NY_ISDA']:
                     i['Ignore'] = 'True'
                 else:
@@ -451,16 +684,23 @@ if __name__ == '__main__':
         # ns.field['Opening_Balance'] = 0.0
         # if 'Collateral_Assets' in ns.field:
         #    ns.field['Collateral_Assets']['Cash_Collateral'][0]['Amount'] = 1.0
+        # cx.current_cfg.params['Valuation Configuration']['FXDiscreteExplicitAsianOption']={'Valuation':'Full'}
 
         logging.getLogger().setLevel(logging.DEBUG)
+
+        for x in []:#['InterestRate.ZAR-JIBAR-3M', 'InterestRate.ZAR-SWAP']:
+        # for x in ['InterestRate.ZAR-JIBAR-3M']:
+            rates = cx.current_cfg.params['Price Factors'][x]['Curve'].array[:, 1]
+            # cx.current_cfg.params['Price Factors'][x]['Curve'].array[:, 1] = np.log(np.exp(rates) + 0.02)
+            cx.current_cfg.params['Price Factors'][x]['Curve'].array[:, 1] = rates + 0.0195
+
+        # cx.current_cfg.params['Price Factors']['InflationRate.ZAR-BOND-CPI']['Curve'].array[:, 0]-=31/365.0
+
         # calc, out = cx.Base_Valuation(overrides=overrides)
+        calc, out = cx.Base_Valuation()
         if 1:
             calc, out = cx.Credit_Monte_Carlo(overrides=overrides)
-            collateral = np.sum([
-                np.concatenate(x.obj.Calc_res['Collateral'], axis=-1) for x in calc.netting_sets.sub_structures],
-                axis=0)
-            dates = np.array(sorted(calc.time_grid.mtm_dates))[calc.time_grid.report_index]
-            result = pd.DataFrame(collateral, index=dates)
+            print(out['Results'].keys())
 
         if 0:
             for i in range(2):

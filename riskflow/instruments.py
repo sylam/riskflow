@@ -306,6 +306,11 @@ def get_forward_price_vol_factor(fieldname, static_offsets, stochastic_offsets, 
     return [calc_factor_index(utils.Factor('ForwardPriceVol', fieldname), static_offsets,
                               stochastic_offsets, all_tenors)]
 
+def get_commoditiy_vol_factor(fieldname, static_offsets, stochastic_offsets, all_tenors):
+    """Read the index of the fx vol price factor"""
+    return [calc_factor_index(utils.Factor('CommodityPriceVol', fieldname), static_offsets, stochastic_offsets,
+                              all_tenors)]
+
 
 class Deal(object):
     """
@@ -1569,6 +1574,7 @@ class StructuredDeal(Deal):
         if node_children is not None:
             # have to reset the original instrument and let the child node decide
             for child in node_children:
+                child.add_reval_date_offset(1)
                 node_resets.update(child.get_reval_dates())
 
         self.reval_dates = node_resets
@@ -2641,7 +2647,12 @@ class EquityBarrierBinaryOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('Fx And Equity', ['A vanilla option described [here](definitions.md#european-options)'])
+    documentation = ('Fx And Equity', [
+                     'A discrete barrier binary (digital) option priced using the same One-Step Survival (OSS)',
+                     'Monte Carlo approach as `EquityBarrierOption`, with `isdigital=True` so the terminal payoff',
+                     'is a fixed cash amount rather than a vanilla call/put payoff.',
+                     'See `EquityBarrierOption` for the full OSS methodology.'
+                     ])
 
     def __init__(self, params, valuation_options):
         super(EquityBarrierBinaryOption, self).__init__(params, valuation_options)
@@ -2903,12 +2914,37 @@ class QEDI_CustomAutoCallSwap(Deal):
                      'Equity_Volatility': ['EquityPriceVol']}
 
     documentation = ('Fx And Equity',
-                     ['An exotic Equity option described',
-                      '[here](https://www.math.uni-frankfurt.de/~harrach/publications/StableDiffs.pdf).',
+                     ['An autocallable equity swap priced using the One-Step Survival (OSS) Monte Carlo',
+                      'technique. See [One-Step Survival Methodology](../theory/mc_simulation.md) for the',
+                      'general OSS theory.',
+                      '',
+                      'An autocall terminates early whenever the underlying spot exceeds an autocall threshold',
+                      '$H_j^{\\text{call}}$ on a scheduled observation date. An optional put barrier $H^{\\text{put}}$',
+                      'can condition participation in the downside leg.',
                       '',
                       'Note that the code has been adjusted to deal with Quanto Payoffs (if necessary) ',
                       'and only supports a single stock sample per coupon payoff (Averaging is possible ',
-                      'if the distribution of the mean can be provided - TODO)'
+                      'if the distribution of the mean can be provided - TODO)',
+                      '',
+                      '**Autocall barrier**',
+                      '',
+                      'The OSS threshold is $H_j^{\\text{call}}$ — the autocall level for observation $j$.',
+                      'The non-surviving weight $(1-p_j)L_{j-1}$ pays the autocall coupon discounted to $t_j$',
+                      'and terminates. Surviving paths carry the weight $L_j = p_j L_{j-1}$ forward.',
+                      '',
+                      '**Put barrier** (optional)',
+                      '',
+                      'When a put barrier is present, a second OSS truncation applies within each surviving path',
+                      'to handle the put protection level. The analytic contribution is the conditional put payoff',
+                      'given the barrier is crossed, valued from the barrier level.',
+                      '',
+                      '**Floating leg**',
+                      '',
+                      'If a floating rate leg is present, the float payments on surviving paths are discounted at',
+                      'each payment date using the same survival weight $L_j$, so the full swap value is:',
+                      '',
+                      '$$V = \\sum_{j} (1-p_j)L_{j-1}\\,\\text{Coupon}_j\\,D_j + L_T\\,V_{\\text{terminal}}\\,D_T',
+                      '    - \\sum_k L_{t_k}\\,\\text{Float}_k\\,D_{t_k}$$'
                       ])
 
     def __init__(self, params, valuation_options):
@@ -3245,7 +3281,47 @@ class EquityBarrierOption(Deal):
                      'Discount_Rate': ['DiscountRate'],
                      'Equity_Volatility': ['EquityPriceVol']}
 
-    documentation = ('Fx And Equity', ['A path dependent option described [here](#single-barrier-options)'])
+    documentation = ('Fx And Equity', [
+                     'A path dependent barrier option priced using the One-Step Survival (OSS) Monte Carlo',
+                     'technique. See [One-Step Survival Methodology](../theory/mc_simulation.md) for the',
+                     'general OSS theory.',
+                     '',
+                     'The barrier is observed at a scheduled set of fixing dates. Between observation dates the',
+                     'spot evolves freely; only at barrier dates does OSS truncation apply.',
+                     '',
+                     '**Knock-Out**',
+                     '',
+                     'At each barrier observation date $t_j$, the weight $(1-p_j)L_{j-1}$ crosses the barrier',
+                     'and pays the cash rebate $R$ discounted to $t_j$. Surviving paths contribute the vanilla',
+                     'payoff at expiry:',
+                     '',
+                     '$$V_{\\text{KO}} = \\sum_{j \\in \\mathcal{B}} (1-p_j)\\,L_{j-1}\\,R\\,D_j + L_T\\,g(S_T)\\,D_T$$',
+                     '',
+                     '**Knock-In** (via in-out parity)',
+                     '',
+                     'The exact identity $V_{\\text{KI}} = V_{\\text{vanilla}} - V_{\\text{KO,pure}} + R\\,E[L_T D_T]$',
+                     'is used. $V_{\\text{vanilla}}$ is computed analytically via Black-Scholes at the start of',
+                     'each MTM block and is constant across inner paths; $V_{\\text{KO,pure}}$ is the',
+                     'survival-weighted MC estimate. The per-path estimator is therefore:',
+                     '',
+                     '$$P = V_{\\text{vanilla}} - L_T\\,D_T\\bigl(g(S_T) - R\\bigr)$$',
+                     '',
+                     'The sample mean is clamped to $\\geq 0$ to enforce no-arbitrage.',
+                     '',
+                     '**CVA / XVA Path-State Tracking**',
+                     '',
+                     'In the outer CVA simulation, each outer scenario spot is compared against the barrier at',
+                     'every past observation date to build a per-row, per-scenario hit mask. Once a scenario has',
+                     'hit the barrier, subsequent MTM values are replaced analytically:',
+                     '',
+                     '| Barrier Type | Hit MTM |',
+                     '|---|---|',
+                     '| Knock-Out | 0 |',
+                     '| Knock-In | Black-Scholes vanilla at current outer spot |',
+                     '',
+                     'When *all* outer scenarios have resolved, the inner OSS simulation is skipped entirely;',
+                     'only a single Black-Scholes evaluation per outer scenario is needed.'
+                     ])
 
     def __init__(self, params, valuation_options):
         super(EquityBarrierOption, self).__init__(params, valuation_options)
@@ -4001,7 +4077,25 @@ class FXTARFOptionDeal(Deal):
                      'FX_Volatility': ['FXVol']}
 
     documentation = (
-        'Fx And Equity', ['A Monte Carlo Priced FX instrument described [here](./definitions.md#european-options)'])
+        'Fx And Equity', [
+            'A Monte Carlo priced FX Target-Accrual Redemption Forward (TARF), using the',
+            'One-Step Survival (OSS) technique. See [One-Step Survival Methodology](../theory/mc_simulation.md)',
+            'for the general OSS theory.',
+            '',
+            'The TARF knocks out when the accumulated profit to the client reaches a target',
+            'level $T^*$. The OSS barrier is the *remaining target* at each fixing.',
+            '',
+            'Let $A_{j-1}$ be the accumulated accrual entering fixing $j$ and $\\Delta_j$ the ITM accrual',
+            'for that step. The barrier in the OSS sense is:',
+            '',
+            '$$H_j = T^* - A_{j-1}$$',
+            '',
+            'The survival probability $p_j$ is the probability that the step accrual $\\Delta_j < H_j$',
+            '(i.e. the TARF does not terminate at fixing $j$). The knocked-out weight',
+            '$(1-p_j)L_{j-1}$ contributes the partial accrual needed to exactly reach $T^*$ plus any',
+            'OTM payments from the terminated fixing. Surviving paths continue with $A_j = A_{j-1} + \\Delta_j$',
+            'drawn from the truncated distribution.'
+        ])
 
     def __init__(self, params, valuation_options):
         super(FXTARFOptionDeal, self).__init__(params, valuation_options)
@@ -4126,9 +4220,9 @@ class FXOptionDeal(Deal):
         forward = utils.calc_fx_forward(
             deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
             deal_data.Factor_dep['Expiry'], deal_time, shared)
-
-        moneyness = deal_data.Factor_dep['Strike_Price'] / forward if deal_data.Factor_dep['Invert_Moneyness'] \
-            else forward / deal_data.Factor_dep['Strike_Price']
+        moneyness = pricing.calc_moneyness(
+            deal_data.Factor_dep['Strike_Price'], forward, forward,
+            deal_data, use_forward=True, invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
 
         mtm = pricing.pv_european_option(
             shared, time_grid, deal_data, self.field['Underlying_Amount'], moneyness, forward) * fx_rep
@@ -4139,6 +4233,81 @@ class FXOptionDeal(Deal):
 class FXEuropeanOption(FXOptionDeal):
     def __init__(self, params, valuation_options):
         super(FXEuropeanOption, self).__init__(params, valuation_options)
+
+
+class CreditNthToDefault(Deal):
+    factor_fields = {'Currency': ['FxRate'],
+                     'Discount_Rate': ['DiscountRate'],
+                     'CDS_Index':['SurvivalProb'],
+                     'Names': ['SurvivalProb']}
+
+    documentation = ('Credit',
+                     ['This is a bilateral agreement where the buyer purchases Stuff'])
+
+    def __init__(self, params, valuation_options):
+        super(CreditNthToDefault, self).__init__(params, valuation_options)
+
+    def reset(self, calendars):
+        super(CreditNthToDefault, self).reset()
+        bus_day = calendars.get(self.field['Calendars'], {'businessday': pd.offsets.Day(1)})['businessday']
+        if list(self.field['Pay_Frequency'].kwds.values()) == [0]:
+            self.resetdates = pd.DatetimeIndex([self.field['Effective_Date'], self.field['Maturity_Date']])
+        else:
+            self.resetdates = generate_dates_backward(
+                self.field['Maturity_Date'], self.field['Effective_Date'],
+                self.field['Pay_Frequency'], bus_day=bus_day)
+        self.add_reval_dates(self.resetdates, self.field['Currency'])
+
+    def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
+                          calendars):
+        field = {'Currency': utils.check_rate_name(self.field['Currency']),
+                 'CDS_Index': utils.check_rate_name(self.field['CDS_Index']),
+                 'Names': [utils.check_rate_name(name) for name in self.field['Names']]}
+
+        field['Discount_Rate'] = utils.check_rate_name(
+            self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
+
+        pay_rate = self.field['Pay_Rate'] / 100.0 if isinstance(
+            self.field['Pay_Rate'], float) else self.field['Pay_Rate'].amount
+
+        index_factor = all_factors.get(utils.Factor('SurvivalProb',field['CDS_Index']))
+        # the idea here is to calculate a "beta" between the index and each underlying name
+        # so we can stress the index and translate that to a pd in the underlying name
+        b=utils.calibrate_index_hazard_scale(
+            base_date,
+            index_factor,
+            [all_factors.get(utils.Factor('SurvivalProb',name)) for name in field['Names']],
+            all_factors.get(utils.Factor('InterestRate', field['Discount_Rate'])),
+            self.resetdates.max()
+        )
+
+        field_index = {
+            'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
+            'SettleCurrency': self.field['Currency'],
+            'Accrue_Fee': self.field.get('Accrue_Fee', 'No') == 'Yes',
+            'Discount': get_discount_factor(
+                field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Name': get_survival_factor(field['CDS_Index'], static_offsets, stochastic_offsets, all_tenors),
+            'Names': [get_survival_factor(
+                name, static_offsets, stochastic_offsets, all_tenors) for name in field['Names']],
+            'Coupon': pay_rate,
+            'Correlation': self.field.get('Correlation', 0.0),
+            'beta': b,
+            'Recovery_Rate': float(get_recovery_rate(field['CDS_Index'], all_factors))
+        }
+
+        field_index['Cashflows'] = utils.generate_fixed_cashflows(
+            base_date, self.resetdates, 1.0,
+            self.field['Amortisation'], utils.get_day_count(self.field['Accrual_Day_Count']), 1.0)
+
+        # include the maturity date in the daycount
+        field_index['Cashflows'].add_maturity_accrual(base_date, utils.get_day_count(self.field['Accrual_Day_Count']))
+
+        return field_index
+
+    def generate(self, shared, time_grid, deal_data):
+        return pricing.pv_credit_step_down_leg(shared, time_grid, deal_data)
+
 
 
 class DealDefaultSwap(Deal):
@@ -4368,7 +4537,7 @@ class FloatingEnergyDeal(Deal):
             'FX_Sampling_Type'] else None
 
         field_index['ForwardPrice'], field_index['ForwardFX'], field_index['CashFX'] = get_forwardprice_factor(
-            field['Currency'], static_offsets, stochastic_offsets, all_tenors,
+            field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors,
             all_factors, reference_factor, forward_factor, base_date)
 
         field_index['Payoff_Currency'] = get_fxrate_factor(field['Payoff_Currency'], static_offsets, stochastic_offsets)
@@ -4377,6 +4546,11 @@ class FloatingEnergyDeal(Deal):
         field_index['Cashflows'] = utils.make_energy_cashflows(
             base_date, time_grid, -1.0 if self.field['Payer_Receiver'] == 'Payer' else 1.0,
             self.field['Payments'], reference_factor, forward_sample, fx_sample, calendars)
+
+        if field['Payoff_Currency'] != field['Currency']:
+            # different discounting - need to convert from Payoff_Currency to Currency
+            field_index['Currency'] = get_fx_and_zero_rate_factor(
+                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         field_index['SettleCurrency'] = self.field['Payoff_Currency']
 
@@ -4432,7 +4606,7 @@ class EnergySingleOption(Deal):
                      'Sampling_Type': ['ForwardPriceSample'],
                      'FX_Sampling_Type': ['ForwardPriceSample'],
                      'Reference_Type': ['ReferencePrice'],
-                     'Reference_Volatility': ['ReferenceVol'],
+                     'Reference_Volatility': ['ReferenceVol', 'CommodityPriceVol'],
                      'Payoff_Currency': ['FxRate']}
 
     documentation = ('Energy', [
@@ -4513,8 +4687,8 @@ class EnergySingleOption(Deal):
             field['Payoff_Currency'], static_offsets, stochastic_offsets)
         field_index['Discount'] = get_discount_factor(
             field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-        field_index['ReferenceVol'] = get_forward_price_vol_factor(
-            forward_price_vol, static_offsets, stochastic_offsets, all_tenors)
+        field_index['Volatility'] = get_commoditiy_vol_factor(
+            field['Reference_Volatility'], static_offsets, stochastic_offsets, all_tenors)
         field_index['SettleCurrency'] = self.field['Payoff_Currency']
         field_index['Buy_Sell'] = 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0
         field_index['Option_Type'] = 1.0 if self.field['Option_Type'] == 'Call' else -1.0

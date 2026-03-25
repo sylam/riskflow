@@ -25,7 +25,7 @@ from xml.etree.ElementTree import ElementTree, Element, SubElement, iterparse, t
 
 # needed types
 from . import utils
-from .config import ModelParams, Context
+from .config import ModelParams, Config
 from .stochasticprocess import construct_calibration_config
 from .instruments import construct_instrument
 
@@ -97,7 +97,7 @@ def drawobj(obj):
             if isinstance(value, tuple):
                 buffer += ['.'.join(value)]
             elif isinstance(value, DateOffset):
-                buffer += [''.join(['%d%s' % (v, Context.reverse_offset[k]) for k, v in value.kwds.items()])]
+                buffer += [''.join(['%d%s' % (v, Config.reverse_offset[k]) for k, v in value.kwds.items()])]
             elif isinstance(value, float):
                 buffer += ['%.12g' % value]
             elif isinstance(value, Timestamp):
@@ -125,7 +125,7 @@ def drawobj(obj):
                 buffer += ['='.join([key, '.'.join(value)])]
             elif isinstance(value, DateOffset):
                 buffer += [
-                    '='.join([key, ''.join(['%d%s' % (v, Context.reverse_offset[k]) for k, v in value.kwds.items()])])]
+                    '='.join([key, ''.join(['%d%s' % (v, Config.reverse_offset[k]) for k, v in value.kwds.items()])])]
             elif isinstance(value, float):
                 buffer += ['='.join([key, '%.12g' % value])]
             elif isinstance(value, Timestamp):
@@ -136,7 +136,7 @@ def drawobj(obj):
     return ','.join(buffer)
 
 
-class AdaptivContext(Context):
+class AdaptivContext(Config):
     """
     Reads (parses) an Adaptiv Analytics compatible marketdata and deals file.
     Also writes out these files once the data has been modified.
@@ -397,7 +397,7 @@ class AdaptivContext(Context):
         '''
 
         def pushDate(strg, loc, toks):
-            return Timestamp('{0}-{1:02d}-{2:02d}'.format(toks[2], Context.month_lookup[toks[1]], int(toks[0])))
+            return Timestamp('{0}-{1:02d}-{2:02d}'.format(toks[2], Config.month_lookup[toks[1]], int(toks[0])))
 
         def pushInt(strg, loc, toks):
             return int(toks[0])
@@ -418,7 +418,7 @@ class AdaptivContext(Context):
             return dict({toks[0]: toks[1]})
 
         def pushSinglePeriod(strg, loc, toks):
-            return (Context.offset_lookup[toks[1]], toks[0])
+            return (Config.offset_lookup[toks[1]], toks[0])
 
         def pushPeriod(strg, loc, toks):
             ofs = dict(toks.asList())

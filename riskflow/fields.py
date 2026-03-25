@@ -192,7 +192,7 @@ mapping = {
             "CommodityPrice":
                 ["Spot", "Currency", "Interest_Rate"],
             "CommodityPriceVol":
-                ["Currency", "Surface"],
+                ["Surface_Type", "Surface", "Moneyness_Rule", "Delta_Surface", "Currency"],
             "CSForwardPriceModelParameters":
                 ["Sigma", "Alpha"],
             "ConvenienceYield":
@@ -208,7 +208,7 @@ mapping = {
                 ["Price_Index", "Seasonal_Adjustment", "Reference_Name", "Day_Count", "Accrual_Calendar", "Currency",
                  "Curve"],
             "FXVol":
-                ["Surface", "Moneyness_Rule"],
+                ["Surface_Type", "Surface", "Moneyness_Rule", "Delta_Surface"],
             "EquityPrice":
                 ["Issuer", "Respect_Default", "Jump_Level", "Currency", "Interest_Rate", "Spot"],
             "FxRate":
@@ -216,7 +216,7 @@ mapping = {
             "SurvivalProb":
                 ["Recovery_Rate", "Minimum_Recovery_Rate", "Issuer", "Curve"],
             "InterestRate":
-                ["Sub_Type", "Floor", "Day_Count", "Accrual_Calendar", "Currency", "Curve"],
+                ["Sub_Type", "Floor", "Day_Count", "Accrual_Calendar", "Currency", "Curve", "Near_Interpolation", "Near_Date"],
             "DiscountRate":
                 ["Interest_Rate"],
             "HullWhite2FactorModelParameters":
@@ -251,7 +251,7 @@ mapping = {
             'Day_Count': {'widget': 'Dropdown', 'description': 'Day Count', 'value': 'ACT_365',
                           'values': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360', 'ACT_ACT_ICMA']},
             'Surface_Type': {'widget': 'Dropdown', 'description': 'Surface Type', 'value': 'Explicit',
-                             'values': ['Explicit', 'SVI', 'Skew']},
+                             'values': ['Explicit', 'SVI', 'Skew', 'Malz']},
             'Moneyness_Rule': {'widget': 'Dropdown', 'description': 'Moneyness Rule', 'value': 'Sticky_Moneyness',
                                'values': ['Sticky_Strike', 'Sticky_Moneyness', 'Sticky_Delta']},
             'Domestic_Currency': {'widget': 'Text', 'description': 'Domestic Currency', 'value': ''},
@@ -278,6 +278,7 @@ mapping = {
             'Jump_Level': {'widget': 'Float', 'description': 'Jump Level', 'value': 0.0, 'obj': 'Percent'},
             'Last_Period_Start': {'widget': 'DatePicker', 'description': 'Last Period Start',
                                   'value': default['DatePicker']},
+            'Near_Date':{'widget': 'DatePicker', 'description': 'Near Date', 'value': default['DatePicker']},
             'Correlation': {'widget': 'Float', 'description': 'Correlation', 'value': 0},
             'Quanto_FX_Correlation': {'widget': 'Float', 'description': 'Quanto FX Correlation', 'value': 0},
             'Quanto_FX_Correlation_1': {'widget': 'Float', 'description': 'Quanto FX_Correlation 1', 'value': 0},
@@ -307,6 +308,7 @@ mapping = {
             'Priority': {'widget': 'Float', 'description': 'Priority', 'value': 3},
             'Publication_Period': {'widget': 'Dropdown', 'description': 'Publication Period', 'value': 'Monthly',
                                    'values': ['Monthly', 'Quarterly']},
+            'Near_Interpolation':{'widget': 'Text', 'description': 'Near Interpolation', 'value': ''},
             'Reference_Name': {'widget': 'Dropdown', 'description': 'Reference Name',
                                'value': 'IndexReferenceInterpolated3M',
                                'values': ['IndexReferenceInterpolated1M', 'IndexReferenceInterpolated2M',
@@ -319,6 +321,7 @@ mapping = {
             'Spot': {'widget': 'Float', 'description': 'Spot', 'value': 0},
             'Price': {'widget': 'Float', 'description': 'Price', 'value': 0},
             'Surface': {'widget': 'Three', 'description': 'Surface', 'value': default['Surface']},
+            'Delta_Surface': {'widget': 'Three', 'description': 'Delta_Surface', 'value': default['Surface']},
             'Space': {'widget': 'Three', 'description': 'Surface', 'value': default['Space']},
             'Sub_Type': {'widget': 'Text', 'description': 'Sub Type', 'value': ''}
         }
@@ -530,7 +533,7 @@ mapping = {
                                                   'QEDI_CustomAutoCallSwap_V2', 'EquitySwapletListDeal',
                                                   'EquityBarrierOption', 'EquityBarrierBinaryOption',
                                                   'EquityDiscreteExplicitAsianOption']),
-            'New Credit Derivative': ('default', ['DealDefaultSwap'])
+            'New Credit Derivative': ('default', ['DealDefaultSwap','CreditNthToDefault'])
         },
 
         # field groups
@@ -659,6 +662,10 @@ mapping = {
                                        'Recovery_Rate', 'Name', 'Buy_Sell', 'Amortisation', 'Calendars',
                                        'Accrual_Day_Count', 'Currency', 'Is_Digital', 'Discount_Rate', 'Effective_Date',
                                        'Maturity_Date', 'Digital_Recovery', 'Accrue_Fee', 'Principal'],
+            'CreditNthToDefault.Fields': ['Names', 'Currency', 'Discount_Rate', 'Effective_Date', 'Maturity_Date',
+                                          'Correlation', 'Calendars', 'Pay_Frequency', 'Pay_Rate', 'Max_Defaults',
+                                          'Defaults_So_Far', 'Buy_Sell', 'Principal',  'Accrual_Day_Count',
+                                          'Amortisation'],
             'CFFixedListDeal.Fields': ['Currency', 'Discount_Rate', 'Buy_Sell', 'Description',
                                        'Fixed_Simple_Cashflows'],
             'SwapBasisDeal.Fields': ['Maturity_Date', 'Principal_Exchange', 'Amortisation', 'Currency', 'Discount_Rate',
@@ -753,6 +760,8 @@ mapping = {
                 ['Admin', 'CapDeal.Fields'],
             'DealDefaultSwap':
                 ['Admin', 'DealDefaultSwap.Fields'],
+            'CreditNthToDefault':
+                ['Admin', 'CreditNthToDefault.Fields'],
             'EquityDeal':
                 ['Admin', 'EquityDeal.Fields'],
             'EquitySwapLeg':
@@ -886,6 +895,7 @@ mapping = {
             'BarrierMemory': {'widget': 'Text', 'description': 'BarrierMemory', 'value': ''},
             'InvertedTarget': {'widget': 'Text', 'description': 'InvertedTarget', 'value': ''},
             'LeverageNotional': {'widget': 'Float', 'description': 'LeverageNotional', 'value': 0},
+            'Correlation': {'widget': 'Float', 'description': 'Correlation', 'value': 0},
             'PivotRate': {'widget': 'Float', 'description': 'PivotRate', 'value': 0},
             'PivotRateStrike': {'widget': 'Text', 'description': 'PivotRateStrike', 'value': ''},
             'SettleInCurr2': {'widget': 'Text', 'description': 'SettleInCurr2', 'value': ''},
@@ -906,6 +916,14 @@ mapping = {
                                 ['Fixing Date', 'Settlement Date','Value']
                             },
             'Months_Lag': {'widget': 'Integer', 'description': 'Months Lag', 'value': 1},
+            'Names': {'widget': 'Table', 'description': 'Names', 'value': 'null',
+                                'sub_types':
+                                    [{}],
+                                'obj':
+                                    ['Text'],
+                                'col_names':
+                                    ['Name']
+                                },
             'Quarters_Lag': {'widget': 'Integer', 'description': 'Quarters Lag', 'value': 0},
             'Quarter_Reference_Month': {'widget': 'Integer', 'description': 'Quarter Reference Month', 'value': 1},
             'Reference_Day': {'widget': 'Integer', 'description': 'Reference Day', 'value': 1},
@@ -1324,7 +1342,8 @@ mapping = {
             'Receive_Frequency': {'widget': 'Text', 'description': 'Receive Frequency', 'value': '3M', 'obj': 'Period'},
             'Object': {'widget': 'Text', 'description': 'Object', 'value': ''},
             'Pay_Compounding_Method': {'widget': 'Dropdown', 'description': 'Pay Compounding Method', 'value': 'None',
-                                       'values': ['None', 'Include_Margin', 'Flat', 'Exclude_Margin', 'Exponential']},
+                                       'values': ['None', 'OIS', 'Include_Margin', 'Flat',
+                                                  'Exclude_Margin', 'Exponential']},
             'Payment_Timing': {'widget': 'Dropdown', 'description': 'Payment Timing', 'value': 'End',
                                'values': ['End', 'Begin', 'Discounted']},
             'Pay_Frequency': {'widget': 'Text', 'description': 'Pay Frequency', 'value': '3M', 'obj': 'Period'},
@@ -1487,7 +1506,7 @@ mapping = {
                                                 'value': default['DatePicker']},
             'Receive_Compounding_Method': {'widget': 'Dropdown', 'description': 'Receive Compounding Method',
                                            'value': 'None',
-                                           'values': ['None', 'Include_Margin', 'Flat', 'Exclude_Margin',
+                                           'values': ['None', 'OIS', 'Include_Margin', 'Flat', 'Exclude_Margin',
                                                       'Exponential']},
             'Rate_Calendars': {'widget': 'Text', 'description': 'Rate Calendars', 'value': ''},
             'Pay_Index_Calendars': {'widget': 'Text', 'description': 'Pay Index Calendars', 'value': ''},
@@ -1510,7 +1529,8 @@ mapping = {
                                         'obj': 'Tuple'},  # tuple
             'MtM': {'widget': 'Text', 'description': 'MtM', 'value': ''},
             'Compounding_Method': {'widget': 'Dropdown', 'description': 'Compounding Method', 'value': 'None',
-                                   'values': ['None', 'Include_Margin', 'Flat', 'Exclude_Margin', 'Exponential']},
+                                   'values': ['None', 'OIS', 'Include_Margin',
+                                              'Flat', 'Exclude_Margin', 'Exponential']},
             'Pay_Interest_Rate_Volatility': {'widget': 'Text', 'description': 'Pay Interest Rate Volatility',
                                              'value': '', 'obj': 'Tuple'},  # tuple
             'Pay_Currency': {'widget': 'Text', 'description': 'Pay Currency', 'value': ''},  # tuple
@@ -1684,6 +1704,8 @@ mapping = {
             'Description': {'widget': 'Text', 'description': 'Description', 'value': ''},
             'Tags': {'widget': 'Text', 'description': 'Tags', 'value': ''},
             'Receive_Index_Offset': {'widget': 'Integer', 'description': 'Receive Index Offset', 'value': 0},
+            'Max_Defaults': {'widget': 'Integer', 'description': 'Max Defaults', 'value': 3},
+            'Defaults_So_Far': {'widget': 'Integer', 'description': 'Defaults So Far', 'value': 0},
             'Receive_Payment_Calendars': {'widget': 'Text', 'description': 'Receive Payment Calendars', 'value': ''},
             'Forecast_Rate_Cap_Volatility': {'widget': 'Text', 'description': 'Forecast Rate Cap Volatility',
                                              'value': '', 'obj': 'Tuple'},  # tuple

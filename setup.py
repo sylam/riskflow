@@ -23,7 +23,7 @@ setup(
     long_description_content_type="text/markdown",
     python_requires='>=3.6',
     install_requires=['numpy>=1.16.1', 'scipy>=1.2.2', 'pandas>=1.0', 'matplotlib>=3.0', 'torch>=2.0',
-                      'python-markdown-math>=0.6'],
+                      'python-markdown-math>=0.6', 'sortedcontainers>2.0'],
     extras_require={
         'interactive': ['jupyter'],
     },

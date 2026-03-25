@@ -393,7 +393,7 @@ class CSForwardPriceModelParameters(object):
             return (1.0 - np.exp(-a * t)) / a if a != 0 else t
 
         def V(sigma, alpha, T, S):
-            return sigma * sigma * np.exp(-2.0 * alpha * S) * B(2.0 * alpha, T)
+            return sigma * sigma * np.exp(-2.0 * alpha * S) * B(-2.0 * alpha, T)
 
         def calc_error(x, options):
             sigma, alpha = x
