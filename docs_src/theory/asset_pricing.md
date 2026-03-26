@@ -203,3 +203,75 @@ $$|\rho| \leq 1$$
 ### Explicit Surfaces
 
 These are moneyness surfaces (defined as either Spot over strike for equities or Forward over strike for FX). These moneyness surfaces must have the moneyness axis strictly greater than 1.0. Volatility is then linearly interpolated across moneyness.
+
+### Malz (Delta-Quoted) Surfaces
+
+FX volatility surfaces are commonly quoted in terms of the option *delta* rather than strike or
+log-moneyness. The Malz convention uses the **percentage-of-foreign-forward delta** to label
+each vol quote. RiskFlow converts this delta-quoted surface into an explicit
+log-moneyness surface on initialisation so that the generic `Explicit` pricing path can be
+reused without modification.
+
+#### Delta Convention
+
+Define $x = \ln(F/K)$ as the log-moneyness (positive for ITM calls, negative for OTM calls).
+Under the lognormal model, the percentage-of-foreign-forward delta for a **call** is
+
+$$\Delta_{\text{call}}(x,\sigma,T) = \frac{K}{F}\,\mathcal{N}(d_2), \qquad
+  d_2 = \frac{x + \tfrac{1}{2}\sigma^2 T}{\sigma\sqrt{T}} - \sigma\sqrt{T}
+       = \frac{x - \tfrac{1}{2}\sigma^2 T}{\sigma\sqrt{T}}$$
+
+and for a **put**
+
+$$\Delta_{\text{put}}(x,\sigma,T) = -\frac{K}{F}\,\mathcal{N}(-d_2)$$
+
+Note the $K/F = e^{-x}$ prefactor distinguishes percentage-of-foreign from the more common
+spot delta.
+
+#### ATM Correction
+
+Vendor surfaces are typically delivered with the ATM node labelled as $\Delta = \pm 0.5$. However,
+the true delta-neutral ATM strike satisfies $\Delta_{\text{call}} = \Delta_{\text{put}}$, which
+under this convention gives
+
+$$\delta_{\text{ATM}} = \tfrac{1}{2}\exp\!\left(-\tfrac{1}{2}\sigma_{\text{ATM}}^2 T\right)$$
+
+rather than exactly $0.5$. The implementation replaces the vendor $\pm 0.5$ nodes with
+the corrected $\pm\delta_{\text{ATM}}$ before any interpolation is performed.
+
+#### Self-Consistency Inversion
+
+For a given log-moneyness $x$ and expiry $T$, the implied volatility $\sigma^*(x,T)$ must satisfy
+the fixed-point condition
+
+$$\Delta\bigl(x,\,\sigma^*(x,T),\,T\bigr) = \delta^*,\qquad
+  \sigma^*(\delta^*, T) = \sigma_{\text{interp}}(\delta^*)$$
+
+where $\sigma_{\text{interp}}$ is the piecewise-linear interpolant of the vendor delta-vol quotes.
+This is a scalar nonlinear equation in $\delta^*$ which is solved with Brent's method, separately
+for calls ($x \le x_{\text{ATM}}$) and puts ($x > x_{\text{ATM}}$), bracketed by the available
+wing deltas.
+
+The ATM dividing point in log-moneyness is
+
+$$x_{\text{ATM}} = \tfrac{1}{2}\sigma_{\text{ATM}}^2 T$$
+
+#### Total-Variance Grid and Adaptive Refinement
+
+To avoid repeated root-finding at runtime, the inversion is performed once at initialisation time
+on a grid of log-moneyness nodes and stored as **total variance**
+
+$$w(x,T) = \sigma^*(x,T)^2\,T$$
+
+The initial grid $x \in \{-0.5,\,-0.25,\,-0.1,\,0.0,\,0.1,\,0.25,\,0.5\}$ is refined adaptively
+as follows. For each consecutive pair $(x_l, x_r)$ the midpoint $x_m = (x_l+x_r)/2$ is tested:
+
+1. Compute the exact implied vol $\sigma^*(x_m, T)$ via the inversion above.
+2. Interpolate the stored total-variance grid linearly in $x$ at $x_m$ and convert back to vol:
+   $\hat\sigma = \sqrt{w_{\text{interp}}(x_m)/T}$.
+3. If $|\hat\sigma - \sigma^*(x_m,T)| > \varepsilon$ (default $\varepsilon = 10^{-4}$, i.e. 1 bp),
+   insert $x_m$ into the grid with the exact value $w(x_m,T) = \sigma^{*2}(x_m,T)\,T$.
+4. Repeat until all midpoint errors are within tolerance.
+
+The resulting `(x, T, \sigma)` triples are stored as an `Explicit` log-moneyness surface and
+the remainder of the pricing pipeline is unchanged.
