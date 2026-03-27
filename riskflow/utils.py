@@ -418,7 +418,8 @@ class Interpolation(object):
         i00, i01, i10, i11 = Interpolation.calculate_indices(t_index, t_index_next, i1, i2)
         tensor = self.indexed_tensor
         kind, tnr_min, tnr_max = tenor_data
-        mult = tnr if time_factor else 1.0
+        tenors = tnr.unsqueeze(-1)
+        mult = tenors if time_factor else 1.0
 
         if kind.startswith("Hermite"):
             g, c = self.interp_params
@@ -438,9 +439,9 @@ class Interpolation(object):
                 val = (1 - alpha) * val + alpha * val_t1
 
         if kind.endswith('RT'):
-            mult = mult / tnr.clamp(tnr_min, tnr_max)
+            mult = mult / tenors.clamp(tnr_min, tnr_max)
 
-        return val * mult.unsqueeze(-1)
+        return val * mult
 
 
 class SegmentedInterpolation(Interpolation):
