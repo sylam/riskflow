@@ -602,7 +602,7 @@ class Factor3D(object):
                 for vol in self.vols.reshape(self.tenor.size, -1)]
             interp_vols = []
             for tenor in tenors:
-                index = np.clip(self.moneyness.searchsorted(
+                index = np.clip(self.tenor.searchsorted(
                     tenor[self.TENOR_INDEX], side='right') - 1, 0, self.tenor.size - 1)
                 index_p1 = np.clip(index + 1, 0, self.tenor.size - 1)
                 val = np.interp(
@@ -713,6 +713,21 @@ class CommodityPrice(EquityPrice):
 
     def __init__(self, param):
         super(CommodityPrice, self).__init__(param)
+
+
+class BasisCarry(Factor0D):
+    """
+    Represents an annualised carry rate for a commodity or asset basis
+    (e.g. roll yield, funding spread).  Used as the input factor for
+    RegimeSwitchingOU2FactorModel.  The fast-carry state x_t is exposed
+    as the spot value; the slow-carry state y_0 is stored as a parameter.
+    """
+    field_desc = ('Energy',
+                  ['- **Spot**: Float. Initial annualised carry rate $x_0$.',
+                   '- **Initial_Y**: Float. Initial slow-carry-pressure state $y_0$ (default 0).'])
+
+    def __init__(self, param):
+        super(BasisCarry, self).__init__(param)
 
 
 class ForwardPriceSample(Factor0D):

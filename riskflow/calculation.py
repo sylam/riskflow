@@ -182,6 +182,9 @@ class DealStructure(object):
             logging.root.name = self.obj.Instrument.field.get('Reference', 'root')
             try:
                 accum = self.obj.Instrument.post_process(accum, shared, time_grid, self.obj, self.dependencies)
+            except RuntimeError as e:
+                logging.error('Runtime error Deal skipped - {}'.format(e.args))
+                raise
             except Exception as e:
                 logging.critical('Deal skipped - {}'.format(e.args))
 

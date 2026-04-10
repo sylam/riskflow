@@ -251,7 +251,7 @@ mapping = {
             'Day_Count': {'widget': 'Dropdown', 'description': 'Day Count', 'value': 'ACT_365',
                           'values': ['ACT_365', 'ACT_360', 'ACT_365_ISDA', '_30_360', '_30E_360', 'ACT_ACT_ICMA']},
             'Surface_Type': {'widget': 'Dropdown', 'description': 'Surface Type', 'value': 'Explicit',
-                             'values': ['Explicit', 'SVI', 'Skew', 'Malz']},
+                             'values': ['Explicit', 'SVI', 'Skew', 'Malz', 'Relative_Forward']},
             'Moneyness_Rule': {'widget': 'Dropdown', 'description': 'Moneyness Rule', 'value': 'Sticky_Moneyness',
                                'values': ['Sticky_Strike', 'Sticky_Moneyness', 'Sticky_Delta']},
             'Domestic_Currency': {'widget': 'Text', 'description': 'Domestic Currency', 'value': ''},
@@ -523,8 +523,9 @@ mapping = {
                             'FloorDeal', 'SwapBasisDeal', 'SwapInterestDeal', 'SwaptionDeal',
                             'YieldInflationCashflowListDeal']),
             'New FX Derivative': (
-                'default', ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'SwapCurrencyDeal',
-                            'FXDiscreteExplicitAsianOption', 'FXOneTouchOption', 'FXBarrierOption', 'FXSwapDeal'
+                'default', ['FXNonDeliverableForward', 'FXForwardDeal', 'FXOptionDeal', 'FXBinaryOption',
+                            'SwapCurrencyDeal', 'FXDiscreteExplicitAsianOption', 'FXOneTouchOption',
+                            'FXBarrierOption', 'FXSwapDeal'
                             'MtMCrossCurrencySwapDeal', 'FXTARFOptionDeal']),
             'New Energy Derivative': (
                 'default', ['FloatingEnergyDeal', 'FixedEnergyDeal', 'EnergySingleOption', 'CommodityForwardDeal']),
@@ -629,6 +630,9 @@ mapping = {
             'FXOptionDeal.Fields': ['Underlying_Amount', 'Settlement_Style', 'Strike_Price', 'Underlying_Currency',
                                     'Buy_Sell', 'Option_Type', 'Option_Style', 'Expiry_Date', 'FX_Volatility',
                                     'Forward_Price_Date', 'Discount_Rate', 'Option_On_Forward', 'Currency'],
+            'FXBinaryOption.Fields': ['Cash_Payoff', 'Settlement_Style', 'Strike_Price', 'Underlying_Currency',
+                                     'Buy_Sell', 'Option_Type', 'Expiry_Date', 'FX_Volatility',
+                                     'Discount_Rate', 'Currency'],
             'FXDiscreteExplicitAsianOption.Fields': ['Currency', 'Discount_Rate', 'Expiry_Date', 'FX_Volatility',
                                                      'Option_Type', 'Buy_Sell', 'Underlying_Currency', 'Strike_Price',
                                                      'Is_Digital', 'Underlying_Amount', 'Sampling_Data'],
@@ -684,6 +688,7 @@ mapping = {
                                   'Pay_Timing', 'Pay_Index_Offset', 'Pay_Rate', 'Pay_Discount_Rate_Volatility',
                                   'Pay_Accrual_Calendars', 'Pay_Index_Calendars', 'Pay_Payment_Calendars'],
             'Admin': ['Object', 'Reference', 'Tags', 'MtM'],
+            'FXAdmin': ['Trade_Date', 'Delivery_Date', 'Sales_Margin', 'Structure_Reference'],
             'DepositDeal.Fields': ['Currency', 'Discount_Rate', 'Accrual_Calendars', 'Payment_Calendars',
                                    'Accrual_Day_Count', 'First_Coupon_Date', 'Penultimate_Coupon_Date', 'Amortisation',
                                    'Effective_Date', 'Maturity_Date', 'Payment_Frequency', 'Interest_Frequency',
@@ -697,7 +702,7 @@ mapping = {
             'FloatingEnergyDeal.Fields': ['Currency', 'Discount_Rate', 'Sampling_Type', 'FX_Sampling_Type',
                                           'Average_FX', 'Payer_Receiver', 'Energy_Cashflows', 'Reference_Type',
                                           'Reference_Volatility', 'Payoff_Currency'],
-            'FixedEnergyDeal.Fields': ['Currency', 'Discount_Rate', 'Payer_Receiver', 'Energy_Fixed_Cashflows'],
+            'FixedEnergyDeal.Fields': ['Currency', 'Payoff_Currency', 'Discount_Rate', 'Payer_Receiver', 'Energy_Fixed_Cashflows'],
             'EnergySingleOption.Fields': ['Currency', 'Discount_Rate', 'Buy_Sell', 'Sampling_Type', 'FX_Sampling_Type',
                                           'Average_FX', 'Settlement_Date', 'Period_Start', 'Period_End', 'Strike',
                                           'Realized_Average', 'Option_Type', 'FX_Period_Start', 'FX_Period_End',
@@ -795,17 +800,19 @@ mapping = {
             'FXForwardDeal':
                 ['Admin', 'FXForwardDeal.Fields'],
             'FXTARFOptionDeal':
-                ['Admin', 'FXTARFOptionDeal.Fields'],
+                ['Admin', 'FXAdmin', 'FXTARFOptionDeal.Fields'],
             'FXNonDeliverableForward':
                 ['Admin', 'FXNonDeliverableForward.Fields'],
             'FXOptionDeal':
-                ['Admin', 'FXOptionDeal.Fields'],
+                ['Admin', 'FXAdmin', 'FXOptionDeal.Fields'],
+            'FXBinaryOption':
+                ['Admin', 'FXAdmin', 'FXBinaryOption.Fields'],
             'FXOneTouchOption':
-                ['Admin', 'FXOneTouchOption.Fields'],
+                ['Admin', 'FXAdmin', 'FXOneTouchOption.Fields'],
             'FXBarrierOption':
-                ['Admin', 'FXBarrierOption.Fields'],
+                ['Admin', 'FXAdmin', 'FXBarrierOption.Fields'],
             'FXDiscreteExplicitAsianOption':
-                ['Admin', 'FXDiscreteExplicitAsianOption.Fields'],
+                ['Admin', 'FXAdmin', 'FXDiscreteExplicitAsianOption.Fields'],
             'FXSwapDeal':
                 ['Admin', 'FXSwapDeal.Fields'],
             'FloorDeal':
@@ -825,6 +832,12 @@ mapping = {
         },
         # instrument fields
         'fields': {
+            'Trade_Date': {
+                'widget': 'DatePicker', 'description': 'Trade Date', 'value': default['DatePicker']},
+            'Delivery_Date': {
+                'widget': 'DatePicker', 'description': 'Delivery Date', 'value': default['DatePicker']},
+            'Sales_Margin': {'widget': 'Float', 'description': 'Sales Margin', 'value': 0},
+            'Structure_Reference': {'widget': 'Text', 'description': 'Structure Reference', 'value': ''},
             'Near_Settlement_Date': {
                 'widget': 'DatePicker', 'description': 'Near Settlement Date', 'value': default['DatePicker']},
             'Far_Settlement_Date': {

@@ -756,21 +756,21 @@ class Config(object):
             self.params = market_data
             self.version = data['Version']
 
-        elif 'Deals' in data:
-            self.deals = data
+        if 'Deals' in data:
+            self.deals = data['Deals']
 
-        elif 'CalibrationConfig' in data:
+        if 'CalibrationConfig' in data:
             # store the calibration config
-            self.calibrations = data
+            self.calibrations = data['CalibrationConfig']
 
             # load the archive file - must be a tab separated file
-            mkt_data_details = self.calibrations['CalibrationConfig']['MarketDataArchiveFile']
+            mkt_data_details = self.calibrations['MarketDataArchiveFile']
             self.archive = pd.read_csv(mkt_data_details['name'], skiprows=mkt_data_details['skiprows'],
                                        sep='\t', index_col=mkt_data_details['index_column'])
             # load the calibration
-            self.calibration_process_map = dict((calibration['PriceModel'], construct_calibration_config(calibration))
-                                                for calibration in
-                                                self.calibrations['CalibrationConfig']['Calibrations'])
+            self.calibration_process_map = {k: construct_calibration_config(
+                k, v) for k,v in self.calibrations['Calibrations'].items()}
+
             # store a lookup to all columns
             self.archive_columns = {}
 
@@ -848,6 +848,14 @@ class Config(object):
     def write_calibration_json(self, json_filename):
         with open(json_filename, 'wt') as f:
             f.write(json.dumps(self.calibrations, separators=(',', ':'), cls=CustomJsonEncoder))
+
+    def write_ada(self):
+        r, c = self.archive.shape
+
+        with open(self.calibrations['MarketDataArchiveFile']['name'], 'wt') as f:
+            f.writelines(['First two lines must be comments.\n', '#Columns\t#Rows\n', '{}\t{}\n'.format(c, r)])
+
+        self.archive.to_csv(self.calibrations['MarketDataArchiveFile']['name'], sep='\t', mode='a')
 
 
 if __name__ == '__main__':

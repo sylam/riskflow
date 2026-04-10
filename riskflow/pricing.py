@@ -55,6 +55,8 @@ def calc_moneyness(strike, spot, forward, deal_data, use_forward=False, invert_m
         # so we just return the strike here (we know the moneyness rule and will do the rest later)
         # otherwise, (Sticky_Moneyness) - we return log of strike over forward
         return strike if subtype[1]=='Sticky_Strike' else torch.log(strike/forward)
+    elif subtype[0] == 'Relative_Forward':
+        return (strike - forward)/forward
     elif subtype[0] == 'Malz':
         forward_or_spot = forward if use_forward else spot
         return torch.log(strike / forward_or_spot if invert_moneyness else forward_or_spot / strike)
@@ -2238,7 +2240,8 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
                 log_rt = torch.log1p(all_resets * accrual.view(1, -1, 1))
                 reset_split = torch.as_tensor(
                     reset_per_cashflows[reset_per_cashflows > 0], device=shared.one.device, dtype=torch.long)
-                sum_log = torch.segment_reduce(log_rt, reduce="sum", lengths=reset_split.reshape(1, -1), axis=1)
+                lengths = reset_split.unsqueeze(0).expand(log_rt.shape[0], -1)
+                sum_log = torch.segment_reduce(log_rt, reduce="sum", lengths=lengths, axis=1)
                 sum_acc = torch.segment_reduce(accrual, reduce="sum", lengths=reset_split, axis=0)
                 all_resets = torch.expm1(sum_log)/sum_acc.view(1, -1, 1)
 
@@ -2336,6 +2339,14 @@ def pv_fixed_cashflows(shared, time_grid, deal_data, ignore_fixed_rate=False, se
 
         # discount rates
         discount_rates = utils.calc_discount_rate(discount_block, future_pmts, shared)
+
+        if 'SettleFX' in factor_dep:
+            discountfx = utils.calc_fx_forward(
+                factor_dep['SettleFX'], factor_dep['Currency'],
+                cash_pmts, discount_block.time_grid, shared)
+        else:
+            discountfx = shared.one
+
         # is this a forward?
         if settlement_amt:
             settlement = settlement_amt * torch.squeeze(utils.calc_discount_rate(discount_block, (
@@ -2379,7 +2390,7 @@ def pv_fixed_cashflows(shared, time_grid, deal_data, ignore_fixed_rate=False, se
 
         # add to the mtm
         mtm_list.append(torch.sum(
-            discount_rates * factor_dep[payment_key].reshape(1, -1, 1), dim=1) - settlement)
+            discountfx * discount_rates * factor_dep[payment_key].reshape(1, -1, 1), dim=1) - settlement)
 
         # settle any cashflows
         if settle_cash:
@@ -2578,13 +2589,10 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
 
         # discount rates
         discount_rates = utils.calc_discount_rate(discount_block, future_pmts, shared)
-        # check if the currency/discount rate is different to the payout currency
-        if 'Currency' in factor_dep:
-            discountfx = utils.calc_fx_forward(
-                factor_dep['ForwardFX'], factor_dep['Currency'],
-                cash_pmts, discount_block.time_grid, shared)
-        else:
-            discountfx = shared.one
+        # fx adjustment when payoff currency differs from deal currency
+        discountfx = utils.calc_fx_forward(
+            factor_dep['ForwardFX'], factor_dep['Currency'],
+            cash_pmts, discount_block.time_grid, shared)
 
         # we need to split the forward block further
         forward_blocks = forward_block.split_counts(
@@ -3030,14 +3038,8 @@ def pv_fixed_leg(shared, time_grid, deal_data):
 @utils.log_exception
 def pv_energy_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-
-    if 'Currency' in deal_data.Factor_dep:
-        deal_ccy = deal_data.Factor_dep['Currency'][0]
-    else:
-        deal_ccy = deal_data.Factor_dep['Payoff_Currency']
-
     FX_rep = utils.calc_fx_cross(
-        deal_ccy, shared.Report_Currency, deal_time, shared)
+        deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
 
     mtm = pv_energy_cashflows(shared, time_grid, deal_data) * FX_rep
 

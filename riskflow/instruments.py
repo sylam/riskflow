@@ -4235,6 +4235,30 @@ class FXEuropeanOption(FXOptionDeal):
         super(FXEuropeanOption, self).__init__(params, valuation_options)
 
 
+class FXBinaryOption(FXOptionDeal):
+    documentation = (
+        'Fx And Equity', ['A path independent vanilla FX binary (digital) option described'
+                          ' [here](./definitions.md#european-options). Pays a fixed **Cash_Payoff**'
+                          ' amount in **Currency** if the option expires in-the-money.'])
+
+    def generate(self, shared, time_grid, deal_data):
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        fx_rep = utils.calc_fx_cross(
+            deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
+        forward = utils.calc_fx_forward(
+            deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
+            deal_data.Factor_dep['Expiry'], deal_time, shared)
+        moneyness = pricing.calc_moneyness(
+            deal_data.Factor_dep['Strike_Price'], forward, forward,
+            deal_data, use_forward=True, invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
+
+        mtm = pricing.pv_european_option(
+            shared, time_grid, deal_data, self.field['Cash_Payoff'], moneyness, forward,
+            binary=True) * fx_rep
+
+        return mtm
+
+
 class CreditNthToDefault(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
@@ -4547,10 +4571,8 @@ class FloatingEnergyDeal(Deal):
             base_date, time_grid, -1.0 if self.field['Payer_Receiver'] == 'Payer' else 1.0,
             self.field['Payments'], reference_factor, forward_sample, fx_sample, calendars)
 
-        if field['Payoff_Currency'] != field['Currency']:
-            # different discounting - need to convert from Payoff_Currency to Currency
-            field_index['Currency'] = get_fx_and_zero_rate_factor(
-                field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+        field_index['Currency'] = get_fx_and_zero_rate_factor(
+            field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         field_index['SettleCurrency'] = self.field['Payoff_Currency']
 
@@ -4563,7 +4585,8 @@ class FloatingEnergyDeal(Deal):
 class FixedEnergyDeal(Deal):
     # dependent price factors for this instrument
     factor_fields = {'Currency': ['FxRate'],
-                     'Discount_Rate': ['DiscountRate']}
+                     'Discount_Rate': ['DiscountRate'],
+                     'Payoff_Currency': ['FxRate']}
 
     documentation = ('Energy', [
         'The time $t$ value of a fixed energy cashflow paid at $T$ indexed to volume $V$ of energy at a fixed price $K$ is',
@@ -4577,21 +4600,29 @@ class FixedEnergyDeal(Deal):
     def reset(self, calendars):
         super(FixedEnergyDeal, self).reset()
         self.paydates = set([x['Payment_Date'] for x in self.field['Payments']['Items']])
-        self.add_reval_dates(self.paydates, self.field['Currency'])
+        self.add_reval_dates(
+            self.paydates,
+            self.field['Payoff_Currency'] if self.field.get('Payoff_Currency') else self.field['Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
         field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
+        field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency']) if self.field.get(
+            'Payoff_Currency') else field['Currency']
 
-        field_index = {'SettleCurrency': self.field['Currency'],
-                       'Currency': get_fx_and_zero_rate_factor(
-                           field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+        field_index = {'SettleCurrency': self.field.get('Payoff_Currency') or self.field['Currency'],                       
                        'Discount': get_discount_factor(
                            field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+                       'Currency': get_fx_and_zero_rate_factor(
+                           field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Cashflows': utils.make_energy_fixed_cashflows(
                            base_date, -1.0 if self.field['Payer_Receiver'] == 'Payer' else 1.0, self.field['Payments'])}
+
+        if field['Payoff_Currency'] != field['Currency']:
+            field_index['SettleFX'] = get_fx_and_zero_rate_factor(
+                field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
 
         return field_index
 

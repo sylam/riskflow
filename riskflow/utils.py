@@ -490,7 +490,7 @@ class SegmentedInterpolation(Interpolation):
 
         cuttoff = tenor_data[0][0][1]
         # this only works for 2 segments - we check for this earlier so it should be fine
-        return torch.where((i2<cuttoff).unsqueeze(-1), results[0], results[1])
+        return torch.where((i2<=cuttoff).unsqueeze(-1), results[0], results[1])
 
 
 class CurveTenor(object):
