@@ -381,9 +381,9 @@ class Calculation(object):
 
 class CMC_State(utils.Calculation_State):
     def __init__(self, cholesky, static_buffer, batch_size, one, mcmc_sims, report_currency,
-                 seed, job_id, num_jobs, scale_survival=False, nomodel='Constant', keep_mtm=False):
+                 seed, job_id, num_jobs, scale_survival=False, nomodel='Constant', keep_tensor=False):
         super(CMC_State, self).__init__(
-            static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size)
+            static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size, keep_tensor=keep_tensor)
         # these are tensors
         self.t_PreCalc = {}
         self.t_cholesky = cholesky
@@ -399,7 +399,6 @@ class CMC_State(utils.Calculation_State):
         # needed if we are running across multiple gpu's
         self.job_id = job_id
         self.num_jobs = num_jobs
-        self.keep_mtm = keep_mtm
         # do we need to scale the mtm by the survival probability in the final answer?
         self.scale_survival = scale_survival
 
@@ -911,7 +910,7 @@ class Credit_Monte_Carlo(Calculation):
             self.get_cholesky_decomp(), self.static_var, self.batch_size,
             torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
                 utils.check_rate_name(reporting_currency), self.static_factors, self.stoch_factors),
-            seed, job_id, num_jobs, scale_by_survival, keep_mtm=self.params.get('Keep_MtM', 'No')=='Yes')
+            seed, job_id, num_jobs, scale_by_survival, keep_tensor=self.params.get('Keep_Tensor', 'No')=='Yes')
 
         return shared_mem
 
@@ -1369,7 +1368,8 @@ class Credit_Monte_Carlo(Calculation):
 
 class Base_Reval_State(utils.Calculation_State):
     def __init__(self, static_buffer, one, mcmc_sims, report_currency, calc_greeks, gamma, nomodel='Constant'):
-        super(Base_Reval_State, self).__init__(static_buffer, one, mcmc_sims, report_currency, nomodel, 1)
+        super(Base_Reval_State, self).__init__(
+            static_buffer, one, mcmc_sims, report_currency, nomodel, 1, False)
         self.calc_greeks = calc_greeks
         self.gamma = gamma
 
@@ -1810,7 +1810,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         self.numscenarios = self.batch_size * params['Simulation_Batches']
         self.params = params
         # keep the mtm
-        self.params['Keep_MtM'] = 'Yes'
+        self.params['Keep_Tensor'] = 'Yes'
 
         logging.root.name = self.config.deals['Attributes'].get('Reference', self.config.file_ref)
         self.calc_stats['Batch_Size'] = self.batch_size

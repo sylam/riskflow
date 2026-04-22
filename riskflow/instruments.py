@@ -4736,10 +4736,10 @@ class FloatingEnergyDeal(Deal):
             'Reference_Type': utils.check_rate_name(self.field['Reference_Type'])
         }
 
+        payoff_currency = self.field['Payoff_Currency' if 'Payoff_Currency' in self.field else 'Currency']
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
-        field['Payoff_Currency'] = utils.check_rate_name(self.field['Payoff_Currency']) if self.field[
-            'Payoff_Currency'] else field['Currency']
+        field['Payoff_Currency'] = utils.check_rate_name(payoff_currency)
 
         field_index = {}
         reference_factor, forward_factor = get_reference_factor_objects(field['Reference_Type'], all_factors)
@@ -4760,7 +4760,7 @@ class FloatingEnergyDeal(Deal):
         field_index['Currency'] = get_fx_and_zero_rate_factor(
             field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
 
-        field_index['SettleCurrency'] = field_index['CashFX'][0]
+        field_index['SettleCurrency'] = payoff_currency
 
         return field_index
 

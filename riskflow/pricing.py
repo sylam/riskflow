@@ -188,7 +188,7 @@ def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
     if deal_data.Calc_res is not None:
         shared.save_results(deal_data.Calc_res, {'Value': mtm})
         # add this as a tensor if we need to
-        if shared.keep_mtm:
+        if shared.keep_tensor:
             deal_data.Calc_res['tensor'] = mtm
 
     if mtm.shape != (1, 1) and mtm.shape[0] < time_grid.mtm_time_grid.size:

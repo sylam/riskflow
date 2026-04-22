@@ -554,7 +554,7 @@ class Calculation_State(object):
     """
 
     def __init__(self, static_buffer, unit, mcmc_sims, report_currency: List[Tuple[bool, int]],
-                 nomodel: str, simulation_batch: int):
+                 nomodel: str, simulation_batch: int, keep_tensor: bool):
         # these are tensors
         self.t_Buffer = {}
         self.t_Static_Buffer = static_buffer
@@ -567,6 +567,8 @@ class Calculation_State(object):
         # these are shared parameter states
         self.riskneutral = nomodel == 'RiskNeutral'
         self.MCMC_sims = mcmc_sims
+        # keep individual calculation results per dependency?
+        self.keep_tensor = keep_tensor
 
 
 # often we need a numpy array and its tensor equivalent at the same time
