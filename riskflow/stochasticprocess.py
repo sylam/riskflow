@@ -727,10 +727,12 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
 
         # get the deltas
         self.delta_KtT = shared.one.new_tensor(
-            np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid_years) * self.K))))
+            np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid_years) * self.K)))
+        ).reshape(-1, 1)
 
         self.delta_HtT = shared.one.new_tensor(np.hstack(
-            (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid_years) * self.H))))
+            (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid_years) * self.H)))
+        ).reshape(-1, 1)
 
         delta_var = np.diff(np.exp(-2.0 * alpha * time_grid_years) * self.J)
         if delta_var.size:
@@ -749,7 +751,7 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
 
     def generate(self, shared_mem):
         f1 = (shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon] *
-              self.delta_vol - self.delta_KtT[0] + self.delta_HtT[0]).cumsum(axis=0)
+              self.delta_vol - self.delta_KtT + self.delta_HtT).cumsum(axis=0)
 
         stoch_component = self.BtT * torch.unsqueeze(f1, dim=1)
         return (self.fwd_component + stoch_component) / self.factor_tenor
@@ -966,98 +968,6 @@ class CSImpliedForwardPriceModel(CSForwardPriceModel):
         self.implied = implied_factor
         # set the drift explicitly to zero - copy the other 2 params
         self.param = {'Drift': 0.0, 'Sigma': implied_factor.param['Sigma'], 'Alpha': implied_factor.param['Alpha']}
-
-
-class CSQuantoForwardPriceModel(CSForwardPriceModel):
-    """Clewlow-Strickland forward price model denominated in a non-USD currency (e.g. ZAR).
-
-    The CCY-denominated forward price is:
-
-        F_CCY(t,T) = F_USD(t,T)  *  X_fwd(t,T)
-
-    where X_fwd(t,T) is the forward FX rate (not the spot):
-
-        X_fwd(t,T) = X(t)  *  D_USD(t,T) / D_CCY(t,T)
-
-    Requiring the full stochastic discount factors from both USD and CCY yield curves
-    is expensive and complex.  Instead we exploit the following factorisation:
-
-        F_CCY(t,T) = F_CCY(0,T)  *  [F_USD(t,T) / F_USD(0,T)]  *  [X(t) / X(0)]
-
-                   ≈  initial_curve  *  CS_growth(t,T)  *  FX_spot_growth(t)
-
-    This is exact when interest rates are deterministic.  The t=0 discount-factor
-    ratio D_USD(0,T)/D_CCY(0,T) is already embedded in the *initial_curve* because
-    the price factor supplied to this model must be the CCY-denominated forward curve
-    F_CCY(0,T) (which the bootstrapper sets up from market FX forwards).
-
-    Critically the FX spot is **normalised by its t=0 value** so that F_CCY(0,T) is
-    recovered when t=0 (X(0)/X(0)=1). Using the raw spot X(t) instead of X(t)/X(0)
-    would double-count the t=0 FX-forward adjustment already embedded in
-    initial_curve, and would also give the wrong units.
-
-    The remaining approximation error is the stochastic evolution of the yield-curve
-    differential D_USD(t,T)/D_CCY(t,T) away from its deterministic projection; for
-    PFE this is a secondary effect compared to commodity and FX volatility.
-
-    Configuration requirements
-    --------------------------
-    * The ForwardPrice price factor must be CCY-denominated (e.g. ZAR), bootstrapped
-      using today's FX forward curve — NOT the USD curve.
-    * ``Quanto_FX_Currency`` must name a FX factor that is actively simulated in the
-      same run, e.g. ``('USD', 'ZAR')``.  Any USD→CCY pair is supported.
-    * The USD CS model parameters (Sigma, Alpha, Drift) are re-used unchanged.
-    """
-
-    def __init__(self, factor, param, implied_factor=None):
-        super(CSQuantoForwardPriceModel, self).__init__(factor, param, implied_factor)
-        self.fx_rate = None
-        self.scen_grid = None
-
-    def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
-        """Store the stochastic index of the FX spot factor for use in generate()."""
-        self.fx_rate = get_fxrate_factor(self.param['Quanto_FX_Currency'], static_ofs, stoch_ofs)
-
-    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-        super(CSQuantoForwardPriceModel, self).precalculate(
-            ref_date, time_grid, tensor, shared, process_ofs, implied_tensor)
-        # store the scenario grid needed to look up the FX spot path at generate-time
-        self.scen_grid = time_grid.scenario_grid
-
-    def generate(self, shared_mem):
-        # CS paths starting from the CCY initial curve: F_CCY(0,T) * G_USD(t,T)
-        # shape [T, n_tenors, n_paths]
-        ccy_fwd = super(CSQuantoForwardPriceModel, self).generate(shared_mem)
-
-        # Simulated FX spot X(t), shape [T, n_paths]
-        fx_spot = utils.calc_time_grid_spot_rate(self.fx_rate, self.scen_grid, shared_mem)
-
-        # Normalise by X(0) so the FX contribution is 1 at t=0 and does not
-        # double-count the FX forward adjustment already in initial_curve.
-        # X(t)/X(0) broadcast to [T, 1, n_paths] across tenors.
-        fx_growth = (fx_spot / fx_spot[0:1]).unsqueeze(1)
-
-        return ccy_fwd * fx_growth
-
-
-class CSQuantoImpliedForwardPriceModel(CSQuantoForwardPriceModel):
-    """Quanto Clewlow-Strickland with implied vol and mean reversion.
-
-    Combines ``CSQuantoForwardPriceModel`` (FX normalised-growth correction) with the
-    implied-parameter override of ``CSImpliedForwardPriceModel``.
-    """
-
-    def __init__(self, factor, param, implied_factor=None):
-        super(CSQuantoImpliedForwardPriceModel, self).__init__(factor, param, implied_factor)
-        self.implied = implied_factor
-        # preserve Quanto_FX_Currency from param; zero out the drift and pull
-        # Sigma / Alpha from the implied factor exactly as CSImpliedForwardPriceModel does
-        self.param = {
-            'Drift': 0.0,
-            'Sigma': implied_factor.param['Sigma'],
-            'Alpha': implied_factor.param['Alpha'],
-            'Quanto_FX_Currency': param['Quanto_FX_Currency'],
-        }
 
 
 class CSForwardPriceCalibration(object):
@@ -2567,7 +2477,7 @@ class SingleRegimeOU1FactorKalmanModel(StochasticProcess):
         self.a_arr   = shared.one.new_tensor(a.reshape(-1, 1))           # [T, 1]
         self.c_arr   = shared.one.new_tensor(c.reshape(-1, 1))           # [T, 1]
         self.vol_arr = shared.one.new_tensor(np.sqrt(q).reshape(-1, 1))  # [T, 1]
-        self.x0      = float(self.param.get('Initial_X', 0.0))
+        self.x0      = tensor
 
     @property
     def correlation_name(self):
@@ -2575,13 +2485,14 @@ class SingleRegimeOU1FactorKalmanModel(StochasticProcess):
 
     def generate(self, shared_mem):
         Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]  # [T, batch]
-        batch = Z.shape[1]
-        x = Z.new_full((1, batch), self.x0)
-        steps = []
-        for k in range(self.scenario_horizon):
-            x = self.a_arr[k] * x + self.c_arr[k] + self.vol_arr[k] * Z[k]
-            steps.append(x)
-        return torch.cat(steps, dim=0)   # [T, batch]
+        # Prefix cumprod of mean-reversion decay: A[k] = prod(a[0..k])       [T, 1]
+        A = torch.cumprod(self.a_arr, dim=0)
+        # Innovation at each step: b[k] = c[k] + vol[k] * Z[k]              [T, batch]
+        b = self.c_arr + self.vol_arr * Z
+        # Closed-form recurrence: x[k] = A[k] * (x0 + cumsum(b/A)[k])
+        # Derivation: unrolling x_k = a_k*x_{k-1}+b_k gives
+        #   x_k = A_k*x0 + sum_{j<k} (A_k/A_j)*b_j = A_k*(x0 + cumsum(b/A)[k])
+        return A * (self.x0 + torch.cumsum(b / A, dim=0))                    # [T, batch]
 
 
 class SingleRegimeOU1FactorKalmanCalibration(object):
@@ -2972,17 +2883,10 @@ class LogOUSpotModel(StochasticProcess):
 
     def generate(self, shared_mem):
         Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]  # [T, batch]
-
-        # Propagate X_t = log(S_t) step by step using the exact OU recurrence
-        x = Z.new_full((1, Z.shape[1]), self.log_spot0) if isinstance(self.log_spot0, float) \
-            else self.log_spot0.reshape(1, -1).expand(1, Z.shape[1])
-
-        steps = []
-        for k in range(self.scenario_horizon):
-            x = self.theta + self.e_kdt[k] * (x - self.theta) + self.ou_vol[k] * Z[k]
-            steps.append(x)
-
-        return torch.exp(torch.cat(steps, dim=0))   # [T, batch], strictly positive
+        A = torch.cumprod(self.e_kdt, dim=0)                           # [T, 1]
+        b = self.theta * (1.0 - self.e_kdt) + self.ou_vol * Z         # [T, batch]
+        log_spot = A * (self.log_spot0 + torch.cumsum(b / A, dim=0))  # [T, batch]
+        return torch.exp(log_spot)
 
 
 class LogOUSpotCalibration(object):

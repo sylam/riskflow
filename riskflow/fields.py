@@ -226,6 +226,8 @@ mapping = {
                 ["Quanto_FX_Volatility", "Vol", "Quanto_FX_Correlation"],
             "PriceIndex":
                 ["Index", "Next_Publication_Date", "Last_Period_Start", "Publication_Period", "Currency"],
+            "BasisCarry":
+                ["Spot"],
             "ForwardPrice":
                 ["Currency", "Curve", "Fixings"],
             "ForwardPriceSample":
@@ -339,6 +341,10 @@ mapping = {
                 ["Vol", "Drift", "Seasonal_Adjustment"],
             "HWHazardRateModel":
                 ["Alpha", "Lambda", "sigma"],
+            "LogOUSpotModel":
+                ["Kappa", "Theta", "sigma"],
+            "SingleRegimeOU1FactorKalmanModel":
+                ["Kappa", "Theta", "sigma"],
             "PCAInterestRateModel":
                 ["Reversion_Speed", "Historical_Yield", "Yield_Volatility", "Eigenvectors", "Rate_Drift_Model",
                  "Princ_Comp_Source", "Distribution_Type"],
@@ -355,6 +361,8 @@ mapping = {
             'Vol': {'widget': 'Float', 'description': 'Vol', 'value': 0},
             'Drift': {'widget': 'Float', 'description': 'Drift', 'value': 0},
             'Alpha': {'widget': 'Float', 'description': 'Alpha', 'value': 0},
+            'Kappa': {'widget': 'Float', 'description': 'Kappa', 'value': 0},
+            'Theta': {'widget': 'Float', 'description': 'Theta', 'value': 0},
             'Lambda': {'widget': 'Float', 'description': 'Lambda', 'value': 0},
             'Lambda_1': {'widget': 'Float', 'description': 'Lambda 1', 'value': 0},
             'Lambda_2': {'widget': 'Float', 'description': 'Lambda 2', 'value': 0},
@@ -387,10 +395,11 @@ mapping = {
     # list mapping risk factors to allowable stochastic processes
     'Process_factor_map': {
         "Correlation": [],
-        "CommodityPrice": [],
+        "CommodityPrice": ['LogOUSpotModel'],
         "CommodityPriceVol": [],
         "ConvenienceYield": [],
         "EquityPriceVol": [],
+        "BasisCarry": ["SingleRegimeOU1FactorKalmanModel"],
         "InterestYieldVol": [],
         "FuturesPrice": [],
         "InflationRate": ["HullWhite1FactorInterestRateModel", "PCAInterestRateModel"],
@@ -601,8 +610,8 @@ mapping = {
                                      'Roll_Direction', 'Units', 'Include_Dividends', 'Buy_Sell', 'Currency',
                                      'Discount_Rate', 'Principal', 'Payoff_Currency', 'Payoff_Type', 'Reset_Calendars',
                                      'Reset_Offset'],
-            'EquitySwapletListDeal.Fields': ['Equity', 'Equity_Currency', 'Currency',
-                                             'Discount_Rate', 'Buy_Sell', 'Payoff_Type', 'Amount_Type',
+            'EquitySwapletListDeal.Fields': ['Accrual_Calendars', 'Settlement_Days', 'Equity', 'Equity_Currency',
+                                             'Currency', 'Discount_Rate', 'Buy_Sell', 'Payoff_Type', 'Amount_Type',
                                              'Equity_Cashflows'],
             'EquityForwardDeal.Fields': ['Forward_Price', 'Buy_Sell', 'Payoff_Type', 'Equity_Volatility',
                                          'Maturity_Date', 'Equity', 'Units', 'Currency', 'Discount_Rate',
@@ -938,6 +947,7 @@ mapping = {
                                     ['Name']
                                 },
             'Quarters_Lag': {'widget': 'Integer', 'description': 'Quarters Lag', 'value': 0},
+            'Settlement_Days': {'widget': 'Integer', 'description': 'Settlement Days', 'value': 0},
             'Quarter_Reference_Month': {'widget': 'Integer', 'description': 'Quarter Reference Month', 'value': 1},
             'Reference_Day': {'widget': 'Integer', 'description': 'Reference Day', 'value': 1},
             'Days_In_Period': {'widget': 'Integer', 'description': 'Days In Period', 'value': 0},

@@ -187,7 +187,9 @@ def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
     # check if we want to store the mtm value for this instrument
     if deal_data.Calc_res is not None:
         shared.save_results(deal_data.Calc_res, {'Value': mtm})
-        # deal_data.Calc_res.setdefault('MTM', []).append(mtm_np.sum(axis=1))
+        # add this as a tensor if we need to
+        if shared.keep_mtm:
+            deal_data.Calc_res['tensor'] = mtm
 
     if mtm.shape != (1, 1) and mtm.shape[0] < time_grid.mtm_time_grid.size:
         # pad it with zeros and return
@@ -2591,7 +2593,7 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
         discount_rates = utils.calc_discount_rate(discount_block, future_pmts, shared)
         # fx adjustment when payoff currency differs from deal currency
         discountfx = utils.calc_fx_forward(
-            factor_dep['ForwardFX'], factor_dep['Currency'],
+            factor_dep['CashFX'], factor_dep['Currency'],
             cash_pmts, discount_block.time_grid, shared)
 
         # we need to split the forward block further
@@ -2878,6 +2880,7 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
     mtm_list = []
     factor_dep = deal_data.Factor_dep
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    forward_settle_days = factor_dep['Bus_Ofs'][deal_data.Time_dep.deal_time_grid]
     eq_spot = utils.calc_time_grid_spot_rate(factor_dep['Equity'], deal_time, shared)
     cash = factor_dep['Flows']
 
@@ -2909,15 +2912,16 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
 
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
     repo_discounts = utils.calc_time_grid_curve_rate(factor_dep['Equity_Zero'], deal_time, shared)
+    eq_div_curve = utils.calc_time_grid_curve_rate(factor_dep['Dividend_Yield'], deal_time, shared)
 
-    # cashflows = cash.schedule
     cashflows = cash.merged(shared.one)
-    # all_index, all_counts = zip(*all_idx.items())
+
     all_index, all_counts = np.unique(list(
         zip(cash_start_idx, cash_end_idx, cash_pay_idx)), axis=0, return_counts=True)
+    time_block_index = 0
 
-    for index, (discount_block, repo_block, eq_block) in enumerate(
-            utils.split_counts([discounts, repo_discounts, eq_spot], all_counts, shared)):
+    for index, (discount_block, repo_block, divi_block, eq_block) in enumerate(
+            utils.split_counts([discounts, repo_discounts, eq_div_curve, eq_spot], all_counts, shared)):
 
         start_idx, end_idx, pay_idx = all_index[index]
 
@@ -2959,13 +2963,11 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
                         torch.sum(payment, dim=1)[0])
 
         if end_idx < start_idx:
-            cashflow_end = cashflows.np[end_idx, utils.CASHFLOW_INDEX_End_Day].reshape(1, -1)
-            future_end = cashflow_end - time_block.reshape(-1, 1)
-            forward_end = utils.calc_eq_forward(
-                factor_dep['Equity'], factor_dep['Equity_Zero'], factor_dep['Dividend_Yield'],
-                np.squeeze(cashflow_end, axis=0), discount_block.time_grid, shared)
-
-            discount_end = utils.calc_discount_rate(repo_block, future_end, shared)
+            cf_end = cashflows.np[end_idx, utils.CASHFLOW_INDEX_End_Adj] - time_block.reshape(-1, 1)
+            cf_settle = forward_settle_days[time_block_index:time_block_index+all_counts[index]].reshape(-1,1)
+            repo_carry = repo_block.gather_weighted_curve(shared, cf_end, cf_settle)
+            divi_carry = divi_block.gather_weighted_curve(shared, cf_end, cf_settle)
+            forward_end = eq_block.unsqueeze(1) * torch.exp(repo_carry - divi_carry)
 
             St0 = torch.unsqueeze(all_samples[0][end_idx:start_idx], dim=0)
             Ht0_t = utils.calc_realized_dividends(
@@ -2979,7 +2981,7 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
             start_mult = cashflows.tn[end_idx:start_idx, utils.CASHFLOW_INDEX_Start_Mult].reshape(1, -1, 1)
 
             payoff = (end_mult - div_mult) * forward_end + div_mult * (
-                    torch.unsqueeze(eq_block, dim=1) + Ht0_t) / discount_end - start_mult * St0
+                    torch.unsqueeze(eq_block, dim=1) + Ht0_t) * torch.exp(repo_carry) - start_mult * St0
 
             if factor_dep['PrincipleNotShares']:
                 payoff /= St0
@@ -2987,18 +2989,16 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
             payoffs.append(payoff * units)
 
         if cashflow_start.any():
-            cashflow_end = cashflows.np[start_idx:, utils.CASHFLOW_INDEX_End_Day].reshape(1, -1)
-            future_start = cashflow_start - time_block.reshape(-1, 1)
-            future_end = cashflow_end - time_block.reshape(-1, 1)
-            forward_start = utils.calc_eq_forward(
-                factor_dep['Equity'], factor_dep['Equity_Zero'], factor_dep['Dividend_Yield'],
-                np.squeeze(cashflow_start, axis=0), discount_block.time_grid, shared)
-            forward_end = utils.calc_eq_forward(
-                factor_dep['Equity'], factor_dep['Equity_Zero'], factor_dep['Dividend_Yield'],
-                np.squeeze(cashflow_end, axis=0), discount_block.time_grid, shared)
+            cf_start = cashflows.np[start_idx:, utils.CASHFLOW_INDEX_Start_Adj] - time_block.reshape(-1, 1)
+            cf_end  = cashflows.np[start_idx:, utils.CASHFLOW_INDEX_End_Adj] - time_block.reshape(-1, 1)
+            cf_settle = forward_settle_days[time_block_index:time_block_index+all_counts[index]].reshape(-1,1)
+            repo_start = repo_block.gather_weighted_curve(shared, cf_start, cf_settle)
+            repo_end = repo_block.gather_weighted_curve(shared, cf_end, cf_settle)
+            divi_start = divi_block.gather_weighted_curve(shared, cf_start, cf_settle)
+            divi_end = divi_block.gather_weighted_curve(shared, cf_end, cf_settle)
 
-            discount_start = utils.calc_discount_rate(repo_block, future_start, shared)
-            discount_end = utils.calc_discount_rate(repo_block, future_end, shared)
+            forward_start = eq_block.unsqueeze(1) * torch.exp(repo_start - divi_start)
+            forward_end = eq_block.unsqueeze(1) * torch.exp(repo_end - divi_end)
 
             if factor_dep['PrincipleNotShares']:
                 factor1 = forward_end / forward_start
@@ -3013,10 +3013,12 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
             start_mult = cashflows.tn[start_idx:, utils.CASHFLOW_INDEX_Start_Mult].reshape(1, -1, 1)
 
             payoff = (end_mult - div_mult) * factor1 + (
-                    div_mult * (discount_start / discount_end) - start_mult) * factor2
+                    div_mult * torch.exp(repo_end - repo_start) - start_mult) * factor2
 
             payoffs.append(payoff * units)
 
+        # update the time block
+        time_block_index += all_counts[index]
         # now finish the payments
         payments = torch.cat(payoffs, dim=1) if len(payoffs) > 1 else payoffs[0]
         mtm_list.append(torch.sum(payments * discount_rates, dim=1))
@@ -3091,8 +3093,8 @@ def pv_credit_step_down_leg(shared, time_grid, deal_data):
 @utils.log_exception
 def pv_equity_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency,
-                                 deal_time, shared)
+    FX_rep = utils.calc_fx_cross(
+        deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
 
     mtm = pv_equity_cashflows(shared, time_grid, deal_data) * FX_rep
 

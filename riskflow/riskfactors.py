@@ -240,10 +240,11 @@ class Factor2D(object):
                 row = surface[surface[:, 1] == T]
                 # row[:,0] = delta, row[:,2] = vol(Δ)
                 # sort by delta for safety
+                # clip the vols to 1e-4 in case they 0/negative
                 idx = np.argsort(row[:, 0])
                 malz_skews[T] = self._prepare_malz_skew({
                     'delta': row[idx, 0],
-                    'vol': row[idx, 2],
+                    'vol': row[idx, 2].clip(min=1e-4)
                 }, T)
 
             # 2) Build an x-grid with adaptive refinement

@@ -87,7 +87,11 @@ CASHFLOW_INDEX_Strike = 6
 CASHFLOW_INDEX_Dividend_Mult = 6
 # Cashflow code for possible FX resets
 CASHFLOW_INDEX_FXResetDate = 7
+# for equity swaps, we need to adjust days based on settlement
+CASHFLOW_INDEX_Start_Adj = 7
 CASHFLOW_INDEX_FXResetValue = 8
+CASHFLOW_INDEX_End_Adj = 8
+
 # used by inflation cashflows
 CASHFLOW_INDEX_BaseReference = 9
 CASHFLOW_INDEX_FinalReference = 10
@@ -2335,8 +2339,8 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
             far_t = f(
                 time_grid,
                 (indices_time[0], (indices_time[1]-cuttoff_index).clamp(min=0), (indices_time[2]-cuttoff_index).clamp(min=0)))
-            mask_near = M < cuttoff_tenor
-            time_t = torch.where(time_grid < cuttoff_tenor, near_t, far_t)
+            mask_near = M <= cuttoff_tenor
+            time_t = torch.where(time_grid <= cuttoff_tenor, near_t, far_t)
         return torch.where(mask_near, near_tT, far_tT) - time_t.reshape(-1, 1)
     else:
         raise ValueError("More than 2 Interpolation Segments not supported")
@@ -2810,7 +2814,7 @@ def make_energy_fixed_cashflows(reference_date, position, cashflows):
     return TensorCashFlows(cash, dummy_resets)
 
 
-def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows, current_spot):
+def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows, current_spot, busday):
     """
     Generates a vector of equity cashflows from a data source.
     """
@@ -2824,7 +2828,9 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows, cur
             cash.append([(cashflow['Start_Date'] - base_date).days, (cashflow['End_Date'] - base_date).days,
                          (cashflow['Payment_Date'] - base_date).days, cashflow.get('Start_Multiplier', 1.0),
                          cashflow.get('End_Multiplier', 1.0), position * cashflow['Amount'],
-                         cashflow.get('Dividend_Multiplier', 1.0), 0.0, 0.0])
+                         cashflow.get('Dividend_Multiplier', 1.0),
+                         (cashflow['Start_Date'] + busday - base_date).days,
+                         (cashflow['End_Date'] + busday - base_date).days])
 
             r = []
             for reset in ['Start', 'End']:
@@ -2860,8 +2866,9 @@ def make_equity_swaplet_cashflows(base_date, time_grid, position, cashflows, cur
 
     cashflows = TensorCashFlows(cash, cashflow_reset_offsets)
     cashflows.set_resets(all_resets, reset_scenario_offsets)
-
-    return cashflows
+    # calculate the business day ajustment on the mtm time grid
+    bus_offset = np.array([((x + busday) - x).days for x in sorted(time_grid.mtm_dates)])
+    return cashflows, bus_offset
 
 
 def make_index_cashflows(base_date, time_grid, position, cashflows, price_index, index_rate,

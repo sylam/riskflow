@@ -26,6 +26,8 @@ import pandas as pd
 import numpy as np
 import torch
 from functools import reduce
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any
 
 # load up some useful data types
 from collections import namedtuple, defaultdict
@@ -34,11 +36,13 @@ from .riskfactors import construct_factor
 # import the stochastic processes
 from .stochasticprocess import construct_process
 # import the currency/curve lookup factors 
-from .instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
+from .instruments import (get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor)
 # import the hessian function
 from .pricing import SensitivitiesEstimator
 # import the documentation and utils modules
-from . import utils, pricing
+from . import utils, pricing, construct_instrument
+from .hedge_runtime import construct_torchrl_runtime
+from .torchrl_hedge import run_torchrl_execution
 
 
 class Aggregation(object):
@@ -190,6 +194,45 @@ class DealStructure(object):
 
         return accum
 
+    def resolve_hedge_structure(self, shared, time_grid):
+        """
+        Resolves the Structure
+        """
+        def merge_features(cumulative, new_features):
+            cumulative['features'] =  new_features['features'] if cumulative.get('features') is None else torch.concat(
+                [cumulative['features'], new_features['features']], 2)
+            cumulative['feature_names'] =  cumulative.setdefault('feature_names', () ) + new_features['feature_names']
+
+            for ccy, payoff  in new_features['liability_cashflows'].items():
+                cum_ccy = cumulative.setdefault('liability_cashflows', {}).setdefault(ccy, shared.one.new_zeros(1, 1))
+                cumulative['liability_cashflows'][ccy] = cum_ccy + payoff
+            cumulative['liability_mtm'] = new_features['liability_mtm'] if cumulative.get('liability_mtm') is None else (
+                cumulative['liability_mtm'] + new_features['liability_mtm']
+            )
+
+        accum = {}
+
+        if self.sub_structures:
+            # process sub structures
+            for structure in self.sub_structures:
+                logging.root.name = structure.obj.Instrument.field.get('Reference', 'root')
+                features = structure.resolve_hedge_structure(shared, time_grid)
+                merge_features(accum, features)
+
+
+        if self.dependencies and self.obj.Instrument.accum_dependencies:
+            # accumulate the mtm's
+            deal_features = {}
+
+            for deal_data in self.dependencies:
+                logging.root.name = deal_data.Instrument.field.get('Reference', 'root')
+                features = deal_data.Instrument.build_features(shared, time_grid, deal_data)
+                merge_features(deal_features, features)
+
+            merge_features(accum, deal_features)
+
+        return accum
+
 
 class ScenarioTimeGrid(object):
     def __init__(self, cutoff_date, global_time_grid, base_date):
@@ -337,8 +380,8 @@ class Calculation(object):
 
 
 class CMC_State(utils.Calculation_State):
-    def __init__(self, cholesky, static_buffer, batch_size, one, mcmc_sims,
-                 report_currency, seed, job_id, num_jobs, scale_survival=False, nomodel='Constant'):
+    def __init__(self, cholesky, static_buffer, batch_size, one, mcmc_sims, report_currency,
+                 seed, job_id, num_jobs, scale_survival=False, nomodel='Constant', keep_mtm=False):
         super(CMC_State, self).__init__(
             static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size)
         # these are tensors
@@ -356,6 +399,7 @@ class CMC_State(utils.Calculation_State):
         # needed if we are running across multiple gpu's
         self.job_id = job_id
         self.num_jobs = num_jobs
+        self.keep_mtm = keep_mtm
         # do we need to scale the mtm by the survival probability in the final answer?
         self.scale_survival = scale_survival
 
@@ -603,11 +647,20 @@ class Credit_Monte_Carlo(Calculation):
         dependent_factors, stochastic_factors, implied_factors, reset_dates, settlement_currencies = \
             self.config.calculate_dependencies(params, base_date, self.input_time_grid)
 
-        # update the time grid
-        # logging.info('Updating timegrid')
         self.update_time_grid(base_date, reset_dates, settlement_currencies,
                               dynamic_scenario_dates=params.get('Dynamic_Scenario_Dates', 'No') == 'Yes')
 
+        return self._build_factor_state(
+            dependent_factors, stochastic_factors, implied_factors, params, base_date, job_id, num_jobs)
+
+    def _build_factor_state(self, dependent_factors, stochastic_factors, implied_factors,
+                            params, base_date, job_id, num_jobs):
+        """Construct factor objects, tensors, shared memory and precalculate processes.
+
+        Called by update_factors after the time grid and dependency sets are known.
+        Subclasses that build their own dependency sets (e.g. HedgeMonteCarlo) can
+        call this directly instead of going through calculate_dependencies.
+        """
         # now construct the stochastic factors and static factors for the simulation
         self.stoch_factors.clear()
 
@@ -657,7 +710,6 @@ class Credit_Monte_Carlo(Calculation):
         sensitivities = params.get('Gradient_Variables', 'All')
 
         # now get the stochastic risk factors ready - these will be generated from the price models
-
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 # check if there are any implied factors linked here
@@ -731,7 +783,6 @@ class Credit_Monte_Carlo(Calculation):
         # now check if any of the stochastic processes depend on other processes
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
-                # precalculate any values for the stochastic process
                 value.calc_references(key, self.static_factors, self.stoch_factors, self.all_tenors, self.all_factors)
 
         return shared_mem
@@ -860,7 +911,7 @@ class Credit_Monte_Carlo(Calculation):
             self.get_cholesky_decomp(), self.static_var, self.batch_size,
             torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
                 utils.check_rate_name(reporting_currency), self.static_factors, self.stoch_factors),
-            seed, job_id, num_jobs, scale_by_survival)
+            seed, job_id, num_jobs, scale_by_survival, keep_mtm=self.params.get('Keep_MtM', 'No')=='Yes')
 
         return shared_mem
 
@@ -943,24 +994,6 @@ class Credit_Monte_Carlo(Calculation):
             else:
                 self.output.setdefault(result, np.concatenate(data, axis=-1).astype(np.float64))
 
-        # now check for jacobians
-        # reverse_lookup = {v: k for k, v in self.implied_ofs.items()}
-        # jacobians = {}
-        # for index, (k, v) in enumerate(self.implied_factors.items()):
-        #     jac_factor = utils.Factor(k.type + 'Jacobian', k.name)
-        #     if utils.check_tuple_name(jac_factor) in self.config.params['Price Factors']:
-        #         jacobian = construct_factor(jac_factor, self.config.params['Price Factors'])
-        #         currency = self.all_factors[reverse_lookup[index]].factor.get_currency()
-        #         for res, value in self.output.items():
-        #             if res.startswith('grad'):
-        #                 jacobians.setdefault(res, {}).setdefault(
-        #                     k, jacobian.calculate_components(k, value, currency))
-
-        # merge and report
-        # for grad_xva, jac_xva in jacobians.items():
-        #     self.output['implied_'+grad_xva[5:]] = pd.concat([v.set_index(pd.MultiIndex.from_tuples([
-        #         (utils.check_scope_name(k), x) for x in v.index])) for k, v in jac_xva.items()])
-
         return self.output
 
     def execute(self, params, job_id=0, num_jobs=1):
@@ -1035,44 +1068,6 @@ class Credit_Monte_Carlo(Calculation):
 
                     if final_run:
                         output['grad_collva'] = sensitivity.report_grad()
-                        # store the size of the Gradient
-                        self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
-
-            if 'LegacyFVA' in params:
-                time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
-                mtm_grid = self.time_grid.mtm_time_grid[time_grid]
-
-                funding = get_interest_factor(
-                    utils.check_rate_name('{}.FUNDING'.format(params['LegacyFVA']['Funding_Curve'])),
-                    self.static_factors, self.stoch_factors, self.all_tenors)
-                collateral = get_interest_factor(
-                    utils.check_rate_name('{}.COLLATERAL'.format(params['LegacyFVA']['Collateral_Curve'])),
-                    self.static_factors, self.stoch_factors, self.all_tenors)
-
-                discount_funding = utils.calc_time_grid_curve_rate(
-                    funding, self.time_grid.time_grid[time_grid], shared_mem)
-                discount_collateral = utils.calc_time_grid_curve_rate(
-                    collateral, self.time_grid.time_grid[time_grid], shared_mem)
-                delta_scen_t = np.append(np.diff(mtm_grid), 0).reshape(-1, 1)
-                discount_collateral_t0 = utils.calc_time_grid_curve_rate(collateral, np.zeros((1, 3)), shared_mem)
-
-                Dc_over_f_tT_m1 = torch.expm1(
-                    torch.squeeze(discount_funding.gather_weighted_curve(shared_mem, delta_scen_t) -
-                                  discount_collateral.gather_weighted_curve(shared_mem, delta_scen_t), dim=1)
-                )
-
-                Dc0_T = torch.exp(
-                    -torch.squeeze(
-                        discount_collateral_t0.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1)), dim=0))
-
-                tensors['legacy_fva'] = (tensors['mtm'] * Dc_over_f_tT_m1 * Dc0_T).mean(axis=1).sum()
-
-                if params['LegacyFVA'].get('Gradient', 'No') == 'Yes':
-                    # calculate all the derivatives of fva
-                    sensitivity = SensitivitiesEstimator(tensors['legacy_fva'], self.all_var)
-
-                    if final_run:
-                        output['grad_legacy_fva'] = sensitivity.report_grad()
                         # store the size of the Gradient
                         self.calc_stats['Gradient_Vector_Size'] = sensitivity.P
 
@@ -1595,6 +1590,375 @@ class Base_Revaluation(Calculation):
 
         # return a dictionary of output
         return {'Netting': self.netting_sets, 'Stats': self.calc_stats, 'Results': self.report()}
+
+
+@dataclass
+class HedgeScenarioResult:
+    """Output of ``HedgeMonteCarlo.execute()``.
+
+    All arrays use a consistent path axis N = ``batch_size * simulation_batches``.
+
+    Attributes
+    ----------
+    base_date:
+        Simulation start date (t = 0).
+    time_grid_days:
+        Integer day offsets from ``base_date`` for each scenario step, shape [T].
+    factor_paths:
+        Raw stochastic factor paths keyed by ``utils.Factor``.  Shape is [T, N]
+        for scalar factors (e.g. spot, carry) or [T, n_tenors, N] for curve factors.
+    n_paths:
+        Total number of simulated paths (``batch_size * simulation_batches``).
+    n_time_steps:
+        Number of scenario time steps T.
+    sim_instruments:
+        RiskFlow-priced MTM paths for every tradable instrument priced in the
+        hedging problem,
+        keyed by the instrument's ``Reference`` label.  Shape is [T, N].
+        These are the primary outputs used by downstream adapters and policies.
+    metadata:
+        Miscellaneous run parameters (dates, batch config, calc stats).
+    """
+    base_date: pd.Timestamp
+    business_day: pd.offsets.CustomBusinessDay
+    time_grid_days: np.ndarray                       # [T]
+    factor_paths: Dict['utils.Factor', np.ndarray]  # factor_key -> [T, ..., N]
+    n_paths: int
+    n_time_steps: int
+    metadata: Dict[str, Any]
+    sim_instruments: Dict[str, np.ndarray] = field(default_factory=dict)  # label -> [T, N]
+
+    @property
+    def scenario_dates(self) -> pd.DatetimeIndex:
+        """DatetimeIndex corresponding to ``time_grid_days``."""
+        return pd.DatetimeIndex(
+            [self.base_date + pd.Timedelta(days=int(d)) for d in self.time_grid_days]
+        )
+
+
+@dataclass
+class HedgeRuntimeExecutionResult:
+    """High-level result for HedgeMonteCarlo's TorchRL bundle handoff.
+
+    ``scenario_result`` optionally retains the full materialized scenario data.
+    ``torchrl_bundle`` is the generic tensor package for downstream TorchRL
+    consumption. Evaluation output is a plain dict for the active TorchRL path.
+    """
+    scenario_result: Optional[HedgeScenarioResult]
+    torchrl_bundle: Optional[Dict[str, Any]]
+    evaluation_summary: Optional[Any]
+    optimizer_diagnostics: Optional[Dict[str, Any]]
+    policy_artifact: Optional[Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+class HedgeMonteCarlo(Credit_Monte_Carlo):
+
+    @staticmethod
+    def _factor_bundle_key(factor_key):
+        if hasattr(factor_key, 'type') and hasattr(factor_key, 'name'):
+            factor_name = factor_key.name
+            if isinstance(factor_name, tuple):
+                factor_name = '.'.join(part for part in factor_name)
+            return '{}:{}'.format(factor_key.type, factor_name)
+        return factor_key
+
+    def _build_scenario_result(self, base_date, business_day, time_grid_days, factor_blocks, params):
+        trade_mtm = {
+            x.Instrument.field['Reference']: np.concatenate(x.Calc_res['Value'], 1)
+            for x in self.netting_sets.dependencies
+            if x.Calc_res.get('Value')
+        }
+        factor_paths = {key: np.concatenate(blocks, axis=-1) for key, blocks in factor_blocks.items()}
+        return HedgeScenarioResult(
+            base_date=base_date,
+            business_day=business_day,
+            time_grid_days=time_grid_days.copy(),
+            factor_paths=factor_paths,
+            n_paths=self.numscenarios,
+            n_time_steps=len(time_grid_days),
+            sim_instruments=trade_mtm,
+            metadata={
+                'base_date': str(base_date),
+                'time_grid': params['Time_Grid'],
+                'batch_size': self.batch_size,
+                'num_batches': params['Simulation_Batches'],
+                'random_seed': params['Random_Seed'],
+                'n_stoch_factors': self.num_factors,
+                'calc_stats': dict(self.calc_stats),
+            },
+        )
+
+    def _build_torchrl_bundle(self, base_date, business_day, time_grid_days, tradable_blocks, factor_tensor_blocks, hedge_profile_blocks, num_batches):
+        def pad_time_axis(tensor, target_steps):
+            current_steps = int(tensor.shape[0])
+            if current_steps >= target_steps:
+                return tensor[:target_steps]
+            if current_steps == 0:
+                raise ValueError('Cannot pad an empty tensor along the time axis')
+            pad_shape = (target_steps - current_steps,) + tuple(tensor.shape[1:])
+            pad_block = tensor[-1:].expand(*pad_shape)
+            return torch.cat([tensor, pad_block], dim=0)
+
+        tradables = {
+            instrument_name: torch.cat(blocks, dim=1)
+            for instrument_name, blocks in tradable_blocks.items()
+        }
+        factors = {
+            factor_name: torch.cat(blocks, dim=-1)
+            for factor_name, blocks in factor_tensor_blocks.items()
+        }
+        hedge_profile = None
+        if hedge_profile_blocks and hedge_profile_blocks.get('features'):
+            hedge_profile = {
+                'features': torch.cat(hedge_profile_blocks['features'], dim=1),
+                'feature_names': tuple(hedge_profile_blocks.get('feature_names', ())),
+                'liability_cashflows': {
+                    currency: torch.cat(blocks, dim=1)
+                    for currency, blocks in hedge_profile_blocks.get('liability_cashflows', {}).items()
+                },
+                'liability_mtm': torch.cat(hedge_profile_blocks['liability_mtm'], dim=1),
+            }
+        if hedge_profile is not None:
+            aligned_time_steps = int(hedge_profile['features'].shape[0])
+        else:
+            candidate_lengths = [int(time_grid_days.shape[0])]
+            candidate_lengths.extend(int(tensor.shape[0]) for tensor in tradables.values())
+            candidate_lengths.extend(int(tensor.shape[0]) for tensor in factors.values())
+            aligned_time_steps = min(candidate_lengths) if candidate_lengths else 0
+        bundle = {
+            'time_grid_days': pad_time_axis(time_grid_days, aligned_time_steps),
+            'tradables': {
+                instrument_name: pad_time_axis(tensor, aligned_time_steps)
+                for instrument_name, tensor in tradables.items()
+            },
+            'meta': {
+                'base_date': base_date,
+                'business_day': business_day,
+                'num_batches': int(num_batches),
+            },
+        }
+        if factors:
+            bundle['factors'] = {
+                factor_name: pad_time_axis(tensor, aligned_time_steps)
+                for factor_name, tensor in factors.items()
+            }
+        if hedge_profile is not None:
+            bundle['hedge_profile'] = {
+                'features': hedge_profile['features'][:aligned_time_steps],
+                'feature_names': hedge_profile['feature_names'],
+                'liability_cashflows': {
+                    currency: tensor[:aligned_time_steps]
+                    for currency, tensor in hedge_profile['liability_cashflows'].items()
+                },
+                'liability_mtm': hedge_profile['liability_mtm'][:aligned_time_steps],
+            }
+        return bundle
+
+    def update_factors(self, params, base_date, job_id, num_jobs):
+        """Override: build dependent_factors from the generic Scenario_Factors JSON dict."""
+        dependent_factors, stochastic_factors, _, reset_dates, _ = self.config.calculate_dependencies(
+            params, base_date, self.input_time_grid)
+
+        # Size the time grid from Futures_Expiries (or a 2-year fallback)
+        max_expiry = max(reset_dates)
+        reset_dates = self.config.parse_grid(base_date, max_expiry, self.input_time_grid, past_max_date=True)
+        reset_dates.update({base_date, max_expiry})
+        # generate scerarios at each grid date
+        self.update_time_grid(base_date, reset_dates, {}, dynamic_scenario_dates=True)
+
+        # Use the last scenario grid date so ScenarioTimeGrid covers the extra step from past_max_date=True
+        last_scen_date = base_date + pd.DateOffset(days=int(self.time_grid.scen_time_grid[-1]))
+        dependent_factors = {k: last_scen_date for k in dependent_factors}
+        stochastic_factors, additional_factors = self.config.find_models(dependent_factors)
+
+        return self._build_factor_state(
+            dependent_factors, stochastic_factors, additional_factors, params, base_date, job_id, num_jobs)
+
+    def execute(self, params, job_id=0, num_jobs=1):
+        """Run hedging simulation batches and package the result for TorchRL.
+
+        The calculation lifecycle is intentionally split into three phases:
+
+        - setup before the simulation loop
+        - tensor accumulation inside the simulation loop
+        - bundle finalization after the loop
+
+        RiskFlow remains responsible for:
+
+        - simulation
+        - tradable pricing
+        - time grid construction
+
+        The output handoff is a minimal dictionary-driven tensor bundle for the
+        TorchRL path. Learning and policy execution are intentionally not run
+        here.
+        """
+        def read_instruments(instruments_dict):
+            instruments = []
+            for obj_type, obj_data in instruments_dict.items():
+                for ref, obj_field in obj_data.items():
+                    ins_obj = {'Object': obj_type, 'Reference': ref}
+                    ins_obj.update(obj_field)
+                    instruments.append({'Instrument':construct_instrument(ins_obj, self.config.params['Valuation Configuration'])})
+            return instruments
+
+        base_date = pd.Timestamp(params['Run_Date'])
+        self.input_time_grid = params['Time_Grid']
+        params['Simulation_Batches'] = params['Simulation_Batches'] // num_jobs
+        self.batch_size = params['Batch_Size']
+        self.numscenarios = self.batch_size * params['Simulation_Batches']
+        self.params = params
+        # keep the mtm
+        self.params['Keep_MtM'] = 'Yes'
+
+        logging.root.name = self.config.deals['Attributes'].get('Reference', self.config.file_ref)
+        self.calc_stats['Batch_Size'] = self.batch_size
+        self.calc_stats['Simulation_Batches'] = params['Simulation_Batches']
+        self.calc_stats['Random_Seed'] = params['Random_Seed']
+
+        execution_mode = params.get('Execution_Mode', 'simulate_only')
+        retain_scenario_result = params.get('Retain_Scenario_Result','Yes')=='Yes'
+        hedging_problem = params.get('Hedging_Problem', {})
+
+        instruments = read_instruments(hedging_problem.get('Tradable_Instruments', {}))
+        liabilities = read_instruments(hedging_problem.get('Liabilities', {}))
+        # store it away for deal resolution
+        self.config.deals['Deals']['Children'] = instruments + liabilities
+        shared_mem = self.update_factors(params, base_date, job_id, num_jobs)
+        # Build the valuation structure first; the hedging runtime will consume
+        # the live factor and instrument tensors produced by this same loop.
+        self.netting_sets = DealStructure(Aggregation('root'), store_results=True)
+        self.set_deal_structures(instruments, self.netting_sets, deal_level_mtm=True)
+        self.netting_sets.finalize_struct(base_date, self.time_grid)
+
+        self.liabilities = DealStructure(Aggregation('contracts'), store_results=False)
+        self.set_deal_structures(liabilities, self.liabilities, deal_level_mtm=False)
+        self.liabilities.finalize_struct(base_date, self.time_grid)
+
+        t_days_arr = self.time_grid.scenario_grid[:, utils.TIME_GRID_MTM]  # [T]
+        execution_label = 'Tensor_Execution_Time ({})'.format(self.device.type)
+        self.calc_stats[execution_label] = time.monotonic()
+
+        normalized_runtime = construct_torchrl_runtime(params)
+
+        # Accumulate one numpy array per stochastic factor across batches
+        factor_blocks = {k: [] for k in self.stoch_factors} if retain_scenario_result else {}
+        factor_tensor_blocks = {
+            self._factor_bundle_key(key): [] for key in self.stoch_factors
+        }
+        tradable_blocks = defaultdict(list)
+        hedge_profile_blocks = {
+            'features': [],
+            'feature_names': None,
+            'liability_cashflows': defaultdict(list),
+            'liability_mtm': [],
+        }
+        # get the calendar for business day
+        bus_day = self.config.holidays.get(
+            self.params['Calendar'], {'businessday': pd.offsets.BDay(1)})['businessday']
+
+        for run in range(params['Simulation_Batches']):
+            shared_mem.reset(
+                self.num_factors, self.time_grid,
+                use_antithetic=params.get('Antithetic', 'No') == 'Yes')
+
+            for key, proc in self.stoch_factors.items():
+                shared_mem.t_Scenario_Buffer[key] = proc.generate(shared_mem)
+
+            _ = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
+            # grab the liability features
+            features = self.liabilities.resolve_hedge_structure(shared_mem, self.time_grid)
+            hedge_profile_blocks['features'].append(features['features'].detach().clone())
+            current_feature_names = tuple(features.get('feature_names', ()))
+            if hedge_profile_blocks['feature_names'] is None:
+                hedge_profile_blocks['feature_names'] = current_feature_names
+            elif hedge_profile_blocks['feature_names'] != current_feature_names:
+                raise ValueError('resolve_hedge_structure returned inconsistent feature_names across batches')
+            for currency, payoff in features.get('liability_cashflows', {}).items():
+                hedge_profile_blocks['liability_cashflows'][currency].append(payoff.detach().clone())
+            hedge_profile_blocks['liability_mtm'].append(features['liability_mtm'].detach().clone())
+
+            if retain_scenario_result:
+                for key in self.stoch_factors:
+                    factor_blocks[key].append(shared_mem.t_Scenario_Buffer[key].cpu().detach().numpy())
+
+            if factor_tensor_blocks is not None:
+                for key in self.stoch_factors:
+                    factor_tensor_blocks[self._factor_bundle_key(key)].append(
+                        shared_mem.t_Scenario_Buffer[key].detach().clone()
+                    )
+
+            # grab the simulated instruments and collect them into a generic bundle
+            trade_tensors = {
+                x.Instrument.field['Reference']: x.Calc_res['tensor']
+                for x in self.netting_sets.dependencies
+                if x.Calc_res.get('tensor') is not None
+            }
+
+            if tradable_blocks is not None:
+                for instrument_name, instrument_tensor in trade_tensors.items():
+                    tradable_blocks[instrument_name].append(instrument_tensor.detach().clone())
+
+            shared_mem.t_Buffer.clear()
+
+        self.calc_stats[execution_label] = time.monotonic() - self.calc_stats[execution_label]
+
+        scenario_result = self._build_scenario_result(
+            base_date, bus_day, t_days_arr, factor_blocks, params) if retain_scenario_result else None
+        torchrl_bundle = None if normalized_runtime is None else self._build_torchrl_bundle(
+            base_date,
+            bus_day,
+            shared_mem.one.new_tensor(t_days_arr),
+            tradable_blocks,
+            factor_tensor_blocks,
+            hedge_profile_blocks,
+            params['Simulation_Batches'],
+        )
+        evaluation_summary = None
+        optimizer_diagnostics = None
+        policy_artifact = None
+        runtime_present = False
+        runtime_diagnostics = {}
+        optimization_result = None
+        if torchrl_bundle is not None and normalized_runtime is not None:
+            optimization_result = run_torchrl_execution(torchrl_bundle, normalized_runtime)
+        if optimization_result is not None:
+            evaluation_summary = optimization_result['evaluation_output']
+            optimizer_diagnostics = optimization_result['optimizer_diagnostics']
+            policy_artifact = optimization_result['policy_artifact']
+            runtime_present = True
+            runtime_diagnostics = {
+                'num_episodes': int(evaluation_summary.get('diagnostics', {}).get('num_episodes', 0)),
+                'trainer_type': evaluation_summary.get('diagnostics', {}).get('trainer_type'),
+                'riskflow_simulation_pricing_time_seconds': float(self.calc_stats.get(execution_label, 0.0)),
+                'torchrl_rollout_time_seconds': float((optimizer_diagnostics or {}).get('torchrl_rollout_time_seconds', 0.0)),
+                'replay_storage_time_seconds': float(evaluation_summary.get('timing', {}).get('replay_storage_time_seconds', 0.0)),
+                'gradient_update_time_seconds': float(evaluation_summary.get('timing', {}).get('gradient_update_time_seconds', 0.0)),
+                'final_evaluation_time_seconds': float(evaluation_summary.get('timing', {}).get('evaluation_time_seconds', 0.0)),
+                'total_fit_time_seconds': float(evaluation_summary.get('timing', {}).get('total_fit_time_seconds', 0.0)),
+                'accounting_mode': normalized_runtime.get('accounting_mode'),
+                'tradable_names': tuple(normalized_runtime.get('names', {}).get('tradables', ())),
+                'cash_account_names': tuple(normalized_runtime.get('names', {}).get('cash_accounts', ())),
+            }
+
+        return HedgeRuntimeExecutionResult(
+            scenario_result=scenario_result,
+            torchrl_bundle=torchrl_bundle,
+            evaluation_summary=evaluation_summary,
+            optimizer_diagnostics=optimizer_diagnostics,
+            policy_artifact=policy_artifact,
+            metadata={
+                'execution_mode': execution_mode,
+                'torchrl_bundle_present': torchrl_bundle is not None,
+                'retain_scenario_result': retain_scenario_result,
+                'num_batches': params['Simulation_Batches'],
+                'num_paths': self.numscenarios,
+                'optimizer_diagnostics_present': optimizer_diagnostics is not None,
+                'runtime_present': runtime_present,
+                'runtime_diagnostics': runtime_diagnostics,
+            },
+        )
 
 
 def construct_calculation(calc_type, config, **kwargs):

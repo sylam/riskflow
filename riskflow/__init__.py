@@ -151,6 +151,41 @@ def run_baseval(context, prec=torch.float64, overrides=None):
     return calc, out
 
 
+def run_hedgemontecarlo(context, prec=torch.float32, overrides=None):
+    from .calculation import construct_calculation
+
+    calc_params = context.deals.get(
+        'Calculation',
+        {'Base_Date': context.params['System Parameters']['Base_Date'],
+         'Currency': context.params['System Parameters']['Base_Currency']})
+
+    # check if the gpu is available
+    if torch.cuda.is_available():
+        # make sure we try to be deterministic as possible
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+        device = torch.device("cuda:0")
+        torch.cuda.empty_cache()
+    else:
+        device = torch.device("cpu")
+
+    rundate = calc_params['Base_Date'].strftime('%Y-%m-%d')
+    time_grid = str(calc_params.get('Time_Grid', '0d 1d(1d) 4m'))
+
+    params_mc = {'Time_grid': time_grid, 'Run_Date': rundate,
+                 'Tenor_Offset': 0.0, 'Batch_Size': 1024, 'Simulation_Batches': 1}
+
+    params_mc.update(calc_params)
+
+    if overrides is not None:
+        update_dict(params_mc, overrides)
+
+    calc = construct_calculation('HedgeMonteCarlo', context, device=device, prec=prec)
+    out = calc.execute(params_mc)
+    # summarize the results for easy review
+
+    return calc, out
+
+
 def run_cmc(context, prec=torch.float32, overrides=None, job_id=0, num_jobs=1, res_queue=None):
     """
     Runs a credit monte carlo calculation on the provided context
@@ -314,6 +349,8 @@ class Context:
                     cfg.params[section].update(section_data)
             else:
                 cfg = Config()
+                for section, section_data in market_data.get('ExplicitMarketData', {}).items():
+                    cfg.params[section].update(section_data)
 
         if data['Calc'].get('CalendDataFile'):
             if data['Calc']['CalendDataFile'] not in self.holiday_cfg_cache:
@@ -336,9 +373,11 @@ class Context:
                 for i in deals['Children']:
                     if 'Children' in i:
                         i['Children'] = utils.compress_deal_data(i['Children'])
+        else :
+            deals = {}
 
-            cfg.deals.update({'Deals': deals})
-            cfg.deals.update({'Calculation': data['Calc']['Calculation']})
+        cfg.deals.update({'Deals': deals})
+        cfg.deals.update({'Calculation': data['Calc']['Calculation']})
 
         #  set the current context to newly loaded one
         self.current_cfg = cfg
@@ -405,6 +444,8 @@ class Context:
             return self.Credit_Monte_Carlo(overrides, runparallel)
         elif self.current_cfg.deals['Calculation']['Object'] == 'BaseValuation':
             return self.Base_Valuation(overrides)
+        elif self.current_cfg.deals['Calculation']['Object'] == 'HedgeMonteCarlo':
+            return self.Hedge_Monte_Carlo(overrides)
         else:
             raise Exception('Unknown Calculation {}'.format(self.current_cfg.deals['Calculation']['Object']))
 
@@ -446,6 +487,9 @@ class Context:
 
     def Base_Valuation(self, overrides=None):
         return run_baseval(self.current_cfg, overrides=overrides)
+
+    def Hedge_Monte_Carlo(self, overrides=None):
+        return run_hedgemontecarlo(self.current_cfg, overrides=overrides)
 
 
 class StressedContext(Context):
