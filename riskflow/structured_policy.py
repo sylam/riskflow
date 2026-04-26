@@ -76,7 +76,7 @@ class TorchRLStateFeatureExtractor:
 
 
 class _StructuredPolicyHead(nn.Module):
-    def __init__(self, *, input_dim, action_dim, hidden_layers, activation, no_trade_bias, device):
+    def __init__(self, *, input_dim, action_dim, hidden_layers, activation, device):
         super().__init__()
         try:
             activation_class = getattr(torch.nn.modules.activation, activation)
@@ -86,20 +86,16 @@ class _StructuredPolicyHead(nn.Module):
             raise ValueError("hidden_layers must contain only positive integers")
         self.network = MLP(
             in_features=input_dim,
-            out_features=1 + int(action_dim),
+            out_features=int(action_dim),
             num_cells=[width for width in hidden_layers],
             activation_class=activation_class,
             device=device,
         )
-        self.no_trade_bias = bool(no_trade_bias)
 
     def forward(self, features):
         raw_output = self.network(features)
-        trade_gate_logit = raw_output[..., 0]
-        if self.no_trade_bias:
-            trade_gate_logit = trade_gate_logit - 2.0
-        rebalance_vector = torch.tanh(raw_output[..., 1:])
-        return trade_gate_logit, rebalance_vector
+        rebalance_vector = torch.tanh(raw_output)
+        return rebalance_vector
 
 
 class StructuredRebalancePolicy(nn.Module):
@@ -110,7 +106,6 @@ class StructuredRebalancePolicy(nn.Module):
         feature_extractor,
         hidden_layers=(64, 64),
         activation="ReLU",
-        no_trade_bias=False,
         device="cpu",
     ):
         super().__init__()
@@ -118,7 +113,6 @@ class StructuredRebalancePolicy(nn.Module):
         self.feature_extractor = feature_extractor
         self.hidden_layers = tuple(int(value) for value in hidden_layers)
         self.activation = str(activation)
-        self.no_trade_bias = bool(no_trade_bias)
         self.device = torch.device(device)
         input_dim = getattr(feature_extractor, "feature_dim", None)
         self.actor = _StructuredPolicyHead(
@@ -126,7 +120,6 @@ class StructuredRebalancePolicy(nn.Module):
             action_dim=action_space.dimension,
             hidden_layers=self.hidden_layers,
             activation=self.activation,
-            no_trade_bias=self.no_trade_bias,
             device=self.device,
         ).to(self.device)
         self.register_buffer(
@@ -139,17 +132,26 @@ class StructuredRebalancePolicy(nn.Module):
             torch.tensor(action_space.max_trade_delta, dtype=torch.float32, device=self.device).reshape(1, -1),
             persistent=False,
         )
+        self.register_buffer(
+            "_min_trade_delta_abs",
+            self._min_trade_delta.abs(),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_action_feature_scale",
+            torch.maximum(self._max_trade_delta.abs(), self._min_trade_delta_abs).clamp_min(1.0),
+            persistent=False,
+        )
 
     def extract_features(self, feature_batch) -> torch.Tensor:
         return self.feature_extractor(feature_batch).to(device=self.device)
 
     def forward(self, feature_batch):
         features = self.extract_features(feature_batch)
-        trade_gate_logit, rebalance_vector = self.actor(features)
+        rebalance_vector = self.actor(features)
         return TensorDict(
             {
                 "features": features,
-                "trade_gate_logit": trade_gate_logit,
                 "rebalance_vector": rebalance_vector,
             },
             batch_size=[int(features.shape[0])],
@@ -164,17 +166,11 @@ class StructuredRebalancePolicy(nn.Module):
         if not bool(random_mask.any().item()):
             return output
         output = output.clone(False)
-        random_gate = torch.where(
-            torch.rand(batch_size, device=self.device) < 0.5,
-            torch.ones(batch_size, dtype=torch.float32, device=self.device),
-            -torch.ones(batch_size, dtype=torch.float32, device=self.device),
-        )
         random_vector = 2.0 * torch.rand(
             (batch_size, self.action_space.dimension),
             dtype=torch.float32,
             device=self.device,
         ) - 1.0
-        output["trade_gate_logit"] = torch.where(random_mask, random_gate, output["trade_gate_logit"])
         output["rebalance_vector"] = torch.where(
             random_mask.unsqueeze(1),
             random_vector,
@@ -182,22 +178,30 @@ class StructuredRebalancePolicy(nn.Module):
         )
         return output
 
+    def _continuous_trade_deltas(self, rebalance_vector: torch.Tensor) -> torch.Tensor:
+        clipped = torch.clamp(rebalance_vector, min=-1.0, max=1.0)
+        positive_trade = clipped.clamp(min=0.0) * self._max_trade_delta
+        negative_trade = clipped.clamp(max=0.0) * self._min_trade_delta_abs
+        return torch.where(
+            clipped > 0.0,
+            positive_trade,
+            torch.where(clipped < 0.0, negative_trade, torch.zeros_like(clipped)),
+        )
+
+    def _normalize_trade_deltas(self, trade_deltas: torch.Tensor) -> torch.Tensor:
+        return trade_deltas / self._action_feature_scale
+
     def map_actions(self, output) -> Dict[str, Any]:
-        trade_gate_logit = torch.as_tensor(output["trade_gate_logit"], dtype=torch.float32, device=self.device).reshape(-1)
         rebalance_vector = torch.as_tensor(output["rebalance_vector"], dtype=torch.float32, device=self.device)
         if rebalance_vector.ndim != 2:
             raise ValueError("rebalance_vector must have shape [B, A]")
         if int(rebalance_vector.shape[1]) != self.action_space.dimension:
             raise ValueError("rebalance_vector action dimension does not match action_space")
-        clipped = torch.clamp(rebalance_vector, min=-1.0, max=1.0)
-        mapped = self._min_trade_delta + 0.5 * (clipped + 1.0) * (self._max_trade_delta - self._min_trade_delta)
+        mapped = self._continuous_trade_deltas(rebalance_vector)
         rounded = torch.sign(mapped) * torch.floor(mapped.abs() + 0.5)
         bounded = torch.max(torch.min(rounded, self._max_trade_delta), self._min_trade_delta).to(torch.int64)
-        trade_gate_open = trade_gate_logit > 0.0
-        ordered_trade_deltas = torch.where(trade_gate_open.unsqueeze(1), bounded, torch.zeros_like(bounded))
+        ordered_trade_deltas = bounded
         return {
-            "trade_gate_logit": trade_gate_logit,
-            "trade_gate_open": trade_gate_open,
             "rebalance_vector": rebalance_vector,
             "ordered_trade_deltas": ordered_trade_deltas,
             "trade_deltas": {
@@ -206,13 +210,15 @@ class StructuredRebalancePolicy(nn.Module):
             },
         }
 
-    def action_features(self, output, *, soft_gate: bool = False) -> torch.Tensor:
-        trade_gate_logit = torch.as_tensor(output["trade_gate_logit"], dtype=torch.float32, device=self.device).reshape(-1, 1)
+    def action_features(self, output) -> torch.Tensor:
+        if "ordered_trade_deltas" in output:
+            ordered_trade_deltas = torch.as_tensor(output["ordered_trade_deltas"], dtype=torch.float32, device=self.device)
+            return self._normalize_trade_deltas(ordered_trade_deltas)
         rebalance_vector = torch.as_tensor(output["rebalance_vector"], dtype=torch.float32, device=self.device)
         if rebalance_vector.ndim != 2:
             raise ValueError("rebalance_vector must have shape [B, A]")
-        gate_feature = torch.sigmoid(trade_gate_logit) if soft_gate else (trade_gate_logit > 0.0).to(dtype=rebalance_vector.dtype)
-        return torch.cat([gate_feature, rebalance_vector], dim=-1)
+        continuous_trade_deltas = self._continuous_trade_deltas(rebalance_vector)
+        return self._normalize_trade_deltas(continuous_trade_deltas)
 
     def to_artifact(self) -> Dict[str, Any]:
         if not hasattr(self.feature_extractor, "to_artifact_payload"):
@@ -227,7 +233,7 @@ class StructuredRebalancePolicy(nn.Module):
         if feature_dim is None:
             raise ValueError("StructuredRebalancePolicy artifact could not infer feature dimension")
         return {
-            "artifact_version": 1,
+            "artifact_version": 2,
             "policy_object_type": "StructuredRebalancePolicy",
             "feature_extractor": self.feature_extractor.to_artifact_payload(),
             "action_space": self.action_space.to_artifact_payload(),
@@ -236,12 +242,8 @@ class StructuredRebalancePolicy(nn.Module):
                 "hidden_layers": list(self.hidden_layers),
                 "activation": self.activation,
                 "output_heads": {
-                    "Trade_Gate": {
-                        "object": "BinaryLogitHead",
-                        "no_trade_bias": self.no_trade_bias,
-                    },
-                    "Rebalance_Vector": {
-                        "object": "TanhHead",
+                    "Trade_Deltas": {
+                        "object": "TanhDeltaHead",
                     },
                 },
                 "feature_dim": feature_dim,
@@ -272,7 +274,6 @@ def load_policy_artifact(file_path, *, device: str = "cpu") -> StructuredRebalan
     model_payload = dict(artifact.get("model", {}))
     action_space_payload = dict(artifact.get("action_space", {}))
     feature_extractor_payload = dict(artifact.get("feature_extractor", {}))
-    trade_gate_payload = dict(model_payload.get("output_heads", {}).get("Trade_Gate", {}))
     feature_dim = int(feature_extractor_payload.get("feature_dim", model_payload.get("feature_dim")))
     policy = StructuredRebalancePolicy(
         action_space=StructuredActionSpace(
@@ -283,7 +284,6 @@ def load_policy_artifact(file_path, *, device: str = "cpu") -> StructuredRebalan
         feature_extractor=TorchRLStateFeatureExtractor(feature_dim=feature_dim),
         hidden_layers=tuple(int(value) for value in model_payload.get("hidden_layers", (64, 64))),
         activation=str(model_payload.get("activation", "ReLU")),
-        no_trade_bias=bool(trade_gate_payload.get("no_trade_bias", False)),
         device=device,
     )
     _ = policy(torch.zeros((1, feature_dim), dtype=torch.float32, device=policy.device))

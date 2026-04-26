@@ -4706,6 +4706,7 @@ class FloatingEnergyDeal(Deal):
                      'Sampling_Type': ['ForwardPriceSample'],
                      'FX_Sampling_Type': ['ForwardPriceSample'],
                      'Reference_Type': ['ReferencePrice'],
+                     'Commodity': ['CommodityPrice'],
                      'Payoff_Currency': ['FxRate']}
 
     documentation = ('Energy', [
@@ -4724,7 +4725,7 @@ class FloatingEnergyDeal(Deal):
         super(FloatingEnergyDeal, self).reset()
         paydates = set([x['Payment_Date'] for x in self.field['Payments']['Items']])
         self.add_reval_dates(
-            paydates, self.field['Payoff_Currency'] if self.field['Payoff_Currency'] else self.field['Currency'])
+            paydates, self.field['Payoff_Currency' if 'Payoff_Currency' in self.field else 'Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
@@ -4735,6 +4736,9 @@ class FloatingEnergyDeal(Deal):
                 self.field['FX_Sampling_Type']) if self.field['FX_Sampling_Type'] else None,
             'Reference_Type': utils.check_rate_name(self.field['Reference_Type'])
         }
+
+        if 'Commodity' in self.field:
+            field['Commodity'] = utils.check_rate_name(self.field['Commodity'])
 
         payoff_currency = self.field['Payoff_Currency' if 'Payoff_Currency' in self.field else 'Currency']
         field['Discount_Rate'] = utils.check_rate_name(
@@ -4750,22 +4754,76 @@ class FloatingEnergyDeal(Deal):
         field_index['ForwardPrice'], field_index['ForwardFX'], field_index['CashFX'] = get_forwardprice_factor(
             field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors,
             all_factors, reference_factor, forward_factor, base_date)
-
         field_index['Discount'] = get_discount_factor(
             field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
         field_index['Cashflows'] = utils.make_energy_cashflows(
             base_date, time_grid, -1.0 if self.field['Payer_Receiver'] == 'Payer' else 1.0,
             self.field['Payments'], reference_factor, forward_sample, fx_sample, calendars)
-
         field_index['Currency'] = get_fx_and_zero_rate_factor(
             field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
-
         field_index['SettleCurrency'] = payoff_currency
+
+        if 'Commodity' in field:
+            field_index['Commodity'] = get_commodity_rate_factor(
+                field['Commodity'], static_offsets, stochastic_offsets)
+            field_index['ForwardStart'] = np.array(
+                sorted([(x - reference_factor.start_date).days for x in time_grid.mtm_dates]))
 
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
         return pricing.pv_energy_leg(shared, time_grid, deal_data)
+
+    def hedge_features(self, shared, time_grid, deal_data):
+        m = pricing.pv_energy_leg(shared, time_grid, deal_data)
+        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+        strike = deal_data.Instrument.field['Strike_Price'] * shared.one
+        spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Commodity'], deal_time, shared)
+
+        discounts = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Discount'], deal_time, shared)
+        units = self.field.get('Units', 1.0)
+
+        intrinsic_value = torch.clamp(option_type * (spot - strike), min=0.0) * units
+        signed_intrinsic = intrinsic_value * deal_data.Factor_dep['Buy_Sell']
+
+        daycount = deal_data.Factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
+        time_to_expiry_years = torch.clamp(
+            torch.as_tensor(
+                daycount(deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]),
+                dtype=spot.dtype,
+                device=spot.device,
+            ),
+            min=0.0,
+        ).reshape(-1, 1).expand_as(spot)
+        min_feature_value = torch.finfo(spot.dtype).tiny
+
+        initial_spot = torch.clamp(spot[:1], min=min_feature_value)
+        safe_spot = torch.clamp(spot, min=min_feature_value)
+        safe_forward_strike = torch.clamp(forward / strike, min=min_feature_value)
+        safe_intrinsic_ratio = torch.clamp(intrinsic_value / safe_spot, min=min_feature_value)
+        feature_names = (
+            'log_underlying',
+            'log_forward_strike',
+            'log_intrinsic_value',
+            'time_to_expiry_years'
+        )
+        features = torch.stack(
+            (
+                torch.log(safe_spot / initial_spot),
+                torch.log(safe_forward_strike),
+                torch.log(safe_intrinsic_ratio),
+                time_to_expiry_years
+            ),
+            dim=-1,
+        )
+        liability_cashflows = torch.zeros_like(spot)
+        liability_cashflows[-1] = signed_intrinsic[-1]
+
+        return {
+            'feature_names': feature_names,
+            'features': features,
+            'liability_cashflows': {deal_data.Factor_dep['SettleCurrency']: liability_cashflows}
+        }
 
 
 class FixedEnergyDeal(Deal):

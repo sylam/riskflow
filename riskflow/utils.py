@@ -3088,20 +3088,19 @@ def make_energy_cashflows(reference_date, time_grid, position, cashflows, refere
                 # create one sample
                 reset_dates = [bunsiness_dates[-1]]
 
-            resets_in_excel_format = [(x - reference.start_date).days for x in reset_dates]
+            resets_in_excel_format = np.array([(x - reference.start_date).days for x in reset_dates])
             reference_date_excel = (reference_date - reference.start_date).days
 
             # retrieve the fixing dates from the reference curve and adding an offset
-            fixing_dates = reference.get_fixings().array[
-                               np.searchsorted(reference.get_tenor(), resets_in_excel_format) + int(
-                                   forwardsample.param.get('Offset'))][:, 1]
+            fixing_dates = reference.get_fixings(resets_in_excel_format + forwardsample.param.get('Offset', 0))
 
             for reset_day, fixing_day in zip(resets_in_excel_format, fixing_dates):
                 Reset_Day = reset_day - reference_date_excel
-                Start_Day = reset_day - reference_date_excel
+                # Start_Day = reset_day - reference_date_excel
+                Start_Day = reset_day
                 End_Day = fixing_day
                 Weight = 1.0 / len(reset_dates)
-                Time_Grid, Scenario = time_grid.get_scenario_offset(Start_Day)
+                Time_Grid, Scenario = time_grid.get_scenario_offset(Reset_Day)
                 # only add a reset if its in the past
                 r.append([Time_Grid, Reset_Day, -1, Start_Day, End_Day, Weight,
                           cashflow['Realized_Average'] or 0.0, cashflow['FX_Realized_Average'] or 0.0])

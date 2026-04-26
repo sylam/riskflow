@@ -734,7 +734,9 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
             (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid_years) * self.H)))
         ).reshape(-1, 1)
 
-        delta_var = np.diff(np.exp(-2.0 * alpha * time_grid_years) * self.J)
+        delta_var = np.diff(self.J)
+        self.exp_minus_alpha_t = shared.one.new(np.exp(-alpha * time_grid_years)).reshape(-1, 1)
+
         if delta_var.size:
             # needed for numerical stability
             delta_var[delta_var <= 0.0] = delta_var[delta_var > 0.0].min()
@@ -751,7 +753,7 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
 
     def generate(self, shared_mem):
         f1 = (shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon] *
-              self.delta_vol - self.delta_KtT + self.delta_HtT).cumsum(axis=0)
+              self.delta_vol - self.delta_KtT + self.delta_HtT).cumsum(axis=0) * self.exp_minus_alpha_t
 
         stoch_component = self.BtT * torch.unsqueeze(f1, dim=1)
         return (self.fwd_component + stoch_component) / self.factor_tenor

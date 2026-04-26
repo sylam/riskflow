@@ -16,6 +16,10 @@ from .hedge_runtime import build_state_feature_groups, flatten_state_feature_gro
 from .structured_policy import StructuredActionSpace, StructuredRebalancePolicy, TorchRLStateFeatureExtractor
 
 
+def _clone_policy_state(policy: StructuredRebalancePolicy) -> Dict[str, torch.Tensor]:
+    return deepcopy(policy.state_dict())
+
+
 OPTIMIZER_DEFAULTS = {
     "epochs": 20,
     "replay_capacity": 10000,
@@ -28,8 +32,8 @@ OPTIMIZER_DEFAULTS = {
     "target_update_interval": 5,
     "gradient_steps_per_epoch": 10,
     "decision_interval_curriculum": (),
-    "dense_tracking_reward_scale": 0.02,
-    "dense_tracking_reward_clip": 0.10,
+    "dense_tracking_reward_scale": 0.05,
+    "dense_tracking_reward_clip": 0.15,
     "validation_fraction": 0.25,
     "validation_min_batch": 256,
     "validation_shards": 4,
@@ -39,7 +43,10 @@ OPTIMIZER_DEFAULTS = {
     "curriculum_min_improvement": 3.0,
     "curriculum_min_trade_rate": 0.01,
     "curriculum_max_trade_rate": 0.70,
-    "turnover_penalty_scale": 1.5,
+    "turnover_penalty_scale": 0.75,
+    "no_trade_reference_scale": 0.0,
+    "replay_imitation_weight": 0.01,
+    "action_sparsity_penalty_weight": 0.0,
 }
 
 
@@ -57,7 +64,6 @@ def _checkpoint_selection_metrics(
     )
     average_liability = float(greedy_terminal_transition["liability_value"].abs().mean().item())
     rollout_stats = _scalar_rollout_diagnostics(greedy_rollout.get("rollout_diagnostics"))
-    gate_open_rate = float(rollout_stats.get("gate_open_rate", 0.0))
     mean_abs_trade_delta = float(rollout_stats.get("mean_abs_trade_delta", 0.0))
     nonzero_trade_rate = float(rollout_stats.get("nonzero_trade_rate", 0.0))
     objective = dict(runtime.get("objective") or {})
@@ -68,14 +74,11 @@ def _checkpoint_selection_metrics(
     mean_trade_limit = max(float(sum(max_trade_delta) / len(max_trade_delta)), 1.0) if max_trade_delta else 1.0
     mean_trade_utilization = mean_abs_trade_delta / mean_trade_limit
     inactivity_penalty = inactivity_scale * max(0.05 - nonzero_trade_rate, 0.0) * 0.02
-    gate_penalty = inactivity_scale * max(0.05 - gate_open_rate, 0.0) * 0.01
-    overtrade_penalty = inactivity_scale * max(mean_trade_utilization - 0.35, 0.0) * 0.05
-    selection_score = average_net_pnl - inactivity_penalty - gate_penalty - overtrade_penalty
+    selection_score = average_net_pnl - inactivity_penalty
     return {
         "average_reward": average_reward,
         "average_net_pnl": average_net_pnl,
         "average_liability": average_liability,
-        "gate_open_rate": gate_open_rate,
         "nonzero_trade_rate": nonzero_trade_rate,
         "mean_abs_trade_delta": mean_abs_trade_delta,
         "mean_trade_utilization": float(mean_trade_utilization),
@@ -186,7 +189,6 @@ def _aggregate_checkpoint_metrics(metrics_list: Tuple[Dict[str, float], ...]) ->
             "average_reward": float("-inf"),
             "average_net_pnl": float("-inf"),
             "average_liability": 0.0,
-            "gate_open_rate": 0.0,
             "nonzero_trade_rate": 0.0,
             "mean_abs_trade_delta": 0.0,
             "mean_trade_utilization": 0.0,
@@ -490,9 +492,75 @@ def _resolve_trade_deltas(
     return resolved
 
 
-def _transaction_costs(trade_delta: torch.Tensor, runtime: Dict[str, Any]) -> torch.Tensor:
+def _realized_structured_action(
+    action: Optional[Dict[str, Any]],
+    current_positions: Dict[str, torch.Tensor],
+    runtime: Dict[str, Any],
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> Optional[Dict[str, Any]]:
+    if action is None:
+        return None
+    executed_trade_deltas = _enforce_position_limits(
+        current_positions,
+        _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device),
+        runtime,
+    )
+    instrument_order = tuple(str(name) for name in _runtime_names(runtime, "action_instruments"))
+    ordered_trade_deltas = torch.stack(
+        [executed_trade_deltas[name] for name in instrument_order],
+        dim=1,
+    ).round().to(dtype=torch.int64)
+    return {
+        **action,
+        "ordered_trade_deltas": ordered_trade_deltas,
+        "trade_deltas": {
+            instrument_name: ordered_trade_deltas[:, index]
+            for index, instrument_name in enumerate(instrument_order)
+        },
+    }
+
+
+def _enforce_position_limits(
+    current_positions: Dict[str, torch.Tensor],
+    trade_deltas: Dict[str, torch.Tensor],
+    runtime: Dict[str, Any],
+) -> Dict[str, torch.Tensor]:
+    adjusted_trade_deltas = dict(trade_deltas)
+    position_limits = dict(runtime.get("accounting", {}).get("position_limits", {}))
+    fail_on_unhedgeable = bool(runtime.get("accounting", {}).get("fail_on_unhedgeable_intent", False))
+    for instrument_name in _runtime_names(runtime, "action_instruments"):
+        name = str(instrument_name)
+        if name not in current_positions or name not in adjusted_trade_deltas:
+            continue
+        limits = dict(position_limits.get(name, {}))
+        min_position = float(limits.get("min_position", float("-inf")))
+        max_position = float(limits.get("max_position", float("inf")))
+        requested_trade_delta = adjusted_trade_deltas[name]
+        proposed_position = current_positions[name] + requested_trade_delta
+        bounded_position = torch.clamp(proposed_position, min=min_position, max=max_position)
+        if fail_on_unhedgeable and bool((bounded_position != proposed_position).any().item()):
+            raise ValueError(f"Action for {name} breaches position limits")
+        adjusted_trade_deltas[name] = bounded_position - current_positions[name]
+    return adjusted_trade_deltas
+
+
+def _transaction_costs(
+    trade_delta: torch.Tensor,
+    price: torch.Tensor,
+    runtime: Dict[str, Any],
+    instrument_name: str,
+) -> torch.Tensor:
     unit_cost = float(runtime.get("accounting", {}).get("transaction_cost_per_unit", 0.0))
-    return trade_delta.abs() * unit_cost
+    spread_bps = float(runtime.get("accounting", {}).get("bid_offer_spread_bps", 0.0))
+    contract_size = float(_runtime_tradable(runtime, instrument_name).get("contract_size", 1.0))
+    per_unit_cost = trade_delta.abs() * unit_cost
+    if spread_bps <= 0.0:
+        return per_unit_cost
+    half_spread = 0.5 * spread_bps * 1.0e-4
+    spread_cost = trade_delta.abs() * price.abs() * contract_size * half_spread
+    return per_unit_cost + spread_cost
 
 
 def _apply_cash_trade(
@@ -537,7 +605,7 @@ def _flatten_cash_inventory(
     for instrument_name in _runtime_names(runtime, "hedges"):
         name = str(instrument_name)
         trade_delta = -positions[name]
-        transaction_cost = _transaction_costs(trade_delta, runtime)
+        transaction_cost = _transaction_costs(trade_delta, terminal_tradable_values[name], runtime, name)
         _apply_cash_trade(
             cash_accounts,
             _cash_account_for_instrument(name, runtime),
@@ -552,12 +620,13 @@ def _flatten_futures_inventory(
     positions: Dict[str, torch.Tensor],
     cash_accounts: Dict[str, torch.Tensor],
     margin_accounts: Dict[str, torch.Tensor],
+    settlement_prices: Dict[str, torch.Tensor],
     runtime: Dict[str, Any],
 ) -> None:
     for instrument_name in _runtime_names(runtime, "hedges"):
         name = str(instrument_name)
         trade_delta = -positions[name]
-        transaction_cost = _transaction_costs(trade_delta, runtime)
+        transaction_cost = _transaction_costs(trade_delta, settlement_prices[name], runtime, name)
         cash_account_name = _cash_account_for_instrument(name, runtime)
         _apply_account_flow(cash_accounts, cash_account_name, -transaction_cost)
         _apply_account_flow(margin_accounts, cash_account_name, -transaction_cost)
@@ -626,12 +695,13 @@ def cash_account_step(
     next_positions = _clone_tensor_dict(state["positions"])
     next_cash_accounts = _clone_tensor_dict(state["cash_accounts"])
     resolved_trade_deltas = _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device)
+    resolved_trade_deltas = _enforce_position_limits(state["positions"], resolved_trade_deltas, runtime)
 
     for instrument_name in _runtime_names(runtime, "action_instruments"):
         name = str(instrument_name)
         trade_delta = resolved_trade_deltas.get(name)
         price = current_tradable_values[name]
-        transaction_cost = _transaction_costs(trade_delta, runtime)
+        transaction_cost = _transaction_costs(trade_delta, price, runtime, name)
         cash_account_name = _cash_account_for_instrument(name, runtime)
         _apply_cash_trade(next_cash_accounts, cash_account_name, trade_delta, price, transaction_cost)
         next_positions[name] = next_positions[name] + trade_delta
@@ -676,6 +746,7 @@ def futures_account_step(
     realized_pnl = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
     variation_margin = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
     resolved_trade_deltas = _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device)
+    resolved_trade_deltas = _enforce_position_limits(state["positions"], resolved_trade_deltas, runtime)
     next_tradable_values = _current_tradable_values(bundle, runtime, settlement_time_index)
 
     for instrument_name in _runtime_names(runtime, "hedges"):
@@ -693,14 +764,14 @@ def futures_account_step(
     for instrument_name in _runtime_names(runtime, "action_instruments"):
         name = str(instrument_name)
         trade_delta = resolved_trade_deltas.get(name)
-        transaction_cost = _transaction_costs(trade_delta, runtime)
+        transaction_cost = _transaction_costs(trade_delta, next_tradable_values[name], runtime, name)
         cash_account_name = _cash_account_for_instrument(name, runtime)
         next_positions[name] = next_positions[name] + trade_delta
         _apply_account_flow(next_cash_accounts, cash_account_name, -transaction_cost)
         _apply_account_flow(next_margin_accounts, cash_account_name, -transaction_cost)
 
     if _should_terminal_flatten(runtime, current_time_index, last_time_index):
-        _flatten_futures_inventory(next_positions, next_cash_accounts, next_margin_accounts, runtime)
+        _flatten_futures_inventory(next_positions, next_cash_accounts, next_margin_accounts, next_settlement_prices, runtime)
 
     next_state = {
         "done": torch.full_like(state["done"], settlement_time_index >= last_time_index, dtype=torch.bool),
@@ -861,6 +932,9 @@ def _optimizer_settings(runtime: Dict[str, Any]) -> Dict[str, Any]:
         "curriculum_min_trade_rate": float(optimizer_params.get("curriculum_min_trade_rate", OPTIMIZER_DEFAULTS["curriculum_min_trade_rate"])),
         "curriculum_max_trade_rate": float(optimizer_params.get("curriculum_max_trade_rate", OPTIMIZER_DEFAULTS["curriculum_max_trade_rate"])),
         "turnover_penalty_scale": float(optimizer_params.get("turnover_penalty_scale", OPTIMIZER_DEFAULTS["turnover_penalty_scale"])),
+        "no_trade_reference_scale": float(optimizer_params.get("no_trade_reference_scale", OPTIMIZER_DEFAULTS["no_trade_reference_scale"])),
+        "replay_imitation_weight": float(optimizer_params.get("replay_imitation_weight", OPTIMIZER_DEFAULTS["replay_imitation_weight"])),
+        "action_sparsity_penalty_weight": float(optimizer_params.get("action_sparsity_penalty_weight", OPTIMIZER_DEFAULTS["action_sparsity_penalty_weight"])),
         "decision_interval_curriculum": tuple(
             dict(stage) for stage in optimizer_params.get("decision_interval_curriculum", OPTIMIZER_DEFAULTS["decision_interval_curriculum"])
         ),
@@ -954,7 +1028,7 @@ def _decision_time_indices_for_interval(bundle: Dict[str, Any], interval_busines
 
 
 def _empty_replay_batch(policy: StructuredRebalancePolicy, state_feature_dim: int) -> TensorDict:
-    action_feature_dim = 1 + int(policy.action_space.dimension)
+    action_feature_dim = int(policy.action_space.dimension)
     return TensorDict(
         {
             "state_features": torch.zeros((0, state_feature_dim), dtype=torch.float32, device=policy.device),
@@ -971,8 +1045,6 @@ def _empty_replay_batch(policy: StructuredRebalancePolicy, state_feature_dim: in
 def _make_structured_policy(bundle: Dict[str, Any], runtime: Dict[str, Any], *, device: torch.device) -> StructuredRebalancePolicy:
     policy_config = runtime.get("policy", {})
     model_config = policy_config.get("model", {})
-    output_heads = model_config.get("output_heads", {})
-    trade_gate_config = output_heads.get("Trade_Gate", {})
     feature_extractor = TorchRLStateFeatureExtractor(
         feature_dim=int(runtime.get("state_layout", {}).get("dimension", 0)) + _hedge_profile_feature_dim(bundle),
     )
@@ -985,7 +1057,6 @@ def _make_structured_policy(bundle: Dict[str, Any], runtime: Dict[str, Any], *, 
         feature_extractor=feature_extractor,
         hidden_layers=tuple(value for value in model_config.get("hidden_layers", (64, 64))),
         activation=model_config.get("activation", "ReLU"),
-        no_trade_bias=bool(trade_gate_config.get("No_Trade_Bias", False)),
         device=device,
     )
 
@@ -1013,11 +1084,6 @@ def _collect_structured_rollout(
     no_trade_steps = 0
     total_action_steps = 0
     terminal_transition = None
-    gate_logit_sum = 0.0
-    gate_logit_count = 0
-    gate_logit_min = None
-    gate_logit_max = None
-    gate_open_count = 0
     trade_abs_sum = 0.0
     trade_elem_count = 0
     trade_abs_max = 0.0
@@ -1027,6 +1093,7 @@ def _collect_structured_rollout(
     initial_feature_mean_abs = float(state["policy_features"].detach().abs().mean().item()) if state["policy_features"].numel() else 0.0
     decision_time_index_set = set(int(index) for index in (decision_time_indices or ()))
     decision_steps = 0
+    rollout_steps = 0
     pending_transition = None
     pending_baseline_state = None
 
@@ -1038,16 +1105,15 @@ def _collect_structured_rollout(
             decision_steps += 1
             state_features = state["policy_features"].to(policy.device)
             output = policy.sample(state_features, epsilon=epsilon, greedy=greedy)
-            mapped = policy.map_actions(output)
-            gate_logits = torch.as_tensor(output["trade_gate_logit"], dtype=torch.float32, device=policy.device).reshape(-1)
-            gate_logit_sum += float(gate_logits.sum().item())
-            gate_logit_count += int(gate_logits.numel())
-            current_gate_min = float(gate_logits.min().item()) if gate_logits.numel() else 0.0
-            current_gate_max = float(gate_logits.max().item()) if gate_logits.numel() else 0.0
-            gate_logit_min = current_gate_min if gate_logit_min is None else min(gate_logit_min, current_gate_min)
-            gate_logit_max = current_gate_max if gate_logit_max is None else max(gate_logit_max, current_gate_max)
-            gate_open = torch.as_tensor(mapped["trade_gate_open"], dtype=torch.bool, device=policy.device).reshape(-1)
-            gate_open_count += int(gate_open.sum().item())
+            mapped = _realized_structured_action(
+                policy.map_actions(output),
+                state["positions"],
+                runtime,
+                batch_size=batch_size,
+                device=policy.device,
+            )
+            if mapped is None:
+                raise RuntimeError("Structured policy decision unexpectedly produced no action")
             ordered_trade_deltas = torch.as_tensor(mapped["ordered_trade_deltas"], dtype=torch.float32, device=policy.device)
             trade_abs = ordered_trade_deltas.abs()
             trade_abs_sum += float(trade_abs.sum().item())
@@ -1063,7 +1129,7 @@ def _collect_structured_rollout(
             total_action_steps += int(trade_mask.numel())
             pending_transition = {
                 "state_features": state_features.detach(),
-                "action_features": policy.action_features(output, soft_gate=False).detach(),
+                "action_features": policy.action_features(mapped).detach(),
                 "rewards": -_turnover_penalty(ordered_trade_deltas, runtime).to(dtype=torch.float32, device=policy.device),
                 "baseline_rewards": torch.zeros(batch_size, dtype=torch.float32, device=policy.device),
             }
@@ -1085,6 +1151,7 @@ def _collect_structured_rollout(
             pending_baseline_state = next_baseline_state
         terminal_transition = {"state": next_state, **transition}
         state = next_state
+        rollout_steps += 1
         next_time_index = int(state["time_index"])
         if pending_transition is not None and (
             bool(state["done"].all().item()) or next_time_index in decision_time_index_set
@@ -1132,17 +1199,13 @@ def _collect_structured_rollout(
         "terminal_transition": terminal_transition,
         "action_counts": action_counts.detach(),
         "no_trade_rate": 0.0 if total_action_steps == 0 else float(no_trade_steps / total_action_steps),
-        "num_steps": len(transition_rows),
+        "num_steps": rollout_steps,
         "rollout_diagnostics": {
-            "num_steps": float(len(transition_rows)),
+            "num_steps": float(rollout_steps),
             "num_decision_steps": float(decision_steps),
             "decision_interval_business_days": float(max(int(decision_interval_business_days), 1)),
             "initial_feature_mean_abs": float(initial_feature_mean_abs),
             "final_feature_mean_abs": float(final_policy_features.abs().mean().item()) if final_policy_features.numel() else 0.0,
-            "gate_logit_mean": 0.0 if gate_logit_count == 0 else float(gate_logit_sum / gate_logit_count),
-            "gate_logit_min": 0.0 if gate_logit_min is None else float(gate_logit_min),
-            "gate_logit_max": 0.0 if gate_logit_max is None else float(gate_logit_max),
-            "gate_open_rate": 0.0 if gate_logit_count == 0 else float(gate_open_count / gate_logit_count),
             "nonzero_trade_rate": 0.0 if total_action_steps == 0 else float(1.0 - (no_trade_steps / total_action_steps)),
             "mean_abs_trade_delta": 0.0 if trade_elem_count == 0 else float(trade_abs_sum / trade_elem_count),
             "max_abs_trade_delta": float(trade_abs_max),
@@ -1166,6 +1229,7 @@ def _collect_no_trade_rollout(
     initial_feature_mean_abs = float(state["policy_features"].detach().abs().mean().item()) if state["policy_features"].numel() else 0.0
     decision_time_index_set = set(int(index) for index in (decision_time_indices or ()))
     decision_steps = 0
+    rollout_steps = 0
     terminal_transition = None
 
     while True:
@@ -1176,6 +1240,7 @@ def _collect_no_trade_rollout(
         transition = reward_and_terminal_payoff(state, next_state, bundle, runtime)
         terminal_transition = {"state": next_state, **transition}
         state = next_state
+        rollout_steps += 1
         if bool(next_state["done"].all().item()):
             break
 
@@ -1184,15 +1249,11 @@ def _collect_no_trade_rollout(
         "action_counts": torch.zeros(batch_size, dtype=torch.float32, device=state["policy_features"].device),
         "no_trade_rate": 1.0,
         "rollout_diagnostics": {
-            "num_steps": float(max(int(state["time_index"]), 0)),
+            "num_steps": float(rollout_steps),
             "num_decision_steps": float(decision_steps),
             "decision_interval_business_days": float(decision_interval_business_days),
             "initial_feature_mean_abs": initial_feature_mean_abs,
             "final_feature_mean_abs": float(state["policy_features"].detach().abs().mean().item()) if state["policy_features"].numel() else 0.0,
-            "gate_logit_mean": 0.0,
-            "gate_logit_min": 0.0,
-            "gate_logit_max": 0.0,
-            "gate_open_rate": 0.0,
             "nonzero_trade_rate": 0.0,
             "mean_abs_trade_delta": 0.0,
             "max_abs_trade_delta": 0.0,
@@ -1217,9 +1278,9 @@ def _update_structured_policy(
         return {"critic_losses": [], "actor_losses": []}
     critic_losses = []
     actor_losses = []
-    gate_entropy_bonus_weight = 1.0e-2
-    rebalance_l2_penalty_weight = 1.0e-3
-    replay_imitation_weight = 5.0e-2
+    rebalance_l2_penalty_weight = 5.0e-3
+    replay_imitation_weight = float(settings.get("replay_imitation_weight", OPTIMIZER_DEFAULTS["replay_imitation_weight"]))
+    action_sparsity_penalty_weight = float(settings.get("action_sparsity_penalty_weight", OPTIMIZER_DEFAULTS["action_sparsity_penalty_weight"]))
     target_critic.eval()
     for _ in range(int(settings["gradient_steps_per_epoch"])):
         sample = _sample_replay_batch(replay_buffer, int(settings["batch_size"]), policy.device)
@@ -1237,7 +1298,7 @@ def _update_structured_policy(
         q_values = critic(states, actions)
         with torch.no_grad():
             next_output = policy(next_states)
-            next_actions = policy.action_features(next_output, soft_gate=True)
+            next_actions = policy.action_features(next_output)
             next_q_values = target_critic(next_states, next_actions)
             target_values = advantage_rewards + float(settings["gamma"]) * (1.0 - dones) * next_q_values
 
@@ -1251,35 +1312,28 @@ def _update_structured_policy(
         for param in critic.parameters():
             param.requires_grad_(False)
         policy_output = policy(states)
-        policy_actions = policy.action_features(policy_output, soft_gate=True)
-        gate_probabilities = torch.sigmoid(policy_output.get("trade_gate_logit").reshape(-1, 1))
-        gate_entropy = -(
-            gate_probabilities * torch.log(gate_probabilities + 1.0e-8)
-            + (1.0 - gate_probabilities) * torch.log(1.0 - gate_probabilities + 1.0e-8)
-        ).mean()
+        policy_actions = policy.action_features(policy_output)
         rebalance_penalty = torch.as_tensor(policy_output.get("rebalance_vector"), dtype=torch.float32).pow(2).mean()
+        action_sparsity_penalty = policy_actions.abs().mean()
         sampled_action_values = critic(states, actions).detach()
         policy_action_values = critic(states, policy_actions).detach()
         no_trade_action_values = critic(states, no_trade_actions).detach()
-        imitation_baseline = torch.maximum(policy_action_values, no_trade_action_values)
+        no_trade_reference_scale = float(settings.get("no_trade_reference_scale", OPTIMIZER_DEFAULTS["no_trade_reference_scale"]))
+        scaled_no_trade_action_values = no_trade_reference_scale * no_trade_action_values
+        imitation_baseline = torch.maximum(policy_action_values, scaled_no_trade_action_values)
         imitation_advantage = torch.relu(sampled_action_values - imitation_baseline)
         imitation_weight = (imitation_advantage / (imitation_advantage.mean() + 1.0e-6)).reshape(-1, 1)
-        gate_targets = actions[:, :1]
-        rebalance_targets = actions[:, 1:]
-        gate_imitation_loss = (
-            torch.nn.functional.binary_cross_entropy(gate_probabilities, gate_targets, reduction="none")
-            * imitation_weight
-        ).mean()
+        rebalance_targets = actions
         rebalance_imitation_loss = (
-            (policy_actions[:, 1:] - rebalance_targets).pow(2)
+            (policy_actions - rebalance_targets).pow(2)
             * imitation_weight
         ).mean()
-        policy_advantage = critic(states, policy_actions) - no_trade_action_values
+        policy_advantage = critic(states, policy_actions) - scaled_no_trade_action_values
         actor_loss = (
             -policy_advantage.mean()
-            - gate_entropy_bonus_weight * gate_entropy
             + rebalance_l2_penalty_weight * rebalance_penalty
-            + replay_imitation_weight * (gate_imitation_loss + rebalance_imitation_loss)
+            + action_sparsity_penalty_weight * action_sparsity_penalty
+            + replay_imitation_weight * rebalance_imitation_loss
         )
         actor_loss.backward()
         actor_optimizer.step()
@@ -1303,29 +1357,33 @@ def _scalar_rollout_diagnostics(rollout_diagnostics: Optional[Dict[str, Any]]) -
     }
 
 
-def build_torchrl_evaluation_output(
+def _terminal_evaluation_summary(
     state: Dict[str, Any],
     terminal_transition: Dict[str, Any],
     action_counts: torch.Tensor,
     no_trade_rate: float,
     bundle: Dict[str, Any],
-    *,
-    trainer_type: str,
-    rollout_diagnostics: Optional[Dict[str, Any]] = None,
-    timing: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     hedge_pnl = terminal_transition["portfolio_value"].detach().to(dtype=torch.float32)
     liability = terminal_transition["liability_value"].detach().to(dtype=torch.float32)
     net_pnl = hedge_pnl - liability
+    hedge_profile = dict(bundle.get("hedge_profile", {}))
+    liability_mtm = hedge_profile.get("liability_mtm")
+    if liability_mtm is None:
+        initial_liability_mtm = torch.zeros_like(net_pnl)
+    else:
+        initial_liability_mtm = liability_mtm[0].detach().to(dtype=torch.float32, device=net_pnl.device)
+    net_pnl_plus_initial_liability_mtm = net_pnl + initial_liability_mtm
     action_counts = action_counts.detach().to(dtype=torch.float32)
-    num_paths = int(net_pnl.shape[0])
     return {
         "metrics": {
             "average_net_pnl": float(net_pnl.mean().item()),
+            "average_net_pnl_plus_initial_liability_mtm": float(net_pnl_plus_initial_liability_mtm.mean().item()),
             "median_net_pnl": float(torch.quantile(net_pnl.to(dtype=torch.float64), 0.5).item()),
             "worst_net_pnl": float(net_pnl.min().item()),
             "average_hedge_pnl": float(hedge_pnl.mean().item()),
             "average_liability": float(liability.mean().item()),
+            "average_initial_liability_mtm": float(initial_liability_mtm.mean().item()),
             "avg_actions": float(action_counts.mean().item()),
             "final_no_trade_rate": float(no_trade_rate),
         },
@@ -1338,6 +1396,26 @@ def build_torchrl_evaluation_output(
             "net_pnl": net_pnl.cpu(),
             "action_counts": action_counts.cpu(),
         },
+    }
+
+
+def build_torchrl_evaluation_output(
+    state: Dict[str, Any],
+    terminal_transition: Dict[str, Any],
+    action_counts: torch.Tensor,
+    no_trade_rate: float,
+    bundle: Dict[str, Any],
+    *,
+    trainer_type: str,
+    rollout_diagnostics: Optional[Dict[str, Any]] = None,
+    no_trade_reference: Optional[Dict[str, Any]] = None,
+    timing: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    policy_summary = _terminal_evaluation_summary(state, terminal_transition, action_counts, no_trade_rate, bundle)
+    num_paths = int(policy_summary["final_state"]["net_pnl"].shape[0])
+    evaluation_output = {
+        "metrics": policy_summary["metrics"],
+        "final_state": policy_summary["final_state"],
         "diagnostics": {
             "num_episodes": num_paths,
             "num_batches": int(bundle.get("meta", {}).get("num_batches", 1)),
@@ -1347,6 +1425,35 @@ def build_torchrl_evaluation_output(
         },
         "timing": dict(timing or {}),
     }
+    if no_trade_reference is not None:
+        baseline_summary = _terminal_evaluation_summary(
+            no_trade_reference["state"],
+            no_trade_reference["terminal_transition"],
+            no_trade_reference["action_counts"],
+            no_trade_reference["no_trade_rate"],
+            bundle,
+        )
+        evaluation_output["reference"] = {
+            "no_trade": {
+                "metrics": baseline_summary["metrics"],
+                "diagnostics": {
+                    "rollout": _scalar_rollout_diagnostics(no_trade_reference.get("rollout_diagnostics")),
+                },
+            },
+            "policy_minus_no_trade": {
+                metric_name: float(policy_summary["metrics"][metric_name] - baseline_summary["metrics"][metric_name])
+                for metric_name in (
+                    "average_net_pnl",
+                    "average_net_pnl_plus_initial_liability_mtm",
+                    "median_net_pnl",
+                    "worst_net_pnl",
+                    "average_hedge_pnl",
+                    "avg_actions",
+                    "final_no_trade_rate",
+                )
+            },
+        }
+    return evaluation_output
 
 
 def evaluate_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dict[str, Any]:
@@ -1375,6 +1482,12 @@ def evaluate_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> 
         decision_time_indices=evaluation_decision_time_indices,
         decision_interval_business_days=evaluation_decision_interval_business_days,
     )
+    no_trade_rollout = _collect_no_trade_rollout(
+        bundle,
+        runtime,
+        decision_time_indices=evaluation_decision_time_indices,
+        decision_interval_business_days=evaluation_decision_interval_business_days,
+    )
     evaluation_time_seconds = float(time.perf_counter() - evaluation_started)
     evaluation_output = build_torchrl_evaluation_output(
         evaluation_rollout["terminal_transition"]["state"],
@@ -1384,6 +1497,13 @@ def evaluate_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> 
         bundle,
         trainer_type="torchrl_tensor_evaluation",
         rollout_diagnostics=evaluation_rollout.get("rollout_diagnostics"),
+        no_trade_reference={
+            "state": no_trade_rollout["terminal_transition"]["state"],
+            "terminal_transition": no_trade_rollout["terminal_transition"],
+            "action_counts": no_trade_rollout["action_counts"],
+            "no_trade_rate": no_trade_rollout["no_trade_rate"],
+            "rollout_diagnostics": no_trade_rollout.get("rollout_diagnostics"),
+        },
         timing={
             "evaluation_time_seconds": evaluation_time_seconds,
         },
@@ -1409,7 +1529,7 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
 
     sample_state = build_shared_state(bundle, runtime)["policy_features"][:1].to(policy.device)
     sample_output = policy(sample_state)
-    action_features = policy.action_features(sample_output, soft_gate=False)
+    action_features = policy.action_features(sample_output)
     critic = StructuredValueOperator(
         state_dim=int(sample_state.shape[1]),
         action_dim=int(action_features.shape[1]),
@@ -1449,6 +1569,16 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
             for shard_indices in _split_episode_indices(_batch_size_from_bundle(validation_bundle), shard_count)
         ) or (validation_bundle,)
     training_episode_count = _batch_size_from_bundle(train_bundle)
+    greedy_validation_time_indices = tuple(
+        _decision_time_indices(
+            validation_shard,
+            settings,
+            epoch=None,
+            evaluation=True,
+        )
+        for validation_shard in validation_shards
+    )
+    stage_validation_time_indices_cache: Dict[int, Tuple[Tuple[int, ...], ...]] = {}
 
     epoch_rewards = []
     epoch_critic_losses = []
@@ -1456,8 +1586,6 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
     epoch_average_net_pnls = []
     epoch_replay_sizes = []
     epoch_no_trade_rates = []
-    epoch_gate_logit_means = []
-    epoch_gate_open_rates = []
     epoch_mean_abs_trade_deltas = []
     epoch_mean_abs_rebalance_signals = []
     epoch_rollout_times_seconds = []
@@ -1468,7 +1596,6 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
     epoch_greedy_selection_scores = []
     epoch_greedy_average_rewards = []
     epoch_greedy_average_net_pnls = []
-    epoch_greedy_gate_open_rates = []
     epoch_greedy_nonzero_trade_rates = []
     epoch_greedy_mean_abs_trade_deltas = []
     epoch_stage_validation_net_pnls = []
@@ -1490,7 +1617,8 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
         "average_net_pnl": float("-inf"),
         "nonzero_trade_rate": float("-inf"),
     }
-    best_no_trade_policy_state = deepcopy(policy.state_dict())
+    initial_policy_state = _clone_policy_state(policy)
+    best_no_trade_policy_state = initial_policy_state
     best_active_epoch = -1
     best_active_metrics = {
         "selection_score": float("-inf"),
@@ -1498,9 +1626,9 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
         "average_net_pnl": float("-inf"),
         "nonzero_trade_rate": float("-inf"),
     }
-    best_active_policy_state = deepcopy(policy.state_dict())
+    best_active_policy_state = initial_policy_state
     top_checkpoint_candidates = []
-    best_policy_state = deepcopy(policy.state_dict())
+    best_policy_state = initial_policy_state
     evaluation_decision_interval_business_days = _decision_interval_business_days_for_epoch(
         settings,
         None,
@@ -1591,8 +1719,6 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
         epoch_replay_sizes.append(_replay_buffer_total_size(replay_buffer))
         epoch_no_trade_rates.append(float(rollout["no_trade_rate"]))
         rollout_stats = _scalar_rollout_diagnostics(rollout.get("rollout_diagnostics"))
-        epoch_gate_logit_means.append(float(rollout_stats.get("gate_logit_mean", 0.0)))
-        epoch_gate_open_rates.append(float(rollout_stats.get("gate_open_rate", 0.0)))
         epoch_mean_abs_trade_deltas.append(float(rollout_stats.get("mean_abs_trade_delta", 0.0)))
         epoch_mean_abs_rebalance_signals.append(float(rollout_stats.get("mean_abs_rebalance_signal", 0.0)))
         epoch_decision_interval_business_days.append(float(train_decision_interval_business_days))
@@ -1603,8 +1729,14 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
         shard_success_count = 0
         trade_rate_low = float(settings["curriculum_min_trade_rate"])
         trade_rate_high = float(settings["curriculum_max_trade_rate"])
-        for validation_shard in validation_shards:
-            stage_validation_time_indices = _decision_time_indices_for_interval(validation_shard, train_decision_interval_business_days)
+        stage_validation_time_indices_by_shard = stage_validation_time_indices_cache.get(train_decision_interval_business_days)
+        if stage_validation_time_indices_by_shard is None:
+            stage_validation_time_indices_by_shard = tuple(
+                _decision_time_indices_for_interval(validation_shard, train_decision_interval_business_days)
+                for validation_shard in validation_shards
+            )
+            stage_validation_time_indices_cache[train_decision_interval_business_days] = stage_validation_time_indices_by_shard
+        for validation_shard, stage_validation_time_indices in zip(validation_shards, stage_validation_time_indices_by_shard):
             stage_validation_rollout = _collect_structured_rollout(
                 policy,
                 validation_shard,
@@ -1648,13 +1780,8 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
 
         greedy_eval_started = time.perf_counter()
         shard_metrics = []
-        for validation_shard in validation_shards:
-            shard_time_indices = _decision_time_indices(
-                validation_shard,
-                settings,
-                epoch=None,
-                evaluation=True,
-            )
+        current_policy_state = None
+        for validation_shard, shard_time_indices in zip(validation_shards, greedy_validation_time_indices):
             greedy_rollout = _collect_structured_rollout(
                 policy,
                 validation_shard,
@@ -1677,24 +1804,29 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
         epoch_greedy_selection_scores.append(float(greedy_checkpoint_metrics["selection_score"]))
         epoch_greedy_average_rewards.append(float(greedy_checkpoint_metrics["average_reward"]))
         epoch_greedy_average_net_pnls.append(float(greedy_checkpoint_metrics["average_net_pnl"]))
-        epoch_greedy_gate_open_rates.append(float(greedy_checkpoint_metrics["gate_open_rate"]))
         epoch_greedy_nonzero_trade_rates.append(float(greedy_checkpoint_metrics["nonzero_trade_rate"]))
         epoch_greedy_mean_abs_trade_deltas.append(float(greedy_checkpoint_metrics["mean_abs_trade_delta"]))
         if float(greedy_checkpoint_metrics["nonzero_trade_rate"]) <= 0.01:
             if float(greedy_checkpoint_metrics["average_net_pnl"]) > float(best_no_trade_metrics["average_net_pnl"]):
                 best_no_trade_metrics = dict(greedy_checkpoint_metrics)
                 best_no_trade_epoch = int(epoch)
-                best_no_trade_policy_state = deepcopy(policy.state_dict())
+                if current_policy_state is None:
+                    current_policy_state = _clone_policy_state(policy)
+                best_no_trade_policy_state = current_policy_state
         elif _is_better_checkpoint(greedy_checkpoint_metrics, best_active_metrics):
             best_active_metrics = dict(greedy_checkpoint_metrics)
             best_active_epoch = int(epoch)
-            best_active_policy_state = deepcopy(policy.state_dict())
+            if current_policy_state is None:
+                current_policy_state = _clone_policy_state(policy)
+            best_active_policy_state = current_policy_state
         if float(greedy_checkpoint_metrics["nonzero_trade_rate"]) > 0.01:
+            if current_policy_state is None:
+                current_policy_state = _clone_policy_state(policy)
             top_checkpoint_candidates.append(
                 {
                     "epoch": int(epoch),
                     "metrics": dict(greedy_checkpoint_metrics),
-                    "policy_state": deepcopy(policy.state_dict()),
+                    "policy_state": current_policy_state,
                 }
             )
             top_checkpoint_candidates.sort(
@@ -1702,41 +1834,7 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
                 reverse=True,
             )
             top_checkpoint_candidates = top_checkpoint_candidates[: max(int(settings["top_validation_checkpoints"]), 1)]
-
-    shortlisted_candidates = []
-    for candidate in top_checkpoint_candidates:
-        policy.load_state_dict(candidate["policy_state"])
-        rerank_metrics = []
-        for validation_shard in validation_shards:
-            shard_time_indices = _decision_time_indices(
-                validation_shard,
-                settings,
-                epoch=None,
-                evaluation=True,
-            )
-            rerank_rollout = _collect_structured_rollout(
-                policy,
-                validation_shard,
-                runtime,
-                greedy=True,
-                epsilon=0.0,
-                decision_time_indices=shard_time_indices,
-                decision_interval_business_days=evaluation_decision_interval_business_days,
-            )
-            rerank_metrics.append(
-                _checkpoint_selection_metrics(
-                    rerank_rollout,
-                    rerank_rollout["terminal_transition"],
-                    runtime,
-                )
-            )
-        shortlisted_candidates.append(
-            {
-                "epoch": int(candidate["epoch"]),
-                "metrics": _aggregate_checkpoint_metrics(tuple(rerank_metrics)),
-                "policy_state": deepcopy(candidate["policy_state"]),
-            }
-        )
+    shortlisted_candidates = list(top_checkpoint_candidates)
 
     if shortlisted_candidates:
         shortlisted_candidates.sort(
@@ -1744,11 +1842,13 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
             reverse=True,
         )
         top_candidate = shortlisted_candidates[0]
-        net_pnl_tolerance = max(float(settings["curriculum_min_improvement"]), 1.0)
-        candidate_within_tolerance = float(top_candidate["metrics"]["average_net_pnl"]) >= (
+        net_pnl_tolerance = max(4.0 * float(settings["curriculum_min_improvement"]), 1.0)
+        candidate_materially_worse_than_no_trade = float(top_candidate["metrics"]["average_net_pnl"]) < (
             float(no_trade_validation_metrics["average_net_pnl"]) - net_pnl_tolerance
         )
-        if candidate_within_tolerance and _is_better_checkpoint(top_candidate["metrics"], no_trade_validation_metrics):
+        candidate_trade_rate = float(top_candidate["metrics"].get("nonzero_trade_rate", 0.0))
+        candidate_is_active_enough = candidate_trade_rate >= float(settings["curriculum_min_trade_rate"])
+        if candidate_is_active_enough and not candidate_materially_worse_than_no_trade:
             best_checkpoint_metrics = dict(top_candidate["metrics"])
             best_epoch = int(top_candidate["epoch"])
             best_policy_state = deepcopy(top_candidate["policy_state"])
@@ -1777,6 +1877,12 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
         decision_time_indices=evaluation_decision_time_indices,
         decision_interval_business_days=evaluation_decision_interval_business_days,
     )
+    no_trade_rollout = _collect_no_trade_rollout(
+        bundle,
+        runtime,
+        decision_time_indices=evaluation_decision_time_indices,
+        decision_interval_business_days=evaluation_decision_interval_business_days,
+    )
     final_evaluation_time_seconds = float(time.perf_counter() - final_evaluation_started)
     total_fit_time_seconds = float(time.perf_counter() - fit_started)
     evaluation_output = build_torchrl_evaluation_output(
@@ -1787,6 +1893,13 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
         bundle,
         trainer_type="minimal_tensor_actor_critic",
         rollout_diagnostics=evaluation_rollout.get("rollout_diagnostics"),
+        no_trade_reference={
+            "state": no_trade_rollout["terminal_transition"]["state"],
+            "terminal_transition": no_trade_rollout["terminal_transition"],
+            "action_counts": no_trade_rollout["action_counts"],
+            "no_trade_rate": no_trade_rollout["no_trade_rate"],
+            "rollout_diagnostics": no_trade_rollout.get("rollout_diagnostics"),
+        },
         timing={
             "rollout_time_seconds": float(sum(epoch_rollout_times_seconds)),
             "replay_storage_time_seconds": float(sum(epoch_replay_storage_times_seconds)),
@@ -1809,15 +1922,12 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
             "epoch_actor_losses": epoch_actor_losses,
             "epoch_average_net_pnls": epoch_average_net_pnls,
             "epoch_no_trade_rates": epoch_no_trade_rates,
-            "epoch_gate_logit_means": epoch_gate_logit_means,
-            "epoch_gate_open_rates": epoch_gate_open_rates,
             "epoch_mean_abs_trade_deltas": epoch_mean_abs_trade_deltas,
             "epoch_mean_abs_rebalance_signals": epoch_mean_abs_rebalance_signals,
             "epoch_decision_interval_business_days": epoch_decision_interval_business_days,
             "epoch_greedy_selection_scores": epoch_greedy_selection_scores,
             "epoch_greedy_average_rewards": epoch_greedy_average_rewards,
             "epoch_greedy_average_net_pnls": epoch_greedy_average_net_pnls,
-            "epoch_greedy_gate_open_rates": epoch_greedy_gate_open_rates,
             "epoch_greedy_nonzero_trade_rates": epoch_greedy_nonzero_trade_rates,
             "epoch_greedy_mean_abs_trade_deltas": epoch_greedy_mean_abs_trade_deltas,
             "epoch_stage_validation_net_pnls": epoch_stage_validation_net_pnls,
@@ -1845,7 +1955,6 @@ def train_torchrl_policy(bundle: Dict[str, Any], runtime: Dict[str, Any]) -> Dic
             "best_average_reward": float(best_checkpoint_metrics["average_reward"]),
             "best_average_net_pnl": float(best_checkpoint_metrics["average_net_pnl"]),
             "best_nonzero_trade_rate": float(best_checkpoint_metrics["nonzero_trade_rate"]),
-            "best_gate_open_rate": float(best_checkpoint_metrics.get("gate_open_rate", 0.0)),
             "best_mean_abs_trade_delta": float(best_checkpoint_metrics.get("mean_abs_trade_delta", 0.0)),
             "replay_size": _replay_buffer_total_size(replay_buffer),
             "active_replay_size": int(len(replay_buffer["active"])),

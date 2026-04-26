@@ -1040,8 +1040,9 @@ class ReferencePrice(Factor1D):
     def get_forwardprice(self):
         return utils.check_rate_name(self.param['ForwardPrice'])
 
-    def get_fixings(self):
-        return self.param['Fixing_Curve']
+    def get_fixings(self, resets_in_excel):
+        return np.interp(
+            resets_in_excel, self.param['Fixing_Curve'].array[:, 0], self.param['Fixing_Curve'].array[:, 1])
 
     def get_tenor(self):
         """Gets the tenor points stored in the Curve attribute"""

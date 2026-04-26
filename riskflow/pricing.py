@@ -2549,33 +2549,42 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
     # first precalc all past resets
     resets = factor_dep['Cashflows'].get_resets(shared.one)
     known_resets = resets.known_resets(shared.simulation_batch)
-    sim_resets = resets.schedule[(resets.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
-                                 (resets.schedule[:, utils.RESET_INDEX_Reset_Day] <=
-                                  deal_time[:, utils.TIME_GRID_MTM].max())]
+    sim_resets = resets.schedule[
+        (resets.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+        (resets.schedule[:, utils.RESET_INDEX_Reset_Day] <= deal_time[:, utils.TIME_GRID_MTM].max())]
+    all_fx_spot = utils.calc_fx_cross(
+        factor_dep['ForwardFX'][0], factor_dep['CashFX'][0], sim_resets, shared)
+
     all_resets = utils.calc_time_grid_curve_rate(factor_dep['ForwardPrice'], sim_resets, shared)
-    all_fx_spot = utils.calc_fx_cross(factor_dep['ForwardFX'][0], factor_dep['CashFX'][0],
-                                      sim_resets, shared)
-
-    reset_values = torch.unsqueeze(
-        torch.squeeze(all_resets.gather_weighted_curve(
-            shared, sim_resets[:, utils.RESET_INDEX_End_Day].reshape(-1, 1), multiply_by_time=False),
-            dim=1) * all_fx_spot, dim=1) \
-        if sim_resets.any() else shared.fillvalue
-
-    old_resets = torch.squeeze(
-        torch.cat([torch.stack(known_resets), reset_values], dim=0) if known_resets else reset_values, dim=1)
-
     forwards = utils.calc_time_grid_curve_rate(factor_dep['ForwardPrice'], deal_time, shared)
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
 
+    if 'Commodity' in factor_dep:
+        # the idea here is to use the carry from the forward curve but use the spot from the commodity
+        forward_t = factor_dep['ForwardStart'][deal_data.Time_dep.deal_time_grid]
+        comm_resets = utils.calc_time_grid_spot_rate (factor_dep['Commodity'], sim_resets, shared)
+        comm_values = comm_resets * all_fx_spot if sim_resets.any() else shared.fillvalue
+        old_resets = torch.squeeze(
+            torch.cat([torch.stack(known_resets), comm_values], dim=0) if known_resets else comm_values, dim=1)
+        comm = utils.calc_time_grid_spot_rate(
+            factor_dep['Commodity'], deal_time, shared).unsqueeze(1)/forwards.gather_weighted_curve(
+            shared, forward_t.reshape(-1, 1), multiply_by_time=False)
+    else:
+        reset_samples = all_resets.gather_weighted_curve(
+            shared, sim_resets[:, utils.RESET_INDEX_End_Day].reshape(-1, 1), multiply_by_time=False)
+        reset_values = torch.unsqueeze(
+            torch.squeeze(reset_samples, dim=1) * all_fx_spot, dim=1) \
+            if sim_resets.any() else shared.fillvalue
+        old_resets = torch.squeeze(
+            torch.cat([torch.stack(known_resets), reset_values], dim=0) if known_resets else reset_values, dim=1)
+        comm = shared.one.expand(deal_time.shape[0], 1, shared.simulation_batch)
+
     start_index, start_counts = np.unique(cash_start_idx, return_counts=True)
 
-    for index, (forward_block, discount_block) in enumerate(utils.split_counts(
-            [forwards, discounts], start_counts, shared)):
+    for index, (forward_block, discount_block, comm_block) in enumerate(utils.split_counts(
+            [forwards, discounts, comm], start_counts, shared)):
 
-        # cashflows = factor_dep['Cashflows'].schedule[start_index[index]:]
         cashflows = factor_dep['Cashflows'].merged(shared.one, start_index[index])
-        # cash_offset = factor_dep['Cashflows'].offsets[start_index[index]:]
 
         cash_pmts, cash_index, cash_counts = np.unique(
             cashflows.np[:, utils.CASHFLOW_INDEX_Pay_Day], return_index=True, return_counts=True)
@@ -2599,11 +2608,12 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
         # we need to split the forward block further
         forward_blocks = forward_block.split_counts(
             reset_count, shared) if len(reset_count) > 1 else [forward_block]
+        comm_blocks = torch.split(comm_block, tuple(reset_count)) if len(reset_count) > 1 else [comm_block]
 
         # empty list for payments
         payments = []
 
-        for offset, size, forward_rates in zip(*[reset_ofs, reset_count, forward_blocks]):
+        for offset, size, forward_rates, comm_rates in zip(*[reset_ofs, reset_count, forward_blocks, comm_blocks]):
             # past resets
             past_resets = torch.unsqueeze(
                 old_resets[reset_offset:reset_offset + offset], dim=0).expand(size, -1, -1)
@@ -2613,11 +2623,11 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
 
             if future_ends.any():
                 future_resets = forward_rates.gather_weighted_curve(
-                    shared, future_ends, multiply_by_time=False)
+                    shared, future_ends, multiply_by_time=False) * comm_rates
 
                 forwardfx = utils.calc_fx_forward(
                     factor_dep['ForwardFX'], factor_dep['CashFX'],
-                    reset_block.np[offset:, utils.RESET_INDEX_Start_Day],
+                    reset_block.np[offset:, utils.RESET_INDEX_Reset_Day],
                     discounts.time_grid[time_ofs:time_ofs + size], shared)
 
                 all_resets = torch.cat([past_resets, future_resets * forwardfx], dim=1)
