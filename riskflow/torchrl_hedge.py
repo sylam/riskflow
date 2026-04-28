@@ -144,6 +144,8 @@ def _refresh_state_views(state, bundle, runtime, time_index):
         "margin_accounts": refreshed["margin_accounts"],
         "realized_pnl": refreshed["realized_pnl"],
         "variation_margin": refreshed["variation_margin"],
+        "cumulative_pnl": refreshed.get("cumulative_pnl", _zeros_by_name(_runtime_names(runtime, "hedges"), int(policy_features.shape[0]), device=policy_features.device)),
+        "time_held": refreshed.get("time_held", _zeros_by_name(_runtime_names(runtime, "hedges"), int(policy_features.shape[0]), device=policy_features.device)),
         "settlement_prices": refreshed["settlement_prices"],
         "tradable_values": tradable_values,
         "entity_state": entity_state,
@@ -312,6 +314,15 @@ def _should_terminal_flatten(runtime, current, last):
     return bool(runtime.get("accounting", {}).get("force_flat_at_end", False)) and current >= last - 1
 
 
+def _step_time_held(time_held, next_positions):
+    # Increment time-held counter where position is non-zero, reset where it returned to zero.
+    out = {}
+    for name, prev in time_held.items():
+        active = next_positions[name].abs() > 0
+        out[name] = torch.where(active, prev + 1.0, torch.zeros_like(prev))
+    return out
+
+
 def _zero_futures_flows(state, runtime):
     batch_size = int(state["done"].shape[0])
     device = state["done"].device
@@ -362,6 +373,8 @@ def build_shared_state(bundle, runtime):
         "margin_accounts": margin_accounts,
         "realized_pnl": _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device),
         "variation_margin": _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device),
+        "cumulative_pnl": _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device),
+        "time_held": _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device),
         "cumulative_liability_value": torch.zeros(batch_size, dtype=torch.float32, device=device),
         "settlement_prices": settlement_prices,
     }
@@ -390,6 +403,9 @@ def cash_account_step(state, action, bundle, runtime):
         next_positions[n] = next_positions[n] + delta
     if _should_terminal_flatten(runtime, current, last):
         _flatten_cash_inventory(next_positions, next_cash, _current_tradable_values(bundle, runtime, last), runtime)
+    # cash-account mode: no daily VM. cumulative_pnl unchanged here.
+    next_cumulative_pnl = _clone_tensor_dict(state["cumulative_pnl"])
+    next_time_held = _step_time_held(state["time_held"], next_positions)
     next_state = {
         "done": state["done"],
         "positions": next_positions,
@@ -397,6 +413,8 @@ def cash_account_step(state, action, bundle, runtime):
         "margin_accounts": _clone_tensor_dict(state["margin_accounts"]),
         "realized_pnl": _clone_tensor_dict(state["realized_pnl"]),
         "variation_margin": _clone_tensor_dict(state["variation_margin"]),
+        "cumulative_pnl": next_cumulative_pnl,
+        "time_held": next_time_held,
         "cumulative_liability_value": state["cumulative_liability_value"].clone(),
         "settlement_prices": _clone_tensor_dict(state["settlement_prices"]),
     }
@@ -442,6 +460,8 @@ def futures_account_step(state, action, bundle, runtime):
         _apply_account_flow(next_margin, account, -cost)
     if _should_terminal_flatten(runtime, current, last):
         _flatten_futures_inventory(next_positions, next_cash, next_margin, next_settlement, runtime)
+    next_cumulative_pnl = {n: state["cumulative_pnl"][n] + variation_margin[n] for n in state["cumulative_pnl"]}
+    next_time_held = _step_time_held(state["time_held"], next_positions)
     next_state = {
         "done": torch.full_like(state["done"], settlement_idx >= last, dtype=torch.bool),
         "positions": next_positions,
@@ -450,6 +470,8 @@ def futures_account_step(state, action, bundle, runtime):
         "margin_accounts": next_margin,
         "realized_pnl": realized_pnl,
         "variation_margin": variation_margin,
+        "cumulative_pnl": next_cumulative_pnl,
+        "time_held": next_time_held,
         "cumulative_liability_value": state["cumulative_liability_value"].clone(),
     }
     refreshed = _refresh_state_views(next_state, bundle, runtime, settlement_idx)
@@ -514,7 +536,11 @@ def _decision_time_indices(bundle, settings, *, epoch, evaluation):
     if dates.empty:
         return tuple()
     last = max(len(dates) - 1, 0)
-    business = [i for i, d in enumerate(dates[:last]) if _is_business_date(d, bundle)]
+    days = bundle["time_grid_days"].detach().cpu().to(dtype=torch.int64).tolist()
+    business = [
+        i for i, d in enumerate(dates[:last])
+        if _is_business_date(d, bundle) and int(days[i]) >= 0
+    ]
     if not business:
         return tuple()
     interval = max(_decision_interval_business_days_for_epoch(settings, epoch, evaluation=evaluation), 1)

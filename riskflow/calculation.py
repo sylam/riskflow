@@ -43,6 +43,7 @@ from .pricing import SensitivitiesEstimator
 from . import utils, pricing, construct_instrument
 from .hedge_runtime import construct_torchrl_runtime
 from .torchrl_hedge import run_torchrl_execution
+from .hedge_features import compute_cross_delta, compute_spot_zscore
 
 
 class Aggregation(object):
@@ -1695,7 +1696,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             },
         )
 
-    def _build_torchrl_bundle(self, base_date, business_day, time_grid_days, tradable_blocks, factor_tensor_blocks, hedge_profile_blocks, num_batches):
+    def _build_torchrl_bundle(self, base_date, business_day, time_grid_days, tradable_blocks, factor_tensor_blocks, hedge_profile_blocks, num_batches, runtime=None):
         def pad_time_axis(tensor, target_steps):
             current_steps = int(tensor.shape[0])
             if current_steps >= target_steps:
@@ -1765,7 +1766,71 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 currency: pad_time_axis(tensor, aligned_time_steps)
                 for currency, tensor in realized_cashflows.items()
             }
+        if runtime is not None:
+            self._prepend_history_prefix(bundle, runtime, base_date)
+        bundle['cross_delta'] = compute_cross_delta(bundle)
+        bundle['spot_zscore'] = compute_spot_zscore(bundle)
         return bundle
+
+    @staticmethod
+    def _prepend_history_prefix(bundle, runtime, base_date):
+        """Prepend H rows of realized history to all time-axis tensors in the bundle so that
+        rolling-window features at sim-day-0 already have a populated lookback. Historical rows
+        are broadcast across the batch dim (one realized series per commodity).
+
+        Adds bundle['spot_price_history'][commodity] of shape (H, B) — broadcast historical spot.
+        Adjusts bundle['time_grid_days'], bundle['tradables'][name], bundle['liability_mtm'],
+        bundle['realized_cashflows'][currency], bundle['legs']['features'], bundle['factors'][name].
+        """
+        H = int(runtime.get('history_lookback_business_days', 0))
+        spot_history = (runtime.get('portfolio_state') or {}).get('spot_price_history') or {}
+        if H <= 0 or not spot_history:
+            return
+        device = bundle['time_grid_days'].device
+        dtype = bundle['time_grid_days'].dtype
+        base_ts = pd.Timestamp(base_date)
+        any_tradable = next(iter(bundle['tradables'].values())) if bundle.get('tradables') else None
+        batch_size = int(any_tradable.shape[1]) if any_tradable is not None else 1
+        # Use the first available commodity history as the reference timeline; spot histories share dates by spec.
+        ref_commodity = next(iter(spot_history))
+        ref_dates = spot_history[ref_commodity]['dates'][-H:]
+        prefix_days = torch.tensor(
+            [int((d - base_ts).days) for d in ref_dates],
+            dtype=dtype, device=device,
+        )
+        bundle['time_grid_days'] = torch.cat([prefix_days, bundle['time_grid_days']], dim=0)
+        # Broadcast each commodity's last-H historical spot to a (H, B) tensor
+        commodity_history_tensors = {}
+        for commodity, payload in spot_history.items():
+            prices = torch.tensor(payload['prices'][-H:], dtype=torch.float32, device=device)
+            commodity_history_tensors[commodity] = prices.unsqueeze(1).expand(-1, batch_size).contiguous()
+        bundle['spot_price_history'] = commodity_history_tensors
+        # Pick the reference commodity's broadcast history as the per-tradable price prefix
+        ref_history = commodity_history_tensors[ref_commodity]
+        new_tradables = {}
+        for name, tensor in bundle['tradables'].items():
+            new_tradables[name] = torch.cat([ref_history.to(dtype=tensor.dtype), tensor], dim=0)
+        bundle['tradables'] = new_tradables
+        if bundle.get('liability_mtm') is not None:
+            mtm = bundle['liability_mtm']
+            mtm_prefix = mtm[:1].expand(H, -1).contiguous()
+            bundle['liability_mtm'] = torch.cat([mtm_prefix, mtm], dim=0)
+        if bundle.get('realized_cashflows'):
+            new_cf = {}
+            for currency, tensor in bundle['realized_cashflows'].items():
+                cf_prefix = torch.zeros((H,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+                new_cf[currency] = torch.cat([cf_prefix, tensor], dim=0)
+            bundle['realized_cashflows'] = new_cf
+        if bundle.get('legs') is not None and bundle['legs'].get('features') is not None:
+            feats = bundle['legs']['features']
+            feats_prefix = feats[:1].expand((H,) + tuple(feats.shape[1:])).contiguous()
+            bundle['legs']['features'] = torch.cat([feats_prefix, feats], dim=0)
+        if bundle.get('factors'):
+            new_factors = {}
+            for factor_name, tensor in bundle['factors'].items():
+                f_prefix = tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous()
+                new_factors[factor_name] = torch.cat([f_prefix, tensor], dim=0)
+            bundle['factors'] = new_factors
 
     def update_factors(self, params, base_date, job_id, num_jobs):
         """Override: build dependent_factors from the generic Scenario_Factors JSON dict."""
@@ -1937,6 +2002,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             factor_tensor_blocks,
             hedge_profile_blocks,
             params['Simulation_Batches'],
+            runtime=normalized_runtime,
         )
         evaluation_summary = None
         optimizer_diagnostics = None

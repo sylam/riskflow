@@ -207,6 +207,7 @@ if __name__=='__main__':
                 "Calendar": "Chicago",
                 "Execution_Mode": "optimize_policy",
                 "Hedging_Problem": {
+                    "History_Lookback_Business_Days": 30,
                     "Tradable_Instruments": {
                         "CommodityFutureDeal": {
                             "PL_APR_2026": {
@@ -271,6 +272,50 @@ if __name__=='__main__':
                             "PL_OCT_2026": {
                                 "Method": "per_contract",
                                 "Amount": 9500.0
+                            }
+                        },
+                        "Spot_Price_History": {
+                            "PLATINUM": {
+                                "Dates": [
+                                    {".Timestamp": "2026-02-26"},
+                                    {".Timestamp": "2026-02-27"},
+                                    {".Timestamp": "2026-03-02"},
+                                    {".Timestamp": "2026-03-03"},
+                                    {".Timestamp": "2026-03-04"},
+                                    {".Timestamp": "2026-03-05"},
+                                    {".Timestamp": "2026-03-06"},
+                                    {".Timestamp": "2026-03-09"},
+                                    {".Timestamp": "2026-03-10"},
+                                    {".Timestamp": "2026-03-11"},
+                                    {".Timestamp": "2026-03-12"},
+                                    {".Timestamp": "2026-03-13"},
+                                    {".Timestamp": "2026-03-16"},
+                                    {".Timestamp": "2026-03-17"},
+                                    {".Timestamp": "2026-03-18"},
+                                    {".Timestamp": "2026-03-19"},
+                                    {".Timestamp": "2026-03-20"},
+                                    {".Timestamp": "2026-03-23"},
+                                    {".Timestamp": "2026-03-24"},
+                                    {".Timestamp": "2026-03-25"},
+                                    {".Timestamp": "2026-03-26"},
+                                    {".Timestamp": "2026-03-27"},
+                                    {".Timestamp": "2026-03-30"},
+                                    {".Timestamp": "2026-03-31"},
+                                    {".Timestamp": "2026-04-01"},
+                                    {".Timestamp": "2026-04-02"},
+                                    {".Timestamp": "2026-04-06"},
+                                    {".Timestamp": "2026-04-07"},
+                                    {".Timestamp": "2026-04-08"},
+                                    {".Timestamp": "2026-04-09"}
+                                ],
+                                "Prices": [
+                                    1987.4, 1984.6, 1981.2, 1979.3, 1998.3,
+                                    1996.0, 1958.2, 1967.6, 1961.7, 1957.2,
+                                    1961.1, 1968.0, 1998.8, 2016.8, 2020.7,
+                                    2002.4, 1977.0, 1984.3, 2019.1, 2021.2,
+                                    2019.4, 2034.4, 1996.9, 1989.8, 2003.5,
+                                    2027.3, 2021.9, 2032.9, 2040.4, 2062.2
+                                ]
                             }
                         }
                     },
@@ -352,9 +397,9 @@ if __name__=='__main__':
                         "Transaction_Cost_Per_Unit": 0.0,
                         "Bid_Offer_Spread_Bps": 10.0,
                         "Position_Limits": {
-                            "PL_APR_2026": {"Min_Position": -50, "Max_Position": 0},
+                            "PL_APR_2026": {"Min_Position": 0, "Max_Position": 0},
                             "PL_JUL_2026": {"Min_Position": -50, "Max_Position": 0},
-                            "PL_OCT_2026": {"Min_Position": -50, "Max_Position": 0}
+                            "PL_OCT_2026": {"Min_Position": 0, "Max_Position": 0}
                         }
                     },
                     "Optimizer": {
@@ -366,11 +411,11 @@ if __name__=='__main__':
                         "GAE_Lambda": 0.95,
                         "Learning_Rate": 0.0003,
                         "Clip_Eps": 0.2,
-                        "Value_Coef": 0.5,
-                        "Entropy_Coef": 0.01,
+                        "Value_Coef": 0.1,
+                        "Entropy_Coef": 0.001,
                         "Max_Grad_Norm": 0.5,
-                        "Reward_Scale": 1.0e-7,
-                        "Dense_Tracking_Reward_Scale": 0.0,
+                        "Reward_Scale": 1.0e-6,
+                        "Dense_Tracking_Reward_Scale": 2.0,
                         "Dense_Tracking_Reward_Clip": 0.15,
                         "Validation_Fraction": 0.25,
                         "Validation_Min_Batch": 512,

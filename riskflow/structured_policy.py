@@ -41,6 +41,11 @@ def _vocab_size(registry, name):
     return max(int(len(registry.get(name, {}))), 1)
 
 
+def _sanitize_features(features):
+    sanitized = torch.nan_to_num(features.to(dtype=torch.float32), nan=0.0, posinf=1.0e6, neginf=-1.0e6)
+    return (torch.sign(sanitized) * torch.log1p(sanitized.abs())).clamp(min=-16.0, max=16.0)
+
+
 class _EntityEncoder(nn.Module):
     def __init__(self, feature_dim, id_vocabs, emb_dim, token_dim, type_id):
         super().__init__()
@@ -54,6 +59,7 @@ class _EntityEncoder(nn.Module):
         self.register_buffer('type_id', torch.tensor(int(type_id), dtype=torch.long), persistent=False)
 
     def forward(self, features, ids):
+        features = _sanitize_features(features)
         emb_parts = [emb(ids[..., i]) for i, emb in enumerate(self.embeddings)]
         x = torch.cat([features] + emb_parts, dim=-1) if emb_parts else features
         return self.mlp(x)
@@ -70,7 +76,7 @@ class _GlobalEncoder(nn.Module):
         self.register_buffer('type_id', torch.tensor(int(type_id), dtype=torch.long), persistent=False)
 
     def forward(self, features):
-        return self.mlp(features).unsqueeze(1)
+        return self.mlp(_sanitize_features(features)).unsqueeze(1)
 
 
 class _EntityTransformer(nn.Module):
@@ -156,8 +162,6 @@ class StructuredRebalancePolicy(nn.Module):
         # Per-instrument categorical: each instrument has (max - min + 1) discrete trade actions.
         self._action_bins = tuple(int(hi) - int(lo) + 1 for lo, hi in zip(action_space.min_trade_delta, action_space.max_trade_delta))
         self._max_bins = max(self._action_bins) if self._action_bins else 1
-        # warm-start: bias initial logits so "no-trade" (action_delta=0) is the dominant bin.
-        no_trade_bins = tuple(-int(lo) for lo in action_space.min_trade_delta)
 
         self.backbone = _EntityTransformer(entity_layout, self.token_dim, self.emb_dim, self.n_heads, self.n_layers).to(self.device)
         self.policy_head = nn.Sequential(
@@ -165,13 +169,12 @@ class StructuredRebalancePolicy(nn.Module):
             nn.GELU(),
             nn.Linear(self.token_dim, self._max_bins),
         ).to(self.device)
-        # zero weights, bias initial logits toward no-trade
+        # uniform-init logits (zero weights, zero bias). prior init had a +0.5 bias on the no-trade
+        # bin which biased deterministic argmax toward no-trade and trapped weak-gradient runs into
+        # a no-trade attractor at evaluation time even when training rollouts were exploring.
         with torch.no_grad():
             self.policy_head[-1].weight.zero_()
             self.policy_head[-1].bias.zero_()
-            for instr_idx, no_trade_bin in enumerate(no_trade_bins):
-                if 0 <= no_trade_bin < self._max_bins:
-                    self.policy_head[-1].bias[no_trade_bin] = 0.5
         self.value_head = nn.Sequential(
             nn.Linear(self.token_dim * 4, self.token_dim),
             nn.GELU(),

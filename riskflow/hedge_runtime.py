@@ -215,8 +215,72 @@ def _normalize_position_limits(evaluator_config: Mapping[str, Any]) -> Dict[str,
     return position_limits
 
 
-def _normalize_portfolio_state(hedging_problem: Mapping[str, Any]) -> Dict[str, Any]:
+def _normalize_spot_price_history(
+    hedging_problem: Mapping[str, Any],
+    lookback: int,
+    referenced_commodities: tuple,
+) -> Dict[str, Dict[str, Any]]:
     state = hedging_problem.get("Portfolio_State") or {}
+    raw_history = state.get("Spot_Price_History") or {}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for commodity, payload in raw_history.items():
+        commodity_name = str(commodity)
+        dates_raw = payload.get("Dates", ())
+        prices_raw = payload.get("Prices", ())
+        if len(dates_raw) != len(prices_raw):
+            raise ValueError(
+                f"Spot_Price_History['{commodity_name}']: Dates and Prices must have equal length "
+                f"({len(dates_raw)} vs {len(prices_raw)})"
+            )
+        if len(dates_raw) < lookback:
+            raise ValueError(
+                f"Spot_Price_History['{commodity_name}']: needs at least "
+                f"History_Lookback_Business_Days={lookback} entries, got {len(dates_raw)}"
+            )
+        dates = tuple(_as_timestamp(d) for d in dates_raw)
+        for i in range(1, len(dates)):
+            if dates[i] <= dates[i - 1]:
+                raise ValueError(
+                    f"Spot_Price_History['{commodity_name}']: Dates must be strictly ascending; "
+                    f"found {dates[i - 1]} >= {dates[i]} at index {i}"
+                )
+        prices = tuple(float(p) for p in prices_raw)
+        normalized[commodity_name] = {"dates": dates, "prices": prices}
+    missing = tuple(c for c in referenced_commodities if c not in normalized)
+    if missing:
+        raise ValueError(
+            f"Spot_Price_History missing entries for referenced commodities: {missing}"
+        )
+    return normalized
+
+
+def _collect_referenced_commodities(
+    liabilities: Mapping[str, Mapping[str, Any]],
+    tradables: Mapping[str, Mapping[str, Any]],
+) -> tuple:
+    referenced: list = []
+    for entry in liabilities.values():
+        params = entry.get("params") or {}
+        for key in ("Commodity", "Reference_Type"):
+            value = params.get(key)
+            if value is not None and str(value) not in referenced:
+                referenced.append(str(value))
+    for entry in tradables.values():
+        params = entry.get("params") or {}
+        value = params.get("Commodity")
+        if value is not None and str(value) not in referenced:
+            referenced.append(str(value))
+    return tuple(referenced)
+
+
+def _normalize_portfolio_state(
+    hedging_problem: Mapping[str, Any],
+    *,
+    lookback: int,
+    referenced_commodities: tuple,
+) -> Dict[str, Any]:
+    state = hedging_problem.get("Portfolio_State") or {}
+    spot_history = _normalize_spot_price_history(hedging_problem, lookback, referenced_commodities)
     return {
         "positions": {str(name): float(value) for name, value in state.get("Positions", {}).items()},
         "cash_balances": {str(name): float(value) for name, value in state.get("Cash_Balances", {}).items()},
@@ -226,6 +290,7 @@ def _normalize_portfolio_state(hedging_problem: Mapping[str, Any]) -> Dict[str, 
             str(name): {"method": str(spec["Method"]), "amount": float(spec["Amount"])}
             for name, spec in state.get("Initial_Margin", {}).items()
         },
+        "spot_price_history": spot_history,
     }
 
 
@@ -319,6 +384,10 @@ def construct_torchrl_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:
         "action_instruments": tuple(policy["action_space"]["instrument_order"]),
         "liabilities": tuple(liabilities.keys()),
     }
+    history_lookback = int(hedging_problem.get("History_Lookback_Business_Days", 30))
+    if history_lookback < 0:
+        raise ValueError("Hedging_Problem.History_Lookback_Business_Days must be non-negative")
+    referenced_commodities = _collect_referenced_commodities(liabilities, normalized_tradables)
     runtime = {
         "execution_mode": execution_mode,
         "accounting_mode": accounting_mode,
@@ -328,7 +397,12 @@ def construct_torchrl_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:
         "objective": _normalize_objective_config(objective_config),
         "policy": policy,
         "optimizer": _normalize_optimizer_config(optimizer_config),
-        "portfolio_state": _normalize_portfolio_state(hedging_problem),
+        "history_lookback_business_days": history_lookback,
+        "portfolio_state": _normalize_portfolio_state(
+            hedging_problem,
+            lookback=history_lookback,
+            referenced_commodities=referenced_commodities,
+        ),
         "accounting": {
             "position_limits": position_limits,
             "cash_accounts": {
