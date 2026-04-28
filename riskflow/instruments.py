@@ -23,6 +23,7 @@ from functools import reduce
 
 # utility functions and constants
 from . import utils, pricing
+from .hedge_features import LEG_FEATURE_NAMES, LEG_ID_NAMES
 
 # specific modules
 import numpy as np
@@ -392,18 +393,7 @@ class Deal(object):
 
     def build_features(self, shared, time_grid, deal_data):
         try:
-            # generate the theo price
-            features =  self.hedge_features(shared, time_grid, deal_data)
-            liability_mtm = self.generate(shared, time_grid, deal_data)
-            padding_needed = time_grid.mtm_time_grid.size - deal_data.Time_dep.interp.size
-            features['features'] = F.pad(
-                features['features'], [0, 0, 0, 0, 0, padding_needed])
-            # need to normalize the cash accounts too
-            for ccy, payoff in features['liability_cashflows'].items():
-                features['liability_cashflows'][ccy] = F.pad(payoff, [0, 0, 0, padding_needed])
-            features['liability_mtm'] = F.pad(liability_mtm, [0, 0, 0, padding_needed])
-            return features
-
+            return self.hedge_features(shared, time_grid, deal_data)
         except Exception as e:
             logging.critical('Deal {} skipped - {}'.format(
                 deal_data.Instrument.field.get("Reference"), e.args))
@@ -4775,54 +4765,49 @@ class FloatingEnergyDeal(Deal):
         return pricing.pv_energy_leg(shared, time_grid, deal_data)
 
     def hedge_features(self, shared, time_grid, deal_data):
-        m = pricing.pv_energy_leg(shared, time_grid, deal_data)
-        deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        strike = deal_data.Instrument.field['Strike_Price'] * shared.one
-        spot = utils.calc_time_grid_spot_rate(deal_data.Factor_dep['Commodity'], deal_time, shared)
+        cashflows = deal_data.Factor_dep['Cashflows']
+        schedule = cashflows.schedule
+        t_days = time_grid.mtm_time_grid
 
-        discounts = utils.calc_time_grid_curve_rate(deal_data.Factor_dep['Discount'], deal_time, shared)
-        units = self.field.get('Units', 1.0)
+        period_start = schedule[:, utils.CASHFLOW_INDEX_Start_Day]
+        period_end = schedule[:, utils.CASHFLOW_INDEX_End_Day]
+        payment = schedule[:, utils.CASHFLOW_INDEX_Pay_Day]
+        signed_volume = schedule[:, utils.CASHFLOW_INDEX_Nominal]
+        fixed_basis = schedule[:, utils.CASHFLOW_INDEX_Strike]
+        period_length = np.maximum(period_end - period_start, 1.0)
 
-        intrinsic_value = torch.clamp(option_type * (spot - strike), min=0.0) * units
-        signed_intrinsic = intrinsic_value * deal_data.Factor_dep['Buy_Sell']
+        time_to_period_start = np.maximum(period_start[None, :] - t_days[:, None], 0.0) / utils.DAYS_IN_YEAR
+        time_to_period_end = np.maximum(period_end[None, :] - t_days[:, None], 0.0) / utils.DAYS_IN_YEAR
+        time_to_payment = np.maximum(payment[None, :] - t_days[:, None], 0.0) / utils.DAYS_IN_YEAR
+        accumulation_fraction = np.clip(
+            (t_days[:, None] - period_start[None, :]) / period_length[None, :], 0.0, 1.0)
 
-        daycount = deal_data.Factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
-        time_to_expiry_years = torch.clamp(
-            torch.as_tensor(
-                daycount(deal_data.Factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]),
-                dtype=spot.dtype,
-                device=spot.device,
-            ),
-            min=0.0,
-        ).reshape(-1, 1).expand_as(spot)
-        min_feature_value = torch.finfo(spot.dtype).tiny
+        mtm = self.calculate(shared, time_grid, deal_data)
+        T, B = mtm.shape
 
-        initial_spot = torch.clamp(spot[:1], min=min_feature_value)
-        safe_spot = torch.clamp(spot, min=min_feature_value)
-        safe_forward_strike = torch.clamp(forward / strike, min=min_feature_value)
-        safe_intrinsic_ratio = torch.clamp(intrinsic_value / safe_spot, min=min_feature_value)
-        feature_names = (
-            'log_underlying',
-            'log_forward_strike',
-            'log_intrinsic_value',
-            'time_to_expiry_years'
+        static = torch.tensor(
+            np.stack([fixed_basis, signed_volume], axis=-1),
+            dtype=mtm.dtype, device=mtm.device,
         )
-        features = torch.stack(
-            (
-                torch.log(safe_spot / initial_spot),
-                torch.log(safe_forward_strike),
-                torch.log(safe_intrinsic_ratio),
-                time_to_expiry_years
-            ),
-            dim=-1,
+        dynamic = torch.tensor(
+            np.stack([time_to_period_start, time_to_period_end, time_to_payment, accumulation_fraction], axis=-1),
+            dtype=mtm.dtype, device=mtm.device,
         )
-        liability_cashflows = torch.zeros_like(spot)
-        liability_cashflows[-1] = signed_intrinsic[-1]
+        features = torch.cat([static.unsqueeze(0).expand(T, -1, -1), dynamic], dim=-1)
+        features = features.unsqueeze(1).expand(T, B, -1, -1).contiguous()
+
+        payoff_currency = str(self.field.get('Payoff_Currency') or self.field['Currency'])
+        underlying = str(self.field['Commodity'])
+        ids = [(payoff_currency, underlying, 'energy_floating')] * cashflows.count()
 
         return {
-            'feature_names': feature_names,
-            'features': features,
-            'liability_cashflows': {deal_data.Factor_dep['SettleCurrency']: liability_cashflows}
+            'legs': {
+                'features': features,
+                'ids': ids,
+                'feature_names': LEG_FEATURE_NAMES,
+                'id_names': LEG_ID_NAMES,
+            },
+            'mtm': mtm,
         }
 
 

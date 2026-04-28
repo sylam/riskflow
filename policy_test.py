@@ -329,21 +329,15 @@ if __name__=='__main__':
                                 -10, -10, -10
                             ],
                             "Max_Trade_Delta": [
-                                0, 0, 0
+                                10, 10, 10
                             ]
                         },
                         "Model": {
-                            "Object": "MLP",
-                            "Hidden_Layers": [
-                                64,
-                                64
-                            ],
-                            "Activation": "ReLU",
-                            "Output_Heads": {
-                                "Trade_Deltas": {
-                                    "Object": "TanhDeltaHead"
-                                }
-                            }
+                            "Object": "EntityTransformer",
+                            "Token_Dim": 64,
+                            "Emb_Dim": 8,
+                            "N_Heads": 4,
+                            "N_Layers": 2
                         }
                     },
                     "Evaluator": {
@@ -364,60 +358,35 @@ if __name__=='__main__':
                         }
                     },
                     "Optimizer": {
-                        "Object": "DQN",
+                        "Object": "PPO",
                         "Epochs": 30,
-                        "Replay_Capacity": 20000,
-                        "Batch_Size": 128,
+                        "PPO_Epochs": 4,
+                        "Minibatch_Size": 8192,
                         "Gamma": 0.99,
-                        "Learning_Rate": 0.0005,
-                        "Epsilon_Start": 1.0,
-                        "Epsilon_End": 0.1,
-                        "Epsilon_Decay_Epochs": 24,
-                        "Target_Update_Interval": 5,
-                        "Gradient_Steps_Per_Epoch": 12,
-                        "Dense_Tracking_Reward_Scale": 0.5,
+                        "GAE_Lambda": 0.95,
+                        "Learning_Rate": 0.0003,
+                        "Clip_Eps": 0.2,
+                        "Value_Coef": 0.5,
+                        "Entropy_Coef": 0.01,
+                        "Max_Grad_Norm": 0.5,
+                        "Reward_Scale": 1.0e-7,
+                        "Dense_Tracking_Reward_Scale": 0.0,
                         "Dense_Tracking_Reward_Clip": 0.15,
                         "Validation_Fraction": 0.25,
                         "Validation_Min_Batch": 512,
                         "Validation_Shards": 4,
-                        "Top_Validation_Checkpoints": 3,
-                        "Performance_Gated_Curriculum": true,
-                        "Curriculum_Advance_Patience": 2,
-                        "Curriculum_Min_Improvement": 3.0,
-                        "Curriculum_Min_Trade_Rate": 0.01,
-                        "Curriculum_Max_Trade_Rate": 0.7,
-                        "Turnover_Penalty_Scale": 0.0,
-                        "No_Trade_Reference_Scale": 0.0,
-                        "Replay_Imitation_Weight": 0.01,
-                        "Action_Sparsity_Penalty_Weight": 0.0,
                         "Decision_Interval_Curriculum": [
-                            {
-                                "Start_Epoch": 1,
-                                "End_Epoch": 8,
-                                "Interval_Business_Days": 10
-                            },
-                            {
-                                "Start_Epoch": 9,
-                                "End_Epoch": 16,
-                                "Interval_Business_Days": 5
-                            },
-                            {
-                                "Start_Epoch": 17,
-                                "End_Epoch": 24,
-                                "Interval_Business_Days": 2
-                            },
-                            {
-                                "Start_Epoch": 25,
-                                "End_Epoch": 30,
-                                "Interval_Business_Days": 1
-                            }
+                            {"Start_Epoch": 1, "End_Epoch": 8, "Interval_Business_Days": 10},
+                            {"Start_Epoch": 9, "End_Epoch": 16, "Interval_Business_Days": 5},
+                            {"Start_Epoch": 17, "End_Epoch": 24, "Interval_Business_Days": 2},
+                            {"Start_Epoch": 25, "End_Epoch": 30, "Interval_Business_Days": 1}
                         ],
                         "Seed": 42
                     }
                 }
             },
             "MergeMarketData": {
-                "MarketDataFile": "Z:/MarketDataRF.json",
+                "MarketDataFile": "/media/vretiel/Shared/Data/crstal/MarketDataRF.json",
                 "ExplicitMarketData": {
                     "System Parameters": {
                         "Base_Currency": "USD"
@@ -1186,7 +1155,7 @@ if __name__=='__main__':
                     }
                 }
             },
-            "CalendDataFile": "Z:/calendar.cal"
+            "CalendDataFile": "/media/vretiel/Shared/Data/crstal/AACalendars.cal"
         }
     }
     '''

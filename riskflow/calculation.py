@@ -199,16 +199,22 @@ class DealStructure(object):
         Resolves the Structure
         """
         def merge_features(cumulative, new_features):
-            cumulative['features'] =  new_features['features'] if cumulative.get('features') is None else torch.concat(
-                [cumulative['features'], new_features['features']], 2)
-            cumulative['feature_names'] =  cumulative.setdefault('feature_names', () ) + new_features['feature_names']
-
-            for ccy, payoff  in new_features['liability_cashflows'].items():
-                cum_ccy = cumulative.setdefault('liability_cashflows', {}).setdefault(ccy, shared.one.new_zeros(1, 1))
-                cumulative['liability_cashflows'][ccy] = cum_ccy + payoff
-            cumulative['liability_mtm'] = new_features['liability_mtm'] if cumulative.get('liability_mtm') is None else (
-                cumulative['liability_mtm'] + new_features['liability_mtm']
-            )
+            new_legs = new_features.get('legs')
+            if new_legs is not None:
+                if 'legs' in cumulative:
+                    cumulative['legs']['features'] = torch.cat(
+                        [cumulative['legs']['features'], new_legs['features']], dim=2)
+                    cumulative['legs']['ids'] = cumulative['legs']['ids'] + new_legs['ids']
+                else:
+                    cumulative['legs'] = {
+                        'features': new_legs['features'],
+                        'ids': list(new_legs['ids']),
+                        'feature_names': new_legs['feature_names'],
+                        'id_names': new_legs['id_names'],
+                    }
+            new_mtm = new_features.get('mtm')
+            if new_mtm is not None:
+                cumulative['mtm'] = new_mtm if cumulative.get('mtm') is None else cumulative['mtm'] + new_mtm
 
         accum = {}
 
@@ -1708,19 +1714,21 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             factor_name: torch.cat(blocks, dim=-1)
             for factor_name, blocks in factor_tensor_blocks.items()
         }
-        hedge_profile = None
-        if hedge_profile_blocks and hedge_profile_blocks.get('features'):
-            hedge_profile = {
-                'features': torch.cat(hedge_profile_blocks['features'], dim=1),
-                'feature_names': tuple(hedge_profile_blocks.get('feature_names', ())),
-                'liability_cashflows': {
-                    currency: torch.cat(blocks, dim=1)
-                    for currency, blocks in hedge_profile_blocks.get('liability_cashflows', {}).items()
-                },
-                'liability_mtm': torch.cat(hedge_profile_blocks['liability_mtm'], dim=1),
+        legs_bundle = None
+        if hedge_profile_blocks and hedge_profile_blocks.get('legs_features'):
+            legs_bundle = {
+                'features': torch.cat(hedge_profile_blocks['legs_features'], dim=1),
+                'ids': list(hedge_profile_blocks['legs_ids'] or ()),
+                'feature_names': tuple(hedge_profile_blocks.get('legs_feature_names') or ()),
+                'id_names': tuple(hedge_profile_blocks.get('legs_id_names') or ()),
             }
-        if hedge_profile is not None:
-            aligned_time_steps = int(hedge_profile['features'].shape[0])
+        liability_mtm = torch.cat(hedge_profile_blocks['mtm'], dim=1) if hedge_profile_blocks.get('mtm') else None
+        realized_cashflows = {
+            currency: torch.cat(blocks, dim=1)
+            for currency, blocks in (hedge_profile_blocks.get('realized_cashflows') or {}).items()
+        }
+        if legs_bundle is not None:
+            aligned_time_steps = int(legs_bundle['features'].shape[0])
         else:
             candidate_lengths = [int(time_grid_days.shape[0])]
             candidate_lengths.extend(int(tensor.shape[0]) for tensor in tradables.values())
@@ -1743,21 +1751,25 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 factor_name: pad_time_axis(tensor, aligned_time_steps)
                 for factor_name, tensor in factors.items()
             }
-        if hedge_profile is not None:
-            bundle['hedge_profile'] = {
-                'features': hedge_profile['features'][:aligned_time_steps],
-                'feature_names': hedge_profile['feature_names'],
-                'liability_cashflows': {
-                    currency: tensor[:aligned_time_steps]
-                    for currency, tensor in hedge_profile['liability_cashflows'].items()
-                },
-                'liability_mtm': hedge_profile['liability_mtm'][:aligned_time_steps],
+        if legs_bundle is not None:
+            bundle['legs'] = {
+                'features': pad_time_axis(legs_bundle['features'], aligned_time_steps),
+                'ids': legs_bundle['ids'],
+                'feature_names': legs_bundle['feature_names'],
+                'id_names': legs_bundle['id_names'],
+            }
+        if liability_mtm is not None:
+            bundle['liability_mtm'] = pad_time_axis(liability_mtm, aligned_time_steps)
+        if realized_cashflows:
+            bundle['realized_cashflows'] = {
+                currency: pad_time_axis(tensor, aligned_time_steps)
+                for currency, tensor in realized_cashflows.items()
             }
         return bundle
 
     def update_factors(self, params, base_date, job_id, num_jobs):
         """Override: build dependent_factors from the generic Scenario_Factors JSON dict."""
-        dependent_factors, stochastic_factors, _, reset_dates, _ = self.config.calculate_dependencies(
+        dependent_factors, stochastic_factors, _, reset_dates, settlement_currencies = self.config.calculate_dependencies(
             params, base_date, self.input_time_grid)
 
         # Size the time grid from Futures_Expiries (or a 2-year fallback)
@@ -1765,7 +1777,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         reset_dates = self.config.parse_grid(base_date, max_expiry, self.input_time_grid, past_max_date=True)
         reset_dates.update({base_date, max_expiry})
         # generate scerarios at each grid date
-        self.update_time_grid(base_date, reset_dates, {}, dynamic_scenario_dates=True)
+        self.update_time_grid(base_date, reset_dates, settlement_currencies, dynamic_scenario_dates=True)
 
         # Use the last scenario grid date so ScenarioTimeGrid covers the extra step from past_max_date=True
         last_scen_date = base_date + pd.DateOffset(days=int(self.time_grid.scen_time_grid[-1]))
@@ -1849,10 +1861,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         }
         tradable_blocks = defaultdict(list)
         hedge_profile_blocks = {
-            'features': [],
-            'feature_names': None,
-            'liability_cashflows': defaultdict(list),
-            'liability_mtm': [],
+            'legs_features': [],
+            'legs_ids': None,
+            'legs_feature_names': None,
+            'legs_id_names': None,
+            'mtm': [],
+            'realized_cashflows': defaultdict(list),
         }
         # get the calendar for business day
         bus_day = self.config.holidays.get(
@@ -1867,17 +1881,26 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 shared_mem.t_Scenario_Buffer[key] = proc.generate(shared_mem)
 
             _ = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
+            # clear hedge cashflows so t_Cashflows after the next call holds only liability cashflows
+            shared_mem.reset_cashflows(self.time_grid)
             # grab the liability features
             features = self.liabilities.resolve_hedge_structure(shared_mem, self.time_grid)
-            hedge_profile_blocks['features'].append(features['features'].detach().clone())
-            current_feature_names = tuple(features.get('feature_names', ()))
-            if hedge_profile_blocks['feature_names'] is None:
-                hedge_profile_blocks['feature_names'] = current_feature_names
-            elif hedge_profile_blocks['feature_names'] != current_feature_names:
-                raise ValueError('resolve_hedge_structure returned inconsistent feature_names across batches')
-            for currency, payoff in features.get('liability_cashflows', {}).items():
-                hedge_profile_blocks['liability_cashflows'][currency].append(payoff.detach().clone())
-            hedge_profile_blocks['liability_mtm'].append(features['liability_mtm'].detach().clone())
+            legs = features.get('legs')
+            if legs is not None:
+                hedge_profile_blocks['legs_features'].append(legs['features'].detach().clone())
+                if hedge_profile_blocks['legs_ids'] is None:
+                    hedge_profile_blocks['legs_ids'] = list(legs['ids'])
+                    hedge_profile_blocks['legs_feature_names'] = legs['feature_names']
+                    hedge_profile_blocks['legs_id_names'] = legs['id_names']
+            mtm = features.get('mtm')
+            if mtm is not None:
+                hedge_profile_blocks['mtm'].append(mtm.detach().clone())
+            mtm_grid_size = self.time_grid.mtm_time_grid.size
+            for currency, by_time in (shared_mem.t_Cashflows or {}).items():
+                dense = shared_mem.one.new_zeros(mtm_grid_size, shared_mem.simulation_batch)
+                for t_idx, payoff in by_time.items():
+                    dense[int(t_idx)] = payoff
+                hedge_profile_blocks['realized_cashflows'][str(currency)].append(dense.detach().clone())
 
             if retain_scenario_result:
                 for key in self.stoch_factors:

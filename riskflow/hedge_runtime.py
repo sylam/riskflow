@@ -16,6 +16,8 @@ from typing import Any, Dict, Mapping, Optional
 import pandas as pd
 import torch
 
+from .hedge_features import build_entity_layout
+
 
 class TerminalFloorThenSurplusUtility:
     def __init__(self, params: Optional[Mapping[str, Any]] = None, **kwargs):
@@ -60,83 +62,6 @@ def _as_timestamp(value: Any) -> pd.Timestamp:
     if isinstance(value, dict) and ".Timestamp" in value:
         return pd.Timestamp(value[".Timestamp"])
     return pd.Timestamp(value)
-
-
-def build_state_feature_groups(
-    runtime: Mapping[str, Any],
-    *,
-    tradable_values: Mapping[str, torch.Tensor],
-    positions: Mapping[str, torch.Tensor],
-    cash_accounts: Mapping[str, torch.Tensor],
-) -> Dict[str, Dict[str, torch.Tensor]]:
-    hedge_names = tuple(str(name) for name in runtime.get("names", {}).get("hedges", ()))
-    position_values = {
-        name: positions[name].to(dtype=torch.float32) * tradable_values[name].to(dtype=torch.float32)
-        for name in hedge_names
-    }
-    inventory_terms = []
-    position_limits = runtime.get("accounting", {}).get("position_limits", {})
-    template = next(iter(tradable_values.values()), None)
-    if template is None:
-        inventory_fraction = torch.zeros((0,), dtype=torch.float32)
-    else:
-        for name in hedge_names:
-            position = positions[str(name)].to(dtype=torch.float32)
-            limits = position_limits.get(str(name), {})
-            max_abs_position = max(
-                abs(int(limits.get("min_position", 0))),
-                abs(int(limits.get("max_position", 0))),
-                1,
-            )
-            inventory_terms.append(position / float(max_abs_position))
-        if inventory_terms:
-            inventory_fraction = torch.stack(inventory_terms, dim=0).mean(dim=0)
-        else:
-            inventory_fraction = torch.zeros(
-                int(template.shape[0]),
-                dtype=torch.float32,
-                device=template.device,
-            )
-    return {
-        "tradables": {
-            str(name): tradable_values[str(name)]
-            for name in runtime.get("state_layout", {}).get("groups", {}).get("tradables", ())
-        },
-        "positions": {
-            str(name): positions[str(name)]
-            for name in runtime.get("state_layout", {}).get("groups", {}).get("positions", ())
-        },
-        "position_values": {
-            str(name): position_values[str(name)]
-            for name in runtime.get("state_layout", {}).get("groups", {}).get("position_values", ())
-        },
-        "cash_accounts": {
-            str(name): cash_accounts[str(name)]
-            for name in runtime.get("state_layout", {}).get("groups", {}).get("cash_accounts", ())
-        },
-        "inventory": {
-            "inventory_fraction": inventory_fraction,
-        },
-    }
-
-
-def flatten_state_feature_groups(
-    feature_groups: Mapping[str, Mapping[str, torch.Tensor]],
-    flat_layout: tuple[tuple[str, str], ...],
-) -> torch.Tensor:
-    feature_columns = []
-    for group_name, feature_name in flat_layout:
-        feature_columns.append(feature_groups[group_name][feature_name].reshape(-1, 1).to(dtype=torch.float32))
-    if not feature_columns:
-        batch_size = 0
-        for group in feature_groups.values():
-            for tensor in group.values():
-                batch_size = int(tensor.shape[0])
-                break
-            if batch_size:
-                break
-        return torch.zeros((batch_size, 0), dtype=torch.float32)
-    return torch.cat(feature_columns, dim=1)
 
 
 def _unwrap_calc_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -199,95 +124,52 @@ def _normalize_liabilities(hedging_problem: Mapping[str, Any]) -> Dict[str, Dict
 def _normalize_policy_config(policy_config: Mapping[str, Any]) -> Dict[str, Any]:
     action_space = _normalize_action_space(policy_config)
     model_config = dict(policy_config.get("Model", {}))
-    output_heads = {
-        str(name): deepcopy(dict(head_config))
-        for name, head_config in model_config.get("Output_Heads", {}).items()
-    }
-    normalized = {
+    return {
         "object": str(policy_config["Object"]),
         "action_space": action_space,
         "model": {
-            "object": str(model_config.get("Object", "MLP")),
-            "hidden_layers": tuple(int(value) for value in model_config.get("Hidden_Layers", (64, 64))),
-            "activation": str(model_config.get("Activation", "ReLU")),
-            "output_heads": output_heads,
+            "object": str(model_config.get("Object", "EntityTransformer")),
+            "token_dim": int(model_config.get("Token_Dim", 64)),
+            "emb_dim": int(model_config.get("Emb_Dim", 8)),
+            "n_heads": int(model_config.get("N_Heads", 4)),
+            "n_layers": int(model_config.get("N_Layers", 2)),
+            "log_std_init": float(model_config.get("Log_Std_Init", -0.5)),
         },
     }
-    if normalized["object"] == "DiscreteRatioPolicy":
-        normalized.update(
-            {
-                "action_grid": [float(value) for value in policy_config.get("Action_Grid", ())],
-                "preferred_contract": policy_config.get("Preferred_Contract"),
-                "hidden_dim": int(policy_config.get("Hidden_Dim", 64)),
-            }
-        )
-    return normalized
 
 
 def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
     if optimizer_config is None:
         return None
     decision_interval_curriculum = []
-    for index, stage in enumerate(optimizer_config.get("Decision_Interval_Curriculum", ())):
-        normalized_stage = {
+    for stage in optimizer_config.get("Decision_Interval_Curriculum", ()):
+        decision_interval_curriculum.append({
             "start_epoch": int(stage.get("Start_Epoch", 1)),
             "end_epoch": None if stage.get("End_Epoch") is None else int(stage.get("End_Epoch")),
             "interval_business_days": int(stage.get("Interval_Business_Days", 1)),
-        }
-        if normalized_stage["start_epoch"] <= 0:
-            raise ValueError(f"Optimizer.Decision_Interval_Curriculum[{index}].Start_Epoch must be positive")
-        if normalized_stage["end_epoch"] is not None and normalized_stage["end_epoch"] < normalized_stage["start_epoch"]:
-            raise ValueError(
-                f"Optimizer.Decision_Interval_Curriculum[{index}] has End_Epoch before Start_Epoch"
-            )
-        if normalized_stage["interval_business_days"] <= 0:
-            raise ValueError(
-                f"Optimizer.Decision_Interval_Curriculum[{index}].Interval_Business_Days must be positive"
-            )
-        decision_interval_curriculum.append(normalized_stage)
-    normalized = {
+        })
+    return {
         "object": str(optimizer_config["Object"]),
         "epochs": int(optimizer_config.get("Epochs", 20)),
-        "replay_capacity": int(optimizer_config.get("Replay_Capacity", 10000)),
-        "batch_size": int(optimizer_config.get("Batch_Size", 64)),
+        "ppo_epochs": int(optimizer_config.get("PPO_Epochs", 4)),
+        "minibatch_size": int(optimizer_config.get("Minibatch_Size", 4096)),
         "gamma": float(optimizer_config.get("Gamma", 0.99)),
-        "learning_rate": float(optimizer_config.get("Learning_Rate", 1.0e-3)),
-        "epsilon_start": float(optimizer_config.get("Epsilon_Start", 1.0)),
-        "epsilon_end": float(optimizer_config.get("Epsilon_End", 0.05)),
-        "epsilon_decay_epochs": int(optimizer_config.get("Epsilon_Decay_Epochs", 10)),
-        "target_update_interval": int(optimizer_config.get("Target_Update_Interval", 5)),
-        "gradient_steps_per_epoch": int(optimizer_config.get("Gradient_Steps_Per_Epoch", 10)),
-        "dense_tracking_reward_scale": float(optimizer_config.get("Dense_Tracking_Reward_Scale", 0.05)),
+        "gae_lambda": float(optimizer_config.get("GAE_Lambda", 0.95)),
+        "learning_rate": float(optimizer_config.get("Learning_Rate", 3.0e-4)),
+        "clip_eps": float(optimizer_config.get("Clip_Eps", 0.2)),
+        "value_coef": float(optimizer_config.get("Value_Coef", 0.5)),
+        "entropy_coef": float(optimizer_config.get("Entropy_Coef", 0.01)),
+        "max_grad_norm": float(optimizer_config.get("Max_Grad_Norm", 0.5)),
+        "reward_scale": float(optimizer_config.get("Reward_Scale", 1.0)),
+        "action_sparsity_coef": float(optimizer_config.get("Action_Sparsity_Coef", 0.0)),
+        "dense_tracking_reward_scale": float(optimizer_config.get("Dense_Tracking_Reward_Scale", 0.0)),
         "dense_tracking_reward_clip": float(optimizer_config.get("Dense_Tracking_Reward_Clip", 0.15)),
         "validation_fraction": float(optimizer_config.get("Validation_Fraction", 0.25)),
         "validation_min_batch": int(optimizer_config.get("Validation_Min_Batch", 256)),
         "validation_shards": int(optimizer_config.get("Validation_Shards", 4)),
-        "top_validation_checkpoints": int(optimizer_config.get("Top_Validation_Checkpoints", 3)),
-        "performance_gated_curriculum": bool(optimizer_config.get("Performance_Gated_Curriculum", True)),
-        "curriculum_advance_patience": int(optimizer_config.get("Curriculum_Advance_Patience", 2)),
-        "curriculum_min_improvement": float(optimizer_config.get("Curriculum_Min_Improvement", 3.0)),
-        "curriculum_min_trade_rate": float(optimizer_config.get("Curriculum_Min_Trade_Rate", 0.01)),
-        "curriculum_max_trade_rate": float(optimizer_config.get("Curriculum_Max_Trade_Rate", 0.70)),
-        "turnover_penalty_scale": float(optimizer_config.get("Turnover_Penalty_Scale", 0.75)),
-        "no_trade_reference_scale": float(optimizer_config.get("No_Trade_Reference_Scale", 0.0)),
-        "replay_imitation_weight": float(optimizer_config.get("Replay_Imitation_Weight", 0.01)),
-        "action_sparsity_penalty_weight": float(optimizer_config.get("Action_Sparsity_Penalty_Weight", 0.0)),
         "decision_interval_curriculum": tuple(decision_interval_curriculum),
         "seed": optimizer_config.get("Seed"),
     }
-    if normalized["object"] != "DQN":
-        raise ValueError(f"Unsupported Optimizer object: {normalized['object']}")
-    if normalized["epochs"] <= 0:
-        raise ValueError("Optimizer.Epochs must be positive")
-    if normalized["replay_capacity"] <= 0 or normalized["batch_size"] <= 0:
-        raise ValueError("Optimizer replay and batch sizes must be positive")
-    if not 0.0 <= normalized["gamma"] <= 1.0:
-        raise ValueError("Optimizer.Gamma must be between 0 and 1")
-    if normalized["learning_rate"] <= 0.0:
-        raise ValueError("Optimizer.Learning_Rate must be positive")
-    if normalized["epsilon_decay_epochs"] <= 0:
-        raise ValueError("Optimizer.Epsilon_Decay_Epochs must be positive")
-    return normalized
 
 
 def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -333,6 +215,20 @@ def _normalize_position_limits(evaluator_config: Mapping[str, Any]) -> Dict[str,
     return position_limits
 
 
+def _normalize_portfolio_state(hedging_problem: Mapping[str, Any]) -> Dict[str, Any]:
+    state = hedging_problem.get("Portfolio_State") or {}
+    return {
+        "positions": {str(name): float(value) for name, value in state.get("Positions", {}).items()},
+        "cash_balances": {str(name): float(value) for name, value in state.get("Cash_Balances", {}).items()},
+        "settlement_prices": {str(name): float(value) for name, value in state.get("Settlement_Prices", {}).items()},
+        "margin_balances": {str(name): float(value) for name, value in state.get("Margin_Balances", {}).items()},
+        "initial_margin": {
+            str(name): {"method": str(spec["Method"]), "amount": float(spec["Amount"])}
+            for name, spec in state.get("Initial_Margin", {}).items()
+        },
+    }
+
+
 def _normalize_instrument_metadata(
     instrument_name: str,
     tradable_entry: Mapping[str, Any],
@@ -360,24 +256,6 @@ def _normalize_instrument_metadata(
         "contract_size": float(params.get("Contract_Size", 1.0)),
         "params": deepcopy(dict(params)),
     }
-
-
-def _build_state_layout(
-    tradables: Mapping[str, Any],
-    hedge_names: tuple,
-    cash_account_names: tuple,
-) -> Dict[str, Any]:
-    groups = {
-        "tradables": tuple(name for name in tradables.keys()),
-        "positions": tuple(name for name in hedge_names),
-        "position_values": tuple(name for name in hedge_names),
-        "cash_accounts": tuple(name for name in cash_account_names),
-        "inventory": ("inventory_fraction",),
-    }
-    flat = []
-    for group_name, feature_names in groups.items():
-        flat.extend((group_name, feature_name) for feature_name in feature_names)
-    return {"groups": groups, "flat": tuple(flat), "dimension": len(flat)}
 
 
 def construct_torchrl_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -441,7 +319,7 @@ def construct_torchrl_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:
         "action_instruments": tuple(policy["action_space"]["instrument_order"]),
         "liabilities": tuple(liabilities.keys()),
     }
-    return {
+    runtime = {
         "execution_mode": execution_mode,
         "accounting_mode": accounting_mode,
         "names": names,
@@ -450,6 +328,7 @@ def construct_torchrl_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:
         "objective": _normalize_objective_config(objective_config),
         "policy": policy,
         "optimizer": _normalize_optimizer_config(optimizer_config),
+        "portfolio_state": _normalize_portfolio_state(hedging_problem),
         "accounting": {
             "position_limits": position_limits,
             "cash_accounts": {
@@ -464,12 +343,9 @@ def construct_torchrl_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:
             "allow_short": allow_short,
             "fail_on_unhedgeable_intent": bool(evaluator_config.get("Fail_On_Unhedgeable_Intent", False)),
         },
-        "state_layout": _build_state_layout(
-            normalized_tradables,
-            hedge_names,
-            cash_account_names,
-        ),
     }
+    runtime["entity_layout"] = build_entity_layout(runtime)
+    return runtime
 
 
 def construct_hedging_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:

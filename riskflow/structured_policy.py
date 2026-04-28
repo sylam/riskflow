@@ -1,47 +1,35 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
-from torchrl.modules import MLP
+
+
+# Discrete categorical action space — per-instrument logits over [min_trade, ..., max_trade]
+# This avoids the saturation/bistability issues that arise with tanh-Gaussian over integer actions.
 
 
 @dataclass(frozen=True)
 class StructuredActionSpace:
-    instrument_order: tuple[str, ...]
-    min_trade_delta: tuple[int, ...]
-    max_trade_delta: tuple[int, ...]
+    instrument_order: tuple
+    min_trade_delta: tuple
+    max_trade_delta: tuple
 
     def __init__(self, instrument_order, min_trade_delta, max_trade_delta):
-        object.__setattr__(self, "instrument_order", tuple(name for name in instrument_order))
-        object.__setattr__(self, "min_trade_delta", tuple(value for value in min_trade_delta))
-        object.__setattr__(self, "max_trade_delta", tuple(value for value in max_trade_delta))
-        if not self.instrument_order:
-            raise ValueError("StructuredActionSpace.instrument_order must be non-empty")
-        if not (
-            len(self.instrument_order) == len(self.min_trade_delta) == len(self.max_trade_delta)
-        ):
-            raise ValueError("StructuredActionSpace entries must have matching lengths")
-        for instrument_name, min_delta, max_delta in zip(
-            self.instrument_order,
-            self.min_trade_delta,
-            self.max_trade_delta,
-        ):
-            if min_delta > max_delta:
-                raise ValueError(
-                    f"StructuredActionSpace has min_trade_delta > max_trade_delta for {instrument_name}"
-                )
+        object.__setattr__(self, "instrument_order", tuple(instrument_order))
+        object.__setattr__(self, "min_trade_delta", tuple(min_trade_delta))
+        object.__setattr__(self, "max_trade_delta", tuple(max_trade_delta))
 
     @property
-    def dimension(self) -> int:
+    def dimension(self):
         return len(self.instrument_order)
 
-    def to_artifact_payload(self) -> Dict[str, Any]:
+    def to_artifact_payload(self):
         return {
             "instrument_order": list(self.instrument_order),
             "min_trade_delta": list(self.min_trade_delta),
@@ -49,53 +37,97 @@ class StructuredActionSpace:
         }
 
 
-@dataclass(frozen=True)
-class TorchRLStateFeatureExtractor:
-    feature_dim: int
+def _vocab_size(registry, name):
+    return max(int(len(registry.get(name, {}))), 1)
 
-    def __init__(self, *, feature_dim):
-        normalized_feature_dim = int(feature_dim)
-        object.__setattr__(self, "feature_dim", normalized_feature_dim)
-        if normalized_feature_dim <= 0:
-            raise ValueError("TorchRLStateFeatureExtractor.feature_dim must be positive")
 
-    def __call__(self, feature_batch) -> torch.Tensor:
-        tensor = torch.as_tensor(feature_batch, dtype=torch.float32)
-        if tensor.ndim != 2:
-            raise ValueError("policy_features must have shape [B, F]")
-        if int(tensor.shape[1]) != self.feature_dim:
-            raise ValueError("policy_features width does not match canonical feature_dim")
-        return tensor
+class _EntityEncoder(nn.Module):
+    def __init__(self, feature_dim, id_vocabs, emb_dim, token_dim, type_id):
+        super().__init__()
+        self.embeddings = nn.ModuleList([nn.Embedding(int(v), emb_dim) for v in id_vocabs])
+        input_dim = int(feature_dim) + len(id_vocabs) * emb_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, token_dim * 2),
+            nn.GELU(),
+            nn.Linear(token_dim * 2, token_dim),
+        )
+        self.register_buffer('type_id', torch.tensor(int(type_id), dtype=torch.long), persistent=False)
 
-    def to_artifact_payload(self) -> Dict[str, Any]:
+    def forward(self, features, ids):
+        emb_parts = [emb(ids[..., i]) for i, emb in enumerate(self.embeddings)]
+        x = torch.cat([features] + emb_parts, dim=-1) if emb_parts else features
+        return self.mlp(x)
+
+
+class _GlobalEncoder(nn.Module):
+    def __init__(self, feature_dim, token_dim, type_id):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(int(feature_dim), token_dim * 2),
+            nn.GELU(),
+            nn.Linear(token_dim * 2, token_dim),
+        )
+        self.register_buffer('type_id', torch.tensor(int(type_id), dtype=torch.long), persistent=False)
+
+    def forward(self, features):
+        return self.mlp(features).unsqueeze(1)
+
+
+class _EntityTransformer(nn.Module):
+    def __init__(self, entity_layout, token_dim, emb_dim, n_heads, n_layers):
+        super().__init__()
+        registry = entity_layout['registry']
+        leg_vocabs = [_vocab_size(registry, name) for name in entity_layout['legs']['id_names']]
+        instr_vocabs = [_vocab_size(registry, name) for name in entity_layout['instruments']['id_names']]
+        cash_vocabs = [_vocab_size(registry, name) for name in entity_layout['cash_accounts']['id_names']]
+
+        self.leg_encoder = _EntityEncoder(entity_layout['legs']['feature_dim'], leg_vocabs, emb_dim, token_dim, type_id=0)
+        self.instr_encoder = _EntityEncoder(entity_layout['instruments']['feature_dim'], instr_vocabs, emb_dim, token_dim, type_id=1)
+        self.cash_encoder = _EntityEncoder(entity_layout['cash_accounts']['feature_dim'], cash_vocabs, emb_dim, token_dim, type_id=2)
+        self.global_encoder = _GlobalEncoder(entity_layout['globals']['feature_dim'], token_dim, type_id=3)
+        self.type_embedding = nn.Embedding(4, token_dim)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=token_dim, nhead=n_heads, dim_feedforward=token_dim * 2,
+            dropout=0.0, activation='gelu', batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.token_dim = token_dim
+
+    def _add_type(self, tokens, type_id):
+        return tokens + self.type_embedding(type_id).reshape(1, 1, -1)
+
+    def forward(self, entity_state):
+        legs = self._add_type(self.leg_encoder(entity_state['legs'], entity_state['legs_ids']), self.leg_encoder.type_id)
+        instr = self._add_type(self.instr_encoder(entity_state['instruments'], entity_state['instruments_ids']), self.instr_encoder.type_id)
+        cash = self._add_type(self.cash_encoder(entity_state['cash_accounts'], entity_state['cash_accounts_ids']), self.cash_encoder.type_id)
+        glb = self._add_type(self.global_encoder(entity_state['globals']), self.global_encoder.type_id)
+
+        L, I, C = legs.shape[1], instr.shape[1], cash.shape[1]
+        tokens = torch.cat([legs, instr, cash, glb], dim=1)
+        batch_size = tokens.shape[0]
+        global_mask = torch.ones((batch_size, glb.shape[1]), dtype=torch.bool, device=tokens.device)
+        masks = torch.cat([
+            entity_state['legs_mask'].to(torch.bool),
+            entity_state['instruments_mask'].to(torch.bool),
+            entity_state['cash_accounts_mask'].to(torch.bool),
+            global_mask,
+        ], dim=1)
+        context = self.transformer(tokens, src_key_padding_mask=~masks)
         return {
-            "object": "TorchRLStateFeatureExtractor",
-            "contract": "canonical_policy_features",
-            "feature_dim": self.feature_dim,
+            'legs': context[:, :L, :],
+            'instruments': context[:, L:L + I, :],
+            'cash_accounts': context[:, L + I:L + I + C, :],
+            'globals': context[:, L + I + C:, :],
+            'mask': masks,
         }
 
 
-class _StructuredPolicyHead(nn.Module):
-    def __init__(self, *, input_dim, action_dim, hidden_layers, activation, device):
-        super().__init__()
-        try:
-            activation_class = getattr(torch.nn.modules.activation, activation)
-        except AttributeError as exc:
-            raise ValueError(f"Unsupported activation: {activation}") from exc
-        if any(int(width) <= 0 for width in hidden_layers):
-            raise ValueError("hidden_layers must contain only positive integers")
-        self.network = MLP(
-            in_features=input_dim,
-            out_features=int(action_dim),
-            num_cells=[width for width in hidden_layers],
-            activation_class=activation_class,
-            device=device,
-        )
-
-    def forward(self, features):
-        raw_output = self.network(features)
-        rebalance_vector = torch.tanh(raw_output)
-        return rebalance_vector
+def _masked_mean(tokens, mask):
+    if tokens.shape[1] == 0:
+        return tokens.new_zeros(tokens.shape[0], tokens.shape[2])
+    weight = mask.to(tokens.dtype).unsqueeze(-1)
+    return (tokens * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
 
 
 class StructuredRebalancePolicy(nn.Module):
@@ -103,150 +135,173 @@ class StructuredRebalancePolicy(nn.Module):
         self,
         *,
         action_space,
-        feature_extractor,
-        hidden_layers=(64, 64),
-        activation="ReLU",
+        entity_layout,
+        token_dim=64,
+        emb_dim=8,
+        n_heads=4,
+        n_layers=2,
+        log_std_init=0.0,  # unused for categorical, kept for backward compat in artifacts
         device="cpu",
     ):
         super().__init__()
         self.action_space = action_space
-        self.feature_extractor = feature_extractor
-        self.hidden_layers = tuple(int(value) for value in hidden_layers)
-        self.activation = str(activation)
+        self.entity_layout = entity_layout
+        self.token_dim = int(token_dim)
+        self.emb_dim = int(emb_dim)
+        self.n_heads = int(n_heads)
+        self.n_layers = int(n_layers)
+        self.log_std_init = float(log_std_init)
         self.device = torch.device(device)
-        input_dim = getattr(feature_extractor, "feature_dim", None)
-        self.actor = _StructuredPolicyHead(
-            input_dim=input_dim,
-            action_dim=action_space.dimension,
-            hidden_layers=self.hidden_layers,
-            activation=self.activation,
-            device=self.device,
+
+        # Per-instrument categorical: each instrument has (max - min + 1) discrete trade actions.
+        self._action_bins = tuple(int(hi) - int(lo) + 1 for lo, hi in zip(action_space.min_trade_delta, action_space.max_trade_delta))
+        self._max_bins = max(self._action_bins) if self._action_bins else 1
+        # warm-start: bias initial logits so "no-trade" (action_delta=0) is the dominant bin.
+        no_trade_bins = tuple(-int(lo) for lo in action_space.min_trade_delta)
+
+        self.backbone = _EntityTransformer(entity_layout, self.token_dim, self.emb_dim, self.n_heads, self.n_layers).to(self.device)
+        self.policy_head = nn.Sequential(
+            nn.Linear(self.token_dim, self.token_dim),
+            nn.GELU(),
+            nn.Linear(self.token_dim, self._max_bins),
         ).to(self.device)
+        # zero weights, bias initial logits toward no-trade
+        with torch.no_grad():
+            self.policy_head[-1].weight.zero_()
+            self.policy_head[-1].bias.zero_()
+            for instr_idx, no_trade_bin in enumerate(no_trade_bins):
+                if 0 <= no_trade_bin < self._max_bins:
+                    self.policy_head[-1].bias[no_trade_bin] = 0.5
+        self.value_head = nn.Sequential(
+            nn.Linear(self.token_dim * 4, self.token_dim),
+            nn.GELU(),
+            nn.Linear(self.token_dim, 1),
+        ).to(self.device)
+
         self.register_buffer(
             "_min_trade_delta",
-            torch.tensor(action_space.min_trade_delta, dtype=torch.float32, device=self.device).reshape(1, -1),
+            torch.tensor(action_space.min_trade_delta, dtype=torch.int64, device=self.device).reshape(1, -1),
             persistent=False,
         )
         self.register_buffer(
             "_max_trade_delta",
-            torch.tensor(action_space.max_trade_delta, dtype=torch.float32, device=self.device).reshape(1, -1),
+            torch.tensor(action_space.max_trade_delta, dtype=torch.int64, device=self.device).reshape(1, -1),
             persistent=False,
         )
-        self.register_buffer(
-            "_min_trade_delta_abs",
-            self._min_trade_delta.abs(),
-            persistent=False,
-        )
+        # mask out logits beyond each instrument's bin count (when bins differ across instruments)
+        bins_tensor = torch.tensor(self._action_bins, dtype=torch.int64, device=self.device)
+        bin_indices = torch.arange(self._max_bins, device=self.device).unsqueeze(0)
+        invalid = bin_indices >= bins_tensor.unsqueeze(1)
+        self.register_buffer("_logit_mask", invalid, persistent=False)
         self.register_buffer(
             "_action_feature_scale",
-            torch.maximum(self._max_trade_delta.abs(), self._min_trade_delta_abs).clamp_min(1.0),
+            torch.maximum(self._max_trade_delta.abs(), self._min_trade_delta.abs()).clamp_min(1).to(dtype=torch.float32),
             persistent=False,
         )
 
-    def extract_features(self, feature_batch) -> torch.Tensor:
-        return self.feature_extractor(feature_batch).to(device=self.device)
+    def _entity_state_to_device(self, entity_state):
+        return entity_state.to(self.device)
 
-    def forward(self, feature_batch):
-        features = self.extract_features(feature_batch)
-        rebalance_vector = self.actor(features)
-        return TensorDict(
-            {
-                "features": features,
-                "rebalance_vector": rebalance_vector,
-            },
-            batch_size=[int(features.shape[0])],
-        )
+    def _ctx_pool(self, ctx, *, detach=False):
+        L = ctx['legs'].shape[1]
+        I = ctx['instruments'].shape[1]
+        C = ctx['cash_accounts'].shape[1]
+        mask = ctx['mask']
+        legs = ctx['legs'].detach() if detach else ctx['legs']
+        instr = ctx['instruments'].detach() if detach else ctx['instruments']
+        cash = ctx['cash_accounts'].detach() if detach else ctx['cash_accounts']
+        glb = ctx['globals'].detach() if detach else ctx['globals']
+        legs_pool = _masked_mean(legs, mask[:, :L])
+        instr_pool = _masked_mean(instr, mask[:, L:L + I])
+        cash_pool = _masked_mean(cash, mask[:, L + I:L + I + C])
+        global_pool = glb.squeeze(1)
+        return torch.cat([legs_pool, instr_pool, cash_pool, global_pool], dim=-1)
 
-    def sample(self, feature_batch, *, epsilon=0.0, greedy=False):
-        output = self(feature_batch)
-        if greedy or float(epsilon) <= 0.0:
-            return output
-        batch_size = int(output.batch_size[0])
-        random_mask = torch.rand(batch_size, device=self.device) < float(epsilon)
-        if not bool(random_mask.any().item()):
-            return output
-        output = output.clone(False)
-        random_vector = 2.0 * torch.rand(
-            (batch_size, self.action_space.dimension),
-            dtype=torch.float32,
-            device=self.device,
-        ) - 1.0
-        output["rebalance_vector"] = torch.where(
-            random_mask.unsqueeze(1),
-            random_vector,
-            output["rebalance_vector"],
-        )
-        return output
+    def _policy_outputs(self, entity_state):
+        es = self._entity_state_to_device(entity_state)
+        ctx = self.backbone(es)
+        # logits: [B, I, max_bins]; mask invalid bins to -inf so they get probability 0
+        logits = self.policy_head(ctx['instruments'])
+        logits = logits.masked_fill(self._logit_mask.unsqueeze(0), float('-inf'))
+        return logits, ctx
 
-    def _continuous_trade_deltas(self, rebalance_vector: torch.Tensor) -> torch.Tensor:
-        clipped = torch.clamp(rebalance_vector, min=-1.0, max=1.0)
-        positive_trade = clipped.clamp(min=0.0) * self._max_trade_delta
-        negative_trade = clipped.clamp(max=0.0) * self._min_trade_delta_abs
-        return torch.where(
-            clipped > 0.0,
-            positive_trade,
-            torch.where(clipped < 0.0, negative_trade, torch.zeros_like(clipped)),
-        )
+    def _value(self, ctx):
+        # Discrete action distribution is non-saturating, so value loss can flow through the
+        # backbone safely. This gives the value function access to richer state representations.
+        return self.value_head(self._ctx_pool(ctx, detach=False)).squeeze(-1)
 
-    def _normalize_trade_deltas(self, trade_deltas: torch.Tensor) -> torch.Tensor:
-        return trade_deltas / self._action_feature_scale
+    def _bins_to_trade_deltas(self, action_bins):
+        # action_bins: int64 [B, I] in [0, n_bins_i). trade_delta = bin + min_trade.
+        return action_bins + self._min_trade_delta
 
-    def map_actions(self, output) -> Dict[str, Any]:
-        rebalance_vector = torch.as_tensor(output["rebalance_vector"], dtype=torch.float32, device=self.device)
-        if rebalance_vector.ndim != 2:
-            raise ValueError("rebalance_vector must have shape [B, A]")
-        if int(rebalance_vector.shape[1]) != self.action_space.dimension:
-            raise ValueError("rebalance_vector action dimension does not match action_space")
-        mapped = self._continuous_trade_deltas(rebalance_vector)
-        rounded = torch.sign(mapped) * torch.floor(mapped.abs() + 0.5)
-        bounded = torch.max(torch.min(rounded, self._max_trade_delta), self._min_trade_delta).to(torch.int64)
-        ordered_trade_deltas = bounded
-        return {
-            "rebalance_vector": rebalance_vector,
-            "ordered_trade_deltas": ordered_trade_deltas,
-            "trade_deltas": {
-                instrument_name: ordered_trade_deltas[:, index]
-                for index, instrument_name in enumerate(self.action_space.instrument_order)
-            },
+    def _trade_deltas_to_bins(self, trade_deltas):
+        return trade_deltas - self._min_trade_delta
+
+    def forward(self, entity_state):
+        logits, ctx = self._policy_outputs(entity_state)
+        return TensorDict({'logits': logits, 'value': self._value(ctx)}, batch_size=[logits.shape[0]])
+
+    def sample(self, entity_state, *, deterministic=False):
+        logits, ctx = self._policy_outputs(entity_state)
+        log_probs_per_instr = torch.log_softmax(logits, dim=-1)
+        if deterministic:
+            action_bins = log_probs_per_instr.argmax(dim=-1)
+        else:
+            probs = log_probs_per_instr.exp()
+            action_bins = torch.distributions.Categorical(probs=probs).sample()
+        action_bin_log_probs = log_probs_per_instr.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
+        log_prob = action_bin_log_probs.sum(-1)
+        value = self._value(ctx)
+        return TensorDict({
+            'logits': logits,
+            'action_bins': action_bins,
+            'log_prob': log_prob,
+            'value': value,
+        }, batch_size=[logits.shape[0]])
+
+    def evaluate_action(self, entity_state, action_bins):
+        logits, ctx = self._policy_outputs(entity_state)
+        log_probs_per_instr = torch.log_softmax(logits, dim=-1)
+        action_bin_log_probs = log_probs_per_instr.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
+        log_prob = action_bin_log_probs.sum(-1)
+        # entropy = -sum(p log p) per instrument, then sum across instruments
+        probs = log_probs_per_instr.exp()
+        entropy_per_instr = -(probs * log_probs_per_instr).sum(-1)
+        entropy = entropy_per_instr.sum(-1)
+        value = self._value(ctx)
+        return log_prob, entropy, value, logits
+
+    def map_actions(self, output):
+        action_bins = output['action_bins'].to(dtype=torch.int64, device=self.device)
+        ordered_trade_deltas = self._bins_to_trade_deltas(action_bins)
+        result = {
+            'action_bins': action_bins,
+            'ordered_trade_deltas': ordered_trade_deltas,
+            'trade_deltas': {name: ordered_trade_deltas[:, i] for i, name in enumerate(self.action_space.instrument_order)},
         }
+        for key in ('logits', 'log_prob', 'value'):
+            if key in output.keys():
+                result[key] = output[key]
+        return result
 
-    def action_features(self, output) -> torch.Tensor:
-        if "ordered_trade_deltas" in output:
-            ordered_trade_deltas = torch.as_tensor(output["ordered_trade_deltas"], dtype=torch.float32, device=self.device)
-            return self._normalize_trade_deltas(ordered_trade_deltas)
-        rebalance_vector = torch.as_tensor(output["rebalance_vector"], dtype=torch.float32, device=self.device)
-        if rebalance_vector.ndim != 2:
-            raise ValueError("rebalance_vector must have shape [B, A]")
-        continuous_trade_deltas = self._continuous_trade_deltas(rebalance_vector)
-        return self._normalize_trade_deltas(continuous_trade_deltas)
+    def action_features(self, output):
+        ordered = torch.as_tensor(output['ordered_trade_deltas'], dtype=torch.float32, device=self.device)
+        return ordered / self._action_feature_scale
 
-    def to_artifact(self) -> Dict[str, Any]:
-        if not hasattr(self.feature_extractor, "to_artifact_payload"):
-            raise TypeError("StructuredRebalancePolicy artifact export requires a serializable feature extractor")
+    def to_artifact(self):
         state = self.state_dict()
-        if not state:
-            raise ValueError("StructuredRebalancePolicy cannot be serialized before its model is initialized")
-        first_tensor = next(iter(state.values()))
-        if isinstance(first_tensor, nn.parameter.UninitializedParameter):
-            raise ValueError("StructuredRebalancePolicy cannot be serialized before its lazy layers are initialized")
-        feature_dim = getattr(self.feature_extractor, "feature_dim", None)
-        if feature_dim is None:
-            raise ValueError("StructuredRebalancePolicy artifact could not infer feature dimension")
         return {
-            "artifact_version": 2,
+            "artifact_version": 4,
             "policy_object_type": "StructuredRebalancePolicy",
-            "feature_extractor": self.feature_extractor.to_artifact_payload(),
+            "entity_layout": self.entity_layout,
             "action_space": self.action_space.to_artifact_payload(),
             "model": {
-                "object": "MLP",
-                "hidden_layers": list(self.hidden_layers),
-                "activation": self.activation,
-                "output_heads": {
-                    "Trade_Deltas": {
-                        "object": "TanhDeltaHead",
-                    },
-                },
-                "feature_dim": feature_dim,
+                "object": "EntityTransformer",
+                "token_dim": self.token_dim,
+                "emb_dim": self.emb_dim,
+                "n_heads": self.n_heads,
+                "n_layers": self.n_layers,
+                "log_std_init": self.log_std_init,
             },
             "state_dict": {
                 key: {
@@ -259,43 +314,44 @@ class StructuredRebalancePolicy(nn.Module):
         }
 
 
-def save_policy_artifact(artifact: Mapping[str, Any], file_path) -> Path:
+def save_policy_artifact(artifact, file_path):
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(dict(artifact), indent=2), encoding="utf-8")
+    path.write_text(json.dumps(dict(artifact), indent=2, default=str), encoding="utf-8")
     return path
 
 
-def load_policy_artifact(file_path, *, device: str = "cpu") -> StructuredRebalancePolicy:
+def load_policy_artifact(file_path, *, device="cpu"):
     path = Path(file_path)
     artifact = json.loads(path.read_text(encoding="utf-8"))
-    if str(artifact.get("policy_object_type")) != "StructuredRebalancePolicy":
-        raise ValueError("Unsupported policy artifact type")
-    model_payload = dict(artifact.get("model", {}))
-    action_space_payload = dict(artifact.get("action_space", {}))
-    feature_extractor_payload = dict(artifact.get("feature_extractor", {}))
-    feature_dim = int(feature_extractor_payload.get("feature_dim", model_payload.get("feature_dim")))
+    model = dict(artifact["model"])
+    action_space_payload = dict(artifact["action_space"])
     policy = StructuredRebalancePolicy(
         action_space=StructuredActionSpace(
-            instrument_order=tuple(action_space_payload.get("instrument_order", ())),
-            min_trade_delta=tuple(int(value) for value in action_space_payload.get("min_trade_delta", ())),
-            max_trade_delta=tuple(int(value) for value in action_space_payload.get("max_trade_delta", ())),
+            instrument_order=tuple(action_space_payload["instrument_order"]),
+            min_trade_delta=tuple(int(value) for value in action_space_payload["min_trade_delta"]),
+            max_trade_delta=tuple(int(value) for value in action_space_payload["max_trade_delta"]),
         ),
-        feature_extractor=TorchRLStateFeatureExtractor(feature_dim=feature_dim),
-        hidden_layers=tuple(int(value) for value in model_payload.get("hidden_layers", (64, 64))),
-        activation=str(model_payload.get("activation", "ReLU")),
+        entity_layout=artifact["entity_layout"],
+        token_dim=int(model.get("token_dim", 64)),
+        emb_dim=int(model.get("emb_dim", 8)),
+        n_heads=int(model.get("n_heads", 4)),
+        n_layers=int(model.get("n_layers", 2)),
+        log_std_init=float(model.get("log_std_init", -0.5)),
         device=device,
     )
-    _ = policy(torch.zeros((1, feature_dim), dtype=torch.float32, device=policy.device))
-    serialized_state = dict(artifact.get("state_dict", {}))
     state_dict = {
         str(key): torch.tensor(
-            value.get("data", []),
-            dtype=getattr(torch, str(value.get("dtype", "float32"))),
+            value["data"],
+            dtype=getattr(torch, str(value["dtype"])),
             device=policy.device,
-        ).reshape(tuple(int(dim) for dim in value.get("shape", ())))
-        for key, value in serialized_state.items()
+        ).reshape(tuple(int(dim) for dim in value["shape"]))
+        for key, value in artifact["state_dict"].items()
     }
     policy.load_state_dict(state_dict)
     policy.eval()
     return policy
+
+
+if __name__ == '__main__':
+    pass
