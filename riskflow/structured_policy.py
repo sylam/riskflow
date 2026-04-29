@@ -136,27 +136,62 @@ def _masked_mean(tokens, mask):
     return (tokens * weight).sum(dim=1) / weight.sum(dim=1).clamp_min(1.0)
 
 
+class _PrivilegedEncoder(nn.Module):
+    """Encodes privileged simulator state (latent OU factors, regime params, etc.) into a fixed-dim
+    vector that the asymmetric critic concatenates with the actor's pooled context. Used only by the
+    value head — actor never sees these inputs."""
+
+    def __init__(self, factor_dims, hidden_dim):
+        super().__init__()
+        # Sort keys for deterministic input order across rollout/update calls.
+        self.factor_names = tuple(sorted(factor_dims.keys()))
+        total_input = int(sum(int(factor_dims[k]) for k in self.factor_names))
+        self.input_dim = total_input
+        if total_input == 0:
+            self.mlp = None
+            self.output_dim = 0
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(total_input, hidden_dim * 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+            )
+            self.output_dim = int(hidden_dim)
+
+    def forward(self, privileged_state):
+        if self.mlp is None or not privileged_state:
+            return None
+        sanitized = []
+        for name in self.factor_names:
+            t = privileged_state[name].to(dtype=torch.float32)
+            t = torch.nan_to_num(t, nan=0.0, posinf=1.0e6, neginf=-1.0e6)
+            t = (torch.sign(t) * torch.log1p(t.abs())).clamp(min=-16.0, max=16.0)
+            sanitized.append(t)
+        x = torch.cat(sanitized, dim=-1)
+        return self.mlp(x)
+
+
 class StructuredRebalancePolicy(nn.Module):
     def __init__(
         self,
         *,
         action_space,
         entity_layout,
+        privileged_layout=None,
         token_dim=64,
         emb_dim=8,
         n_heads=4,
         n_layers=2,
-        log_std_init=0.0,  # unused for categorical, kept for backward compat in artifacts
         device="cpu",
     ):
         super().__init__()
         self.action_space = action_space
         self.entity_layout = entity_layout
+        self.privileged_layout = dict(privileged_layout or {})
         self.token_dim = int(token_dim)
         self.emb_dim = int(emb_dim)
         self.n_heads = int(n_heads)
         self.n_layers = int(n_layers)
-        self.log_std_init = float(log_std_init)
         self.device = torch.device(device)
 
         # Per-instrument categorical: each instrument has (max - min + 1) discrete trade actions.
@@ -175,8 +210,14 @@ class StructuredRebalancePolicy(nn.Module):
         with torch.no_grad():
             self.policy_head[-1].weight.zero_()
             self.policy_head[-1].bias.zero_()
+        # Asymmetric critic: backbone output (pooled, 4*token_dim) + privileged-encoder output.
+        # Privileged factors are simulator-only (latent OU state, regime params, etc.) — actor never
+        # consumes them. Value-loss gradients flow back through the shared backbone, teaching the
+        # actor's encoder to extract regime-relevant info from observable history.
+        self.privileged_encoder = _PrivilegedEncoder(self.privileged_layout, self.token_dim).to(self.device)
+        self._privileged_dim = int(self.privileged_encoder.output_dim)
         self.value_head = nn.Sequential(
-            nn.Linear(self.token_dim * 4, self.token_dim),
+            nn.Linear(self.token_dim * 4 + self._privileged_dim, self.token_dim),
             nn.GELU(),
             nn.Linear(self.token_dim, 1),
         ).to(self.device)
@@ -228,10 +269,23 @@ class StructuredRebalancePolicy(nn.Module):
         logits = logits.masked_fill(self._logit_mask.unsqueeze(0), float('-inf'))
         return logits, ctx
 
-    def _value(self, ctx):
+    def _value(self, ctx, privileged_state=None):
         # Discrete action distribution is non-saturating, so value loss can flow through the
-        # backbone safely. This gives the value function access to richer state representations.
-        return self.value_head(self._ctx_pool(ctx, detach=False)).squeeze(-1)
+        # backbone safely. The privileged encoder consumes simulator-only state and contributes a
+        # separate embedding concatenated with the pooled actor context.
+        pooled = self._ctx_pool(ctx, detach=False)
+        priv_emb = self.privileged_encoder(privileged_state) if privileged_state else None
+        if priv_emb is None:
+            if self._privileged_dim > 0:
+                # Layout configured but no factors supplied at this step — pad with zeros so the
+                # value-head input dim is consistent.
+                priv_emb = torch.zeros((pooled.shape[0], self._privileged_dim), dtype=pooled.dtype, device=pooled.device)
+                value_input = torch.cat([pooled, priv_emb], dim=-1)
+            else:
+                value_input = pooled
+        else:
+            value_input = torch.cat([pooled, priv_emb], dim=-1)
+        return self.value_head(value_input).squeeze(-1)
 
     def _bins_to_trade_deltas(self, action_bins):
         # action_bins: int64 [B, I] in [0, n_bins_i). trade_delta = bin + min_trade.
@@ -240,11 +294,11 @@ class StructuredRebalancePolicy(nn.Module):
     def _trade_deltas_to_bins(self, trade_deltas):
         return trade_deltas - self._min_trade_delta
 
-    def forward(self, entity_state):
+    def forward(self, entity_state, privileged_state=None):
         logits, ctx = self._policy_outputs(entity_state)
-        return TensorDict({'logits': logits, 'value': self._value(ctx)}, batch_size=[logits.shape[0]])
+        return TensorDict({'logits': logits, 'value': self._value(ctx, privileged_state)}, batch_size=[logits.shape[0]])
 
-    def sample(self, entity_state, *, deterministic=False):
+    def sample(self, entity_state, *, deterministic=False, privileged_state=None):
         logits, ctx = self._policy_outputs(entity_state)
         log_probs_per_instr = torch.log_softmax(logits, dim=-1)
         if deterministic:
@@ -254,7 +308,7 @@ class StructuredRebalancePolicy(nn.Module):
             action_bins = torch.distributions.Categorical(probs=probs).sample()
         action_bin_log_probs = log_probs_per_instr.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
         log_prob = action_bin_log_probs.sum(-1)
-        value = self._value(ctx)
+        value = self._value(ctx, privileged_state)
         return TensorDict({
             'logits': logits,
             'action_bins': action_bins,
@@ -262,7 +316,7 @@ class StructuredRebalancePolicy(nn.Module):
             'value': value,
         }, batch_size=[logits.shape[0]])
 
-    def evaluate_action(self, entity_state, action_bins):
+    def evaluate_action(self, entity_state, action_bins, privileged_state=None):
         logits, ctx = self._policy_outputs(entity_state)
         log_probs_per_instr = torch.log_softmax(logits, dim=-1)
         action_bin_log_probs = log_probs_per_instr.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
@@ -271,7 +325,7 @@ class StructuredRebalancePolicy(nn.Module):
         probs = log_probs_per_instr.exp()
         entropy_per_instr = -(probs * log_probs_per_instr).sum(-1)
         entropy = entropy_per_instr.sum(-1)
-        value = self._value(ctx)
+        value = self._value(ctx, privileged_state)
         return log_prob, entropy, value, logits
 
     def map_actions(self, output):
@@ -294,9 +348,10 @@ class StructuredRebalancePolicy(nn.Module):
     def to_artifact(self):
         state = self.state_dict()
         return {
-            "artifact_version": 4,
+            "artifact_version": 5,
             "policy_object_type": "StructuredRebalancePolicy",
             "entity_layout": self.entity_layout,
+            "privileged_layout": dict(self.privileged_layout),
             "action_space": self.action_space.to_artifact_payload(),
             "model": {
                 "object": "EntityTransformer",
@@ -304,7 +359,6 @@ class StructuredRebalancePolicy(nn.Module):
                 "emb_dim": self.emb_dim,
                 "n_heads": self.n_heads,
                 "n_layers": self.n_layers,
-                "log_std_init": self.log_std_init,
             },
             "state_dict": {
                 key: {
@@ -336,11 +390,11 @@ def load_policy_artifact(file_path, *, device="cpu"):
             max_trade_delta=tuple(int(value) for value in action_space_payload["max_trade_delta"]),
         ),
         entity_layout=artifact["entity_layout"],
+        privileged_layout=dict(artifact.get("privileged_layout") or {}),
         token_dim=int(model.get("token_dim", 64)),
         emb_dim=int(model.get("emb_dim", 8)),
         n_heads=int(model.get("n_heads", 4)),
         n_layers=int(model.get("n_layers", 2)),
-        log_std_init=float(model.get("log_std_init", -0.5)),
         device=device,
     )
     state_dict = {

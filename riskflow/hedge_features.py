@@ -46,7 +46,9 @@ GLOBAL_FEATURE_NAMES = (
     'near_position_value',       # sum of position_value for instruments with ttf < 60d
     'mid_position_value',        # 60d <= ttf < 180d
     'far_position_value',        # ttf >= 180d
-    'spot_zscore_20d',           # rolling 20d z-score of underlying spot (overbought/oversold; first commodity)
+    'spot_zscore_20d',           # rolling 20d z-score of underlying spot
+    'spot_realized_vol_20d',     # annualized 20d realized log-vol of underlying spot
+    'implied_atm_vol_30d',       # 30d ATM implied vol (option-market regime signal)
 )
 
 
@@ -154,27 +156,136 @@ def _id_lookup(registry, vocab, name):
     return registry[vocab].get(str(name), 0)
 
 
-def compute_spot_zscore(bundle, window=PRICE_ZSCORE_WINDOW, min_periods=5, eps=1e-6):
-    """Per-commodity rolling z-score of underlying spot: (S - SMA_w(S)) / STD_w(S), per scenario.
-    Spot timeline = JSON-supplied historical spot (rows 0..H-1) concatenated with the simulated
-    commodity factor (rows H..). Captures overbought/oversold regime in the underlying.
-    Returns {commodity: tensor (H+T, B)}. Same scenario gets a single z value at each t."""
+def derive_privileged_layout(price_models, referenced_commodities, *, factor_module='LogOUSpotModel'):
+    """Static schema of privileged factors the simulator will expose, derived from price-model
+    config alone. Used by the policy at construction time to size the privileged encoder, before
+    the simulation has run. Mirrors the keys that compute_privileged_factors emits at sim time."""
+    layout = {}
+    multi = len(referenced_commodities) > 1
+    for commodity in referenced_commodities:
+        if f'{factor_module}.{commodity}' not in (price_models or {}):
+            continue
+        prefix = f'{commodity.lower()}_' if multi else ''
+        layout[f'{prefix}ou_log_deviation'] = 1
+        layout[f'{prefix}ou_kappa'] = 1
+        layout[f'{prefix}ou_sigma'] = 1
+    return layout
+
+
+def compute_privileged_factors(bundle, price_models, *, factor_module='LogOUSpotModel'):
+    """Privileged factors the asymmetric critic sees but the actor does not. For each commodity
+    referenced by Spot_Price_History, looks up its LogOUSpotModel params and produces:
+      - ou_log_deviation: log(spot_t) - theta  (time-varying per-scenario)
+      - ou_kappa, ou_sigma: scenario constants (broadcast)
+    All tensors are shape (T_full, B, 1). Multi-commodity prefixes the factor name."""
+    factors = bundle.get('factors') or {}
+    spot_history = bundle.get('spot_price_history') or {}
+    if not factors or not spot_history or not price_models:
+        return {}
+    out = {}
+    multi = len(spot_history) > 1
+    for commodity in spot_history.keys():
+        spot_key = f'CommodityPrice:{commodity}'
+        model_key = f'{factor_module}.{commodity}'
+        if spot_key not in factors or model_key not in price_models:
+            continue
+        spot = factors[spot_key].to(dtype=torch.float32)
+        params = price_models[model_key]
+        theta = float(params['Theta'])
+        kappa = float(params['Kappa'])
+        sigma = float(params['Sigma'])
+        log_dev = (spot.clamp_min(1e-9).log() - theta).unsqueeze(-1)
+        const_shape = log_dev.shape
+        kappa_t = torch.full(const_shape, kappa, dtype=torch.float32, device=spot.device)
+        sigma_t = torch.full(const_shape, sigma, dtype=torch.float32, device=spot.device)
+        prefix = f'{commodity.lower()}_' if multi else ''
+        out[f'{prefix}ou_log_deviation'] = log_dev
+        out[f'{prefix}ou_kappa'] = kappa_t
+        out[f'{prefix}ou_sigma'] = sigma_t
+    return out
+
+
+def _full_spot_timeline(bundle, commodity):
+    """Return the (H+T_sim, B) spot tensor for `commodity`, made of JSON history (rows 0..H-1)
+    concatenated with the simulator's CommodityPrice factor (rows H..)."""
     spot_history = bundle.get('spot_price_history') or {}
     factors = bundle.get('factors') or {}
+    hist = spot_history.get(commodity)
+    sim = factors.get(f'CommodityPrice:{commodity}')
+    if hist is None or sim is None:
+        return None
+    sim_full = sim.to(dtype=torch.float32)
+    hist_t = hist.to(dtype=torch.float32, device=sim_full.device)
+    H = int(hist_t.shape[0])
+    return torch.cat([hist_t, sim_full[H:]], dim=0)
+
+
+def compute_spot_realized_vol(bundle, window=PRICE_ZSCORE_WINDOW, min_periods=5, eps=1e-6):
+    """Annualized rolling realized log-vol of underlying spot. In MR regimes with σ scaled to
+    keep stationary std fixed, realized vol increases with kappa — making this a regime signal."""
+    spot_history = bundle.get('spot_price_history') or {}
     if not spot_history:
         return {}
     out = {}
-    for commodity, hist_tensor in spot_history.items():
-        factor_key = f'CommodityPrice:{commodity}'
-        sim = factors.get(factor_key)
-        if sim is None:
+    for commodity in spot_history.keys():
+        S = _full_spot_timeline(bundle, commodity)
+        if S is None:
             continue
-        H = int(hist_tensor.shape[0])
-        # sim already includes the prefix-injected history rows (broadcast row[0]); replace its
-        # historical portion with the JSON-supplied real spot, keep the simulated portion as-is.
-        sim_full = sim.to(dtype=torch.float32)
-        hist = hist_tensor.to(dtype=torch.float32, device=sim_full.device)
-        S = torch.cat([hist, sim_full[H:]], dim=0)  # (H + T, B)
+        log_S = S.clamp_min(1e-9).log()
+        log_ret = log_S[1:] - log_S[:-1]  # (T_full - 1, B)
+        ret_sq = torch.cat([torch.zeros_like(log_ret[:1]), log_ret * log_ret], dim=0)  # (T_full, B)
+        cum = torch.cat([torch.zeros_like(ret_sq[:1]), ret_sq.cumsum(dim=0)], dim=0)
+        T = ret_sq.shape[0]
+        idx = torch.arange(T + 1, device=S.device)
+        lo = (idx - window).clamp_min(0)
+        count = (idx - lo).to(dtype=torch.float32).clamp_min(1.0).unsqueeze(-1)
+        sum_w = cum[idx[1:]] - cum[lo[1:]]
+        rv = (252.0 * sum_w / count[1:]).clamp_min(0.0).sqrt()
+        rv[:min_periods] = 0.0
+        out[commodity] = rv
+    return out
+
+
+def compute_implied_atm_vol(bundle, price_models, *, tenor_days=30, factor_module='LogOUSpotModel'):
+    """Per-commodity implied ATM volatility for a `tenor_days` option (calendar days), derived
+    from LogOU process parameters. Closed-form: integrated log-variance V(T) = σ²(1-e^(-2κT))/(2κ),
+    annualized IV = √(V(T)/T). Constant across (t, b) in synthetic mode (one set of OU params per
+    bundle); in production this would be replaced by a JSON `Implied_ATM_Vol_History` block."""
+    spot_history = bundle.get('spot_price_history') or {}
+    factors = bundle.get('factors') or {}
+    if not spot_history or not price_models:
+        return {}
+    import math as _math
+    T = float(tenor_days) / utils.DAYS_IN_YEAR
+    out = {}
+    for commodity in spot_history.keys():
+        spot_key = f'CommodityPrice:{commodity}'
+        model_key = f'{factor_module}.{commodity}'
+        if spot_key not in factors or model_key not in price_models:
+            continue
+        params = price_models[model_key]
+        kappa = max(float(params['Kappa']), 1e-9)
+        sigma = float(params['Sigma'])
+        integrated_var = sigma * sigma * (1.0 - _math.exp(-2.0 * kappa * T)) / (2.0 * kappa)
+        iv = _math.sqrt(max(integrated_var / max(T, 1e-9), 0.0))
+        sim = factors[spot_key]
+        T_full, B = sim.shape
+        out[commodity] = torch.full((T_full, B), float(iv), dtype=torch.float32, device=sim.device)
+    return out
+
+
+def compute_spot_zscore(bundle, window=PRICE_ZSCORE_WINDOW, min_periods=5, eps=1e-6):
+    """Per-commodity rolling z-score of underlying spot: (S - SMA_w(S)) / STD_w(S), per scenario.
+    Captures overbought/oversold regime in the underlying.
+    Returns {commodity: tensor (H+T, B)}."""
+    spot_history = bundle.get('spot_price_history') or {}
+    if not spot_history:
+        return {}
+    out = {}
+    for commodity in spot_history.keys():
+        S = _full_spot_timeline(bundle, commodity)
+        if S is None:
+            continue
         T = S.shape[0]
         cum = torch.cat([torch.zeros_like(S[:1]), S.cumsum(dim=0)], dim=0)
         sq_cum = torch.cat([torch.zeros_like(S[:1]), (S * S).cumsum(dim=0)], dim=0)
@@ -377,18 +488,23 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
             far_pv = far_pv + pv
     residual_exposure = total_pv + mtm_now
     coverage_ratio = -total_pv / mtm_now.abs().clamp_min(1.0)
-    spot_zscore_bundle = bundle.get('spot_zscore') or {}
-    if spot_zscore_bundle:
-        first_commodity = next(iter(spot_zscore_bundle))
-        zs_tensor = spot_zscore_bundle[first_commodity]
-        zs_now = zs_tensor[time_index].to(device=device, dtype=torch.float32).reshape(-1, 1)
-        if zs_now.shape[0] == 1 and zs_now.shape[0] != batch_size:
-            zs_now = zs_now.expand(batch_size, 1).contiguous()
-    else:
-        zs_now = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
+
+    def _first_commodity_scalar(bundle_key):
+        store = bundle.get(bundle_key) or {}
+        if not store:
+            return torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
+        first = next(iter(store))
+        slice_t = store[first][time_index].to(device=device, dtype=torch.float32).reshape(-1, 1)
+        if slice_t.shape[0] == 1 and slice_t.shape[0] != batch_size:
+            slice_t = slice_t.expand(batch_size, 1).contiguous()
+        return slice_t
+
+    zs_now = _first_commodity_scalar('spot_zscore')
+    rv_now = _first_commodity_scalar('spot_realized_vol')
+    iv_now = _first_commodity_scalar('implied_atm_vol')
     return torch.cat(
         [time_to_horizon, mtm_now, mtm_prev, total_pv, residual_exposure, coverage_ratio,
-         near_pv, mid_pv, far_pv, zs_now],
+         near_pv, mid_pv, far_pv, zs_now, rv_now, iv_now],
         dim=1,
     )
 

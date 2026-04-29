@@ -4774,7 +4774,7 @@ class FloatingEnergyDeal(Deal):
         payment = schedule[:, utils.CASHFLOW_INDEX_Pay_Day]
         signed_volume = schedule[:, utils.CASHFLOW_INDEX_Nominal]
         fixed_basis = schedule[:, utils.CASHFLOW_INDEX_Strike]
-        period_length = np.maximum(period_end - period_start, 1.0)
+        period_length = period_end - period_start
 
         time_to_period_start = np.maximum(period_start[None, :] - t_days[:, None], 0.0) / utils.DAYS_IN_YEAR
         time_to_period_end = np.maximum(period_end[None, :] - t_days[:, None], 0.0) / utils.DAYS_IN_YEAR

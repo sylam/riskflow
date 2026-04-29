@@ -43,7 +43,10 @@ from .pricing import SensitivitiesEstimator
 from . import utils, pricing, construct_instrument
 from .hedge_runtime import construct_torchrl_runtime
 from .torchrl_hedge import run_torchrl_execution
-from .hedge_features import compute_cross_delta, compute_spot_zscore
+from .hedge_features import (
+    compute_cross_delta, compute_spot_zscore, compute_privileged_factors,
+    compute_spot_realized_vol, compute_implied_atm_vol,
+)
 
 
 class Aggregation(object):
@@ -1768,8 +1771,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             }
         if runtime is not None:
             self._prepend_history_prefix(bundle, runtime, base_date)
+        price_models = self.config.params.get('Price Models', {})
         bundle['cross_delta'] = compute_cross_delta(bundle)
         bundle['spot_zscore'] = compute_spot_zscore(bundle)
+        bundle['spot_realized_vol'] = compute_spot_realized_vol(bundle)
+        bundle['implied_atm_vol'] = compute_implied_atm_vol(bundle, price_models)
+        bundle['privileged_factors'] = compute_privileged_factors(bundle, price_models)
         return bundle
 
     @staticmethod
@@ -1791,7 +1798,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         base_ts = pd.Timestamp(base_date)
         any_tradable = next(iter(bundle['tradables'].values())) if bundle.get('tradables') else None
         batch_size = int(any_tradable.shape[1]) if any_tradable is not None else 1
-        # Use the first available commodity history as the reference timeline; spot histories share dates by spec.
+        # All commodities share the same Dates timeline (validator enforces this); take the first.
         ref_commodity = next(iter(spot_history))
         ref_dates = spot_history[ref_commodity]['dates'][-H:]
         prefix_days = torch.tensor(
@@ -1799,17 +1806,24 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             dtype=dtype, device=device,
         )
         bundle['time_grid_days'] = torch.cat([prefix_days, bundle['time_grid_days']], dim=0)
-        # Broadcast each commodity's last-H historical spot to a (H, B) tensor
+        # Build per-commodity historical-spot tensors keyed by commodity name.
         commodity_history_tensors = {}
         for commodity, payload in spot_history.items():
             prices = torch.tensor(payload['prices'][-H:], dtype=torch.float32, device=device)
             commodity_history_tensors[commodity] = prices.unsqueeze(1).expand(-1, batch_size).contiguous()
         bundle['spot_price_history'] = commodity_history_tensors
-        # Pick the reference commodity's broadcast history as the per-tradable price prefix
-        ref_history = commodity_history_tensors[ref_commodity]
+        # Per-tradable: prefix with its OWN commodity's history. Tradables without a Commodity
+        # field (cash accounts, equities) fall back to row[0] broadcast — they're not affected by
+        # commodity-history-driven features.
+        runtime_tradables = runtime.get('tradables') or {}
         new_tradables = {}
         for name, tensor in bundle['tradables'].items():
-            new_tradables[name] = torch.cat([ref_history.to(dtype=tensor.dtype), tensor], dim=0)
+            commodity = (runtime_tradables.get(name, {}).get('params') or {}).get('Commodity')
+            if commodity is not None and commodity in commodity_history_tensors:
+                prefix = commodity_history_tensors[commodity].to(dtype=tensor.dtype)
+            else:
+                prefix = tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous()
+            new_tradables[name] = torch.cat([prefix, tensor], dim=0)
         bundle['tradables'] = new_tradables
         if bundle.get('liability_mtm') is not None:
             mtm = bundle['liability_mtm']
@@ -1917,7 +1931,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         execution_label = 'Tensor_Execution_Time ({})'.format(self.device.type)
         self.calc_stats[execution_label] = time.monotonic()
 
-        normalized_runtime = construct_torchrl_runtime(params)
+        normalized_runtime = construct_torchrl_runtime(
+            params, price_models=self.config.params.get('Price Models', {}),
+        )
 
         # Accumulate one numpy array per stochastic factor across batches
         factor_blocks = {k: [] for k in self.stoch_factors} if retain_scenario_result else {}

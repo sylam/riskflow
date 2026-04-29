@@ -564,7 +564,6 @@ def _optimizer_settings(runtime):
         "action_sparsity_coef": float(p.get("action_sparsity_coef", 0.0)),
         "validation_fraction": float(p.get("validation_fraction", 0.25)),
         "validation_min_batch": int(p.get("validation_min_batch", 256)),
-        "validation_shards": int(p.get("validation_shards", 4)),
         "decision_interval_curriculum": tuple(dict(s) for s in p.get("decision_interval_curriculum", ())),
         "seed": p.get("seed"),
     }
@@ -582,13 +581,28 @@ def _make_structured_policy(runtime, *, device):
             tuple(action_space_cfg.get("max_trade_delta", {}).get(n, 0) for n in instrument_order),
         ),
         entity_layout=runtime["entity_layout"],
+        privileged_layout=runtime.get("privileged_layout") or {},
         token_dim=int(model.get("token_dim", 64)),
         emb_dim=int(model.get("emb_dim", 8)),
         n_heads=int(model.get("n_heads", 4)),
         n_layers=int(model.get("n_layers", 2)),
-        log_std_init=float(model.get("log_std_init", -0.5)),
         device=device,
     )
+
+
+def _privileged_state_at(bundle, time_index, batch_size, device):
+    """Slice bundle['privileged_factors'] at the given time index, returning a per-name dict of
+    tensors shaped (B, dim). Empty dict if no privileged factors are available."""
+    factors = (bundle.get("privileged_factors") or {}) if bundle else {}
+    if not factors:
+        return {}
+    out = {}
+    for name, t in factors.items():
+        slice_t = t[time_index].to(dtype=torch.float32, device=device)
+        if slice_t.shape[0] == 1 and slice_t.shape[0] != batch_size:
+            slice_t = slice_t.expand(batch_size, -1).contiguous()
+        out[name] = slice_t
+    return out
 
 
 def _entity_state_snapshot(entity_state):
@@ -613,6 +627,7 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
     batch_size = int(state["entity_state"].batch_size[0])
     device = policy.device
     entity_snapshots = []
+    privileged_snapshots = []
     action_bins_list = []
     log_probs = []
     values = []
@@ -628,9 +643,11 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
             if pending_reward is not None:
                 rewards.append(pending_reward)
                 dones.append(state["done"].to(dtype=torch.float32, device=device))
-            output = policy.sample(state["entity_state"], deterministic=deterministic)
+            priv = _privileged_state_at(bundle, t, batch_size, device)
+            output = policy.sample(state["entity_state"], deterministic=deterministic, privileged_state=priv)
             mapped = _realized_structured_action(policy.map_actions(output), state["positions"], runtime, batch_size=batch_size, device=device)
             entity_snapshots.append(_entity_state_snapshot(state["entity_state"]))
+            privileged_snapshots.append({k: v.detach().clone() for k, v in priv.items()})
             action_bins_list.append(output["action_bins"].detach())
             log_probs.append(output["log_prob"].detach())
             values.append(output["value"].detach())
@@ -650,8 +667,13 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
     if not entity_snapshots:
         return None
     stacked_states = _stack_entity_states(entity_snapshots)
+    stacked_privileged = {}
+    if privileged_snapshots and privileged_snapshots[0]:
+        for name in privileged_snapshots[0].keys():
+            stacked_privileged[name] = torch.stack([s[name] for s in privileged_snapshots], dim=0)
     return {
         "states": stacked_states,
+        "privileged_states": stacked_privileged,
         "action_bins": torch.stack(action_bins_list, dim=0),
         "log_probs": torch.stack(log_probs, dim=0),
         "values": torch.stack(values, dim=0),
@@ -687,6 +709,9 @@ def _ppo_update(policy, optimizer, rollout, settings):
     flat_advantages = advantages.reshape(D * B)
     flat_returns = returns.reshape(D * B)
     flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
+    flat_privileged = {}
+    for name, t in (rollout.get("privileged_states") or {}).items():
+        flat_privileged[name] = t.reshape(D * B, -1)
     N = D * B
     mb = max(int(settings["minibatch_size"]), 1)
     policy_losses = []
@@ -703,7 +728,8 @@ def _ppo_update(policy, optimizer, rollout, settings):
             mb_old_v = flat_old_values[idx]
             mb_adv = flat_advantages[idx]
             mb_ret = flat_returns[idx]
-            new_lp, entropy, value, logits = policy.evaluate_action(mb_state, mb_actions)
+            mb_privileged = {name: t[idx] for name, t in flat_privileged.items()} if flat_privileged else None
+            new_lp, entropy, value, logits = policy.evaluate_action(mb_state, mb_actions, privileged_state=mb_privileged)
             ratio = (new_lp - mb_old_lp).exp()
             clipped = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps)
             policy_loss = -torch.min(ratio * mb_adv, clipped * mb_adv).mean()
@@ -712,10 +738,15 @@ def _ppo_update(policy, optimizer, rollout, settings):
             v_loss_clipped = (v_clipped - mb_ret).pow(2)
             value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
             entropy_bonus = entropy.mean()
+            # Action-sparsity penalty: |trade_delta| normalized by action range. Discourages
+            # over-trading when the gradient signal is weak (e.g., noisy regime features).
+            trade_deltas = (mb_actions + policy._min_trade_delta).to(dtype=torch.float32)
+            action_sparsity_loss = (trade_deltas.abs() / policy._action_feature_scale).mean()
             loss = (
                 policy_loss
                 + settings["value_coef"] * value_loss
                 - settings["entropy_coef"] * entropy_bonus
+                + settings["action_sparsity_coef"] * action_sparsity_loss
             )
             optimizer.zero_grad()
             loss.backward()

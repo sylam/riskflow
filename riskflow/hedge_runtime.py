@@ -16,7 +16,7 @@ from typing import Any, Dict, Mapping, Optional
 import pandas as pd
 import torch
 
-from .hedge_features import build_entity_layout
+from .hedge_features import build_entity_layout, derive_privileged_layout
 
 
 class TerminalFloorThenSurplusUtility:
@@ -133,7 +133,6 @@ def _normalize_policy_config(policy_config: Mapping[str, Any]) -> Dict[str, Any]
             "emb_dim": int(model_config.get("Emb_Dim", 8)),
             "n_heads": int(model_config.get("N_Heads", 4)),
             "n_layers": int(model_config.get("N_Layers", 2)),
-            "log_std_init": float(model_config.get("Log_Std_Init", -0.5)),
         },
     }
 
@@ -166,7 +165,6 @@ def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -
         "dense_tracking_reward_clip": float(optimizer_config.get("Dense_Tracking_Reward_Clip", 0.15)),
         "validation_fraction": float(optimizer_config.get("Validation_Fraction", 0.25)),
         "validation_min_batch": int(optimizer_config.get("Validation_Min_Batch", 256)),
-        "validation_shards": int(optimizer_config.get("Validation_Shards", 4)),
         "decision_interval_curriculum": tuple(decision_interval_curriculum),
         "seed": optimizer_config.get("Seed"),
     }
@@ -251,6 +249,15 @@ def _normalize_spot_price_history(
         raise ValueError(
             f"Spot_Price_History missing entries for referenced commodities: {missing}"
         )
+    if len(normalized) > 1:
+        commodity_names = list(normalized.keys())
+        ref_dates = normalized[commodity_names[0]]["dates"]
+        for other in commodity_names[1:]:
+            if normalized[other]["dates"] != ref_dates:
+                raise ValueError(
+                    f"Spot_Price_History['{other}'].Dates must match "
+                    f"Spot_Price_History['{commodity_names[0]}'].Dates exactly"
+                )
     return normalized
 
 
@@ -304,8 +311,10 @@ def _normalize_instrument_metadata(
 ) -> Dict[str, Any]:
     params = tradable_entry["params"]
     investment_horizon = params.get("Investment_Horizon")
-    expiry_date = params.get("Expiry_Date", investment_horizon if investment_horizon is not None else liability_expiry)
-    last_trade_date = params.get("Last_Trade_Date", investment_horizon if investment_horizon is not None else liability_expiry)
+    maturity_date = params.get("Maturity_Date")
+    fallback = investment_horizon if investment_horizon is not None else liability_expiry
+    expiry_date = params.get("Expiry_Date", maturity_date if maturity_date is not None else fallback)
+    last_trade_date = params.get("Last_Trade_Date", maturity_date if maturity_date is not None else fallback)
     return {
         "name": str(instrument_name),
         "deal_type": tradable_entry["deal_type"],
@@ -323,7 +332,10 @@ def _normalize_instrument_metadata(
     }
 
 
-def construct_torchrl_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:
+def construct_torchrl_runtime(
+    config: Mapping[str, Any],
+    price_models: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     config = _unwrap_calc_config(config)
     hedging_problem = config["Hedging_Problem"]
     evaluator_config = hedging_problem["Evaluator"]
@@ -415,10 +427,10 @@ def construct_torchrl_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:
             "bid_offer_spread_bps": float(evaluator_config.get("Bid_Offer_Spread_Bps", 0.0)),
             "force_flat_at_end": bool(evaluator_config.get("Force_Flat_At_End", True)),
             "allow_short": allow_short,
-            "fail_on_unhedgeable_intent": bool(evaluator_config.get("Fail_On_Unhedgeable_Intent", False)),
         },
     }
     runtime["entity_layout"] = build_entity_layout(runtime)
+    runtime["privileged_layout"] = derive_privileged_layout(price_models or {}, referenced_commodities)
     return runtime
 
 
