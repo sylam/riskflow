@@ -264,26 +264,34 @@ def _tracking_error_value(state, runtime):
 
 
 def _dense_tracking_reward(prev_state, next_state, runtime):
-    """Per-step shaping in dollars: |prev_err| - |next_err| where err = pnl_excess + liability_mtm.
-    Positive when the step closes the tracking gap. Telescopes to |initial_err| - |final_err|
-    over an episode, so the dense channel adds per-step gradient without distorting the asymptote
-    — the optimum is still "minimize final |error|".
+    """Per-step ASYMMETRIC shaping in dollars × floor_penalty: rewards reducing the magnitude of
+    the DOWNSIDE part of the tracking error (max(-err, 0) — err < 0 in our convention is the
+    side the terminal asymmetric utility penalizes), silent on the upside.
 
-    Living in dollars (same units as the terminal asymmetric utility) means a single reward_scale
-    calibrates both consistently; the prior relative-error formulation was 4 orders of magnitude
-    below terminal under reward_scale=1e-6 and contributed effectively no gradient.
+    The previous symmetric `|prev| - |next|` pushed for tracking_error → 0 at every step, which
+    directly fights the asymmetric terminal utility (where net_pnl > 0 is rewarded at sr while
+    net_pnl < 0 is penalized at fp >> sr). The optimum of (symmetric_dense + asymmetric_terminal)
+    becomes essentially a delta-zero hedger with a small downside tilt — exactly the asymmetry
+    the project is supposed to learn. Asymmetric dense aligns the per-step gradient with terminal.
 
-    `dense_tracking_reward_clip` (dollars, optional, default 0=off) caps per-step magnitude in
-    case a price jump produces a single-step spike that would dominate the update."""
+    floor_penalty is baked into the per-step magnitude so dense and terminal speak the same units
+    on the loss branch; `Dense_Tracking_Reward_Scale` (rs) is now a balance knob — rs=1 puts dense
+    and terminal in the same ballpark per dollar of downside movement; rs=0 disables.
+
+    Telescopes to fp × (|initial_downside| − |final_downside|): for a typical initial_err > 0
+    (initial liability_mtm > 0 at deal start), |initial_downside| = 0, so dense_total reduces
+    to -fp × |final_downside| — a free per-step gradient on top of terminal's same value."""
     settings = dict(runtime.get("optimizer") or {})
     rs = float(settings.get("dense_tracking_reward_scale", 0.0))
+    fp = float((runtime.get("objective") or {}).get("floor_penalty", 1.0))
     prev_err = _tracking_error_value(prev_state, runtime)
     next_err = _tracking_error_value(next_state, runtime)
-    shaping = prev_err.abs() - next_err.abs()
+    # Magnitude of the negative part of err (the downside the asymmetric utility penalizes).
+    shaping = torch.clamp(-prev_err, min=0.0) - torch.clamp(-next_err, min=0.0)
     rc = float(settings.get("dense_tracking_reward_clip", 0.0))
     if rc > 0.0:
         shaping = torch.clamp(shaping, min=-rc, max=rc)
-    return rs * shaping
+    return rs * fp * shaping
 
 
 def _evaluate_objective(pnl_excess, liability, runtime):
@@ -374,10 +382,13 @@ def _transaction_costs(trade_delta, price, runtime, name):
     return cost
 
 
-def _apply_cash_trade(cash_accounts, account_name, trade_delta, price, transaction_cost):
+def _apply_cash_trade(cash_accounts, account_name, trade_delta, price, transaction_cost, contract_size):
     if account_name is None:
         return
-    cash_accounts[account_name] = cash_accounts[account_name] - (trade_delta * price + transaction_cost)
+    # Notional debit is `delta × price × contract_size` — each contract is `contract_size` units of
+    # the underlying. Without contract_size the cash leg was off by exactly that factor (50 for
+    # platinum at $2050: $2050 instead of $102,500 per contract).
+    cash_accounts[account_name] = cash_accounts[account_name] - (trade_delta * price * contract_size + transaction_cost)
 
 
 def _apply_account_flow(accounts, account_name, amount):
@@ -415,7 +426,8 @@ def _flatten_cash_inventory(positions, cash_accounts, terminal_values, runtime):
         n = str(name)
         delta = -positions[n]
         cost = _transaction_costs(delta, terminal_values[n], runtime, n)
-        _apply_cash_trade(cash_accounts, _cash_account_for_instrument(n, runtime), delta, terminal_values[n], cost)
+        cs = float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
+        _apply_cash_trade(cash_accounts, _cash_account_for_instrument(n, runtime), delta, terminal_values[n], cost, cs)
         positions[n] = positions[n] + delta
 
 
@@ -499,7 +511,8 @@ def cash_account_step(state, action, bundle, runtime):
         delta = deltas.get(n)
         price = state["tradable_values"][n]
         cost = _transaction_costs(delta, price, runtime, n)
-        _apply_cash_trade(next_cash, _cash_account_for_instrument(n, runtime), delta, price, cost)
+        cs = float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
+        _apply_cash_trade(next_cash, _cash_account_for_instrument(n, runtime), delta, price, cost, cs)
         next_positions[n] = next_positions[n] + delta
     if _should_terminal_flatten(runtime, current, last):
         _flatten_cash_inventory(next_positions, next_cash, _current_tradable_values(bundle, runtime, last), runtime)
@@ -545,9 +558,17 @@ def futures_account_step(state, action, bundle, runtime):
     deltas = _enforce_position_limits(state["positions"], _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device), runtime)
     next_values = _current_tradable_values(bundle, runtime, settlement_idx)
     # Futures: cash_accounts is frozen at starting capital; only margin tracks VM and trade cost.
+    # Apply the trade BEFORE computing VM so the new delta participates in the price(t)→price(t+1)
+    # accrual: the agent transacted at decision-time price (= settlement_old in steady state, since
+    # the previous step set settlement to that step's tradable_values), and after this step the
+    # whole post-trade position is marked at price(t+1). Pre-fix, VM was computed on pre-trade
+    # position only, so `delta × (next_value − decision_price) × cs` was silently dropped — mean
+    # zero but ~$25k std/path noise on advantages.
     for name in _runtime_names(runtime, "hedges"):
         n = str(name)
-        vm = state["positions"][n] * (next_values[n] - state["settlement_prices"][n]) * float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
+        cs = float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
+        next_positions[n] = next_positions[n] + deltas[n]
+        vm = next_positions[n] * (next_values[n] - state["settlement_prices"][n]) * cs
         realized_pnl[n] = vm
         variation_margin[n] = vm
         next_settlement[n] = next_values[n].clone()
@@ -556,13 +577,10 @@ def futures_account_step(state, action, bundle, runtime):
     for name in _runtime_names(runtime, "action_instruments"):
         n = str(name)
         delta = deltas.get(n)
-        # Trade is executed at decision-time price (state["tradable_values"]), not next-step
-        # settlement. Bid/offer spread and per-unit cost should both reference the price the agent
-        # actually saw and acted on; using next_values[n] would let unrelated overnight mid moves
-        # distort cost.
+        # Trade cost references the price the agent actually saw and acted on (decision-time).
+        # Using next_values[n] would let unrelated overnight mid moves distort the spread cost.
         cost = _transaction_costs(delta, state["tradable_values"][n], runtime, n)
         account = _cash_account_for_instrument(n, runtime)
-        next_positions[n] = next_positions[n] + delta
         _apply_account_flow(next_margin, account, -cost)
     if _should_terminal_flatten(runtime, current, last):
         _flatten_futures_inventory(next_positions, next_margin, next_settlement, next_values, runtime)

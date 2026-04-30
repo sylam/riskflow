@@ -231,15 +231,12 @@ if __name__=='__main__':
                         "Entropy_Coef": 0.001,
                         "Max_Grad_Norm": 0.5,
                         "Reward_Scale": 1.0e-6,
-                        "Dense_Tracking_Reward_Scale": 2.0,
+                        "Dense_Tracking_Reward_Scale": 1.0,
                         "Validation_Fraction": 0.25,
                         "Validation_Min_Batch": 512,
                         "Validation_Shards": 4,
                         "Decision_Interval_Curriculum": [
-                            {"Start_Epoch": 1, "End_Epoch": 8, "Interval_Business_Days": 10},
-                            {"Start_Epoch": 9, "End_Epoch": 16, "Interval_Business_Days": 5},
-                            {"Start_Epoch": 17, "End_Epoch": 24, "Interval_Business_Days": 2},
-                            {"Start_Epoch": 25, "End_Epoch": 30, "Interval_Business_Days": 1}
+                            {"Start_Epoch": 1, "End_Epoch": 30, "Interval_Business_Days": 1}
                         ],
                         "Seed": 42
                     }
