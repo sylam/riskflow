@@ -10,7 +10,7 @@ import torch
 import torch.optim as optim
 from tensordict import TensorDict
 
-from .hedge_features import build_entity_state, flatten_entity_features
+from .hedge_features import build_entity_state
 from .structured_policy import StructuredActionSpace, StructuredRebalancePolicy
 
 
@@ -124,18 +124,16 @@ def _current_tradable_values(bundle, runtime, time_index):
     return {n: tradables[str(n)][time_index].to(dtype=torch.float32) for n in _runtime_names(runtime, "tradables") if n in tradables}
 
 
-def _sanitize_policy_features(policy_features):
-    sanitized = torch.nan_to_num(torch.as_tensor(policy_features, dtype=torch.float32), nan=0.0, posinf=1.0e6, neginf=-1.0e6)
-    compressed = torch.sign(sanitized) * torch.log1p(sanitized.abs())
-    return torch.clamp(compressed, min=-16.0, max=16.0)
-
-
 def _refresh_state_views(state, bundle, runtime, time_index):
+    """Cheap per-step refresh: refreshes price/liability views and carries forward simulator state.
+    Entity-state construction (the expensive transformer-shaped feature stack) is deferred to
+    `_ensure_decision_views`, which only runs on decision steps where the policy actually reads
+    it. With a 10-day decision interval this saves ~9 entity rebuilds per decision."""
     refreshed = dict(state)
     tradable_values = _current_tradable_values(bundle, runtime, time_index)
-    intermediate = {**refreshed, "tradable_values": tradable_values}
-    entity_state = build_entity_state(bundle, intermediate, time_index, runtime["entity_layout"])
-    policy_features = _sanitize_policy_features(flatten_entity_features(entity_state))
+    sample = next(iter(refreshed["positions"].values()))
+    batch_size = int(sample.shape[0])
+    device = sample.device
     return {
         "time_index": int(time_index),
         "done": refreshed["done"],
@@ -144,75 +142,157 @@ def _refresh_state_views(state, bundle, runtime, time_index):
         "margin_accounts": refreshed["margin_accounts"],
         "realized_pnl": refreshed["realized_pnl"],
         "variation_margin": refreshed["variation_margin"],
-        "cumulative_pnl": refreshed.get("cumulative_pnl", _zeros_by_name(_runtime_names(runtime, "hedges"), int(policy_features.shape[0]), device=policy_features.device)),
-        "time_held": refreshed.get("time_held", _zeros_by_name(_runtime_names(runtime, "hedges"), int(policy_features.shape[0]), device=policy_features.device)),
+        "cumulative_pnl": refreshed.get("cumulative_pnl", _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)),
+        "time_held": refreshed.get("time_held", _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)),
         "settlement_prices": refreshed["settlement_prices"],
         "tradable_values": tradable_values,
-        "entity_state": entity_state,
-        "policy_features": policy_features,
         "liability_mtm_value": _current_liability_mtm(bundle, time_index),
         "realized_cashflow_value": _current_realized_cashflow_total(bundle, time_index),
         "cumulative_liability_value": refreshed.get(
             "cumulative_liability_value",
-            torch.zeros(int(policy_features.shape[0]), dtype=torch.float32, device=policy_features.device),
+            torch.zeros(batch_size, dtype=torch.float32, device=device),
         ).to(dtype=torch.float32),
+        "initial_portfolio_value": refreshed.get("initial_portfolio_value"),
     }
 
 
-def _account_market_values(account_values, tradable_values, account_names):
+def _ensure_decision_views(state, bundle, runtime):
+    """Materialize `entity_state` on a state dict that came out of the cheap refresh path.
+    Idempotent — returns the input unchanged when entity_state is already present."""
+    if state.get("entity_state") is not None:
+        return state
+    entity_state = build_entity_state(bundle, state, int(state["time_index"]), runtime["entity_layout"])
+    return {**state, "entity_state": entity_state}
+
+
+def _sum_account_balances(accounts):
+    # Cash and margin balances are stored as raw dollars and compounded daily (each step we
+    # multiply by cash_tv(next)/cash_tv(curr) ≈ 1 + SOFR·dt, then add today's flows). That gives
+    # each dollar interest only from the day it landed — not from t=0 the way a single multiply
+    # by tradable_value(t) = 1/D(t) at portfolio-value time would.
+    total = None
+    for tensor in accounts.values():
+        v = tensor.to(dtype=torch.float32)
+        total = v if total is None else total + v
+    return total
+
+
+def _daily_growth_factors(bundle, runtime, current, next_idx):
+    """Per-cash-account one-day growth factor for compounding cash/margin balances overnight.
+
+    The cash tradable value is `Units / D(t) × fx_rep`, so the ratio
+    `tradable_value(next_idx) / tradable_value(current) = D(current) / D(next_idx)` is the one-day
+    growth factor (≈ 1 + SOFR · dt). Returns {} when next_idx == current so terminal steps pass
+    balances through unchanged."""
+    if current >= next_idx:
+        return {}
+    tv_curr = _current_tradable_values(bundle, runtime, current)
+    tv_next = _current_tradable_values(bundle, runtime, next_idx)
     out = {}
-    for name in account_names:
+    for name in _runtime_names(runtime, "cash_accounts"):
         n = str(name)
-        if n in tradable_values:
-            out[n] = account_values[n].to(dtype=torch.float32) * tradable_values[n]
-        else:
-            out[n] = account_values[n].to(dtype=torch.float32)
+        if n in tv_curr and n in tv_next:
+            out[n] = tv_next[n] / tv_curr[n]
     return out
 
 
+def _compound_accounts(accounts, factors):
+    """Multiply each balance by its one-day growth factor (or pass through if no factor present)."""
+    return {n: (bal * factors[n] if n in factors else bal.clone()) for n, bal in accounts.items()}
+
+
 def _portfolio_value(state, runtime):
+    """Absolute total wealth (cash + margin + unrealized VM + position value where applicable).
+    Use `_pnl_excess` to get wealth change since inception — that's what the asymmetric utility
+    and dense tracking reward need so the floor at zero correctly discriminates loss from gain."""
     accounting_mode = str(runtime.get("accounting_mode", "futures"))
     position_total = _position_value_total(state, runtime)
     if accounting_mode == "cash_account":
-        cash_total = torch.zeros_like(position_total)
-        for tensor in _account_market_values(state.get("cash_accounts", {}), state.get("tradable_values", {}), _runtime_names(runtime, "cash_accounts")).values():
-            cash_total = cash_total + tensor.to(dtype=torch.float32)
+        cash_total = _sum_account_balances(state.get("cash_accounts", {}))
+        if cash_total is None:
+            cash_total = torch.zeros_like(position_total)
         return position_total + cash_total
-    margin_total = torch.zeros_like(position_total)
-    for tensor in _account_market_values(state.get("margin_accounts", {}), state.get("tradable_values", {}), _runtime_names(runtime, "cash_accounts")).values():
-        margin_total = margin_total + tensor.to(dtype=torch.float32)
-    return margin_total
+    # Futures mode: cash = starting capital (frozen); margin = all VM and trade-cost flows since
+    # inception; unrealized_vm = position × (current_price - last_settlement_price) × cs captures
+    # the gap between the most recent settlement and the current observable price (typically zero
+    # within an episode, but non-zero at t=0 when the book starts with an overnight position whose
+    # prior settlement is yesterday's close).
+    total = torch.zeros_like(position_total)
+    margin_total = _sum_account_balances(state.get("margin_accounts", {}))
+    if margin_total is not None:
+        total = total + margin_total
+    cash_total = _sum_account_balances(state.get("cash_accounts", {}))
+    if cash_total is not None:
+        total = total + cash_total
+    settlement_prices = state.get("settlement_prices", {})
+    tradable_values = state.get("tradable_values", {})
+    for name in _runtime_names(runtime, "hedges"):
+        n = str(name)
+        if n not in settlement_prices or n not in tradable_values:
+            continue
+        pos = state["positions"][n].to(dtype=torch.float32)
+        price = tradable_values[n].to(dtype=torch.float32)
+        settlement = settlement_prices[n].to(dtype=torch.float32)
+        contract_size = float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
+        total = total + pos * (price - settlement) * contract_size
+    return total
+
+
+def _pnl_excess(state, runtime):
+    """Wealth change since inception: portfolio_value - initial_portfolio_value. Used by the
+    asymmetric utility, dense tracking reward, and reported metrics — anywhere we want net P&L
+    rather than absolute wealth so the floor at zero is meaningful. The initial baseline is
+    snapshotted in build_shared_state and threaded through state across all step transitions."""
+    pv = _portfolio_value(state, runtime)
+    initial = state.get("initial_portfolio_value")
+    if initial is None:
+        return pv
+    return pv - initial.to(device=pv.device, dtype=pv.dtype)
 
 
 def _tracking_error_value(state, runtime):
-    # Use the running MTM of the liability (smooth, no jumps at payment dates) for the dense
-    # tracking signal. Optimal hedge keeps portfolio + liability_mtm ≈ 0 at every time step.
-    portfolio = _portfolio_value(state, runtime).to(dtype=torch.float32)
-    liability_mtm = state.get("liability_mtm_value", torch.zeros_like(portfolio)).to(dtype=torch.float32, device=portfolio.device)
-    return portfolio + liability_mtm
+    # Optimal hedge keeps pnl_excess + (liability_mtm + cumulative_liability_value) ≈ 0 at every
+    # step. liability_mtm alone drops by the cashflow amount on payment dates (the cashflow moves
+    # to realized cash, summed into cumulative_liability_value), which would otherwise inject a
+    # ±cf shock into the dense reward unrelated to any action. The sum across the two channels
+    # is continuous across the payment boundary, matching the terminal-reward invariant
+    # (`pnl_excess + cumulative_liability_value` once everything has been paid).
+    pnl_excess = _pnl_excess(state, runtime).to(dtype=torch.float32)
+    liability_mtm = state.get("liability_mtm_value", torch.zeros_like(pnl_excess)).to(dtype=torch.float32, device=pnl_excess.device)
+    cumulative_liability = state.get("cumulative_liability_value", torch.zeros_like(pnl_excess)).to(dtype=torch.float32, device=pnl_excess.device)
+    return pnl_excess + liability_mtm + cumulative_liability
 
 
 def _dense_tracking_reward(prev_state, next_state, runtime):
-    prev_err = _tracking_error_value(prev_state, runtime)
-    next_err = _tracking_error_value(next_state, runtime)
-    scale = torch.maximum(
-        torch.as_tensor(next_state.get("cumulative_liability_value", torch.zeros_like(next_err)), dtype=torch.float32, device=next_err.device).abs(),
-        torch.ones_like(next_err),
-    )
+    """Per-step shaping in dollars: |prev_err| - |next_err| where err = pnl_excess + liability_mtm.
+    Positive when the step closes the tracking gap. Telescopes to |initial_err| - |final_err|
+    over an episode, so the dense channel adds per-step gradient without distorting the asymptote
+    — the optimum is still "minimize final |error|".
+
+    Living in dollars (same units as the terminal asymmetric utility) means a single reward_scale
+    calibrates both consistently; the prior relative-error formulation was 4 orders of magnitude
+    below terminal under reward_scale=1e-6 and contributed effectively no gradient.
+
+    `dense_tracking_reward_clip` (dollars, optional, default 0=off) caps per-step magnitude in
+    case a price jump produces a single-step spike that would dominate the update."""
     settings = dict(runtime.get("optimizer") or {})
     rs = float(settings.get("dense_tracking_reward_scale", 0.0))
-    rc = float(settings.get("dense_tracking_reward_clip", 0.15))
-    shaping = (prev_err.abs() / scale) - (next_err.abs() / scale)
+    prev_err = _tracking_error_value(prev_state, runtime)
+    next_err = _tracking_error_value(next_state, runtime)
+    shaping = prev_err.abs() - next_err.abs()
+    rc = float(settings.get("dense_tracking_reward_clip", 0.0))
     if rc > 0.0:
         shaping = torch.clamp(shaping, min=-rc, max=rc)
     return rs * shaping
 
 
-def _evaluate_objective(hedge_pnl, liability, runtime):
+def _evaluate_objective(pnl_excess, liability, runtime):
     objective = runtime.get("objective")
-    # net_pnl = hedge gain + leg cashflows received (total terminal wealth).
-    # For a Receiver leg, liability is positive when we have received money; perfect hedge → portfolio = -liability → net_pnl ≈ 0.
-    net_pnl = hedge_pnl + liability
+    # net_pnl = hedge gain since inception + leg cashflows received. Perfect hedge → pnl_excess
+    # offsets liability → net_pnl ≈ 0, sitting exactly at the floor where Floor_Penalty kicks in.
+    # Using ABSOLUTE portfolio_value here (cash baseline included) would silently bias every
+    # scenario into the surplus regime and the floor penalty would never fire.
+    net_pnl = pnl_excess + liability
     if objective is None:
         return net_pnl
     fp = float(objective.get("floor_penalty", 1.0))
@@ -339,13 +419,23 @@ def _flatten_cash_inventory(positions, cash_accounts, terminal_values, runtime):
         positions[n] = positions[n] + delta
 
 
-def _flatten_futures_inventory(positions, cash_accounts, margin_accounts, settlement_prices, runtime):
+def _flatten_futures_inventory(positions, margin_accounts, settlement_prices, terminal_values, runtime):
+    """Close hedge positions at `terminal_values` and capture any residual variation margin.
+
+    `settlement_prices` is the price each position last settled at; `terminal_values` is the
+    price at which we're closing. The residual VM = position × (terminal - settlement) × cs is
+    applied to margin to ensure no PnL leaks between the last settlement and close. When the
+    caller has already advanced settlement to terminal (current futures_account_step path), the
+    residual is 0 and only the trade cost is debited; otherwise the residual is captured here.
+    Trade cost is always computed at `terminal_values` (the actual close price)."""
     for name in _runtime_names(runtime, "hedges"):
         n = str(name)
+        cs = float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
+        residual_vm = positions[n] * (terminal_values[n] - settlement_prices[n]) * cs
         delta = -positions[n]
-        cost = _transaction_costs(delta, settlement_prices[n], runtime, n)
+        cost = _transaction_costs(delta, terminal_values[n], runtime, n)
         account = _cash_account_for_instrument(n, runtime)
-        _apply_account_flow(cash_accounts, account, -cost)
+        _apply_account_flow(margin_accounts, account, residual_vm)
         _apply_account_flow(margin_accounts, account, -cost)
         positions[n] = positions[n] + delta
 
@@ -357,8 +447,12 @@ def build_shared_state(bundle, runtime):
     positions = _seed_by_name(portfolio_state.get("positions", {}), _runtime_names(runtime, "hedges"), batch_size, device=device)
     cash_accounts = _seed_by_name(portfolio_state.get("cash_balances", {}), _runtime_names(runtime, "cash_accounts"), batch_size, device=device)
     margin_accounts = _seed_by_name(portfolio_state.get("margin_balances", {}), _runtime_names(runtime, "cash_accounts"), batch_size, device=device)
+    # Start simulation state at sim-day-0 (= bundle row H) so the prefix-injected historical rows
+    # are only used by features (z-score, cross-delta, momentum) — never visited by the simulator
+    # itself. JSON-supplied positions are "today's overnight book", not "30 days ago".
+    initial_time_index = int(runtime.get("history_lookback_business_days", 0) or 0)
     seeded_settlement = portfolio_state.get("settlement_prices", {})
-    fallback = _current_tradable_values(bundle, runtime, 0)
+    fallback = _current_tradable_values(bundle, runtime, initial_time_index)
     settlement_prices = {
         name: torch.full((batch_size,), float(seeded_settlement[name]), dtype=torch.float32, device=device)
         if name in seeded_settlement
@@ -378,13 +472,18 @@ def build_shared_state(bundle, runtime):
         "cumulative_liability_value": torch.zeros(batch_size, dtype=torch.float32, device=device),
         "settlement_prices": settlement_prices,
     }
-    refreshed = _refresh_state_views(state, bundle, runtime, 0)
+    refreshed = _refresh_state_views(state, bundle, runtime, initial_time_index)
     refreshed["cumulative_liability_value"] = refreshed["cumulative_liability_value"] + refreshed["realized_cashflow_value"]
+    # Snapshot the inception baseline (cash + margin + initial unrealized VM if positions started
+    # non-zero with a stale settlement). Threaded through state so _pnl_excess returns the change.
+    refreshed["initial_portfolio_value"] = _portfolio_value(refreshed, runtime).detach().clone()
     return refreshed
 
 
 def cash_account_step(state, action, bundle, runtime):
-    if bool(state["done"].all().item()):
+    # `done` is purely a function of time_index vs. last bundle index; checking the Python int
+    # avoids a CUDA-CPU sync that would fire on every step.
+    if int(state["time_index"]) >= _last_time_index(bundle):
         return state
     batch_size = _batch_size_from_bundle(bundle)
     device = bundle["time_grid_days"].device
@@ -392,7 +491,8 @@ def cash_account_step(state, action, bundle, runtime):
     last = _last_time_index(bundle)
     next_idx = min(current + 1, last)
     next_positions = _clone_tensor_dict(state["positions"])
-    next_cash = _clone_tensor_dict(state["cash_accounts"])
+    growth = _daily_growth_factors(bundle, runtime, current, next_idx)
+    next_cash = _compound_accounts(state["cash_accounts"], growth)
     deltas = _enforce_position_limits(state["positions"], _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device), runtime)
     for name in _runtime_names(runtime, "action_instruments"):
         n = str(name)
@@ -417,6 +517,7 @@ def cash_account_step(state, action, bundle, runtime):
         "time_held": next_time_held,
         "cumulative_liability_value": state["cumulative_liability_value"].clone(),
         "settlement_prices": _clone_tensor_dict(state["settlement_prices"]),
+        "initial_portfolio_value": state["initial_portfolio_value"].clone(),
     }
     _zero_futures_flows(next_state, runtime)
     next_state["done"] = torch.full_like(state["done"], next_idx >= last, dtype=torch.bool)
@@ -426,7 +527,8 @@ def cash_account_step(state, action, bundle, runtime):
 
 
 def futures_account_step(state, action, bundle, runtime):
-    if bool(state["done"].all().item()):
+    # See cash_account_step — sync-free guard via time_index.
+    if int(state["time_index"]) >= _last_time_index(bundle):
         return state
     batch_size = _batch_size_from_bundle(bundle)
     device = bundle["time_grid_days"].device
@@ -434,13 +536,15 @@ def futures_account_step(state, action, bundle, runtime):
     last = _last_time_index(bundle)
     settlement_idx = min(current + 1, last)
     next_positions = _clone_tensor_dict(state["positions"])
-    next_cash = _clone_tensor_dict(state["cash_accounts"])
-    next_margin = _clone_tensor_dict(state["margin_accounts"])
+    growth = _daily_growth_factors(bundle, runtime, current, settlement_idx)
+    next_cash = _compound_accounts(state["cash_accounts"], growth)
+    next_margin = _compound_accounts(state["margin_accounts"], growth)
     next_settlement = _clone_tensor_dict(state["settlement_prices"])
     realized_pnl = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
     variation_margin = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
     deltas = _enforce_position_limits(state["positions"], _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device), runtime)
     next_values = _current_tradable_values(bundle, runtime, settlement_idx)
+    # Futures: cash_accounts is frozen at starting capital; only margin tracks VM and trade cost.
     for name in _runtime_names(runtime, "hedges"):
         n = str(name)
         vm = state["positions"][n] * (next_values[n] - state["settlement_prices"][n]) * float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
@@ -449,17 +553,19 @@ def futures_account_step(state, action, bundle, runtime):
         next_settlement[n] = next_values[n].clone()
         account = _cash_account_for_instrument(n, runtime)
         _apply_account_flow(next_margin, account, vm)
-        _apply_account_flow(next_cash, account, vm)
     for name in _runtime_names(runtime, "action_instruments"):
         n = str(name)
         delta = deltas.get(n)
-        cost = _transaction_costs(delta, next_values[n], runtime, n)
+        # Trade is executed at decision-time price (state["tradable_values"]), not next-step
+        # settlement. Bid/offer spread and per-unit cost should both reference the price the agent
+        # actually saw and acted on; using next_values[n] would let unrelated overnight mid moves
+        # distort cost.
+        cost = _transaction_costs(delta, state["tradable_values"][n], runtime, n)
         account = _cash_account_for_instrument(n, runtime)
         next_positions[n] = next_positions[n] + delta
-        _apply_account_flow(next_cash, account, -cost)
         _apply_account_flow(next_margin, account, -cost)
     if _should_terminal_flatten(runtime, current, last):
-        _flatten_futures_inventory(next_positions, next_cash, next_margin, next_settlement, runtime)
+        _flatten_futures_inventory(next_positions, next_margin, next_settlement, next_values, runtime)
     next_cumulative_pnl = {n: state["cumulative_pnl"][n] + variation_margin[n] for n in state["cumulative_pnl"]}
     next_time_held = _step_time_held(state["time_held"], next_positions)
     next_state = {
@@ -473,6 +579,7 @@ def futures_account_step(state, action, bundle, runtime):
         "cumulative_pnl": next_cumulative_pnl,
         "time_held": next_time_held,
         "cumulative_liability_value": state["cumulative_liability_value"].clone(),
+        "initial_portfolio_value": state["initial_portfolio_value"].clone(),
     }
     refreshed = _refresh_state_views(next_state, bundle, runtime, settlement_idx)
     refreshed["cumulative_liability_value"] = refreshed["cumulative_liability_value"] + refreshed["realized_cashflow_value"]
@@ -490,15 +597,20 @@ def reward_and_terminal_payoff(prev_state, state, bundle, runtime):
     device = bundle["time_grid_days"].device
     reward = _dense_tracking_reward(prev_state, state, runtime).to(device=device, dtype=torch.float32)
     terminal_payoff = torch.zeros(batch_size, dtype=torch.float32, device=device)
-    portfolio_value = torch.zeros(batch_size, dtype=torch.float32, device=device)
+    pnl_excess = torch.zeros(batch_size, dtype=torch.float32, device=device)
     liability_value = state.get("cumulative_liability_value", torch.zeros(batch_size, dtype=torch.float32, device=device)).to(device=device, dtype=torch.float32)
-    done_mask = state["done"].to(dtype=torch.bool)
-    if bool(done_mask.any().item()):
-        portfolio_value = _portfolio_value(state, runtime).to(device=device, dtype=torch.float32)
-        terminal_reward = _evaluate_objective(portfolio_value, liability_value, runtime).to(device=device, dtype=torch.float32)
+    # Sync-free terminality check: done becomes True iff time_index hits last_idx, and is uniform
+    # across the batch (the simulator advances all scenarios together). Avoids a `.item()` sync on
+    # every rollout step.
+    if int(state["time_index"]) >= _last_time_index(bundle):
+        done_mask = state["done"].to(dtype=torch.bool)
+        # pnl_excess = portfolio change since inception; the asymmetric utility evaluates against
+        # this (NOT absolute portfolio value) so the seed cash baseline doesn't bias the floor.
+        pnl_excess = _pnl_excess(state, runtime).to(device=device, dtype=torch.float32)
+        terminal_reward = _evaluate_objective(pnl_excess, liability_value, runtime).to(device=device, dtype=torch.float32)
         reward = reward + torch.where(done_mask, terminal_reward, torch.zeros_like(reward))
         terminal_payoff = torch.where(done_mask, liability_value, terminal_payoff)
-    return {"reward": reward, "terminal_payoff": terminal_payoff, "portfolio_value": portfolio_value, "liability_value": liability_value}
+    return {"reward": reward, "terminal_payoff": terminal_payoff, "pnl_excess": pnl_excess, "liability_value": liability_value}
 
 
 def _bundle_scenario_dates(bundle):
@@ -582,11 +694,21 @@ def _make_structured_policy(runtime, *, device):
         ),
         entity_layout=runtime["entity_layout"],
         privileged_layout=runtime.get("privileged_layout") or {},
+        position_limits=runtime.get("accounting", {}).get("position_limits", {}),
         token_dim=int(model.get("token_dim", 64)),
         emb_dim=int(model.get("emb_dim", 8)),
         n_heads=int(model.get("n_heads", 4)),
         n_layers=int(model.get("n_layers", 2)),
         device=device,
+    )
+
+
+def _positions_tensor(state, instrument_order, *, device):
+    """Stack a state's per-instrument position dict into a (B, I) int64 tensor in policy order.
+    Used to feed the policy's feasibility mask at sample / evaluate time."""
+    return torch.stack(
+        [state["positions"][name].to(dtype=torch.int64, device=device) for name in instrument_order],
+        dim=-1,
     )
 
 
@@ -624,10 +746,12 @@ def _flatten_for_minibatch(stacked_td):
 def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, deterministic=False, reward_scale=1.0):
     state = build_shared_state(bundle, runtime)
     decision_set = set(int(i) for i in decision_indices)
-    batch_size = int(state["entity_state"].batch_size[0])
+    batch_size = int(next(iter(state["positions"].values())).shape[0])
     device = policy.device
+    instrument_order = policy.action_space.instrument_order
     entity_snapshots = []
     privileged_snapshots = []
+    position_snapshots = []
     action_bins_list = []
     log_probs = []
     values = []
@@ -635,35 +759,50 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
     dones = []
     pending_reward = None
     pending_index = -1
-    mapped = None
     last_state = state
-    while True:
+    # Loop bounded by Python-side time_index — `done` becomes True iff time_index hits the bundle's
+    # last index, so the tensor.all().item() sync was equivalent and just forced a CUDA-CPU sync
+    # every step. With B=4096 and ~200 sim steps × ppo_epochs the syncs become measurable on GPU.
+    last_idx = _last_time_index(bundle)
+    while int(state["time_index"]) < last_idx:
         t = int(state["time_index"])
+        # Per-iteration step_action: applied at exactly one step (the decision step). On
+        # non-decision steps we pass None → step_runtime_state computes zero trade deltas.
+        # Previously a persistent `mapped` was reused across non-decision steps, so the chosen
+        # delta was applied every day until the next decision — multiplying effective trade size
+        # by the decision interval and biasing early-curriculum policies toward the floor.
+        step_action = None
         if t in decision_set:
             if pending_reward is not None:
                 rewards.append(pending_reward)
                 dones.append(state["done"].to(dtype=torch.float32, device=device))
+            # Materialize entity_state lazily on the decision step. The cheap refresh path skips
+            # this on non-decision steps (interval=10 → 9× saved per decision).
+            state = _ensure_decision_views(state, bundle, runtime)
             priv = _privileged_state_at(bundle, t, batch_size, device)
-            output = policy.sample(state["entity_state"], deterministic=deterministic, privileged_state=priv)
-            mapped = _realized_structured_action(policy.map_actions(output), state["positions"], runtime, batch_size=batch_size, device=device)
+            positions_t = _positions_tensor(state, instrument_order, device=device)
+            output = policy.sample(
+                state["entity_state"], deterministic=deterministic,
+                privileged_state=priv, positions=positions_t,
+            )
+            step_action = _realized_structured_action(policy.map_actions(output), state["positions"], runtime, batch_size=batch_size, device=device)
             entity_snapshots.append(_entity_state_snapshot(state["entity_state"]))
             privileged_snapshots.append({k: v.detach().clone() for k, v in priv.items()})
+            position_snapshots.append(positions_t.detach().clone())
             action_bins_list.append(output["action_bins"].detach())
             log_probs.append(output["log_prob"].detach())
             values.append(output["value"].detach())
             pending_reward = torch.zeros(batch_size, dtype=torch.float32, device=device)
             pending_index = len(entity_snapshots) - 1
-        next_state = step_runtime_state(state, mapped, bundle, runtime)
+        next_state = step_runtime_state(state, step_action, bundle, runtime)
         transition = reward_and_terminal_payoff(state, next_state, bundle, runtime)
         if pending_reward is not None:
             pending_reward = pending_reward + transition["reward"].to(device=device, dtype=torch.float32) * reward_scale
         last_state = next_state
         state = next_state
-        if bool(state["done"].all().item()):
-            if pending_reward is not None and pending_index == len(entity_snapshots) - 1:
-                rewards.append(pending_reward)
-                dones.append(state["done"].to(dtype=torch.float32, device=device))
-            break
+    if pending_reward is not None and pending_index == len(entity_snapshots) - 1:
+        rewards.append(pending_reward)
+        dones.append(state["done"].to(dtype=torch.float32, device=device))
     if not entity_snapshots:
         return None
     stacked_states = _stack_entity_states(entity_snapshots)
@@ -671,9 +810,11 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
     if privileged_snapshots and privileged_snapshots[0]:
         for name in privileged_snapshots[0].keys():
             stacked_privileged[name] = torch.stack([s[name] for s in privileged_snapshots], dim=0)
+    stacked_positions = torch.stack(position_snapshots, dim=0) if position_snapshots else None
     return {
         "states": stacked_states,
         "privileged_states": stacked_privileged,
+        "positions": stacked_positions,
         "action_bins": torch.stack(action_bins_list, dim=0),
         "log_probs": torch.stack(log_probs, dim=0),
         "values": torch.stack(values, dim=0),
@@ -684,24 +825,43 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
     }
 
 
-def _compute_gae(rewards, values, dones, gamma, lam):
+def _compute_gae(rewards, values, dones, gamma, lam, *, last_value=None, last_done=None):
+    """SB3-style GAE: at iter t, mask uses dones[t] (whether the transition out of segment t ended
+    the episode), not dones[t+1]. The previous implementation lagged the mask by one step, which
+    silently dropped the bootstrap from V[t+1] at the second-to-last decision.
+
+    For the final segment, `last_value` is the value estimate at the post-rollout state (0 if the
+    rollout terminated naturally — the default — or V(s_{D}) if you cut off mid-episode), and
+    `last_done` indicates whether the rollout boundary IS terminal (1 = terminal, 0 = cutoff)."""
     D = rewards.shape[0]
     advantages = torch.zeros_like(rewards)
     gae = torch.zeros_like(rewards[0])
-    next_value = torch.zeros_like(values[0])
-    next_nonterminal = torch.ones_like(rewards[0])
+    last_value_t = torch.zeros_like(values[0]) if last_value is None else last_value
+    last_done_t = torch.ones_like(rewards[0]) if last_done is None else last_done
     for t in reversed(range(D)):
+        if t == D - 1:
+            next_value = last_value_t
+            next_nonterminal = 1.0 - last_done_t
+        else:
+            next_value = values[t + 1]
+            next_nonterminal = 1.0 - dones[t]
         delta = rewards[t] + gamma * next_value * next_nonterminal - values[t]
         gae = delta + gamma * lam * next_nonterminal * gae
         advantages[t] = gae
-        next_value = values[t]
-        next_nonterminal = 1.0 - dones[t]
     returns = advantages + values
     return advantages, returns
 
 
-def _ppo_update(policy, optimizer, rollout, settings):
-    advantages, returns = _compute_gae(rollout["rewards"], rollout["values"], rollout["dones"], settings["gamma"], settings["gae_lambda"])
+def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1):
+    # Gamma and gae_lambda are interpreted per-business-day so a curriculum that ramps the
+    # decision interval (10 → 5 → 2 → 1) doesn't change the implicit per-day discount and shift
+    # value-target / advantage scales at every stage boundary. gamma_stage = gamma_per_day ** N
+    # gives the effective per-decision discount over N days; same logic for lambda keeps the
+    # effective horizon stable in calendar time across stages.
+    interval = max(int(decision_interval), 1)
+    gamma_stage = float(settings["gamma"]) ** interval
+    lam_stage = float(settings["gae_lambda"]) ** interval
+    advantages, returns = _compute_gae(rollout["rewards"], rollout["values"], rollout["dones"], gamma_stage, lam_stage)
     flat_states, D, B = _flatten_for_minibatch(rollout["states"])
     flat_actions = rollout["action_bins"].reshape(D * B, -1)
     flat_old_log_probs = rollout["log_probs"].reshape(D * B)
@@ -712,14 +872,20 @@ def _ppo_update(policy, optimizer, rollout, settings):
     flat_privileged = {}
     for name, t in (rollout.get("privileged_states") or {}).items():
         flat_privileged[name] = t.reshape(D * B, -1)
+    rollout_positions = rollout.get("positions")
+    flat_positions = rollout_positions.reshape(D * B, -1) if rollout_positions is not None else None
     N = D * B
     mb = max(int(settings["minibatch_size"]), 1)
-    policy_losses = []
-    value_losses = []
-    entropies = []
+    # Accumulate per-minibatch losses as device-side tensors and sync once at the end of the
+    # update — saves ~3 .item() syncs × ~60 minibatches per update.
+    device = flat_actions.device
+    policy_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+    value_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+    entropy_sum = torch.zeros((), dtype=torch.float32, device=device)
+    minibatch_count = 0
     clip_eps = float(settings["clip_eps"])
     for _ in range(int(settings["ppo_epochs"])):
-        perm = torch.randperm(N, device=flat_actions.device)
+        perm = torch.randperm(N, device=device)
         for start in range(0, N, mb):
             idx = perm[start:start + mb]
             mb_state = flat_states[idx]
@@ -729,7 +895,8 @@ def _ppo_update(policy, optimizer, rollout, settings):
             mb_adv = flat_advantages[idx]
             mb_ret = flat_returns[idx]
             mb_privileged = {name: t[idx] for name, t in flat_privileged.items()} if flat_privileged else None
-            new_lp, entropy, value, logits = policy.evaluate_action(mb_state, mb_actions, privileged_state=mb_privileged)
+            mb_positions = flat_positions[idx] if flat_positions is not None else None
+            new_lp, entropy, value, logits = policy.evaluate_action(mb_state, mb_actions, privileged_state=mb_privileged, positions=mb_positions)
             ratio = (new_lp - mb_old_lp).exp()
             clipped = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps)
             policy_loss = -torch.min(ratio * mb_adv, clipped * mb_adv).mean()
@@ -748,17 +915,19 @@ def _ppo_update(policy, optimizer, rollout, settings):
                 - settings["entropy_coef"] * entropy_bonus
                 + settings["action_sparsity_coef"] * action_sparsity_loss
             )
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), settings["max_grad_norm"])
             optimizer.step()
-            policy_losses.append(float(policy_loss.item()))
-            value_losses.append(float(value_loss.item()))
-            entropies.append(float(entropy_bonus.item()))
+            policy_loss_sum = policy_loss_sum + policy_loss.detach()
+            value_loss_sum = value_loss_sum + value_loss.detach()
+            entropy_sum = entropy_sum + entropy_bonus.detach()
+            minibatch_count += 1
+    denom = max(minibatch_count, 1)
     return {
-        "policy_loss": float(np.mean(policy_losses)) if policy_losses else 0.0,
-        "value_loss": float(np.mean(value_losses)) if value_losses else 0.0,
-        "entropy": float(np.mean(entropies)) if entropies else 0.0,
+        "policy_loss": float((policy_loss_sum / denom).item()),
+        "value_loss": float((value_loss_sum / denom).item()),
+        "entropy": float((entropy_sum / denom).item()),
         "advantage_mean": float(advantages.mean().item()),
         "advantage_std": float(advantages.std().item()),
     }
@@ -766,13 +935,13 @@ def _ppo_update(policy, optimizer, rollout, settings):
 
 def _collect_no_trade_rollout(bundle, runtime, decision_indices):
     state = build_shared_state(bundle, runtime)
-    while True:
+    last_idx = _last_time_index(bundle)
+    terminal = None
+    while int(state["time_index"]) < last_idx:
         next_state = step_runtime_state(state, None, bundle, runtime)
         transition = reward_and_terminal_payoff(state, next_state, bundle, runtime)
         terminal = {"state": next_state, **transition}
         state = next_state
-        if bool(state["done"].all().item()):
-            break
     return terminal
 
 
@@ -781,7 +950,9 @@ def _cpu_tensor_dict(values):
 
 
 def _terminal_summary(state, terminal_transition, bundle):
-    hedge_pnl = terminal_transition["portfolio_value"].detach().to(dtype=torch.float32)
+    # `pnl_excess` is hedge gain since inception (cleaner Sortino interpretation than absolute
+    # portfolio_value, which would otherwise have the seed cash baked into every metric).
+    hedge_pnl = terminal_transition["pnl_excess"].detach().to(dtype=torch.float32)
     liability = terminal_transition["liability_value"].detach().to(dtype=torch.float32)
     net_pnl = hedge_pnl + liability
     return {
@@ -796,7 +967,7 @@ def _terminal_summary(state, terminal_transition, bundle):
             "positions": _cpu_tensor_dict(state.get("positions", {})),
             "cash_accounts": _cpu_tensor_dict(state.get("cash_accounts", {})),
             "margin_accounts": _cpu_tensor_dict(state.get("margin_accounts", {})),
-            "portfolio_value": hedge_pnl.cpu(),
+            "pnl_excess": hedge_pnl.cpu(),
             "liability_value": liability.cpu(),
             "net_pnl": net_pnl.cpu(),
         },
@@ -868,20 +1039,20 @@ def train_torchrl_policy(bundle, runtime):
     started = time.perf_counter()
     for epoch in range(settings["epochs"]):
         decision_indices = _decision_time_indices(train_bundle, settings, epoch=epoch, evaluation=False)
+        decision_interval = _decision_interval_business_days_for_epoch(settings, epoch, evaluation=False)
         rollout_started = time.perf_counter()
         rollout = _collect_ppo_rollout(policy, train_bundle, runtime, decision_indices, deterministic=False, reward_scale=settings["reward_scale"])
         rollout_time = float(time.perf_counter() - rollout_started)
         if rollout is None:
             continue
         update_started = time.perf_counter()
-        diag = _ppo_update(policy, optimizer, rollout, settings)
+        diag = _ppo_update(policy, optimizer, rollout, settings, decision_interval=decision_interval)
         update_time = float(time.perf_counter() - update_started)
         terminal_reward = float(rollout["terminal_transition"]["reward"].mean().item())
-        net_pnl = float((rollout["terminal_transition"]["portfolio_value"] + rollout["terminal_transition"]["liability_value"]).mean().item())
+        net_pnl = float((rollout["terminal_transition"]["pnl_excess"] + rollout["terminal_transition"]["liability_value"]).mean().item())
         # action stats: action_bins are integer [0, n_bins). trade_delta = bin + min_trade.
         trade_deltas_seen = rollout["action_bins"] + policy._min_trade_delta
         action_abs_mean = float(trade_deltas_seen.float().abs().mean().item())
-        decision_interval = _decision_interval_business_days_for_epoch(settings, epoch, evaluation=False)
         epoch_diag.append({
             "epoch": epoch,
             "policy_loss": diag["policy_loss"],

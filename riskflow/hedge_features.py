@@ -36,7 +36,7 @@ INSTRUMENT_ID_NAMES = ('currency', 'underlying', 'instrument_type')
 CASH_FEATURE_NAMES = ('balance', 'margin_balance', 'realized_cashflow', 'realized_cashflow_prev')
 CASH_ID_NAMES = ('currency',)
 
-GLOBAL_FEATURE_NAMES = (
+GLOBAL_BASE_FEATURE_NAMES = (
     'time_to_horizon',
     'liability_mtm',
     'liability_mtm_prev',
@@ -46,10 +46,28 @@ GLOBAL_FEATURE_NAMES = (
     'near_position_value',       # sum of position_value for instruments with ttf < 60d
     'mid_position_value',        # 60d <= ttf < 180d
     'far_position_value',        # ttf >= 180d
-    'spot_zscore_20d',           # rolling 20d z-score of underlying spot
-    'spot_realized_vol_20d',     # annualized 20d realized log-vol of underlying spot
-    'implied_atm_vol_30d',       # 30d ATM implied vol (option-market regime signal)
 )
+
+# Per-commodity globals appended after the base block, suffixed with the commodity name.
+# (bundle_key, name_prefix) pairs — order is preserved in feature names.
+PER_COMMODITY_GLOBAL_FEATURES = (
+    ('spot_zscore', 'spot_zscore_20d'),
+    ('spot_realized_vol', 'spot_realized_vol_20d'),
+    ('implied_atm_vol', 'implied_atm_vol_30d'),
+)
+
+
+def build_global_feature_names(referenced_commodities):
+    names = list(GLOBAL_BASE_FEATURE_NAMES)
+    for commodity in referenced_commodities:
+        for _bundle_key, prefix in PER_COMMODITY_GLOBAL_FEATURES:
+            names.append(f'{prefix}_{commodity}')
+    return tuple(names)
+
+
+# Backwards-compat alias for callers that imported the flat list before per-commodity globals
+# (none remain in-repo, but exporting keeps third-party consumers from breaking silently).
+GLOBAL_FEATURE_NAMES = build_global_feature_names(())
 
 
 def _intern(registry, vocab, name):
@@ -120,6 +138,11 @@ def build_entity_layout(runtime):
         items = params.get('Payments', {}).get('Items', ())
         leg_count += len(items)
 
+    referenced_commodities = tuple(
+        ((runtime.get('portfolio_state') or {}).get('spot_price_history') or {}).keys()
+    )
+    global_feature_names = build_global_feature_names(referenced_commodities)
+
     return {
         'registry': registry,
         'instruments': {
@@ -146,8 +169,9 @@ def build_entity_layout(runtime):
             'max_cardinality': leg_count,
         },
         'globals': {
-            'feature_names': GLOBAL_FEATURE_NAMES,
-            'feature_dim': len(GLOBAL_FEATURE_NAMES),
+            'feature_names': global_feature_names,
+            'feature_dim': len(global_feature_names),
+            'referenced_commodities': referenced_commodities,
         },
     }
 
@@ -304,29 +328,33 @@ def compute_spot_zscore(bundle, window=PRICE_ZSCORE_WINDOW, min_periods=5, eps=1
     return out
 
 
-def compute_cross_delta(bundle, eps=1e-6):
-    """Per-timestep cross-section regression of liability MTM increments on each instrument's price
-    increments across the Monte Carlo batch. The simulator's stochastic process implicitly defines
-    the model-derived sensitivity, well-defined at every t including t=0 (uses t -> t+1 divergence
-    across paths). Returns a dict {name: tensor (T, B)} broadcast scalar across the batch dim.
-    """
+def compute_cross_delta(bundle, window=PRICE_ZSCORE_WINDOW, eps=1e-6):
+    """Per-instrument PATH-LOCAL BACKWARD-LOOKING rolling hedge ratio. For each path b at time t:
+        beta[t, b, c] = Σ_{s=max(0,t-window)..t-1} dP_c[s,b] * dL[s,b]
+                        / Σ_{s=max(0,t-window)..t-1} dP_c[s,b]^2 + eps
+    Uses only data observable on path b at or before time t — deployable in production where the
+    agent has only its own realized history. No look-ahead (window ends at t-1, not t+1) and no
+    cross-section privilege (regression is along the time axis of path b, not across paths)."""
     liability_mtm = bundle.get('liability_mtm')
     tradables = bundle.get('tradables') or {}
     if liability_mtm is None or not tradables:
         return {}
     L = liability_mtm.to(dtype=torch.float32)
     dL = L[1:] - L[:-1]
-    dL_centered = dL - dL.mean(dim=1, keepdim=True)
     out = {}
     for name, price in tradables.items():
         P = price.to(dtype=torch.float32)
         dP = P[1:] - P[:-1]
-        dP_centered = dP - dP.mean(dim=1, keepdim=True)
-        num = (dP_centered * dL_centered).mean(dim=1)
-        den = (dP_centered * dP_centered).mean(dim=1)
-        beta = num / (den + eps)
-        beta_aligned = torch.cat([beta, beta[-1:]], dim=0)
-        out[name] = beta_aligned.unsqueeze(1).expand(-1, P.shape[1]).contiguous()
+        T = P.shape[0]
+        zeros = torch.zeros_like(dP[:1])
+        # cumulative sums prepended with zero so cum_sum[t] = Σ_{s=0..t-1} (dP·dL)[s]
+        num_cum = torch.cat([zeros, (dP * dL).cumsum(dim=0)], dim=0)
+        den_cum = torch.cat([zeros, (dP * dP).cumsum(dim=0)], dim=0)
+        idx = torch.arange(T, device=P.device)
+        lo = (idx - window).clamp_min(0)
+        num = num_cum[idx] - num_cum[lo]
+        den = den_cum[idx] - den_cum[lo]
+        out[name] = num / (den + eps)
     return out
 
 
@@ -341,6 +369,11 @@ def _legs_state(bundle, time_index, layout, batch_size, device):
             torch.zeros((batch_size, 0), dtype=torch.bool, device=device),
         )
     features_t = legs['features'][time_index].to(dtype=torch.float32, device=device)
+    # Bundle legs may be (T, B, L, F) → indexed (B, L, F) — or (T, L, F) → indexed (L, F).
+    # Normalize to (batch_size, L, F) by inserting a singleton batch dim when missing, then
+    # broadcasting if the present batch dim is 1.
+    if features_t.ndim == 2:
+        features_t = features_t.unsqueeze(0)
     if features_t.shape[0] == 1 and features_t.shape[0] != batch_size:
         features_t = features_t.expand(batch_size, -1, -1).contiguous()
     registry = layout['registry']
@@ -489,22 +522,23 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
     residual_exposure = total_pv + mtm_now
     coverage_ratio = -total_pv / mtm_now.abs().clamp_min(1.0)
 
-    def _first_commodity_scalar(bundle_key):
+    def _commodity_scalar(bundle_key, commodity):
         store = bundle.get(bundle_key) or {}
-        if not store:
+        if commodity not in store:
             return torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
-        first = next(iter(store))
-        slice_t = store[first][time_index].to(device=device, dtype=torch.float32).reshape(-1, 1)
+        slice_t = store[commodity][time_index].to(device=device, dtype=torch.float32).reshape(-1, 1)
         if slice_t.shape[0] == 1 and slice_t.shape[0] != batch_size:
             slice_t = slice_t.expand(batch_size, 1).contiguous()
         return slice_t
 
-    zs_now = _first_commodity_scalar('spot_zscore')
-    rv_now = _first_commodity_scalar('spot_realized_vol')
-    iv_now = _first_commodity_scalar('implied_atm_vol')
+    referenced = layout['globals'].get('referenced_commodities', ())
+    extras = []
+    for commodity in referenced:
+        for bundle_key, _prefix in PER_COMMODITY_GLOBAL_FEATURES:
+            extras.append(_commodity_scalar(bundle_key, commodity))
     return torch.cat(
         [time_to_horizon, mtm_now, mtm_prev, total_pv, residual_exposure, coverage_ratio,
-         near_pv, mid_pv, far_pv, zs_now, rv_now, iv_now],
+         near_pv, mid_pv, far_pv, *extras],
         dim=1,
     )
 

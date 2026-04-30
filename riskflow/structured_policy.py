@@ -178,6 +178,7 @@ class StructuredRebalancePolicy(nn.Module):
         action_space,
         entity_layout,
         privileged_layout=None,
+        position_limits=None,
         token_dim=64,
         emb_dim=8,
         n_heads=4,
@@ -188,6 +189,7 @@ class StructuredRebalancePolicy(nn.Module):
         self.action_space = action_space
         self.entity_layout = entity_layout
         self.privileged_layout = dict(privileged_layout or {})
+        self.position_limits = dict(position_limits or {})
         self.token_dim = int(token_dim)
         self.emb_dim = int(emb_dim)
         self.n_heads = int(n_heads)
@@ -242,6 +244,25 @@ class StructuredRebalancePolicy(nn.Module):
             torch.maximum(self._max_trade_delta.abs(), self._min_trade_delta.abs()).clamp_min(1).to(dtype=torch.float32),
             persistent=False,
         )
+        # Per-instrument hard position limits for feasibility masking at sample/evaluate time.
+        # Without this, the policy proposes bins that get silently clipped by the evaluator and
+        # the PPO ratio is biased: log_prob is over the unconstrained distribution but the
+        # observed reward is from the clipped action.
+        BIG = 10**9
+        instrument_order = action_space.instrument_order
+        pl = self.position_limits or {}
+        min_pos = tuple(int(pl.get(name, {}).get('min_position', -BIG)) for name in instrument_order)
+        max_pos = tuple(int(pl.get(name, {}).get('max_position', +BIG)) for name in instrument_order)
+        self.register_buffer(
+            "_min_position",
+            torch.tensor(min_pos, dtype=torch.int64, device=self.device).reshape(1, -1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_max_position",
+            torch.tensor(max_pos, dtype=torch.int64, device=self.device).reshape(1, -1),
+            persistent=False,
+        )
 
     def _entity_state_to_device(self, entity_state):
         return entity_state.to(self.device)
@@ -261,12 +282,27 @@ class StructuredRebalancePolicy(nn.Module):
         global_pool = glb.squeeze(1)
         return torch.cat([legs_pool, instr_pool, cash_pool, global_pool], dim=-1)
 
-    def _policy_outputs(self, entity_state):
+    def _feasible_mask(self, positions):
+        """Returns a (B, I, max_bins) bool tensor with True for bins whose resulting position
+        would violate `position_limits`. trade_delta of bin k = k + min_trade_delta[i], so the
+        resulting position is positions[b,i] + min_trade_delta[i] + k. Mask any bin whose result
+        falls outside [min_position[i], max_position[i]]."""
+        positions_t = positions.to(dtype=torch.int64, device=self.device)
+        bin_indices = torch.arange(self._max_bins, device=self.device, dtype=torch.int64)
+        # Broadcast: positions (B, I, 1) + min_trade_delta (1, I, 1) + bin_indices (max_bins,) → (B, I, max_bins)
+        resulting = positions_t.unsqueeze(-1) + self._min_trade_delta.unsqueeze(-1) + bin_indices.reshape(1, 1, -1)
+        below = resulting < self._min_position.unsqueeze(-1)
+        above = resulting > self._max_position.unsqueeze(-1)
+        return below | above
+
+    def _policy_outputs(self, entity_state, positions=None):
         es = self._entity_state_to_device(entity_state)
         ctx = self.backbone(es)
         # logits: [B, I, max_bins]; mask invalid bins to -inf so they get probability 0
         logits = self.policy_head(ctx['instruments'])
         logits = logits.masked_fill(self._logit_mask.unsqueeze(0), float('-inf'))
+        if positions is not None:
+            logits = logits.masked_fill(self._feasible_mask(positions), float('-inf'))
         return logits, ctx
 
     def _value(self, ctx, privileged_state=None):
@@ -294,12 +330,12 @@ class StructuredRebalancePolicy(nn.Module):
     def _trade_deltas_to_bins(self, trade_deltas):
         return trade_deltas - self._min_trade_delta
 
-    def forward(self, entity_state, privileged_state=None):
-        logits, ctx = self._policy_outputs(entity_state)
+    def forward(self, entity_state, privileged_state=None, positions=None):
+        logits, ctx = self._policy_outputs(entity_state, positions=positions)
         return TensorDict({'logits': logits, 'value': self._value(ctx, privileged_state)}, batch_size=[logits.shape[0]])
 
-    def sample(self, entity_state, *, deterministic=False, privileged_state=None):
-        logits, ctx = self._policy_outputs(entity_state)
+    def sample(self, entity_state, *, deterministic=False, privileged_state=None, positions=None):
+        logits, ctx = self._policy_outputs(entity_state, positions=positions)
         log_probs_per_instr = torch.log_softmax(logits, dim=-1)
         if deterministic:
             action_bins = log_probs_per_instr.argmax(dim=-1)
@@ -316,14 +352,19 @@ class StructuredRebalancePolicy(nn.Module):
             'value': value,
         }, batch_size=[logits.shape[0]])
 
-    def evaluate_action(self, entity_state, action_bins, privileged_state=None):
-        logits, ctx = self._policy_outputs(entity_state)
+    def evaluate_action(self, entity_state, action_bins, privileged_state=None, positions=None):
+        logits, ctx = self._policy_outputs(entity_state, positions=positions)
         log_probs_per_instr = torch.log_softmax(logits, dim=-1)
         action_bin_log_probs = log_probs_per_instr.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
         log_prob = action_bin_log_probs.sum(-1)
-        # entropy = -sum(p log p) per instrument, then sum across instruments
+        # entropy = -Σ p log p with the convention p log p = 0 when p = 0. With feasibility-masked
+        # logits, masked bins have log_p = -inf and p = 0; computing `p * log_p` would produce
+        # 0 × -inf = NaN that ALSO propagates NaN gradients. Replace -inf log_probs with 0 before
+        # the multiplication — for masked bins the 0 prob factor zeroes out the contribution
+        # cleanly in both forward and backward.
         probs = log_probs_per_instr.exp()
-        entropy_per_instr = -(probs * log_probs_per_instr).sum(-1)
+        safe_log_probs = log_probs_per_instr.masked_fill(log_probs_per_instr == float('-inf'), 0.0)
+        entropy_per_instr = -(probs * safe_log_probs).sum(-1)
         entropy = entropy_per_instr.sum(-1)
         value = self._value(ctx, privileged_state)
         return log_prob, entropy, value, logits
@@ -348,10 +389,11 @@ class StructuredRebalancePolicy(nn.Module):
     def to_artifact(self):
         state = self.state_dict()
         return {
-            "artifact_version": 5,
+            "artifact_version": 6,
             "policy_object_type": "StructuredRebalancePolicy",
             "entity_layout": self.entity_layout,
             "privileged_layout": dict(self.privileged_layout),
+            "position_limits": dict(self.position_limits),
             "action_space": self.action_space.to_artifact_payload(),
             "model": {
                 "object": "EntityTransformer",
@@ -391,6 +433,7 @@ def load_policy_artifact(file_path, *, device="cpu"):
         ),
         entity_layout=artifact["entity_layout"],
         privileged_layout=dict(artifact.get("privileged_layout") or {}),
+        position_limits=dict(artifact.get("position_limits") or {}),
         token_dim=int(model.get("token_dim", 64)),
         emb_dim=int(model.get("emb_dim", 8)),
         n_heads=int(model.get("n_heads", 4)),
