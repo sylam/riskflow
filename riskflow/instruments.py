@@ -4776,11 +4776,10 @@ class FloatingEnergyDeal(Deal):
         fixed_basis = schedule[:, utils.CASHFLOW_INDEX_Strike]
         period_length = period_end - period_start
 
-        time_to_period_start = np.maximum(period_start[None, :] - t_days[:, None], 0.0) / utils.DAYS_IN_YEAR
-        time_to_period_end = np.maximum(period_end[None, :] - t_days[:, None], 0.0) / utils.DAYS_IN_YEAR
-        time_to_payment = np.maximum(payment[None, :] - t_days[:, None], 0.0) / utils.DAYS_IN_YEAR
-        accumulation_fraction = np.clip(
-            (t_days[:, None] - period_start[None, :]) / period_length[None, :], 0.0, 1.0)
+        time_to_period_start = (period_start[None, :] - t_days[:, None]) / utils.DAYS_IN_YEAR
+        time_to_period_end = (period_end[None, :] - t_days[:, None]) / utils.DAYS_IN_YEAR
+        time_to_payment = (payment[None, :] - t_days[:, None]) / utils.DAYS_IN_YEAR
+        accumulation_fraction = (t_days[:, None] - period_start[None, :]) / period_length[None, :]
 
         mtm = self.calculate(shared, time_grid, deal_data)
         T, B = mtm.shape

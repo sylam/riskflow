@@ -13,9 +13,6 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional
 
-import pandas as pd
-import torch
-
 from .hedge_features import build_entity_layout, derive_privileged_layout
 
 
@@ -54,14 +51,6 @@ def construct_objective(config: Mapping[str, Any]):
     if str(config["Object"]) != "TerminalFloorThenSurplusUtility":
         raise ValueError(f"Unsupported objective: {config['Object']}")
     return TerminalFloorThenSurplusUtility(config)
-
-
-def _as_timestamp(value: Any) -> pd.Timestamp:
-    if isinstance(value, pd.Timestamp):
-        return value
-    if isinstance(value, dict) and ".Timestamp" in value:
-        return pd.Timestamp(value[".Timestamp"])
-    return pd.Timestamp(value)
 
 
 def _unwrap_calc_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -156,9 +145,16 @@ def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -
         "gamma": float(optimizer_config.get("Gamma", 0.999)),
         "gae_lambda": float(optimizer_config.get("GAE_Lambda", 0.995)),
         "learning_rate": float(optimizer_config.get("Learning_Rate", 3.0e-4)),
+        "lr_schedule": str(optimizer_config.get("LR_Schedule", "constant")).lower(),
+        "lr_min": float(optimizer_config.get("LR_Min", 0.0)),
+        "lr_warmup_epochs": int(optimizer_config.get("LR_Warmup_Epochs", 0)),
         "clip_eps": float(optimizer_config.get("Clip_Eps", 0.2)),
         "value_coef": float(optimizer_config.get("Value_Coef", 0.5)),
         "entropy_coef": float(optimizer_config.get("Entropy_Coef", 0.01)),
+        "entropy_schedule": str(optimizer_config.get("Entropy_Schedule", "constant")).lower(),
+        "entropy_coef_min": float(optimizer_config.get("Entropy_Coef_Min", 0.0)),
+        "reward_normalize": bool(optimizer_config.get("Reward_Normalize", False)),
+        "warm_start_epochs": int(optimizer_config.get("Warm_Start_Epochs", 0)),
         "max_grad_norm": float(optimizer_config.get("Max_Grad_Norm", 0.5)),
         "reward_scale": float(optimizer_config.get("Reward_Scale", 1.0)),
         "action_sparsity_coef": float(optimizer_config.get("Action_Sparsity_Coef", 0.0)),
@@ -179,6 +175,7 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
         "floor_penalty": float(objective_config.get("Floor_Penalty", 1.0)),
         "surplus_reward": float(objective_config.get("Surplus_Reward", 1.0)),
         "power": float(objective_config.get("Power", 1.0)),
+        "naked_penalty": float(objective_config.get("Naked_Penalty", 0.0)),
     }
 
 
@@ -236,7 +233,7 @@ def _normalize_spot_price_history(
                 f"Spot_Price_History['{commodity_name}']: needs at least "
                 f"History_Lookback_Business_Days={lookback} entries, got {len(dates_raw)}"
             )
-        dates = tuple(_as_timestamp(d) for d in dates_raw)
+        dates = tuple(dates_raw)
         for i in range(1, len(dates)):
             if dates[i] <= dates[i - 1]:
                 raise ValueError(
@@ -335,7 +332,7 @@ def _normalize_instrument_metadata(
 
 def construct_torchrl_runtime(
     config: Mapping[str, Any],
-    price_models: Optional[Mapping[str, Any]] = None,
+    stoch_factors: Optional[Mapping[Any, Any]] = None,
 ) -> Dict[str, Any]:
     config = _unwrap_calc_config(config)
     hedging_problem = config["Hedging_Problem"]
@@ -374,8 +371,7 @@ def construct_torchrl_runtime(
         expiry_date = liability.get("expiry_date")
         if expiry_date is None:
             continue
-        expiry_timestamp = _as_timestamp(expiry_date)
-        if liability_expiry is None or expiry_timestamp > _as_timestamp(liability_expiry):
+        if liability_expiry is None or expiry_date > liability_expiry:
             liability_expiry = expiry_date
     normalized_tradables = {
         instrument_name: _normalize_instrument_metadata(
@@ -431,7 +427,7 @@ def construct_torchrl_runtime(
         },
     }
     runtime["entity_layout"] = build_entity_layout(runtime)
-    runtime["privileged_layout"] = derive_privileged_layout(price_models or {}, referenced_commodities)
+    runtime["privileged_layout"] = derive_privileged_layout(stoch_factors)
     return runtime
 
 

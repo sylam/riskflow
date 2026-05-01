@@ -23,7 +23,7 @@ from collections import OrderedDict
 # 3rd party libraries
 import numpy as np
 import scipy.interpolate
-from scipy.linalg import expm as matrix_expm
+from scipy.linalg import expm as matrix_expm, logm as matrix_logm
 import torch
 import torch.nn.functional as F
 
@@ -124,6 +124,17 @@ class StochasticProcess(object):
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         pass
+
+    @classmethod
+    def privileged_layout(cls, param):
+        """Static {name: dim} schema of privileged factors this process emits, derivable from
+        param alone for the policy's privileged-encoder sizing at construction time."""
+        return {}
+
+    def privileged_factors(self, simulated):
+        """Privileged factors the asymmetric critic sees but the actor does not — dict of
+        (T, B, dim) tensors keyed by name. `simulated` is this process's (T, B) path."""
+        return {}
 
 
 class GBMAssetPriceModel(StochasticProcess):
@@ -1193,1215 +1204,6 @@ class PCAInterestRateCalibration(object):
         )
 
 
-class RegimeSwitchingOU2FactorModel(StochasticProcess):
-    """Two-factor OU carry model with regime switching via a 2-state continuous-time Markov chain.
-
-    Regime-conditional dynamics (z in {0=Low, 1=High}):
-
-        dx_t = kappa_x[z] * (theta_x[z] + beta[z] * y_t - x_t) dt + sigma_x[z] dW_x
-        dy_t = kappa_y[z] * (theta_y[z] - y_t)                  dt + sigma_y[z] dW_y
-        corr(dW_x, dW_y) = rho[z]
-
-    Exact linear-Gaussian discretisation is used per time step via the Van Loan
-    block-matrix method to compute the conditional covariance Omega(dt).
-
-    **Timing convention** (regime frozen over the interval): the regime z_k observed
-    at the *start* of [t_k, t_{k+1}] is held constant while the state evolves; only
-    after the state update is the next regime z_{k+1} drawn from P(.|z_k, dt).
-    That is:
-
-        s_{k+1} = A[z_k] @ s_k + b[z_k] + eps_k,   eps_k ~ N(0, Omega[z_k])
-        z_{k+1} ~ P( . | z_k, dt )                  (CTMC transition)
-    """
-
-    documentation = (
-        'Asset Pricing',
-        ['A two-factor mean-reverting carry model with two latent regimes.',
-         '',
-         'The **fast** carry factor $x_t$ (annualised) and **slow** pressure factor $y_t$',
-         'satisfy, conditional on latent regime $z_t \\in \\{0,1\\}$:',
-         '',
-         '$$ dx_t = \\kappa_x^{[z]}(\\theta_x^{[z]} + \\beta^{[z]} y_t - x_t)\\,dt'
-         ' + \\sigma_x^{[z]}\\,dW_x $$',
-         '',
-         '$$ dy_t = \\kappa_y^{[z]}(\\theta_y^{[z]} - y_t)\\,dt + \\sigma_y^{[z]}\\,dW_y $$',
-         '',
-         'with $\\operatorname{Corr}(dW_x, dW_y) = \\rho^{[z]}$.',
-         '',
-         'The regime $z_t$ follows a 2-state continuous-time Markov chain with intensities',
-         '$\\lambda_{01}$ (Low$\\to$High) and $\\lambda_{10}$ (High$\\to$Low).',
-         '',
-         'Simulation uses the **exact linear-Gaussian discretisation** with the'
-         ' **regime frozen over each interval**: the regime $z_{t_k}$ at the'
-         ' *start* of $[t_k,\\,t_{k+1}]$ governs the state update, and the'
-         ' next regime $z_{t_{k+1}}$ is drawn afterwards:',
-         '',
-         '$$ \\mathbf{s}_{t_{k+1}} = A^{[z_{t_k}]}(\\delta)\\,\\mathbf{s}_{t_k}'
-         ' + b^{[z_{t_k}]}(\\delta) + \\varepsilon_k,'
-         '\\quad \\varepsilon_k \\sim \\mathcal{N}(0,\\,\\Omega^{[z_{t_k}]}(\\delta)) $$',
-         '',
-         '$$ z_{t_{k+1}} \\sim P(\\,\\cdot\\mid z_{t_k},\\,\\delta) $$',
-         '',
-         'where $A(\\delta) = e^{F\\delta}$ ($F$ is the mean-reversion generator),'
-         ' $b = (I-A)\\,\\boldsymbol{\\theta}^*$, and $\\Omega$ is obtained via the'
-         ' Van Loan block-matrix method.',
-         '',
-         'Two correlated Gaussian drivers are used per step for the state update;'
-         ' regime transitions draw independent uniforms via the quasi-random'
-         ' number stream (``shared_mem.quasi_rng``).',
-         '',
-         'The forward carry price is reconstructed as',
-         '',
-         '$$ F(t,T) = S(t)\\,\\exp\\!\\bigl((r_t + x_t)\\,\\tau\\bigr) $$',
-         ])
-
-    def __init__(self, factor, param, implied_factor=None):
-        super(RegimeSwitchingOU2FactorModel, self).__init__(factor, param)
-        self._validate_params()
-
-    def _validate_params(self):
-        p = self.param
-        for key in ('Kappa_X_Low', 'Kappa_X_High', 'Kappa_Y_Low', 'Kappa_Y_High'):
-            if p.get(key, 0.0) <= 0.0:
-                self.params_ok = False
-                return
-        for key in ('Sigma_X_Low', 'Sigma_X_High', 'Sigma_Y_Low', 'Sigma_Y_High'):
-            if p.get(key, 0.0) < 0.0:
-                self.params_ok = False
-                return
-        for key in ('Rho_Low', 'Rho_High'):
-            if abs(p.get(key, 0.0)) >= 1.0:
-                self.params_ok = False
-                return
-        for key in ('Lambda_01', 'Lambda_10'):
-            if p.get(key, 0.0) <= 0.0:
-                self.params_ok = False
-                return
-
-    @staticmethod
-    def num_factors():
-        return 2
-
-    @staticmethod
-    def _unpack_regime(param, label):
-        """Return (kx, ky, tx, ty, sx, sy, beta, rho) for label 'Low' or 'High'."""
-        return (
-            param['Kappa_X_{}'.format(label)],
-            param['Kappa_Y_{}'.format(label)],
-            param['Theta_X_{}'.format(label)],
-            param['Theta_Y_{}'.format(label)],
-            param['Sigma_X_{}'.format(label)],
-            param['Sigma_Y_{}'.format(label)],
-            param['Beta_{}'.format(label)],
-            param['Rho_{}'.format(label)],
-        )
-
-    @staticmethod
-    def _compute_discretization(kx, ky, tx, ty, sx, sy, beta, rho, dt):
-        """Exact linear-Gaussian step matrices for one regime over interval dt.
-
-        Uses the centred-variable representation and the Van Loan block-matrix
-        method to compute the conditional step covariance Omega(dt).
-
-        Parameters
-        ----------
-        kx, ky       : mean-reversion speeds for x and y
-        tx, ty       : long-run means (theta)
-        sx, sy       : volatilities
-        beta         : y-to-x coupling
-        rho          : instantaneous correlation between dW_x and dW_y
-        dt           : time step in years
-
-        Returns
-        -------
-        A  : (2,2) ndarray  transition matrix  expm(F * dt)
-        b  : (2,)  ndarray  mean-reversion drift  (I - A) @ [tx + beta*ty, ty]
-        L  : (2,2) ndarray  lower-Cholesky factor of Omega(dt)
-        """
-        # Mean-reversion generator
-        F = np.array([[-kx,  kx * beta],
-                      [0.0,  -ky]])
-        # Long-run mean of the joint state
-        theta_vec = np.array([tx + beta * ty, ty])
-        # Transition matrix A = expm(F * dt)
-        A = matrix_expm(F * dt)
-        # Mean-reversion drift in original coordinates:  b = (I - A) * theta*
-        b = (np.eye(2) - A) @ theta_vec
-        # Diffusion covariance  Q = Sigma * Corr * Sigma^T
-        Q = np.array([[sx * sx,       rho * sx * sy],
-                      [rho * sx * sy, sy * sy]])
-        # Van Loan block matrix:  M = [[-F, Q], [0, F^T]] * dt
-        # expm(M) = [[expm(-F*dt),  expm(-F*dt)*Omega], [0, expm(F^T*dt)]]
-        M = np.zeros((4, 4))
-        M[:2, :2] = -F * dt
-        M[:2, 2:] =  Q * dt
-        M[2:, 2:] =  F.T * dt
-        eM = matrix_expm(M)
-        # Omega = A @ (upper-right 2x2 block of expm(M))
-        Omega = A @ eM[:2, 2:]
-        # Symmetrise to remove floating-point residuals
-        Omega = 0.5 * (Omega + Omega.T)
-        # Cholesky — regularise if barely non-PSD
-        try:
-            L = np.linalg.cholesky(Omega)
-        except np.linalg.LinAlgError:
-            vals, vecs = np.linalg.eigh(Omega)
-            vals = np.clip(vals, 0.0, None)
-            L = np.linalg.cholesky(vecs @ np.diag(vals) @ vecs.T + 1e-14 * np.eye(2))
-        return A, b, L
-
-    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-        # store random-number slice offset and horizon
-        self.z_offset = process_ofs
-        self.scenario_horizon = time_grid.scen_time_grid.size
-        dt_arr = np.diff(np.hstack(([0.0], time_grid.time_grid_years)))
-        n = self.scenario_horizon
-
-        prms_low  = self._unpack_regime(self.param, 'Low')
-        prms_high = self._unpack_regime(self.param, 'High')
-
-        # Allocate per-step discretisation arrays
-        A_low  = np.zeros((n, 2, 2));  b_low  = np.zeros((n, 2));  L_low  = np.zeros((n, 2, 2))
-        A_high = np.zeros((n, 2, 2));  b_high = np.zeros((n, 2));  L_high = np.zeros((n, 2, 2))
-
-        for k, dt in enumerate(dt_arr):
-            if dt > 1e-10:
-                A_low[k],  b_low[k],  L_low[k]  = self._compute_discretization(*prms_low,  dt)
-                A_high[k], b_high[k], L_high[k] = self._compute_discretization(*prms_high, dt)
-            else:
-                # dt == 0: identity step, no noise
-                A_low[k]  = np.eye(2)
-                A_high[k] = np.eye(2)
-
-        # Regime transition probabilities from 2-state CTMC over each dt
-        lam01    = self.param['Lambda_01']
-        lam10    = self.param['Lambda_10']
-        lam      = lam01 + lam10
-        p_sw     = (1.0 - np.exp(-lam * dt_arr)) if lam > 0.0 else np.zeros(n)
-        p01      = (lam01 / lam) * p_sw   # P(Low  -> High | currently Low)
-        p10      = (lam10 / lam) * p_sw   # P(High -> Low  | currently High)
-
-        # Initial conditions (stored as Python scalars for use inside generate())
-        self.x0        = tensor                                          # tensor [1] or [batch]
-        self.init_y    = float(self.param.get('Initial_Y',                0.0))
-        self.init_p_hi = float(self.param.get('Initial_Regime_Prob_High', 0.5))
-
-        # Store discretisation matrices as tensors
-        def _t(arr):
-            return shared.one.new_tensor(arr)
-
-        self.A_low  = _t(A_low);   self.b_low  = _t(b_low);   self.L_low  = _t(L_low)
-        self.A_high = _t(A_high);  self.b_high = _t(b_high);  self.L_high = _t(L_high)
-        # per-step transition probabilities — shape [T] for scalar indexing in the loop
-        self.p01 = _t(p01)
-        self.p10 = _t(p10)
-
-    @property
-    def correlation_name(self):
-        return 'RegimeSwitchingOUProcess', [('F_x',), ('F_y',)]
-
-    def generate(self, shared_mem):
-        # Correlated Gaussian drivers for the OU state update: [T, batch]
-        Z1 = shared_mem.t_random_numbers[self.z_offset,     :self.scenario_horizon]
-        Z2 = shared_mem.t_random_numbers[self.z_offset + 1, :self.scenario_horizon]
-
-        batch = Z1.shape[1]
-
-        # Independent uniforms for regime transitions drawn from the quasi-rng stream
-        # quasi_rng(dimension, sample_size) returns (normals, uniforms), shape [sample_size, dimension]
-        u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, self.scenario_horizon)[1].T
-        # u_regime: [T, batch]
-
-        # Initial state — broadcast x0 (which may be [1] or [batch]) to [batch]
-        x = self.x0.reshape(-1).expand(batch).clone()
-        y = Z1.new_full((batch,), self.init_y)
-        # Sample initial regime from Bernoulli(p_high); result is float -> cast to long
-        z = torch.bernoulli(Z1.new_full((batch,), self.init_p_hi)).long()  # [batch]
-
-        x_path = []
-
-        for k in range(self.scenario_horizon):
-            # --- Step 1: state update using regime z_k (frozen over [t_k, t_{k+1}]) ---
-            z1k, z2k = Z1[k], Z2[k]   # [batch]
-
-            # Correlated noise for each regime via lower-Cholesky
-            # L is lower triangular: eps = [L[0,0]*z1 + L[0,1]*z2,  L[1,0]*z1 + L[1,1]*z2]
-            ex0 = self.L_low[k, 0, 0]  * z1k + self.L_low[k, 0, 1]  * z2k
-            ey0 = self.L_low[k, 1, 0]  * z1k + self.L_low[k, 1, 1]  * z2k
-            ex1 = self.L_high[k, 0, 0] * z1k + self.L_high[k, 0, 1] * z2k
-            ey1 = self.L_high[k, 1, 0] * z1k + self.L_high[k, 1, 1] * z2k
-
-            # s_{k+1} = A[z_k] @ s_k + b[z_k] + eps_k
-            nx0 = self.A_low[k, 0, 0] * x + self.A_low[k, 0, 1] * y + self.b_low[k, 0]  + ex0
-            ny0 = self.A_low[k, 1, 0] * x + self.A_low[k, 1, 1] * y + self.b_low[k, 1]  + ey0
-            nx1 = self.A_high[k, 0, 0] * x + self.A_high[k, 0, 1] * y + self.b_high[k, 0] + ex1
-            ny1 = self.A_high[k, 1, 0] * x + self.A_high[k, 1, 1] * y + self.b_high[k, 1] + ey1
-
-            is_low = (z == 0)
-            x = torch.where(is_low, nx0, nx1)
-            y = torch.where(is_low, ny0, ny1)
-
-            # Record s_{k+1}  (state is now at t_{k+1}, regime still z_k)
-            x_path.append(x.unsqueeze(0))  # [1, batch]
-
-            # --- Step 2: draw z_{k+1} ~ P(.|z_k, dt) for the *next* interval ---
-            u      = u_regime[k]                                         # [batch] in (0,1)
-            p_sw_k = torch.where(is_low, self.p01[k], self.p10[k])      # [batch]
-            z      = torch.where(u < p_sw_k, 1 - z, z)
-
-        return torch.cat(x_path, dim=0)   # [T, batch]
-
-
-class RegimeSwitchingOU2FactorCalibration(object):
-    """Calibrate RegimeSwitchingOU2FactorModel from a carry-rate time series.
-
-    The observable is the fast carry factor x_t (a scalar, possibly negative).
-    The slow pressure factor y_t is latent; its parameters default to a slower
-    version of the x-process and can be overridden via ``self.param``.
-
-    **Regime assignment**: a rolling volatility window (``vol_window`` steps)
-    is computed; observations above the ``high_vol_percentile``-th percentile
-    are labelled High, the rest Low.
-
-    **Per-regime OU x parameters** (Kappa_X, Theta_X, Sigma_X) are estimated
-    with ``utils.calc_statistics(method='Diff')`` on each regime subset.
-
-    **y-process defaults** (can be overridden in ``self.param``):
-      - Kappa_Y  = Kappa_X / 5   (slower reversion than x)
-      - Theta_Y  = 0.0
-      - Sigma_Y  = 0.0           (deterministic y; set > 0 to add y-noise)
-      - Beta     = 0.0           (no y-to-x coupling)
-      - Rho      = 0.0           (zero x-y correlation given regime)
-
-    **Transition intensities** are estimated from empirical sojourn times:
-      - Lambda_01 = 1 / mean_steps_in_Low  * num_business_days
-      - Lambda_10 = 1 / mean_steps_in_High * num_business_days
-
-    The ``correlation_coef`` returned is the 2×2 identity: Z1, Z2 are drawn
-    as independent standard normals by the simulation engine; within-regime
-    x-y correlation is applied internally via the Van Loan Cholesky L.
-    """
-
-    def __init__(self, model, param):
-        self.model = model
-        self.param = param
-        self.num_factors = 2
-
-    @staticmethod
-    def _regime_labels(series, vol_window, high_vol_percentile):
-        """Return a boolean array: True = High-vol regime."""
-        roll_vol = series.rolling(vol_window, min_periods=1).std().fillna(0.0)
-        threshold = np.percentile(roll_vol.values, high_vol_percentile)
-        return roll_vol.values >= threshold
-
-    @staticmethod
-    def _transition_intensity(labels, num_business_days):
-        """Estimate CTMC rate from empirical sojourn run-lengths.
-
-        Returns (lambda_01, lambda_10) in annualised units.  If a regime is
-        never visited the corresponding intensity defaults to 1.0.
-        """
-        def _mean_run_length(mask):
-            runs, current = [], 0
-            for v in mask:
-                if v:
-                    current += 1
-                else:
-                    if current:
-                        runs.append(current)
-                    current = 0
-            if current:
-                runs.append(current)
-            return float(np.mean(runs)) if runs else 1.0
-
-        is_high = labels
-        is_low  = ~labels
-        mean_low  = _mean_run_length(is_low)   # avg steps in Low before switching
-        mean_high = _mean_run_length(is_high)  # avg steps in High before switching
-        # rate = 1/(mean sojourn in steps) * num_business_days = annualised
-        lam01 = num_business_days / mean_low
-        lam10 = num_business_days / mean_high
-        return lam01, lam10
-
-    def calibrate(self, data_frame, vol_shift, num_business_days=252.0,
-                  vol_window=21, high_vol_percentile=60.0,
-                  kappa_max=10.0, sigma_max=2.0):
-        series = data_frame.iloc[:, 0]
-
-        # 1. Regime labels
-        is_high = self._regime_labels(series, vol_window, high_vol_percentile)
-        is_low  = ~is_high
-
-        # 2. Per-regime OU calibration via calc_statistics
-        def _ou_params(subset_df):
-            stats, _, _ = utils.calc_statistics(
-                subset_df, method='Diff', num_business_days=num_business_days)
-            kappa = np.clip(stats['Mean Reversion Speed'].values[0], 1e-4, kappa_max)
-            # Reversion Volatility is sigma of the OU process (sd of increments * sqrt(2k))
-            sigma = np.clip(stats['Reversion Volatility'].values[0] + vol_shift, 0.0, sigma_max)
-            theta = float(stats['Long Run Mean'].values[0])
-            return kappa, theta, sigma
-
-        # Fall back to full series if a regime is absent
-        df_low  = data_frame[is_low]  if is_low.sum()  > 10 else data_frame
-        df_high = data_frame[is_high] if is_high.sum() > 10 else data_frame
-
-        kx_low,  tx_low,  sx_low  = _ou_params(df_low)
-        kx_high, tx_high, sx_high = _ou_params(df_high)
-
-        # 3. Transition intensities
-        lam01, lam10 = self._transition_intensity(is_high, num_business_days)
-
-        # 4.  y-process defaults (overridable via self.param)
-        p = self.param
-        ky_scale  = p.get('KY_Scale',  0.2)       # Kappa_Y = ky_scale * Kappa_X
-        ty_default = p.get('Theta_Y_Default', 0.0)
-        sy_default = p.get('Sigma_Y_Default', 0.0)
-        beta_default = p.get('Beta_Default',  0.0)
-        rho_default  = p.get('Rho_Default',   0.0)
-
-        params = {
-            'Kappa_X_Low':   kx_low,
-            'Theta_X_Low':   tx_low,
-            'Sigma_X_Low':   sx_low,
-            'Kappa_Y_Low':   max(kx_low  * ky_scale, 1e-4),
-            'Theta_Y_Low':   ty_default,
-            'Sigma_Y_Low':   sy_default,
-            'Beta_Low':      beta_default,
-            'Rho_Low':       rho_default,
-            'Kappa_X_High':  kx_high,
-            'Theta_X_High':  tx_high,
-            'Sigma_X_High':  sx_high,
-            'Kappa_Y_High':  max(kx_high * ky_scale, 1e-4),
-            'Theta_Y_High':  ty_default,
-            'Sigma_Y_High':  sy_default,
-            'Beta_High':     beta_default,
-            'Rho_High':      rho_default,
-            'Lambda_01':     lam01,
-            'Lambda_10':     lam10,
-        }
-
-        # 5. Correlation matrix: Z1/Z2 are independent inputs; within-regime
-        #    x-y correlation is handled entirely by the Van Loan Cholesky L.
-        correlation_coef = np.eye(2)
-
-        # Return delta from the full series for time-grid purposes
-        _, _, delta = utils.calc_statistics(
-            data_frame, method='Diff', num_business_days=num_business_days)
-
-        return utils.CalibrationInfo(params, correlation_coef, delta)
-
-
-class RegimeSwitchingOU2FactorHMMCalibration(object):
-    """HMM-based calibration of RegimeSwitchingOU2FactorModel from an observed carry series.
-
-    This class is a practical calibration of a **regime-switching 1-factor OU**
-    for the directly observed carry factor x_t.  It is **not** a full latent-state
-    MLE of the continuous-time 2-factor system — the second factor y remains
-    inactive by default (Sigma_Y = Beta = Rho = 0).
-
-    Approach
-    --------
-    1.  A 2-state ``GaussianHMM`` is fitted on the observation vector
-        ``[x_t, dx_t]`` (level + increment) with multiple random restarts;
-        the best non-degenerate fit (by log-likelihood) is retained.
-
-    2.  States are reordered so that regime 0 = low carry, regime 1 = high carry
-        (primary key: higher mean x_t; secondary: higher variance of dx_t).
-
-    3.  Regime-conditional OU parameters (Kappa_X, Theta_X, Sigma_X) are
-        estimated via **weighted AR(1) regression** using the HMM posterior
-        probabilities as observation weights, which avoids hard-subsetting a
-        non-contiguous series.
-
-    4.  CTMC transition intensities are derived analytically from the discrete
-        HMM transition matrix.
-
-    Diagnostics are stored on ``self.last_result`` after each call to
-    ``calibrate()``.
-
-    Parameters (via ``self.param``)
-    --------------------------------
-    HMM_Num_States          int    2
-    HMM_Covariance_Type     str    'full'
-    HMM_N_Iter              int    500
-    HMM_Tol                 float  1e-4
-    HMM_N_Init              int    10
-    HMM_Random_State        int    1234
-    HMM_Use_Diff_Feature    bool   True    — use [x_t, dx_t]; False → [x_t] only
-    KY_Scale                float  0.2     — Kappa_Y = KY_Scale * Kappa_X
-    Theta_Y_Default         float  0.0
-    Sigma_Y_Default         float  0.0
-    Beta_Default            float  0.0
-    Rho_Default             float  0.0
-    Kappa_Max               float  10.0
-    Sigma_Max               float  2.0
-    Min_Regime_Weight       float  0.05    — min total posterior mass for a
-                                            regime to be considered non-degenerate
-    """
-
-    def __init__(self, model, param):
-        self.model = model
-        self.param = param
-        self.num_factors = 2
-        self.last_result = {}
-
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
-
-    def calibrate(self, data_frame, vol_shift=0.0, num_business_days=252.0, **kwargs):
-        """Calibrate from a DataFrame whose first column is the carry series x_t.
-
-        Parameters
-        ----------
-        data_frame          : pd.DataFrame  (index = dates, col 0 = x_t)
-        vol_shift           : float         optional: added to Sigma_X_Low/High after fit
-        num_business_days   : float         trading days per year (default 252)
-
-        Returns
-        -------
-        utils.CalibrationInfo(params, np.eye(2), delta)
-        """
-        try:
-            from hmmlearn.hmm import GaussianHMM
-        except ImportError:
-            raise ImportError(
-                'hmmlearn is required for RegimeSwitchingOU2FactorHMMCalibration. '
-                'Install it with: pip install hmmlearn')
-
-        p = self.param
-        n_states          = int(p.get('HMM_Num_States',       2))
-        cov_type          = str(p.get('HMM_Covariance_Type',  'full'))
-        n_iter            = int(p.get('HMM_N_Iter',           500))
-        tol               = float(p.get('HMM_Tol',            1e-4))
-        n_init            = int(p.get('HMM_N_Init',           10))
-        rand_state        = int(p.get('HMM_Random_State',     1234))
-        use_diff          = bool(p.get('HMM_Use_Diff_Feature', True))
-        ky_scale          = float(p.get('KY_Scale',            0.2))
-        ty_default        = float(p.get('Theta_Y_Default',     0.0))
-        sy_default        = float(p.get('Sigma_Y_Default',     0.0))
-        beta_default      = float(p.get('Beta_Default',        0.0))
-        rho_default       = float(p.get('Rho_Default',         0.0))
-        kappa_max         = float(p.get('Kappa_Max',           10.0))
-        sigma_max         = float(p.get('Sigma_Max',           2.0))
-        min_regime_weight = float(p.get('Min_Regime_Weight',   0.05))
-
-        dt = 1.0 / num_business_days
-
-        # --- 1. Prepare series ------------------------------------------------
-        series = self._prepare_series(data_frame)
-
-        # --- 2. Build observation matrix -------------------------------------
-        obs = self._build_observations(series, use_diff_feature=use_diff)
-
-        # --- 3. Fit HMM (multi-start, best non-degenerate) -------------------
-        hmm_model = self._fit_best_hmm(
-            obs, n_states, cov_type, n_iter, tol, n_init, rand_state, min_regime_weight)
-
-        # --- 4. Posterior probabilities & Viterbi decoding -------------------
-        posterior     = hmm_model.predict_proba(obs)      # [n, n_states]
-        decoded_raw   = hmm_model.predict(obs)            # [n]
-        log_likelihood = hmm_model.score(obs)
-
-        # --- 5. Reorder states: 0=Low, 1=High --------------------------------
-        low_idx, high_idx, posterior, decoded = self._reorder_states(
-            hmm_model, obs, posterior, decoded_raw)
-
-        startprob = hmm_model.startprob_[[low_idx, high_idx]]
-        trans_mat = hmm_model.transmat_[np.ix_([low_idx, high_idx],
-                                                [low_idx, high_idx])]
-
-        # --- 6. Weighted AR(1) per regime ------------------------------------
-        x_t   = series.values[:-1]
-        x_tp1 = series.values[1:]
-        w_low  = posterior[:-1, 0]   # weights for Low regime
-        w_high = posterior[:-1, 1]   # weights for High regime
-
-        fit_low  = self._weighted_ar1_fit(x_t, x_tp1, w_low,  dt, kappa_max, sigma_max)
-        fit_high = self._weighted_ar1_fit(x_t, x_tp1, w_high, dt, kappa_max, sigma_max)
-
-        kx_low,  tx_low,  sx_low  = fit_low['kappa'],  fit_low['theta'],  fit_low['sigma']
-        kx_high, tx_high, sx_high = fit_high['kappa'], fit_high['theta'], fit_high['sigma']
-
-        # Optional vol_shift bump
-        sx_low  = min(sx_low  + vol_shift, sigma_max)
-        sx_high = min(sx_high + vol_shift, sigma_max)
-
-        # --- 7. Transition intensities from discrete matrix ------------------
-        lam01, lam10 = self._transition_probs_to_intensities(trans_mat, dt)
-
-        # --- 8. Initial high-regime probability ------------------------------
-        init_p_hi = float(startprob[1])
-
-        # --- 9. Build parameter dict -----------------------------------------
-        params = self._build_params(
-            kx_low, tx_low, sx_low, kx_high, tx_high, sx_high,
-            lam01, lam10, init_p_hi,
-            ky_scale, ty_default, sy_default, beta_default, rho_default)
-
-        # --- 10. delta for CalibrationInfo compatibility ---------------------
-        _, _, delta = utils.calc_statistics(
-            data_frame, method='Diff', num_business_days=num_business_days)
-
-        # --- 11. Store diagnostics -------------------------------------------
-        self.last_result = {
-            'log_likelihood':             log_likelihood,
-            'transition_matrix':          trans_mat,
-            'startprob':                  startprob,
-            'posterior':                  posterior,
-            'decoded_states':             decoded,
-            'state_means':                hmm_model.means_[[low_idx, high_idx]],
-            'state_covars':               hmm_model.covars_[[low_idx, high_idx]],
-            'weighted_fit_low':           fit_low,
-            'weighted_fit_high':          fit_high,
-            'expected_duration_low_years':  1.0 / lam01,
-            'expected_duration_high_years': 1.0 / lam10,
-            'observations':               obs,
-            'series_used':                series,
-        }
-
-        return utils.CalibrationInfo(params, np.eye(2), delta)
-
-    # ------------------------------------------------------------------
-    # Helper: data preparation
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _prepare_series(data_frame):
-        """Sort, drop NaN, validate length.  Returns a pd.Series."""
-        series = data_frame.iloc[:, 0].sort_index().dropna()
-        if len(series) < 250:
-            raise ValueError(
-                'RegimeSwitchingOU2FactorHMMCalibration requires at least 250 '
-                'observations; got {}.'.format(len(series)))
-        return series
-
-    # ------------------------------------------------------------------
-    # Helper: build HMM observation matrix
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_observations(series, use_diff_feature=True):
-        """Return feature matrix [n_obs, d].
-
-        If use_diff_feature is True: d=2, columns = [x_t, dx_t].
-        Otherwise: d=1, column = [x_t].
-        """
-        x = series.values.astype(float)
-        if use_diff_feature:
-            dx = np.diff(x, prepend=x[0])   # dx[0] = 0 by convention
-            return np.column_stack([x, dx])
-        return x.reshape(-1, 1)
-
-    # ------------------------------------------------------------------
-    # Helper: fit best HMM over multiple random starts
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _fit_best_hmm(observations, n_states, covariance_type, n_iter, tol,
-                      n_init, random_state, min_regime_weight):
-        from hmmlearn.hmm import GaussianHMM
-
-        best_model  = None
-        best_score  = -np.inf
-        n_obs       = observations.shape[0]
-        rng         = np.random.default_rng(random_state)
-
-        for trial in range(n_init):
-            seed = int(rng.integers(0, 2 ** 31))
-            try:
-                candidate = GaussianHMM(
-                    n_components=n_states,
-                    covariance_type=covariance_type,
-                    n_iter=n_iter,
-                    tol=tol,
-                    random_state=seed,
-                    verbose=False,
-                )
-                candidate.fit(observations)
-                ll = candidate.score(observations)
-
-                # Reject degenerate fits: any regime with near-zero occupancy
-                posterior = candidate.predict_proba(observations)
-                regime_mass = posterior.mean(axis=0)
-                if np.any(regime_mass < min_regime_weight):
-                    continue
-
-                if ll > best_score:
-                    best_score = ll
-                    best_model = candidate
-
-            except Exception:
-                continue
-
-        if best_model is None:
-            # Last resort: refit once without the occupancy filter
-            fallback = GaussianHMM(
-                n_components=n_states,
-                covariance_type=covariance_type,
-                n_iter=n_iter,
-                tol=tol,
-                random_state=random_state,
-                verbose=False,
-            )
-            fallback.fit(observations)
-            best_model = fallback
-
-        return best_model
-
-    # ------------------------------------------------------------------
-    # Helper: reorder states so 0=Low, 1=High by mean carry level
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _reorder_states(model, observations, posterior, decoded):
-        """Map HMM states to economic states: 0=Low carry, 1=High carry.
-
-        Primary ranking: mean of the first feature (x_t level).
-        Secondary tie-break: variance of the second feature (dx_t).
-        """
-        n_states  = model.n_components
-        x_means   = model.means_[:, 0]
-
-        if n_states == 2:
-            # Simple 2-state case
-            if x_means[0] <= x_means[1]:
-                # state 0 is already Low
-                low_idx, high_idx = 0, 1
-            else:
-                low_idx, high_idx = 1, 0
-        else:
-            order     = np.argsort(x_means)
-            low_idx   = int(order[0])
-            high_idx  = int(order[-1])
-
-        # Reorder posterior columns: col 0 = Low, col 1 = High
-        reordered_post   = np.column_stack([posterior[:, low_idx],
-                                             posterior[:, high_idx]])
-        # Remap decoded states
-        remap            = {low_idx: 0, high_idx: 1}
-        reordered_decoded = np.array([remap.get(s, s) for s in decoded])
-
-        return low_idx, high_idx, reordered_post, reordered_decoded
-
-    # ------------------------------------------------------------------
-    # Helper: weighted AR(1) → OU parameters
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _weighted_ar1_fit(x_t, x_tp1, weights, dt, kappa_max, sigma_max):
-        """Fit  x_{t+1} = a + b * x_t + eps  with observation weights.
-
-        Returns a dict with keys: a, b, q, kappa, theta, sigma.
-        """
-        eps = 1e-12
-        w   = np.clip(weights, 0.0, None)
-        w_sum = w.sum()
-        if w_sum < eps:
-            # Degenerate: no weight — fall back to OLS
-            w = np.ones_like(weights)
-            w_sum = w.sum()
-
-        # Weighted means
-        mx  = (w * x_t).sum()   / w_sum
-        my  = (w * x_tp1).sum() / w_sum
-
-        # Weighted (co)variances
-        cxx = (w * (x_t   - mx) ** 2).sum() / w_sum
-        cxy = (w * (x_t   - mx) * (x_tp1 - my)).sum() / w_sum
-
-        if cxx < eps:
-            b = 1.0 - 1e-6   # near-unit root fallback
-        else:
-            b = cxy / cxx
-
-        b = float(np.clip(b, 1e-6, 1.0 - 1e-6))
-        a = my - b * mx
-
-        # Weighted residual variance
-        resid = x_tp1 - (a + b * x_t)
-        q = (w * resid ** 2).sum() / w_sum
-        q = max(q, eps)
-
-        # AR(1) → continuous-time OU
-        kappa = float(np.clip(-np.log(b) / dt, 1e-4, kappa_max))
-        theta = float(a / (1.0 - b))
-        sigma_sq = q * 2.0 * kappa / max(1.0 - np.exp(-2.0 * kappa * dt), eps)
-        sigma = float(np.clip(np.sqrt(max(sigma_sq, 0.0)), 0.0, sigma_max))
-
-        return {'a': a, 'b': b, 'q': q, 'kappa': kappa, 'theta': theta, 'sigma': sigma}
-
-    # ------------------------------------------------------------------
-    # Helper: discrete transition matrix → CTMC intensities
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _transition_probs_to_intensities(P, dt):
-        """Convert 2×2 discrete transition matrix P to annualised CTMC rates.
-
-        Uses  Lambda = -log(max(1-p, eps)) / dt.
-        """
-        eps   = 1e-12
-        p01   = float(np.clip(P[0, 1], 0.0, 1.0))
-        p10   = float(np.clip(P[1, 0], 0.0, 1.0))
-        lam01 = -np.log(max(1.0 - p01, eps)) / dt
-        lam10 = -np.log(max(1.0 - p10, eps)) / dt
-        return float(lam01), float(lam10)
-
-    # ------------------------------------------------------------------
-    # Helper: assemble output parameter dict
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_params(kx_low, tx_low, sx_low, kx_high, tx_high, sx_high,
-                      lam01, lam10, init_p_hi,
-                      ky_scale, ty_default, sy_default, beta_default, rho_default):
-        return {
-            'Kappa_X_Low':             kx_low,
-            'Theta_X_Low':             tx_low,
-            'Sigma_X_Low':             sx_low,
-            'Kappa_Y_Low':             max(kx_low  * ky_scale, 1e-4),
-            'Theta_Y_Low':             ty_default,
-            'Sigma_Y_Low':             sy_default,
-            'Beta_Low':                beta_default,
-            'Rho_Low':                 rho_default,
-            'Kappa_X_High':            kx_high,
-            'Theta_X_High':            tx_high,
-            'Sigma_X_High':            sx_high,
-            'Kappa_Y_High':            max(kx_high * ky_scale, 1e-4),
-            'Theta_Y_High':            ty_default,
-            'Sigma_Y_High':            sy_default,
-            'Beta_High':               beta_default,
-            'Rho_High':                rho_default,
-            'Lambda_01':               lam01,
-            'Lambda_10':               lam10,
-            'Initial_Regime_Prob_High': init_p_hi,
-        }
-
-class RegimeSwitchingOU1FactorKalmanCalibration(object):
-    """Kalman-filter calibration of a latent 1-factor switching OU carry model.
-
-    Observation equation
-    --------------------
-        m_t = tau_t * x_t + eps_t
-        eps_t ~ N(0, R)
-
-    where ``m_t`` is an observed raw log basis (for example ``log(F_t / S_t)``)
-    and ``tau_t`` is the time-to-expiry in years. The latent carry state ``x_t``
-    follows a regime-dependent Ornstein-Uhlenbeck process:
-
-        dx_t = kappa[z_t] * (theta[z_t] - x_t) dt + sigma[z_t] dW_t
-
-    The latent regime ``z_t`` is a 2-state Markov chain. Estimation uses an
-    approximate EM loop with a switching Kalman filter and collapsed regime
-    mixtures. Parameters are returned in the existing
-    ``RegimeSwitchingOU2FactorModel`` format, with the second factor switched off
-    by default (Sigma_Y = Beta = Rho = 0).
-    """
-
-    def __init__(self, model, param):
-        self.model = model
-        self.param = param or {}
-        self.num_factors = 2
-        self.last_result = {}
-
-    @staticmethod
-    def _safe_tau(tau, floor=1e-4):
-        return np.clip(np.asarray(tau, dtype=float), floor, np.inf)
-
-    def _extract_observations(self, data_frame):
-        df = data_frame.copy()
-        cols = list(df.columns)
-        lower = {c: str(c).lower() for c in cols}
-
-        tau_col = next((c for c in cols if any(k in lower[c] for k in ['tau', 'tenor', 'expiry'])), None)
-        obs_col = next((c for c in cols if any(k in lower[c] for k in ['raw_basis', 'log_basis', 'basis_obs', 'observed_basis'])), None)
-
-        if obs_col is None:
-            basis_carry_col = next((c for c in cols if 'basis_carry' in lower[c]), None)
-            if basis_carry_col is not None and tau_col is not None:
-                obs = df[basis_carry_col].astype(float).values * df[tau_col].astype(float).values
-                reconstructed = True
-            else:
-                non_tau_cols = [c for c in cols if c != tau_col]
-                if not non_tau_cols:
-                    raise ValueError('Need at least one observation column for Kalman calibration.')
-                obs_col = non_tau_cols[0]
-                obs = df[obs_col].astype(float).values
-                reconstructed = False
-        else:
-            obs = df[obs_col].astype(float).values
-            reconstructed = False
-
-        if tau_col is None:
-            raise ValueError('Kalman calibration requires a tau / tenor column in the archive data.')
-
-        tau = df[tau_col].astype(float).values
-        valid = np.isfinite(obs) & np.isfinite(tau) & (tau > 0.0)
-        if valid.sum() < 50:
-            raise ValueError('Need at least 50 valid observations with positive tau for Kalman calibration.')
-
-        obs = obs[valid]
-        tau = tau[valid]
-        out = df.loc[valid].copy()
-        out['_obs'] = obs
-        out['_tau'] = tau
-        return out, reconstructed
-
-    @staticmethod
-    def _weighted_ar1_fit(x_t, x_tp1, weights, dt, kappa_max, sigma_max):
-        eps = 1e-12
-        w = np.clip(np.asarray(weights, dtype=float), 0.0, None)
-        w_sum = w.sum()
-        if w_sum < eps:
-            w = np.ones_like(x_t, dtype=float)
-            w_sum = w.sum()
-
-        mx = np.sum(w * x_t) / w_sum
-        my = np.sum(w * x_tp1) / w_sum
-        cxx = np.sum(w * (x_t - mx) ** 2) / w_sum
-        cxy = np.sum(w * (x_t - mx) * (x_tp1 - my)) / w_sum
-
-        if cxx < eps:
-            b = 1.0 - 1e-6
-        else:
-            b = cxy / cxx
-        b = float(np.clip(b, 1e-6, 1.0 - 1e-6))
-        a = float(my - b * mx)
-
-        resid = x_tp1 - (a + b * x_t)
-        q = float(max(np.sum(w * resid ** 2) / w_sum, eps))
-
-        kappa = float(np.clip(-np.log(b) / max(dt, eps), 1e-4, kappa_max))
-        theta = float(a / max(1.0 - b, eps))
-        sigma_sq = q * 2.0 * kappa / max(1.0 - np.exp(-2.0 * kappa * dt), eps)
-        sigma = float(np.clip(np.sqrt(max(sigma_sq, 0.0)), 0.0, sigma_max))
-        return {'a': a, 'b': b, 'q': q, 'kappa': kappa, 'theta': theta, 'sigma': sigma}
-
-    @staticmethod
-    def _transition_probs_to_intensities(P, dt):
-        eps = 1e-12
-        p01 = float(np.clip(P[0, 1], 0.0, 1.0 - eps))
-        p10 = float(np.clip(P[1, 0], 0.0, 1.0 - eps))
-        lam01 = -np.log(max(1.0 - p01, eps)) / max(dt, eps)
-        lam10 = -np.log(max(1.0 - p10, eps)) / max(dt, eps)
-        return lam01, lam10
-
-    @staticmethod
-    def _normal_pdf(v, s):
-        s = max(float(s), 1e-12)
-        return np.exp(-0.5 * (v * v) / s) / np.sqrt(2.0 * np.pi * s)
-
-    def _switching_kalman_filter(self, obs, tau, params, trans_mat, init_prob, meas_var_t, dt):
-        kappa = np.asarray(params['kappa'], dtype=float)
-        theta = np.asarray(params['theta'], dtype=float)
-        sigma = np.asarray(params['sigma'], dtype=float)
-
-        n = obs.shape[0]
-        n_reg = 2
-        trans_mat = np.clip(np.asarray(trans_mat, dtype=float), 1e-8, 1.0)
-        trans_mat /= trans_mat.sum(axis=1, keepdims=True)
-        init_prob = np.clip(np.asarray(init_prob, dtype=float), 1e-8, 1.0)
-        init_prob /= init_prob.sum()
-        meas_var_t = np.asarray(meas_var_t, dtype=float)
-        meas_var_t = np.clip(meas_var_t, 1e-10, np.inf)
-
-        a = np.exp(-kappa * dt)
-        c = (1.0 - a) * theta
-        q = sigma * sigma * (1.0 - np.exp(-2.0 * kappa * dt)) / (2.0 * kappa)
-        q = np.clip(q, 1e-10, np.inf)
-
-        regime_prob = np.zeros((n, n_reg))
-        state_mean = np.zeros((n, n_reg))
-        state_var = np.zeros((n, n_reg))
-        pair_prob = np.zeros((n, n_reg, n_reg))
-        emission_mass = np.zeros((n, n_reg, n_reg))
-        loglik = 0.0
-
-        var0 = np.maximum(sigma * sigma / np.maximum(2.0 * kappa, 1e-6), 1e-4)
-        pred_mean = theta.copy()
-        pred_var = var0.copy()
-        prev_prob = init_prob.copy()
-
-        for t in range(n):
-            H = float(tau[t])
-            y = float(obs[t])
-
-            w = np.zeros((n_reg, n_reg))
-            m_upd = np.zeros((n_reg, n_reg))
-            p_upd = np.zeros((n_reg, n_reg))
-
-            for i in range(n_reg):
-                for j in range(n_reg):
-                    m_pred = a[j] * pred_mean[i] + c[j]
-                    p_pred = a[j] * a[j] * pred_var[i] + q[j]
-                    R = meas_var_t[t]
-                    s = H * H * p_pred + R
-                    v = y - H * m_pred
-                    lik = self._normal_pdf(v, s)
-                    w[i, j] = prev_prob[i] * trans_mat[i, j] * lik
-                    K = p_pred * H / s
-                    m_upd[i, j] = m_pred + K * v
-                    p_upd[i, j] = max((1.0 - K * H) * p_pred, 1e-12)
-                    emission_mass[t, i, j] = lik
-
-            total = w.sum()
-            if not np.isfinite(total) or total <= 0.0:
-                total = 1e-300
-                w = np.full_like(w, 1.0 / (n_reg * n_reg))
-
-            pair_prob[t] = w / total
-            regime_prob[t] = pair_prob[t].sum(axis=0)
-            loglik += np.log(total)
-
-            next_mean = np.zeros(n_reg)
-            next_var = np.zeros(n_reg)
-            for j in range(n_reg):
-                pj = regime_prob[t, j]
-                if pj <= 1e-15:
-                    next_mean[j] = theta[j]
-                    next_var[j] = var0[j]
-                    continue
-                weights_j = pair_prob[t, :, j] / pj
-                mu = np.sum(weights_j * m_upd[:, j])
-                var = np.sum(weights_j * (p_upd[:, j] + (m_upd[:, j] - mu) ** 2))
-                next_mean[j] = mu
-                next_var[j] = max(var, 1e-12)
-
-            state_mean[t] = next_mean
-            state_var[t] = next_var
-            pred_mean = next_mean
-            pred_var = next_var
-            prev_prob = regime_prob[t]
-
-        return {
-            'loglik': loglik,
-            'regime_prob': regime_prob,
-            'state_mean': state_mean,
-            'state_var': state_var,
-            'pair_prob': pair_prob,
-            'emission_mass': emission_mass,
-        }
-
-    @staticmethod
-    def _build_measurement_variance(tau,
-                                    base_meas_var=1e-4,
-                                    tau_floor=1e-4,
-                                    tau_power=1.0,
-                                    tau_scale=0.0,
-                                    roll_mask=None,
-                                    roll_mult=1.0,
-                                    max_meas_var=1.0):
-        """
-        Build time-varying measurement variance R_t.
-
-        R_t = base_meas_var + tau_scale / tau**tau_power
-
-        Parameters
-        ----------
-        tau : array-like
-            Time to expiry in years.
-        base_meas_var : float
-            Base observation noise floor.
-        tau_floor : float
-            Lower bound for tau.
-        tau_power : float
-            1.0 or 2.0 are sensible starting points.
-        tau_scale : float
-            Strength of tenor-dependent inflation.
-        roll_mask : bool array-like or None
-            If provided, multiply R_t by roll_mult where roll_mask is True.
-        roll_mult : float
-            Roll-window inflation multiplier.
-        max_meas_var : float
-            Clip to avoid absurd variances.
-        """
-        tau = np.clip(np.asarray(tau, dtype=float), tau_floor, np.inf)
-        R_t = base_meas_var + tau_scale / np.power(tau, tau_power)
-
-        if roll_mask is not None:
-            roll_mask = np.asarray(roll_mask, dtype=bool)
-            R_t = np.where(roll_mask, R_t * roll_mult, R_t)
-
-        return np.clip(R_t, base_meas_var, max_meas_var)
-
-    def calibrate(self, data_frame, vol_shift=0.0, num_business_days=252.0, **kwargs):
-        p = self.param
-        max_iter = int(p.get('KF_Max_Iter', 25))
-        tol = float(p.get('KF_Tol', 1e-5))
-        kappa_max = float(p.get('Kappa_Max', 10.0))
-        sigma_max = float(p.get('Sigma_Max', 2.0))
-        tau_floor = float(p.get('Tau_Floor', 1e-4))
-        ky_scale = float(p.get('KY_Scale', 0.2))
-        ty_default = float(p.get('Theta_Y_Default', 0.0))
-        sy_default = float(p.get('Sigma_Y_Default', 0.0))
-        beta_default = float(p.get('Beta_Default', 0.0))
-        rho_default = float(p.get('Rho_Default', 0.0))
-        min_meas_var = float(p.get('Min_Measurement_Var', 1e-6))
-        rolling_clip = float(p.get('Proxy_Clip_Std', 4.0))
-        base_meas_var = float(p.get('Base_Measurement_Var', 1e-4))
-        tau_meas_scale = float(p.get('Tau_Measurement_Scale', 1e-5))
-        tau_meas_power = float(p.get('Tau_Measurement_Power', 1.0))
-        roll_meas_mult = float(p.get('Roll_Measurement_Mult', 1.0))
-        max_meas_var = float(p.get('Max_Measurement_Var', 1.0))
-
-        df, reconstructed = self._extract_observations(data_frame)
-        obs = df['_obs'].astype(float).values
-        tau = self._safe_tau(df['_tau'].values, floor=tau_floor)
-        dt = 1.0 / num_business_days
-        n = obs.shape[0]
-
-        # --- Warm-start: recover a proxy carry series and fit a single OU ----
-        proxy = obs / tau
-        if rolling_clip > 0.0:
-            mu_p, sd_p = np.nanmean(proxy), np.nanstd(proxy)
-            proxy = np.clip(proxy, mu_p - rolling_clip * sd_p, mu_p + rolling_clip * sd_p)
-
-        fit_init = self._weighted_ar1_fit(
-            proxy[:-1], proxy[1:], np.ones(n - 1), dt, kappa_max, sigma_max)
-
-        # Regime params: Low = quieter, High = more volatile
-        ou_params = {
-            'kappa': np.clip([fit_init['kappa'] * 0.5, fit_init['kappa'] * 1.5], 1e-4, kappa_max),
-            'theta': np.array([fit_init['theta'], fit_init['theta']]),
-            'sigma': np.clip([fit_init['sigma'] * 0.7, fit_init['sigma'] * 1.3], 1e-8, sigma_max),
-        }
-
-        trans_mat  = np.array([[0.95, 0.05], [0.05, 0.95]])
-        init_prob  = np.array([0.5, 0.5])
-        roll_mask = None
-        if 'ignore_roll' in df.columns:
-            roll_mask = df['ignore_roll'].astype(bool).values
-
-        meas_var_t = self._build_measurement_variance(
-            tau=tau,
-            base_meas_var=max(base_meas_var, min_meas_var),
-            tau_floor=tau_floor,
-            tau_power=tau_meas_power,
-            tau_scale=tau_meas_scale,
-            roll_mask=roll_mask,
-            roll_mult=roll_meas_mult,
-            max_meas_var=max_meas_var
-        )
-
-        prev_loglik = -np.inf
-        kf_result   = None
-
-        # --- EM loop ----------------------------------------------------------
-        for em_iter in range(max_iter):
-
-            # E-step: switching Kalman filter
-            kf_result = self._switching_kalman_filter(
-                obs, tau, ou_params, trans_mat, init_prob, meas_var_t, dt)
-            loglik      = kf_result['loglik']
-            regime_prob = kf_result['regime_prob']   # [n, 2]
-            state_mean  = kf_result['state_mean']    # [n, 2]
-            pair_prob   = kf_result['pair_prob']     # [n, 2, 2]
-
-            # M-step 1: per-regime OU params via weighted AR(1) on filtered means
-            new_kappa = np.zeros(2)
-            new_theta = np.zeros(2)
-            new_sigma = np.zeros(2)
-            for j in range(2):
-                fit_j = self._weighted_ar1_fit(
-                    state_mean[:-1, j], state_mean[1:, j],
-                    regime_prob[:-1, j], dt, kappa_max, sigma_max)
-                new_kappa[j] = fit_j['kappa']
-                new_theta[j] = fit_j['theta']
-                new_sigma[j] = min(fit_j['sigma'] + vol_shift, sigma_max)
-
-            ou_params = {
-                'kappa': np.clip(new_kappa, 1e-4, kappa_max),
-                'theta': new_theta,
-                'sigma': np.clip(new_sigma, 1e-8, sigma_max),
-            }
-
-            # M-step 2: transition matrix from soft pair counts
-            trans_counts = pair_prob.sum(axis=0)           # [2, 2]
-            row_sums     = trans_counts.sum(axis=1, keepdims=True)
-            row_sums     = np.where(row_sums > 1e-12, row_sums, 1.0)
-            trans_mat    = trans_counts / row_sums
-
-            # M-step 3: measurement variance from collapsed residuals
-            x_hat = np.einsum('tj,tj->t', regime_prob, state_mean)
-            resid2 = (obs - tau * x_hat) ** 2
-
-            base_est = max(float(np.median(resid2)), min_meas_var)
-
-            meas_var_t = self._build_measurement_variance(
-                tau=tau,
-                base_meas_var=base_est,
-                tau_floor=tau_floor,
-                tau_power=tau_meas_power,
-                tau_scale=tau_meas_scale,
-                roll_mask=roll_mask,
-                roll_mult=roll_meas_mult,
-                max_meas_var=max_meas_var
-            )
-
-            # M-step 4: initial regime probability
-            init_prob = np.clip(regime_prob[0], 1e-8, 1.0)
-            init_prob /= init_prob.sum()
-
-            if abs(loglik - prev_loglik) < tol * max(1.0, abs(prev_loglik)):
-                break
-            prev_loglik = loglik
-
-        # --- Build output parameter dict -------------------------------------
-        kx_low,  tx_low,  sx_low  = float(ou_params['kappa'][0]), float(ou_params['theta'][0]), float(ou_params['sigma'][0])
-        kx_high, tx_high, sx_high = float(ou_params['kappa'][1]), float(ou_params['theta'][1]), float(ou_params['sigma'][1])
-
-        lam01, lam10 = self._transition_probs_to_intensities(trans_mat, dt)
-        init_p_hi    = float(init_prob[1])
-
-        out_params = {
-            'Kappa_X_Low':              kx_low,
-            'Theta_X_Low':              tx_low,
-            'Sigma_X_Low':              sx_low,
-            'Kappa_Y_Low':              max(kx_low  * ky_scale, 1e-4),
-            'Theta_Y_Low':              ty_default,
-            'Sigma_Y_Low':              sy_default,
-            'Beta_Low':                 beta_default,
-            'Rho_Low':                  rho_default,
-            'Kappa_X_High':             kx_high,
-            'Theta_X_High':             tx_high,
-            'Sigma_X_High':             sx_high,
-            'Kappa_Y_High':             max(kx_high * ky_scale, 1e-4),
-            'Theta_Y_High':             ty_default,
-            'Sigma_Y_High':             sy_default,
-            'Beta_High':                beta_default,
-            'Rho_High':                 rho_default,
-            'Lambda_01':                lam01,
-            'Lambda_10':                lam10,
-            'Initial_Regime_Prob_High': init_p_hi,
-        }
-
-        _, _, delta = utils.calc_statistics(
-            df.iloc[:,:2], method='Diff', num_business_days=num_business_days)
-
-        self.last_result = {
-            'log_likelihood':               prev_loglik,
-            'em_iterations':                em_iter + 1,
-            'transition_matrix':            trans_mat,
-            'init_prob':                    init_prob,
-            'regime_prob':                  kf_result['regime_prob'] if kf_result else None,
-            'state_mean':                   kf_result['state_mean']  if kf_result else None,
-            'state_var':                    kf_result['state_var']   if kf_result else None,
-            'measurement_var_t':            meas_var_t,
-            'measurement_var_base':         float(np.median(meas_var_t)),
-            'expected_duration_low_years':  1.0 / lam01,
-            'expected_duration_high_years': 1.0 / lam10,
-            'params_low':  {'kappa': kx_low,  'theta': tx_low,  'sigma': sx_low},
-            'params_high': {'kappa': kx_high, 'theta': tx_high, 'sigma': sx_high},
-            'observations':                 obs,
-            'tau':                          tau,
-            'reconstructed_obs':            reconstructed,
-        }
-
-        return utils.CalibrationInfo(out_params, np.eye(2), delta)
-
-
 class SingleRegimeOU1FactorKalmanModel(StochasticProcess):
     """Single-regime latent 1-factor OU carry model.
 
@@ -2499,9 +1301,6 @@ class SingleRegimeOU1FactorKalmanModel(StochasticProcess):
 
 class SingleRegimeOU1FactorKalmanCalibration(object):
     """Kalman-filter calibration of a single-regime latent 1-factor OU carry model.
-
-    A simpler alternative to ``RegimeSwitchingOU1FactorKalmanCalibration`` for
-    cases where regime switching is not warranted.
 
     Observation equation
     --------------------
@@ -2861,10 +1660,17 @@ class LogOUSpotModel(StochasticProcess):
 
         self.e_kdt   = tensor.new(e_kdt.reshape(-1, 1))
         self.ou_vol  = tensor.new(np.sqrt(var_step).reshape(-1, 1))
-        self.theta   = float(self.param['Theta'])
-
-        # initial log-spot
+        # Initial log-spot
         self.log_spot0 = float(torch.log(tensor).item()) if tensor.numel() == 1 else torch.log(tensor)
+        # Anchor theta at the current spot rather than the calibrated long-run mean. Production
+        # hedging shouldn't bet that today's price will revert to a historical average — the agent
+        # should hedge variance around the current regime, not directional drift toward a stale θ.
+        # Disable via `Anchor_Theta_At_Spot: false` for backtests that want absolute calibrated θ.
+        if bool(self.param.get('Anchor_Theta_At_Spot', True)):
+            log_spot_scalar = self.log_spot0 if isinstance(self.log_spot0, float) else float(self.log_spot0.mean().item())
+            self.theta = log_spot_scalar
+        else:
+            self.theta = float(self.param['Theta'])
 
     def theoretical_mean_std(self, t):
         """Theoretical mean and std of S_t = exp(X_t) under the exact OU distribution."""
@@ -2889,6 +1695,18 @@ class LogOUSpotModel(StochasticProcess):
         b = self.theta * (1.0 - self.e_kdt) + self.ou_vol * Z         # [T, batch]
         log_spot = A * (self.log_spot0 + torch.cumsum(b / A, dim=0))  # [T, batch]
         return torch.exp(log_spot)
+
+    @classmethod
+    def privileged_layout(cls, param):
+        return {'log_deviation': 1, 'kappa': 1, 'sigma': 1}
+
+    def privileged_factors(self, simulated):
+        spot = simulated.to(dtype=torch.float32)
+        # Use self.theta (post-anchor) so the critic sees the actual θ used during simulation.
+        log_dev = (spot.clamp_min(1.0e-9).log() - float(self.theta)).unsqueeze(-1)
+        kappa_t = torch.full_like(log_dev, float(self.param['Kappa']))
+        sigma_t = torch.full_like(log_dev, float(self.param['Sigma']))
+        return {'log_deviation': log_dev, 'kappa': kappa_t, 'sigma': sigma_t}
 
 
 class LogOUSpotCalibration(object):
@@ -2930,6 +1748,369 @@ class LogOUSpotCalibration(object):
              'Theta': theta,
              'Sigma': np.clip(sigma + vol_shift, 0.0, sigma_max)},
             [[1.0]], delta)
+
+
+class MarkovSwitchingLogOUSpotModel(StochasticProcess):
+    """N-state hidden-Markov LogOU spot-price model. Conditional on the latent regime z_t, the
+    log-spot follows the same exact OU discretisation as `LogOUSpotModel`; a discrete Markov
+    chain over regimes drives parameter switching. One Gaussian driver per step (num_factors=1);
+    regime transitions sampled from the independent quasi-rng uniform stream.
+
+    JSON config:
+        States: list of {Kappa, Theta, Sigma} dicts (one per regime, must be >= 2)
+        Transition_Matrix: NxN row-stochastic matrix at the calibration time step
+        Initial_State_Probs: length-N vector summing to 1
+        Calibration_DT_Years: step size of the calibrated P (default 1/252).
+
+    The calibrated P is converted to a CTMC generator Q = log(P)/dt_calib once, then re-discretised
+    per simulation step P_step = expm(Q * dt) so a daily-calibrated chain stays faithful when the
+    sim grid uses non-daily steps."""
+
+    documentation = (
+        'Asset Pricing',
+        ['An N-state hidden-Markov extension of the LogOU spot model. The latent regime '
+         '$z_t \\in \\{0,...,N-1\\}$ follows a Markov chain with transition matrix $P$; '
+         'conditional on $z_t$ the log-spot follows:',
+         '',
+         '$$ dX_t = \\kappa_{z_t} (\\theta_{z_t} - X_t) dt + \\sigma_{z_t} dW_t $$',
+         '',
+         'Exact OU discretisation per step (regime frozen over the interval):',
+         '',
+         '$$ X_{t+\\delta} = \\theta_z + e^{-\\kappa_z\\delta}(X_t - \\theta_z) '
+         '+ \\sigma_z \\sqrt{\\frac{1-e^{-2\\kappa_z\\delta}}{2\\kappa_z}}\\,Z $$',
+         '',
+         'Regime transitions: $z_{t+1} \\sim \\text{Categorical}(P[z_t, :])$, drawn from the '
+         'quasi-RNG uniform stream — independent of the OU Gaussian. The configured P is at '
+         'calibration step $\\delta_c$; for simulation step $\\delta$ the model uses '
+         '$P_\\delta = \\exp(\\log(P) \\delta / \\delta_c)$.',
+         '',
+         'Parameters:',
+         '- **Spot**: Initial spot price.',
+         '- **States**: List of $\\{\\kappa, \\theta, \\sigma\\}$ per regime.',
+         '- **Transition_Matrix**: NxN row-stochastic matrix at the calibration step.',
+         '- **Initial_State_Probs**: Initial regime distribution (length N).',
+         '- **Calibration_DT_Years**: Step size $\\delta_c$ of the calibrated $P$ (default 1/252).'])
+
+    def __init__(self, factor, param, implied_factor=None):
+        super(MarkovSwitchingLogOUSpotModel, self).__init__(factor, param)
+        self._validate_params()
+
+    def _validate_params(self):
+        states = self.param.get('States') or []
+        if len(states) < 2:
+            self.params_ok = False
+            return
+        for s in states:
+            if s.get('Kappa', 0.0) <= 0.0 or s.get('Sigma', 0.0) < 0.0:
+                self.params_ok = False
+                return
+        n = len(states)
+        P = self.param.get('Transition_Matrix')
+        if not isinstance(P, list) or len(P) != n:
+            self.params_ok = False
+            return
+        for row in P:
+            if not isinstance(row, list) or len(row) != n:
+                self.params_ok = False
+                return
+            if abs(sum(row) - 1.0) > 1.0e-6:
+                self.params_ok = False
+                return
+        pi0 = self.param.get('Initial_State_Probs', [1.0 / n] * n)
+        if len(pi0) != n or abs(sum(pi0) - 1.0) > 1.0e-6:
+            self.params_ok = False
+
+    @staticmethod
+    def num_factors():
+        return 1
+
+    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
+        dt_arr = np.diff(np.hstack(([0.0], time_grid.time_grid_years)))
+        states = self.param['States']
+        self.n_states = len(states)
+        T = len(dt_arr)
+
+        e_kdt = np.zeros((self.n_states, T))
+        ou_vol = np.zeros((self.n_states, T))
+        thetas = np.zeros(self.n_states)
+        for i, s in enumerate(states):
+            kappa = float(s['Kappa'])
+            sigma = float(s['Sigma'])
+            e_kdt[i] = np.exp(-kappa * dt_arr)
+            var_step = sigma * sigma * (1.0 - np.exp(-2.0 * kappa * dt_arr)) / (2.0 * kappa)
+            ou_vol[i] = np.sqrt(np.clip(var_step, 0.0, None))
+            thetas[i] = float(s['Theta'])
+
+        # Anchor theta at current spot rather than the calibrated long-run mean. Production
+        # hedging shouldn't bet that today's price will revert to a stale historical average —
+        # the agent should hedge variance around the current regime, not directional drift.
+        # Preserve the calibrated *relative* spread between regime means (state 1 still hotter
+        # than state 0, etc.) but center the stationary log-mean at log(current_spot).
+        # Disable via `Anchor_Theta_At_Spot: false` for backtests that want absolute calibrated θ.
+        if bool(self.param.get('Anchor_Theta_At_Spot', True)):
+            log_spot_scalar = float(torch.log(tensor).mean().item()) if tensor.numel() > 1 else float(torch.log(tensor).item())
+            pi0 = np.array(self.param.get('Initial_State_Probs', [1.0 / self.n_states] * self.n_states))
+            calibrated_log_mean = float((pi0 * thetas).sum())
+            thetas = thetas + (log_spot_scalar - calibrated_log_mean)
+            self.param = dict(self.param)  # don't mutate caller's dict
+            self.param['States'] = [
+                {**s, 'Theta': float(t)} for s, t in zip(states, thetas)
+            ]
+
+        # Convert the calibrated transition matrix to its CTMC generator once, then re-discretise
+        # per simulation dt — preserves the daily calibration when the sim grid uses non-daily steps.
+        P_calib = np.array(self.param['Transition_Matrix'], dtype=np.float64)
+        dt_calib = float(self.param.get('Calibration_DT_Years', 1.0 / 252.0))
+        Q = np.real(matrix_logm(P_calib)) / dt_calib
+        P_per_step = np.zeros((T, self.n_states, self.n_states))
+        for t, dt in enumerate(dt_arr):
+            P_per_step[t] = np.real(matrix_expm(Q * dt)) if dt > 1.0e-12 else np.eye(self.n_states)
+        P_cum = np.cumsum(P_per_step, axis=2)
+
+        pi0 = np.array(self.param.get('Initial_State_Probs', [1.0 / self.n_states] * self.n_states))
+        pi0_cum = np.cumsum(pi0)
+
+        def _t(arr):
+            return shared.one.new_tensor(arr)
+
+        self.e_kdt_per_state = _t(e_kdt)
+        self.ou_vol_per_state = _t(ou_vol)
+        self.thetas = _t(thetas)
+        self.P_cum = _t(P_cum)
+        self.pi0_cum = _t(pi0_cum)
+
+        self.log_spot0 = float(torch.log(tensor).item()) if tensor.numel() == 1 else torch.log(tensor)
+
+    @property
+    def correlation_name(self):
+        return 'MarkovSwitchingLogOUProcess', [()]
+
+    def generate(self, shared_mem):
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        T, B = Z.shape
+        device = Z.device
+
+        # quasi_rng(dim, sample_size) returns sobol.draw(sample_size) of shape (sample_size, dim).
+        # We want (T+1, B) — one initial draw plus one per transition — so pass dim=B, sample_size=T+1.
+        u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, T + 1)[1].contiguous()
+
+        state = torch.searchsorted(self.pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
+        regimes = torch.empty((T, B), dtype=torch.long, device=device)
+        regimes[0] = state
+        for t in range(1, T):
+            cdf_rows = self.P_cum[t - 1].index_select(0, state)
+            state = (cdf_rows < u_regime[t].unsqueeze(1)).sum(dim=1).clamp_max_(self.n_states - 1)
+            regimes[t] = state
+
+        t_idx = torch.arange(T, device=device).unsqueeze(1).expand(T, B)
+        e_kdt_t = self.e_kdt_per_state[regimes, t_idx]
+        ou_vol_t = self.ou_vol_per_state[regimes, t_idx]
+        theta_t = self.thetas[regimes]
+
+        A = torch.cumprod(e_kdt_t, dim=0)
+        b = theta_t * (1.0 - e_kdt_t) + ou_vol_t * Z
+        log_spot = A * (self.log_spot0 + torch.cumsum(b / A, dim=0))
+        # Stashed for privileged_factors() called immediately after generate() in the sim loop.
+        self.last_regime_path = regimes
+        return torch.exp(log_spot)
+
+    @classmethod
+    def privileged_layout(cls, param):
+        n = len(param.get('States') or [])
+        out = {'regime_onehot': n}
+        for i in range(n):
+            out[f'state{i}_kappa'] = 1
+            out[f'state{i}_theta'] = 1
+            out[f'state{i}_sigma'] = 1
+        return out
+
+    def privileged_factors(self, simulated):
+        regimes = self.last_regime_path
+        T, B = regimes.shape
+        device = regimes.device
+        out = {'regime_onehot': torch.nn.functional.one_hot(regimes, num_classes=self.n_states).to(dtype=torch.float32)}
+        for i, s in enumerate(self.param['States']):
+            for attr in ('Kappa', 'Theta', 'Sigma'):
+                out[f'state{i}_{attr.lower()}'] = torch.full((T, B, 1), float(s[attr]), dtype=torch.float32, device=device)
+        return out
+
+
+class MarkovSwitchingLogOUSpotCalibration(object):
+    """Baum-Welch (EM) calibration of MarkovSwitchingLogOUSpotModel from a daily price series.
+
+    Each state is an Ornstein-Uhlenbeck process on log-spot; a discrete N-state Markov chain
+    drives parameter switching. Estimation:
+
+        E-step: forward-backward to obtain posterior state probabilities gamma_t(z) and joint
+                gamma_t(z, z') over consecutive observations.
+        M-step: transition matrix from soft-counts; per-state OU params via weighted MLE on
+                (X_t, X_{t+1}) pairs (closed form: regress X_{t+1} = a + b X_t with weights w_t,
+                recover kappa = -log(b)/dt, theta = a/(1-b), sigma from residual variance).
+
+    Hyperparameters (read from `param` if provided, else defaults):
+        N_States   — number of regimes (default 2)
+        N_Iter     — EM iterations cap (default 200)
+        Seed       — RNG seed for the small init perturbation (default 42)
+        Tol        — relative log-likelihood change for early stopping (default 1e-6)
+    """
+
+    def __init__(self, model, param):
+        self.model = model
+        self.param = param
+        self.num_factors = 1
+
+    @staticmethod
+    def _logsumexp(x, axis=None, keepdims=False):
+        m = np.max(x, axis=axis, keepdims=True)
+        out = m + np.log(np.exp(x - m).sum(axis=axis, keepdims=True))
+        return out if keepdims else np.squeeze(out, axis=axis)
+
+    @staticmethod
+    def _emission_logprob(X, kappa, theta, sigma, dt):
+        """Per-state log p(X_{t+1} | X_t, z=s) for each transition. Returns (T-1, n_states)."""
+        T = len(X) - 1
+        n_states = len(kappa)
+        out = np.empty((T, n_states))
+        for s in range(n_states):
+            e_kdt = np.exp(-kappa[s] * dt)
+            var = max(sigma[s] ** 2 * (1.0 - np.exp(-2.0 * kappa[s] * dt)) / (2.0 * kappa[s]), 1.0e-12)
+            mu = theta[s] + e_kdt * (X[:-1] - theta[s])
+            out[:, s] = -0.5 * np.log(2.0 * np.pi * var) - 0.5 * (X[1:] - mu) ** 2 / var
+        return out
+
+    @classmethod
+    def _forward_backward(cls, log_pi, log_P, log_emit):
+        T, S = log_emit.shape
+        log_alpha = np.full((T, S), -np.inf)
+        log_alpha[0] = log_pi + log_emit[0]
+        for t in range(1, T):
+            log_alpha[t] = cls._logsumexp(log_alpha[t - 1, :, None] + log_P, axis=0) + log_emit[t]
+        log_lik = cls._logsumexp(log_alpha[-1])
+        log_beta = np.zeros((T, S))
+        for t in range(T - 2, -1, -1):
+            log_beta[t] = cls._logsumexp(log_P + (log_emit[t + 1] + log_beta[t + 1])[None, :], axis=1)
+        log_gamma = log_alpha + log_beta
+        log_gamma -= cls._logsumexp(log_gamma, axis=1, keepdims=True)
+        gamma = np.exp(log_gamma)
+        log_xi = (log_alpha[:-1, :, None] + log_P[None, :, :]
+                  + log_emit[1:, None, :] + log_beta[1:, None, :])
+        log_xi -= cls._logsumexp(log_xi.reshape(T - 1, -1), axis=1)[:, None, None]
+        xi = np.exp(log_xi)
+        return gamma, xi, log_lik
+
+    @staticmethod
+    def _m_step_ou(X, w, dt, eps=1.0e-12):
+        """Weighted OU MLE on (X_t → X_{t+1}) pairs with state-occupancy weights w (length T-1).
+        Regress X_{t+1} = a + b X_t with sample weights, recover (kappa, theta, sigma)."""
+        sw = max(w.sum(), eps)
+        Xt, Xt1 = X[:-1], X[1:]
+        mx = (w * Xt).sum() / sw
+        my = (w * Xt1).sum() / sw
+        sxx = (w * (Xt - mx) ** 2).sum() / sw
+        sxy = (w * (Xt - mx) * (Xt1 - my)).sum() / sw
+        b = sxy / max(sxx, eps)
+        # Clip with margin to keep b in (0, 1) — outside this range OU is non-stationary.
+        b = float(np.clip(b, 1.0e-3, 1.0 - 1.0e-6))
+        a = my - b * mx
+        resid = Xt1 - (a + b * Xt)
+        var_resid = max((w * resid ** 2).sum() / sw, eps)
+        kappa = -np.log(b) / dt
+        theta = a / (1.0 - b)
+        sigma2 = var_resid * 2.0 * kappa / max(1.0 - np.exp(-2.0 * kappa * dt), eps)
+        return float(kappa), float(theta), float(np.sqrt(max(sigma2, eps)))
+
+    @classmethod
+    def _fit_em(cls, prices, dt, n_states=2, n_iter=200, seed=42, tol=1.0e-6):
+        rng = np.random.default_rng(seed)
+        X = np.log(np.asarray(prices, dtype=np.float64))
+        if len(X) < 50:
+            raise ValueError('Need at least ~50 observations for stable HMM-LogOU fit')
+        log_returns = np.diff(X)
+        base_sigma = log_returns.std() / np.sqrt(dt)
+        # Init: spread sigma across states so EM has distinguishable regimes from the start.
+        if n_states == 2:
+            kappa = np.array([0.5, 5.0])
+            sigma = np.array([base_sigma * 0.7, base_sigma * 1.5])
+        else:
+            kappa = rng.uniform(0.2, 5.0, size=n_states)
+            sigma = rng.uniform(base_sigma * 0.5, base_sigma * 2.0, size=n_states)
+        theta = np.full(n_states, X.mean())
+        pi = np.full(n_states, 1.0 / n_states)
+        P = np.full((n_states, n_states), 0.05) + 0.85 * np.eye(n_states)
+        P /= P.sum(axis=1, keepdims=True)
+
+        log_lik_traj = []
+        prev_lik = -np.inf
+        for it in range(n_iter):
+            log_emit = cls._emission_logprob(X, kappa, theta, sigma, dt)
+            gamma, xi, log_lik = cls._forward_backward(np.log(pi + 1e-12), np.log(P + 1e-12), log_emit)
+            log_lik_traj.append(float(log_lik))
+            if it > 0 and abs(log_lik - prev_lik) < tol * abs(prev_lik):
+                break
+            prev_lik = log_lik
+            pi = gamma[0]
+            denom = gamma[:-1].sum(axis=0)
+            P_new = xi.sum(axis=0) / np.maximum(denom[:, None], 1.0e-12)
+            P_new /= P_new.sum(axis=1, keepdims=True)
+            P = P_new
+            for s in range(n_states):
+                kappa[s], theta[s], sigma[s] = cls._m_step_ou(X, gamma[:, s], dt)
+
+        # Stationary distribution of the converged transition matrix.
+        eigvals, eigvecs = np.linalg.eig(P.T)
+        stationary = np.real(eigvecs[:, np.isclose(eigvals, 1.0)].flatten())
+        if stationary.size == 0:
+            stationary = pi
+        stationary = stationary / stationary.sum()
+
+        # Order states by sigma (state 0 = least volatile) for deterministic JSON output.
+        order = np.argsort(sigma)
+        kappa, theta, sigma = kappa[order], theta[order], sigma[order]
+        P = P[order][:, order]
+        pi = pi[order]
+        stationary = stationary[order]
+
+        return {
+            'states': [{'Kappa': float(kappa[s]), 'Theta': float(theta[s]), 'Sigma': float(sigma[s])}
+                       for s in range(n_states)],
+            'transition_matrix': P.tolist(),
+            'initial_state_probs': pi.tolist(),
+            'stationary_probs': stationary.tolist(),
+            'log_likelihood': log_lik_traj[-1],
+            'iterations': len(log_lik_traj),
+        }
+
+    def calibrate(self, data_frame, vol_shift=0.0, num_business_days=252.0):
+        """Fit MS-LogOU via EM on the first column of `data_frame` (assumed daily prices).
+        Hyperparameters (N_States, N_Iter, Seed, Tol) read from self.param if provided."""
+        n_states = int(self.param.get('N_States', 2))
+        n_iter = int(self.param.get('N_Iter', 200))
+        seed = int(self.param.get('Seed', 42))
+        tol = float(self.param.get('Tol', 1.0e-6))
+        prices = data_frame.iloc[:, 0].dropna().astype(float).values
+        dt = 1.0 / float(num_business_days)
+        fit = self._fit_em(prices, dt, n_states=n_states, n_iter=n_iter, seed=seed, tol=tol)
+        states = [
+            {
+                'Kappa': float(np.clip(s['Kappa'], 1.0e-4, 50.0)),
+                'Theta': float(s['Theta']),
+                'Sigma': float(np.clip(s['Sigma'] + vol_shift, 0.0, 5.0)),
+            }
+            for s in fit['states']
+        ]
+        return utils.CalibrationInfo(
+            {
+                'States': states,
+                'Transition_Matrix': [[float(x) for x in row] for row in fit['transition_matrix']],
+                'Initial_State_Probs': [float(x) for x in fit['stationary_probs']],
+                'Calibration_DT_Years': dt,
+            },
+            [[1.0]],
+            dt,
+        )
 
 
 def construct_process(sp_type, factor, param, implied_factor=None):

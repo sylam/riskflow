@@ -42,7 +42,7 @@ GLOBAL_BASE_FEATURE_NAMES = (
     'liability_mtm_prev',
     'total_position_value',     # sum of position_value across all instruments (negative if net short)
     'residual_exposure',         # portfolio + liability_mtm (zero = fully hedged)
-    'coverage_ratio',            # -portfolio / |liability_mtm| (1.0 = fully hedged short)
+    'coverage_ratio',            # -(Σ position × contract_size) / Σ |leg.Volume| — unitless delta coverage; 1.0 = fully hedged short
     'near_position_value',       # sum of position_value for instruments with ttf < 60d
     'mid_position_value',        # 60d <= ttf < 180d
     'far_position_value',        # ttf >= 180d
@@ -65,24 +65,11 @@ def build_global_feature_names(referenced_commodities):
     return tuple(names)
 
 
-# Backwards-compat alias for callers that imported the flat list before per-commodity globals
-# (none remain in-repo, but exporting keeps third-party consumers from breaking silently).
-GLOBAL_FEATURE_NAMES = build_global_feature_names(())
-
-
 def _intern(registry, vocab, name):
     table = registry.setdefault(vocab, {})
     if name not in table:
         table[name] = len(table)
     return table[name]
-
-
-def _to_timestamp(value):
-    if isinstance(value, pd.Timestamp):
-        return value
-    if isinstance(value, dict) and '.Timestamp' in value:
-        return pd.Timestamp(value['.Timestamp'])
-    return pd.Timestamp(value)
 
 
 def build_entity_layout(runtime):
@@ -104,7 +91,7 @@ def build_entity_layout(runtime):
             'underlying_id': _intern(registry, 'underlying', underlying),
             'instrument_type_id': _intern(registry, 'instrument_type', instrument_type),
             'contract_size': float(spec['contract_size']),
-            'last_trade_date': _to_timestamp(spec['last_trade_date']),
+            'last_trade_date': spec['last_trade_date'],
         })
 
     cash_meta = []
@@ -180,53 +167,37 @@ def _id_lookup(registry, vocab, name):
     return registry[vocab].get(str(name), 0)
 
 
-def derive_privileged_layout(price_models, referenced_commodities, *, factor_module='LogOUSpotModel'):
-    """Static schema of privileged factors the simulator will expose, derived from price-model
-    config alone. Used by the policy at construction time to size the privileged encoder, before
-    the simulation has run. Mirrors the keys that compute_privileged_factors emits at sim time."""
+def _privileged_name(factor_name, attr_name, multi):
+    """Multi-commodity runs prefix factor attribute names with `<factor>_` to disambiguate."""
+    return f'{factor_name.lower()}_{attr_name}' if multi else attr_name
+
+
+def _privileged_multi(stoch_factors):
+    """True iff there are multiple distinct primary factor names — drives the prefix decision."""
+    return len({f.name[0] for f in (stoch_factors or {})}) > 1
+
+
+def derive_privileged_layout(stoch_factors):
+    """Build the {name: dim} schema by asking each live stoch-factor process what it emits.
+    Polymorphic via `type(process).privileged_layout(process.param)` — adding a new
+    StochasticProcess subclass with its own privileged surface flows through automatically."""
+    multi = _privileged_multi(stoch_factors)
     layout = {}
-    multi = len(referenced_commodities) > 1
-    for commodity in referenced_commodities:
-        if f'{factor_module}.{commodity}' not in (price_models or {}):
-            continue
-        prefix = f'{commodity.lower()}_' if multi else ''
-        layout[f'{prefix}ou_log_deviation'] = 1
-        layout[f'{prefix}ou_kappa'] = 1
-        layout[f'{prefix}ou_sigma'] = 1
+    for factor, process in (stoch_factors or {}).items():
+        for attr_name, dim in type(process).privileged_layout(process.param).items():
+            layout[_privileged_name(factor.name[0], attr_name, multi)] = int(dim)
     return layout
 
 
-def compute_privileged_factors(bundle, price_models, *, factor_module='LogOUSpotModel'):
-    """Privileged factors the asymmetric critic sees but the actor does not. For each commodity
-    referenced by Spot_Price_History, looks up its LogOUSpotModel params and produces:
-      - ou_log_deviation: log(spot_t) - theta  (time-varying per-scenario)
-      - ou_kappa, ou_sigma: scenario constants (broadcast)
-    All tensors are shape (T_full, B, 1). Multi-commodity prefixes the factor name."""
-    factors = bundle.get('factors') or {}
-    spot_history = bundle.get('spot_price_history') or {}
-    if not factors or not spot_history or not price_models:
-        return {}
-    out = {}
-    multi = len(spot_history) > 1
-    for commodity in spot_history.keys():
-        spot_key = f'CommodityPrice:{commodity}'
-        model_key = f'{factor_module}.{commodity}'
-        if spot_key not in factors or model_key not in price_models:
-            continue
-        spot = factors[spot_key].to(dtype=torch.float32)
-        params = price_models[model_key]
-        theta = float(params['Theta'])
-        kappa = float(params['Kappa'])
-        sigma = float(params['Sigma'])
-        log_dev = (spot.clamp_min(1e-9).log() - theta).unsqueeze(-1)
-        const_shape = log_dev.shape
-        kappa_t = torch.full(const_shape, kappa, dtype=torch.float32, device=spot.device)
-        sigma_t = torch.full(const_shape, sigma, dtype=torch.float32, device=spot.device)
-        prefix = f'{commodity.lower()}_' if multi else ''
-        out[f'{prefix}ou_log_deviation'] = log_dev
-        out[f'{prefix}ou_kappa'] = kappa_t
-        out[f'{prefix}ou_sigma'] = sigma_t
-    return out
+def assemble_privileged_factors(privileged_factor_blocks, stoch_factors):
+    """Concatenate per-batch privileged-factor tensors collected during the simulation loop into
+    a single dict ready for the bundle. Input keyed by (factor_name, attr_name); output keys match
+    the schema produced by `derive_privileged_layout`."""
+    multi = _privileged_multi(stoch_factors)
+    return {
+        _privileged_name(factor_name, attr_name, multi): torch.cat(blocks, dim=1)
+        for (factor_name, attr_name), blocks in privileged_factor_blocks.items()
+    }
 
 
 def _full_spot_timeline(bundle, commodity):
@@ -361,7 +332,7 @@ def compute_cross_delta(bundle, window=PRICE_ZSCORE_WINDOW, eps=1e-6):
 def _legs_state(bundle, time_index, layout, batch_size, device):
     leg_dim = layout['legs']['feature_dim']
     id_dim = layout['legs']['id_dim']
-    legs = bundle.get('legs') if bundle else None
+    legs = bundle.get('legs')
     if not legs or not legs.get('ids'):
         return (
             torch.zeros((batch_size, 0, leg_dim), dtype=torch.float32, device=device),
@@ -382,8 +353,7 @@ def _legs_state(bundle, time_index, layout, batch_size, device):
         for ids in legs['ids']
     ]
     ids_t = torch.tensor(id_rows, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1, -1).contiguous()
-    time_to_payment_idx = LEG_FEATURE_NAMES.index('time_to_payment')
-    mask_t = features_t[..., time_to_payment_idx] > 0
+    mask_t = torch.ones(features_t.shape[:2], dtype=torch.bool, device=device)
     return features_t, ids_t, mask_t
 
 
@@ -401,7 +371,6 @@ def _instruments_state(bundle, state, time_index, layout, batch_size, device):
     current_day = float(bundle['time_grid_days'][time_index].item())
     columns = []
     ids_rows = []
-    mask_rows = []
     cumulative_pnl_state = state.get('cumulative_pnl', {})
     time_held_state = state.get('time_held', {})
     cross_delta_bundle = bundle.get('cross_delta') or {}
@@ -414,7 +383,7 @@ def _instruments_state(bundle, state, time_index, layout, batch_size, device):
         contract_size = float(entry['contract_size'])
         position_value = position * price * contract_size
         last_trade_day = float((entry['last_trade_date'] - base_date).days)
-        time_to_expiry = max(0.0, (last_trade_day - current_day)) / utils.DAYS_IN_YEAR
+        time_to_expiry = (last_trade_day - current_day) / utils.DAYS_IN_YEAR
         tradable = 1.0 if current_day < last_trade_day else 0.0
         cs = torch.full_like(price, contract_size)
         tte = torch.full_like(price, time_to_expiry)
@@ -439,10 +408,9 @@ def _instruments_state(bundle, state, time_index, layout, batch_size, device):
             price_change = price - price_prev
         columns.append(torch.stack([price, price_change, position, position_value, tte, cs, flag, cum_pnl, held_years, cd], dim=-1))
         ids_rows.append([entry['currency_id'], entry['underlying_id'], entry['instrument_type_id']])
-        mask_rows.append(True)
     features = torch.stack(columns, dim=1)
     ids = torch.tensor(ids_rows, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1, -1).contiguous()
-    mask = torch.tensor(mask_rows, dtype=torch.bool, device=device).unsqueeze(0).expand(batch_size, -1).contiguous()
+    mask = torch.ones((batch_size, len(meta)), dtype=torch.bool, device=device)
     return features, ids, mask
 
 
@@ -456,7 +424,7 @@ def _cash_state(bundle, state, layout, time_index, batch_size, device):
             torch.zeros((batch_size, 0, id_dim), dtype=torch.long, device=device),
             torch.zeros((batch_size, 0), dtype=torch.bool, device=device),
         )
-    realized_cashflows = (bundle.get('realized_cashflows') or {}) if bundle else {}
+    realized_cashflows = bundle.get('realized_cashflows') or {}
     prev_index = max(time_index - 1, 0)
     columns = []
     ids_rows = []
@@ -487,7 +455,7 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
     time_grid_days = bundle['time_grid_days'].to(device=device, dtype=torch.float32)
     horizon_days = (time_grid_days[-1] - time_grid_days[time_index]).clamp_min(0.0)
     time_to_horizon = (horizon_days / utils.DAYS_IN_YEAR).expand(batch_size).reshape(batch_size, 1)
-    liability_mtm_tensor = bundle.get('liability_mtm') if bundle else None
+    liability_mtm_tensor = bundle.get('liability_mtm')
     if liability_mtm_tensor is None:
         mtm_now = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
         mtm_prev = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
@@ -505,6 +473,7 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
     near_pv = torch.zeros_like(total_pv)
     mid_pv = torch.zeros_like(total_pv)
     far_pv = torch.zeros_like(total_pv)
+    total_oz = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
     for entry in layout['instruments']['meta']:
         name = entry['name']
         price = state['tradable_values'][name].to(device=device, dtype=torch.float32)
@@ -512,6 +481,7 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
         contract_size = float(entry['contract_size'])
         pv = (position * price * contract_size).reshape(-1, 1)
         total_pv = total_pv + pv
+        total_oz = total_oz + (position * contract_size).reshape(-1, 1)
         ttf_days = float((entry['last_trade_date'] - base_date).days) - current_day
         if ttf_days < 60.0:
             near_pv = near_pv + pv
@@ -520,7 +490,22 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
         else:
             far_pv = far_pv + pv
     residual_exposure = total_pv + mtm_now
-    coverage_ratio = -total_pv / mtm_now.abs().clamp_min(1.0)
+    # Delta coverage: fraction of leg notional (in underlying units) covered by the hedge book.
+    # Unitless and bounded around [-1, 0] for short hedges in the regime we care about; 1.0 means
+    # the short book exactly offsets the leg's volume. Previous formulation (-total_pv / |mtm|)
+    # mostly tracked price level since position notional ($M) and swap MTM ($k) are 100x apart.
+    legs_bundle = bundle.get('legs') or {}
+    legs_features = legs_bundle.get('features')
+    leg_feat_names = tuple(legs_bundle.get('feature_names', ()))
+    if legs_features is not None and 'volume' in leg_feat_names:
+        vol_idx = leg_feat_names.index('volume')
+        leg_vol = legs_features[..., vol_idx]
+        while leg_vol.ndim > 1:
+            leg_vol = leg_vol[0]
+        total_leg_volume = float(leg_vol.abs().sum().item())
+    else:
+        total_leg_volume = 0.0
+    coverage_ratio = -total_oz / max(total_leg_volume, 1.0)
 
     def _commodity_scalar(bundle_key, commodity):
         store = bundle.get(bundle_key) or {}

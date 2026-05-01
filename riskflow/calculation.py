@@ -44,7 +44,7 @@ from . import utils, pricing, construct_instrument
 from .hedge_runtime import construct_torchrl_runtime
 from .torchrl_hedge import run_torchrl_execution
 from .hedge_features import (
-    compute_cross_delta, compute_spot_zscore, compute_privileged_factors,
+    compute_cross_delta, compute_spot_zscore, assemble_privileged_factors,
     compute_spot_realized_vol, compute_implied_atm_vol,
 )
 
@@ -1699,7 +1699,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             },
         )
 
-    def _build_torchrl_bundle(self, base_date, business_day, time_grid_days, tradable_blocks, factor_tensor_blocks, hedge_profile_blocks, num_batches, runtime=None):
+    def _build_torchrl_bundle(self, base_date, business_day, time_grid_days, tradable_blocks, factor_tensor_blocks, hedge_profile_blocks, num_batches, runtime=None, privileged_factor_blocks=None):
         def pad_time_axis(tensor, target_steps):
             current_steps = int(tensor.shape[0])
             if current_steps >= target_steps:
@@ -1771,12 +1771,56 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             }
         if runtime is not None:
             self._prepend_history_prefix(bundle, runtime, base_date)
+        # Last time index where any leg still has time_to_payment > 0; steps with
+        # index strictly greater are post-settlement (all legs paid). Used by the
+        # naked-position penalty in the reward path.
+        if bundle.get('legs') is not None and bundle['legs'].get('features') is not None:
+            from .hedge_features import LEG_FEATURE_NAMES
+            ttp_idx = LEG_FEATURE_NAMES.index('time_to_payment')
+            ttp = bundle['legs']['features'][..., ttp_idx]
+            while ttp.ndim > 2:
+                ttp = ttp[:, 0]
+            active = (ttp > 0).any(dim=-1) if ttp.ndim == 2 else (ttp > 0)
+            if bool(active.any()):
+                bundle['last_settlement_index'] = int(active.nonzero(as_tuple=False).max().item())
+        # Naked-penalty normalization scale: total max-notional across hedge instruments at the
+        # first time step. Lets the naked-penalty coef have a unit-free interpretation (fraction
+        # of full hedge book per step) rather than scaling with raw dollar notional in the millions.
+        if runtime is not None:
+            position_limits = runtime.get('accounting', {}).get('position_limits', {})
+            hedge_names = (runtime.get('names') or {}).get('hedges', ())
+            runtime_tradables = runtime.get('tradables') or {}
+            scale = 0.0
+            for hedge_name in hedge_names:
+                lim = position_limits.get(hedge_name) or {}
+                max_pos = max(abs(float(lim.get('min_position', 0))), abs(float(lim.get('max_position', 0))))
+                if max_pos == 0 or hedge_name not in bundle['tradables']:
+                    continue
+                cs = float((runtime_tradables.get(hedge_name) or {}).get('contract_size', 1.0))
+                first_price = float(bundle['tradables'][hedge_name][0, 0].item())
+                scale += max_pos * first_price * cs
+            if scale > 0.0:
+                bundle['naked_scale'] = float(scale)
         price_models = self.config.params.get('Price Models', {})
         bundle['cross_delta'] = compute_cross_delta(bundle)
         bundle['spot_zscore'] = compute_spot_zscore(bundle)
         bundle['spot_realized_vol'] = compute_spot_realized_vol(bundle)
         bundle['implied_atm_vol'] = compute_implied_atm_vol(bundle, price_models)
-        bundle['privileged_factors'] = compute_privileged_factors(bundle, price_models)
+        # Privileged factors come from the live stoch-process objects (each emits its own surface
+        # via privileged_factors()). Per-batch tensors were collected during the simulation loop;
+        # concatenate along batch dim using the same multi-commodity convention as the layout.
+        bundle['privileged_factors'] = assemble_privileged_factors(privileged_factor_blocks or {}, self.stoch_factors)
+        # Match the history-prefix already applied to factors/tradables so per-step indexing at
+        # sim time agrees with `bundle['time_grid_days']`. We do it here (not in
+        # `_prepend_history_prefix`) because privileged factors are assembled after that pass.
+        H = int(runtime.get('history_lookback_business_days', 0)) if runtime else 0
+        if H > 0 and bundle['privileged_factors']:
+            bundle['privileged_factors'] = {
+                name: torch.cat(
+                    [tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous(), tensor], dim=0,
+                )
+                for name, tensor in bundle['privileged_factors'].items()
+            }
         return bundle
 
     @staticmethod
@@ -1932,7 +1976,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         self.calc_stats[execution_label] = time.monotonic()
 
         normalized_runtime = construct_torchrl_runtime(
-            params, price_models=self.config.params.get('Price Models', {}),
+            params, stoch_factors=self.stoch_factors,
         )
 
         # Accumulate one numpy array per stochastic factor across batches
@@ -1949,6 +1993,10 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             'mtm': [],
             'realized_cashflows': defaultdict(list),
         }
+        # Per-batch privileged-factor accumulator. Keyed by (factor_name, factor_attr) where
+        # factor_attr is whatever the process exposes via `privileged_factors()`. Concatenated
+        # along the batch dim after all simulation batches finish.
+        privileged_factor_blocks = defaultdict(list)
         # get the calendar for business day
         bus_day = self.config.holidays.get(
             self.params['Calendar'], {'businessday': pd.offsets.BDay(1)})['businessday']
@@ -1959,7 +2007,15 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 use_antithetic=params.get('Antithetic', 'No') == 'Yes')
 
             for key, proc in self.stoch_factors.items():
-                shared_mem.t_Scenario_Buffer[key] = proc.generate(shared_mem)
+                simulated = proc.generate(shared_mem)
+                shared_mem.t_Scenario_Buffer[key] = simulated
+                # Each process owns its privileged-factor surface; ask it what to expose. Default
+                # implementation returns {} so processes opt in by overriding privileged_factors.
+                priv = proc.privileged_factors(simulated)
+                if priv:
+                    factor_name = key.name[0] if key.name else str(key)
+                    for attr_name, tensor in priv.items():
+                        privileged_factor_blocks[(factor_name, attr_name)].append(tensor.detach().clone())
 
             _ = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
             # clear hedge cashflows so t_Cashflows after the next call holds only liability cashflows
@@ -2019,6 +2075,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             hedge_profile_blocks,
             params['Simulation_Batches'],
             runtime=normalized_runtime,
+            privileged_factor_blocks=privileged_factor_blocks,
         )
         evaluation_summary = None
         optimizer_diagnostics = None

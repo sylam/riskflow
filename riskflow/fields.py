@@ -343,6 +343,8 @@ mapping = {
                 ["Alpha", "Lambda", "sigma"],
             "LogOUSpotModel":
                 ["Kappa", "Theta", "sigma"],
+            "MarkovSwitchingLogOUSpotModel":
+                ["States", "Transition_Matrix", "Initial_State_Probs", "Calibration_DT_Years"],
             "SingleRegimeOU1FactorKalmanModel":
                 ["Kappa", "Theta", "sigma"],
             "PCAInterestRateModel":
@@ -395,7 +397,7 @@ mapping = {
     # list mapping risk factors to allowable stochastic processes
     'Process_factor_map': {
         "Correlation": [],
-        "CommodityPrice": ['LogOUSpotModel'],
+        "CommodityPrice": ['LogOUSpotModel', 'MarkovSwitchingLogOUSpotModel'],
         "CommodityPriceVol": [],
         "ConvenienceYield": [],
         "EquityPriceVol": [],

@@ -719,9 +719,8 @@ class CommodityPrice(EquityPrice):
 class BasisCarry(Factor0D):
     """
     Represents an annualised carry rate for a commodity or asset basis
-    (e.g. roll yield, funding spread).  Used as the input factor for
-    RegimeSwitchingOU2FactorModel.  The fast-carry state x_t is exposed
-    as the spot value; the slow-carry state y_0 is stored as a parameter.
+    (e.g. roll yield, funding spread). The carry state is exposed as the
+    spot value.
     """
     field_desc = ('Energy',
                   ['- **Spot**: Float. Initial annualised carry rate $x_0$.',

@@ -17,7 +17,7 @@ if __name__=='__main__':
                     ".Timestamp": "2026-04-10"
                 },
                 "Simulation_Batches": 4,
-                "Batch_Size": 1024,
+                "Batch_Size": 2048,
                 "Random_Seed": 42,
                 "Currency": "USD",
                 "Calendar": "Chicago",
@@ -139,7 +139,8 @@ if __name__=='__main__':
                         "Object": "TerminalFloorThenSurplusUtility",
                         "Floor_Penalty": 10.0,
                         "Surplus_Reward": 1.0,
-                        "Power": 1.0
+                        "Power": 1.0,
+                        "Naked_Penalty": 5.0
                     },
                     "Liabilities": {
                         "FloatingEnergyDeal": {
@@ -220,30 +221,32 @@ if __name__=='__main__':
                     },
                     "Optimizer": {
                         "Object": "PPO",
-                        "Epochs": 30,
+                        "Epochs": 80,
                         "PPO_Epochs": 4,
                         "Minibatch_Size": 8192,
                         "Gamma": 0.999,
                         "GAE_Lambda": 0.995,
                         "Learning_Rate": 0.0003,
+                        "LR_Schedule": "cosine",
+                        "LR_Min": 1.0e-5,
                         "Clip_Eps": 0.2,
                         "Value_Coef": 0.1,
                         "Entropy_Coef": 0.001,
                         "Max_Grad_Norm": 0.5,
                         "Reward_Scale": 1.0e-6,
-                        "Dense_Tracking_Reward_Scale": 1.0,
+                        "Dense_Tracking_Reward_Scale": 2.0,
                         "Validation_Fraction": 0.25,
                         "Validation_Min_Batch": 512,
                         "Validation_Shards": 4,
                         "Decision_Interval_Curriculum": [
-                            {"Start_Epoch": 1, "End_Epoch": 30, "Interval_Business_Days": 1}
+                            {"Start_Epoch": 1, "End_Epoch": 80, "Interval_Business_Days": 1}
                         ],
                         "Seed": 42
                     }
                 }
             },
             "MergeMarketData": {
-                "MarketDataFile": "/media/vretiel/Shared/Data/crstal/MarketDataRF.json",
+                "MarketDataFile": "./data/MarketDataRF.json",
                 "ExplicitMarketData": {
                     "System Parameters": {
                         "Base_Currency": "USD"

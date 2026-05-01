@@ -206,9 +206,9 @@ class StructuredRebalancePolicy(nn.Module):
             nn.GELU(),
             nn.Linear(self.token_dim, self._max_bins),
         ).to(self.device)
-        # uniform-init logits (zero weights, zero bias). prior init had a +0.5 bias on the no-trade
-        # bin which biased deterministic argmax toward no-trade and trapped weak-gradient runs into
-        # a no-trade attractor at evaluation time even when training rollouts were exploring.
+        # Zero-init final logits so the initial categorical distribution is uniform across bins.
+        # Prior +0.5 bias on no-trade caused argmax to lock at no-trade for weak-gradient runs
+        # even when stochastic training looked fine.
         with torch.no_grad():
             self.policy_head[-1].weight.zero_()
             self.policy_head[-1].bias.zero_()
@@ -263,6 +263,25 @@ class StructuredRebalancePolicy(nn.Module):
             torch.tensor(max_pos, dtype=torch.int64, device=self.device).reshape(1, -1),
             persistent=False,
         )
+        # Structural invariant: the no-trade bin (delta=0) must be representable AND must keep the
+        # position inside [min_position, max_position]. The env enforces position-in-bounds via
+        # `_enforce_position_limits`, so delta=0 always preserves the invariant — i.e. the no-trade
+        # bin is always feasible. Without this, a fully-masked logit row produces NaN through
+        # log_softmax (not -inf) and silently corrupts the PPO loss.
+        for i, name in enumerate(instrument_order):
+            lo = int(action_space.min_trade_delta[i])
+            hi = int(action_space.max_trade_delta[i])
+            if not (lo <= 0 <= hi):
+                raise ValueError(
+                    f"Action_Space for instrument {name!r} must include the no-trade delta 0; "
+                    f"got Min_Trade_Delta={lo}, Max_Trade_Delta={hi}. Without this the policy can "
+                    "encounter fully-masked logit rows (no feasible bin), producing NaN in log_softmax."
+                )
+            if min_pos[i] > max_pos[i]:
+                raise ValueError(
+                    f"Position_Limits for instrument {name!r} are empty: "
+                    f"Min_Position={min_pos[i]} > Max_Position={max_pos[i]}."
+                )
 
     def _entity_state_to_device(self, entity_state):
         return entity_state.to(self.device)
@@ -340,8 +359,10 @@ class StructuredRebalancePolicy(nn.Module):
         if deterministic:
             action_bins = log_probs_per_instr.argmax(dim=-1)
         else:
-            probs = log_probs_per_instr.exp()
-            action_bins = torch.distributions.Categorical(probs=probs).sample()
+            # logits-based Categorical avoids re-softmax inside the constructor and is more
+            # numerically robust than passing exp'd probs (which re-renormalizes and is more
+            # NaN-fragile under masked rows).
+            action_bins = torch.distributions.Categorical(logits=logits).sample()
         action_bin_log_probs = log_probs_per_instr.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
         log_prob = action_bin_log_probs.sum(-1)
         value = self._value(ctx, privileged_state)
