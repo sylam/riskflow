@@ -26,7 +26,7 @@ work but have not been tested.
 
 - This is the computational library that evaluates tensors either on CPU or GPU.
 
-[pyparsing](http://pyparsing.wikispaces.com)
+[pyparsing](https://github.com/pyparsing/pyparsing)
 
 - Required for simple parsing of time grids.
 
@@ -38,13 +38,13 @@ work but have not been tested.
 
 [Matplotlib](https://matplotlib.org/)>=3.0.0
 
-- Needed for generating plots of risk factors and simualted paths
+- Needed for generating plots of risk factors and simulated paths
 
 [mkdocs](http://www.mkdocs.org/)>=0.16
 
 - Needed for building this documentation.
 - Additional documentation dependencies are 
-  - Math formatting is done via [python-markdown-math](https://github.com/mitya57/python-markdown-math/). 
+  - Math formatting is done via [pymdown-extensions](https://facelessuser.github.io/pymdown-extensions/) (specifically the `pymdownx.arithmatex` extension).
   - Theming is done via [mkdocs-material](https://squidfunk.github.io/mkdocs-material/)
 
 [jupyter](https://jupyter.org/)

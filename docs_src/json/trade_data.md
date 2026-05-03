@@ -9,7 +9,7 @@ an uncollateralized netting set.
   "Deals": {
     "Children": [
       {
-        "instrument": {
+        "Instrument": {
           ".Deal": {
             "Object": "NettingCollateralSet",
             "Reference": "Test",
@@ -20,7 +20,7 @@ an uncollateralized netting set.
         },
         "Children": [
           {
-            "instrument": {
+            "Instrument": {
               ".Deal": {
                 "Object": "FXNonDeliverableForward",
                 "Reference": "341",
@@ -29,7 +29,7 @@ an uncollateralized netting set.
                 "Sell_Currency": "USD",
                 "Sell_Amount": 1000,
                 "Settlement_Date": {
-                  ".Timestamp": "2017-08-31"
+                  ".Timestamp": "2024-08-31"
                 },
                 "Settlement_Currency": "ZAR",
                 "Buy_Amount": 14000,

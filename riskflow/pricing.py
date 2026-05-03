@@ -31,6 +31,42 @@ OPTION_PUT = -1.0
 OPTION_CALL = 1.0
 
 
+def extract_spot_deltas(value_tensor, scenario_buffer):
+    """For each AAD-leaf factor in `scenario_buffer`, compute per-(t, b) spot delta of
+    `value_tensor`. Returns {factor_name: (T, B) tensor, detached}.
+
+    Works for any (T, B) value tensor that's part of the AAD graph — liability MtM,
+    individual tradable values, or any other simulator output. Caller should invoke
+    before any `.detach()` upstream of the value.
+    """
+    leaves = {
+        key: tensor for key, tensor in scenario_buffer.items()
+        if tensor.requires_grad and tensor.is_leaf
+    }
+    if not leaves:
+        return {}
+
+    T_, B_ = value_tensor.shape
+    out = {}
+
+    for key, leaf in leaves.items():
+        delta = torch.zeros_like(value_tensor)
+        for t in range(T_):
+            grads = torch.autograd.grad(
+                value_tensor[t].sum(), leaf,
+                retain_graph=True, allow_unused=True,
+            )
+            g = grads[0]
+            if g is not None:
+                # g has shape (T_scen, B). For per-(t,b) diagonal, take row t.
+                # If the scenario grid != mtm grid, you'd index via Time_dep mapping;
+                # for the common case where they match, plain row indexing works.
+                delta[t] = g[t]
+        out[utils.check_tuple_name(key)] = delta.detach()
+
+    return out
+
+
 def cash_settle(shared, currency, time_index, value):
     # need to check if the time_index
     if shared.t_Cashflows is not None and time_index in shared.t_Cashflows.get(currency, []):

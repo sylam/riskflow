@@ -62,10 +62,18 @@ def _slice_bundle_episodes(bundle, episode_indices):
         store = bundle.get(key)
         if store:
             sliced[key] = {n: _slice_episode_tensor(t, episode_indices, batch_size) for n, t in store.items()}
-    if "last_settlement_index" in bundle:
-        sliced["last_settlement_index"] = bundle["last_settlement_index"]
-    if "naked_scale" in bundle:
-        sliced["naked_scale"] = bundle["naked_scale"]
+    # hedge_ratios is a 2-deep dict: {tradable: {factor: (T, B)}} — slice the inner tensors only.
+    if bundle.get("hedge_ratios"):
+        sliced["hedge_ratios"] = {
+            tradable: {
+                factor: _slice_episode_tensor(t, episode_indices, batch_size)
+                for factor, t in by_factor.items()
+            }
+            for tradable, by_factor in bundle["hedge_ratios"].items()
+        }
+    for scalar_key in ("last_settlement_index", "naked_scale", "time_grid_days_cpu", "total_leg_volume"):
+        if scalar_key in bundle:
+            sliced[scalar_key] = bundle[scalar_key]
     sliced["meta"]["validation_episode_count"] = int(episode_indices.numel())
     return sliced
 
@@ -92,10 +100,6 @@ def _runtime_names(runtime, key):
 
 def _runtime_tradable(runtime, name):
     return dict(runtime.get("tradables", {}).get(str(name), {}))
-
-
-def _clone_tensor_dict(values):
-    return {str(n): t.clone() for n, t in values.items()}
 
 
 def _current_liability_mtm(bundle, time_index):
@@ -272,31 +276,42 @@ def _tracking_error_value(state, runtime):
 
 
 def _dense_tracking_reward(prev_state, next_state, runtime):
-    """Per-step ASYMMETRIC shaping in dollars × floor_penalty: rewards reducing the magnitude of
-    the DOWNSIDE part of the tracking error (max(-err, 0) — err < 0 in our convention is the
-    side the terminal asymmetric utility penalizes), silent on the upside.
+    """Per-step shaping reward on the downside part of the tracking error. Two modes:
 
-    The previous symmetric `|prev| - |next|` pushed for tracking_error → 0 at every step, which
-    directly fights the asymmetric terminal utility (where net_pnl > 0 is rewarded at sr while
-    net_pnl < 0 is penalized at fp >> sr). The optimum of (symmetric_dense + asymmetric_terminal)
-    becomes essentially a delta-zero hedger with a small downside tilt — exactly the asymmetry
-    the project is supposed to learn. Asymmetric dense aligns the per-step gradient with terminal.
+    `Dense_Reward_Mode = "asymmetric"` (default, current behavior):
+        shaping_t = rs · fp · (max(−err_t, 0) − max(−err_{t+1}, 0))
+        Telescopes to rs·fp·(|downside_0| − |downside_T|) ≈ −rs·fp·|downside_T| for typical
+        deals where the initial err is non-negative. Combined with the terminal asymmetric
+        utility (−fp·|downside_T| on losses), the EFFECTIVE floor penalty becomes (1 + rs)·fp
+        while the upside coefficient sr is unchanged. With rs=2, fp=10, sr=1 the agent is
+        optimized as if effective fp=30 vs sr=1 — a real asymmetry shift, not just a gradient
+        density change. Use rs=1 for terminal-parity, rs=0 to disable.
 
-    floor_penalty is baked into the per-step magnitude so dense and terminal speak the same units
-    on the loss branch; `Dense_Tracking_Reward_Scale` (rs) is now a balance knob — rs=1 puts dense
-    and terminal in the same ballpark per dollar of downside movement; rs=0 disables.
-
-    Telescopes to fp × (|initial_downside| − |final_downside|): for a typical initial_err > 0
-    (initial liability_mtm > 0 at deal start), |initial_downside| = 0, so dense_total reduces
-    to -fp × |final_downside| — a free per-step gradient on top of terminal's same value."""
+    `Dense_Reward_Mode = "potential_based"` (Ng et al. 1999 PBRS):
+        Φ(s) = −fp · max(−err(s), 0); shaping_t = γ·Φ(s_{t+1}) − Φ(s_t).
+        Provably policy-invariant — the optimal policy under (PBRS + terminal) equals the
+        optimal under terminal alone; only the gradient signal density changes. Telescopes to
+        γ^T·Φ(s_T) − Φ(s_0). Use this mode when you want densified credit assignment WITHOUT
+        shifting the asymmetry of the terminal utility. `Dense_Tracking_Reward_Scale` is
+        ignored in this mode (scaling Φ would break the invariance theorem)."""
     settings = dict(runtime.get("optimizer") or {})
-    rs = float(settings.get("dense_tracking_reward_scale", 0.0))
     fp = float((runtime.get("objective") or {}).get("floor_penalty", 1.0))
     prev_err = _tracking_error_value(prev_state, runtime)
     next_err = _tracking_error_value(next_state, runtime)
-    # Magnitude of the negative part of err (the downside the asymmetric utility penalizes).
-    shaping = torch.clamp(-prev_err, min=0.0) - torch.clamp(-next_err, min=0.0)
     rc = float(settings.get("dense_tracking_reward_clip", 0.0))
+    mode = str(settings.get("dense_reward_mode", "asymmetric")).lower()
+    if mode == "potential_based":
+        gamma = float(settings.get("gamma", 1.0))
+        prev_pot = -fp * torch.clamp(-prev_err, min=0.0)
+        next_pot = -fp * torch.clamp(-next_err, min=0.0)
+        shaping = gamma * next_pot - prev_pot
+        if rc > 0.0:
+            shaping = torch.clamp(shaping, min=-rc, max=rc)
+        return shaping
+    # Asymmetric mode preserves original clip-before-scale semantics: rc is in dollar units of
+    # downside change, then `rs · fp` scales the clipped shaping into reward-pre-Reward_Scale.
+    rs = float(settings.get("dense_tracking_reward_scale", 0.0))
+    shaping = torch.clamp(-prev_err, min=0.0) - torch.clamp(-next_err, min=0.0)
     if rc > 0.0:
         shaping = torch.clamp(shaping, min=-rc, max=rc)
     return rs * fp * shaping
@@ -433,6 +448,18 @@ def _step_time_held(time_held, next_positions):
     return out
 
 
+def _step_cumulative_pnl(cumulative_pnl, variation_margin, next_positions):
+    """Per-trade running P&L: accumulates VM while a position is open, resets to 0 when flat.
+    Mirrors the lifetime-of-current-trade semantics of `_step_time_held` so the policy sees
+    consistent features describing the *current* open position rather than mixed
+    since-inception (cum_pnl) / per-trade (time_held) scopes."""
+    out = {}
+    for name, prev in cumulative_pnl.items():
+        active = next_positions[name].abs() > 0
+        out[name] = torch.where(active, prev + variation_margin[name], torch.zeros_like(prev))
+    return out
+
+
 def _zero_futures_flows(state, runtime):
     batch_size = int(state["done"].shape[0])
     device = state["done"].device
@@ -530,7 +557,9 @@ def cash_account_step(state, action, bundle, runtime):
     current = int(state["time_index"])
     last = _last_time_index(bundle)
     next_idx = min(current + 1, last)
-    next_positions = _clone_tensor_dict(state["positions"])
+    # Shallow dict copy: we'll replace tensors in-slot via `next_positions[n] = ...`. Cloning the
+    # tensors themselves is wasted since each is immediately overwritten with a new tensor.
+    next_positions = dict(state["positions"])
     growth = _daily_growth_factors(bundle, runtime, current, next_idx)
     next_cash = _compound_accounts(state["cash_accounts"], growth)
     deltas = _enforce_position_limits(state["positions"], _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device), runtime)
@@ -544,21 +573,26 @@ def cash_account_step(state, action, bundle, runtime):
         next_positions[n] = (next_positions[n] + delta).round()
     if _should_terminal_flatten(runtime, current, last):
         _flatten_cash_inventory(next_positions, next_cash, _current_tradable_values(bundle, runtime, last), runtime)
-    # cash-account mode: no daily VM. cumulative_pnl unchanged here.
-    next_cumulative_pnl = _clone_tensor_dict(state["cumulative_pnl"])
+    # cash-account mode tracks no daily VM — cumulative_pnl can only be added to in futures
+    # mode. Still reset at flat for the same per-trade-lifetime semantics as time_held.
+    zero_vm = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
+    next_cumulative_pnl = _step_cumulative_pnl(state["cumulative_pnl"], zero_vm, next_positions)
     next_time_held = _step_time_held(state["time_held"], next_positions)
+    # margin_accounts / settlement_prices are not modified in cash mode — pass through references.
+    # realized_pnl / variation_margin are replaced by `_zero_futures_flows` immediately below, so
+    # any clone here would be discarded.
     next_state = {
         "done": state["done"],
         "positions": next_positions,
         "cash_accounts": next_cash,
-        "margin_accounts": _clone_tensor_dict(state["margin_accounts"]),
-        "realized_pnl": _clone_tensor_dict(state["realized_pnl"]),
-        "variation_margin": _clone_tensor_dict(state["variation_margin"]),
+        "margin_accounts": state["margin_accounts"],
+        "realized_pnl": state["realized_pnl"],
+        "variation_margin": state["variation_margin"],
         "cumulative_pnl": next_cumulative_pnl,
         "time_held": next_time_held,
-        "cumulative_liability_value": state["cumulative_liability_value"].clone(),
-        "settlement_prices": _clone_tensor_dict(state["settlement_prices"]),
-        "initial_portfolio_value": state["initial_portfolio_value"].clone(),
+        "cumulative_liability_value": state["cumulative_liability_value"],
+        "settlement_prices": state["settlement_prices"],
+        "initial_portfolio_value": state["initial_portfolio_value"],
     }
     _zero_futures_flows(next_state, runtime)
     next_state["done"] = torch.full_like(state["done"], next_idx >= last, dtype=torch.bool)
@@ -576,11 +610,15 @@ def futures_account_step(state, action, bundle, runtime):
     current = int(state["time_index"])
     last = _last_time_index(bundle)
     settlement_idx = min(current + 1, last)
-    next_positions = _clone_tensor_dict(state["positions"])
+    # Shallow dict copies — we replace tensors in-slot via `next_positions[n] = ...` and
+    # `next_settlement[n] = ...`. The original tensors are never mutated in place anywhere in
+    # this codebase, so reusing references is safe; cloning every step would just burn memory
+    # bandwidth.
+    next_positions = dict(state["positions"])
     growth = _daily_growth_factors(bundle, runtime, current, settlement_idx)
     next_cash = _compound_accounts(state["cash_accounts"], growth)
     next_margin = _compound_accounts(state["margin_accounts"], growth)
-    next_settlement = _clone_tensor_dict(state["settlement_prices"])
+    next_settlement = dict(state["settlement_prices"])
     realized_pnl = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
     variation_margin = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
     deltas = _enforce_position_limits(state["positions"], _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device), runtime)
@@ -615,7 +653,7 @@ def futures_account_step(state, action, bundle, runtime):
         _apply_account_flow(next_margin, account, -cost)
     if _should_terminal_flatten(runtime, current, last):
         _flatten_futures_inventory(next_positions, next_margin, next_settlement, next_values, runtime)
-    next_cumulative_pnl = {n: state["cumulative_pnl"][n] + variation_margin[n] for n in state["cumulative_pnl"]}
+    next_cumulative_pnl = _step_cumulative_pnl(state["cumulative_pnl"], variation_margin, next_positions)
     next_time_held = _step_time_held(state["time_held"], next_positions)
     next_state = {
         "done": torch.full_like(state["done"], settlement_idx >= last, dtype=torch.bool),
@@ -627,8 +665,10 @@ def futures_account_step(state, action, bundle, runtime):
         "variation_margin": variation_margin,
         "cumulative_pnl": next_cumulative_pnl,
         "time_held": next_time_held,
-        "cumulative_liability_value": state["cumulative_liability_value"].clone(),
-        "initial_portfolio_value": state["initial_portfolio_value"].clone(),
+        # cumulative_liability_value gets `= old + realized_cashflow_value` on the line below —
+        # new tensor, no in-place. initial_portfolio_value is read-only after build_shared_state.
+        "cumulative_liability_value": state["cumulative_liability_value"],
+        "initial_portfolio_value": state["initial_portfolio_value"],
     }
     refreshed = _refresh_state_views(next_state, bundle, runtime, settlement_idx)
     refreshed["cumulative_liability_value"] = refreshed["cumulative_liability_value"] + refreshed["realized_cashflow_value"]
@@ -780,6 +820,16 @@ def _optimizer_settings(runtime):
         "validation_fraction": float(p.get("validation_fraction", 0.25)),
         "validation_min_batch": int(p.get("validation_min_batch", 256)),
         "decision_interval_curriculum": tuple(dict(s) for s in p.get("decision_interval_curriculum", ())),
+        "anchor_beta": float(p.get("anchor_beta", 0.0)),
+        "anchor_beta_floor": float(p.get("anchor_beta_floor", 0.0)),
+        "anchor_anneal_epochs": int(p.get("anchor_anneal_epochs", 0)),
+        "anchor_bin_sharpness": float(p.get("anchor_bin_sharpness", 2.0)),
+        "anchor_target": str(p.get("anchor_target", "delta1_jul")).lower(),
+        "cvar_alpha": float(p.get("cvar_alpha", 0.0)),
+        "cvar_lambda": float(p.get("cvar_lambda", 0.0)),
+        "value_loss_asym_weight": float(p.get("value_loss_asym_weight", 1.0)),
+        "entropy_floor_h_min": float(p.get("entropy_floor_h_min", 0.0)),
+        "entropy_floor_coef": float(p.get("entropy_floor_coef", 0.0)),
         "seed": p.get("seed"),
     }
 
@@ -908,11 +958,14 @@ def _collect_textbook_rollout(policy, bundle, runtime, decision_indices, *, rewa
     batch_size = int(next(iter(state["positions"].values())).shape[0])
     device = policy.device
     instrument_order = list(policy.action_space.instrument_order)
-    min_trade = policy._min_trade_delta.reshape(-1).to(device=device, dtype=torch.float32)
     n_bins = policy._action_bins
     targets_per_step = _textbook_targets_per_step(bundle, runtime)
     if targets_per_step is None:
         return None
+    # Host-side caches: avoid a per-step-per-instrument .item() sync (was ~3 syncs per decision).
+    target_table = {name: targets_per_step[name].tolist() for name in instrument_order}
+    min_trade_floats = policy._min_trade_delta.reshape(-1).to(dtype=torch.float32).tolist()
+    max_trade_floats = [min_trade_floats[i] + n_bins[i] - 1 for i in range(len(instrument_order))]
     entity_snapshots = []
     privileged_snapshots = []
     position_snapshots = []
@@ -927,11 +980,11 @@ def _collect_textbook_rollout(policy, bundle, runtime, decision_indices, *, rewa
             positions_t = _positions_tensor(state, instrument_order, device=device)
             trade_per_instr = {}
             for i, name in enumerate(instrument_order):
-                target_scalar = float(targets_per_step[name][t].item())
+                target_scalar = target_table[name][t]
                 cur_pos = state["positions"][name].to(device=device, dtype=torch.float32)
-                min_t = float(min_trade[i].item())
-                max_t = min_t + n_bins[i] - 1
-                delta = (torch.full_like(cur_pos, target_scalar) - cur_pos).round().clamp(min_t, max_t)
+                delta = (torch.full_like(cur_pos, target_scalar) - cur_pos).round().clamp(
+                    min_trade_floats[i], max_trade_floats[i],
+                )
                 trade_per_instr[name] = delta
             step_action = _realized_structured_action(
                 {"trade_deltas": trade_per_instr}, state["positions"], runtime,
@@ -995,16 +1048,30 @@ def _bc_update(policy, optimizer, rollout, settings):
     return {"bc_loss": float((loss_sum / max(minibatch_count, 1)).item())}
 
 
-def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, deterministic=False, reward_scale=1.0):
+def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, deterministic=False, reward_scale=1.0, anchor_targets=False):
     state = build_shared_state(bundle, runtime)
     decision_set = set(int(i) for i in decision_indices)
     batch_size = int(next(iter(state["positions"].values())).shape[0])
     device = policy.device
     instrument_order = policy.action_space.instrument_order
+    debug_strict_bins = bool((runtime.get("optimizer") or {}).get("debug_strict_bins", False))
+    # Anchor targets (textbook delta1) — recorded only when KL-anchor is active. Stored as the
+    # *unclipped* target trade delta in real bin-space (target_position - current_position), so
+    # the KL prior can build a Gaussian centered at the true textbook target and renormalize within
+    # the feasible bin range, putting extra mass on the boundary bin when the target is out of range
+    # rather than artificially flattening near the boundary.
+    anchor_target_table = None
+    if anchor_targets:
+        targets_per_step = _textbook_targets_per_step(bundle, runtime)
+        if targets_per_step is not None:
+            anchor_target_table = {name: targets_per_step[name].tolist() for name in instrument_order}
     entity_snapshots = []
     privileged_snapshots = []
     position_snapshots = []
     action_bins_list = []
+    target_deltas_list = []
+    entropy_list = []
+    n_feasible_list = []
     log_probs = []
     values = []
     rewards = []
@@ -1038,6 +1105,16 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
                 privileged_state=priv, positions=positions_t,
             )
             step_action = _realized_structured_action(policy.map_actions(output), state["positions"], runtime, batch_size=batch_size, device=device)
+            # Optional invariant check: the sampled bins (under the policy's int64-cast feasibility
+            # mask) must equal the env's post-clip bins (under float-clamped position limits). True
+            # in our setup because positions are always integer-valued; would silently corrupt the
+            # PPO ratio if ever decoupled (e.g. fractional positions, lot-size != 1, mask drift).
+            # Off by default — adds a CPU sync per decision step.
+            if debug_strict_bins and not torch.equal(output["action_bins"], step_action["action_bins"]):
+                raise AssertionError(
+                    "PPO ratio decoupled: policy-sampled bins != env-clipped bins. "
+                    "Check fractional positions, lot-size, or position-limit mask divergence."
+                )
             entity_snapshots.append(_entity_state_snapshot(state["entity_state"]))
             privileged_snapshots.append({k: v.detach().clone() for k, v in priv.items()})
             position_snapshots.append(positions_t.detach().clone())
@@ -1046,8 +1123,31 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
             # uses float clamping vs the policy mask's int64 cast — they can drift by 1 bin under
             # fractional positions, decoupling action_bins from log_prob and biasing the PPO ratio.
             action_bins_list.append(output["action_bins"].detach())
+            if anchor_target_table is not None:
+                # Unclipped target_delta[b, i] = target_pos[t] - cur_pos[b]. May exceed the action
+                # range — Gaussian prior in PPO update will renormalize within feasible bins, which
+                # correctly puts extra mass on the boundary bin when target is out-of-range.
+                target_deltas_step = torch.empty((batch_size, len(instrument_order)), dtype=torch.float32, device=device)
+                for i, name in enumerate(instrument_order):
+                    target_scalar = anchor_target_table[name][t]
+                    cur_pos = state["positions"][name].to(device=device, dtype=torch.float32)
+                    target_deltas_step[:, i] = torch.full_like(cur_pos, target_scalar) - cur_pos
+                target_deltas_list.append(target_deltas_step)
             log_probs.append(output["log_prob"].detach())
             values.append(output["value"].detach())
+            # Diagnostic-only: per-decision per-path entropy (summed over instruments) and the
+            # count of feasible bins. Cheap (D × B floats per rollout) and lets post-hoc analysis
+            # bin paths by win/lose and look for entropy-collapse / mask-pinning at specific time
+            # indices. Computed from the same logits the policy sampled from, so they reflect
+            # the actual decision distribution post-feasibility-mask.
+            with torch.no_grad():
+                logits_det = output["logits"].detach()
+                log_probs_per = torch.log_softmax(logits_det, dim=-1)
+                probs_per = log_probs_per.exp()
+                safe_log = log_probs_per.masked_fill(log_probs_per == float('-inf'), 0.0)
+                entropy_per_instr = -(probs_per * safe_log).sum(dim=-1)
+                entropy_list.append(entropy_per_instr.sum(dim=-1))
+                n_feasible_list.append(torch.isfinite(logits_det).sum(dim=-1).sum(dim=-1).to(dtype=torch.int32))
             pending_reward = torch.zeros(batch_size, dtype=torch.float32, device=device)
             pending_index = len(entity_snapshots) - 1
         next_state = step_runtime_state(state, step_action, bundle, runtime)
@@ -1072,6 +1172,9 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
         "privileged_states": stacked_privileged,
         "positions": stacked_positions,
         "action_bins": torch.stack(action_bins_list, dim=0),
+        "target_deltas": torch.stack(target_deltas_list, dim=0) if target_deltas_list else None,
+        "entropy_per_decision": torch.stack(entropy_list, dim=0),  # (D, B), sum over instruments
+        "n_feasible_per_decision": torch.stack(n_feasible_list, dim=0),  # (D, B), sum over instruments
         "log_probs": torch.stack(log_probs, dim=0),
         "values": torch.stack(values, dim=0),
         "rewards": torch.stack(rewards, dim=0),
@@ -1133,7 +1236,7 @@ def _compute_gae(rewards, values, dones, gamma, lam, *, last_value=None, last_do
     return advantages, returns
 
 
-def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1):
+def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1, epoch=0):
     # Gamma and gae_lambda are interpreted per-business-day so a curriculum that ramps the
     # decision interval (10 → 5 → 2 → 1) doesn't change the implicit per-day discount and shift
     # value-target / advantage scales at every stage boundary. gamma_stage = gamma_per_day ** N
@@ -1149,12 +1252,47 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1):
     flat_old_values = rollout["values"].reshape(D * B)
     flat_advantages = advantages.reshape(D * B)
     flat_returns = returns.reshape(D * B)
-    flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
+    # CVaR-α weighting: rare crash paths are too dilute to drive the policy gradient under PPO's
+    # mean-aggregating loss. Identify the bottom α-fraction by path-realized return, multiply
+    # those paths' advantages by (1 + λ). λ=0 ⇒ no-op; λ>0 amplifies tail gradient. Path-level
+    # (not per-decision): all decisions on a tail path carry the same upweight, propagating the
+    # crash signal back to early decisions. When CVaR is active we skip advantage normalization —
+    # the standardization was a variance-reduction trick that partly undoes intentional re-weighting,
+    # and CVaR runs may need lr/clip_eps re-tuning to compensate for the new advantage scale.
+    cvar_alpha = float(settings.get("cvar_alpha", 0.0))
+    cvar_lambda = float(settings.get("cvar_lambda", 0.0))
+    cvar_active = cvar_alpha > 0.0 and cvar_lambda > 0.0
+    if cvar_active:
+        path_realized = rollout["rewards"].sum(dim=0)
+        tail_threshold = torch.quantile(path_realized.double(), cvar_alpha).to(dtype=path_realized.dtype)
+        tail_mask = (path_realized <= tail_threshold).to(dtype=torch.float32)
+        path_weight = 1.0 + cvar_lambda * tail_mask  # (B,)
+        flat_weight = path_weight.unsqueeze(0).expand(D, -1).reshape(D * B)
+        flat_advantages = flat_advantages * flat_weight
+    else:
+        flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
     flat_privileged = {}
     for name, t in (rollout.get("privileged_states") or {}).items():
         flat_privileged[name] = t.reshape(D * B, -1)
     rollout_positions = rollout.get("positions")
     flat_positions = rollout_positions.reshape(D * B, -1) if rollout_positions is not None else None
+    # KL-anchor: textbook prior on the action distribution. β anneals linearly from anchor_beta
+    # to anchor_beta_floor over anchor_anneal_epochs (anneal-to-zero ⇒ warm-start interpretation;
+    # nonzero floor ⇒ persistent prior). Target is a Gaussian over bin space centered on the
+    # unclipped textbook target delta, masked to feasible bins, then renormalized — preserves
+    # ordinal action structure (close-to-textbook bins > far-from-textbook bins) and naturally
+    # puts extra mass on the boundary bin when the textbook target is outside the action range.
+    anchor_beta_init = float(settings.get("anchor_beta", 0.0))
+    anchor_beta_floor = float(settings.get("anchor_beta_floor", 0.0))
+    anneal_epochs = int(settings.get("anchor_anneal_epochs", 0))
+    if anchor_beta_init > 0.0 and anneal_epochs > 0:
+        frac = max(0.0, 1.0 - epoch / anneal_epochs)
+        anchor_beta = anchor_beta_floor + (anchor_beta_init - anchor_beta_floor) * frac
+    else:
+        anchor_beta = anchor_beta_init
+    anchor_sharpness = float(settings.get("anchor_bin_sharpness", 2.0))
+    target_deltas = rollout.get("target_deltas")
+    flat_target_deltas = target_deltas.reshape(D * B, -1) if (target_deltas is not None and anchor_beta > 0.0) else None
     N = D * B
     mb = max(int(settings["minibatch_size"]), 1)
     # Accumulate per-minibatch losses as device-side tensors and sync once at the end of the
@@ -1163,6 +1301,7 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1):
     policy_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     value_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     entropy_sum = torch.zeros((), dtype=torch.float32, device=device)
+    anchor_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     minibatch_count = 0
     clip_eps = float(settings["clip_eps"])
     for _ in range(int(settings["ppo_epochs"])):
@@ -1178,13 +1317,36 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1):
             mb_privileged = {name: t[idx] for name, t in flat_privileged.items()} if flat_privileged else None
             mb_positions = flat_positions[idx] if flat_positions is not None else None
             new_lp, entropy, value, logits = policy.evaluate_action(mb_state, mb_actions, privileged_state=mb_privileged, positions=mb_positions)
+            # Per-element entropy floor: hinge loss penalizing any minibatch element whose entropy
+            # falls below H_min. Standard `-coef × entropy.mean()` regularization can leave a
+            # low-entropy *minimum* coexisting with a healthy mean — the failing-paths signature
+            # we observe in Diagnostic F. The floor activates exactly when the bug manifests
+            # (entropy < H_min on some path) and is silent when the policy is healthy.
+            entropy_floor_h_min = float(settings.get("entropy_floor_h_min", 0.0))
+            entropy_floor_coef = float(settings.get("entropy_floor_coef", 0.0))
+            if entropy_floor_coef > 0.0:
+                floor_violation = (entropy_floor_h_min - entropy).clamp_min(0.0)
+                entropy_floor_loss = floor_violation.mean()
+            else:
+                entropy_floor_loss = torch.zeros((), dtype=torch.float32, device=device)
             ratio = (new_lp - mb_old_lp).exp()
             clipped = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps)
             policy_loss = -torch.min(ratio * mb_adv, clipped * mb_adv).mean()
             v_clipped = mb_old_v + (value - mb_old_v).clamp(-clip_eps, clip_eps)
-            v_loss_unclipped = (value - mb_ret).pow(2)
-            v_loss_clipped = (v_clipped - mb_ret).pow(2)
-            value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+            # Optional asymmetric weighting: penalize over-prediction (V > G, i.e. V optimistic
+            # about a realized outcome) more than under-prediction. Counters the median-bias of
+            # MSE on heavy-tailed-downside distributions. asym_weight=1.0 ⇒ symmetric MSE.
+            sq_unclipped = (value - mb_ret).pow(2)
+            sq_clipped = (v_clipped - mb_ret).pow(2)
+            asym_weight = float(settings.get("value_loss_asym_weight", 1.0))
+            if asym_weight != 1.0:
+                over_unclipped = (value > mb_ret).to(dtype=sq_unclipped.dtype)
+                over_clipped = (v_clipped > mb_ret).to(dtype=sq_clipped.dtype)
+                w_unclipped = 1.0 + (asym_weight - 1.0) * over_unclipped
+                w_clipped = 1.0 + (asym_weight - 1.0) * over_clipped
+                sq_unclipped = w_unclipped * sq_unclipped
+                sq_clipped = w_clipped * sq_clipped
+            value_loss = 0.5 * torch.max(sq_unclipped, sq_clipped).mean()
             entropy_bonus = entropy.mean()
             # Action-sparsity penalty: expected |trade_delta| under the current policy, normalized
             # by per-instrument action range. Discourages over-trading when the gradient signal
@@ -1196,11 +1358,43 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1):
             probs = torch.softmax(logits, dim=-1)
             expected_abs_delta = (probs * trade_per_bin.abs()).sum(dim=-1)
             action_sparsity_loss = (expected_abs_delta / policy._action_feature_scale).mean()
+            # KL-anchor: forward KL(π_textbook || π_current) — pulls policy mass toward textbook
+            # modes (right form when we want π to *cover* the prior rather than match marginals).
+            # π_textbook is a Gaussian over bin-deltas centered on the unclipped textbook target,
+            # masked to bins the policy considers feasible, then renormalized.
+            anchor_loss = torch.zeros((), dtype=torch.float32, device=device)
+            if flat_target_deltas is not None:
+                mb_target_deltas = flat_target_deltas[idx]  # (mb, n_inst)
+                # Clip textbook target to feasible bin-delta range before centering the Gaussian.
+                # When target is far out-of-range (e.g., target=-50, action range ±10), the
+                # unclipped Gaussian underflows to zero across all feasible bins in float32, and
+                # the prior provides no signal. Clipping puts the Gaussian center on the boundary
+                # bin, which is the right behaviour: "as far in the textbook direction as feasible".
+                min_trade_per_inst = policy._min_trade_delta.to(dtype=torch.float32)  # (1, n_inst)
+                max_trade_per_inst = min_trade_per_inst + torch.tensor(policy._action_bins, device=device, dtype=torch.float32).unsqueeze(0) - 1.0
+                mb_target_clipped = mb_target_deltas.clamp(min_trade_per_inst, max_trade_per_inst)
+                sq_dev = (trade_per_bin - mb_target_clipped.unsqueeze(-1)).pow(2)
+                target_unnorm = torch.exp(-anchor_sharpness * sq_dev)
+                # Feasibility mask from the policy's logits (already includes static + position
+                # mask). Bins whose logits are -inf get probability zero in the prior too.
+                feasible = torch.isfinite(logits)
+                target_unnorm = target_unnorm * feasible.to(target_unnorm.dtype)
+                target_dist = target_unnorm / target_unnorm.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                log_probs_dist = torch.log_softmax(logits, dim=-1)
+                log_target = torch.log(target_dist.clamp_min(1e-12))
+                # Infeasible bins have logits=-inf → log_probs_dist=-inf and target_dist=0.
+                # 0 × -inf = NaN; replace -inf with 0 (safe because target_dist=0 there too,
+                # so the contribution is identically zero).
+                log_probs_safe = torch.where(torch.isfinite(log_probs_dist), log_probs_dist, torch.zeros_like(log_probs_dist))
+                kl_per = (target_dist * (log_target - log_probs_safe)).sum(dim=-1)
+                anchor_loss = kl_per.mean()
             loss = (
                 policy_loss
                 + settings["value_coef"] * value_loss
                 - settings["entropy_coef"] * entropy_bonus
                 + settings["action_sparsity_coef"] * action_sparsity_loss
+                + anchor_beta * anchor_loss
+                + entropy_floor_coef * entropy_floor_loss
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -1209,12 +1403,15 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1):
             policy_loss_sum = policy_loss_sum + policy_loss.detach()
             value_loss_sum = value_loss_sum + value_loss.detach()
             entropy_sum = entropy_sum + entropy_bonus.detach()
+            anchor_loss_sum = anchor_loss_sum + anchor_loss.detach()
             minibatch_count += 1
     denom = max(minibatch_count, 1)
     return {
         "policy_loss": float((policy_loss_sum / denom).item()),
         "value_loss": float((value_loss_sum / denom).item()),
         "entropy": float((entropy_sum / denom).item()),
+        "anchor_loss": float((anchor_loss_sum / denom).item()),
+        "anchor_beta": float(anchor_beta),
         "advantage_mean": float(advantages.mean().item()),
         "advantage_std": float(advantages.std().item()),
     }
@@ -1284,9 +1481,17 @@ def build_torchrl_evaluation_output(state, terminal_transition, bundle, *, no_tr
 
 
 def evaluate_torchrl_policy(bundle, runtime):
+    """Run a deterministic-argmax rollout of the policy on `bundle`. If
+    `runtime['policy']['artifact_path']` is set, loads weights from that artifact; otherwise
+    falls back to a freshly-initialised policy (useful as a "policy-untrained" baseline)."""
+    from .structured_policy import load_policy_artifact
     settings = _optimizer_settings(runtime)
     device = bundle["time_grid_days"].device
-    policy = _make_structured_policy(runtime, device=device)
+    artifact_path = (runtime.get("policy") or {}).get("artifact_path")
+    if artifact_path:
+        policy = load_policy_artifact(artifact_path, device=device)
+    else:
+        policy = _make_structured_policy(runtime, device=device)
     decision_indices = _decision_time_indices(bundle, settings, epoch=None, evaluation=True)
     started = time.perf_counter()
     rollout = _collect_ppo_rollout(policy, bundle, runtime, decision_indices, deterministic=True)
@@ -1365,7 +1570,7 @@ def train_torchrl_policy(bundle, runtime):
         decision_indices = _decision_time_indices(train_bundle, settings, epoch=epoch, evaluation=False)
         decision_interval = _decision_interval_business_days_for_epoch(settings, epoch, evaluation=False)
         rollout_started = time.perf_counter()
-        rollout = _collect_ppo_rollout(policy, train_bundle, runtime, decision_indices, deterministic=False, reward_scale=settings["reward_scale"])
+        rollout = _collect_ppo_rollout(policy, train_bundle, runtime, decision_indices, deterministic=False, reward_scale=settings["reward_scale"], anchor_targets=settings.get("anchor_beta", 0.0) > 0.0)
         rollout_time = float(time.perf_counter() - rollout_started)
         if rollout is None:
             continue
@@ -1373,7 +1578,7 @@ def train_torchrl_policy(bundle, runtime):
             reward_normalizer.update_from_rollout(rollout["rewards"])
             rollout["rewards"] = rollout["rewards"] / reward_normalizer.scale
         update_started = time.perf_counter()
-        diag = _ppo_update(policy, optimizer, rollout, settings, decision_interval=decision_interval)
+        diag = _ppo_update(policy, optimizer, rollout, settings, decision_interval=decision_interval, epoch=epoch)
         update_time = float(time.perf_counter() - update_started)
         if scheduler is not None:
             scheduler.step()
@@ -1387,6 +1592,8 @@ def train_torchrl_policy(bundle, runtime):
             "policy_loss": diag["policy_loss"],
             "value_loss": diag["value_loss"],
             "entropy": diag["entropy"],
+            "anchor_loss": diag["anchor_loss"],
+            "anchor_beta": diag["anchor_beta"],
             "advantage_mean": diag["advantage_mean"],
             "advantage_std": diag["advantage_std"],
             "average_reward": terminal_reward,
@@ -1396,12 +1603,13 @@ def train_torchrl_policy(bundle, runtime):
             "update_time_seconds": update_time,
             "decision_interval_business_days": decision_interval,
         })
+        anchor_str = f" anc_kl={diag['anchor_loss']:.3f} β={diag['anchor_beta']:.3f}" if diag["anchor_beta"] > 0.0 else ""
         print(
             f"epoch={epoch:>2} interval={decision_interval}d "
             f"net_pnl={net_pnl:>+12.0f} "
             f"reward={terminal_reward:>+10.2f} "
             f"|trade|={action_abs_mean:.2f} "
-            f"pol_l={diag['policy_loss']:+.4f} val_l={diag['value_loss']:.2e} ent={diag['entropy']:.3f} "
+            f"pol_l={diag['policy_loss']:+.4f} val_l={diag['value_loss']:.2e} ent={diag['entropy']:.3f}{anchor_str} "
             f"t={rollout_time + update_time:.2f}s",
             flush=True,
         )

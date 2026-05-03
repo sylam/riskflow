@@ -1666,12 +1666,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
     @staticmethod
     def _factor_bundle_key(factor_key):
-        if hasattr(factor_key, 'type') and hasattr(factor_key, 'name'):
-            factor_name = factor_key.name
-            if isinstance(factor_name, tuple):
-                factor_name = '.'.join(part for part in factor_name)
-            return '{}:{}'.format(factor_key.type, factor_name)
-        return factor_key
+        return utils.check_tuple_name(factor_key) if hasattr(factor_key, 'type') and hasattr(factor_key, 'name') else factor_key
 
     def _build_scenario_result(self, base_date, business_day, time_grid_days, factor_blocks, params):
         trade_mtm = {
@@ -1727,6 +1722,18 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 'id_names': tuple(hedge_profile_blocks.get('legs_id_names') or ()),
             }
         liability_mtm = torch.cat(hedge_profile_blocks['mtm'], dim=1) if hedge_profile_blocks.get('mtm') else None
+        # Per-(tradable, factor) hedge ratios — already in contract units, computed per-batch
+        # in the sim loop. Concat along batch dim per (tradable, factor).
+        hedge_ratio_blocks = hedge_profile_blocks.get('hedge_ratios') or {}
+        hedge_ratios_pre_pad = {}
+        for tradable_name, blocks in hedge_ratio_blocks.items():
+            if not blocks:
+                continue
+            factor_names = list(blocks[0].keys())
+            hedge_ratios_pre_pad[tradable_name] = {
+                name: torch.cat([block[name] for block in blocks], dim=1)
+                for name in factor_names
+            }
         realized_cashflows = {
             currency: torch.cat(blocks, dim=1)
             for currency, blocks in (hedge_profile_blocks.get('realized_cashflows') or {}).items()
@@ -1764,6 +1771,23 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             }
         if liability_mtm is not None:
             bundle['liability_mtm'] = pad_time_axis(liability_mtm, aligned_time_steps)
+        # Pad each (tradable, factor) hedge ratio to the common time grid. Each tradable's
+        # native T equals its lifetime (expires at maturity); zero-pad post-expiry rows since
+        # the contract can't be traded there. Don't use the shared `pad_time_axis` helper:
+        # it repeats the last row, which would leak the at-expiry ratio into post-expiry steps.
+        if hedge_ratios_pre_pad:
+            hedge_ratios = {}
+            for tradable_name, by_factor in hedge_ratios_pre_pad.items():
+                hedge_ratios[tradable_name] = {}
+                for factor_name, tensor in by_factor.items():
+                    cur_T = int(tensor.shape[0])
+                    if cur_T >= aligned_time_steps:
+                        padded = tensor[:aligned_time_steps]
+                    else:
+                        zeros = tensor.new_zeros((aligned_time_steps - cur_T,) + tuple(tensor.shape[1:]))
+                        padded = torch.cat([tensor, zeros], dim=0)
+                    hedge_ratios[tradable_name][factor_name] = padded
+            bundle['hedge_ratios'] = hedge_ratios
         if realized_cashflows:
             bundle['realized_cashflows'] = {
                 currency: pad_time_axis(tensor, aligned_time_steps)
@@ -1771,6 +1795,21 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             }
         if runtime is not None:
             self._prepend_history_prefix(bundle, runtime, base_date)
+        # CPU mirror of the time grid for hot-path feature builders that need scalar `current_day`
+        # values per decision step. Avoids a CUDA→CPU sync per (decision step × feature builder).
+        bundle['time_grid_days_cpu'] = bundle['time_grid_days'].detach().cpu().to(dtype=torch.int64).tolist()
+        # Total leg notional |Σ Volume| — constant across the episode, used by the global
+        # delta-coverage feature. Cache as a Python float once at bundle build instead of
+        # re-summing + .item()-ing every decision step.
+        if bundle.get('legs') is not None and bundle['legs'].get('features') is not None:
+            from .hedge_features import LEG_FEATURE_NAMES
+            feat_names = tuple(bundle['legs'].get('feature_names', LEG_FEATURE_NAMES))
+            if 'volume' in feat_names:
+                vol_idx = feat_names.index('volume')
+                leg_vol = bundle['legs']['features'][..., vol_idx]
+                while leg_vol.ndim > 1:
+                    leg_vol = leg_vol[0]
+                bundle['total_leg_volume'] = float(leg_vol.abs().sum().item())
         # Last time index where any leg still has time_to_payment > 0; steps with
         # index strictly greater are post-settlement (all legs paid). Used by the
         # naked-position penalty in the reward path.
@@ -1873,6 +1912,14 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             mtm = bundle['liability_mtm']
             mtm_prefix = mtm[:1].expand(H, -1).contiguous()
             bundle['liability_mtm'] = torch.cat([mtm_prefix, mtm], dim=0)
+        if bundle.get('hedge_ratios'):
+            new_ratios = {}
+            for tradable_name, by_factor in bundle['hedge_ratios'].items():
+                new_ratios[tradable_name] = {}
+                for factor_name, tensor in by_factor.items():
+                    r_prefix = tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous()
+                    new_ratios[tradable_name][factor_name] = torch.cat([r_prefix, tensor], dim=0)
+            bundle['hedge_ratios'] = new_ratios
         if bundle.get('realized_cashflows'):
             new_cf = {}
             for currency, tensor in bundle['realized_cashflows'].items():
@@ -1991,6 +2038,10 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             'legs_feature_names': None,
             'legs_id_names': None,
             'mtm': [],
+            # Per-(tradable, factor) hedge ratios (in *contract* units), computed per-batch in
+            # the sim loop directly from liability and tradable AAD deltas — no separate
+            # spot_deltas accumulator needed since the ratio is the only thing the policy reads.
+            'hedge_ratios': defaultdict(list),
             'realized_cashflows': defaultdict(list),
         }
         # Per-batch privileged-factor accumulator. Keyed by (factor_name, factor_attr) where
@@ -2000,6 +2051,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # get the calendar for business day
         bus_day = self.config.holidays.get(
             self.params['Calendar'], {'businessday': pd.offsets.BDay(1)})['businessday']
+        # Identify which factors correspond to user-declared underlyings.
+        # Spot_Price_History is keyed by commodity name; the matching factor key is
+        declared_underlyings = self.params['Hedging_Problem']['Portfolio_State'].get('Spot_Price_History',{}).keys()
 
         for run in range(params['Simulation_Batches']):
             shared_mem.reset(
@@ -2008,6 +2062,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
             for key, proc in self.stoch_factors.items():
                 simulated = proc.generate(shared_mem)
+                if utils.check_tuple_name(key) in declared_underlyings:
+                    simulated = simulated.detach().requires_grad_(True)
                 shared_mem.t_Scenario_Buffer[key] = simulated
                 # Each process owns its privileged-factor surface; ask it what to expose. Default
                 # implementation returns {} so processes opt in by overriding privileged_factors.
@@ -2030,8 +2086,11 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     hedge_profile_blocks['legs_feature_names'] = legs['feature_names']
                     hedge_profile_blocks['legs_id_names'] = legs['id_names']
             mtm = features.get('mtm')
+            liability_spot_deltas = None
             if mtm is not None:
+                liability_spot_deltas = pricing.extract_spot_deltas(mtm, shared_mem.t_Scenario_Buffer)
                 hedge_profile_blocks['mtm'].append(mtm.detach().clone())
+
             mtm_grid_size = self.time_grid.mtm_time_grid.size
             for currency, by_time in (shared_mem.t_Cashflows or {}).items():
                 dense = shared_mem.one.new_zeros(mtm_grid_size, shared_mem.simulation_batch)
@@ -2058,6 +2117,34 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
             if tradable_blocks is not None:
                 for instrument_name, instrument_tensor in trade_tensors.items():
+                    # Hedge ratio per (tradable, factor) in *contract* units:
+                    #     ratio_contracts = (dL/dS) / (dF_i/dS) / contract_size_i
+                    # i.e. "how many contracts of this tradable to short to delta-flatten the
+                    # liability against this factor at this (t, b)". AAD-extracted before the
+                    # .detach() below. Cash accounts and other constant-tensor instruments have
+                    # no backward graph — skipped (their hedge_ratio is undefined anyway).
+                    if instrument_tensor.requires_grad and liability_spot_deltas:
+                        td_deltas = pricing.extract_spot_deltas(instrument_tensor, shared_mem.t_Scenario_Buffer)
+                        contract_size = float(
+                            normalized_runtime['tradables'][instrument_name].get('contract_size', 1.0)
+                        ) or 1.0
+                        ratios = {}
+                        T_td = instrument_tensor.shape[0]
+                        for factor_name, td_delta in td_deltas.items():
+                            liab_delta = liability_spot_deltas.get(factor_name)
+                            if liab_delta is None:
+                                continue
+                            # Liability MtM lives over the full deal period; tradable lives until
+                            # its expiry (T_td <= T_liab). Crop liability to the tradable's grid.
+                            liab_aligned = liab_delta[:T_td]
+                            nonzero = td_delta.abs() > 1e-6
+                            safe_td = torch.where(nonzero, td_delta, torch.ones_like(td_delta))
+                            ratios[factor_name] = torch.where(
+                                nonzero,
+                                liab_aligned / (safe_td * contract_size),
+                                torch.zeros_like(liab_aligned),
+                            )
+                        hedge_profile_blocks['hedge_ratios'][instrument_name].append(ratios)
                     tradable_blocks[instrument_name].append(instrument_tensor.detach().clone())
 
             shared_mem.t_Buffer.clear()

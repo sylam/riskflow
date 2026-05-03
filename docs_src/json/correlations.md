@@ -37,11 +37,19 @@ Each factor model has its own correlation name. They are as follows:
 | Factor Model      | Correlation Name     | Number of factors  | Sub Components  |
 | -----------------:|:--------------------:| ------------------:| ---------------:|
 | GBMAssetPriceModel  | LognormalDiffusionProcess | 1 | <NA> |
+| GBMAssetPriceTSModelImplied  | LognormalDiffusionProcess | 1 | <NA> |
 | GBMPriceIndexModel  | LognormalDiffusionProcess | 1 | <NA> |
-| HullWhite1FactorInterestRateModel  | HWInterestRate | 1 | F1|
+| HullWhite1FactorInterestRateModel  | HWInterestRate | 1 | F1 |
 | HullWhite2FactorImpliedInterestRateModel  | HWImpliedInterestRate | 2 | F1, F2 |
 | HWHazardRateModel | HullWhiteProcess | 1 | <NA> |
 | CSForwardPriceModel | ClewlowStricklandProcess | 1 | <NA> |
-| PCAInterestRateModel | InterestRateOUProcess | 3 | PC1,PC2,PC3 |
+| CSImpliedForwardPriceModel | ClewlowStricklandProcess | 1 | <NA> |
+| PCAInterestRateModel | InterestRateOUProcess | $N$ | PC1, PC2, ..., PC$N$ |
+| SingleRegimeOU1FactorKalmanModel | SingleRegimeOUCarryProcess | 1 | <NA> |
+| LogOUSpotModel | OULogSpotProcess | 1 | <NA> |
+| MarkovSwitchingLogOUSpotModel | MarkovSwitchingLogOUProcess | 1 | <NA> |
+
+For `PCAInterestRateModel`, the number of factors $N$ matches the number of principal components
+configured (typically 3). Sub-components are named `PC1` through `PC`$N$ accordingly.
 
 These names may change in future.

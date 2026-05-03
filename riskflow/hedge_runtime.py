@@ -13,6 +13,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional
 
+from . import utils
 from .hedge_features import build_entity_layout, derive_privileged_layout
 
 
@@ -113,6 +114,7 @@ def _normalize_liabilities(hedging_problem: Mapping[str, Any]) -> Dict[str, Dict
 def _normalize_policy_config(policy_config: Mapping[str, Any]) -> Dict[str, Any]:
     action_space = _normalize_action_space(policy_config)
     model_config = dict(policy_config.get("Model", {}))
+    artifact_path = policy_config.get("Artifact_Path")
     return {
         "object": str(policy_config["Object"]),
         "action_space": action_space,
@@ -123,6 +125,7 @@ def _normalize_policy_config(policy_config: Mapping[str, Any]) -> Dict[str, Any]
             "n_heads": int(model_config.get("N_Heads", 4)),
             "n_layers": int(model_config.get("N_Layers", 2)),
         },
+        "artifact_path": str(artifact_path) if artifact_path else None,
     }
 
 
@@ -157,12 +160,24 @@ def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -
         "warm_start_epochs": int(optimizer_config.get("Warm_Start_Epochs", 0)),
         "max_grad_norm": float(optimizer_config.get("Max_Grad_Norm", 0.5)),
         "reward_scale": float(optimizer_config.get("Reward_Scale", 1.0)),
+        "debug_strict_bins": bool(optimizer_config.get("Debug_Strict_Bins", False)),
         "action_sparsity_coef": float(optimizer_config.get("Action_Sparsity_Coef", 0.0)),
         "dense_tracking_reward_scale": float(optimizer_config.get("Dense_Tracking_Reward_Scale", 0.0)),
         "dense_tracking_reward_clip": float(optimizer_config.get("Dense_Tracking_Reward_Clip", 0.0)),
+        "dense_reward_mode": str(optimizer_config.get("Dense_Reward_Mode", "asymmetric")).lower(),
         "validation_fraction": float(optimizer_config.get("Validation_Fraction", 0.25)),
         "validation_min_batch": int(optimizer_config.get("Validation_Min_Batch", 256)),
         "decision_interval_curriculum": tuple(decision_interval_curriculum),
+        "anchor_beta": float(optimizer_config.get("Anchor_Beta", 0.0)),
+        "anchor_beta_floor": float(optimizer_config.get("Anchor_Beta_Floor", 0.0)),
+        "anchor_anneal_epochs": int(optimizer_config.get("Anchor_Anneal_Epochs", 0)),
+        "anchor_bin_sharpness": float(optimizer_config.get("Anchor_Bin_Sharpness", 2.0)),
+        "anchor_target": str(optimizer_config.get("Anchor_Target", "delta1_jul")).lower(),
+        "cvar_alpha": float(optimizer_config.get("CVaR_Alpha", 0.0)),
+        "cvar_lambda": float(optimizer_config.get("CVaR_Lambda", 0.0)),
+        "value_loss_asym_weight": float(optimizer_config.get("Value_Loss_Asym_Weight", 1.0)),
+        "entropy_floor_h_min": float(optimizer_config.get("Entropy_Floor_H_Min", 0.0)),
+        "entropy_floor_coef": float(optimizer_config.get("Entropy_Floor_Coef", 0.0)),
         "seed": optimizer_config.get("Seed"),
     }
 
@@ -259,23 +274,14 @@ def _normalize_spot_price_history(
     return normalized
 
 
-def _collect_referenced_commodities(
-    liabilities: Mapping[str, Mapping[str, Any]],
-    tradables: Mapping[str, Mapping[str, Any]],
-) -> tuple:
-    referenced: list = []
-    for entry in liabilities.values():
-        params = entry.get("params") or {}
-        for key in ("Commodity", "Reference_Type"):
-            value = params.get(key)
-            if value is not None and str(value) not in referenced:
-                referenced.append(str(value))
-    for entry in tradables.values():
-        params = entry.get("params") or {}
-        value = params.get("Commodity")
-        if value is not None and str(value) not in referenced:
-            referenced.append(str(value))
-    return tuple(referenced)
+def _collect_referenced_commodities(stoch_factors: Optional[Mapping[Any, Any]]) -> tuple:
+    """Pull commodity names from the live CommodityPrice factors. Instruments populate
+    `stoch_factors` at construction (in `Calculation.calc_dependencies`); downstream
+    consumers read from there rather than re-parsing instrument JSON params."""
+    return tuple(dict.fromkeys(
+        utils.check_tuple_name(factor) for factor in (stoch_factors or {})
+        if factor.type == 'CommodityPrice'
+    ))
 
 
 def _normalize_portfolio_state(
@@ -396,11 +402,12 @@ def construct_torchrl_runtime(
     history_lookback = int(hedging_problem.get("History_Lookback_Business_Days", 30))
     if history_lookback < 0:
         raise ValueError("Hedging_Problem.History_Lookback_Business_Days must be non-negative")
-    referenced_commodities = _collect_referenced_commodities(liabilities, normalized_tradables)
+    referenced_commodities = _collect_referenced_commodities(stoch_factors)
     runtime = {
         "execution_mode": execution_mode,
         "accounting_mode": accounting_mode,
         "names": names,
+        "referenced_commodities": referenced_commodities,
         "tradables": normalized_tradables,
         "liabilities": liabilities,
         "objective": _normalize_objective_config(objective_config),

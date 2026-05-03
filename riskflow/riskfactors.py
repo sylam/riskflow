@@ -637,6 +637,14 @@ class FxRate(Factor0D):
 
 
 class FuturesPrice(Factor0D):
+    """
+    Spot price of a single listed futures contract. Used when a deal references the price of one
+    specific futures by name rather than a forward curve indexed by maturity.
+    """
+    field_desc = ('Energy',
+                  ['- **Price**: Float. The current settlement price of the futures contract in '
+                   'its quote currency.'])
+
     def __init__(self, param):
         super(FuturesPrice, self).__init__(param)
 

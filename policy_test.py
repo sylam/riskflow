@@ -91,7 +91,7 @@ if __name__=='__main__':
                             }
                         },
                         "Spot_Price_History": {
-                            "PLATINUM": {
+                            "CommodityPrice.PLATINUM": {
                                 "Dates": [
                                     {".Timestamp": "2026-02-26"},
                                     {".Timestamp": "2026-02-27"},
@@ -235,6 +235,17 @@ if __name__=='__main__':
                         "Max_Grad_Norm": 0.5,
                         "Reward_Scale": 1.0e-6,
                         "Dense_Tracking_Reward_Scale": 2.0,
+                        "Dense_Reward_Mode": "asymmetric",
+                        "Anchor_Beta": 0.0,
+                        "Anchor_Beta_Floor": 0.0,
+                        "Anchor_Anneal_Epochs": 0,
+                        "Anchor_Bin_Sharpness": 2.0,
+                        "Anchor_Target": "delta1_jul",
+                        "CVaR_Alpha": 0.0,
+                        "CVaR_Lambda": 0.0,
+                        "Value_Loss_Asym_Weight": 1.0,
+                        "Entropy_Floor_H_Min": 0.0,
+                        "Entropy_Floor_Coef": 0.0,
                         "Validation_Fraction": 0.25,
                         "Validation_Min_Batch": 512,
                         "Validation_Shards": 4,

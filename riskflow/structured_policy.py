@@ -79,6 +79,43 @@ class _GlobalEncoder(nn.Module):
         return self.mlp(_sanitize_features(features)).unsqueeze(1)
 
 
+class _TemporalEncoder(nn.Module):
+    """1D-conv summary of a (B, K, n_channels) trajectory window. Output is a single token of
+    `token_dim` per scenario, fed alongside the existing entity tokens into the transformer.
+    The conv learns its own temporal weighting — strictly more flexible than the hand-picked
+    LOOKBACK_WINDOWS and able to capture nonlinear patterns (acceleration, regime change)."""
+
+    def __init__(self, n_channels, window, token_dim, type_id, *, hidden=32, kernel=5):
+        super().__init__()
+        if int(n_channels) <= 0 or int(window) <= 0:
+            self.conv = None
+            self.proj = nn.Linear(1, token_dim)  # unused fallback
+        else:
+            self.conv = nn.Sequential(
+                nn.Conv1d(int(n_channels), hidden, kernel_size=kernel),
+                nn.GELU(),
+                nn.Conv1d(hidden, hidden, kernel_size=kernel),
+                nn.GELU(),
+                nn.AdaptiveAvgPool1d(1),
+            )
+            self.proj = nn.Linear(hidden, token_dim)
+        self.register_buffer('type_id', torch.tensor(int(type_id), dtype=torch.long), persistent=False)
+
+    def forward(self, temporal_window):
+        # temporal_window shape: (B, K, n_channels) — sanitize to log-domain to handle the
+        # mtm channel's $-scale alongside the log-spot channel's O(1) scale.
+        if self.conv is None or temporal_window.shape[-1] == 0 or temporal_window.shape[-2] == 0:
+            B = temporal_window.shape[0]
+            zeros = torch.zeros((B, 1, self.proj.out_features),
+                                dtype=temporal_window.dtype, device=temporal_window.device)
+            return zeros
+        x = _sanitize_features(temporal_window)
+        # (B, K, C) -> (B, C, K) for conv1d
+        x = x.permute(0, 2, 1).contiguous()
+        x = self.conv(x).squeeze(-1)  # (B, hidden)
+        return self.proj(x).unsqueeze(1)  # (B, 1, token_dim)
+
+
 class _EntityTransformer(nn.Module):
     def __init__(self, entity_layout, token_dim, emb_dim, n_heads, n_layers):
         super().__init__()
@@ -91,7 +128,14 @@ class _EntityTransformer(nn.Module):
         self.instr_encoder = _EntityEncoder(entity_layout['instruments']['feature_dim'], instr_vocabs, emb_dim, token_dim, type_id=1)
         self.cash_encoder = _EntityEncoder(entity_layout['cash_accounts']['feature_dim'], cash_vocabs, emb_dim, token_dim, type_id=2)
         self.global_encoder = _GlobalEncoder(entity_layout['globals']['feature_dim'], token_dim, type_id=3)
-        self.type_embedding = nn.Embedding(4, token_dim)
+        temporal_meta = entity_layout.get('temporal', {})
+        self.temporal_encoder = _TemporalEncoder(
+            n_channels=int(temporal_meta.get('n_channels', 0)),
+            window=int(temporal_meta.get('window', 0)),
+            token_dim=token_dim, type_id=4,
+        )
+        # 5 token types: legs / instruments / cash / globals / temporal.
+        self.type_embedding = nn.Embedding(5, token_dim)
 
         layer = nn.TransformerEncoderLayer(
             d_model=token_dim, nhead=n_heads, dim_feedforward=token_dim * 2,
@@ -108,23 +152,36 @@ class _EntityTransformer(nn.Module):
         instr = self._add_type(self.instr_encoder(entity_state['instruments'], entity_state['instruments_ids']), self.instr_encoder.type_id)
         cash = self._add_type(self.cash_encoder(entity_state['cash_accounts'], entity_state['cash_accounts_ids']), self.cash_encoder.type_id)
         glb = self._add_type(self.global_encoder(entity_state['globals']), self.global_encoder.type_id)
+        temporal_window = entity_state.get('temporal', None)
+        if temporal_window is not None and temporal_window.shape[-1] > 0:
+            temporal = self._add_type(self.temporal_encoder(temporal_window), self.temporal_encoder.type_id)
+        else:
+            temporal = None
 
         L, I, C = legs.shape[1], instr.shape[1], cash.shape[1]
-        tokens = torch.cat([legs, instr, cash, glb], dim=1)
+        token_list = [legs, instr, cash, glb]
+        if temporal is not None:
+            token_list.append(temporal)
+        tokens = torch.cat(token_list, dim=1)
         batch_size = tokens.shape[0]
         global_mask = torch.ones((batch_size, glb.shape[1]), dtype=torch.bool, device=tokens.device)
-        masks = torch.cat([
+        mask_list = [
             entity_state['legs_mask'].to(torch.bool),
             entity_state['instruments_mask'].to(torch.bool),
             entity_state['cash_accounts_mask'].to(torch.bool),
             global_mask,
-        ], dim=1)
+        ]
+        if temporal is not None:
+            mask_list.append(torch.ones((batch_size, temporal.shape[1]), dtype=torch.bool, device=tokens.device))
+        masks = torch.cat(mask_list, dim=1)
         context = self.transformer(tokens, src_key_padding_mask=~masks)
+        T = temporal.shape[1] if temporal is not None else 0
         return {
             'legs': context[:, :L, :],
             'instruments': context[:, L:L + I, :],
             'cash_accounts': context[:, L + I:L + I + C, :],
-            'globals': context[:, L + I + C:, :],
+            'globals': context[:, L + I + C:L + I + C + glb.shape[1], :],
+            'temporal': context[:, L + I + C + glb.shape[1]:, :] if T > 0 else None,
             'mask': masks,
         }
 
@@ -218,8 +275,12 @@ class StructuredRebalancePolicy(nn.Module):
         # actor's encoder to extract regime-relevant info from observable history.
         self.privileged_encoder = _PrivilegedEncoder(self.privileged_layout, self.token_dim).to(self.device)
         self._privileged_dim = int(self.privileged_encoder.output_dim)
+        # _ctx_pool concatenates legs + instruments + cash + globals = 4 token vectors, plus
+        # the temporal token when present (n_channels > 0).
+        temporal_present = int(entity_layout.get('temporal', {}).get('n_channels', 0)) > 0
+        self._ctx_pool_dim = self.token_dim * (5 if temporal_present else 4)
         self.value_head = nn.Sequential(
-            nn.Linear(self.token_dim * 4 + self._privileged_dim, self.token_dim),
+            nn.Linear(self._ctx_pool_dim + self._privileged_dim, self.token_dim),
             nn.GELU(),
             nn.Linear(self.token_dim, 1),
         ).to(self.device)
@@ -299,7 +360,14 @@ class StructuredRebalancePolicy(nn.Module):
         instr_pool = _masked_mean(instr, mask[:, L:L + I])
         cash_pool = _masked_mean(cash, mask[:, L + I:L + I + C])
         global_pool = glb.squeeze(1)
-        return torch.cat([legs_pool, instr_pool, cash_pool, global_pool], dim=-1)
+        parts = [legs_pool, instr_pool, cash_pool, global_pool]
+        # Temporal token is optional (zero-channel falls back to None) — concat its post-
+        # transformer representation when present so the policy/value heads can attend to it.
+        temporal_ctx = ctx.get('temporal')
+        if temporal_ctx is not None and temporal_ctx.shape[1] > 0:
+            t = temporal_ctx.detach() if detach else temporal_ctx
+            parts.append(t.squeeze(1))
+        return torch.cat(parts, dim=-1)
 
     def _feasible_mask(self, positions):
         """Returns a (B, I, max_bins) bool tensor with True for bins whose resulting position

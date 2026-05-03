@@ -385,7 +385,22 @@ mapping = {
                              'value': '[{"label":"1", "data":[[0.0,0.0]]},{"label":"2", "data":[[0.0,0.0]]},{"label":"3", "data":[[0.0,0.0]]}]'},
             'Quanto_FX_Volatility': {'widget': 'Flot', 'description': 'Quanto FX Volatility',
                                      'value': default['Flot']},
-            'Seasonal_Adjustment': {'widget': 'Text', 'description': 'Seasonal Adjustment', 'value': ''}
+            'Seasonal_Adjustment': {'widget': 'Text', 'description': 'Seasonal Adjustment', 'value': ''},
+            # MarkovSwitchingLogOUSpotModel fields. The latent regime z_t follows a Markov chain
+            # with transition matrix P; conditional on z_t the log-spot follows a per-regime OU.
+            'States': {'widget': 'Container', 'description':
+                       'List of per-regime {Kappa, Theta, Sigma} dicts (must have at least 2 regimes)',
+                       'value': []},
+            'Transition_Matrix': {'widget': 'Table', 'description':
+                                  'NxN row-stochastic transition matrix at the calibration time step',
+                                  'value': []},
+            'Initial_State_Probs': {'widget': 'Table', 'description':
+                                    'Initial regime distribution (length-N vector summing to 1)',
+                                    'value': []},
+            'Calibration_DT_Years': {'widget': 'Float', 'description':
+                                     'Step size (in years) of the calibrated transition matrix; the model '
+                                     're-discretises P per simulation step via the CTMC generator',
+                                     'value': 1.0 / 252.0},
         },
     },
 

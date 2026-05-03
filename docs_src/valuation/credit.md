@@ -23,9 +23,9 @@ $$V(t)=\int_{t_1}^{t_2} D(t,u)S(t,u)h(t,u)g(u)du.$$
 This is approximated by assuming a constant forward hazard rate $\bar h$ and forward rate $f$ between
 $t_1$ and $t_2$ so that
 
-$$S(t,u)=S(t,t_1)e^{\bar h(u-t_1)}$$
+$$S(t,u)=S(t,t_1)e^{-\bar h(u-t_1)}$$
 
-$$D(t,u)=D(t,t_1)e^{f(u-t_1)}$$
+$$D(t,u)=D(t,t_1)e^{-f(u-t_1)}$$
 
 where
 
@@ -35,8 +35,8 @@ $$f=\frac{1}{t_2-t_1}\log\Big(\frac{D(t,t_1)}{D(t,t_2)}\Big)$$
 
 For a unit cashflow paid on default, $g(u)=1$ and
 
-$$\begin{align}V(t) & = D(t,t_1)S(t,t_1)\bar h\Big(\frac{1-e^{(f+\bar h)(t_2-t_1)}}{f+\bar h}\Big)\\
- & = \frac{\bar h}{f+\bar h}\Big((D(t,t_1)S(t,t_1)-D(t,t_2)S(t,t_2)\Big).\end{align}$$
+$$\begin{align}V(t) & = D(t,t_1)S(t,t_1)\bar h\Big(\frac{1-e^{-(f+\bar h)(t_2-t_1)}}{f+\bar h}\Big)\\
+ & = \frac{\bar h}{f+\bar h}\Big(D(t,t_1)S(t,t_1)-D(t,t_2)S(t,t_2)\Big).\end{align}$$
 
 For credit derivatives, define the following:
 

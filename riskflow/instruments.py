@@ -3605,6 +3605,25 @@ class CommodityFutureDeal(Deal):
                      'Repo_Rate': ['InterestRate'],
                      'Carry': ['BasisCarry']}
 
+    documentation = ('Energy', [
+        'A standardised futures contract on a commodity. Priced via the cost-of-carry forward',
+        'formula evaluated at the contract\'s maturity $T$:',
+        '',
+        '$$F(t,T)=S(t)\\exp\\Big(b(t)(T-t) + \\int_t^T r(t,u)du\\Big)$$',
+        '',
+        'where $S(t)$ is the spot price of the **Commodity** in its quote currency, $r(t,u)$ is',
+        'the forward repo rate from the **Repo_Rate** curve, and $b(t)$ is the **Carry** basis',
+        'spread (cost minus benefits of carry — storage, convenience yield, etc.). The output is',
+        'converted to the report currency via the **Currency** FX rate.',
+        '',
+        'Note that this is a price (per contract unit), not a P&L — variation margin and',
+        'position-level cashflow accounting are handled by the calculation\'s margin / cash',
+        'machinery, not by this instrument.',
+        '',
+        'See also [Forward rates](../theory/asset_pricing.md#forward-rates) for the underlying',
+        'no-arbitrage derivation.'
+    ])
+
     def __init__(self, params, valuation_options):
         super(CommodityFutureDeal, self).__init__(params, valuation_options)
 
@@ -4779,7 +4798,12 @@ class FloatingEnergyDeal(Deal):
         time_to_period_start = (period_start[None, :] - t_days[:, None]) / utils.DAYS_IN_YEAR
         time_to_period_end = (period_end[None, :] - t_days[:, None]) / utils.DAYS_IN_YEAR
         time_to_payment = (payment[None, :] - t_days[:, None]) / utils.DAYS_IN_YEAR
-        accumulation_fraction = (t_days[:, None] - period_start[None, :]) / period_length[None, :]
+        # Negative pre-period encodes "fraction of period_length until averaging starts" — useful
+        # signal. Post-period, values > 1 would duplicate `time_to_period_end < 0`, so clamp at
+        # 1.0 (= "averaging done") to avoid the same number meaning two different things.
+        accumulation_fraction = np.minimum(
+            (t_days[:, None] - period_start[None, :]) / period_length[None, :], 1.0,
+        )
 
         mtm = self.calculate(shared, time_grid, deal_data)
         T, B = mtm.shape

@@ -56,12 +56,31 @@ PER_COMMODITY_GLOBAL_FEATURES = (
     ('implied_atm_vol', 'implied_atm_vol_30d'),
 )
 
+# Trajectory lookbacks (business days) on liability_mtm and per-commodity spot. Generic
+# regime/momentum stack — deliberately not tuned to any deal calendar. Encodes how rapidly
+# the underlying / liability has been moving so the policy can distinguish "stable at $X"
+# from "rapidly evolving toward $X".
+LOOKBACK_WINDOWS = (1, 5, 20, 60)
 
-def build_global_feature_names(referenced_commodities):
+# Temporal-encoder window: number of business days of history fed into the 1D-conv
+# trajectory token. The conv learns its own temporal weighting (vs the hand-picked
+# LOOKBACK_WINDOWS above). The minimum 20-day window covers enough lookback for the
+# 60-day signal to also fit at run time once the H-row history prefix is included.
+TEMPORAL_WINDOW = 20
+
+
+def build_global_feature_names(referenced_commodities, hedge_ratio_pairs=()):
     names = list(GLOBAL_BASE_FEATURE_NAMES)
     for commodity in referenced_commodities:
         for _bundle_key, prefix in PER_COMMODITY_GLOBAL_FEATURES:
             names.append(f'{prefix}_{commodity}')
+    for tradable, commodity in hedge_ratio_pairs:
+        names.append(f'hedge_ratio_{tradable}_{commodity}')
+    # Lookback diagnostics: liability MtM change + per-commodity log-return per window.
+    for w in LOOKBACK_WINDOWS:
+        names.append(f'liability_mtm_change_{w}d')
+        for commodity in referenced_commodities:
+            names.append(f'spot_logret_{w}d_{commodity}')
     return tuple(names)
 
 
@@ -125,10 +144,17 @@ def build_entity_layout(runtime):
         items = params.get('Payments', {}).get('Items', ())
         leg_count += len(items)
 
-    referenced_commodities = tuple(
-        ((runtime.get('portfolio_state') or {}).get('spot_price_history') or {}).keys()
+    referenced_commodities = tuple(runtime.get('referenced_commodities', ()))
+    # Hedge-ratio globals: one scalar per (hedge tradable, factor) pair. `factor_name` is the
+    # full dotted factor name produced by `_collect_referenced_commodities` (e.g.
+    # 'CommodityPrice.PLATINUM'); it keys directly into bundle['hedge_ratios'][tradable].
+    # Pair order is deterministic: hedges × commodities, fixed by hedge_names iteration order.
+    hedge_ratio_pairs = tuple(
+        (tradable, factor_name)
+        for tradable in hedge_names
+        for factor_name in referenced_commodities
     )
-    global_feature_names = build_global_feature_names(referenced_commodities)
+    global_feature_names = build_global_feature_names(referenced_commodities, hedge_ratio_pairs)
 
     return {
         'registry': registry,
@@ -159,6 +185,17 @@ def build_entity_layout(runtime):
             'feature_names': global_feature_names,
             'feature_dim': len(global_feature_names),
             'referenced_commodities': referenced_commodities,
+            'hedge_ratio_pairs': hedge_ratio_pairs,
+        },
+        # Temporal trajectory token: 1D-conv-encoded summary of the last K business days of
+        # (per-commodity log-spot, liability MtM). Channel ordering matches the iteration
+        # order of referenced_commodities + the global liability_mtm appended last.
+        'temporal': {
+            'window': TEMPORAL_WINDOW,
+            'n_channels': len(referenced_commodities) + (1 if 'liability_mtm' in GLOBAL_BASE_FEATURE_NAMES else 0),
+            'channel_names': tuple(
+                [f'log_spot_{c}' for c in referenced_commodities] + ['liability_mtm']
+            ),
         },
     }
 
@@ -200,13 +237,51 @@ def assemble_privileged_factors(privileged_factor_blocks, stoch_factors):
     }
 
 
+def _temporal_window(bundle, time_index, batch_size, device, *, window=TEMPORAL_WINDOW):
+    """Build a (B, K, n_features) tensor of the last `window` business days of trajectory
+    signals at the current decision step. Features per timepoint: per-commodity spot prices
+    (using the full history+sim timeline) followed by the global liability MtM. The history
+    prefix added at bundle build (`_prepend_history_prefix`) ensures the lookback is always
+    in-bounds for any sim-time decision step. Channel ordering is deterministic — same as the
+    iteration order of `bundle['spot_price_history']`."""
+    spot_history = bundle.get('spot_price_history') or {}
+    liability_mtm = bundle.get('liability_mtm')
+    K = int(window)
+    t_end = int(time_index) + 1
+    t_start = max(0, t_end - K)
+    channels = []
+    for commodity in spot_history.keys():
+        S = _full_spot_timeline(bundle, commodity)
+        if S is None:
+            continue
+        # Log-prices: stationary scale, robust to spot levels across commodities.
+        slice_t = S[t_start:t_end].clamp_min(1e-9).log().to(device=device, dtype=torch.float32)
+        if slice_t.shape[0] < K:
+            pad = slice_t[:1].expand(K - slice_t.shape[0], -1)
+            slice_t = torch.cat([pad, slice_t], dim=0)
+        channels.append(slice_t)
+    if liability_mtm is not None:
+        slice_t = liability_mtm[t_start:t_end].to(device=device, dtype=torch.float32)
+        if slice_t.shape[0] < K:
+            pad = slice_t[:1].expand(K - slice_t.shape[0], -1)
+            slice_t = torch.cat([pad, slice_t], dim=0)
+        channels.append(slice_t)
+    if not channels:
+        return torch.zeros((batch_size, K, 0), dtype=torch.float32, device=device)
+    # Stack to (n_features, K, B) then permute to (B, K, n_features).
+    stacked = torch.stack(channels, dim=0).permute(2, 1, 0).contiguous()
+    return stacked
+
+
 def _full_spot_timeline(bundle, commodity):
     """Return the (H+T_sim, B) spot tensor for `commodity`, made of JSON history (rows 0..H-1)
-    concatenated with the simulator's CommodityPrice factor (rows H..)."""
+    concatenated with the simulator's CommodityPrice factor (rows H..). `commodity` is the
+    canonical factor name produced by `utils.check_tuple_name` (e.g. 'CommodityPrice.PLATINUM');
+    the bundle's `spot_price_history` and `factors` dicts both key by that same form."""
     spot_history = bundle.get('spot_price_history') or {}
     factors = bundle.get('factors') or {}
     hist = spot_history.get(commodity)
-    sim = factors.get(f'CommodityPrice:{commodity}')
+    sim = factors.get(commodity)
     if hist is None or sim is None:
         return None
     sim_full = sim.to(dtype=torch.float32)
@@ -254,16 +329,21 @@ def compute_implied_atm_vol(bundle, price_models, *, tenor_days=30, factor_modul
     T = float(tenor_days) / utils.DAYS_IN_YEAR
     out = {}
     for commodity in spot_history.keys():
-        spot_key = f'CommodityPrice:{commodity}'
-        model_key = f'{factor_module}.{commodity}'
-        if spot_key not in factors or model_key not in price_models:
+        # `commodity` is the canonical factor name (e.g. 'CommodityPrice.PLATINUM').
+        # The bundle keys factors by the same name. price_models is keyed by model name
+        # (e.g. 'LogOUSpotModel.PLATINUM') — derive the bare underlying via tuple split.
+        if commodity not in factors:
+            continue
+        bare_commodity = commodity.split('.', 1)[1] if '.' in commodity else commodity
+        model_key = f'{factor_module}.{bare_commodity}'
+        if model_key not in price_models:
             continue
         params = price_models[model_key]
         kappa = max(float(params['Kappa']), 1e-9)
         sigma = float(params['Sigma'])
         integrated_var = sigma * sigma * (1.0 - _math.exp(-2.0 * kappa * T)) / (2.0 * kappa)
         iv = _math.sqrt(max(integrated_var / max(T, 1e-9), 0.0))
-        sim = factors[spot_key]
+        sim = factors[commodity]
         T_full, B = sim.shape
         out[commodity] = torch.full((T_full, B), float(iv), dtype=torch.float32, device=sim.device)
     return out
@@ -310,12 +390,23 @@ def compute_cross_delta(bundle, window=PRICE_ZSCORE_WINDOW, eps=1e-6):
     tradables = bundle.get('tradables') or {}
     if liability_mtm is None or not tradables:
         return {}
+    # _prepend_history_prefix replicates `mtm[0]` for the H history rows AND keeps `mtm[0]` at
+    # index H (concat of prefix + original), so dL = 0 for every transition s < H. Without
+    # excluding those transitions, the rolling regression's denominator (Σ dP² over history)
+    # dominates while the numerator stays zero — cross_delta reads artificially flat-at-zero
+    # for the first ~window sim days, exactly when the early hedging decisions matter. Zero dP
+    # at history transitions so both num and den exclude them cleanly.
+    days = bundle.get('time_grid_days')
+    history_size = int((days < 0).sum().item()) if days is not None else 0
     L = liability_mtm.to(dtype=torch.float32)
     dL = L[1:] - L[:-1]
     out = {}
     for name, price in tradables.items():
         P = price.to(dtype=torch.float32)
         dP = P[1:] - P[:-1]
+        if history_size > 0:
+            dP = dP.clone()
+            dP[:history_size] = 0
         T = P.shape[0]
         zeros = torch.zeros_like(dP[:1])
         # cumulative sums prepended with zero so cum_sum[t] = Σ_{s=0..t-1} (dP·dL)[s]
@@ -368,7 +459,7 @@ def _instruments_state(bundle, state, time_index, layout, batch_size, device):
             torch.zeros((batch_size, 0), dtype=torch.bool, device=device),
         )
     base_date = pd.Timestamp(bundle['meta']['base_date'])
-    current_day = float(bundle['time_grid_days'][time_index].item())
+    current_day = float(bundle['time_grid_days_cpu'][time_index])
     columns = []
     ids_rows = []
     cumulative_pnl_state = state.get('cumulative_pnl', {})
@@ -468,7 +559,7 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
             mtm_prev = mtm_prev.expand(batch_size, 1).contiguous()
     # Portfolio-level aggregates over instruments, bucketed by time-to-expiry.
     base_date = pd.Timestamp(bundle['meta']['base_date'])
-    current_day = float(time_grid_days[time_index].item())
+    current_day = float(bundle['time_grid_days_cpu'][time_index])
     total_pv = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
     near_pv = torch.zeros_like(total_pv)
     mid_pv = torch.zeros_like(total_pv)
@@ -492,20 +583,9 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
     residual_exposure = total_pv + mtm_now
     # Delta coverage: fraction of leg notional (in underlying units) covered by the hedge book.
     # Unitless and bounded around [-1, 0] for short hedges in the regime we care about; 1.0 means
-    # the short book exactly offsets the leg's volume. Previous formulation (-total_pv / |mtm|)
-    # mostly tracked price level since position notional ($M) and swap MTM ($k) are 100x apart.
-    legs_bundle = bundle.get('legs') or {}
-    legs_features = legs_bundle.get('features')
-    leg_feat_names = tuple(legs_bundle.get('feature_names', ()))
-    if legs_features is not None and 'volume' in leg_feat_names:
-        vol_idx = leg_feat_names.index('volume')
-        leg_vol = legs_features[..., vol_idx]
-        while leg_vol.ndim > 1:
-            leg_vol = leg_vol[0]
-        total_leg_volume = float(leg_vol.abs().sum().item())
-    else:
-        total_leg_volume = 0.0
-    coverage_ratio = -total_oz / max(total_leg_volume, 1.0)
+    # the short book exactly offsets the leg's volume. Cached on the bundle at build time —
+    # constant across the episode, so no per-step .sum().item() sync.
+    coverage_ratio = -total_oz / max(float(bundle.get('total_leg_volume', 0.0)), 1.0)
 
     def _commodity_scalar(bundle_key, commodity):
         store = bundle.get(bundle_key) or {}
@@ -521,6 +601,43 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
     for commodity in referenced:
         for bundle_key, _prefix in PER_COMMODITY_GLOBAL_FEATURES:
             extras.append(_commodity_scalar(bundle_key, commodity))
+    # Hedge-ratio scalars per (tradable, factor). `factor_name` here is the full dotted
+    # factor name (e.g. 'CommodityPrice.PLATINUM') matching bundle['hedge_ratios'] keys.
+    # Missing entries contribute zero and the policy learns to ignore them.
+    hedge_ratios = bundle.get('hedge_ratios') or {}
+    for tradable, factor_name in layout['globals'].get('hedge_ratio_pairs', ()):
+        by_factor = hedge_ratios.get(tradable) or {}
+        tensor = by_factor.get(factor_name)
+        if tensor is None:
+            extras.append(torch.zeros((batch_size, 1), dtype=torch.float32, device=device))
+        else:
+            slice_t = tensor[time_index].to(device=device, dtype=torch.float32).reshape(-1, 1)
+            if slice_t.shape[0] == 1 and slice_t.shape[0] != batch_size:
+                slice_t = slice_t.expand(batch_size, 1).contiguous()
+            extras.append(slice_t)
+    # Lookback features: liability MtM change + per-commodity spot log-return over each
+    # window. The bundle already has `H` rows of history-prefix prepended, so windows of
+    # 1/5/20 are always in-bounds at any decision step. The 60-day window can underflow
+    # for the first ~30 sim decisions; clamp to row 0 (the constant prefix) so the lookup
+    # is well-defined and the change collapses to zero — equivalent to "no info yet".
+    liability_mtm_full = bundle.get('liability_mtm')
+    for w in LOOKBACK_WINDOWS:
+        prev_t = max(0, int(time_index) - int(w))
+        if liability_mtm_full is not None:
+            mtm_then = liability_mtm_full[prev_t].to(device=device, dtype=torch.float32).reshape(-1, 1)
+            if mtm_then.shape[0] == 1 and mtm_then.shape[0] != batch_size:
+                mtm_then = mtm_then.expand(batch_size, 1).contiguous()
+            extras.append(mtm_now - mtm_then)
+        else:
+            extras.append(torch.zeros((batch_size, 1), dtype=torch.float32, device=device))
+        for commodity in referenced:
+            S = _full_spot_timeline(bundle, commodity)
+            if S is None:
+                extras.append(torch.zeros((batch_size, 1), dtype=torch.float32, device=device))
+                continue
+            S_now = S[int(time_index)].to(device=device, dtype=torch.float32).reshape(-1, 1)
+            S_then = S[prev_t].to(device=device, dtype=torch.float32).reshape(-1, 1)
+            extras.append(S_now.clamp_min(1e-9).log() - S_then.clamp_min(1e-9).log())
     return torch.cat(
         [time_to_horizon, mtm_now, mtm_prev, total_pv, residual_exposure, coverage_ratio,
          near_pv, mid_pv, far_pv, *extras],
@@ -542,6 +659,10 @@ def build_entity_state(bundle, state, time_index, layout):
     instr_features, instr_ids, instr_mask = _instruments_state(bundle, state, time_index, layout, batch_size, device)
     cash_features, cash_ids, cash_mask = _cash_state(bundle, state, layout, time_index, batch_size, device)
     globals_features = _globals_state(bundle, state, layout, time_index, batch_size, device)
+    temporal = _temporal_window(
+        bundle, time_index, batch_size, device,
+        window=int(layout.get('temporal', {}).get('window', TEMPORAL_WINDOW)),
+    )
 
     return TensorDict({
         'legs': legs_features,
@@ -554,6 +675,7 @@ def build_entity_state(bundle, state, time_index, layout):
         'cash_accounts_ids': cash_ids,
         'cash_accounts_mask': cash_mask,
         'globals': globals_features,
+        'temporal': temporal,
     }, batch_size=[batch_size])
 
 

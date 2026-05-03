@@ -31,8 +31,6 @@ context of the library.
 The GUI is also designed to work with [voila](https://github.com/voila-dashboards/voila) as a stand-alone dashboard if
 desired. 
 
-An example base_valuation calculation is in the ./examples folder
-
 ## Design Philosophy
 
 The basic idea in riskflow is to define all inputs that would normally be associated with pricing a financial instrument 
