@@ -4796,11 +4796,10 @@ class FloatingEnergyDeal(Deal):
         period_length = period_end - period_start
 
         time_to_period_start = (period_start[None, :] - t_days[:, None]) / utils.DAYS_IN_YEAR
-        time_to_period_end = (period_end[None, :] - t_days[:, None]) / utils.DAYS_IN_YEAR
         time_to_payment = (payment[None, :] - t_days[:, None]) / utils.DAYS_IN_YEAR
         # Negative pre-period encodes "fraction of period_length until averaging starts" — useful
-        # signal. Post-period, values > 1 would duplicate `time_to_period_end < 0`, so clamp at
-        # 1.0 (= "averaging done") to avoid the same number meaning two different things.
+        # signal. Post-period, values > 1 would duplicate "averaging done", so clamp at
+        # 1.0 to avoid the same number meaning two different things.
         accumulation_fraction = np.minimum(
             (t_days[:, None] - period_start[None, :]) / period_length[None, :], 1.0,
         )
@@ -4812,8 +4811,12 @@ class FloatingEnergyDeal(Deal):
             np.stack([fixed_basis, signed_volume], axis=-1),
             dtype=mtm.dtype, device=mtm.device,
         )
+        # `time_to_period_end` was pruned from the leg feature schema — for our deal types
+        # it's a fixed offset from `time_to_payment` (settlement lag) and contributes only
+        # correlated input. Reintroduce alongside `LEG_FEATURE_NAMES` if a future deal type
+        # has non-trivial period-end-to-payment dynamics.
         dynamic = torch.tensor(
-            np.stack([time_to_period_start, time_to_period_end, time_to_payment, accumulation_fraction], axis=-1),
+            np.stack([time_to_period_start, time_to_payment, accumulation_fraction], axis=-1),
             dtype=mtm.dtype, device=mtm.device,
         )
         features = torch.cat([static.unsqueeze(0).expand(T, -1, -1), dynamic], dim=-1)

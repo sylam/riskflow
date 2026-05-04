@@ -58,7 +58,10 @@ def _slice_bundle_episodes(bundle, episode_indices):
         sliced["realized_cashflows"] = {
             ccy: _slice_episode_tensor(t, episode_indices, batch_size) for ccy, t in bundle["realized_cashflows"].items()
         }
-    for key in ("privileged_factors", "cross_delta", "spot_zscore", "spot_realized_vol", "implied_atm_vol", "spot_price_history"):
+    for key in ("privileged_factors", "spot_realized_vol",
+                "spot_trend_20", "spot_trend_60", "spot_stretch_20",
+                "hawkes_h_plus", "hawkes_h_minus", "hawkes_ratio",
+                "spot_price_history"):
         store = bundle.get(key)
         if store:
             sliced[key] = {n: _slice_episode_tensor(t, episode_indices, batch_size) for n, t in store.items()}

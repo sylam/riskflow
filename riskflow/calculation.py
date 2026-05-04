@@ -44,8 +44,10 @@ from . import utils, pricing, construct_instrument
 from .hedge_runtime import construct_torchrl_runtime
 from .torchrl_hedge import run_torchrl_execution
 from .hedge_features import (
-    compute_cross_delta, compute_spot_zscore, assemble_privileged_factors,
-    compute_spot_realized_vol, compute_implied_atm_vol,
+    assemble_privileged_factors,
+    compute_spot_realized_vol,
+    compute_spot_trend, compute_spot_stretch,
+    compute_hawkes_intensities,
 )
 
 
@@ -1663,6 +1665,53 @@ class HedgeRuntimeExecutionResult:
 
 
 class HedgeMonteCarlo(Credit_Monte_Carlo):
+    documentation = ('Calculations', [
+        'A specialisation of `Credit_Monte_Carlo` that wires the same simulated scenario',
+        'engine into a TorchRL training loop. Instead of producing exposure profiles, the',
+        'calculation rolls a structured policy through every simulated path, learning to',
+        'hedge a portfolio of liabilities by trading a configured set of futures (or other',
+        'instruments) over time. The Monte Carlo engine is unchanged — the additions are:',
+        '',
+        '- A **bundle** built per simulation batch containing the trajectories the policy',
+        '  needs at decision time (tradable prices, liability MtM, factor history, leg',
+        '  metadata, AAD-derived hedge ratios, privileged regime indicators for the critic).',
+        '- A **runtime** dict normalised from the JSON `Hedging_Problem` block (action',
+        '  space, position limits, cash accounts, objective, policy and optimiser configs).',
+        '- A **policy** (default: structured entity transformer with optional 1D-conv',
+        '  temporal encoder) that consumes the entity-tokenised bundle slice at each',
+        '  decision step and emits a discrete trade per instrument.',
+        '- A **PPO optimiser** that updates the policy from the rollouts. Supports',
+        '  asymmetric utility rewards, dense tracking shaping, naked-position penalties,',
+        '  CVaR-α path-level advantage weighting, asymmetric Huber on the value head, an',
+        '  entropy floor, and a textbook KL-anchor — all gated behind config flags.',
+        '',
+        'The configuration contract is documented in the',
+        '[Hedging_Problem](../json/index.md#calculation) section of the JSON reference.',
+        '',
+        '### Execution modes',
+        '',
+        '- `Execution_Mode = "optimize_policy"` — train the policy in-process. Returns the',
+        '  trained policy artifact alongside diagnostic metrics (per-epoch losses,',
+        '  reward / |trade| / entropy, advantage stats).',
+        '- `Execution_Mode = "simulate_only"` — build the bundle and exit without training.',
+        '  Useful for offline analysis, evaluation against a saved policy, or computing',
+        '  textbook benchmarks against the same scenarios the optimiser would have seen.',
+        '',
+        '### Output',
+        '',
+        '`out[\'Results\']` contains the trained policy artifact (when `optimize_policy`),',
+        'a textbook-vs-policy comparison table, the simulated bundle, and optimiser',
+        'diagnostics. Wallclock and device statistics are in `out[\'Stats\']`.',
+        '',
+        '### Reusing the inherited Credit Monte Carlo simulator',
+        '',
+        'Because this class inherits from `Credit_Monte_Carlo`, the underlying scenario',
+        'engine — random factor generation, instrument valuation across paths, calendar',
+        'handling, AAD graph construction — is identical. Anything that can be priced for',
+        'a credit-exposure run can be priced as a hedging-problem leg or tradable. The only',
+        'difference is what we do with the simulated MtMs: aggregate into exposures, or',
+        'feed into a learning loop.'
+    ])
 
     @staticmethod
     def _factor_bundle_key(factor_key):
@@ -1840,11 +1889,23 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 scale += max_pos * first_price * cs
             if scale > 0.0:
                 bundle['naked_scale'] = float(scale)
-        price_models = self.config.params.get('Price Models', {})
-        bundle['cross_delta'] = compute_cross_delta(bundle)
-        bundle['spot_zscore'] = compute_spot_zscore(bundle)
         bundle['spot_realized_vol'] = compute_spot_realized_vol(bundle)
-        bundle['implied_atm_vol'] = compute_implied_atm_vol(bundle, price_models)
+        # Direction-aware trend signals: annualised log-return over 20d / 60d (signed),
+        # plus a vol-normalised stretch from the 20d MA. These let the policy identify
+        # benign-trend scenarios where smaller hedges suffice. Realised vol on its own
+        # is direction-blind and doesn't carry that signal.
+        bundle['spot_trend_20'] = compute_spot_trend(bundle, window=20)
+        bundle['spot_trend_60'] = compute_spot_trend(bundle, window=60)
+        bundle['spot_stretch_20'] = compute_spot_stretch(bundle, window=20)
+        # Bivariate marked Hawkes intensities — only populated when the underlying uses a
+        # process that exposes `last_h_plus_path`/`last_h_minus_path` (currently
+        # `HawkesRegimeLogOUSpotModel`). Pad with the same history-prefix the rest of the
+        # bundle already carries so the time axis matches `spot_price_history`.
+        H_prefix = int(runtime.get('history_lookback_business_days', 0)) if runtime else 0
+        h_plus, h_minus, h_ratio = compute_hawkes_intensities(self.stoch_factors, history_prefix=H_prefix)
+        bundle['hawkes_h_plus'] = h_plus
+        bundle['hawkes_h_minus'] = h_minus
+        bundle['hawkes_ratio'] = h_ratio
         # Privileged factors come from the live stoch-process objects (each emits its own surface
         # via privileged_factors()). Per-batch tensors were collected during the simulation loop;
         # concatenate along batch dim using the same multi-commodity convention as the layout.

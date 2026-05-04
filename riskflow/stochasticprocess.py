@@ -24,6 +24,7 @@ from collections import OrderedDict
 import numpy as np
 import scipy.interpolate
 from scipy.linalg import expm as matrix_expm, logm as matrix_logm
+from scipy.optimize import minimize as scipy_minimize
 import torch
 import torch.nn.functional as F
 
@@ -1938,6 +1939,241 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
         return out
 
 
+class CompoundHawkesSpotModel(StochasticProcess):
+    """Pure compound bivariate marked Hawkes spot-price model. No diffusion, no
+    regime switching — log-price moves entirely through up- and down-jump arrivals
+    whose rates self- and cross-excite each other. The mark distribution carries
+    all of the volatility information; there is no separate σ.
+
+    Per step δ, for each of K independent Hawkes components k=1..K:
+
+        N⁺_k ~ Poisson(λ⁺_k δ),  N⁻_k ~ Poisson(λ⁻_k δ)        # arrivals
+        M⁺_{k,i} ~ Exp(η⁺_k),    M⁻_{k,j} ~ Exp(η⁻_k)          # marks (jump sizes)
+        ΣM⁺_k = Σ_{i=1..N⁺_k} M⁺_{k,i}                          # compound Poisson sums
+        ΣM⁻_k = Σ_{j=1..N⁻_k} M⁻_{k,j}
+
+    Net log-return aggregated across components:
+
+        r_t = Σ_k (ΣM⁺_k - ΣM⁻_k)
+        log_S_t = log_S_{t-1} + r_t
+
+    Intensity update (mark-weighted self- and cross-excitation):
+
+        λ⁺_k(t+δ) = μ⁺_k + e^{-β_k δ}(λ⁺_k(t) - μ⁺_k) + α⁺⁺_k ΣM⁺_k + α⁻⁺_k ΣM⁻_k
+        λ⁻_k(t+δ) = μ⁻_k + e^{-β_k δ}(λ⁻_k(t) - μ⁻_k) + α⁺⁻_k ΣM⁺_k + α⁻⁻_k ΣM⁻_k
+
+    Multiple components (K>1) capture multi-scale clustering — e.g., one fast-decay
+    process for daily-burst dynamics and one slow-decay process for multi-week regimes.
+    Per component, the kernel matrix [α⁺⁺ α⁻⁺; α⁺⁻ α⁻⁻] / (β · E[mark]) must have
+    spectral radius < 1 for stationarity.
+
+    JSON config:
+        Components: list of dicts, one per Hawkes component:
+            {Mu_Plus, Mu_Minus, Beta, Alpha_PP, Alpha_NP, Alpha_PN, Alpha_NN, Eta_Plus, Eta_Minus}
+
+        Mu_*  — baseline arrival intensities (events/year). E.g. Mu=10 ≈ 10 events/yr.
+        Beta  — kernel decay rate (1/years). β=5 ≈ 50-day half-life at 252 bd/yr.
+        Alpha_** — 4 mark-weighted cross-excitation gains.
+        Eta_*  — exponential mark rates: E[|mark|] = 1/η in log-return units.
+                 e.g. η=100 ⇒ typical jump = 1%; η=30 ⇒ typical jump = 3.3%.
+    """
+
+    documentation = (
+        'Asset Pricing',
+        ['A pure compound bivariate marked Hawkes spot-price process. Up- and down-jumps '
+         'arrive as Poisson events with self- and cross-exciting intensities; jump sizes '
+         '(marks) are exponentially distributed and supply all of the volatility — there '
+         'is no separate diffusion or regime-switching layer. Per step:',
+         '',
+         '$$ N^+_k \\sim \\text{Pois}(\\lambda^+_k \\delta), \\quad '
+         'N^-_k \\sim \\text{Pois}(\\lambda^-_k \\delta) $$',
+         '',
+         '$$ M^+_{k,i} \\sim \\text{Exp}(\\eta^+_k), \\quad '
+         'M^-_{k,j} \\sim \\text{Exp}(\\eta^-_k) $$',
+         '',
+         '$$ r_t = \\sum_k \\Big(\\sum_i M^+_{k,i} - \\sum_j M^-_{k,j}\\Big), \\quad '
+         '\\log S_t = \\log S_{t-1} + r_t $$',
+         '',
+         'Intensity update with mark-weighted excitation:',
+         '',
+         '$$ \\lambda^+_k(t{+}\\delta) = \\mu^+_k + e^{-\\beta_k\\delta}(\\lambda^+_k(t) - \\mu^+_k) '
+         '+ \\alpha^{++}_k \\Sigma M^+_k + \\alpha^{-+}_k \\Sigma M^-_k $$',
+         '',
+         '$$ \\lambda^-_k(t{+}\\delta) = \\mu^-_k + e^{-\\beta_k\\delta}(\\lambda^-_k(t) - \\mu^-_k) '
+         '+ \\alpha^{+-}_k \\Sigma M^+_k + \\alpha^{--}_k \\Sigma M^-_k $$',
+         '',
+         'Multiple components (K>1) capture multi-scale clustering. Per component, '
+         'spectral radius of the kernel matrix divided by $\\beta_k \\cdot E[M_k]$ must '
+         'be < 1 for stationarity.',
+         '',
+         'Parameters:',
+         '- **Components**: list of dicts, one per Hawkes component '
+         '$\\{\\mu^+, \\mu^-, \\beta, \\alpha^{++}, \\alpha^{-+}, \\alpha^{+-}, \\alpha^{--}, \\eta^+, \\eta^-\\}$.'])
+
+    REQUIRED_COMPONENT_KEYS = (
+        'Mu_Plus', 'Mu_Minus', 'Beta',
+        'Alpha_PP', 'Alpha_NP', 'Alpha_PN', 'Alpha_NN',
+        'Eta_Plus', 'Eta_Minus',
+    )
+
+    def __init__(self, factor, param, implied_factor=None):
+        super().__init__(factor, param)
+        self._validate_params()
+
+    def _validate_params(self):
+        comps = self.param.get('Components')
+        if not isinstance(comps, list) or len(comps) < 1:
+            self.params_ok = False
+            return
+        for c in comps:
+            if not isinstance(c, dict):
+                self.params_ok = False
+                return
+            for k in self.REQUIRED_COMPONENT_KEYS:
+                v = c.get(k)
+                if not isinstance(v, (int, float)) or v < 0.0:
+                    self.params_ok = False
+                    return
+            if c['Beta'] <= 0.0 or c['Eta_Plus'] <= 0.0 or c['Eta_Minus'] <= 0.0:
+                self.params_ok = False
+                return
+
+    @staticmethod
+    def num_factors():
+        return 1
+
+    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        # process_ofs is retained for parity with peers even though we don't draw from
+        # the shared Gaussian pool — Hawkes uses Poisson + Gamma sampling instead.
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
+        dt_arr = np.diff(np.hstack(([0.0], time_grid.time_grid_years)))
+        comps = self.param['Components']
+        K = len(comps)
+
+        def _t(arr):
+            return shared.one.new_tensor(arr)
+
+        # Per-component scalar parameters, packed (K,) for vectorised loop math.
+        self.K = K
+        self.mu_plus = _t(np.array([c['Mu_Plus'] for c in comps], dtype=np.float64))
+        self.mu_minus = _t(np.array([c['Mu_Minus'] for c in comps], dtype=np.float64))
+        self.beta = _t(np.array([c['Beta'] for c in comps], dtype=np.float64))
+        self.alpha_pp = _t(np.array([c['Alpha_PP'] for c in comps], dtype=np.float64))
+        self.alpha_np = _t(np.array([c['Alpha_NP'] for c in comps], dtype=np.float64))
+        self.alpha_pn = _t(np.array([c['Alpha_PN'] for c in comps], dtype=np.float64))
+        self.alpha_nn = _t(np.array([c['Alpha_NN'] for c in comps], dtype=np.float64))
+        self.eta_plus = _t(np.array([c['Eta_Plus'] for c in comps], dtype=np.float64))
+        self.eta_minus = _t(np.array([c['Eta_Minus'] for c in comps], dtype=np.float64))
+
+        # exp(-β_k δ_t) per (component, step) — pre-computed.
+        beta_np = np.array([c['Beta'] for c in comps], dtype=np.float64)
+        self.decay_per_step = _t(np.exp(-np.outer(beta_np, dt_arr)))  # (K, T)
+        self.dt_per_step = _t(dt_arr)                                  # (T,)
+
+        self.log_spot0 = float(torch.log(tensor).item()) if tensor.numel() == 1 else torch.log(tensor)
+
+    @property
+    def correlation_name(self):
+        return 'CompoundHawkesProcess', [()]
+
+    def generate(self, shared_mem):
+        # We don't read the Gaussian pool here, but stay shape-consistent with peers
+        # by sizing the output from t_random_numbers / scenario_horizon.
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        T, B = Z.shape
+        device = Z.device
+        K = self.K
+
+        if isinstance(self.log_spot0, torch.Tensor) and self.log_spot0.numel() > 1:
+            log_spot = self.log_spot0.to(device).expand(B).clone()
+        else:
+            scalar = self.log_spot0 if isinstance(self.log_spot0, float) else float(self.log_spot0.item())
+            log_spot = torch.full((B,), scalar, device=device, dtype=torch.float32)
+
+        # Per-component intensities, initialised at baseline. Shape (K, B).
+        lam_plus = self.mu_plus.to(dtype=torch.float32).view(K, 1).expand(K, B).contiguous()
+        lam_minus = self.mu_minus.to(dtype=torch.float32).view(K, 1).expand(K, B).contiguous()
+
+        log_spot_out = torch.empty((T, B), device=device, dtype=torch.float32)
+        h_plus_path = torch.empty((T, B), device=device, dtype=torch.float32)
+        h_minus_path = torch.empty((T, B), device=device, dtype=torch.float32)
+
+        # Pre-cast scalar param tensors to float32 once.
+        mu_plus = self.mu_plus.to(dtype=torch.float32).view(K, 1)
+        mu_minus = self.mu_minus.to(dtype=torch.float32).view(K, 1)
+        decay = self.decay_per_step.to(dtype=torch.float32)            # (K, T)
+        eta_plus = self.eta_plus.to(dtype=torch.float32).view(K, 1)    # rate of Exp marks
+        eta_minus = self.eta_minus.to(dtype=torch.float32).view(K, 1)
+        a_pp = self.alpha_pp.to(dtype=torch.float32).view(K, 1)
+        a_np = self.alpha_np.to(dtype=torch.float32).view(K, 1)
+        a_pn = self.alpha_pn.to(dtype=torch.float32).view(K, 1)
+        a_nn = self.alpha_nn.to(dtype=torch.float32).view(K, 1)
+        dt_per_step = self.dt_per_step.to(dtype=torch.float32)         # (T,)
+
+        for t in range(T):
+            dt = dt_per_step[t]
+            decay_t = decay[:, t].view(K, 1)                            # (K, 1)
+
+            # Decay intensities toward baselines (Hawkes mean-reverting kernel).
+            lam_plus = mu_plus + decay_t * (lam_plus - mu_plus)
+            lam_minus = mu_minus + decay_t * (lam_minus - mu_minus)
+
+            # Sample event counts per (component, path). torch.poisson takes a rate tensor.
+            n_plus = torch.poisson(lam_plus * dt)                       # (K, B), real-valued >= 0
+            n_minus = torch.poisson(lam_minus * dt)
+
+            # Compound-Poisson mark sums. Σ of N iid Exp(η) is Gamma(N, rate=η);
+            # for N=0 the sum is 0 (Gamma(0, ·) is degenerate, mask it out).
+            mask_p = (n_plus > 0).to(dtype=torch.float32)
+            mask_n = (n_minus > 0).to(dtype=torch.float32)
+            shape_p = n_plus.clamp(min=1.0)
+            shape_n = n_minus.clamp(min=1.0)
+            sum_mp = mask_p * torch.distributions.Gamma(shape_p, eta_plus).sample()    # (K, B)
+            sum_mn = mask_n * torch.distributions.Gamma(shape_n, eta_minus).sample()
+
+            # Net log-return summed across components.
+            r_t = (sum_mp - sum_mn).sum(dim=0)                          # (B,)
+            log_spot = log_spot + r_t
+            log_spot_out[t] = log_spot
+
+            # Mark-weighted intensity update.
+            lam_plus = lam_plus + a_pp * sum_mp + a_np * sum_mn
+            lam_minus = lam_minus + a_pn * sum_mp + a_nn * sum_mn
+
+            # Aggregate (sum across K) for the bundle/feature surface.
+            h_plus_path[t] = lam_plus.sum(dim=0)
+            h_minus_path[t] = lam_minus.sum(dim=0)
+
+        self.last_h_plus_path = h_plus_path
+        self.last_h_minus_path = h_minus_path
+        return torch.exp(log_spot_out)
+
+    @classmethod
+    def privileged_layout(cls, param):
+        K = len(param.get('Components') or [])
+        return {
+            'hawkes_h_plus_total': 1,
+            'hawkes_h_minus_total': 1,
+            'hawkes_ratio_total': 1,
+            # Per-component intensities for asymmetric critic — gives the critic visibility
+            # into multi-scale clustering structure that the actor only sees aggregated.
+            'hawkes_h_plus_components': K,
+            'hawkes_h_minus_components': K,
+        }
+
+    def privileged_factors(self, simulated):
+        H_plus = self.last_h_plus_path.to(dtype=torch.float32)
+        H_minus = self.last_h_minus_path.to(dtype=torch.float32)
+        ratio = H_minus / (H_plus + H_minus + 1.0e-8)
+        return {
+            'hawkes_h_plus_total': H_plus.unsqueeze(-1),
+            'hawkes_h_minus_total': H_minus.unsqueeze(-1),
+            'hawkes_ratio_total': ratio.unsqueeze(-1),
+        }
+
+
 class MarkovSwitchingLogOUSpotCalibration(object):
     """Baum-Welch (EM) calibration of MarkovSwitchingLogOUSpotModel from a daily price series.
 
@@ -2108,6 +2344,191 @@ class MarkovSwitchingLogOUSpotCalibration(object):
                 'Initial_State_Probs': [float(x) for x in fit['stationary_probs']],
                 'Calibration_DT_Years': dt,
             },
+            [[1.0]],
+            dt,
+        )
+
+
+class CompoundHawkesSpotCalibration(object):
+    """MLE calibration of `CompoundHawkesSpotModel` (K=1 component) from a daily price series.
+
+    Extracts events via a magnitude threshold τ on |r_t|: days with r_t > τ are "up events"
+    (mark = r_t), days with r_t < -τ are "down events" (mark = -r_t), and |r_t| ≤ τ are
+    non-events. Fits the 9 K=1 parameters {μ⁺, μ⁻, β, α⁺⁺, α⁻⁺, α⁺⁻, α⁻⁻, η⁺, η⁻} by
+    maximising the discrete-time Poisson log-likelihood:
+
+        log L_t = log P(N⁺_t, N⁻_t | λ⁺(t), λ⁻(t)) + 1[event]·log f_M(|r_t| | η_sign)
+
+        with N⁺_t, N⁻_t ∈ {0, 1}; the intensities recurse:
+
+        λ⁺(t+1) = μ⁺ + e^{-βδ}(λ⁺(t) - μ⁺) + α⁺⁺ M_t·1[up] + α⁻⁺ M_t·1[down]
+        λ⁻(t+1) = μ⁻ + e^{-βδ}(λ⁻(t) - μ⁻) + α⁺⁻ M_t·1[up] + α⁻⁻ M_t·1[down]
+
+    Optimisation in log-parameter space (params = exp(θ)) so positivity is enforced; uses
+    L-BFGS-B with multi-start. K>1 calibration requires an EM/SMC scheme to assign events
+    to components and is deferred — for K>1 calibrate K=1 then split the kernel manually.
+
+    Hyperparameters (read from `param` if provided):
+        Threshold_Quantile  — quantile of |r| above which events are extracted (default 0.5)
+        Threshold_Abs       — explicit threshold (overrides quantile if set)
+        N_Restarts          — multi-start optimiser restarts (default 4)
+        N_Iter              — L-BFGS max iterations per start (default 500)
+        Seed                — RNG for init perturbation (default 42)
+        Tol                 — relative LL tolerance (default 1e-6)
+    """
+
+    def __init__(self, model, param):
+        self.model = model
+        self.param = param
+        self.num_factors = 1
+
+    @staticmethod
+    def _extract_events(log_returns, threshold):
+        """Classify each step as up-event (+1), down-event (-1), or non-event (0)."""
+        sign = np.zeros_like(log_returns, dtype=np.int8)
+        sign[log_returns > threshold] = 1
+        sign[log_returns < -threshold] = -1
+        marks = np.abs(log_returns)
+        return sign, marks
+
+    @staticmethod
+    def _neg_log_lik(log_theta, sign, marks, dt):
+        """Discrete-time Poisson log-likelihood under the K=1 Hawkes recursion. log_theta packs
+        log of (μ⁺, μ⁻, β, α⁺⁺, α⁻⁺, α⁺⁻, α⁻⁻, η⁺, η⁻); positivity enforced via exp."""
+        mu_p, mu_m, beta, a_pp, a_np, a_pn, a_nn, eta_p, eta_m = np.exp(log_theta)
+        decay = np.exp(-beta * dt)
+
+        T = sign.shape[0]
+        lam_p = mu_p
+        lam_m = mu_m
+        log_lik = 0.0
+
+        for t in range(T):
+            # Discrete-time joint Poisson likelihood for at-most-one-event-per-side per step.
+            #   N⁺=1, N⁻=0  (up event):    log(λ⁺δ) − λ⁺δ − λ⁻δ
+            #   N⁺=0, N⁻=1  (down event):  log(λ⁻δ) − λ⁺δ − λ⁻δ
+            #   N⁺=0, N⁻=0  (no event):    − λ⁺δ − λ⁻δ
+            base = -(lam_p + lam_m) * dt
+            s = sign[t]
+            m = marks[t]
+            if s == 1:
+                ll_t = np.log(max(lam_p * dt, 1.0e-300)) + base + np.log(eta_p) - eta_p * m
+            elif s == -1:
+                ll_t = np.log(max(lam_m * dt, 1.0e-300)) + base + np.log(eta_m) - eta_m * m
+            else:
+                ll_t = base
+            log_lik += ll_t
+
+            # Mark-weighted excitation only when an event was observed.
+            if s == 1:
+                lam_p = mu_p + decay * (lam_p - mu_p) + a_pp * m
+                lam_m = mu_m + decay * (lam_m - mu_m) + a_pn * m
+            elif s == -1:
+                lam_p = mu_p + decay * (lam_p - mu_p) + a_np * m
+                lam_m = mu_m + decay * (lam_m - mu_m) + a_nn * m
+            else:
+                lam_p = mu_p + decay * (lam_p - mu_p)
+                lam_m = mu_m + decay * (lam_m - mu_m)
+
+        return -log_lik
+
+    @classmethod
+    def _stationarity_radius(cls, mu_p, mu_m, beta, a_pp, a_np, a_pn, a_nn, eta_p, eta_m):
+        """Spectral radius of the branching matrix G = αᵀ·diag(E[M⁺], E[M⁻])/β. < 1 ⇒ stationary."""
+        kernel = np.array([[a_pp, a_pn], [a_np, a_nn]])
+        em = np.array([1.0 / eta_p, 1.0 / eta_m])
+        G = kernel.T * em[None, :] / beta
+        return float(max(abs(np.linalg.eigvals(G))))
+
+    @classmethod
+    def _fit(cls, prices, dt, threshold_quantile=0.5, threshold_abs=None,
+             n_restarts=4, n_iter=500, seed=42, tol=1.0e-6):
+        rng = np.random.default_rng(seed)
+        X = np.log(np.asarray(prices, dtype=np.float64))
+        if len(X) < 100:
+            raise ValueError('Need at least ~100 observations for stable Hawkes fit')
+        log_returns = np.diff(X)
+        threshold = (float(threshold_abs) if threshold_abs is not None
+                     else float(np.quantile(np.abs(log_returns), threshold_quantile)))
+        sign, marks = cls._extract_events(log_returns, threshold)
+        n_up = int((sign == 1).sum())
+        n_dn = int((sign == -1).sum())
+        n_no = int((sign == 0).sum())
+
+        # Method-of-moments init: per-side baseline rate from event count, mark scale from
+        # mean of in-class marks, β default ≈ 5 (50d half-life), α small to start near additive.
+        T = len(log_returns)
+        mu_p_init = max(n_up / (T * dt), 1.0e-3)
+        mu_m_init = max(n_dn / (T * dt), 1.0e-3)
+        em_p_init = float(marks[sign == 1].mean()) if n_up else float(marks.mean())
+        em_m_init = float(marks[sign == -1].mean()) if n_dn else float(marks.mean())
+        eta_p_init = 1.0 / max(em_p_init, 1.0e-6)
+        eta_m_init = 1.0 / max(em_m_init, 1.0e-6)
+        # α scaled so initial branching ratio ≈ 0.3 — meaningful but well stationary.
+        target_branch = 0.3
+        beta_init = 5.0
+        a_init = target_branch * beta_init / max(em_p_init, em_m_init)
+
+        log_theta_0 = np.log(np.array([
+            mu_p_init, mu_m_init, beta_init,
+            a_init, a_init, a_init, a_init,
+            eta_p_init, eta_m_init,
+        ]))
+
+        best = None
+        for r in range(n_restarts):
+            jitter = rng.normal(0.0, 0.3, size=log_theta_0.shape)
+            x0 = log_theta_0 if r == 0 else log_theta_0 + jitter
+            res = scipy_minimize(
+                cls._neg_log_lik, x0, args=(sign, marks, dt),
+                method='L-BFGS-B', tol=tol,
+                options={'maxiter': n_iter, 'disp': False},
+            )
+            if best is None or res.fun < best.fun:
+                best = res
+
+        params = np.exp(best.x)
+        mu_p, mu_m, beta, a_pp, a_np, a_pn, a_nn, eta_p, eta_m = params
+        rho = cls._stationarity_radius(*params)
+
+        return {
+            'components': [{
+                'Mu_Plus': float(mu_p),
+                'Mu_Minus': float(mu_m),
+                'Beta': float(beta),
+                'Alpha_PP': float(a_pp),
+                'Alpha_NP': float(a_np),
+                'Alpha_PN': float(a_pn),
+                'Alpha_NN': float(a_nn),
+                'Eta_Plus': float(eta_p),
+                'Eta_Minus': float(eta_m),
+            }],
+            'log_likelihood': float(-best.fun),
+            'iterations': int(best.nit),
+            'threshold': threshold,
+            'event_counts': {'up': n_up, 'down': n_dn, 'none': n_no},
+            'mean_mark_up': em_p_init,
+            'mean_mark_down': em_m_init,
+            'spectral_radius': rho,
+            'stationary': rho < 1.0,
+        }
+
+    def calibrate(self, data_frame, vol_shift=0.0, num_business_days=252.0):
+        """Fit CompoundHawkesSpotModel (K=1) to the first column of `data_frame`. Hyperparameters
+        (Threshold_Quantile, Threshold_Abs, N_Restarts, N_Iter, Seed, Tol) read from self.param."""
+        threshold_q = float(self.param.get('Threshold_Quantile', 0.5))
+        threshold_abs = self.param.get('Threshold_Abs', None)
+        n_restarts = int(self.param.get('N_Restarts', 4))
+        n_iter = int(self.param.get('N_Iter', 500))
+        seed = int(self.param.get('Seed', 42))
+        tol = float(self.param.get('Tol', 1.0e-6))
+        prices = data_frame.iloc[:, 0].dropna().astype(float).values
+        dt = 1.0 / float(num_business_days)
+        fit = self._fit(prices, dt, threshold_quantile=threshold_q,
+                        threshold_abs=threshold_abs, n_restarts=n_restarts,
+                        n_iter=n_iter, seed=seed, tol=tol)
+        return utils.CalibrationInfo(
+            {'Components': fit['components']},
             [[1.0]],
             dt,
         )

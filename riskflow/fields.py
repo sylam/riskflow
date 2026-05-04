@@ -345,6 +345,8 @@ mapping = {
                 ["Kappa", "Theta", "sigma"],
             "MarkovSwitchingLogOUSpotModel":
                 ["States", "Transition_Matrix", "Initial_State_Probs", "Calibration_DT_Years"],
+            "CompoundHawkesSpotModel":
+                ["Components"],
             "SingleRegimeOU1FactorKalmanModel":
                 ["Kappa", "Theta", "sigma"],
             "PCAInterestRateModel":
@@ -401,6 +403,15 @@ mapping = {
                                      'Step size (in years) of the calibrated transition matrix; the model '
                                      're-discretises P per simulation step via the CTMC generator',
                                      'value': 1.0 / 252.0},
+            # CompoundHawkesSpotModel: list of K bivariate marked Hawkes components.
+            # Each component carries baseline intensities (Mu_*), kernel decay (Beta),
+            # the 4 cross-excitation gains (Alpha_**) and exponential mark rates
+            # (Eta_*; E[|jump|] = 1/η in log-return units). K=1 is the standard model;
+            # K>1 captures multi-scale clustering (e.g. fast burst + slow regime).
+            'Components': {'widget': 'Container', 'description':
+                           'List of Hawkes components: each {Mu_Plus, Mu_Minus, Beta, '
+                           'Alpha_PP, Alpha_NP, Alpha_PN, Alpha_NN, Eta_Plus, Eta_Minus}',
+                           'value': []},
         },
     },
 
@@ -412,7 +423,7 @@ mapping = {
     # list mapping risk factors to allowable stochastic processes
     'Process_factor_map': {
         "Correlation": [],
-        "CommodityPrice": ['LogOUSpotModel', 'MarkovSwitchingLogOUSpotModel'],
+        "CommodityPrice": ['LogOUSpotModel', 'MarkovSwitchingLogOUSpotModel', 'CompoundHawkesSpotModel'],
         "CommodityPriceVol": [],
         "ConvenienceYield": [],
         "EquityPriceVol": [],

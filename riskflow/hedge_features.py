@@ -9,7 +9,10 @@ LEG_FEATURE_NAMES = (
     'fixed_basis',
     'volume',
     'time_to_period_start',
-    'time_to_period_end',
+    # time_to_period_end pruned — for our deal types it differs from `time_to_payment`
+    # by a fixed settlement-lag offset and is therefore highly correlated. Reintroduce
+    # for deal structures with non-trivial period-end-to-payment dynamics (deferred
+    # settlement, conditional payments).
     'time_to_payment',
     'accumulation_fraction',
 )
@@ -21,11 +24,15 @@ INSTRUMENT_FEATURE_NAMES = (
     'inventory',
     'position_value',
     'time_to_expiry',
-    'contract_size',
+    # contract_size pruned — constant per instrument and already implicit via the
+    # categorical `instrument_type_id` embedding; never varies during a rollout.
     'is_tradable_now',
     'cumulative_pnl',
     'time_held',
-    'cross_delta',
+    # cross_delta pruned — was a per-path rolling-regression proxy for d(MtM)/d(spot)
+    # over the per-instrument tradable; the AAD-derived `hedge_ratio_*` globals now
+    # provide the exact derivative, making cross_delta the noisy version of a feature
+    # we have cleanly.
 )
 
 PRICE_MOMENTUM_LOOKBACK = 1
@@ -33,15 +40,18 @@ PRICE_ZSCORE_WINDOW = 20
 
 INSTRUMENT_ID_NAMES = ('currency', 'underlying', 'instrument_type')
 
-CASH_FEATURE_NAMES = ('balance', 'margin_balance', 'realized_cashflow', 'realized_cashflow_prev')
+CASH_FEATURE_NAMES = ('balance', 'margin_balance', 'realized_cashflow_today')
 CASH_ID_NAMES = ('currency',)
 
 GLOBAL_BASE_FEATURE_NAMES = (
     'time_to_horizon',
     'liability_mtm',
-    'liability_mtm_prev',
+    # liability_mtm_prev intentionally pruned — `liability_mtm_change_1d` lookback already
+    # carries the delta (the only informative quantity); the lagged absolute level is
+    # redundant.
     'total_position_value',     # sum of position_value across all instruments (negative if net short)
-    'residual_exposure',         # portfolio + liability_mtm (zero = fully hedged)
+    # residual_exposure intentionally pruned — derivable from `liability_mtm + total_position_value`
+    # in one linear unit; carrying it is a free hint that costs a correlated input.
     'coverage_ratio',            # -(Σ position × contract_size) / Σ |leg.Volume| — unitless delta coverage; 1.0 = fully hedged short
     'near_position_value',       # sum of position_value for instruments with ttf < 60d
     'mid_position_value',        # 60d <= ttf < 180d
@@ -51,9 +61,24 @@ GLOBAL_BASE_FEATURE_NAMES = (
 # Per-commodity globals appended after the base block, suffixed with the commodity name.
 # (bundle_key, name_prefix) pairs — order is preserved in feature names.
 PER_COMMODITY_GLOBAL_FEATURES = (
-    ('spot_zscore', 'spot_zscore_20d'),
+    # spot_zscore_20d intentionally pruned — vol-normalised `spot_stretch_20d` below
+    # supersedes it (both are mean-reversion proximity; stretch's RV-normalised denominator
+    # adapts to vol regime more cleanly than zscore's price-STD denominator).
     ('spot_realized_vol', 'spot_realized_vol_20d'),
-    ('implied_atm_vol', 'implied_atm_vol_30d'),
+    # Direction-aware trend stack — signed log-return at two horizons + vol-normalised
+    # stretch against the 20d moving average. The realised-vol feature above is
+    # direction-blind; these tell the policy which way the underlying is moving and
+    # whether current price is stretched relative to its recent path.
+    ('spot_trend_20', 'spot_trend_20d'),
+    ('spot_trend_60', 'spot_trend_60d'),
+    ('spot_stretch_20', 'spot_stretch_20d'),
+    # Bivariate marked Hawkes intensities (only populated when the underlying uses
+    # `HawkesRegimeLogOUSpotModel`; zero-filled for non-Hawkes processes via the
+    # runtime feeder's missing-key handling). h_plus/h_minus capture self- and cross-
+    # excitation magnitudes; ratio = H- / (H+ + H-) summarises directional bias.
+    ('hawkes_h_plus', 'hawkes_h_plus'),
+    ('hawkes_h_minus', 'hawkes_h_minus'),
+    ('hawkes_ratio', 'hawkes_ratio'),
 )
 
 # Trajectory lookbacks (business days) on liability_mtm and per-commodity spot. Generic
@@ -61,6 +86,12 @@ PER_COMMODITY_GLOBAL_FEATURES = (
 # the underlying / liability has been moving so the policy can distinguish "stable at $X"
 # from "rapidly evolving toward $X".
 LOOKBACK_WINDOWS = (1, 5, 20, 60)
+# Spot-only lookback windows. The 20d and 60d horizons are omitted because the
+# direction-aware `spot_trend_20d`/`spot_trend_60d` features carry the same information
+# annualised. The 5d horizon is also omitted — for monotone-MtM deals (which ours is)
+# `liability_mtm_change_5d` overlaps heavily with it. Only the 1d short-momentum signal
+# remains, since no other feature covers it.
+SPOT_LOOKBACK_WINDOWS = (1,)
 
 # Temporal-encoder window: number of business days of history fed into the 1D-conv
 # trajectory token. The conv learns its own temporal weighting (vs the hand-picked
@@ -76,9 +107,11 @@ def build_global_feature_names(referenced_commodities, hedge_ratio_pairs=()):
             names.append(f'{prefix}_{commodity}')
     for tradable, commodity in hedge_ratio_pairs:
         names.append(f'hedge_ratio_{tradable}_{commodity}')
-    # Lookback diagnostics: liability MtM change + per-commodity log-return per window.
+    # Lookback diagnostics: liability MtM change at all windows (no redundancy elsewhere)
+    # + per-commodity short-horizon spot log-return (long-horizon spot covered by trend stack).
     for w in LOOKBACK_WINDOWS:
         names.append(f'liability_mtm_change_{w}d')
+    for w in SPOT_LOOKBACK_WINDOWS:
         for commodity in referenced_commodities:
             names.append(f'spot_logret_{w}d_{commodity}')
     return tuple(names)
@@ -209,6 +242,33 @@ def _privileged_name(factor_name, attr_name, multi):
     return f'{factor_name.lower()}_{attr_name}' if multi else attr_name
 
 
+def compute_hawkes_intensities(stoch_factors, history_prefix=0):
+    """Pull bivariate Hawkes intensities (H+, H-, ratio) from each stoch process exposing
+    `last_h_plus_path`/`last_h_minus_path`. Returns three per-commodity dicts keyed by the
+    canonical factor name (matching `bundle['spot_price_history']` keys), each with shape
+    (history_prefix + T_sim, B). The history-prefix rows are zero-filled (no excitement
+    before sim start) so the time axis aligns with the post-prefix bundle. Commodities whose
+    process doesn't expose Hawkes intensities are simply absent from the output dicts;
+    the runtime feeder zero-fills missing keys."""
+    h_plus_out, h_minus_out, ratio_out = {}, {}, {}
+    for factor, process in (stoch_factors or {}).items():
+        h_plus = getattr(process, 'last_h_plus_path', None)
+        h_minus = getattr(process, 'last_h_minus_path', None)
+        if h_plus is None or h_minus is None:
+            continue
+        commodity = utils.check_tuple_name(factor)
+        if history_prefix > 0:
+            zero = torch.zeros((int(history_prefix),) + tuple(h_plus.shape[1:]),
+                               device=h_plus.device, dtype=h_plus.dtype)
+            h_plus = torch.cat([zero, h_plus], dim=0)
+            h_minus = torch.cat([zero, h_minus], dim=0)
+        ratio = h_minus / (h_plus + h_minus + 1e-8)
+        h_plus_out[commodity] = h_plus
+        h_minus_out[commodity] = h_minus
+        ratio_out[commodity] = ratio
+    return h_plus_out, h_minus_out, ratio_out
+
+
 def _privileged_multi(stoch_factors):
     """True iff there are multiple distinct primary factor names — drives the prefix decision."""
     return len({f.name[0] for f in (stoch_factors or {})}) > 1
@@ -313,6 +373,74 @@ def compute_spot_realized_vol(bundle, window=PRICE_ZSCORE_WINDOW, min_periods=5,
         rv = (252.0 * sum_w / count[1:]).clamp_min(0.0).sqrt()
         rv[:min_periods] = 0.0
         out[commodity] = rv
+    return out
+
+
+def compute_spot_trend(bundle, *, window):
+    """Annualised log-return over `window` business days, per commodity.
+
+        trend_W(t) = log(S(t) / S(t-W)) * (252 / W)
+
+    Signed direction-and-magnitude trend signal — positive for uptrend, negative for
+    downtrend, magnitude comparable across windows because of the 252/W scaling. Filled
+    with zero for `t < window` (no full lookback yet)."""
+    spot_history = bundle.get('spot_price_history') or {}
+    if not spot_history:
+        return {}
+    out = {}
+    for commodity in spot_history.keys():
+        S = _full_spot_timeline(bundle, commodity)
+        if S is None:
+            continue
+        log_S = S.clamp_min(1e-9).log()
+        T = log_S.shape[0]
+        trend = torch.zeros_like(log_S)
+        if T > window:
+            trend[window:] = (log_S[window:] - log_S[:-window]) * (252.0 / float(window))
+        out[commodity] = trend
+    return out
+
+
+def compute_spot_stretch(bundle, *, window):
+    """Vol-normalised stretch from the rolling moving average:
+
+        stretch_W(t) = (S(t) - MA_W(t)) / (RV_W(t) * S(t))
+
+    Tells the policy how far current price is from its recent path, normalised by the
+    typical move size in that path — values around ±0.5 are noise, ±2 is meaningful
+    stretch (mean-reversion candidate). The denominator normalises across vol regimes:
+    during high-vol periods, larger absolute deviations are normal.
+
+    Reuses `bundle['spot_realized_vol']` if available (which the calculation already
+    computes at the same default 20d window); otherwise falls back to recomputing.
+    """
+    spot_history = bundle.get('spot_price_history') or {}
+    if not spot_history:
+        return {}
+    rv_dict = bundle.get('spot_realized_vol') or {}
+    out = {}
+    for commodity in spot_history.keys():
+        S = _full_spot_timeline(bundle, commodity)
+        if S is None:
+            continue
+        T = S.shape[0]
+        # Vectorised rolling mean via cumulative sum: MA_W(t) = (cum[t+1] - cum[max(0, t-W+1)]) / count
+        cum = torch.cat([torch.zeros_like(S[:1]), S.cumsum(dim=0)], dim=0)  # (T+1, B)
+        idx = torch.arange(T, device=S.device)
+        lo = (idx - window + 1).clamp_min(0)
+        count = (idx - lo + 1).to(dtype=torch.float32).clamp_min(1.0).unsqueeze(-1)
+        ma = (cum[idx + 1] - cum[lo]) / count
+        rv = rv_dict.get(commodity)
+        if rv is None:
+            # No RV available; fall back to price-std normalisation (≈ what spot_zscore uses).
+            sq = (S - ma).pow(2)
+            cum_sq = torch.cat([torch.zeros_like(sq[:1]), sq.cumsum(dim=0)], dim=0)
+            window_sq = cum_sq[idx + 1] - cum_sq[lo]
+            std = (window_sq / count).clamp_min(1e-12).sqrt()
+            denom = std
+        else:
+            denom = (rv * S).clamp_min(1e-9)
+        out[commodity] = (S - ma) / denom
     return out
 
 
@@ -464,7 +592,6 @@ def _instruments_state(bundle, state, time_index, layout, batch_size, device):
     ids_rows = []
     cumulative_pnl_state = state.get('cumulative_pnl', {})
     time_held_state = state.get('time_held', {})
-    cross_delta_bundle = bundle.get('cross_delta') or {}
     tradables_bundle = bundle.get('tradables') or {}
     prev_index = max(time_index - PRICE_MOMENTUM_LOOKBACK, 0)
     for entry in meta:
@@ -476,19 +603,11 @@ def _instruments_state(bundle, state, time_index, layout, batch_size, device):
         last_trade_day = float((entry['last_trade_date'] - base_date).days)
         time_to_expiry = (last_trade_day - current_day) / utils.DAYS_IN_YEAR
         tradable = 1.0 if current_day < last_trade_day else 0.0
-        cs = torch.full_like(price, contract_size)
         tte = torch.full_like(price, time_to_expiry)
         flag = torch.full_like(price, tradable)
         cum_pnl = cumulative_pnl_state.get(name, torch.zeros_like(price)).to(device=device, dtype=torch.float32)
         held_steps = time_held_state.get(name, torch.zeros_like(price)).to(device=device, dtype=torch.float32)
         held_years = held_steps / utils.DAYS_IN_YEAR
-        cd_tensor = cross_delta_bundle.get(name)
-        if cd_tensor is None:
-            cd = torch.zeros_like(price)
-        else:
-            cd = cd_tensor[time_index].to(device=device, dtype=torch.float32)
-            if cd.shape[0] == 1 and cd.shape[0] != batch_size:
-                cd = cd.expand(batch_size).contiguous()
         prev_tensor = tradables_bundle.get(name)
         if prev_tensor is None:
             price_change = torch.zeros_like(price)
@@ -497,7 +616,7 @@ def _instruments_state(bundle, state, time_index, layout, batch_size, device):
             if price_prev.shape[0] == 1 and price_prev.shape[0] != batch_size:
                 price_prev = price_prev.expand(batch_size).contiguous()
             price_change = price - price_prev
-        columns.append(torch.stack([price, price_change, position, position_value, tte, cs, flag, cum_pnl, held_years, cd], dim=-1))
+        columns.append(torch.stack([price, price_change, position, position_value, tte, flag, cum_pnl, held_years], dim=-1))
         ids_rows.append([entry['currency_id'], entry['underlying_id'], entry['instrument_type_id']])
     features = torch.stack(columns, dim=1)
     ids = torch.tensor(ids_rows, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1, -1).contiguous()
@@ -526,15 +645,19 @@ def _cash_state(bundle, state, layout, time_index, batch_size, device):
         margin = state['margin_accounts'].get(name, torch.zeros_like(balance)).to(device=device, dtype=torch.float32)
         cf_tensor = realized_cashflows.get(currency)
         if cf_tensor is None:
-            cf_now = torch.zeros_like(balance)
-            cf_prev = torch.zeros_like(balance)
+            cf_today = torch.zeros_like(balance)
         else:
             cf_now = cf_tensor[time_index].to(device=device, dtype=torch.float32)
             cf_prev = cf_tensor[prev_index].to(device=device, dtype=torch.float32)
             if cf_now.shape[0] == 1 and cf_now.shape[0] != batch_size:
                 cf_now = cf_now.expand(batch_size).contiguous()
                 cf_prev = cf_prev.expand(batch_size).contiguous()
-        columns.append(torch.stack([balance, margin, cf_now, cf_prev], dim=-1))
+            # `cf_tensor` is the cumulative-since-inception cashflow per currency. The agent
+            # only needs today's flow (cumulative levels are recoverable from balance + margin
+            # already in this token); replacing two correlated cumulative scalars with one
+            # delta drops 1 feature and gives a sharper signal.
+            cf_today = cf_now - cf_prev
+        columns.append(torch.stack([balance, margin, cf_today], dim=-1))
         ids_rows.append([entry['currency_id']])
     features = torch.stack(columns, dim=1)
     ids = torch.tensor(ids_rows, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1, -1).contiguous()
@@ -549,14 +672,10 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
     liability_mtm_tensor = bundle.get('liability_mtm')
     if liability_mtm_tensor is None:
         mtm_now = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
-        mtm_prev = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
     else:
-        prev_index = max(time_index - 1, 0)
         mtm_now = liability_mtm_tensor[time_index].to(device=device, dtype=torch.float32).reshape(-1, 1)
-        mtm_prev = liability_mtm_tensor[prev_index].to(device=device, dtype=torch.float32).reshape(-1, 1)
         if mtm_now.shape[0] == 1 and mtm_now.shape[0] != batch_size:
             mtm_now = mtm_now.expand(batch_size, 1).contiguous()
-            mtm_prev = mtm_prev.expand(batch_size, 1).contiguous()
     # Portfolio-level aggregates over instruments, bucketed by time-to-expiry.
     base_date = pd.Timestamp(bundle['meta']['base_date'])
     current_day = float(bundle['time_grid_days_cpu'][time_index])
@@ -580,7 +699,6 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
             mid_pv = mid_pv + pv
         else:
             far_pv = far_pv + pv
-    residual_exposure = total_pv + mtm_now
     # Delta coverage: fraction of leg notional (in underlying units) covered by the hedge book.
     # Unitless and bounded around [-1, 0] for short hedges in the regime we care about; 1.0 means
     # the short book exactly offsets the leg's volume. Cached on the bundle at build time —
@@ -615,11 +733,12 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
             if slice_t.shape[0] == 1 and slice_t.shape[0] != batch_size:
                 slice_t = slice_t.expand(batch_size, 1).contiguous()
             extras.append(slice_t)
-    # Lookback features: liability MtM change + per-commodity spot log-return over each
-    # window. The bundle already has `H` rows of history-prefix prepended, so windows of
-    # 1/5/20 are always in-bounds at any decision step. The 60-day window can underflow
-    # for the first ~30 sim decisions; clamp to row 0 (the constant prefix) so the lookup
-    # is well-defined and the change collapses to zero — equivalent to "no info yet".
+    # Lookback features: liability MtM change at all windows; per-commodity spot
+    # log-return only at short horizons (long-horizon spot returns are redundant with the
+    # annualised `spot_trend_20d`/`spot_trend_60d` features handled via PER_COMMODITY_GLOBAL_FEATURES).
+    # The bundle already has `H` rows of history-prefix prepended, so all windows are
+    # in-bounds; the 60-day MtM window can underflow for the first ~30 sim decisions
+    # (clamp to row 0 → change collapses to zero, "no info yet").
     liability_mtm_full = bundle.get('liability_mtm')
     for w in LOOKBACK_WINDOWS:
         prev_t = max(0, int(time_index) - int(w))
@@ -630,6 +749,8 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
             extras.append(mtm_now - mtm_then)
         else:
             extras.append(torch.zeros((batch_size, 1), dtype=torch.float32, device=device))
+    for w in SPOT_LOOKBACK_WINDOWS:
+        prev_t = max(0, int(time_index) - int(w))
         for commodity in referenced:
             S = _full_spot_timeline(bundle, commodity)
             if S is None:
@@ -639,7 +760,7 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
             S_then = S[prev_t].to(device=device, dtype=torch.float32).reshape(-1, 1)
             extras.append(S_now.clamp_min(1e-9).log() - S_then.clamp_min(1e-9).log())
     return torch.cat(
-        [time_to_horizon, mtm_now, mtm_prev, total_pv, residual_exposure, coverage_ratio,
+        [time_to_horizon, mtm_now, total_pv, coverage_ratio,
          near_pv, mid_pv, far_pv, *extras],
         dim=1,
     )
