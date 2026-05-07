@@ -31,7 +31,7 @@ if __name__=='__main__':
                                  "Currency": "USD",
                                  "Carry": "PLATINUM_CARRY",
                                  "Repo_Rate": "USD-SOFR",
-                                 "Commodity": "PLATINUM",
+                                 "Implied_Basis": "LME_CME",
                                  "Contract_Size": 50
                             },
                             "PL_JUL_2026": {
@@ -39,7 +39,7 @@ if __name__=='__main__':
                                  "Currency": "USD",
                                  "Carry": "PLATINUM_CARRY",
                                  "Repo_Rate": "USD-SOFR",
-                                 "Commodity": "PLATINUM",
+                                 "Implied_Basis": "LME_CME",
                                  "Contract_Size": 50
                             },
                             "PL_OCT_2026": {
@@ -47,7 +47,7 @@ if __name__=='__main__':
                                  "Currency": "USD",
                                  "Carry": "PLATINUM_CARRY",
                                  "Repo_Rate": "USD-SOFR",
-                                 "Commodity": "PLATINUM",
+                                 "Implied_Basis": "LME_CME",
                                  "Contract_Size": 50
                             }
                         },
@@ -91,7 +91,7 @@ if __name__=='__main__':
                             }
                         },
                         "Spot_Price_History": {
-                            "CommodityPrice.PLATINUM": {
+                            "CommodityPrice.PLATINUM_LME": {
                                 "Dates": [
                                     {".Timestamp": "2026-02-26"},
                                     {".Timestamp": "2026-02-27"},
@@ -125,12 +125,13 @@ if __name__=='__main__':
                                     {".Timestamp": "2026-04-09"}
                                 ],
                                 "Prices": [
-                                    1987.4, 1984.6, 1981.2, 1979.3, 1998.3,
-                                    1996.0, 1958.2, 1967.6, 1961.7, 1957.2,
-                                    1961.1, 1968.0, 1998.8, 2016.8, 2020.7,
-                                    2002.4, 1977.0, 1984.3, 2019.1, 2021.2,
-                                    2019.4, 2034.4, 1996.9, 1989.8, 2003.5,
-                                    2027.3, 2021.9, 2032.9, 2040.4, 2062.2
+                                    2365.5,2272.5,
+                                    2351,2123.5,2167.5,2164.5,2119,
+                                    2121.5,2231,2186.5,2172.5,2076,
+                                    2083,2149.5,2087,1939.5,1977,
+                                    1840.5,1896,1951.5,1877.5,1858.5,
+                                    1926.5, 1915.5, 2003.5, 1964.5, 
+                                    1916.5, 1962.5, 2053.0, 2028.5
                                 ]
                             }
                         }
@@ -149,7 +150,7 @@ if __name__=='__main__':
                                 "Sampling_Type": "USD",
                                 "FX_Sampling_Type": "USD",
                                 "Discount_Rate": "USD-SOFR",
-                                "Commodity": "PLATINUM",
+                                "Commodity": "PLATINUM_LME",
                                 "Reference_Type": "PLATINUM",
                                 "Payer_Receiver": "Receiver",
                                 "Payments": {
@@ -165,7 +166,7 @@ if __name__=='__main__':
                                                 ".Timestamp": "2026-07-31"
                                             },                                            
                                             "Volume": 2500.0,
-                                            "Fixed_Basis": -2041.0,
+                                            "Fixed_Basis": -2060.0,
                                             "Price_Multiplier": 1.0,
                                             "FX_Period_Start": {
                                                 ".Timestamp": "2026-07-01"
@@ -187,11 +188,16 @@ if __name__=='__main__':
                             "Instrument_Order": [
                                 "PL_APR_2026", "PL_JUL_2026", "PL_OCT_2026"
                             ],
-                            "Min_Trade_Delta": [
-                                -10, -10, -10
-                            ],
-                            "Max_Trade_Delta": [
-                                10, 10, 10
+                            "Trade_Deltas": [
+                                [-50, -45, -40, -35, -30, -25, -20, -15,
+                                 -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 15, 20, 25, 30, 35, 40, 45, 50],
+                                [-50, -45, -40, -35, -30, -25, -20, -15,
+                                 -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 15, 20, 25, 30, 35, 40, 45, 50],
+                                [-50, -45, -40, -35, -30, -25, -20, -15,
+                                 -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 15, 20, 25, 30, 35, 40, 45, 50]
                             ]
                         },
                         "Model": {
@@ -257,35 +263,12 @@ if __name__=='__main__':
                 }
             },
             "MergeMarketData": {
-                "MarketDataFile": "./data/MarketDataRF.json",
+                "MarketDataFile": "./data/MarketDataRF_platinum_calibrated.json",
                 "ExplicitMarketData": {
                     "System Parameters": {
                         "Base_Currency": "USD"
                     },
                     "Price Factors": {
-                        "EquityPrice.ZAR_ANG": {
-                            "Issuer": "",
-                            "Respect_Default": "Yes",
-                            "Jump_Level": {
-                                ".Percent": 0.0
-                            },
-                            "Currency": "ZAR",
-                            "Interest_Rate": "ZAR-SWAP",
-                            "Spot": 1778.0
-                        },
-                        "EquityPrice.USD_GOOG": {
-                            "Issuer": "",
-                            "Respect_Default": "Yes",
-                            "Jump_Level": {
-                                ".Percent": 0.0
-                            },
-                            "Currency": "USD",
-                            "Interest_Rate": "USD-SOFR",
-                            "Spot": 332.4
-                        },
-                        "BasisCarry.PLATINUM_CARRY": {
-                            "Spot": 0.01
-                        },
                         "FxRate.USD": {
                             "Domestic_Currency": "",
                             "Interest_Rate": "USD-SOFR",
@@ -334,60 +317,15 @@ if __name__=='__main__':
                             },
                             "Currency": "USD"
                         },
-                        "EquityPriceVol.USD.GOOG": {
-                            "Surface": {
-                                ".Curve": {
-                                    "meta": [
-                                        2,
-                                        "linear"
-                                    ],
-                                    "data": [
-                                        [
-                                            1,
-                                            1,
-                                            0.3
-                                        ]
-                                    ]
-                                }
-                            }
-                        },
-                        "EquityPriceVol.ZAR.ANG": {
-                            "Surface": {
-                                ".Curve": {
-                                    "meta": [
-                                        2,
-                                        "linear"
-                                    ],
-                                    "data": [
-                                        [
-                                            1,
-                                            1,
-                                            0.26
-                                        ]
-                                    ]
-                                }
-                            }
-                        },
-                        "CommodityPrice.PLATINUM": {
+                        "CommodityPrice.PLATINUM_LME": {
                             "Currency": "USD",
                             "Interest_Rate": "USD-SOFR",
-                            "Spot": 2033.18,
+                            "Spot": 2055.0,
                             "Property_Aliases": ""
                         },
-                        "DividendRate.USD_GOOG": {
-                            "Currency": "USD",
-                            "Curve": {
-                                ".Curve": {
-                                    "meta": [],
-                                    "data": [
-                                        [
-                                            1.0,
-                                            0.0
-                                        ]
-                                    ]
-                                }
-                            },
-                            "Property_Aliases": ""
+                        "CommodityBasis.LME_CME": {
+                            "Spot": -32.5375,
+                            "Observed_Commodity": "PLATINUM_LME"
                         },
                         "ReferencePrice.PLATINUM": {
                             "Fixing_Curve": {
@@ -432,92 +370,15 @@ if __name__=='__main__':
                             "Fixings": "",
                             "Property_Aliases": ""
                         },
-                        "DividendRate.ZAR_ANG": {
-                            "Currency": "ZAR",
+                        "ForwardRate.PLATINUM_CARRY": {
+                            "Currency": "USD",
                             "Curve": {
                                 ".Curve": {
                                     "meta": [],
                                     "data": [
-                                        [
-                                            0.10684931506849316,
-                                            0.0
-                                        ],
-                                        [
-                                            0.1095890410958904,
-                                            0.09722726725168002
-                                        ],
-                                        [
-                                            0.336986301369863,
-                                            0.031618623496481309
-                                        ],
-                                        [
-                                            0.33972602739726029,
-                                            0.06257297405013339
-                                        ],
-                                        [
-                                            0.6054794520547945,
-                                            0.03510881801907936
-                                        ],
-                                        [
-                                            0.6082191780821918,
-                                            0.05224104179577427
-                                        ],
-                                        [
-                                            0.8931506849315068,
-                                            0.03557518797135548
-                                        ],
-                                        [
-                                            0.8958904109589041,
-                                            0.0470926833061865
-                                        ],
-                                        [
-                                            1.104109589041096,
-                                            0.0382116809953424
-                                        ],
-                                        [
-                                            1.106849315068493,
-                                            0.047958975826108207
-                                        ],
-                                        [
-                                            1.3342465753424658,
-                                            0.039785269473814607
-                                        ],
-                                        [
-                                            1.336986301369863,
-                                            0.04781093817334874
-                                        ],
-                                        [
-                                            1.6027397260273973,
-                                            0.039883312527511437
-                                        ],
-                                        [
-                                            1.6054794520547946,
-                                            0.04651586859571097
-                                        ],
-                                        [
-                                            1.8904109589041097,
-                                            0.03950478115519802
-                                        ],
-                                        [
-                                            1.893150684931507,
-                                            0.04508086918216233
-                                        ],
-                                        [
-                                            2.1013698630136989,
-                                            0.04061392516932747
-                                        ],
-                                        [
-                                            2.1041095890410959,
-                                            0.04586541512023414
-                                        ],
-                                        [
-                                            2.3315068493150687,
-                                            0.04139205500862493
-                                        ],
-                                        [
-                                            2.334246575342466,
-                                            0.046103570929040767
-                                        ]
+                                        [46141, 0.06662175643011484],
+                                        [46232, 0.06673054371954815],
+                                        [46324, 0.06710550489097832]
                                     ]
                                 }
                             }
@@ -1026,7 +887,7 @@ if __name__=='__main__':
                     }
                 }
             },
-            "CalendDataFile": "/media/vretiel/Shared/Data/crstal/AACalendars.cal"
+            "CalendDataFile": "./data/AACalendars.cal"
         }
     }
     '''

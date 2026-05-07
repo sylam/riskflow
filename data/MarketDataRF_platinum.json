@@ -1,0 +1,48 @@
+{
+    "Version": ["AnalyticsVersion", "231.200.901.0"],
+    "MarketData": {
+        "System Parameters": {
+            "Base_Currency": "USD",
+            "Base_Date": null,
+            "Correlations_Healing_Method": "Eigenvalue_Raising",
+            "Exclude_Deals_With_Missing_Market_Data": "No",
+            "Grouping_File": null,
+            "Proxying_Rules_File": null,
+            "Script_Base_Scenario_Multiplier": 1
+        },
+        "Model Configuration": {
+            ".ModelParams": {
+                "modeldefaults": {
+                    "CommodityPrice": "MarkovHMMSpotModel",
+                    "InterestRate": "PCAInterestRateModel",
+                    "ForwardPrice": "CSForwardPriceModel",
+                    "ForwardRate": "VARMixedFactorInterestRateModel",
+                    "FxRate": "GBMAssetPriceModel",
+                    "CommodityBasis": "BasisLinkedSpotModel"
+                },
+                "modelfilters": {}
+            }
+        },
+        "Price Factor Interpolation": {
+            ".ModelParams": {
+                "modeldefaults": {
+                    "InterestRate": "Hermite"
+                },
+                "modelfilters": {}
+            }
+        },
+        "Price Factors": {},
+        "Price Models": {
+            "CSForwardPriceModel.PLATINUM":
+            {
+                "Sigma": 0.2334814157908477,
+                "Alpha": 0.2954751694490799,
+                "Drift": 0.12970475946856183
+            }
+        },
+        "Correlations": {},
+        "Valuation Configuration": {},
+        "Market Prices": {},
+        "Bootstrapper Configuration": {}
+    }
+}

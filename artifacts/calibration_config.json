@@ -1,0 +1,188 @@
+{
+    "CalibrationConfig": {
+        "MarketDataArchiveFile": {
+            "name": "./data/plat_archive.csv",
+            "skiprows": 0,
+            "index_column": 0,
+            "sep": ","
+        },
+        "Calibrations": {
+            "CSForwardPriceModel": {
+                "ID": "",
+                "Method": "CSForwardPriceCalibration",
+                "Use_Pre_Computed_Statistics": "Yes",
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252
+                }
+            },
+            "GBMAssetPriceModel": {
+                "ID": "",
+                "Method": "GBMAssetPriceCalibration",
+                "Use_Pre_Computed_Statistics": "Yes",
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252
+                }
+            },
+            "GBMPriceIndexModel": {
+                "ID": "",
+                "Method": "GBMPriceIndexCalibration",
+                "Use_Pre_Computed_Statistics": "Yes",
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252
+                }
+            },
+            "HullWhite1FactorInterestRateModel": {
+                "ID": "",
+                "Method": "HWInterestRateCalibration",
+                "Calibration_Method": "Pre_Computed_Statistics",
+                "MLE_Parameters": {
+                    "Data_Retrieval_Parameters": {
+                        "Frequency": "1d",
+                        "Calendar": "",
+                        "Business_Days_In_Year": 252,
+                        "Diagnostics_Error_Level": "Info",
+                        "Data_Cleaning_Methods": [
+                            {
+                                "Method_Name": "Data Cleaning ZScore",
+                                "Parameters": {
+                                    "Threshold": 3.09,
+                                    "Window_Size": 36,
+                                    "Perturbation": 0.0001,
+                                    "Replacement_Method": "Remove"
+                                }
+                            }
+                        ]
+                    },
+                    "Tenor": "3M",
+                    "Alpha_Fixed": null,
+                    "Optimization_Parameters": {
+                        "Alpha_Lower_Bound": 0.000001,
+                        "Sigma_Lower_Bound": 0.0001,
+                        "Max_Iterations": 1000,
+                        "Fractional_Tolerance": 1e-8
+                    }
+                }
+            },
+            "HWHazardRateModel": {
+                "ID": "",
+                "Method": "HWHazardRateCalibration",
+                "Use_Pre_Computed_Statistics": "Yes",
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252
+                }
+            },
+            "LogOUSpotModel": {
+                "ID": "",
+                "Method": "LogOUSpotCalibration",
+                "Use_Pre_Computed_Statistics": "Yes",
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252
+                },
+                "Kappa_Max": 10.0,
+                "Sigma_Max": 2.0,
+                "Vol_Shift": 0.0
+            },
+            "SingleRegimeOU1FactorKalmanModel": {
+                "ID": "",
+                "Method": "SingleRegimeOU1FactorKalmanCalibration",
+                "Use_Pre_Computed_Statistics": "Yes",
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252,
+                    "Diagnostics_Error_Level": "Info"
+                },
+                "KF_Max_Iter": 25,
+                "KF_Tol": 0.00001,
+                "Kappa_Max": 10.0,
+                "Sigma_Max": 2.0,
+                "Tau_Floor": 0.0001,
+                "KY_Scale": 0.2,
+                "Theta_Y_Default": 0.0,
+                "Sigma_Y_Default": 0.0,
+                "Beta_Default": 0.0,
+                "Rho_Default": 0.0,
+                "Min_Measurement_Var": 0.000001,
+                "Proxy_Clip_Std": 4.0,
+                "Vol_Shift": 0.0
+            },
+            "PCAInterestRateModel": {
+                "ID": "",
+                "Method": "PCAInterestRateCalibration",
+                "Calibration_Method": "Pre_Computed_Statistics",
+                "Number_Of_PCA_Factors": 3,
+                "Distribution_Type": "Lognormal",
+                "Matrix_Type": "Covariance",
+                "Rate_Drift_Model": "Drift_To_Forward",
+                "MLE_Parameters": {
+                    "Data_Retrieval_Parameters": {
+                        "Frequency": "1d",
+                        "Calendar": "",
+                        "Business_Days_In_Year": 252
+                    },
+                    "Min_Tenor": "1M",
+                    "Reversion_Speed_Fixed": null,
+                    "Reversion_Speed_Lower_Bound": 0.1,
+                    "Reversion_Speed_Upper_Bound": 3.5,
+                    "Yield_Volatility_Upper_Bound": null,
+                    "Exact_Solution_Optimisation_Parameters": {
+                        "Max_Iterations": 1000,
+                        "Fractional_Tolerance": 1e-8,
+                        "Downhill_Simplex_Scale": 0.005
+                    }
+                }
+            },
+            "MarkovHMMSpotModel": {
+                "ID": "",
+                "Method": "MarkovHMMSpotCalibration",
+                "N_States": 3,
+                "N_Iter": 200,
+                "Seed": 42,
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252
+                }
+            },
+            "VARMixedFactorInterestRateModel": {
+                "ID": "",
+                "Method": "VARMixedFactorInterestRateCalibration",
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252
+                }
+            },
+            "BasisLinkedSpotModel": {
+                "ID": "",
+                "Method": "BasisLinkedSpotCalibration",
+                "Nu_Min": 3.0,
+                "Nu_Max": 50.0,
+                "Vol_Window": 21,
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252
+                }
+            }
+        },
+        "BootstrappingPriceFactorSelections": {
+            "BootstrapAll": "False",
+            "Selections": [
+                {
+                    "PriceFactorType": "GBMTSImpliedParameters"
+                }
+            ]
+        }
+    }
+}
