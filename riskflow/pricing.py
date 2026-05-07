@@ -1121,6 +1121,7 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
     tenor_in_days = factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM]
+    settle_in_days = factor_dep['Settlement'] - deal_time[:, utils.TIME_GRID_MTM]
     expiry = discount.code[0][utils.FACTOR_INDEX_Daycount](tenor_in_days)
     vols = utils.calc_time_grid_vol_rate(factor_dep['Volatility'], moneyness, expiry, shared)
 
@@ -1143,7 +1144,7 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
         value = nominal * theo_price
 
     discount_rates = torch.squeeze(
-        utils.calc_discount_rate(discount, tenor_in_days.reshape(-1, 1), shared), dim=1)
+        utils.calc_discount_rate(discount, settle_in_days.reshape(-1, 1), shared), dim=1)
 
     # handle cashflows (if necessary)
     cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], value[-1])

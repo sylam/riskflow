@@ -1144,9 +1144,9 @@ class PCAInterestRateModel(StochasticProcess):
         # also need to pre-calculate the forward curves at time_grid given and pass that to the cuda kernel
         if self.param['Rate_Drift_Model'] == 'Drift_To_Blend':
             hist_mean = scipy.interpolate.interp1d(*np.hstack(
-                ([[0.0], [self.param['Historical_Yield'].array.T[-1][0]]], self.param['Historical_Yield'].array.T)),
-                                                   kind='linear', bounds_error=False,
-                                                   fill_value=self.param['Historical_Yield'].array.T[-1][-1])
+                ([[0.0], [self.param['Historical_Yield'].array.T[-1][0]]],
+                 self.param['Historical_Yield'].array.T)), kind='linear', bounds_error=False,
+                    fill_value=self.param['Historical_Yield'].array.T[-1][-1])
             curve_t0 = self.factor.current_value(self.factor.tenors)
             omega = hist_mean(self.factor.tenors)
             # R_τ(t) = exp(-α t) r_τ(0) + (1 - exp(-α t)) Θ_τ  vectorised over [T, n_tenors]

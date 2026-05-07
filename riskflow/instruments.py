@@ -62,6 +62,73 @@ def generate_dates_forward(end_date, start_date, date_offset, bus_day=None, clip
     return pd.DatetimeIndex(dates)
 
 
+def get_business_day_offsets(calendar_names, calendars, business_days=2):
+
+    def calendar_business_day(calendar_name, calendars):
+        """Return the business-day offset object for a named calendar.
+
+        Falls back to a standard Monday-Friday business day when no calendar is found.
+        """
+        return calendars.get(
+            calendar_name,
+            {'businessday': pd.offsets.BDay(1)}
+        )['businessday']
+
+    """Return the two business-day offsets used for settlement adjustment.
+
+    The adjustment assumes two offsets applied as:
+        bus_day_offsets[0].rollforward(date + bus_day_offsets[1])
+
+    If one calendar is supplied, use it for both sides.
+    If none is supplied, use a standard Monday-Friday calendar.
+    """
+    if calendar_names:
+        names = [x.strip() for x in calendar_names.split(',') if x.strip()]
+        offsets = [business_days * calendar_business_day(name, calendars) for name in names]
+
+        if len(offsets) == 1:
+            offsets = [offsets[0]]
+
+        return offsets[:2]
+
+    return [pd.offsets.BDay(business_days)]
+
+
+def forward_settlement_date(date_to_roll, calendar_names, calendars, business_days=2):
+    """Return expiry plus settlement lag, rolled using the configured calendars."""
+    bus_day_offsets = get_business_day_offsets(calendar_names, calendars, business_days=business_days)
+    if len(bus_day_offsets)>1:
+        return adjust_date(bus_day_offsets[0], False, date_to_roll + bus_day_offsets[1])
+    else:
+        return date_to_roll + bus_day_offsets[0]
+
+
+def option_date_info(field, base_date, calendars, business_days=2):
+    """Build expiry, settlement and forward-settlement offsets for option-style deals.
+
+    Expiry:
+        option expiry / vol expiry date.
+
+    Forward_Settlement:
+        expiry date adjusted by settlement lag; used as T in forward calculations.
+
+    Settlement:
+        explicit cash/payment settlement date if supplied, otherwise Expiry_Date.
+    """
+    expiry_date = field['Expiry_Date']
+    calendar_names = field.get('Calendars')
+
+    adjusted_forward_settlement_date = forward_settlement_date(
+        expiry_date, calendar_names, calendars, business_days=business_days)
+
+    settlement_date = field.get('Settlement_Date', expiry_date)
+    expiry = (expiry_date - base_date).days
+    settlement = (settlement_date - base_date).days
+    forward_settlement = (adjusted_forward_settlement_date - base_date).days
+
+    return expiry, settlement, forward_settlement
+
+
 def calc_factor_index(field, static_offsets, stochastic_offsets, all_tenors={}):
     """Utility function to determine if a factor is static or stochastic and returns its offset in the scenario block"""
     if static_offsets.get(field) is not None:
@@ -4393,16 +4460,22 @@ class FXOptionDeal(Deal):
 
     def reset(self, calendars):
         super(FXOptionDeal, self).reset()
-        self.add_reval_dates({self.field['Expiry_Date']}, self.field['Currency'])
+        self.add_reval_dates(
+            {self.field['Settlement_Date' if 'Settlement_Date' in self.field else 'Expiry_Date']},
+            self.field['Currency'])
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
+
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Underlying_Currency': utils.check_rate_name(self.field['Underlying_Currency']),
                  'FX_Volatility': utils.check_rate_name(self.field['FX_Volatility'])}
 
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
+
+        expiry, settlement, forward_settlement = utils.option_date_info(
+            self.field, base_date, calendars)
 
         field_index = {
             'Currency': get_fx_and_zero_rate_factor(
@@ -4414,7 +4487,9 @@ class FXOptionDeal(Deal):
                 field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Volatility': get_fx_vol_factor(
                 field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
-            'Expiry': (self.field['Expiry_Date'] - base_date).days,
+            'Expiry': expiry,
+            'Settlement': settlement,
+            'Forward_Settlement': forward_settlement,
             'Invert_Moneyness': field['Currency'][0] == field['FX_Volatility'][0],
             'Strike_Price': self.field['Strike_Price'],
             'Buy_Sell': 1.0 if self.field['Buy_Sell'] == 'Buy' else -1.0,
@@ -4427,14 +4502,16 @@ class FXOptionDeal(Deal):
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
+        factor = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+
         fx_rep = utils.calc_fx_cross(
-            deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
+            factor['Currency'][0], shared.Report_Currency, deal_time, shared)
         forward = utils.calc_fx_forward(
-            deal_data.Factor_dep['Underlying_Currency'], deal_data.Factor_dep['Currency'],
-            deal_data.Factor_dep['Expiry'], deal_time, shared)
+            factor['Underlying_Currency'], deal_data.Factor_dep['Currency'],
+            factor['Forward_Settlement'], deal_time, shared)
         moneyness = pricing.calc_moneyness(
-            deal_data.Factor_dep['Strike_Price'], forward, forward,
+            factor['Strike_Price'], forward, forward,
             deal_data, use_forward=True, invert_moneyness=deal_data.Factor_dep['Invert_Moneyness'])
 
         mtm = pricing.pv_european_option(
