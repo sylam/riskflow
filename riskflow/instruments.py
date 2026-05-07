@@ -4474,8 +4474,7 @@ class FXOptionDeal(Deal):
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
 
-        expiry, settlement, forward_settlement = utils.option_date_info(
-            self.field, base_date, calendars)
+        expiry, settlement, forward_settlement = option_date_info(self.field, base_date, calendars)
 
         field_index = {
             'Currency': get_fx_and_zero_rate_factor(
