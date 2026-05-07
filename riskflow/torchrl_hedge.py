@@ -395,12 +395,26 @@ def _realized_structured_action(action, current_positions, runtime, *, batch_siz
     # the env actually executes. Without this, `_enforce_position_limits` could silently
     # decouple the logged categorical action from the realized trade — a mask/clip
     # mismatch would cause PPO to reinforce an action different from the one observed.
-    min_map = runtime.get("policy", {}).get("action_space", {}).get("min_trade_delta", {})
-    min_trade_delta = torch.tensor(
-        [int(min_map.get(n, 0)) for n in instrument_order],
-        dtype=torch.int64, device=ordered.device,
-    )
-    bins = ordered - min_trade_delta
+    # With explicit (possibly non-uniform) deltas, the bin index is the position of the
+    # delta in the per-instrument sorted list — searchsorted gives this exactly since the
+    # list is sorted. Build (n_instruments, max_bins) padded tensor and reverse-lookup.
+    deltas_map = runtime.get("policy", {}).get("action_space", {}).get("trade_deltas", {})
+    if deltas_map:
+        per_instrument = [tuple(deltas_map[n]) for n in instrument_order]
+        max_bins = max(len(d) for d in per_instrument) if per_instrument else 1
+        padded = [list(d) + [d[-1]] * (max_bins - len(d)) for d in per_instrument]
+        deltas_tensor = torch.tensor(padded, dtype=torch.int64, device=ordered.device)  # (I, max_bins)
+        # searchsorted(sorted=(I, max_bins), values=(I, B)) → (I, B)
+        bins_T = torch.searchsorted(deltas_tensor, ordered.transpose(0, 1).contiguous())
+        bins = bins_T.transpose(0, 1).contiguous()
+    else:
+        # Fallback: legacy unit-step ranges. bin = delta - min.
+        min_map = runtime.get("policy", {}).get("action_space", {}).get("min_trade_delta", {})
+        min_trade_delta = torch.tensor(
+            [int(min_map.get(n, 0)) for n in instrument_order],
+            dtype=torch.int64, device=ordered.device,
+        )
+        bins = ordered - min_trade_delta
     return {
         **action,
         "action_bins": bins,
@@ -851,12 +865,21 @@ def _make_structured_policy(runtime, *, device):
             "feasibility masks are built in Instrument_Order — divergence silently miswires "
             "per-instrument position constraints onto the wrong logit row."
         )
-    return StructuredRebalancePolicy(
-        action_space=StructuredActionSpace(
+    deltas_map = action_space_cfg.get("trade_deltas") or {}
+    if deltas_map:
+        per_instrument_deltas = tuple(tuple(deltas_map[n]) for n in instrument_order)
+        action_space = StructuredActionSpace(
             instrument_order,
-            tuple(action_space_cfg.get("min_trade_delta", {}).get(n, 0) for n in instrument_order),
-            tuple(action_space_cfg.get("max_trade_delta", {}).get(n, 0) for n in instrument_order),
-        ),
+            trade_deltas=per_instrument_deltas,
+        )
+    else:
+        action_space = StructuredActionSpace(
+            instrument_order,
+            min_trade_delta=tuple(action_space_cfg.get("min_trade_delta", {}).get(n, 0) for n in instrument_order),
+            max_trade_delta=tuple(action_space_cfg.get("max_trade_delta", {}).get(n, 0) for n in instrument_order),
+        )
+    return StructuredRebalancePolicy(
+        action_space=action_space,
         entity_layout=runtime["entity_layout"],
         privileged_layout=runtime.get("privileged_layout") or {},
         position_limits=runtime.get("accounting", {}).get("position_limits", {}),

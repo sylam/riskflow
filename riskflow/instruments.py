@@ -176,10 +176,17 @@ def get_commodity_rate_factor(fieldname, static_offsets, stochastic_offsets):
                               static_offsets, stochastic_offsets)]
 
 
-def get_basiscarry_factor(fieldname, static_offsets, stochastic_offsets):
-    """Read the index of the BasisCarry scalar price factor"""
-    return [calc_factor_index(utils.Factor('BasisCarry', fieldname),
+def get_impliedbasis_factor(fieldname, static_offsets, stochastic_offsets):
+    """Read the index of the CommodityBasis scalar price factor"""
+    return [calc_factor_index(utils.Factor('CommodityBasis', fieldname),
                               static_offsets, stochastic_offsets)]
+
+
+def get_observed_commodity_name(fieldname, all_factors):
+    """Read the name of the CommodityPrice factor that this CommodityBasis is observed against."""
+    basis = all_factors.get(utils.Factor('CommodityBasis', fieldname))
+    return basis.factor.observed_commodity() if hasattr(basis, 'factor') \
+        else basis.observed_commodity()
 
 
 def get_equity_rate_factor(fieldname, static_offsets, stochastic_offsets):
@@ -3601,27 +3608,22 @@ class CommodityForwardDeal(Deal):
 
 class CommodityFutureDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
-                     'Commodity': ['CommodityPrice'],
+                     'Implied_Basis': ['CommodityBasis'],
                      'Repo_Rate': ['InterestRate'],
-                     'Carry': ['BasisCarry']}
+                     'Carry': ['ForwardRate']}
 
     documentation = ('Energy', [
-        'A standardised futures contract on a commodity. Priced via the cost-of-carry forward',
-        'formula evaluated at the contract\'s maturity $T$:',
+        'A standardised futures contract on a commodity. The pricing spot is constructed as',
+        'an observed market spot plus an implied basis adjustment; the **Implied_Basis** factor',
+        'declares the linked **Observed_Commodity** via its own field, so the deal references',
+        'the basis only and the framework wires the observed spot in automatically.',
         '',
-        '$$F(t,T)=S(t)\\exp\\Big(b(t)(T-t) + \\int_t^T r(t,u)du\\Big)$$',
+        '$$F(t,T)=(S(t)+b(t))\\exp\\Big(c(t,T)\\,(T-t) + \\int_t^T r(t,u)du\\Big)$$',
         '',
-        'where $S(t)$ is the spot price of the **Commodity** in its quote currency, $r(t,u)$ is',
-        'the forward repo rate from the **Repo_Rate** curve, and $b(t)$ is the **Carry** basis',
-        'spread (cost minus benefits of carry — storage, convenience yield, etc.). The output is',
-        'converted to the report currency via the **Currency** FX rate.',
-        '',
-        'Note that this is a price (per contract unit), not a P&L — variation margin and',
-        'position-level cashflow accounting are handled by the calculation\'s margin / cash',
-        'machinery, not by this instrument.',
-        '',
-        'See also [Forward rates](../theory/asset_pricing.md#forward-rates) for the underlying',
-        'no-arbitrage derivation.'
+        'where $S(t)$ is the observed spot, $b(t)$ is the implied basis, $r(t,u)$ is the forward',
+        'repo rate from **Repo_Rate**, and $c(t,T)$ is the carry rate at the contract\'s expiry',
+        'date $T$ from the **Carry** factor (a `ForwardPrice`-shaped factor with absolute-date',
+        'tenors). Output is converted to the report currency via **Currency**.',
     ])
 
     def __init__(self, params, valuation_options):
@@ -3633,16 +3635,26 @@ class CommodityFutureDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
+        # The basis carries the observed-commodity link in its own Price Factor entry; resolve
+        # the observed commodity through the basis rather than declaring it on the deal.
+        basis_field = utils.check_rate_name(self.field['Implied_Basis'])
+        observed_field = utils.check_rate_name(get_observed_commodity_name(basis_field, all_factors))
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Carry': utils.check_rate_name(self.field['Carry']),
                  'Repo_Rate': utils.check_rate_name(self.field['Repo_Rate']),
-                 'Commodity': utils.check_rate_name(self.field['Commodity'])}
+                 'Implied_Basis': basis_field,
+                 'Observed_Commodity': observed_field}
 
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-                       'Commodity': get_commodity_rate_factor(field['Commodity'], static_offsets, stochastic_offsets),
+                       'Observed_Commodity': get_commodity_rate_factor(
+                           field['Observed_Commodity'], static_offsets, stochastic_offsets),
+                       'Implied_Basis': get_impliedbasis_factor(
+                           field['Implied_Basis'], static_offsets, stochastic_offsets),
                        'Repo': get_interest_factor(
                            field['Repo_Rate'], static_offsets, stochastic_offsets, all_tenors),
-                       'Carry': get_basiscarry_factor(field['Carry'], static_offsets, stochastic_offsets),
+                       'Carry': [calc_factor_index(utils.Factor('ForwardRate', field['Carry']),
+                                                   static_offsets, stochastic_offsets, all_tenors)],
+                       'base_index': (base_date - utils.excel_offset).days,
                        'Expiry': (self.field['Maturity_Date'] - base_date).days}
 
         return field_index
@@ -3650,19 +3662,24 @@ class CommodityFutureDeal(Deal):
     def generate(self, shared, time_grid, deal_data):
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        commodity_spot = utils.calc_time_grid_spot_rate(factor_dep['Commodity'], deal_time, shared)
+        observed_spot = utils.calc_time_grid_spot_rate(factor_dep['Observed_Commodity'], deal_time, shared)
+        basis = utils.calc_time_grid_spot_rate(factor_dep['Implied_Basis'], deal_time, shared)
         repo = utils.calc_time_grid_curve_rate(factor_dep['Repo'], deal_time, shared)
-        basis = utils.calc_time_grid_spot_rate(factor_dep['Carry'], deal_time, shared)
+        carry = utils.calc_time_grid_curve_rate(factor_dep['Carry'], deal_time, shared)
         T_t = factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM].reshape(-1, 1)
+        # Carry is a forward-curve-shaped factor (absolute-date tenor); query at the
+        # contract's absolute expiry-date Excel offset so the lookup lands exactly on
+        # a knot. Multiply by remaining tenor (years) explicitly to integrate the rate.
+        expiry_date_index = np.full_like(T_t, factor_dep['base_index'] + factor_dep['Expiry'])
+        carry_rate = carry.gather_weighted_curve(shared, expiry_date_index, multiply_by_time=False)
+        T_t_years = shared.one.new_tensor(T_t / utils.DAYS_IN_YEAR).unsqueeze(-1)
 
         fx_rep = utils.calc_fx_cross(
             factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
-        # calculate the basis
-        key_tau = factor_dep['Repo'][0][:2] + ('taukey', T_t.tobytes())
-        if key_tau not in shared.t_Buffer:
-            shared.t_Buffer[key_tau] = shared.one.new(factor_dep['Repo'][0][utils.FACTOR_INDEX_Daycount](T_t))
-        tau = shared.t_Buffer[key_tau]
-        mtm = commodity_spot * torch.exp((basis*tau).unsqueeze(1) + repo.gather_weighted_curve(shared, T_t)).squeeze(1)
+        # Synthetic spot = observed + basis; cost-of-carry forward.
+        synthetic_spot = observed_spot + basis
+        mtm = synthetic_spot * torch.exp(
+            carry_rate * T_t_years + repo.gather_weighted_curve(shared, T_t)).squeeze(1)
 
         return mtm * fx_rep
 

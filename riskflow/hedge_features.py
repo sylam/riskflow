@@ -242,27 +242,33 @@ def _privileged_name(factor_name, attr_name, multi):
     return f'{factor_name.lower()}_{attr_name}' if multi else attr_name
 
 
-def compute_hawkes_intensities(stoch_factors, history_prefix=0):
-    """Pull bivariate Hawkes intensities (H+, H-, ratio) from each stoch process exposing
-    `last_h_plus_path`/`last_h_minus_path`. Returns three per-commodity dicts keyed by the
+def compute_hawkes_intensities(privileged_factor_blocks, stoch_factors, history_prefix=0):
+    """Pull bivariate Hawkes intensities (H+, H-, ratio) from the per-batch privileged-factor
+    accumulator, concatenate across batches, and prepend `history_prefix` zero rows so the time
+    axis aligns with the post-prefix bundle. Returns three per-commodity dicts keyed by the
     canonical factor name (matching `bundle['spot_price_history']` keys), each with shape
-    (history_prefix + T_sim, B). The history-prefix rows are zero-filled (no excitement
-    before sim start) so the time axis aligns with the post-prefix bundle. Commodities whose
-    process doesn't expose Hawkes intensities are simply absent from the output dicts;
-    the runtime feeder zero-fills missing keys."""
+    (history_prefix + T_sim, B_total).
+
+    Reading from `privileged_factor_blocks` rather than `process.last_*` is correct because the
+    simulator runs in per-batch chunks; only the *last* batch's tensors live on the process
+    instance. Commodities whose process doesn't emit Hawkes intensities are simply absent."""
     h_plus_out, h_minus_out, ratio_out = {}, {}, {}
     for factor, process in (stoch_factors or {}).items():
-        h_plus = getattr(process, 'last_h_plus_path', None)
-        h_minus = getattr(process, 'last_h_minus_path', None)
-        if h_plus is None or h_minus is None:
+        factor_name = factor.name[0] if factor.name else str(factor)
+        plus_blocks = privileged_factor_blocks.get((factor_name, 'hawkes_h_plus_total'))
+        minus_blocks = privileged_factor_blocks.get((factor_name, 'hawkes_h_minus_total'))
+        if not plus_blocks or not minus_blocks:
             continue
-        commodity = utils.check_tuple_name(factor)
+        # Each per-batch tensor is (T_sim, B_batch, 1). Concatenate along batch dim, squeeze.
+        h_plus = torch.cat(plus_blocks, dim=1).squeeze(-1)    # (T_sim, B_total)
+        h_minus = torch.cat(minus_blocks, dim=1).squeeze(-1)  # (T_sim, B_total)
         if history_prefix > 0:
             zero = torch.zeros((int(history_prefix),) + tuple(h_plus.shape[1:]),
                                device=h_plus.device, dtype=h_plus.dtype)
             h_plus = torch.cat([zero, h_plus], dim=0)
             h_minus = torch.cat([zero, h_minus], dim=0)
         ratio = h_minus / (h_plus + h_minus + 1e-8)
+        commodity = utils.check_tuple_name(factor)
         h_plus_out[commodity] = h_plus
         h_minus_out[commodity] = h_minus
         ratio_out[commodity] = ratio

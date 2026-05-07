@@ -226,10 +226,12 @@ mapping = {
                 ["Quanto_FX_Volatility", "Vol", "Quanto_FX_Correlation"],
             "PriceIndex":
                 ["Index", "Next_Publication_Date", "Last_Period_Start", "Publication_Period", "Currency"],
-            "BasisCarry":
-                ["Spot"],
+            "CommodityBasis":
+                ["Spot", "Observed_Commodity"],
             "ForwardPrice":
                 ["Currency", "Curve", "Fixings"],
+            "ForwardRate":
+                ["Currency", "Curve"],
             "ForwardPriceSample":
                 ["Offset", "Holiday_Calendar", "Sampling_Convention"],
             "ReferencePrice":
@@ -321,6 +323,9 @@ mapping = {
                               'max': 1.0},
             'Seasonal_Adjustment': {'widget': 'Text', 'description': 'Seasonal Adjustment', 'value': ''},
             'Spot': {'widget': 'Float', 'description': 'Spot', 'value': 0},
+            'Observed_Commodity': {'widget': 'Text', 'description':
+                                   'Name of the CommodityPrice factor this basis is observed against',
+                                   'value': ''},
             'Price': {'widget': 'Float', 'description': 'Price', 'value': 0},
             'Surface': {'widget': 'Three', 'description': 'Surface', 'value': default['Surface']},
             'Delta_Surface': {'widget': 'Three', 'description': 'Delta_Surface', 'value': default['Surface']},
@@ -345,8 +350,13 @@ mapping = {
                 ["Kappa", "Theta", "sigma"],
             "MarkovSwitchingLogOUSpotModel":
                 ["States", "Transition_Matrix", "Initial_State_Probs", "Calibration_DT_Years"],
-            "CompoundHawkesSpotModel":
-                ["Components"],
+            "MarkovHMMSpotModel":
+                ["States", "Transition_Matrix", "Initial_State_Probs", "Calibration_DT_Years"],
+            "VARMixedFactorInterestRateModel":
+                ["Mean", "Phi", "Sigma", "Calibration_Tenors", "Contract_Cycle_Years",
+                 "Calibration_DT_Years"],
+            "BasisLinkedSpotModel":
+                ["A", "Phi", "Nu", "Sigma_By_State", "Mu", "Calibration_DT_Years"],
             "SingleRegimeOU1FactorKalmanModel":
                 ["Kappa", "Theta", "sigma"],
             "PCAInterestRateModel":
@@ -403,15 +413,28 @@ mapping = {
                                      'Step size (in years) of the calibrated transition matrix; the model '
                                      're-discretises P per simulation step via the CTMC generator',
                                      'value': 1.0 / 252.0},
-            # CompoundHawkesSpotModel: list of K bivariate marked Hawkes components.
-            # Each component carries baseline intensities (Mu_*), kernel decay (Beta),
-            # the 4 cross-excitation gains (Alpha_**) and exponential mark rates
-            # (Eta_*; E[|jump|] = 1/η in log-return units). K=1 is the standard model;
-            # K>1 captures multi-scale clustering (e.g. fast burst + slow regime).
-            'Components': {'widget': 'Container', 'description':
-                           'List of Hawkes components: each {Mu_Plus, Mu_Minus, Beta, '
-                           'Alpha_PP, Alpha_NP, Alpha_PN, Alpha_NN, Eta_Plus, Eta_Minus}',
-                           'value': []},
+            # MarkovHMMSpotModel: per-state {Mu, Sigma} are annualised drift/vol of additive ΔS.
+            'Mu': {'widget': 'Float', 'description': 'Annualised additive drift (per-state)', 'value': 0.0},
+            # VARMixedFactorInterestRateModel: 3-factor VAR(1) on (β_0, β_1, r) with curvature
+            # weight w from the orthogonal-to-(1,1,1)-and-τ construction.
+            'Mean': {'widget': 'Container', 'description':
+                     'Long-run mean vector [μ_β0, μ_β1, μ_r]',
+                     'value': []},
+            'Phi': {'widget': 'Table', 'description':
+                    'VAR(1) transition matrix Φ (3x3) at the calibration step',
+                    'value': []},
+            'Calibration_Tenors': {'widget': 'Container', 'description':
+                                   'Slot tenor vector τ_i(0) at simulation start (years)',
+                                   'value': []},
+            'Contract_Cycle_Years': {'widget': 'Float', 'description':
+                                     'Front-slot roll cycle (years) — contracts shift forward by this '
+                                     'amount once the front slot expires', 'value': 0.25},
+            # BasisLinkedSpotModel: lagged-AR(1) basis on a sibling commodity-spot path.
+            'A': {'widget': 'Float', 'description': 'Concurrent ΔS loading on the basis', 'value': 0.0},
+            'Nu': {'widget': 'Float', 'description': 'Student-t degrees of freedom (basis innovation)', 'value': 5.0},
+            'Sigma_By_State': {'widget': 'Container', 'description':
+                               'Per-regime innovation std σ_s (indexed by linked-spot HMM state)',
+                               'value': []},
         },
     },
 
@@ -423,16 +446,17 @@ mapping = {
     # list mapping risk factors to allowable stochastic processes
     'Process_factor_map': {
         "Correlation": [],
-        "CommodityPrice": ['LogOUSpotModel', 'MarkovSwitchingLogOUSpotModel', 'CompoundHawkesSpotModel'],
+        "CommodityPrice": ['LogOUSpotModel', 'MarkovSwitchingLogOUSpotModel', 'MarkovHMMSpotModel'],
         "CommodityPriceVol": [],
         "ConvenienceYield": [],
         "EquityPriceVol": [],
-        "BasisCarry": ["SingleRegimeOU1FactorKalmanModel"],
+        "CommodityBasis": ["SingleRegimeOU1FactorKalmanModel", "BasisLinkedSpotModel"],
         "InterestYieldVol": [],
         "FuturesPrice": [],
         "InflationRate": ["HullWhite1FactorInterestRateModel", "PCAInterestRateModel"],
         "FXVol": [],
         "ForwardPrice": ["CSForwardPriceModel"],
+        "ForwardRate": ["VARMixedFactorInterestRateModel"],
         "ForwardPriceVol": [],
         "ForwardPriceSample": [],
         "ReferencePrice": [],
@@ -444,7 +468,8 @@ mapping = {
         "EquityPrice": ["GBMAssetPriceModel"],
         "FxRate": ["GBMAssetPriceModel", "GBMAssetPriceTSModelImplied"],
         "SurvivalProb": ["HWHazardRateModel"],
-        "InterestRate": ["HullWhite1FactorInterestRateModel", "PCAInterestRateModel"],
+        "InterestRate": ["HullWhite1FactorInterestRateModel", "PCAInterestRateModel",
+                          "VARMixedFactorInterestRateModel"],
         "DiscountRate": [],
         "PriceIndex": ["GBMPriceIndexModel"],
         "InterestRateVol": [],

@@ -290,7 +290,11 @@ class Config(object):
                                                       self.calibration_process_map.get(model))
 
         remaining_factor = {}
-        remaining_rates = set([col.split(',')[0] for col in self.archive.columns]).difference(model_factor.keys())
+        # Subtract present factors by archive_name (which carries the subtype) — the JSON
+        # key (factor) lacks the subtype suffix so it can't be compared to archive column
+        # roots directly.
+        covered_archives = {v.archive_name for v in model_factor.values()}
+        remaining_rates = set([col.split(',')[0] for col in self.archive.columns]).difference(covered_archives)
         for factor in remaining_rates:
             price_factor = utils.check_rate_name(factor)
             model = self.params['Model Configuration'].search(utils.Factor(price_factor[0], price_factor[1:]), {})
@@ -340,12 +344,41 @@ class Config(object):
         ak = []
         num_indexes = 0
         num_factors = 0
+        # Pull primary calibration columns plus any related-factor archive columns referenced
+        # by non-numeric sub-keys. Two patterns share this mechanism:
+        #   - InterestRate.PLATINUM_CARRY,PLATINUM_TAU1  pairs with Tenor.PLATINUM_TAU1
+        #   - CommodityBasis.LME_CME,PLATINUM_LME        pairs with CommodityPrice.PLATINUM_LME
+        # Generalisation: for each non-numeric sub_key, find any archive_name that ends in
+        # `.{sub_key}`. This keeps the dependency declaration in the archive header, no JSON
+        # config needed in calibration_config.
+        def _related_archive_cols(archive_name):
+            extras = []
+            for col in self.archive_columns.get(archive_name, []):
+                parts = col.split(',', 1)
+                if len(parts) < 2:
+                    continue
+                try:
+                    float(parts[1])
+                except ValueError:
+                    sub = parts[1]
+                    for other_arch in self.archive_columns:
+                        if other_arch == archive_name:
+                            continue
+                        other_parts = other_arch.split('.', 1)
+                        if len(other_parts) >= 2 and other_parts[1] == sub:
+                            extras.extend(self.archive_columns[other_arch])
+            return extras
+
         total_rates = reduce(operator.concat,
-                             [self.archive_columns[rate.archive_name] for rate in factors.values()], [])
+                             [self.archive_columns[rate.archive_name] + _related_archive_cols(rate.archive_name)
+                              for rate in factors.values()], [])
+        total_rates = list(dict.fromkeys(total_rates))
         factor_data = utils.filter_data_frame(self.archive, from_date, to_date)[total_rates]
 
         for rate_name, rate_value in sorted(factors.items()):
-            df = factor_data[[col for col in factor_data.columns if col.split(',')[0] == rate_value.archive_name]]
+            primary_cols = [col for col in factor_data.columns if col.split(',')[0] == rate_value.archive_name]
+            related_cols = [c for c in _related_archive_cols(rate_value.archive_name) if c in factor_data.columns]
+            df = factor_data[primary_cols + related_cols]
             # now remove spikes
             data_frame = df[np.abs(df - df.median()) <= (smooth * df.std())].interpolate(method='index') \
                 if smooth else df
@@ -560,7 +593,8 @@ class Config(object):
                                              ('ReferencePrice', 'ReferencePrice')],
                             'InflationRate': [('Price_Index', 'PriceIndex')],
                             'CommodityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')],
-                            'EquityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')]}
+                            'EquityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')],
+                            'CommodityBasis': [('Observed_Commodity', 'CommodityPrice')]}
 
         # nested fields need to include all their children
         nested_fields = {'InterestRate'}
@@ -763,10 +797,18 @@ class Config(object):
             # store the calibration config
             self.calibrations = data['CalibrationConfig']
 
-            # load the archive file - must be a tab separated file
+            # load the archive file - separator defaults to tab for back-compat with legacy
+            # archives; override via "sep" in MarketDataArchiveFile
             mkt_data_details = self.calibrations['MarketDataArchiveFile']
             self.archive = pd.read_csv(mkt_data_details['name'], skiprows=mkt_data_details['skiprows'],
-                                       sep='\t', index_col=mkt_data_details['index_column'])
+                                       sep=mkt_data_details.get('sep', '\t'),
+                                       index_col=mkt_data_details['index_column'])
+            # Normalise the archive index to Excel-offset integers (filter_data_frame and
+            # calibrate_PFE assume that convention). If the file already stores ints, this is
+            # a no-op; if it has parsed-date strings (e.g. plat_archive.csv: "2009/11/10"), we
+            # convert via the project's excel_offset.
+            if self.archive.index.dtype == object:
+                self.archive.index = (pd.to_datetime(self.archive.index) - utils.excel_offset).days
             # load the calibration
             self.calibration_process_map = {k: construct_calibration_config(
                 k, v) for k,v in self.calibrations['Calibrations'].items()}

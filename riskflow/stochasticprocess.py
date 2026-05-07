@@ -18,10 +18,10 @@
 
 # import standard libraries
 import itertools
-from collections import OrderedDict
 
 # 3rd party libraries
 import numpy as np
+import pandas as pd
 import scipy.interpolate
 from scipy.linalg import expm as matrix_expm, logm as matrix_logm
 from scipy.optimize import minimize as scipy_minimize
@@ -109,6 +109,31 @@ def hw_calc_IJK(a, exp):
                 * exp(a * dt) - a2 * vi_vj + a * mj_vi_p_mi_vj - 2 * mi_mj) * exp(a * t)
 
     return IJK, a ** 3
+
+
+def hmm_forward_backward(log_pi, log_P, log_emit):
+    """Log-space forward-backward for a discrete-state HMM. `log_emit` is (T, S) of
+    per-step per-state emission log-densities; returns smoothed posteriors `gamma`
+    (T, S), pairwise posteriors `xi` (T-1, S, S), and log-likelihood. Used by every
+    Markov-style calibration class."""
+    from scipy.special import logsumexp
+    T, S = log_emit.shape
+    log_alpha = np.full((T, S), -np.inf)
+    log_alpha[0] = log_pi + log_emit[0]
+    for t in range(1, T):
+        log_alpha[t] = logsumexp(log_alpha[t - 1, :, None] + log_P, axis=0) + log_emit[t]
+    log_lik = logsumexp(log_alpha[-1])
+    log_beta = np.zeros((T, S))
+    for t in range(T - 2, -1, -1):
+        log_beta[t] = logsumexp(log_P + (log_emit[t + 1] + log_beta[t + 1])[None, :], axis=1)
+    log_gamma = log_alpha + log_beta
+    log_gamma -= logsumexp(log_gamma, axis=1, keepdims=True)
+    gamma = np.exp(log_gamma)
+    log_xi = (log_alpha[:-1, :, None] + log_P[None, :, :]
+              + log_emit[1:, None, :] + log_beta[1:, None, :])
+    log_xi -= logsumexp(log_xi.reshape(T - 1, -1), axis=1)[:, None, None]
+    xi = np.exp(log_xi)
+    return gamma, xi, log_lik
 
 
 class StochasticProcess(object):
@@ -1189,17 +1214,17 @@ class PCAInterestRateCalibration(object):
         correlation_coef = aki.T
 
         return utils.CalibrationInfo(
-            OrderedDict({
+            {
                 'Reversion_Speed': meanReversionSpeed,
                 'Historical_Yield': utils.Curve([], list(zip(tenor, reversionLevel))),
                 'Yield_Volatility': utils.Curve([], list(zip(tenor, volCurve))),
                 'Eigenvectors': [
-                    OrderedDict({'Eigenvector': utils.Curve([], list(zip(tenor, evec))), 'Eigenvalue': eval})
+                    {'Eigenvector': utils.Curve([], list(zip(tenor, evec))), 'Eigenvalue': eval}
                     for evec, eval in zip(evecs.real.T, evals.real)],
                 'Rate_Drift_Model': self.param['Rate_Drift_Model'],
                 'Princ_Comp_Source': self.param['Matrix_Type'],
                 'Distribution_Type': self.param['Distribution_Type']
-            }),
+            },
             correlation_coef,
             delta
         )
@@ -1490,7 +1515,7 @@ class SingleRegimeOU1FactorKalmanCalibration(object):
             'innov_var':   innov_var,
         }
 
-    def calibrate(self, data_frame, vol_shift=0.0, num_business_days=252.0, **kwargs):
+    def calibrate(self, data_frame, vol_shift=0.0, num_business_days=252.0):
         p = self.param
         max_iter       = int(p.get('KF_Max_Iter', 30))
         tol            = float(p.get('KF_Tol', 1e-6))
@@ -1914,8 +1939,10 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
         A = torch.cumprod(e_kdt_t, dim=0)
         b = theta_t * (1.0 - e_kdt_t) + ou_vol_t * Z
         log_spot = A * (self.log_spot0 + torch.cumsum(b / A, dim=0))
-        # Stashed for privileged_factors() called immediately after generate() in the sim loop.
+        # Stashed for privileged_factors() called immediately after generate() in the sim loop;
+        # also published for cross-process consumers under the (factor_key, kind) convention.
         self.last_regime_path = regimes
+        shared_mem.t_Scenario_Buffer[(self.factor_key, 'regimes')] = regimes
         return torch.exp(log_spot)
 
     @classmethod
@@ -1939,239 +1966,731 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
         return out
 
 
-class CompoundHawkesSpotModel(StochasticProcess):
-    """Pure compound bivariate marked Hawkes spot-price model. No diffusion, no
-    regime switching — log-price moves entirely through up- and down-jump arrivals
-    whose rates self- and cross-excite each other. The mark distribution carries
-    all of the volatility information; there is no separate σ.
-
-    Per step δ, for each of K independent Hawkes components k=1..K:
-
-        N⁺_k ~ Poisson(λ⁺_k δ),  N⁻_k ~ Poisson(λ⁻_k δ)        # arrivals
-        M⁺_{k,i} ~ Exp(η⁺_k),    M⁻_{k,j} ~ Exp(η⁻_k)          # marks (jump sizes)
-        ΣM⁺_k = Σ_{i=1..N⁺_k} M⁺_{k,i}                          # compound Poisson sums
-        ΣM⁻_k = Σ_{j=1..N⁻_k} M⁻_{k,j}
-
-    Net log-return aggregated across components:
-
-        r_t = Σ_k (ΣM⁺_k - ΣM⁻_k)
-        log_S_t = log_S_{t-1} + r_t
-
-    Intensity update (mark-weighted self- and cross-excitation):
-
-        λ⁺_k(t+δ) = μ⁺_k + e^{-β_k δ}(λ⁺_k(t) - μ⁺_k) + α⁺⁺_k ΣM⁺_k + α⁻⁺_k ΣM⁻_k
-        λ⁻_k(t+δ) = μ⁻_k + e^{-β_k δ}(λ⁻_k(t) - μ⁻_k) + α⁺⁻_k ΣM⁺_k + α⁻⁻_k ΣM⁻_k
-
-    Multiple components (K>1) capture multi-scale clustering — e.g., one fast-decay
-    process for daily-burst dynamics and one slow-decay process for multi-week regimes.
-    Per component, the kernel matrix [α⁺⁺ α⁻⁺; α⁺⁻ α⁻⁻] / (β · E[mark]) must have
-    spectral radius < 1 for stationarity.
+class MarkovHMMSpotModel(StochasticProcess):
+    """N-state hidden-Markov spot-price model. Conditional on regime z_t, the per-step
+    innovation is Gaussian (or Student-t if `Nu` is set on the state) with annualised
+    `(Mu, Sigma)`. Long-memory autocorrelation comes from regime persistence; fat tails
+    from regime mixture plus optional t-emissions. One framework Gaussian per step;
+    regime transitions sampled from the independent quasi-RNG uniform stream.
 
     JSON config:
-        Components: list of dicts, one per Hawkes component:
-            {Mu_Plus, Mu_Minus, Beta, Alpha_PP, Alpha_NP, Alpha_PN, Alpha_NN, Eta_Plus, Eta_Minus}
-
-        Mu_*  — baseline arrival intensities (events/year). E.g. Mu=10 ≈ 10 events/yr.
-        Beta  — kernel decay rate (1/years). β=5 ≈ 50-day half-life at 252 bd/yr.
-        Alpha_** — 4 mark-weighted cross-excitation gains.
-        Eta_*  — exponential mark rates: E[|mark|] = 1/η in log-return units.
-                 e.g. η=100 ⇒ typical jump = 1%; η=30 ⇒ typical jump = 3.3%.
-    """
+        States: list of N dicts {Mu, Sigma, [Nu]} per regime (annualised).
+        Transition_Matrix: NxN row-stochastic at Calibration_DT_Years.
+        Initial_State_Probs: length-N vector summing to 1.
+        Calibration_DT_Years: step size of P (default 1/252).
+        Log_Price: bool (default False) — emit log returns instead of raw price diffs."""
 
     documentation = (
         'Asset Pricing',
-        ['A pure compound bivariate marked Hawkes spot-price process. Up- and down-jumps '
-         'arrive as Poisson events with self- and cross-exciting intensities; jump sizes '
-         '(marks) are exponentially distributed and supply all of the volatility — there '
-         'is no separate diffusion or regime-switching layer. Per step:',
+        ['An N-state hidden-Markov spot-price model with additive Gaussian emissions on the '
+         'daily diff $\\Delta S_t = S_t - S_{t-1}$. Latent regime $z_t$ follows a Markov chain '
+         'with transition matrix $P$. Conditional on $z_t$:',
          '',
-         '$$ N^+_k \\sim \\text{Pois}(\\lambda^+_k \\delta), \\quad '
-         'N^-_k \\sim \\text{Pois}(\\lambda^-_k \\delta) $$',
+         '$$ \\Delta S_t \\sim \\mathcal{N}(\\mu_{z_t}\\delta,\\, \\sigma_{z_t}^2\\delta) $$',
          '',
-         '$$ M^+_{k,i} \\sim \\text{Exp}(\\eta^+_k), \\quad '
-         'M^-_{k,j} \\sim \\text{Exp}(\\eta^-_k) $$',
-         '',
-         '$$ r_t = \\sum_k \\Big(\\sum_i M^+_{k,i} - \\sum_j M^-_{k,j}\\Big), \\quad '
-         '\\log S_t = \\log S_{t-1} + r_t $$',
-         '',
-         'Intensity update with mark-weighted excitation:',
-         '',
-         '$$ \\lambda^+_k(t{+}\\delta) = \\mu^+_k + e^{-\\beta_k\\delta}(\\lambda^+_k(t) - \\mu^+_k) '
-         '+ \\alpha^{++}_k \\Sigma M^+_k + \\alpha^{-+}_k \\Sigma M^-_k $$',
-         '',
-         '$$ \\lambda^-_k(t{+}\\delta) = \\mu^-_k + e^{-\\beta_k\\delta}(\\lambda^-_k(t) - \\mu^-_k) '
-         '+ \\alpha^{+-}_k \\Sigma M^+_k + \\alpha^{--}_k \\Sigma M^-_k $$',
-         '',
-         'Multiple components (K>1) capture multi-scale clustering. Per component, '
-         'spectral radius of the kernel matrix divided by $\\beta_k \\cdot E[M_k]$ must '
-         'be < 1 for stationarity.',
+         'No mean reversion at the spot level; long-memory autocorrelation arises from regime '
+         'persistence and fat tails from regime occupancy.',
          '',
          'Parameters:',
-         '- **Components**: list of dicts, one per Hawkes component '
-         '$\\{\\mu^+, \\mu^-, \\beta, \\alpha^{++}, \\alpha^{-+}, \\alpha^{+-}, \\alpha^{--}, \\eta^+, \\eta^-\\}$.'])
-
-    REQUIRED_COMPONENT_KEYS = (
-        'Mu_Plus', 'Mu_Minus', 'Beta',
-        'Alpha_PP', 'Alpha_NP', 'Alpha_PN', 'Alpha_NN',
-        'Eta_Plus', 'Eta_Minus',
-    )
+         '- **States**: List of $\\{\\mu, \\sigma\\}$ per regime (annualised).',
+         '- **Transition_Matrix**: NxN row-stochastic at the calibration step.',
+         '- **Initial_State_Probs**: Initial regime distribution.',
+         '- **Calibration_DT_Years**: Step size of $P$ (default 1/252).'])
 
     def __init__(self, factor, param, implied_factor=None):
         super().__init__(factor, param)
-        self._validate_params()
-
-    def _validate_params(self):
-        comps = self.param.get('Components')
-        if not isinstance(comps, list) or len(comps) < 1:
-            self.params_ok = False
-            return
-        for c in comps:
-            if not isinstance(c, dict):
-                self.params_ok = False
-                return
-            for k in self.REQUIRED_COMPONENT_KEYS:
-                v = c.get(k)
-                if not isinstance(v, (int, float)) or v < 0.0:
-                    self.params_ok = False
-                    return
-            if c['Beta'] <= 0.0 or c['Eta_Plus'] <= 0.0 or c['Eta_Minus'] <= 0.0:
-                self.params_ok = False
-                return
 
     @staticmethod
     def num_factors():
         return 1
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-        # process_ofs is retained for parity with peers even though we don't draw from
-        # the shared Gaussian pool — Hawkes uses Poisson + Gamma sampling instead.
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size
 
         dt_arr = np.diff(np.hstack(([0.0], time_grid.time_grid_years)))
-        comps = self.param['Components']
-        K = len(comps)
+        states = self.param['States']
+        self.n_states = len(states)
+        T = len(dt_arr)
 
         def _t(arr):
             return shared.one.new_tensor(arr)
 
-        # Per-component scalar parameters, packed (K,) for vectorised loop math.
-        self.K = K
-        self.mu_plus = _t(np.array([c['Mu_Plus'] for c in comps], dtype=np.float64))
-        self.mu_minus = _t(np.array([c['Mu_Minus'] for c in comps], dtype=np.float64))
-        self.beta = _t(np.array([c['Beta'] for c in comps], dtype=np.float64))
-        self.alpha_pp = _t(np.array([c['Alpha_PP'] for c in comps], dtype=np.float64))
-        self.alpha_np = _t(np.array([c['Alpha_NP'] for c in comps], dtype=np.float64))
-        self.alpha_pn = _t(np.array([c['Alpha_PN'] for c in comps], dtype=np.float64))
-        self.alpha_nn = _t(np.array([c['Alpha_NN'] for c in comps], dtype=np.float64))
-        self.eta_plus = _t(np.array([c['Eta_Plus'] for c in comps], dtype=np.float64))
-        self.eta_minus = _t(np.array([c['Eta_Minus'] for c in comps], dtype=np.float64))
+        # Annualised (μ, σ) per state; per-step values applied in generate via dt scaling.
+        self.mu_per_state = _t(np.array([float(s.get('Mu', 0.0)) for s in states], dtype=np.float64))
+        self.sigma_per_state = _t(np.array([float(s['Sigma']) for s in states], dtype=np.float64))
+        self.dt_per_step = _t(dt_arr)
+        # Optional Student-t degrees of freedom per state. If any state has Nu the model
+        # emits t-distributed innovations (rescaled to unit marginal variance so σ retains
+        # its standard interpretation). Absent or all-None → Gaussian as before.
+        nu_arr = [s.get('Nu') for s in states]
+        if any(n is not None for n in nu_arr):
+            self.nu_per_state = _t(np.array([float(n) if n is not None else 1.0e6 for n in nu_arr],
+                                            dtype=np.float64))
+        else:
+            self.nu_per_state = None
 
-        # exp(-β_k δ_t) per (component, step) — pre-computed.
-        beta_np = np.array([c['Beta'] for c in comps], dtype=np.float64)
-        self.decay_per_step = _t(np.exp(-np.outer(beta_np, dt_arr)))  # (K, T)
-        self.dt_per_step = _t(dt_arr)                                  # (T,)
+        # Log-price mode: emissions are log returns; final price is exp(log_spot0 + cumsum).
+        # When False, emissions are raw price diffs and price is spot0 + cumsum(dS).
+        self.log_price = bool(self.param.get('Log_Price', False))
 
-        self.log_spot0 = float(torch.log(tensor).item()) if tensor.numel() == 1 else torch.log(tensor)
+        # CTMC re-discretisation (same pattern as MarkovSwitchingLogOUSpotModel).
+        P_calib = np.array(self.param['Transition_Matrix'], dtype=np.float64)
+        dt_calib = float(self.param['Calibration_DT_Years'])
+        Q = np.real(matrix_logm(P_calib)) / dt_calib
+        P_per_step = np.zeros((T, self.n_states, self.n_states))
+        for t, dt in enumerate(dt_arr):
+            P_per_step[t] = np.real(matrix_expm(Q * dt)) if dt > 1.0e-12 else np.eye(self.n_states)
+        self.P_cum = _t(np.cumsum(P_per_step, axis=2))
+        self.pi0_cum = _t(np.cumsum(self.param['Initial_State_Probs']))
+
+        # Initial spot — broadcast scalar or keep per-scenario tensor.
+        self.spot0 = float(tensor.item()) if tensor.numel() == 1 else tensor.detach().clone()
 
     @property
     def correlation_name(self):
-        return 'CompoundHawkesProcess', [()]
+        return 'MarkovHMMSpotProcess', [()]
 
     def generate(self, shared_mem):
-        # We don't read the Gaussian pool here, but stay shape-consistent with peers
-        # by sizing the output from t_random_numbers / scenario_horizon.
-        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]      # (T, B)
         T, B = Z.shape
         device = Z.device
-        K = self.K
+        dtype = torch.float32
 
-        if isinstance(self.log_spot0, torch.Tensor) and self.log_spot0.numel() > 1:
-            log_spot = self.log_spot0.to(device).expand(B).clone()
+        u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, T + 1)[1].contiguous()
+        pi0_cum = self.pi0_cum.to(device=device, dtype=dtype)
+        P_cum = self.P_cum.to(device=device, dtype=dtype)
+        state = torch.searchsorted(pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
+
+        regimes = torch.empty((T, B), dtype=torch.long, device=device)
+        regimes[0] = state
+        for t in range(1, T):
+            cdf_rows = P_cum[t - 1].index_select(0, state)
+            state = (cdf_rows < u_regime[t].unsqueeze(1)).sum(dim=1).clamp_max_(self.n_states - 1)
+            regimes[t] = state
+
+        mu = self.mu_per_state.to(device=device, dtype=dtype)
+        sigma = self.sigma_per_state.to(device=device, dtype=dtype)
+        dt = self.dt_per_step.to(device=device, dtype=dtype)
+
+        # Student-t emission via Z·sqrt(ν/W), W ~ Chi²(ν) internal. Falls back to
+        # Gaussian if Nu absent on every state.
+        nu_per_state = getattr(self, 'nu_per_state', None)
+        Z_dt = Z.to(dtype=dtype)
+        if nu_per_state is not None:
+            nu = nu_per_state.to(device=device, dtype=dtype)                        # (n_states,)
+            # Draw W~Chi²(ν_z) per (T, B). Generate one Chi² stack per state then gather
+            # along the regime path. Memory: n_states × T × B floats.
+            W_per_state = torch.stack([
+                torch.distributions.Chi2(float(nu[s])).sample((T, B)).to(device=device, dtype=dtype)
+                for s in range(self.n_states)
+            ])                                                                       # (n_states, T, B)
+            W = W_per_state.gather(0, regimes.unsqueeze(0)).squeeze(0)              # (T, B)
+            nu_t = nu[regimes]                                                       # (T, B)
+            # Student-t innovation with df=ν, var=ν/(ν-2). Rescale so the marginal
+            # daily variance matches σ² (i.e. neutralise the t variance amplification).
+            t_innov = Z_dt * torch.sqrt(nu_t / W)                                    # std-t
+            scale_to_unit_var = torch.sqrt((nu_t - 2.0).clamp_min(1.0e-3) / nu_t)
+            innov = t_innov * scale_to_unit_var
         else:
-            scalar = self.log_spot0 if isinstance(self.log_spot0, float) else float(self.log_spot0.item())
-            log_spot = torch.full((B,), scalar, device=device, dtype=torch.float32)
+            innov = Z_dt
 
-        # Per-component intensities, initialised at baseline. Shape (K, B).
-        lam_plus = self.mu_plus.to(dtype=torch.float32).view(K, 1).expand(K, B).contiguous()
-        lam_minus = self.mu_minus.to(dtype=torch.float32).view(K, 1).expand(K, B).contiguous()
+        # Per-step emission: ΔS_t = μ_s·δ + σ_s·√δ·innov_t (additive, price space).
+        mu_t = mu[regimes] * dt.view(T, 1)                                          # (T, B)
+        std_t = sigma[regimes] * dt.view(T, 1).sqrt()
+        ds = mu_t + std_t * innov
 
-        log_spot_out = torch.empty((T, B), device=device, dtype=torch.float32)
-        h_plus_path = torch.empty((T, B), device=device, dtype=torch.float32)
-        h_minus_path = torch.empty((T, B), device=device, dtype=torch.float32)
+        if isinstance(self.spot0, torch.Tensor):
+            s0 = self.spot0.to(device=device, dtype=dtype).expand(B)
+        else:
+            s0 = torch.full((B,), float(self.spot0), device=device, dtype=dtype)
+        if self.log_price:
+            log_path = s0.log().unsqueeze(0) + ds.cumsum(dim=0)                     # (T, B)
+            spot_path = log_path.exp()
+        else:
+            spot_path = s0.unsqueeze(0) + ds.cumsum(dim=0)                          # (T, B)
 
-        # Pre-cast scalar param tensors to float32 once.
-        mu_plus = self.mu_plus.to(dtype=torch.float32).view(K, 1)
-        mu_minus = self.mu_minus.to(dtype=torch.float32).view(K, 1)
-        decay = self.decay_per_step.to(dtype=torch.float32)            # (K, T)
-        eta_plus = self.eta_plus.to(dtype=torch.float32).view(K, 1)    # rate of Exp marks
-        eta_minus = self.eta_minus.to(dtype=torch.float32).view(K, 1)
-        a_pp = self.alpha_pp.to(dtype=torch.float32).view(K, 1)
-        a_np = self.alpha_np.to(dtype=torch.float32).view(K, 1)
-        a_pn = self.alpha_pn.to(dtype=torch.float32).view(K, 1)
-        a_nn = self.alpha_nn.to(dtype=torch.float32).view(K, 1)
-        dt_per_step = self.dt_per_step.to(dtype=torch.float32)         # (T,)
-
-        for t in range(T):
-            dt = dt_per_step[t]
-            decay_t = decay[:, t].view(K, 1)                            # (K, 1)
-
-            # Decay intensities toward baselines (Hawkes mean-reverting kernel).
-            lam_plus = mu_plus + decay_t * (lam_plus - mu_plus)
-            lam_minus = mu_minus + decay_t * (lam_minus - mu_minus)
-
-            # Sample event counts per (component, path). torch.poisson takes a rate tensor.
-            n_plus = torch.poisson(lam_plus * dt)                       # (K, B), real-valued >= 0
-            n_minus = torch.poisson(lam_minus * dt)
-
-            # Compound-Poisson mark sums. Σ of N iid Exp(η) is Gamma(N, rate=η);
-            # for N=0 the sum is 0 (Gamma(0, ·) is degenerate, mask it out).
-            mask_p = (n_plus > 0).to(dtype=torch.float32)
-            mask_n = (n_minus > 0).to(dtype=torch.float32)
-            shape_p = n_plus.clamp(min=1.0)
-            shape_n = n_minus.clamp(min=1.0)
-            sum_mp = mask_p * torch.distributions.Gamma(shape_p, eta_plus).sample()    # (K, B)
-            sum_mn = mask_n * torch.distributions.Gamma(shape_n, eta_minus).sample()
-
-            # Net log-return summed across components.
-            r_t = (sum_mp - sum_mn).sum(dim=0)                          # (B,)
-            log_spot = log_spot + r_t
-            log_spot_out[t] = log_spot
-
-            # Mark-weighted intensity update.
-            lam_plus = lam_plus + a_pp * sum_mp + a_np * sum_mn
-            lam_minus = lam_minus + a_pn * sum_mp + a_nn * sum_mn
-
-            # Aggregate (sum across K) for the bundle/feature surface.
-            h_plus_path[t] = lam_plus.sum(dim=0)
-            h_minus_path[t] = lam_minus.sum(dim=0)
-
-        self.last_h_plus_path = h_plus_path
-        self.last_h_minus_path = h_minus_path
-        return torch.exp(log_spot_out)
+        # Stashed for privileged_factors() called immediately after generate() in the sim loop;
+        # also published for cross-process consumers under the (factor_key, kind) convention.
+        self.last_regime_path = regimes
+        shared_mem.t_Scenario_Buffer[(self.factor_key, 'regimes')] = regimes
+        return spot_path
 
     @classmethod
     def privileged_layout(cls, param):
-        K = len(param.get('Components') or [])
-        return {
-            'hawkes_h_plus_total': 1,
-            'hawkes_h_minus_total': 1,
-            'hawkes_ratio_total': 1,
-            # Per-component intensities for asymmetric critic — gives the critic visibility
-            # into multi-scale clustering structure that the actor only sees aggregated.
-            'hawkes_h_plus_components': K,
-            'hawkes_h_minus_components': K,
-        }
+        n = len(param.get('States') or [])
+        return {'regime_onehot': n}
 
     def privileged_factors(self, simulated):
-        H_plus = self.last_h_plus_path.to(dtype=torch.float32)
-        H_minus = self.last_h_minus_path.to(dtype=torch.float32)
-        ratio = H_minus / (H_plus + H_minus + 1.0e-8)
+        regimes = self.last_regime_path
         return {
-            'hawkes_h_plus_total': H_plus.unsqueeze(-1),
-            'hawkes_h_minus_total': H_minus.unsqueeze(-1),
-            'hawkes_ratio_total': ratio.unsqueeze(-1),
+            'regime_onehot': torch.nn.functional.one_hot(
+                regimes, num_classes=self.n_states).to(dtype=torch.float32),
         }
+
+
+class MarkovHMMSpotCalibration(object):
+    """Calibration of MarkovHMMSpotModel via in-house Baum-Welch on price diffs (or log
+    returns when `Log_Price=True`). Per-state emission is Gaussian; M-step uses weighted
+    mean and weighted variance. Optional Student-t refit picks a shared ν via
+    method-of-moments on the unconditional mixture kurtosis — per-state μ, σ are kept
+    and ν enters the simulator's t-rescaling so marginal variance per regime stays at σ².
+    States are reordered ascending by σ post-fit. `delta` is the regime-standardised
+    innovation series — approximately iid under the calibrated model.
+
+    JSON config (calibration_config.json):
+        N_States, N_Iter, Seed, Tol: EM knobs (defaults 3, 200, 42, 1e-6).
+        Log_Price: fit on log returns rather than raw diffs (default True).
+        Use_Student_T: enable t-refit (default True; False → pure Gaussian).
+        Nu_Min, Nu_Max: clamps on ν (defaults 3.0, 50.0; above max → drop t)."""
+
+    def __init__(self, model, param):
+        self.model = model
+        self.param = param
+        self.num_factors = 1
+
+    @staticmethod
+    def _emission_logprob(diffs, means, sigmas):
+        """Per-state log Normal(diffs | μ_s, σ_s²); returns (T, n_states)."""
+        var = np.maximum(sigmas ** 2, 1.0e-12)
+        return (-0.5 * np.log(2.0 * np.pi * var)
+                - 0.5 * (diffs[:, None] - means) ** 2 / var)
+
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
+        from scipy import stats as scipy_stats
+
+        n_states = int(self.param.get('N_States', 3))
+        n_iter = int(self.param.get('N_Iter', 200))
+        seed = int(self.param.get('Seed', 42))
+        tol = float(self.param.get('Tol', 1.0e-6))
+        use_t = bool(self.param.get('Use_Student_T', True))
+        nu_min = float(self.param.get('Nu_Min', 3.0))
+        nu_max = float(self.param.get('Nu_Max', 50.0))
+        # Log_Price: fit on log returns. Scale-invariant, simulator exp()s to keep prices positive.
+        log_price = bool(self.param.get('Log_Price', True))
+        dt_calib = 1.0 / float(num_business_days)
+
+        prices = data_frame.iloc[:, 0].astype(np.float64).dropna()
+        if log_price:
+            diffs = np.log(prices).diff().dropna()
+        else:
+            diffs = prices.diff().dropna()
+        x = diffs.values
+
+        # Init: spread σ across regimes for distinguishable EM start.
+        rng = np.random.default_rng(seed)
+        base_sigma = x.std()
+        means = np.full(n_states, x.mean()) + rng.normal(0, base_sigma * 0.05, n_states)
+        sigmas = base_sigma * np.linspace(0.5, 2.0, n_states)
+        pi = np.full(n_states, 1.0 / n_states)
+        P = np.full((n_states, n_states), 0.05) + 0.85 * np.eye(n_states)
+        P /= P.sum(axis=1, keepdims=True)
+
+        prev_lik = -np.inf
+        for it in range(n_iter):
+            log_emit = self._emission_logprob(x, means, sigmas)
+            gamma, xi, log_lik = hmm_forward_backward(
+                np.log(pi + 1e-12), np.log(P + 1e-12), log_emit)
+            if it > 0 and abs(log_lik - prev_lik) < tol * abs(prev_lik):
+                break
+            prev_lik = log_lik
+            pi = gamma[0]
+            denom = gamma[:-1].sum(axis=0)
+            P = xi.sum(axis=0) / np.maximum(denom[:, None], 1e-12)
+            P /= P.sum(axis=1, keepdims=True)
+            w_sum = gamma.sum(axis=0)
+            means = (gamma * x[:, None]).sum(axis=0) / np.maximum(w_sum, 1e-12)
+            sigmas = np.sqrt(np.maximum(
+                (gamma * (x[:, None] - means) ** 2).sum(axis=0) / np.maximum(w_sum, 1e-12),
+                1e-12))
+
+        # Reorder states ascending by σ; remap P, π, posterior assignments accordingly.
+        order = np.argsort(sigmas)
+        means = means[order]
+        sigmas = sigmas[order]
+        P = P[np.ix_(order, order)]
+        regimes = np.argmax(gamma, axis=1)
+        remap = {old: new for new, old in enumerate(order)}
+        regimes = np.array([remap[s] for s in regimes])
+        occ = np.bincount(regimes, minlength=n_states) / len(regimes)
+        nus = [None] * n_states
+
+        # Method-of-moments shared ν, derived from the unconditional kurt of the
+        # regime mixture: K = (3 + 6/(ν-4)) · Σπ_s σ_s⁴ / Var² - 3. Inverting for ν:
+        #     ν = 4 + 6 / [(K_emp + 3)·Var² / Σπ_s σ_s⁴ - 3]
+        # Use the *model's* stationary variance (not the sample variance) so the
+        # simulator round-trips on kurt — EM convergence may underfit empirical Var.
+        if use_t:
+            emp_kurt = float(scipy_stats.kurtosis(x, fisher=True))
+            mu_total = float((occ * means).sum())
+            mix_var = float((occ * sigmas**2).sum() + (occ * (means - mu_total)**2).sum())
+            sum_pi_sigma4 = float(np.sum(occ * sigmas**4))
+            denom = (emp_kurt + 3.0) * mix_var * mix_var / sum_pi_sigma4 - 3.0
+            if denom > 1e-3:
+                nu_global = 4.0 + 6.0 / denom
+                nu_global = float(np.clip(nu_global, nu_min, nu_max))
+                if nu_global < nu_max - 1e-6:
+                    nus = [nu_global] * n_states
+
+        # Annualised storage convention so model.precalculate's per-step
+        # `μ·δ, σ²·δ` formula gives the calibration-step daily moments at δ=dt_calib.
+        mu_year = means / dt_calib
+        sigma_year = sigmas / np.sqrt(dt_calib)
+
+        param = {
+            'Log_Price': log_price,
+            'States': [
+                {'Mu': float(m), 'Sigma': float(s), **({'Nu': float(n)} if n is not None else {})}
+                for m, s, n in zip(mu_year, sigma_year, nus)
+            ],
+            'Transition_Matrix': P.tolist(),
+            'Initial_State_Probs': occ.tolist(),
+            'Calibration_DT_Years': dt_calib,
+        }
+
+        # delta = regime-standardised innovation: (diff - μ_state) / σ_state under the
+        # posterior regime path. Approximately iid N(0,1) so the framework's correlation
+        # consolidation isn't contaminated by regime-induced heteroskedasticity.
+        innov = (diffs.values - means[regimes]) / np.where(sigmas[regimes] > 0, sigmas[regimes], 1.0)
+        delta = pd.DataFrame({data_frame.columns[0]: innov}, index=diffs.index)
+
+        return utils.CalibrationInfo(param, [[1.0]], delta)
+
+
+class VARMixedFactorInterestRateModel(StochasticProcess):
+    """3-factor VAR(1) curve model on a forward-curve-shaped factor (absolute-date
+    tenors, in the same shape as ForwardPrice consumed by CSForwardPriceModel). The
+    latent state X(t) = (β_0, β_1, r) — level, slope, curvature — evolves jointly:
+
+        X(t+δ) = μ + Φ_step (X(t) − μ) + diag(σ_step) Z(t)
+
+    Internally the model maintains a 3-slot ladder (front/mid/back contract τs that
+    age with sim time and roll forward by `Contract_Cycle_Years` together), evaluates
+    the curve at the slot τs via the cross-product orthogonal basis:
+
+        c_i_slot(t) = β_0 + β_1·τ_i_slot(t) + r·w_i_slot(t)
+
+    then *publishes* by linearly interpolating the 3 slot values onto the factor's
+    contract tenors (T_j(t) = factor_tenor[j] − sim_t in years). The factor's tenor
+    is in absolute Excel-date offsets — one per dated contract — so consumer-side
+    `gather_weighted_curve(date_index, multiply_by_time=False)` lands exactly on a
+    knot. Slot machinery is purely an internal latent-state representation; the
+    published shape is a forward curve.
+
+    Φ_step and σ_step are matrix-power-scaled from the calibration step when
+    sim δ ≠ δ_calib. Innovation correlations live in the global Correlations block;
+    the framework's global Cholesky delivers Z pre-correlated.
+
+    JSON config:
+        Mean: 3-vector [μ_β0, μ_β1, μ_r] (long-run mean per factor)
+        Phi: 3x3 list-of-lists (calibration-step transition)
+        Sigma: 3-vector (marginal innovation std per factor)
+        Calibration_Tenors: 3-vector (τ_i(0) — slot tenors at simulation start, years)
+        Contract_Cycle_Years: float (front-slot roll cycle, e.g. 0.25 quarterly)
+        Calibration_DT_Years: float (default 1/252)"""
+
+    documentation = (
+        'Interest Rates',
+        ['A 3-factor VAR(1) model with internal slot ladder, published as a '
+         'forward-curve-shaped factor (absolute-date tenors). The latent state '
+         '$X = (\\beta_0, \\beta_1, r)$ — level, slope, curvature — evolves jointly:',
+         '',
+         '$$ X(t+\\delta) = \\boldsymbol{\\mu} + \\Phi (X(t) - \\boldsymbol{\\mu}) '
+         '+ \\text{diag}(\\sigma) Z, \\quad Z \\sim \\mathcal{N}(0, \\rho_\\text{innov}) $$',
+         '',
+         'Internally the curve at the slot τs is reconstructed each step as $c_i^{slot}(t) '
+         '= \\beta_0 + \\beta_1 \\tau_i^{slot}(t) + r \\cdot w_i^{slot}(t)$. The factor '
+         'output at the dated contract tenors $T_j(t)$ is obtained by linearly '
+         'interpolating the three slot values; this is algebraically equivalent to '
+         'evaluating the parametric form with linearly-interpolated $w$, but only '
+         'evaluates $w$ where it is mathematically defined (at the slot τs). Innovation '
+         'correlations $\\rho_\\text{innov}$ live in the global Correlations block.'])
+
+    def __init__(self, factor, param, implied_factor=None):
+        super().__init__(factor, param)
+
+    def num_factors(self):
+        return 3
+
+    @property
+    def correlation_name(self):
+        return 'VARMixedFactorInterestRateProcess', [('B0',), ('B1',), ('R',)]
+
+    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
+        dt_calib = float(self.param['Calibration_DT_Years'])
+        sim_t = time_grid.time_grid_years
+        dt_arr = np.diff(np.hstack(([0.0], sim_t)))                                    # (T,)
+
+        # Per-step Φ via matrix-power: Φ_step = Φ_calib^(dt/dt_calib). For dt = dt_calib
+        # this is just Φ_calib. Eigendecomposition handles arbitrary dt.
+        Phi_calib = np.array(self.param['Phi'], dtype=np.float64)
+        eigvals, eigvecs = np.linalg.eig(Phi_calib)
+        eigvecs_inv = np.linalg.inv(eigvecs)
+        Phi_per_step = np.zeros((len(dt_arr), 3, 3))
+        sigma_calib = np.array(self.param['Sigma'], dtype=np.float64)                  # (3,)
+        sigma_per_step = np.zeros((len(dt_arr), 3))
+        for t_idx, dt in enumerate(dt_arr):
+            power = dt / dt_calib
+            Phi_per_step[t_idx] = np.real(eigvecs @ np.diag(eigvals ** power) @ eigvecs_inv)
+            sigma_per_step[t_idx] = sigma_calib * np.sqrt(power)
+
+        self.Phi_per_step = shared.one.new_tensor(Phi_per_step)                        # (T, 3, 3)
+        self.sigma_per_step = shared.one.new_tensor(sigma_per_step)                    # (T, 3)
+        self.mean_vec = shared.one.new_tensor(np.array(self.param['Mean'], dtype=np.float64))  # (3,)
+
+        # Slot ladder: starting at cal_tau_0 = τ_i(0), each slot ages with sim_t. The
+        # front slot rolls when its tenor would otherwise hit zero; all three slots
+        # shift forward by Δ_cycle together (futures-ladder convention).
+        cal_tau_0 = np.array(self.param['Calibration_Tenors'], dtype=np.float64)       # (3,)
+        delta_cycle = float(self.param['Contract_Cycle_Years'])
+        n_rolls = np.where(sim_t < cal_tau_0[0], 0,
+                           np.floor((sim_t - cal_tau_0[0]) / delta_cycle).astype(int) + 1)
+        slot_tenors = cal_tau_0[None, :] + n_rolls[:, None] * delta_cycle - sim_t[:, None]
+        if (slot_tenors <= 0).any():
+            raise ValueError(f'Slot tenor schedule went non-positive: min={slot_tenors.min():.4f}')
+
+        # Per-step W via cross-product on the slot τs (where w is mathematically defined).
+        t1, t2, t3 = slot_tenors[:, 0], slot_tenors[:, 1], slot_tenors[:, 2]
+        w_raw = np.stack([t2 - t3, t3 - t1, t1 - t2], axis=-1)
+        W_per_step = w_raw / np.linalg.norm(w_raw, axis=-1, keepdims=True)
+        W_per_step = W_per_step * np.where(W_per_step[:, 1:2] < 0, -1.0, 1.0)
+
+        D_slot_per_step = np.stack([
+            np.ones_like(slot_tenors),
+            slot_tenors,
+            W_per_step,
+        ], axis=-1)                                                                    # (T, 3, 3)
+        self.D_slot_per_step = shared.one.new_tensor(D_slot_per_step)
+        self.tau_slot_per_step = shared.one.new_tensor(slot_tenors)                    # (T, 3)
+
+        # CSForward-style per-step contract tenors: factor_tenor is in absolute Excel
+        # date offsets; convert to remaining years per sim step. Contracts past expiry
+        # get a zero output (clamped via expired mask).
+        factor_tenor = np.asarray(self.factor.get_tenor(), dtype=np.float64)
+        excel_offset = (ref_date - utils.excel_offset).days
+        excel_date_time_grid = time_grid.scen_time_grid + excel_offset                 # (T,) Excel days
+        contract_T = (factor_tenor[None, :] - excel_date_time_grid[:, None]) / utils.DAYS_IN_YEAR
+        self.contract_expired = shared.one.new_tensor(
+            (contract_T <= 0.0).astype(np.float64)).bool()                             # (T, n_contracts)
+        self.contract_T = shared.one.new_tensor(np.maximum(contract_T, 0.0))           # (T, n_contracts)
+
+        # X_0 from t=0 carries: find X such that linearly-interpolating the slot values
+        # c_slot = D_slot[0] @ X at slot τs onto contract Ts reproduces today's curve.
+        # The linear-interp/extrap operator is captured by row-mixing of D_slot[0] —
+        # for contract j in bracket [slot k, slot k+1]:
+        #   M[j, :] = (1-α_j) D_slot[0, k, :] + α_j D_slot[0, k+1, :]
+        # This matches the runtime interp in `generate` exactly (including extrapolation
+        # outside the slot range).
+        if tensor.numel() == factor_tenor.size:
+            curve0_at_dates = tensor.detach().cpu().numpy().astype(np.float64)
+        else:
+            curve0_at_dates = np.full(factor_tenor.size, float(tensor.item()))
+        slot_t0 = slot_tenors[0]
+        contract_T0 = np.maximum(contract_T[0], 1e-9)
+        idx0 = np.clip(np.searchsorted(slot_t0, contract_T0, side='left'), 1, 2)
+        alpha0 = (contract_T0 - slot_t0[idx0 - 1]) / (slot_t0[idx0] - slot_t0[idx0 - 1])
+        M = (1.0 - alpha0)[:, None] * D_slot_per_step[0, idx0 - 1, :] \
+            + alpha0[:, None] * D_slot_per_step[0, idx0, :]                            # (n_contracts, 3)
+        if M.shape[0] == 3:
+            X0 = np.linalg.solve(M, curve0_at_dates)
+        else:
+            X0, *_ = np.linalg.lstsq(M, curve0_at_dates, rcond=None)
+        self.X0 = shared.one.new_tensor(X0)                                            # (3,)
+
+    def generate(self, shared_mem):
+        Z = shared_mem.t_random_numbers[
+            self.z_offset:self.z_offset + 3, :self.scenario_horizon]                   # (3, T, B)
+        _, T, B = Z.shape
+        n_contracts = self.contract_T.shape[1]
+
+        mean = self.mean_vec.view(3, 1)                                                # (3, 1)
+        X = self.X0.view(3, 1).expand(3, B).clone()                                    # (3, B)
+        out = torch.empty((T, n_contracts, B), dtype=Z.dtype, device=Z.device)
+        for t in range(T):
+            X = mean + self.Phi_per_step[t] @ (X - mean) \
+                + self.sigma_per_step[t].view(3, 1) * Z[:, t, :]                       # (3, B)
+            c_slot = self.D_slot_per_step[t] @ X                                       # (3, B)
+            ts = self.tau_slot_per_step[t]                                             # (3,) ascending
+            cT_t = self.contract_T[t]                                                  # (n_contracts,)
+            # Bracket cT_t inside one of [ts[0], ts[1]] or [ts[1], ts[2]]; outside the
+            # range, extrapolate from the closest segment (linear in c_slot vs ts).
+            idx = torch.clamp(torch.searchsorted(ts, cT_t, right=False), 1, 2)
+            alpha = ((cT_t - ts[idx - 1]) / (ts[idx] - ts[idx - 1])).unsqueeze(-1)     # (n_contracts, 1)
+            out_t = (1.0 - alpha) * c_slot[idx - 1] + alpha * c_slot[idx]              # (n_contracts, B)
+            out[t] = torch.where(self.contract_expired[t].unsqueeze(-1),
+                                 torch.zeros_like(out_t), out_t)
+        return out
+
+
+class VARMixedFactorInterestRateCalibration(object):
+    """Calibration of VARMixedFactorInterestRateModel from floating-tenor curve
+    observations. Per day t: solve D(t)·X(t) = c(t) where D = [1, τ, w(τ)] is the 3×3
+    design matrix built from that day's τ-vector — exact 3-equations-3-unknowns. Then
+    fit VAR(1) to the daily latent series via OLS for Φ, sample mean for μ, and column-
+    std of the residuals for σ.
+
+    The simulator-side `Calibration_Tenors` is τ at the *last* calibration date — i.e.
+    τ_i(0) of the simulation. `Contract_Cycle_Years` is the front-slot roll cycle,
+    auto-detected from the median τ-spacing across slots.
+
+    `delta` is ε_t (3 columns); `correlation` is identity 3×3 so the framework's
+    consolidation picks up the innovation cross-correlations directly."""
+
+    def __init__(self, model, param):
+        self.model = model
+        self.param = param
+        self.num_factors = 3
+
+    @staticmethod
+    def _w_vector(tau):
+        """Unit vector orthogonal to (1,1,1) and τ, with sign convention w_2 > 0."""
+        w = np.array([tau[2] - tau[1], tau[0] - tau[2], tau[1] - tau[0]], dtype=np.float64)
+        n = np.linalg.norm(w)
+        if n < 1e-12:
+            return np.zeros(3)
+        w /= n
+        if w[1] < 0:
+            w = -w
+        return w
+
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
+        primary = [c for c in data_frame.columns if not c.split(',', 1)[0].startswith('Tenor.')]
+        tenor_cols = [c for c in data_frame.columns if c.split(',', 1)[0].startswith('Tenor.')]
+
+        sub_keys = [c.split(',', 1)[1] for c in primary]
+        tenor_lookup = {c.split(',', 1)[0].split('.', 1)[1]: c for c in tenor_cols}
+        carry_arr = data_frame[primary].astype(np.float64).values                      # (T_obs, 3)
+        tau_arr = np.column_stack([
+            data_frame[tenor_lookup[sk]].astype(np.float64).values for sk in sub_keys
+        ])                                                                              # (T_obs, 3)
+
+        # Drop NaN + near-expiry rows. Tau_Floor (default 0.03 ≈ 1 BD) eliminates days
+        # where 1/τ amplification destabilises the carry estimate.
+        tau_floor = float(self.param.get('Tau_Floor', 0.03))
+        valid = (~(np.isnan(carry_arr).any(axis=1) | np.isnan(tau_arr).any(axis=1))
+                 & (tau_arr[:, 0] > tau_floor))
+        carry_arr = carry_arr[valid]
+        tau_arr = tau_arr[valid]
+        valid_index = data_frame.index[valid]
+
+        X_daily = np.zeros((len(carry_arr), 3))
+        for t in range(len(carry_arr)):
+            tau_t = tau_arr[t]
+            w_t = self._w_vector(tau_t)
+            D = np.column_stack([np.ones(3), tau_t, w_t])
+            X_daily[t] = np.linalg.solve(D, carry_arr[t])
+
+        mu = X_daily.mean(axis=0)
+        X_centered = X_daily - mu
+        X_lag = X_centered[:-1]
+        X_next = X_centered[1:]
+        gram = X_lag.T @ X_lag
+        rhs = X_lag.T @ X_next
+        Phi = np.linalg.solve(gram, rhs).T
+        innov = X_next - X_centered[:-1] @ Phi.T
+        sigma = innov.std(axis=0)
+
+        # τ_i(0) for the simulator: τ at the last calibration date (sim picks up here).
+        # Cycle: median inter-slot spacing across the calibration window.
+        tau_ref = tau_arr[-1]
+        cycle = float(np.median(np.diff(tau_arr, axis=1)))
+
+        dt_calib = 1.0 / float(num_business_days)
+        param = {
+            'Mean': [float(m) for m in mu],
+            'Phi': [[float(v) for v in row] for row in Phi],
+            'Sigma': [float(s) for s in sigma],
+            'Calibration_Tenors': [float(t) for t in tau_ref],
+            'Contract_Cycle_Years': cycle,
+            'Calibration_DT_Years': dt_calib,
+        }
+
+        # delta: per-factor innovation series. Framework concatenates these and computes
+        # ρ for both within-factor (β0↔β1 etc.) and cross-factor (e.g. spot↔β0) correlations.
+        archive_name = primary[0].split(',', 1)[0]                                     # e.g. 'InterestRate.PLATINUM_CARRY'
+        delta = pd.DataFrame(
+            innov, index=valid_index[1:],
+            columns=[f'{archive_name},B0', f'{archive_name},B1', f'{archive_name},R'])
+        # correlation: identity 3×3 — each delta column maps 1-1 to a primitive factor.
+        correlation_coef = np.eye(3).tolist()
+
+        return utils.CalibrationInfo(param, correlation_coef, delta)
+
+
+class BasisLinkedSpotModel(StochasticProcess):
+    """Lagged-AR(1) basis driven by a sibling commodity-spot path and its HMM regime:
+
+        b(t) = a · ΔS(t) + φ · b(t-1) + η(t)
+        η(t) = σ(s_t) · √((ν-2)/ν) · ε_t,    ε_t ~ t_ν
+
+    ΔS is the linked spot's per-step diff, s_t is the linked spot's HMM regime, and σ(s)
+    is the regime-keyed innovation std. Innovation is built from a framework-correlated
+    Gaussian Z plus an internal Chi²(ν) draw; the √((ν-2)/ν) rescaling makes σ(s) the
+    realised std of η regardless of ν. The linked spot's path and regime path are read
+    from `shared_mem.t_Scenario_Buffer`; sim ordering is enforced by
+    `dependant_fields['CommodityBasis']` and the `Observed_Commodity` Price Factor field.
+    Initial b(0) is taken from the factor's `Spot` value.
+
+    JSON config:
+        A: concurrent ΔS loading
+        Phi: AR(1) coefficient on b(t-1)
+        Nu: Student-t degrees of freedom (shared across regimes)
+        Sigma_By_State: list of σ_s indexed by linked-spot HMM state
+        Mu: long-run mean of η (typically 0)
+        Calibration_DT_Years: float (default 1/252)"""
+
+    documentation = (
+        'Asset Pricing',
+        ['A lagged-AR(1) basis driven by a sibling commodity-spot path and its HMM regime.',
+         '',
+         '$$ b(t) = a \\Delta S(t) + \\phi b(t-1) + \\eta(t),'
+         '\\quad \\eta(t) = \\sigma(s_t)\\sqrt{(\\nu-2)/\\nu}\\,\\varepsilon_t,'
+         '\\quad \\varepsilon_t \\sim t_\\nu $$',
+         '',
+         'Reads the linked spot path and its HMM regime path from the simulator shared '
+         'buffer; the linked spot is simulated first (enforced via `dependant_fields`).',
+         '',
+         '- **A**: concurrent ΔS loading',
+         '- **Phi**: AR(1) coefficient',
+         '- **Nu**: Student-t degrees of freedom (shared across regimes)',
+         '- **Sigma_By_State**: per-regime innovation std'])
+
+    def __init__(self, factor, param, implied_factor=None):
+        super().__init__(factor, param)
+
+    @staticmethod
+    def num_factors():
+        return 1
+
+    @property
+    def correlation_name(self):
+        return 'BasisLinkedSpotProcess', [()]
+
+    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+        # The linked CommodityPrice factor is named in this Price Factor's Observed_Commodity
+        # field — declared via dependant_fields['CommodityBasis']. At sim time the framework
+        # has populated the Price Factor entry from the job file's ExplicitMarketData.
+        linked_id = self.factor.param['Observed_Commodity']
+        self.linked_key = utils.Factor('CommodityPrice', tuple(linked_id.split('.')))
+
+        self.A = float(self.param['A'])
+        self.Phi = float(self.param['Phi'])
+        self.Nu = float(self.param['Nu'])
+        self.Mu = float(self.param.get('Mu', 0.0))
+        self.sigma_by_state = shared.one.new_tensor(np.array(self.param['Sigma_By_State'], dtype=np.float64))
+        self.b0 = float(tensor.item()) if tensor.numel() == 1 else tensor.detach().clone()
+
+    def generate(self, shared_mem):
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]      # (T, B), correlated
+        T, B = Z.shape
+        device = Z.device
+        dtype = Z.dtype
+
+        # Cross-process reads. The linked spot must have been generated first; the
+        # `dependant_fields` declaration on CommodityBasis enforces the ordering by
+        # making CommodityPrice a dependency, so the simulator topo-orders it before us.
+        lme_path = shared_mem.t_Scenario_Buffer[self.linked_key].to(dtype=dtype)     # (T, B)
+        regimes = shared_mem.t_Scenario_Buffer[(self.linked_key, 'regimes')]         # (T, B) long
+
+        sigma_t = self.sigma_by_state.to(device=device, dtype=dtype)[regimes]        # (T, B)
+
+        # Student-t innovation: η_t = sigma_t · ε_t · √((ν-2)/ν), ε_t ~ t_ν.
+        # Identity: ε_t = Z · √(ν/W) where W ~ Chi²(ν). Combine the rescaling so the
+        # marginal variance of η_t is sigma_t² regardless of ν.
+        nu = self.Nu
+        W = torch.distributions.Chi2(nu).sample((T, B)).to(device=device, dtype=dtype)
+        eta = sigma_t * Z * torch.sqrt((nu - 2.0) / W)
+
+        # Sequential AR(1): b[0] = b0 (deterministic); for t≥1, b[t] = a·ΔLME[t] + φ·b[t-1] + η[t].
+        phi = float(self.Phi)
+        a = float(self.A)
+        b_init = torch.full((B,), float(self.b0), device=device, dtype=dtype) \
+                 if not isinstance(self.b0, torch.Tensor) \
+                 else self.b0.to(device=device, dtype=dtype).expand(B)
+        out = torch.empty((T, B), device=device, dtype=dtype)
+        out[0] = b_init
+        for t in range(1, T):
+            out[t] = a * (lme_path[t] - lme_path[t - 1]) + phi * out[t - 1] + eta[t]
+        return out
+
+
+class BasisLinkedSpotCalibration(object):
+    """Calibration of BasisLinkedSpotModel. Self-contained: data_frame carries the basis
+    column (`CommodityBasis.<basis>,<linked>`) plus the linked CommodityPrice column,
+    delivered via the comma-subkey archive-pull. OLS on `b(t) = a·ΔS + φ·b(t-1) + η(t)`
+    recovers (a, φ); ν from method-of-moments on the η excess kurt; per-regime σ from
+    rolling-vol-tercile partitioning of η — terciles indexed in σ-ascending order to
+    match the linked spot's HMM regime convention.
+
+    JSON config (calibration_config.json):
+        Nu_Min, Nu_Max: clamps for the MoM ν solve (defaults 3.0, 50.0)
+        Vol_Window: rolling window for regime-tercile assignment (default 21 BD)"""
+
+    def __init__(self, model, param):
+        self.model = model
+        self.param = param
+        self.num_factors = 1
+
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
+        from scipy import stats as scipy_stats
+
+        nu_min = float(self.param.get('Nu_Min', 3.0))
+        nu_max = float(self.param.get('Nu_Max', 50.0))
+        vol_window = int(self.param.get('Vol_Window', 21))
+        dt_calib = 1.0 / float(num_business_days)
+
+        # Basis col is `CommodityBasis.<basis>,<linked>`; linked col is `CommodityPrice.<linked>`.
+        basis_col = next(c for c in data_frame.columns if c.split('.', 1)[0] == 'CommodityBasis')
+        linked_id = basis_col.split(',', 1)[1]
+        linked_col = next(c for c in data_frame.columns if ',' not in c and c.endswith(f'.{linked_id}'))
+
+        joint = data_frame[[basis_col, linked_col]].astype(np.float64).dropna()
+        b = joint[basis_col].values
+        lme_v = joint[linked_col].values
+        dlme = np.diff(lme_v)
+        y = b[1:]
+        X = np.column_stack([dlme, b[:-1]])
+
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        a_hat, phi_hat = float(coef[0]), float(coef[1])
+        eta = y - X @ coef
+
+        eta_kurt = float(scipy_stats.kurtosis(eta, fisher=True))
+        nu_hat = float(np.clip(4.0 + 6.0 / max(eta_kurt, 1.0e-3), nu_min, nu_max))
+
+        # Rolling-21d vol of ΔLME → tercile bins (low/mid/high). Index ascending in
+        # vol matches the production HMM's σ-ascending state ordering, so per-regime σ
+        # values are positionally consistent with the HMM regime path read at sim time.
+        rolling_vol = pd.Series(dlme).rolling(vol_window, min_periods=vol_window).std()
+        # Align rolling_vol to η (same length n-1)
+        rolling_vol = rolling_vol.values
+        valid = ~np.isnan(rolling_vol)
+        if valid.sum() < 100:
+            sigma_by_state = [float(eta.std())] * 3
+        else:
+            quantiles = np.quantile(rolling_vol[valid], [1.0 / 3, 2.0 / 3])
+            tercile = np.zeros(len(eta), dtype=int)
+            tercile[rolling_vol > quantiles[0]] = 1
+            tercile[rolling_vol > quantiles[1]] = 2
+            tercile[~valid] = 1                                                       # leading NaN → mid
+            sigma_by_state = [float(eta[tercile == s].std()) if (tercile == s).sum() > 1
+                              else float(eta.std()) for s in range(3)]
+
+        param = {
+            'A': a_hat,
+            'Phi': phi_hat,
+            'Nu': nu_hat,
+            'Mu': 0.0,
+            'Sigma_By_State': sigma_by_state,
+            'Calibration_DT_Years': dt_calib,
+        }
+        delta = pd.DataFrame({basis_col: eta}, index=joint.index[1:])
+        return utils.CalibrationInfo(param, [[1.0]], delta)
 
 
 class MarkovSwitchingLogOUSpotCalibration(object):
@@ -2199,12 +2718,6 @@ class MarkovSwitchingLogOUSpotCalibration(object):
         self.num_factors = 1
 
     @staticmethod
-    def _logsumexp(x, axis=None, keepdims=False):
-        m = np.max(x, axis=axis, keepdims=True)
-        out = m + np.log(np.exp(x - m).sum(axis=axis, keepdims=True))
-        return out if keepdims else np.squeeze(out, axis=axis)
-
-    @staticmethod
     def _emission_logprob(X, kappa, theta, sigma, dt):
         """Per-state log p(X_{t+1} | X_t, z=s) for each transition. Returns (T-1, n_states)."""
         T = len(X) - 1
@@ -2216,26 +2729,6 @@ class MarkovSwitchingLogOUSpotCalibration(object):
             mu = theta[s] + e_kdt * (X[:-1] - theta[s])
             out[:, s] = -0.5 * np.log(2.0 * np.pi * var) - 0.5 * (X[1:] - mu) ** 2 / var
         return out
-
-    @classmethod
-    def _forward_backward(cls, log_pi, log_P, log_emit):
-        T, S = log_emit.shape
-        log_alpha = np.full((T, S), -np.inf)
-        log_alpha[0] = log_pi + log_emit[0]
-        for t in range(1, T):
-            log_alpha[t] = cls._logsumexp(log_alpha[t - 1, :, None] + log_P, axis=0) + log_emit[t]
-        log_lik = cls._logsumexp(log_alpha[-1])
-        log_beta = np.zeros((T, S))
-        for t in range(T - 2, -1, -1):
-            log_beta[t] = cls._logsumexp(log_P + (log_emit[t + 1] + log_beta[t + 1])[None, :], axis=1)
-        log_gamma = log_alpha + log_beta
-        log_gamma -= cls._logsumexp(log_gamma, axis=1, keepdims=True)
-        gamma = np.exp(log_gamma)
-        log_xi = (log_alpha[:-1, :, None] + log_P[None, :, :]
-                  + log_emit[1:, None, :] + log_beta[1:, None, :])
-        log_xi -= cls._logsumexp(log_xi.reshape(T - 1, -1), axis=1)[:, None, None]
-        xi = np.exp(log_xi)
-        return gamma, xi, log_lik
 
     @staticmethod
     def _m_step_ou(X, w, dt, eps=1.0e-12):
@@ -2282,7 +2775,7 @@ class MarkovSwitchingLogOUSpotCalibration(object):
         prev_lik = -np.inf
         for it in range(n_iter):
             log_emit = cls._emission_logprob(X, kappa, theta, sigma, dt)
-            gamma, xi, log_lik = cls._forward_backward(np.log(pi + 1e-12), np.log(P + 1e-12), log_emit)
+            gamma, xi, log_lik = hmm_forward_backward(np.log(pi + 1e-12), np.log(P + 1e-12), log_emit)
             log_lik_traj.append(float(log_lik))
             if it > 0 and abs(log_lik - prev_lik) < tol * abs(prev_lik):
                 break
@@ -2344,191 +2837,6 @@ class MarkovSwitchingLogOUSpotCalibration(object):
                 'Initial_State_Probs': [float(x) for x in fit['stationary_probs']],
                 'Calibration_DT_Years': dt,
             },
-            [[1.0]],
-            dt,
-        )
-
-
-class CompoundHawkesSpotCalibration(object):
-    """MLE calibration of `CompoundHawkesSpotModel` (K=1 component) from a daily price series.
-
-    Extracts events via a magnitude threshold τ on |r_t|: days with r_t > τ are "up events"
-    (mark = r_t), days with r_t < -τ are "down events" (mark = -r_t), and |r_t| ≤ τ are
-    non-events. Fits the 9 K=1 parameters {μ⁺, μ⁻, β, α⁺⁺, α⁻⁺, α⁺⁻, α⁻⁻, η⁺, η⁻} by
-    maximising the discrete-time Poisson log-likelihood:
-
-        log L_t = log P(N⁺_t, N⁻_t | λ⁺(t), λ⁻(t)) + 1[event]·log f_M(|r_t| | η_sign)
-
-        with N⁺_t, N⁻_t ∈ {0, 1}; the intensities recurse:
-
-        λ⁺(t+1) = μ⁺ + e^{-βδ}(λ⁺(t) - μ⁺) + α⁺⁺ M_t·1[up] + α⁻⁺ M_t·1[down]
-        λ⁻(t+1) = μ⁻ + e^{-βδ}(λ⁻(t) - μ⁻) + α⁺⁻ M_t·1[up] + α⁻⁻ M_t·1[down]
-
-    Optimisation in log-parameter space (params = exp(θ)) so positivity is enforced; uses
-    L-BFGS-B with multi-start. K>1 calibration requires an EM/SMC scheme to assign events
-    to components and is deferred — for K>1 calibrate K=1 then split the kernel manually.
-
-    Hyperparameters (read from `param` if provided):
-        Threshold_Quantile  — quantile of |r| above which events are extracted (default 0.5)
-        Threshold_Abs       — explicit threshold (overrides quantile if set)
-        N_Restarts          — multi-start optimiser restarts (default 4)
-        N_Iter              — L-BFGS max iterations per start (default 500)
-        Seed                — RNG for init perturbation (default 42)
-        Tol                 — relative LL tolerance (default 1e-6)
-    """
-
-    def __init__(self, model, param):
-        self.model = model
-        self.param = param
-        self.num_factors = 1
-
-    @staticmethod
-    def _extract_events(log_returns, threshold):
-        """Classify each step as up-event (+1), down-event (-1), or non-event (0)."""
-        sign = np.zeros_like(log_returns, dtype=np.int8)
-        sign[log_returns > threshold] = 1
-        sign[log_returns < -threshold] = -1
-        marks = np.abs(log_returns)
-        return sign, marks
-
-    @staticmethod
-    def _neg_log_lik(log_theta, sign, marks, dt):
-        """Discrete-time Poisson log-likelihood under the K=1 Hawkes recursion. log_theta packs
-        log of (μ⁺, μ⁻, β, α⁺⁺, α⁻⁺, α⁺⁻, α⁻⁻, η⁺, η⁻); positivity enforced via exp."""
-        mu_p, mu_m, beta, a_pp, a_np, a_pn, a_nn, eta_p, eta_m = np.exp(log_theta)
-        decay = np.exp(-beta * dt)
-
-        T = sign.shape[0]
-        lam_p = mu_p
-        lam_m = mu_m
-        log_lik = 0.0
-
-        for t in range(T):
-            # Discrete-time joint Poisson likelihood for at-most-one-event-per-side per step.
-            #   N⁺=1, N⁻=0  (up event):    log(λ⁺δ) − λ⁺δ − λ⁻δ
-            #   N⁺=0, N⁻=1  (down event):  log(λ⁻δ) − λ⁺δ − λ⁻δ
-            #   N⁺=0, N⁻=0  (no event):    − λ⁺δ − λ⁻δ
-            base = -(lam_p + lam_m) * dt
-            s = sign[t]
-            m = marks[t]
-            if s == 1:
-                ll_t = np.log(max(lam_p * dt, 1.0e-300)) + base + np.log(eta_p) - eta_p * m
-            elif s == -1:
-                ll_t = np.log(max(lam_m * dt, 1.0e-300)) + base + np.log(eta_m) - eta_m * m
-            else:
-                ll_t = base
-            log_lik += ll_t
-
-            # Mark-weighted excitation only when an event was observed.
-            if s == 1:
-                lam_p = mu_p + decay * (lam_p - mu_p) + a_pp * m
-                lam_m = mu_m + decay * (lam_m - mu_m) + a_pn * m
-            elif s == -1:
-                lam_p = mu_p + decay * (lam_p - mu_p) + a_np * m
-                lam_m = mu_m + decay * (lam_m - mu_m) + a_nn * m
-            else:
-                lam_p = mu_p + decay * (lam_p - mu_p)
-                lam_m = mu_m + decay * (lam_m - mu_m)
-
-        return -log_lik
-
-    @classmethod
-    def _stationarity_radius(cls, mu_p, mu_m, beta, a_pp, a_np, a_pn, a_nn, eta_p, eta_m):
-        """Spectral radius of the branching matrix G = αᵀ·diag(E[M⁺], E[M⁻])/β. < 1 ⇒ stationary."""
-        kernel = np.array([[a_pp, a_pn], [a_np, a_nn]])
-        em = np.array([1.0 / eta_p, 1.0 / eta_m])
-        G = kernel.T * em[None, :] / beta
-        return float(max(abs(np.linalg.eigvals(G))))
-
-    @classmethod
-    def _fit(cls, prices, dt, threshold_quantile=0.5, threshold_abs=None,
-             n_restarts=4, n_iter=500, seed=42, tol=1.0e-6):
-        rng = np.random.default_rng(seed)
-        X = np.log(np.asarray(prices, dtype=np.float64))
-        if len(X) < 100:
-            raise ValueError('Need at least ~100 observations for stable Hawkes fit')
-        log_returns = np.diff(X)
-        threshold = (float(threshold_abs) if threshold_abs is not None
-                     else float(np.quantile(np.abs(log_returns), threshold_quantile)))
-        sign, marks = cls._extract_events(log_returns, threshold)
-        n_up = int((sign == 1).sum())
-        n_dn = int((sign == -1).sum())
-        n_no = int((sign == 0).sum())
-
-        # Method-of-moments init: per-side baseline rate from event count, mark scale from
-        # mean of in-class marks, β default ≈ 5 (50d half-life), α small to start near additive.
-        T = len(log_returns)
-        mu_p_init = max(n_up / (T * dt), 1.0e-3)
-        mu_m_init = max(n_dn / (T * dt), 1.0e-3)
-        em_p_init = float(marks[sign == 1].mean()) if n_up else float(marks.mean())
-        em_m_init = float(marks[sign == -1].mean()) if n_dn else float(marks.mean())
-        eta_p_init = 1.0 / max(em_p_init, 1.0e-6)
-        eta_m_init = 1.0 / max(em_m_init, 1.0e-6)
-        # α scaled so initial branching ratio ≈ 0.3 — meaningful but well stationary.
-        target_branch = 0.3
-        beta_init = 5.0
-        a_init = target_branch * beta_init / max(em_p_init, em_m_init)
-
-        log_theta_0 = np.log(np.array([
-            mu_p_init, mu_m_init, beta_init,
-            a_init, a_init, a_init, a_init,
-            eta_p_init, eta_m_init,
-        ]))
-
-        best = None
-        for r in range(n_restarts):
-            jitter = rng.normal(0.0, 0.3, size=log_theta_0.shape)
-            x0 = log_theta_0 if r == 0 else log_theta_0 + jitter
-            res = scipy_minimize(
-                cls._neg_log_lik, x0, args=(sign, marks, dt),
-                method='L-BFGS-B', tol=tol,
-                options={'maxiter': n_iter, 'disp': False},
-            )
-            if best is None or res.fun < best.fun:
-                best = res
-
-        params = np.exp(best.x)
-        mu_p, mu_m, beta, a_pp, a_np, a_pn, a_nn, eta_p, eta_m = params
-        rho = cls._stationarity_radius(*params)
-
-        return {
-            'components': [{
-                'Mu_Plus': float(mu_p),
-                'Mu_Minus': float(mu_m),
-                'Beta': float(beta),
-                'Alpha_PP': float(a_pp),
-                'Alpha_NP': float(a_np),
-                'Alpha_PN': float(a_pn),
-                'Alpha_NN': float(a_nn),
-                'Eta_Plus': float(eta_p),
-                'Eta_Minus': float(eta_m),
-            }],
-            'log_likelihood': float(-best.fun),
-            'iterations': int(best.nit),
-            'threshold': threshold,
-            'event_counts': {'up': n_up, 'down': n_dn, 'none': n_no},
-            'mean_mark_up': em_p_init,
-            'mean_mark_down': em_m_init,
-            'spectral_radius': rho,
-            'stationary': rho < 1.0,
-        }
-
-    def calibrate(self, data_frame, vol_shift=0.0, num_business_days=252.0):
-        """Fit CompoundHawkesSpotModel (K=1) to the first column of `data_frame`. Hyperparameters
-        (Threshold_Quantile, Threshold_Abs, N_Restarts, N_Iter, Seed, Tol) read from self.param."""
-        threshold_q = float(self.param.get('Threshold_Quantile', 0.5))
-        threshold_abs = self.param.get('Threshold_Abs', None)
-        n_restarts = int(self.param.get('N_Restarts', 4))
-        n_iter = int(self.param.get('N_Iter', 500))
-        seed = int(self.param.get('Seed', 42))
-        tol = float(self.param.get('Tol', 1.0e-6))
-        prices = data_frame.iloc[:, 0].dropna().astype(float).values
-        dt = 1.0 / float(num_business_days)
-        fit = self._fit(prices, dt, threshold_quantile=threshold_q,
-                        threshold_abs=threshold_abs, n_restarts=n_restarts,
-                        n_iter=n_iter, seed=seed, tol=tol)
-        return utils.CalibrationInfo(
-            {'Components': fit['components']},
             [[1.0]],
             dt,
         )

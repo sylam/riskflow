@@ -724,18 +724,23 @@ class CommodityPrice(EquityPrice):
         super(CommodityPrice, self).__init__(param)
 
 
-class BasisCarry(Factor0D):
+class CommodityBasis(Factor0D):
     """
-    Represents an annualised carry rate for a commodity or asset basis
-    (e.g. roll yield, funding spread). The carry state is exposed as the
-    spot value.
+    Represents the implied basis between two related observables (e.g. LME spot
+    fix vs CME-derived synthetic spot for platinum), expressed as the price-level
+    offset b(t) such that one observable = the other + b(t). The state is exposed
+    as the spot value.
     """
     field_desc = ('Energy',
-                  ['- **Spot**: Float. Initial annualised carry rate $x_0$.',
-                   '- **Initial_Y**: Float. Initial slow-carry-pressure state $y_0$ (default 0).'])
+                  ['- **Spot**: Float. Initial basis level $b_0$.',
+                   '- **Observed_Commodity**: String. Name of the CommodityPrice factor '
+                   'this basis is observed against (the "anchor" spot).'])
 
     def __init__(self, param):
-        super(BasisCarry, self).__init__(param)
+        super(CommodityBasis, self).__init__(param)
+
+    def observed_commodity(self):
+        return self.param.get('Observed_Commodity')
 
 
 class ForwardPriceSample(Factor0D):
@@ -1024,6 +1029,18 @@ class ForwardPrice(Factor1D):
 
     def get_day_count(self):
         return utils.DAYCOUNT_None
+
+
+class ForwardRate(ForwardPrice):
+    """A rate (e.g. cost-of-carry, convenience yield) sampled at absolute contract
+    expiry dates — same tenor convention as `ForwardPrice` (Excel date offsets), but
+    semantically a rate rather than a price. Distinct from `InterestRate` (which is
+    quoted at relative year-tenors); used for forward-curve dynamics where each curve
+    knot is tied to a specific dated contract."""
+    field_desc = ('Energy',
+                  ['- **Currency**: String. The associated currency for this curve',
+                   '- **Curve**: *Curve* object of (excel_date, rate) pairs specifying the rate at the contract expiry'
+                   ])
 
 
 class ReferencePrice(Factor1D):

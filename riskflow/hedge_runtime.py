@@ -195,23 +195,54 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
 
 
 def _normalize_action_space(policy_config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize the JSON action-space config into a runtime dict. Accepts either:
+
+      - `Trade_Deltas`: list-of-list of allowed integer deltas per instrument (preferred).
+        Allows non-uniform spacings (e.g. fine bins near 0 + coarse bins at extremes).
+      - `Min_Trade_Delta` + `Max_Trade_Delta`: legacy unit-step integer ranges; expanded
+        to range(min, max+1) for each instrument.
+
+    The runtime dict carries both `trade_deltas` (per-instrument tuple of ints) and the
+    derived `min_trade_delta` / `max_trade_delta` (per-instrument int) for backward compat
+    with downstream consumers that only need the bounds.
+    """
     action_space = dict(policy_config.get("Action_Space", {}))
     instrument_order = tuple(str(name) for name in action_space.get("Instrument_Order", ()))
-    min_trade_delta = tuple(int(value) for value in action_space.get("Min_Trade_Delta", ()))
-    max_trade_delta = tuple(int(value) for value in action_space.get("Max_Trade_Delta", ()))
-    if instrument_order and not (
-        len(instrument_order) == len(min_trade_delta) == len(max_trade_delta)
-    ):
-        raise ValueError("Structured action space entries must have matching lengths")
+    explicit_deltas = action_space.get("Trade_Deltas")
+
+    if explicit_deltas is not None:
+        per_instrument = tuple(
+            tuple(sorted(set(int(d) for d in deltas)))
+            for deltas in explicit_deltas
+        )
+        if instrument_order and len(instrument_order) != len(per_instrument):
+            raise ValueError(
+                "Trade_Deltas length must match Instrument_Order length; "
+                f"got {len(per_instrument)} delta-lists for {len(instrument_order)} instruments")
+    else:
+        min_trade_delta = tuple(int(value) for value in action_space.get("Min_Trade_Delta", ()))
+        max_trade_delta = tuple(int(value) for value in action_space.get("Max_Trade_Delta", ()))
+        if instrument_order and not (
+            len(instrument_order) == len(min_trade_delta) == len(max_trade_delta)
+        ):
+            raise ValueError("Structured action space entries must have matching lengths")
+        per_instrument = tuple(
+            tuple(range(int(lo), int(hi) + 1))
+            for lo, hi in zip(min_trade_delta, max_trade_delta))
+
     return {
         "instrument_order": instrument_order,
+        "trade_deltas": {
+            instrument_name: deltas
+            for instrument_name, deltas in zip(instrument_order, per_instrument)
+        },
         "min_trade_delta": {
-            instrument_name: min_value
-            for instrument_name, min_value in zip(instrument_order, min_trade_delta)
+            instrument_name: min(deltas)
+            for instrument_name, deltas in zip(instrument_order, per_instrument)
         },
         "max_trade_delta": {
-            instrument_name: max_value
-            for instrument_name, max_value in zip(instrument_order, max_trade_delta)
+            instrument_name: max(deltas)
+            for instrument_name, deltas in zip(instrument_order, per_instrument)
         },
     }
 

@@ -785,6 +785,9 @@ class Credit_Monte_Carlo(Calculation):
                     value.link_references(implied_tensor, self.implied_var, self.implied_factors)
                 else:
                     implied_tensor = None
+                # Hand the process its own factor key so it can publish auxiliaries to
+                # t_Scenario_Buffer under the documented (factor_key, kind) convention.
+                value.factor_key = key
                 value.precalculate(
                     base_date, ScenarioTimeGrid(dependent_factors[key], self.time_grid, base_date),
                     self.stoch_var[key], shared_mem, self.process_ofs[key], implied_tensor=implied_tensor)
@@ -1902,7 +1905,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # `HawkesRegimeLogOUSpotModel`). Pad with the same history-prefix the rest of the
         # bundle already carries so the time axis matches `spot_price_history`.
         H_prefix = int(runtime.get('history_lookback_business_days', 0)) if runtime else 0
-        h_plus, h_minus, h_ratio = compute_hawkes_intensities(self.stoch_factors, history_prefix=H_prefix)
+        h_plus, h_minus, h_ratio = compute_hawkes_intensities(
+            privileged_factor_blocks or {}, self.stoch_factors, history_prefix=H_prefix)
         bundle['hawkes_h_plus'] = h_plus
         bundle['hawkes_h_minus'] = h_minus
         bundle['hawkes_ratio'] = h_ratio

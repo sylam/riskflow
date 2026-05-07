@@ -16,24 +16,62 @@ from tensordict import TensorDict
 
 @dataclass(frozen=True)
 class StructuredActionSpace:
-    instrument_order: tuple
-    min_trade_delta: tuple
-    max_trade_delta: tuple
+    """Per-instrument allowed trade deltas as an explicit (sorted, deduped) list. Earlier
+    versions used (min, max) integer ranges; this is now stored as `trade_deltas` with the
+    integer range expanded out — non-uniform spacings are allowed (e.g. fine 1-step bins
+    near zero plus coarse 5-step bins at the extremes).
 
-    def __init__(self, instrument_order, min_trade_delta, max_trade_delta):
+    Construction accepts either:
+      - `trade_deltas`: sequence of per-instrument iterables of allowed integer deltas, or
+      - `min_trade_delta` + `max_trade_delta`: legacy integer ranges that get expanded to
+        unit-step lists for backward compatibility.
+
+    `min_trade_delta` and `max_trade_delta` remain available as derived properties for
+    callers that only need the bounds.
+    """
+
+    instrument_order: tuple
+    trade_deltas: tuple  # tuple[tuple[int, ...]] — sorted, deduped, contains 0
+
+    def __init__(self, instrument_order, trade_deltas=None,
+                 min_trade_delta=None, max_trade_delta=None):
         object.__setattr__(self, "instrument_order", tuple(instrument_order))
-        object.__setattr__(self, "min_trade_delta", tuple(min_trade_delta))
-        object.__setattr__(self, "max_trade_delta", tuple(max_trade_delta))
+        if trade_deltas is not None:
+            normalized = tuple(
+                tuple(sorted(set(int(d) for d in deltas))) for deltas in trade_deltas)
+        else:
+            assert min_trade_delta is not None and max_trade_delta is not None, (
+                "StructuredActionSpace requires either trade_deltas or "
+                "(min_trade_delta + max_trade_delta)")
+            normalized = tuple(
+                tuple(range(int(lo), int(hi) + 1))
+                for lo, hi in zip(min_trade_delta, max_trade_delta))
+        # Validate: each instrument's list must be non-empty and contain 0 (no-trade bin
+        # is always required so the position-feasibility mask never fully masks a row).
+        for name, deltas in zip(self.instrument_order, normalized):
+            if not deltas:
+                raise ValueError(f"trade_deltas for instrument {name!r} is empty")
+            if 0 not in deltas:
+                raise ValueError(
+                    f"trade_deltas for instrument {name!r} must include 0; got {deltas}")
+        object.__setattr__(self, "trade_deltas", normalized)
 
     @property
     def dimension(self):
         return len(self.instrument_order)
 
+    @property
+    def min_trade_delta(self):
+        return tuple(min(d) for d in self.trade_deltas)
+
+    @property
+    def max_trade_delta(self):
+        return tuple(max(d) for d in self.trade_deltas)
+
     def to_artifact_payload(self):
         return {
             "instrument_order": list(self.instrument_order),
-            "min_trade_delta": list(self.min_trade_delta),
-            "max_trade_delta": list(self.max_trade_delta),
+            "trade_deltas": [list(d) for d in self.trade_deltas],
         }
 
 
@@ -253,8 +291,9 @@ class StructuredRebalancePolicy(nn.Module):
         self.n_layers = int(n_layers)
         self.device = torch.device(device)
 
-        # Per-instrument categorical: each instrument has (max - min + 1) discrete trade actions.
-        self._action_bins = tuple(int(hi) - int(lo) + 1 for lo, hi in zip(action_space.min_trade_delta, action_space.max_trade_delta))
+        # Per-instrument categorical: each instrument has its own (possibly non-uniform)
+        # list of allowed trade deltas — bin count = len of that list.
+        self._action_bins = tuple(len(d) for d in action_space.trade_deltas)
         self._max_bins = max(self._action_bins) if self._action_bins else 1
 
         self.backbone = _EntityTransformer(entity_layout, self.token_dim, self.emb_dim, self.n_heads, self.n_layers).to(self.device)
@@ -285,6 +324,20 @@ class StructuredRebalancePolicy(nn.Module):
             nn.Linear(self.token_dim, 1),
         ).to(self.device)
 
+        # Per-instrument allowed-deltas tensor padded to (n_instruments, max_bins) with the
+        # last valid value (so bin lookups for invalid bin indices return a known sentinel
+        # — they're masked out via _logit_mask before sampling, so the value is irrelevant
+        # for outputs but must be finite for arithmetic).
+        deltas_padded = []
+        for deltas in action_space.trade_deltas:
+            row = list(deltas) + [deltas[-1]] * (self._max_bins - len(deltas))
+            deltas_padded.append(row)
+        self.register_buffer(
+            "_trade_deltas",
+            torch.tensor(deltas_padded, dtype=torch.int64, device=self.device),  # (I, max_bins)
+            persistent=False,
+        )
+        # Bounds kept for diagnostic-friendly summaries (not used in mask/lookup arithmetic).
         self.register_buffer(
             "_min_trade_delta",
             torch.tensor(action_space.min_trade_delta, dtype=torch.int64, device=self.device).reshape(1, -1),
@@ -330,13 +383,12 @@ class StructuredRebalancePolicy(nn.Module):
         # bin is always feasible. Without this, a fully-masked logit row produces NaN through
         # log_softmax (not -inf) and silently corrupts the PPO loss.
         for i, name in enumerate(instrument_order):
-            lo = int(action_space.min_trade_delta[i])
-            hi = int(action_space.max_trade_delta[i])
-            if not (lo <= 0 <= hi):
+            deltas = action_space.trade_deltas[i]
+            if 0 not in deltas:
                 raise ValueError(
                     f"Action_Space for instrument {name!r} must include the no-trade delta 0; "
-                    f"got Min_Trade_Delta={lo}, Max_Trade_Delta={hi}. Without this the policy can "
-                    "encounter fully-masked logit rows (no feasible bin), producing NaN in log_softmax."
+                    f"got Trade_Deltas={list(deltas)}. Without this the policy can encounter "
+                    "fully-masked logit rows (no feasible bin), producing NaN in log_softmax."
                 )
             if min_pos[i] > max_pos[i]:
                 raise ValueError(
@@ -371,13 +423,13 @@ class StructuredRebalancePolicy(nn.Module):
 
     def _feasible_mask(self, positions):
         """Returns a (B, I, max_bins) bool tensor with True for bins whose resulting position
-        would violate `position_limits`. trade_delta of bin k = k + min_trade_delta[i], so the
-        resulting position is positions[b,i] + min_trade_delta[i] + k. Mask any bin whose result
-        falls outside [min_position[i], max_position[i]]."""
+        would violate `position_limits`. With the explicit-deltas action space, the trade
+        delta of bin k for instrument i is `_trade_deltas[i, k]`, so the resulting position
+        is `positions[b,i] + _trade_deltas[i, k]`. Mask any bin whose result falls outside
+        [min_position[i], max_position[i]]."""
         positions_t = positions.to(dtype=torch.int64, device=self.device)
-        bin_indices = torch.arange(self._max_bins, device=self.device, dtype=torch.int64)
-        # Broadcast: positions (B, I, 1) + min_trade_delta (1, I, 1) + bin_indices (max_bins,) → (B, I, max_bins)
-        resulting = positions_t.unsqueeze(-1) + self._min_trade_delta.unsqueeze(-1) + bin_indices.reshape(1, 1, -1)
+        # Broadcast: positions (B, I, 1) + _trade_deltas (1, I, max_bins) → (B, I, max_bins)
+        resulting = positions_t.unsqueeze(-1) + self._trade_deltas.unsqueeze(0)
         below = resulting < self._min_position.unsqueeze(-1)
         above = resulting > self._max_position.unsqueeze(-1)
         return below | above
@@ -411,11 +463,21 @@ class StructuredRebalancePolicy(nn.Module):
         return self.value_head(value_input).squeeze(-1)
 
     def _bins_to_trade_deltas(self, action_bins):
-        # action_bins: int64 [B, I] in [0, n_bins_i). trade_delta = bin + min_trade.
-        return action_bins + self._min_trade_delta
+        # action_bins: int64 [B, I] in [0, n_bins_i). trade_delta = lookup in _trade_deltas[i].
+        # _trade_deltas is (I, max_bins); use gather along last axis with bin indices.
+        # Expand _trade_deltas to (1, I, max_bins) and gather (B, I, 1) → (B, I).
+        deltas = self._trade_deltas.unsqueeze(0).expand(action_bins.shape[0], -1, -1)
+        return deltas.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
 
     def _trade_deltas_to_bins(self, trade_deltas):
-        return trade_deltas - self._min_trade_delta
+        # trade_deltas: int64 [B, I]. Reverse lookup via searchsorted on the (sorted) per-
+        # instrument allowed-deltas list. Allowed deltas are sorted in StructuredActionSpace
+        # construction, so searchsorted with right=False returns the matching index for any
+        # delta that's actually in the list. Out-of-list deltas would clip to a valid index;
+        # callers must only pass legal deltas.
+        # Shape contract: searchsorted(sorted=(I, max_bins), values=(I, B)) → (I, B).
+        bins_T = torch.searchsorted(self._trade_deltas, trade_deltas.transpose(0, 1).contiguous())
+        return bins_T.transpose(0, 1).contiguous()
 
     def forward(self, entity_state, privileged_state=None, positions=None):
         logits, ctx = self._policy_outputs(entity_state, positions=positions)
@@ -514,12 +576,22 @@ def load_policy_artifact(file_path, *, device="cpu"):
     artifact = json.loads(path.read_text(encoding="utf-8"))
     model = dict(artifact["model"])
     action_space_payload = dict(artifact["action_space"])
-    policy = StructuredRebalancePolicy(
-        action_space=StructuredActionSpace(
+    # Backward compat: older artifacts stored min/max only; newer artifacts store an explicit
+    # `trade_deltas` list. Honor whichever is present.
+    if "trade_deltas" in action_space_payload:
+        action_space = StructuredActionSpace(
+            instrument_order=tuple(action_space_payload["instrument_order"]),
+            trade_deltas=tuple(tuple(int(d) for d in deltas)
+                               for deltas in action_space_payload["trade_deltas"]),
+        )
+    else:
+        action_space = StructuredActionSpace(
             instrument_order=tuple(action_space_payload["instrument_order"]),
             min_trade_delta=tuple(int(value) for value in action_space_payload["min_trade_delta"]),
             max_trade_delta=tuple(int(value) for value in action_space_payload["max_trade_delta"]),
-        ),
+        )
+    policy = StructuredRebalancePolicy(
+        action_space=action_space,
         entity_layout=artifact["entity_layout"],
         privileged_layout=dict(artifact.get("privileged_layout") or {}),
         position_limits=dict(artifact.get("position_limits") or {}),
