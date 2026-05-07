@@ -58,6 +58,20 @@ GLOBAL_BASE_FEATURE_NAMES = (
     'far_position_value',        # ttf >= 180d
 )
 
+# Direct factor reads exposed as globals, in addition to the per-commodity stack
+# below. Each tuple is (factor_key, slot_index_or_None, exposed_name): for curve-shaped
+# factors (e.g. ForwardRate.PLATINUM_CARRY → 3 contract slots), pick the slot index;
+# for scalar factors (e.g. CommodityBasis.LME_CME), use None. The simulator publishes
+# these factors to bundle['factors'] each step, so this is a zero-cost look-through.
+# Add a tuple here to expose another factor's value as a feature; order is preserved
+# in the global-feature name list.
+EXTRA_FACTOR_GLOBALS = (
+    ('ForwardRate.PLATINUM_CARRY',  0, 'carry_front'),
+    ('ForwardRate.PLATINUM_CARRY',  1, 'carry_mid'),
+    ('ForwardRate.PLATINUM_CARRY',  2, 'carry_back'),
+    ('CommodityBasis.LME_CME',      None, 'basis_lme_cme'),
+)
+
 # Per-commodity globals appended after the base block, suffixed with the commodity name.
 # (bundle_key, name_prefix) pairs — order is preserved in feature names.
 PER_COMMODITY_GLOBAL_FEATURES = (
@@ -102,6 +116,8 @@ TEMPORAL_WINDOW = 20
 
 def build_global_feature_names(referenced_commodities, hedge_ratio_pairs=()):
     names = list(GLOBAL_BASE_FEATURE_NAMES)
+    for _factor_key, _slot, exposed in EXTRA_FACTOR_GLOBALS:
+        names.append(exposed)
     for commodity in referenced_commodities:
         for _bundle_key, prefix in PER_COMMODITY_GLOBAL_FEATURES:
             names.append(f'{prefix}_{commodity}')
@@ -722,6 +738,21 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
 
     referenced = layout['globals'].get('referenced_commodities', ())
     extras = []
+    # Direct factor reads: ForwardRate.PLATINUM_CARRY (per slot) and CommodityBasis.LME_CME
+    # are visible at sim time t and informative for the policy (carry regime dominates
+    # textbook P&L by ~6× over strike). Read from bundle['factors'] which the simulator
+    # publishes each step. Missing factor → zero-fill so the policy learns to ignore it.
+    bundle_factors = bundle.get('factors') or {}
+    for factor_key, slot, _exposed in EXTRA_FACTOR_GLOBALS:
+        path = bundle_factors.get(factor_key)
+        if path is None:
+            extras.append(torch.zeros((batch_size, 1), dtype=torch.float32, device=device))
+            continue
+        slice_t = path[int(time_index)] if slot is None else path[int(time_index), slot]
+        slice_t = slice_t.to(device=device, dtype=torch.float32).reshape(-1, 1)
+        if slice_t.shape[0] == 1 and slice_t.shape[0] != batch_size:
+            slice_t = slice_t.expand(batch_size, 1).contiguous()
+        extras.append(slice_t)
     for commodity in referenced:
         for bundle_key, _prefix in PER_COMMODITY_GLOBAL_FEATURES:
             extras.append(_commodity_scalar(bundle_key, commodity))

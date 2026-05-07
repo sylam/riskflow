@@ -1686,17 +1686,17 @@ class LogOUSpotModel(StochasticProcess):
 
         self.e_kdt   = tensor.new(e_kdt.reshape(-1, 1))
         self.ou_vol  = tensor.new(np.sqrt(var_step).reshape(-1, 1))
-        # Initial log-spot
-        self.log_spot0 = float(torch.log(tensor).item()) if tensor.numel() == 1 else torch.log(tensor)
+        # Initial log-spot. AAD: keep on graph — `tensor` is the factor's `Spot` (always
+        # scalar for a CommodityPrice/EquityPrice); reshape to 0-d preserves grad.
+        self.log_spot0 = torch.log(tensor.reshape(()))
         # Anchor theta at the current spot rather than the calibrated long-run mean. Production
         # hedging shouldn't bet that today's price will revert to a historical average — the agent
         # should hedge variance around the current regime, not directional drift toward a stale θ.
         # Disable via `Anchor_Theta_At_Spot: false` for backtests that want absolute calibrated θ.
         if bool(self.param.get('Anchor_Theta_At_Spot', True)):
-            log_spot_scalar = self.log_spot0 if isinstance(self.log_spot0, float) else float(self.log_spot0.mean().item())
-            self.theta = log_spot_scalar
+            self.theta = self.log_spot0                                                # 0-d tensor, on graph
         else:
-            self.theta = float(self.param['Theta'])
+            self.theta = tensor.new_tensor(float(self.param['Theta']))                 # constant, no grad
 
     def theoretical_mean_std(self, t):
         """Theoretical mean and std of S_t = exp(X_t) under the exact OU distribution."""
@@ -1704,7 +1704,8 @@ class LogOUSpotModel(StochasticProcess):
         sigma = self.param['Sigma']
         theta = self.param['Theta']
         e_kt  = np.exp(-kappa * t)
-        mu_X  = theta + e_kt * (self.log_spot0 - theta)
+        # Analytical path — pull log_spot0 to numpy at use site (no AAD here).
+        mu_X  = theta + e_kt * (float(self.log_spot0) - theta)
         var_X = sigma ** 2 * (1.0 - np.exp(-2.0 * kappa * t)) / (2.0 * kappa)
         # lognormal moments of exp(X) where X ~ N(mu_X, var_X)
         mean_S = np.exp(mu_X + 0.5 * var_X)
@@ -1908,7 +1909,9 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
         self.P_cum = _t(P_cum)
         self.pi0_cum = _t(pi0_cum)
 
-        self.log_spot0 = float(torch.log(tensor).item()) if tensor.numel() == 1 else torch.log(tensor)
+        # AAD: keep on graph — `tensor` is the factor's `Spot` (always scalar for a
+        # CommodityPrice); reshape to 0-d preserves grad.
+        self.log_spot0 = torch.log(tensor.reshape(()))
 
     @property
     def correlation_name(self):
@@ -2045,7 +2048,10 @@ class MarkovHMMSpotModel(StochasticProcess):
         self.pi0_cum = _t(np.cumsum(self.param['Initial_State_Probs']))
 
         # Initial spot — broadcast scalar or keep per-scenario tensor.
-        self.spot0 = float(tensor.item()) if tensor.numel() == 1 else tensor.detach().clone()
+        # AAD: keep spot0 on the autograd graph so payoff sensitivities w.r.t. the
+        # initial spot flow through. `tensor` is the factor's `Spot` (always scalar for
+        # a CommodityPrice); reshape to 0-d preserves grad.
+        self.spot0 = tensor.reshape(())
 
     @property
     def correlation_name(self):
@@ -2100,10 +2106,7 @@ class MarkovHMMSpotModel(StochasticProcess):
         std_t = sigma[regimes] * dt.view(T, 1).sqrt()
         ds = mu_t + std_t * innov
 
-        if isinstance(self.spot0, torch.Tensor):
-            s0 = self.spot0.to(device=device, dtype=dtype).expand(B)
-        else:
-            s0 = torch.full((B,), float(self.spot0), device=device, dtype=dtype)
+        s0 = self.spot0.expand(B)
         if self.log_price:
             log_path = s0.log().unsqueeze(0) + ds.cumsum(dim=0)                     # (T, B)
             spot_path = log_path.exp()
@@ -2284,10 +2287,18 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
     JSON config:
         Mean: 3-vector [μ_β0, μ_β1, μ_r] (long-run mean per factor)
         Phi: 3x3 list-of-lists (calibration-step transition)
-        Sigma: 3-vector (marginal innovation std per factor)
+        Sigma: 3-vector — *marginal* innovation std per latent component (post-correlation,
+            NOT a Cholesky factor). Innovation cross-correlation lives in the global
+            Correlations block; the framework's Cholesky pre-correlates Z, the model
+            scales each component by σ. At δ = δ_calib the resulting innovation
+            covariance is diag(σ)·ρ·diag(σ) = Σ_calib.
         Calibration_Tenors: 3-vector (τ_i(0) — slot tenors at simulation start, years)
         Contract_Cycle_Years: float (front-slot roll cycle, e.g. 0.25 quarterly)
-        Calibration_DT_Years: float (default 1/252)"""
+        Calibration_DT_Years: float (default 1/252)
+
+    Caveat: σ-step scales as σ_calib·√(δ/δ_calib), a Brownian approximation valid for
+    δ ≈ δ_calib. precalculate raises if any step ratio drifts >50% from 1 — implement
+    Lyapunov-equation step covariance before running on weekly/monthly grids."""
 
     documentation = (
         'Interest Rates',
@@ -2324,12 +2335,34 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
         sim_t = time_grid.time_grid_years
         dt_arr = np.diff(np.hstack(([0.0], sim_t)))                                    # (T,)
 
+        # σ_step uses a Brownian approximation σ_calib·√(δ/δ_calib) which assumes i.i.d.
+        # innovations. The exact VAR(1) per-step covariance is V_stat − Φ^(δ/δ_calib)
+        # V_stat (Φ^(δ/δ_calib))ᵀ (Lyapunov), reducing to Σ_calib at δ = δ_calib. The
+        # Brownian form is first-order in (1−Φ); error is small for daily sim against a
+        # daily-calibrated model (including the 0.69 calendar/business-day ratio) and
+        # grows on slow eigenmodes at long sim steps. Reject weekly+ steps to prevent
+        # silent mis-pricing of innovation variance. dt = 0 (the initial sim point, not
+        # a stochastic step) is excluded from the check.
+        nonzero_dt = dt_arr[dt_arr > 1.0e-12]
+        if nonzero_dt.size and np.any((nonzero_dt / dt_calib > 2.0)
+                                       | (nonzero_dt / dt_calib < 0.5)):
+            raise ValueError(
+                "VARMixedFactorInterestRateModel σ-step uses a Brownian approximation valid for "
+                f"δ ≈ δ_calib; sim grid has non-zero step ratios in "
+                f"[{(nonzero_dt/dt_calib).min():.2f}, {(nonzero_dt/dt_calib).max():.2f}], "
+                "outside the supported [0.5, 2.0] band. Implement Lyapunov-equation step "
+                "covariance for weekly/monthly time grids before running this.")
+
         # Per-step Φ via matrix-power: Φ_step = Φ_calib^(dt/dt_calib). For dt = dt_calib
         # this is just Φ_calib. Eigendecomposition handles arbitrary dt.
         Phi_calib = np.array(self.param['Phi'], dtype=np.float64)
         eigvals, eigvecs = np.linalg.eig(Phi_calib)
         eigvecs_inv = np.linalg.inv(eigvecs)
         Phi_per_step = np.zeros((len(dt_arr), 3, 3))
+        # `Sigma` is the calibrated *marginal* std per latent component (post-correlation),
+        # NOT a Cholesky factor. The framework's global Cholesky supplies pre-correlated Z
+        # to `generate`; multiplying by sigma_per_step recovers Σ_calib = diag(σ)·ρ·diag(σ)
+        # at δ = δ_calib (where ρ comes from the Correlations block).
         sigma_calib = np.array(self.param['Sigma'], dtype=np.float64)                  # (3,)
         sigma_per_step = np.zeros((len(dt_arr), 3))
         for t_idx, dt in enumerate(dt_arr):
@@ -2384,21 +2417,48 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
         #   M[j, :] = (1-α_j) D_slot[0, k, :] + α_j D_slot[0, k+1, :]
         # This matches the runtime interp in `generate` exactly (including extrapolation
         # outside the slot range).
-        if tensor.numel() == factor_tenor.size:
-            curve0_at_dates = tensor.detach().cpu().numpy().astype(np.float64)
-        else:
-            curve0_at_dates = np.full(factor_tenor.size, float(tensor.item()))
+        #
+        # AAD: M is data-independent (built from calibration tenors + sim time grid only),
+        # so build it as a constant tensor. `tensor` carries the live curve and may have
+        # requires_grad — keep it as a torch tensor through the solve so ∂X_0/∂curve_0 = M⁻¹
+        # flows via autograd's standard linear-solve adjoint, and downstream `out` retains
+        # the gradient through to the input curve.
+        if factor_tenor.size != 3:
+            # TODO: relax to N≥3 by switching torch.linalg.solve → torch.linalg.lstsq below
+            # and warning when the round-trip residual is non-negligible (which is
+            # expected for N>3: 3 latent factors can't exactly span an N-dim curve).
+            # Runtime generate() already supports arbitrary N via slot interpolation /
+            # linear extrapolation. For N>3 with cross-product w, calibration on >3
+            # archive anchors needs an anchor-choice convention (or switch to NS basis).
+            raise ValueError(
+                f'VARMixedFactorInterestRateModel expects a 3-knot factor (front/mid/back '
+                f'contract ladder); got factor_tenor of size {factor_tenor.size}.')
         slot_t0 = slot_tenors[0]
         contract_T0 = np.maximum(contract_T[0], 1e-9)
         idx0 = np.clip(np.searchsorted(slot_t0, contract_T0, side='left'), 1, 2)
         alpha0 = (contract_T0 - slot_t0[idx0 - 1]) / (slot_t0[idx0] - slot_t0[idx0 - 1])
-        M = (1.0 - alpha0)[:, None] * D_slot_per_step[0, idx0 - 1, :] \
-            + alpha0[:, None] * D_slot_per_step[0, idx0, :]                            # (n_contracts, 3)
-        if M.shape[0] == 3:
-            X0 = np.linalg.solve(M, curve0_at_dates)
-        else:
-            X0, *_ = np.linalg.lstsq(M, curve0_at_dates, rcond=None)
-        self.X0 = shared.one.new_tensor(X0)                                            # (3,)
+        M_np = (1.0 - alpha0)[:, None] * D_slot_per_step[0, idx0 - 1, :] \
+               + alpha0[:, None] * D_slot_per_step[0, idx0, :]                         # (3, 3)
+        M_t = shared.one.new_tensor(M_np)
+        curve0 = tensor.reshape(-1)
+        X0 = torch.linalg.solve(M_t, curve0.unsqueeze(-1)).squeeze(-1)                 # (3,)
+
+        # Round-trip verification: M·X_0 must reproduce today's curve at the dated knots.
+        # Catches boundary issues in the searchsorted/clip bracketing where contract_T0
+        # exactly equals slot_t0[0] or slot_t0[2] — `side='left'` with the clip can land on
+        # the wrong segment. Tolerance is scaled to dtype precision: tight for float64
+        # (1e-10), loose for float32 (1e-5) since the framework's default precision is
+        # float32 and the round-trip error tracks machine epsilon × curve magnitude.
+        # `.item()` is only used for the bounds check; X_0 itself stays on the graph.
+        roundtrip_err_t = (M_t @ X0 - curve0).abs().max()
+        rt_tol = 1.0e-10 if M_t.dtype == torch.float64 else 1.0e-5
+        if roundtrip_err_t.item() > rt_tol:
+            raise ValueError(
+                f'X_0 round-trip failed: max |M·X_0 - curve_0| = {roundtrip_err_t.item():.2e}'
+                f' (tol {rt_tol:.0e} for dtype {M_t.dtype}). '
+                f'Likely boundary mishandling in the slot-bracketing (contract_T0={contract_T0}, '
+                f'slot_t0={slot_t0}).')
+        self.X0 = X0                                                                   # (3,) — non-leaf, on `tensor`'s graph
 
     def generate(self, shared_mem):
         Z = shared_mem.t_random_numbers[
@@ -2583,7 +2643,10 @@ class BasisLinkedSpotModel(StochasticProcess):
         self.Nu = float(self.param['Nu'])
         self.Mu = float(self.param.get('Mu', 0.0))
         self.sigma_by_state = shared.one.new_tensor(np.array(self.param['Sigma_By_State'], dtype=np.float64))
-        self.b0 = float(tensor.item()) if tensor.numel() == 1 else tensor.detach().clone()
+        # AAD: keep b0 on the autograd graph so sensitivities of payoffs w.r.t. the
+        # observed initial basis flow through. `tensor` is the factor's `Spot` value
+        # (always scalar for a basis); reshape to 0-d preserves grad.
+        self.b0 = tensor.reshape(())
 
     def generate(self, shared_mem):
         Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]      # (T, B), correlated
@@ -2594,24 +2657,29 @@ class BasisLinkedSpotModel(StochasticProcess):
         # Cross-process reads. The linked spot must have been generated first; the
         # `dependant_fields` declaration on CommodityBasis enforces the ordering by
         # making CommodityPrice a dependency, so the simulator topo-orders it before us.
-        lme_path = shared_mem.t_Scenario_Buffer[self.linked_key].to(dtype=dtype)     # (T, B)
+        # The linked spot path is in *price level* (dollars), not log-space — the HMM
+        # process exp()s its log-cumsum before publishing.
+        lme_path = shared_mem.t_Scenario_Buffer[self.linked_key]                     # (T, B)
         regimes = shared_mem.t_Scenario_Buffer[(self.linked_key, 'regimes')]         # (T, B) long
+        assert (lme_path > 0).all(), 'lme_path expected to be price levels in dollars'
 
-        sigma_t = self.sigma_by_state.to(device=device, dtype=dtype)[regimes]        # (T, B)
+        sigma_t = self.sigma_by_state[regimes]                                       # (T, B)
 
         # Student-t innovation: η_t = sigma_t · ε_t · √((ν-2)/ν), ε_t ~ t_ν.
         # Identity: ε_t = Z · √(ν/W) where W ~ Chi²(ν). Combine the rescaling so the
-        # marginal variance of η_t is sigma_t² regardless of ν.
+        # marginal variance of η_t is sigma_t² regardless of ν. Chi² comes from
+        # torch.distributions (CPU/default dtype), so .to() bridges to the framework's.
         nu = self.Nu
         W = torch.distributions.Chi2(nu).sample((T, B)).to(device=device, dtype=dtype)
         eta = sigma_t * Z * torch.sqrt((nu - 2.0) / W)
 
-        # Sequential AR(1): b[0] = b0 (deterministic); for t≥1, b[t] = a·ΔLME[t] + φ·b[t-1] + η[t].
+        # Sequential AR(1): b[0] = b0 (deterministic, anchors on observed basis); for
+        # t≥1, b[t] = a·ΔLME[t] + φ·b[t-1] + η[t]. eta[0] is computed but unused — the
+        # framework's correlated-Z indexing requires Z[0] be consumed even at the
+        # privileged-init step so cross-process correlations stay aligned for t≥1.
         phi = float(self.Phi)
         a = float(self.A)
-        b_init = torch.full((B,), float(self.b0), device=device, dtype=dtype) \
-                 if not isinstance(self.b0, torch.Tensor) \
-                 else self.b0.to(device=device, dtype=dtype).expand(B)
+        b_init = self.b0.expand(B)
         out = torch.empty((T, B), device=device, dtype=dtype)
         out[0] = b_init
         for t in range(1, T):
@@ -2647,7 +2715,12 @@ class BasisLinkedSpotCalibration(object):
         # Basis col is `CommodityBasis.<basis>,<linked>`; linked col is `CommodityPrice.<linked>`.
         basis_col = next(c for c in data_frame.columns if c.split('.', 1)[0] == 'CommodityBasis')
         linked_id = basis_col.split(',', 1)[1]
-        linked_col = next(c for c in data_frame.columns if ',' not in c and c.endswith(f'.{linked_id}'))
+        linked_col = f'CommodityPrice.{linked_id}'
+        if linked_col not in data_frame.columns:
+            raise ValueError(
+                f'BasisLinkedSpotCalibration: required linked-spot column {linked_col!r} '
+                f'not in data_frame (have {list(data_frame.columns)}). The framework should '
+                f'have auto-pulled it via the comma-subkey on {basis_col!r}.')
 
         joint = data_frame[[basis_col, linked_col]].astype(np.float64).dropna()
         b = joint[basis_col].values

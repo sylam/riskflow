@@ -1,13 +1,72 @@
+"""Strike sweep of the textbook hedge — fully self-contained.
+
+For each strike in [spot-10, spot+10] step $2:
+  1. Build the simulator bundle (Execution_Mode='simulate_only', no training).
+  2. Run the textbook hedge policy on PL_JUL_2026 (the contract whose expiry
+     brackets the deal's averaging window).
+  3. Compute per-day cashflow components for representative paths
+     (worst, p5, mean, p95, best by terminal total P&L).
+  4. Append rows to a single CSV.
+
+CSV columns are spreadsheet-replicable from action × futures × contract_size:
+
+  trade_cash              = -action × futures × contract_size       (cash from the trade)
+  trade_cost              =  |action| × futures × contract_size × ½ × spread_bps × 1e-4
+  position_mtm            =  position × futures × contract_size     (mark-to-market of holdings)
+  cum_trade_cash, cum_trade_cost   — running sums
+  hedge_portfolio_ex_funding       = cum_trade_cash + position_mtm − cum_trade_cost
+  mtm_ex_post_settle_discount      = liability MtM (running PV) carrying the un-discounted
+                                     realised cashflow forward past Aug 5
+  total_ex_funding_discount        = mtm_ex_post_settle_discount + hedge_portfolio_ex_funding
+
+The `_ex_funding` suffix flags that interest/funding cost on margin and cash balances is
+NOT modelled (small effect, ~$1K worst case). The `_ex_post_settle_discount` flags that
+the realised deal cashflow is carried forward un-discounted from Aug 5 payment date
+through end-of-sim (~$12K worst case). Both ignored deliberately per textbook-trajectory
+inspection convention.
+
+Output: artifacts/sweep_textbook_strikes.csv
+"""
+import json as jsonlib
 import os
+import numpy as np
+import pandas as pd
+import torch
+
+import riskflow as rf
+from riskflow import torchrl_hedge, calculation as _calc_mod
+from riskflow.torchrl_hedge import (
+    build_shared_state, step_runtime_state, reward_and_terminal_payoff,
+    _decision_time_indices, _optimizer_settings, _last_time_index,
+    _bundle_scenario_dates,
+)
+
+torch.set_default_dtype(torch.float32)
 
 
-if __name__=='__main__':
-    import riskflow as rf
-    from riskflow.structured_policy import save_policy_artifact
+# Spot at sim start (matches the deal config's PLATINUM_LME Spot).
+SPOT = 2055.0
+STRIKES = np.arange(SPOT - 20, SPOT + 0 + 1e-9, 2.0)                # 2035..2055 step $2
+# Carry-curve override at sim start. Each value here replaces ALL THREE knots of the
+# ForwardRate.PLATINUM_CARRY Curve (front=46141 / mid=46232 / back=46324) so the
+# simulator starts under a uniform contango (positive) / flat / backwardation (negative)
+# regime. The VAR(1) dynamics still mean-revert toward calibrated Mean (~0) over time,
+# so the regime is the *initial condition*, not a permanent shift.
+CARRY_OVERRIDES = [-0.02, 0.0, 0.02]
+HEDGE_INSTRUMENT = 'PL_JUL_2026'
+N_PATHS = 1024
+RANDOM_SEED = 42
+OUT_PATH = 'artifacts/sweep_textbook_carry_strike.csv'
 
-    cx = rf.Context()
 
-    json = '''
+# ============================================================================
+# Self-contained JSON config (copied verbatim from policy_test.py at sweep
+# build time so the runner has no project-script dependency at runtime).
+# Strike is overridden per iteration via Hedging_Problem.Liabilities[...]
+# .Payments.Items[0].Fixed_Basis.
+# ============================================================================
+CONFIG_JSON = """
+
     {
         "Calc": {
             "Calculation": {
@@ -218,9 +277,9 @@ if __name__=='__main__':
                         "Allow_Short": true,
                         "Fail_On_Unhedgeable_Intent": false,
                         "Transaction_Cost_Per_Unit": 0.0,
-                        "Bid_Offer_Spread_Bps": 10.0,
+                        "Bid_Offer_Spread_Bps": 15.0,
                         "Position_Limits": {
-                            "PL_APR_2026": {"Min_Position": -50, "Max_Position": 0},
+                            "PL_APR_2026": {"Min_Position": 0, "Max_Position": 0},
                             "PL_JUL_2026": {"Min_Position": -50, "Max_Position": 0},
                             "PL_OCT_2026": {"Min_Position": -50, "Max_Position": 0}
                         }
@@ -1490,15 +1549,285 @@ if __name__=='__main__':
             "CalendDataFile": "./data/AACalendars.cal"
         }
     }
-    '''
+    """
 
-    cx.load_json((json, 'hedge_test.json'))
-    calc, result = cx.run_job()
 
-    artifact_path = save_policy_artifact(
-        result.policy_artifact,
-        os.path.join('artifacts', 'policy_test_policy_artifact.json'),
-    )
+def build_bundle_for(strike, carry_override):
+    """Build the simulator bundle + runtime for a given Fixed_Basis strike and
+    initial carry-curve override. Hijacks `run_torchrl_execution` so we capture both
+    objects without launching training. Both `torchrl_hedge.run_torchrl_execution`
+    and the `from`-imported binding inside `calculation` need replacing — see
+    feedback_aad_minimum_touch on import bindings."""
+    cfg = jsonlib.loads(CONFIG_JSON)
+    calc = cfg['Calc']['Calculation']
+    calc['Execution_Mode'] = 'simulate_only'
+    calc['Simulation_Batches'] = 1
+    calc['Batch_Size'] = N_PATHS
+    calc['Random_Seed'] = RANDOM_SEED
+    pmt = (calc['Hedging_Problem']['Liabilities']['FloatingEnergyDeal']
+           ['PLAT_JUL29']['Payments']['Items'][0])
+    pmt['Fixed_Basis'] = -float(strike)
 
-    print(result.evaluation_summary)
-    print({'policy_artifact_path': str(artifact_path)})
+    # Override the entire ForwardRate.PLATINUM_CARRY curve with the carry value.
+    # All three knots (front 46141 / mid 46232 / back 46324) set to the same rate so
+    # the futures market starts under a uniform contango (positive) / flat / backwardation
+    # (negative). VAR(1) dynamics still mean-revert toward calibrated Mean (~0) over time;
+    # the override is the *initial condition*, not a permanent shift.
+    carry_factor = (cfg['Calc']['MergeMarketData']['ExplicitMarketData']
+                    ['Price Factors']['ForwardRate.PLATINUM_CARRY'])
+    for row in carry_factor['Curve']['.Curve']['data']:
+        row[1] = float(carry_override)
+
+    holder = {}
+    orig_th = torchrl_hedge.run_torchrl_execution
+    orig_calc = _calc_mod.run_torchrl_execution
+
+    def capture(bundle, runtime):
+        holder['bundle'] = bundle
+        holder['runtime'] = runtime
+        return torchrl_hedge.evaluate_torchrl_policy(
+            bundle, {**runtime, 'execution_mode': 'simulate_only'})
+
+    torchrl_hedge.run_torchrl_execution = capture
+    _calc_mod.run_torchrl_execution = capture
+    try:
+        cx = rf.Context()
+        cx.load_json((jsonlib.dumps(cfg), f'sweep_strike_{strike:.0f}.json'))
+        cx.run_job()
+    finally:
+        torchrl_hedge.run_torchrl_execution = orig_th
+        _calc_mod.run_torchrl_execution = orig_calc
+
+    return holder['bundle'], holder['runtime']
+
+
+def rollout_textbook(bundle, runtime, instrument):
+    """Textbook hedge: short the deal volume from t=0, linearly buy back across the
+    business days inside the averaging window (capped at the futures' last trade
+    date), then flat. Returns per-decision-step (T_d, B) tensors plus terminal P&L.
+    """
+    settings = _optimizer_settings(runtime)
+    decision_indices = _decision_time_indices(bundle, settings, epoch=None, evaluation=True)
+    decision_set = set(int(i) for i in decision_indices)
+    instrument_order = tuple(runtime['names']['action_instruments'])
+    dates = _bundle_scenario_dates(bundle)
+
+    # Pull period_start / period_end from the deal's first payment item (resolves to
+    # pd.Timestamp at JSON load).
+    liabilities = runtime.get('liabilities') or {}
+    first_liab = next(iter(liabilities.values())) if liabilities else {}
+    payments = ((first_liab or {}).get('params') or {}).get('Payments') or {}
+    items = payments.get('Items') or []
+    first_pmt = items[0] if items else {}
+    period_start = pd.Timestamp(first_pmt['Period_Start'])
+    period_end = pd.Timestamp(first_pmt['Period_End'])
+    tn_idx = next(i for i, d in enumerate(dates) if d >= period_start)
+
+    # Calendar-aware buyback schedule.
+    bus_day_offset = bundle.get('meta', {}).get('business_day')
+    tradable_meta = (runtime.get('tradables') or {}).get(instrument, {}) or {}
+    last_trade_date = tradable_meta.get('last_trade_date')
+    window_end = pd.Timestamp(last_trade_date) if last_trade_date is not None else period_end
+    window_end = min(window_end, period_end)
+
+    def _is_bd(d):
+        if bus_day_offset is not None and hasattr(bus_day_offset, 'is_on_offset'):
+            return bool(bus_day_offset.is_on_offset(pd.Timestamp(d)))
+        return pd.Timestamp(d).weekday() < 5
+
+    buyback_indices = [i for i, d in enumerate(dates)
+                       if period_start <= d <= window_end and _is_bd(d)]
+    deal_volume = float(first_pmt.get('Volume', 0.0))
+    contract_size = float((runtime.get('tradables') or {}).get(instrument, {})
+                          .get('contract_size', 1.0))
+    short_at_start = int(round(deal_volume / contract_size))
+
+    target_at_idx = {}
+    if buyback_indices:
+        N = len(buyback_indices)
+        for i, idx in enumerate(buyback_indices):
+            u = i / max(N - 1, 1)
+            target_at_idx[idx] = -short_at_start * (1.0 - u)
+    buyback_end_idx = buyback_indices[-1] if buyback_indices else tn_idx
+
+    state = build_shared_state(bundle, runtime)
+    t0_idx = int(state['time_index'])
+    last_idx = _last_time_index(bundle)
+    batch_size = int(next(iter(state['positions'].values())).shape[0])
+    device = bundle['time_grid_days'].device
+    deltas_map = runtime.get('policy', {}).get('action_space', {}).get('trade_deltas', {}) or {}
+    allowed = sorted(set(int(d) for d in deltas_map.get(instrument, range(-10, 11))))
+    allowed_arr = np.asarray(allowed, dtype=np.int64)
+
+    times, positions, trades, prices = [], [], [], []
+    transition = None
+    while int(state['time_index']) < last_idx:
+        t = int(state['time_index'])
+        if t in decision_set:
+            if t < tn_idx:
+                target = -short_at_start
+            elif t in target_at_idx:
+                target = target_at_idx[t]
+            else:
+                target = 0.0
+            cur = int(round(state['positions'][instrument][0].item()))
+            desired = int(round(target)) - cur
+            trade = int(allowed_arr[int(np.argmin(np.abs(allowed_arr - desired)))])
+            action = {
+                'trade_deltas': {
+                    name: torch.full(
+                        (batch_size,),
+                        float(trade if name == instrument else 0),
+                        dtype=torch.float32, device=device,
+                    )
+                    for name in instrument_order
+                }
+            }
+            times.append(t)
+            positions.append(state['positions'][instrument].detach().cpu())
+            trades.append(action['trade_deltas'][instrument].detach().cpu())
+            prices.append(state['tradable_values'][instrument].detach().cpu())
+        else:
+            action = None
+        next_state = step_runtime_state(state, action, bundle, runtime)
+        transition = reward_and_terminal_payoff(state, next_state, bundle, runtime)
+        state = next_state
+    return {
+        'times': times, 'tn_idx': tn_idx, 't0_idx': t0_idx,
+        'buyback_end_idx': buyback_end_idx,
+        'position': torch.stack(positions, dim=0),
+        'trade':    torch.stack(trades, dim=0),
+        'price':    torch.stack(prices, dim=0),
+        'pnl_excess': transition['pnl_excess'].detach().cpu(),
+        'liability':  transition['liability_value'].detach().cpu(),
+        'net_pnl':    (transition['pnl_excess'] + transition['liability_value']).detach().cpu(),
+    }
+
+
+def per_day_cashflow(rollout, bundle, runtime, instrument):
+    """Reconstruct (T, B) per-day arrays for spot, futures, position, trade,
+    and the cashflow components. Mirrors write_pnl_trajectory_csv but returns
+    arrays so the caller can pick representative paths for each strike."""
+    factors = bundle['factors']
+    spot_key = next(k for k in factors if 'CommodityPrice' in k and 'PLATINUM' in k)
+    mtm_running = bundle['liability_mtm'].detach().cpu().float()
+    spot = factors[spot_key].detach().cpu().float()
+    fut = bundle['tradables'][instrument].detach().cpu().float()
+    cs = float(runtime['tradables'][instrument]['contract_size'])
+    spread_bps = float((runtime.get('accounting') or {}).get('bid_offer_spread_bps', 0.0))
+    unit_cost = float((runtime.get('accounting') or {}).get('transaction_cost_per_unit', 0.0))
+    T, B = mtm_running.shape
+
+    # Carry the realised cashflow forward (bundle's liability_mtm zeros out post-settle;
+    # we want the cashflow to persist for trajectory reading).
+    nonzero = (mtm_running != 0)
+    last_nz = (nonzero * torch.arange(T).unsqueeze(1)).max(dim=0).values
+    rows = torch.arange(T).unsqueeze(1).expand(T, B)
+    fill_mask = rows > last_nz.unsqueeze(0)
+    realised = mtm_running.gather(0, last_nz.unsqueeze(0)).expand(T, B)
+    mtm = torch.where(fill_mask, realised, mtm_running)
+
+    # Forward-fill position from decision steps (rollout['position'][k] is BEFORE the
+    # trade at decision k, so post-trade holdings are position + trade).
+    times = [int(t) for t in rollout['times']]
+    pos = torch.zeros((T, B)); trd = torch.zeros((T, B))
+    cur = torch.zeros(B); j = 0
+    for t in range(T):
+        if j < len(times) and t == times[j]:
+            trd[t] = rollout['trade'][j].cpu().float()
+            cur = rollout['position'][j].cpu().float() + rollout['trade'][j].cpu().float()
+            j += 1
+        pos[t] = cur
+
+    trade_cash = -trd * fut * cs
+    trade_cost = trd.abs() * (unit_cost + fut * cs * 0.5 * spread_bps * 1.0e-4)
+    position_mtm = pos * fut * cs
+    cum_cash = trade_cash.cumsum(0)
+    cum_cost = trade_cost.cumsum(0)
+    hp = cum_cash + position_mtm - cum_cost
+    total = mtm + hp
+
+    return {
+        'spot': spot, 'fut': fut, 'cs': cs, 'spread_bps': spread_bps,
+        'pos': pos, 'trd': trd,
+        'trade_cash': trade_cash, 'trade_cost': trade_cost, 'position_mtm': position_mtm,
+        'cum_cash': cum_cash, 'cum_cost': cum_cost,
+        'hp': hp, 'mtm': mtm, 'total': total,
+    }
+
+
+def write_strike_block(rows_list, day_strs, strike, carry_override, fields, instrument):
+    """Append one (carry, strike) cell's rows (5 cases × T days each) to rows_list."""
+    total = fields['total']
+    T, B = total.shape
+    sidx = torch.argsort(total[-1])
+    cases = {
+        'worst': int(sidx[0]),
+        'p5':    int(sidx[round(0.05 * (B - 1))]),
+        'p95':   int(sidx[round(0.95 * (B - 1))]),
+        'best':  int(sidx[-1]),
+    }
+
+    def _row(t, case, path_idx, getter):
+        return {
+            'carry_override': float(carry_override),
+            'strike':         float(strike),
+            'moneyness':      float(strike - SPOT),
+            'case':           case,
+            'path_idx':       int(path_idx),
+            'day':            day_strs[t],
+            'instrument':     instrument,
+            'spot':                            getter(fields['spot'][t]).item(),
+            'futures':                         getter(fields['fut'][t]).item(),
+            'contract_size':                   fields['cs'],
+            'spread_bps':                      fields['spread_bps'],
+            'action':                          float(getter(fields['trd'][t]).item()),
+            'position':                        float(getter(fields['pos'][t]).item()),
+            'trade_cash':                      float(getter(fields['trade_cash'][t]).item()),
+            'trade_cost':                      float(getter(fields['trade_cost'][t]).item()),
+            'position_mtm':                    float(getter(fields['position_mtm'][t]).item()),
+            'cum_trade_cash':                  float(getter(fields['cum_cash'][t]).item()),
+            'cum_trade_cost':                  float(getter(fields['cum_cost'][t]).item()),
+            'hedge_portfolio_ex_funding':      float(getter(fields['hp'][t]).item()),
+            'mtm_ex_post_settle_discount':     float(getter(fields['mtm'][t]).item()),
+            'total_ex_funding_discount':       float(getter(fields['total'][t]).item()),
+        }
+
+    for case_name, idx in cases.items():
+        for t in range(T):
+            rows_list.append(_row(t, case_name, idx, lambda x, idx=idx: x[idx]))
+    # mean case — cross-path average per day; path_idx = -1
+    for t in range(T):
+        rows_list.append(_row(t, 'mean', -1, lambda x: x.mean()))
+
+
+def main():
+    print(f'Spot:               ${SPOT:.2f}')
+    print(f'Strikes:            {[float(s) for s in STRIKES]}    (moneyness {STRIKES[0]-SPOT:+.0f}..{STRIKES[-1]-SPOT:+.0f})')
+    print(f'Carry overrides:    {CARRY_OVERRIDES}    (negative=backwardation, positive=contango)')
+    print(f'Hedge instrument:   {HEDGE_INSTRUMENT}    paths={N_PATHS}    seed={RANDOM_SEED}\n')
+    rows = []
+    for carry in CARRY_OVERRIDES:
+        regime = 'backwardation' if carry < 0 else ('flat' if carry == 0 else 'contango')
+        print(f'\n=== carry override = {carry:+.3f} ({regime}) ===')
+        for strike in STRIKES:
+            bundle, runtime = build_bundle_for(strike, carry)
+            rollout = rollout_textbook(bundle, runtime, HEDGE_INSTRUMENT)
+            fields = per_day_cashflow(rollout, bundle, runtime, HEDGE_INSTRUMENT)
+            day_strs = [pd.Timestamp(d).strftime('%Y-%m-%d')
+                        for d in _bundle_scenario_dates(bundle)]
+            write_strike_block(rows, day_strs, strike, carry, fields, HEDGE_INSTRUMENT)
+            net = rollout['net_pnl'].numpy()
+            print(f'  strike=${strike:.0f}  (m{strike-SPOT:+.0f})    '
+                  f'net mean=${net.mean():>10,.0f}    std=${net.std():>9,.0f}    '
+                  f'min=${net.min():>10,.0f}    p5=${np.percentile(net,5):>9,.0f}    '
+                  f'p95=${np.percentile(net,95):>9,.0f}    max=${net.max():>9,.0f}')
+
+    os.makedirs('artifacts', exist_ok=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(OUT_PATH, index=False, float_format='%.6f')
+    print(f'\nWrote {OUT_PATH}    ({df.shape[0]} rows × {df.shape[1]} cols)')
+
+
+if __name__ == '__main__':
+    main()
