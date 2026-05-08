@@ -191,6 +191,8 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
         "surplus_reward": float(objective_config.get("Surplus_Reward", 1.0)),
         "power": float(objective_config.get("Power", 1.0)),
         "naked_penalty": float(objective_config.get("Naked_Penalty", 0.0)),
+        "expiry_penalty": float(objective_config.get("Expiry_Penalty", 0.0)),
+        "expiry_threshold_days": float(objective_config.get("Expiry_Threshold_Days", 4.0)),
     }
 
 

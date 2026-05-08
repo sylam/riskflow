@@ -141,7 +141,9 @@ if __name__=='__main__':
                         "Floor_Penalty": 10.0,
                         "Surplus_Reward": 1.0,
                         "Power": 1.0,
-                        "Naked_Penalty": 5.0
+                        "Naked_Penalty": 5.0,
+                        "Expiry_Penalty": 1.0,
+                        "Expiry_Threshold_Days": 4.0
                     },
                     "Liabilities": {
                         "FloatingEnergyDeal": {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -728,6 +729,60 @@ def _naked_position_penalty(state, bundle, runtime):
     return -coef * fp * naked / naked_scale
 
 
+def _expiry_holding_penalty(state, bundle, runtime):
+    """Per-step exponential-ramp penalty for non-zero positions approaching contract
+    expiry. Teaches the policy that holding past `last_trade_date` is meaningless —
+    once a contract expires its futures price freezes, so post-expiry MtM is an
+    accounting artefact, not a real PnL.
+
+    Smooth ramp: outside the warning window the penalty is zero; inside it, the
+    coefficient multiplies the position notional by `exp(threshold − days_to_expiry)`.
+    With threshold = 4 days, the multiplier is 1 at 4d before expiry, ~2.7 at 3d,
+    ~7.4 at 2d, ~20 at 1d, ~55 on expiry day, ~148 the day after, etc. Position
+    keeps incurring rapidly-growing penalty for every day past expiry until closed.
+
+    Coef from `Expiry_Penalty`; threshold from `Expiry_Threshold_Days` (default 4).
+    Disabled when objective.expiry_penalty <= 0.
+    """
+    objective = runtime.get("objective") or {}
+    coef = float(objective.get("expiry_penalty", 0.0))
+    if coef <= 0.0:
+        return None
+    threshold = float(objective.get("expiry_threshold_days", 4.0))
+    layout_instruments = (runtime.get("entity_layout", {})
+                          .get("instruments", {}).get("meta", ()))
+    if not layout_instruments:
+        return None
+
+    base_date = pd.Timestamp(bundle["meta"]["base_date"])
+    days_arr = bundle["time_grid_days"]
+    current_day_offset = int(days_arr[int(state["time_index"])].item())
+
+    device = bundle["time_grid_days"].device
+    batch_size = _batch_size_from_bundle(bundle)
+    penalty = torch.zeros(batch_size, dtype=torch.float32, device=device)
+    any_active = False
+    for entry in layout_instruments:
+        name = entry["name"]
+        if name not in state["positions"]:
+            continue
+        last_trade_day = (entry["last_trade_date"] - base_date).days
+        days_to_expiry = last_trade_day - current_day_offset
+        if days_to_expiry > threshold:
+            continue
+        # Exponential ramp: multiplier = exp(threshold − days_to_expiry).
+        # = 1 at days_to_expiry == threshold, grows ~3× per day toward expiry.
+        # Past expiry (days_to_expiry < 0) the ramp keeps growing → strong incentive
+        # to flatten before the contract dies.
+        mult = math.exp(threshold - days_to_expiry)
+        position = state["positions"][name].to(device=device, dtype=torch.float32)
+        price = state["tradable_values"][name].to(device=device, dtype=torch.float32)
+        cs = float(_runtime_tradable(runtime, name).get("contract_size", 1.0))
+        penalty = penalty - coef * mult * position.abs() * price * cs
+        any_active = True
+    return penalty if any_active else None
+
+
 def reward_and_terminal_payoff(prev_state, state, bundle, runtime):
     batch_size = _batch_size_from_bundle(bundle)
     device = bundle["time_grid_days"].device
@@ -744,6 +799,9 @@ def reward_and_terminal_payoff(prev_state, state, bundle, runtime):
     naked = _naked_position_penalty(state, bundle, runtime)
     if naked is not None:
         reward = reward + naked.to(device=device, dtype=torch.float32)
+    expiry = _expiry_holding_penalty(state, bundle, runtime)
+    if expiry is not None:
+        reward = reward + expiry.to(device=device, dtype=torch.float32)
     terminal_payoff = torch.zeros(batch_size, dtype=torch.float32, device=device)
     pnl_excess = torch.zeros(batch_size, dtype=torch.float32, device=device)
     liability_value = state.get("cumulative_liability_value", torch.zeros(batch_size, dtype=torch.float32, device=device)).to(device=device, dtype=torch.float32)
