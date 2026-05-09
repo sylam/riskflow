@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import random
 import time
-from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -75,19 +74,12 @@ def _slice_bundle_episodes(bundle, episode_indices):
             }
             for tradable, by_factor in bundle["hedge_ratios"].items()
         }
-    for scalar_key in ("last_settlement_index", "naked_scale", "time_grid_days_cpu", "total_leg_volume"):
+    for scalar_key in ("last_settlement_index", "time_grid_days_cpu", "total_leg_volume",
+                        "scenario_dates", "business_indices"):
         if scalar_key in bundle:
             sliced[scalar_key] = bundle[scalar_key]
     sliced["meta"]["validation_episode_count"] = int(episode_indices.numel())
     return sliced
-
-
-def _split_episode_indices(total, num_splits):
-    if total <= 0:
-        return tuple()
-    n = max(min(int(num_splits), total), 1)
-    full = torch.arange(total, dtype=torch.int64)
-    return tuple(chunk for chunk in torch.tensor_split(full, n) if int(chunk.numel()) > 0)
 
 
 def _zeros_by_name(names, batch_size, *, device, dtype=torch.float32):
@@ -99,11 +91,13 @@ def _seed_by_name(seed_values, names, batch_size, *, device, dtype=torch.float32
 
 
 def _runtime_names(runtime, key):
-    return tuple(name for name in runtime.get("names", {}).get(key, ()))
+    # Returns the underlying tuple from runtime["names"] — read-only by all callers.
+    return runtime.get("names", {}).get(key, ())
 
 
 def _runtime_tradable(runtime, name):
-    return dict(runtime.get("tradables", {}).get(str(name), {}))
+    # Returns the underlying dict from runtime["tradables"][name] — read-only by all callers.
+    return runtime.get("tradables", {}).get(str(name), {})
 
 
 def _current_liability_mtm(bundle, time_index):
@@ -145,30 +139,29 @@ def _refresh_state_views(state, bundle, runtime, time_index):
     Entity-state construction (the expensive transformer-shaped feature stack) is deferred to
     `_ensure_decision_views`, which only runs on decision steps where the policy actually reads
     it. With a 10-day decision interval this saves ~9 entity rebuilds per decision."""
-    refreshed = dict(state)
     tradable_values = _current_tradable_values(bundle, runtime, time_index)
-    sample = next(iter(refreshed["positions"].values()))
+    sample = next(iter(state["positions"].values()))
     batch_size = int(sample.shape[0])
     device = sample.device
     return {
         "time_index": int(time_index),
-        "done": refreshed["done"],
-        "positions": refreshed["positions"],
-        "cash_accounts": refreshed["cash_accounts"],
-        "margin_accounts": refreshed["margin_accounts"],
-        "realized_pnl": refreshed["realized_pnl"],
-        "variation_margin": refreshed["variation_margin"],
-        "cumulative_pnl": refreshed.get("cumulative_pnl", _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)),
-        "time_held": refreshed.get("time_held", _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)),
-        "settlement_prices": refreshed["settlement_prices"],
+        "done": state["done"],
+        "positions": state["positions"],
+        "cash_accounts": state["cash_accounts"],
+        "margin_accounts": state["margin_accounts"],
+        "realized_pnl": state["realized_pnl"],
+        "variation_margin": state["variation_margin"],
+        "cumulative_pnl": state.get("cumulative_pnl", _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)),
+        "time_held": state.get("time_held", _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)),
+        "settlement_prices": state["settlement_prices"],
         "tradable_values": tradable_values,
         "liability_mtm_value": _current_liability_mtm(bundle, time_index),
         "realized_cashflow_value": _current_realized_cashflow_total(bundle, time_index),
-        "cumulative_liability_value": refreshed.get(
+        "cumulative_liability_value": state.get(
             "cumulative_liability_value",
             torch.zeros(batch_size, dtype=torch.float32, device=device),
         ).to(dtype=torch.float32),
-        "initial_portfolio_value": refreshed.get("initial_portfolio_value"),
+        "initial_portfolio_value": state.get("initial_portfolio_value"),
     }
 
 
@@ -213,8 +206,11 @@ def _daily_growth_factors(bundle, runtime, current, next_idx):
 
 
 def _compound_accounts(accounts, factors):
-    """Multiply each balance by its one-day growth factor (or pass through if no factor present)."""
-    return {n: (bal * factors[n] if n in factors else bal.clone()) for n, bal in accounts.items()}
+    """Multiply each balance by its one-day growth factor (or pass through reference if no
+    factor present). Pass-through is safe: callers never mutate balances in place — they
+    rebind via `next_state[key] = new_tensor` or via `_apply_account_flow` (which writes a
+    new tensor into the dict, not in-place into the existing tensor)."""
+    return {n: (bal * factors[n] if n in factors else bal) for n, bal in accounts.items()}
 
 
 def _portfolio_value(state, runtime):
@@ -283,21 +279,25 @@ def _dense_tracking_reward(prev_state, next_state, runtime):
     """Per-step shaping reward on the downside part of the tracking error. Two modes:
 
     `Dense_Reward_Mode = "asymmetric"` (default, current behavior):
-        shaping_t = rs · fp · (max(−err_t, 0) − max(−err_{t+1}, 0))
-        Telescopes to rs·fp·(|downside_0| − |downside_T|) ≈ −rs·fp·|downside_T| for typical
-        deals where the initial err is non-negative. Combined with the terminal asymmetric
-        utility (−fp·|downside_T| on losses), the EFFECTIVE floor penalty becomes (1 + rs)·fp
-        while the upside coefficient sr is unchanged. With rs=2, fp=10, sr=1 the agent is
-        optimized as if effective fp=30 vs sr=1 — a real asymmetry shift, not just a gradient
-        density change. Use rs=1 for terminal-parity, rs=0 to disable.
+        shaping_t = rs · fp · (max(−err_t, 0) − max(−err_{t+1}, 0))   for non-terminal t
+        Terminal transition's shaping is FORCIBLY ZEROED in `reward_and_terminal_payoff`
+        (to avoid penalizing the unavoidable force-flat close cost as fresh downside),
+        so the telescoping sum is rs·fp·(|downside_0| − |downside_{T-1}|), NOT
+        |downside_T|. Combined with the terminal asymmetric utility (−fp·|downside_T|
+        on losses), the EFFECTIVE floor penalty is approximately (1 + rs)·fp — exact
+        only when |downside_{T-1}| ≈ |downside_T|, i.e. when the close-cost segment
+        (bid-offer × position × contract_size) is small relative to total downside.
+        For non-trivial close costs the actual coefficient sits between fp and (1+rs)·fp.
+        With rs=2, fp=10, sr=1 the agent is optimized as if effective fp ≈ 30 vs sr=1.
+        Use rs=1 for terminal-parity (effective fp ≈ 2·fp), rs=0 to disable shaping.
 
     `Dense_Reward_Mode = "potential_based"` (Ng et al. 1999 PBRS):
         Φ(s) = −fp · max(−err(s), 0); shaping_t = γ·Φ(s_{t+1}) − Φ(s_t).
-        Provably policy-invariant — the optimal policy under (PBRS + terminal) equals the
-        optimal under terminal alone; only the gradient signal density changes. Telescopes to
-        γ^T·Φ(s_T) − Φ(s_0). Use this mode when you want densified credit assignment WITHOUT
-        shifting the asymmetry of the terminal utility. `Dense_Tracking_Reward_Scale` is
-        ignored in this mode (scaling Φ would break the invariance theorem)."""
+        Same terminal-zero applies; the PBRS invariance theorem holds for the
+        kept-transitions sum γ^{T-1}·Φ(s_{T-1}) − Φ(s_0). Use this mode when you
+        want densified credit assignment WITHOUT shifting the asymmetry of the
+        terminal utility. `Dense_Tracking_Reward_Scale` is ignored in this mode
+        (scaling Φ would break the invariance theorem)."""
     settings = dict(runtime.get("optimizer") or {})
     fp = float((runtime.get("objective") or {}).get("floor_penalty", 1.0))
     prev_err = _tracking_error_value(prev_state, runtime)
@@ -338,18 +338,9 @@ def _evaluate_objective(pnl_excess, liability, runtime):
     return torch.where(net_pnl >= 0.0, surplus, shortfall)
 
 
-def _cash_account_currency_map(runtime):
-    return {str(n): str(d.get("currency")) for n, d in runtime.get("accounting", {}).get("cash_accounts", {}).items()}
-
-
 def _cash_account_for_instrument(name, runtime):
-    instrument_currency = str(_runtime_tradable(runtime, str(name)).get("currency"))
-    cmap = _cash_account_currency_map(runtime)
-    for account in _runtime_names(runtime, "cash_accounts"):
-        if cmap.get(str(account)) == instrument_currency:
-            return str(account)
-    accounts = _runtime_names(runtime, "cash_accounts")
-    return None if not accounts else accounts[0]
+    # Precomputed at runtime construction (hedge_runtime._build_instrument_cash_account_map).
+    return runtime.get("accounting", {}).get("instrument_to_cash_account", {}).get(str(name))
 
 
 def _coerce_batch_tensor(value, batch_size, *, device):
@@ -370,35 +361,14 @@ def _resolve_trade_deltas(action, runtime, *, batch_size, device):
     return resolved
 
 
-def _enforce_position_limits(positions, trade_deltas, runtime):
-    adjusted = dict(trade_deltas)
-    limits = dict(runtime.get("accounting", {}).get("position_limits", {}))
-    for name in _runtime_names(runtime, "action_instruments"):
-        n = str(name)
-        if n not in positions or n not in adjusted:
-            continue
-        lim = dict(limits.get(n, {}))
-        min_p = float(lim.get("min_position", float("-inf")))
-        max_p = float(lim.get("max_position", float("inf")))
-        proposed = positions[n] + adjusted[n]
-        bounded = torch.clamp(proposed, min=min_p, max=max_p)
-        adjusted[n] = bounded - positions[n]
-    return adjusted
-
-
 def _realized_structured_action(action, current_positions, runtime, *, batch_size, device):
     if action is None:
         return None
-    executed = _enforce_position_limits(current_positions, _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device), runtime)
+    executed = _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device)
     instrument_order = tuple(str(n) for n in _runtime_names(runtime, "action_instruments"))
     ordered = torch.stack([executed[n] for n in instrument_order], dim=1).round().to(dtype=torch.int64)
-    # Recompute action_bins from the *clipped* trade deltas so the bins PPO logs match what
-    # the env actually executes. Without this, `_enforce_position_limits` could silently
-    # decouple the logged categorical action from the realized trade — a mask/clip
-    # mismatch would cause PPO to reinforce an action different from the one observed.
-    # With explicit (possibly non-uniform) deltas, the bin index is the position of the
-    # delta in the per-instrument sorted list — searchsorted gives this exactly since the
-    # list is sorted. Build (n_instruments, max_bins) padded tensor and reverse-lookup.
+    # Action bins from realized deltas — searchsorted reverse-lookup against the per-instrument
+    # sorted delta list. Since limits are now reward-side rather than clipped, executed ≡ proposed.
     deltas_map = runtime.get("policy", {}).get("action_space", {}).get("trade_deltas", {})
     if deltas_map:
         per_instrument = [tuple(deltas_map[n]) for n in instrument_order]
@@ -476,13 +446,6 @@ def _step_cumulative_pnl(cumulative_pnl, variation_margin, next_positions):
         active = next_positions[name].abs() > 0
         out[name] = torch.where(active, prev + variation_margin[name], torch.zeros_like(prev))
     return out
-
-
-def _zero_futures_flows(state, runtime):
-    batch_size = int(state["done"].shape[0])
-    device = state["done"].device
-    state["realized_pnl"] = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
-    state["variation_margin"] = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
 
 
 def _flatten_cash_inventory(positions, cash_accounts, terminal_values, runtime):
@@ -580,7 +543,7 @@ def cash_account_step(state, action, bundle, runtime):
     next_positions = dict(state["positions"])
     growth = _daily_growth_factors(bundle, runtime, current, next_idx)
     next_cash = _compound_accounts(state["cash_accounts"], growth)
-    deltas = _enforce_position_limits(state["positions"], _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device), runtime)
+    deltas = _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device)
     for name in _runtime_names(runtime, "action_instruments"):
         n = str(name)
         delta = deltas.get(n)
@@ -596,24 +559,22 @@ def cash_account_step(state, action, bundle, runtime):
     zero_vm = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
     next_cumulative_pnl = _step_cumulative_pnl(state["cumulative_pnl"], zero_vm, next_positions)
     next_time_held = _step_time_held(state["time_held"], next_positions)
-    # margin_accounts / settlement_prices are not modified in cash mode — pass through references.
-    # realized_pnl / variation_margin are replaced by `_zero_futures_flows` immediately below, so
-    # any clone here would be discarded.
+    # Cash mode: no daily VM accrued (realized_pnl / variation_margin always zero).
+    # margin_accounts / settlement_prices are not modified — pass through references.
+    hedge_names = _runtime_names(runtime, "hedges")
     next_state = {
-        "done": state["done"],
+        "done": torch.full_like(state["done"], next_idx >= last, dtype=torch.bool),
         "positions": next_positions,
         "cash_accounts": next_cash,
         "margin_accounts": state["margin_accounts"],
-        "realized_pnl": state["realized_pnl"],
-        "variation_margin": state["variation_margin"],
+        "realized_pnl": _zeros_by_name(hedge_names, batch_size, device=device),
+        "variation_margin": _zeros_by_name(hedge_names, batch_size, device=device),
         "cumulative_pnl": next_cumulative_pnl,
         "time_held": next_time_held,
         "cumulative_liability_value": state["cumulative_liability_value"],
         "settlement_prices": state["settlement_prices"],
         "initial_portfolio_value": state["initial_portfolio_value"],
     }
-    _zero_futures_flows(next_state, runtime)
-    next_state["done"] = torch.full_like(state["done"], next_idx >= last, dtype=torch.bool)
     refreshed = _refresh_state_views(next_state, bundle, runtime, next_idx)
     refreshed["cumulative_liability_value"] = refreshed["cumulative_liability_value"] + refreshed["realized_cashflow_value"]
     return refreshed
@@ -639,7 +600,7 @@ def futures_account_step(state, action, bundle, runtime):
     next_settlement = dict(state["settlement_prices"])
     realized_pnl = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
     variation_margin = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
-    deltas = _enforce_position_limits(state["positions"], _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device), runtime)
+    deltas = _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device)
     next_values = _current_tradable_values(bundle, runtime, settlement_idx)
     # Futures: cash_accounts is frozen at starting capital; only margin tracks VM and trade cost.
     # Apply the trade BEFORE computing VM so the new delta participates in the price(t)→price(t+1)
@@ -699,47 +660,12 @@ def step_runtime_state(state, action, bundle, runtime):
     return futures_account_step(state, action, bundle, runtime)
 
 
-def _naked_position_penalty(state, bundle, runtime):
-    """Per-step penalty proportional to total |position notional| for steps strictly past
-    `bundle['last_settlement_index']` — no leg remains to hedge, so any open position is naked
-    directional exposure. Scaled by `floor_penalty` (matching `_dense_tracking_reward` convention)
-    so the coef is in the same dollar-per-dollar units as the dense shaping. Gated on
-    objective.naked_penalty > 0; bundle key absent → no-op."""
-    objective = runtime.get("objective") or {}
-    coef = float(objective.get("naked_penalty", 0.0))
-    last_settle = bundle.get("last_settlement_index")
-    if coef <= 0.0 or last_settle is None:
-        return None
-    if int(state["time_index"]) <= int(last_settle):
-        return None
-    fp = float(objective.get("floor_penalty", 1.0))
-    device = bundle["time_grid_days"].device
-    batch_size = _batch_size_from_bundle(bundle)
-    naked = torch.zeros(batch_size, dtype=torch.float32, device=device)
-    for name, position in state["positions"].items():
-        price = state["tradable_values"][name].to(device=device, dtype=torch.float32)
-        cs = float(_runtime_tradable(runtime, name).get("contract_size", 1.0))
-        naked = naked + (position.to(device=device, dtype=torch.float32) * price * cs).abs()
-    # Normalize by total max-notional at inception so coef is a unit-free fraction (≈ [0, 1])
-    # rather than scaling with raw dollar notional. Without this, naked dominates the reward
-    # signal by ~3 orders of magnitude vs typical terminal P&L.
-    naked_scale = float(bundle.get("naked_scale", 1.0))
-    if naked_scale <= 0.0:
-        naked_scale = 1.0
-    return -coef * fp * naked / naked_scale
-
-
 def _expiry_holding_penalty(state, bundle, runtime):
-    """Per-step exponential-ramp penalty for non-zero positions approaching contract
-    expiry. Teaches the policy that holding past `last_trade_date` is meaningless —
-    once a contract expires its futures price freezes, so post-expiry MtM is an
-    accounting artefact, not a real PnL.
-
-    Smooth ramp: outside the warning window the penalty is zero; inside it, the
-    coefficient multiplies the position notional by `exp(threshold − days_to_expiry)`.
-    With threshold = 4 days, the multiplier is 1 at 4d before expiry, ~2.7 at 3d,
-    ~7.4 at 2d, ~20 at 1d, ~55 on expiry day, ~148 the day after, etc. Position
-    keeps incurring rapidly-growing penalty for every day past expiry until closed.
+    """Per-step penalty for non-zero positions near or past contract expiry.
+    Pre-expiry: smooth exp ramp inside the warning window. Post-expiry: large
+    linear-in-days-past hammer. Plateauing past expiry leaves the policy with
+    no marginal incentive to *exit* an already-expired contract — so the
+    multiplier must keep growing once we cross zero.
 
     Coef from `Expiry_Penalty`; threshold from `Expiry_Threshold_Days` (default 4).
     Disabled when objective.expiry_penalty <= 0.
@@ -755,8 +681,9 @@ def _expiry_holding_penalty(state, bundle, runtime):
         return None
 
     base_date = pd.Timestamp(bundle["meta"]["base_date"])
-    days_arr = bundle["time_grid_days"]
-    current_day_offset = int(days_arr[int(state["time_index"])].item())
+    # Use the CPU-cached day grid (Python list) — avoids a per-step GPU→CPU sync
+    # that fires on every reward computation across the rollout.
+    current_day_offset = int(bundle["time_grid_days_cpu"][int(state["time_index"])])
 
     device = bundle["time_grid_days"].device
     batch_size = _batch_size_from_bundle(bundle)
@@ -768,19 +695,97 @@ def _expiry_holding_penalty(state, bundle, runtime):
             continue
         last_trade_day = (entry["last_trade_date"] - base_date).days
         days_to_expiry = last_trade_day - current_day_offset
+        # Outside the warning window (still plenty of time) → no penalty.
         if days_to_expiry > threshold:
             continue
-        # Exponential ramp: multiplier = exp(threshold − days_to_expiry).
-        # = 1 at days_to_expiry == threshold, grows ~3× per day toward expiry.
-        # Past expiry (days_to_expiry < 0) the ramp keeps growing → strong incentive
-        # to flatten before the contract dies.
-        mult = math.exp(threshold - days_to_expiry)
+        if days_to_expiry >= 0:
+            mult = math.exp(threshold - days_to_expiry)
+        else:
+            # Past expiry: continuous with the at-expiry value, then grows
+            # linearly with days-past so each extra day of holding hurts more
+            # than the last. Linear (not exp) avoids float32 overflow over a
+            # multi-week post-expiry tail.
+            mult = math.exp(threshold) * (1.0 + abs(days_to_expiry))
         position = state["positions"][name].to(device=device, dtype=torch.float32)
         price = state["tradable_values"][name].to(device=device, dtype=torch.float32)
         cs = float(_runtime_tradable(runtime, name).get("contract_size", 1.0))
         penalty = penalty - coef * mult * position.abs() * price * cs
         any_active = True
     return penalty if any_active else None
+
+
+def _post_deal_trade_penalty(prev_state, state, bundle, runtime):
+    """Per-step holding penalty on ANY non-zero position past the original
+    liability's last settlement. Mirrors the expiry penalty's post-expiry form
+    (linear-in-days-past × |position notional|) but applied at portfolio level
+    rather than per-contract: once the deal is gone, no instrument should be
+    held, regardless of which contract it is.
+
+    Coefficient `Post_Deal_Trade_Penalty` × `(1 + days_past_settlement)` × Σ_i
+    |position_i| × price_i × contract_size_i. Disabled when coef <= 0 or
+    `last_settlement_index` missing.
+    """
+    objective = runtime.get("objective") or {}
+    coef = float(objective.get("post_deal_trade_penalty", 0.0))
+    if coef <= 0.0:
+        return None
+    last_settle = bundle.get("last_settlement_index")
+    if last_settle is None:
+        return None
+    current_idx = int(state["time_index"])
+    if current_idx <= int(last_settle):
+        return None
+    days_past = float(current_idx - int(last_settle))
+    device = bundle["time_grid_days"].device
+    batch_size = _batch_size_from_bundle(bundle)
+    penalty = torch.zeros(batch_size, dtype=torch.float32, device=device)
+    any_active = False
+    for name, pos in state["positions"].items():
+        price = state["tradable_values"][name].to(device=device, dtype=torch.float32)
+        cs = float(_runtime_tradable(runtime, name).get("contract_size", 1.0))
+        pos_abs = pos.to(device=device, dtype=torch.float32).abs()
+        penalty = penalty - coef * (1.0 + days_past) * pos_abs * price * cs
+        any_active = True
+    return penalty if any_active else None
+
+
+def _exp_linear_ramp(violation, threshold):
+    """f(0)=0; exp(v)−1 for 0≤v<T; exp(T)−1 + exp(T)·(v−T) for v≥T. C¹ at v=T."""
+    v = violation.clamp_min(0.0)
+    eT = math.exp(threshold)
+    return torch.exp(v.clamp_max(threshold)) - 1.0 + eT * (v - threshold).clamp_min(0.0)
+
+
+def _position_bounds_penalty(state, bundle, runtime):
+    """exp→linear penalty on the portfolio Σ_i|pos_i| total-position constraint:
+      v = max(0, Σ_i|pos_i| − total_position_abs_limit)
+    Scaled by held-position weighted average notional (dollar units, consistent with
+    the rest of the reward stack). Disabled when coef <= 0 or limit <= 0.
+
+    Per-instrument [min_position, max_position] bounds are enforced upstream by
+    `StructuredRebalancePolicy._feasible_mask`, which sets logits to -inf for any
+    bin whose resulting position would breach the per-instrument range — those
+    violations are unreachable so a per-instrument soft term would always be zero."""
+    objective = runtime.get("objective") or {}
+    coef = float(objective.get("position_bounds_penalty", 0.0))
+    threshold = float(objective.get("position_bounds_threshold", 5.0))
+    total_limit = float((runtime.get("accounting") or {}).get("total_position_abs_limit", 0.0))
+    if coef <= 0.0 or total_limit <= 0.0:
+        return None
+    device = bundle["time_grid_days"].device
+    batch_size = _batch_size_from_bundle(bundle)
+    abs_count = torch.zeros(batch_size, dtype=torch.float32, device=device)
+    abs_notional = torch.zeros(batch_size, dtype=torch.float32, device=device)
+    for name in _runtime_names(runtime, "action_instruments"):
+        if name not in state["positions"]:
+            continue
+        p = state["positions"][name].to(device=device, dtype=torch.float32).abs()
+        price = state["tradable_values"][name].to(device=device, dtype=torch.float32)
+        cs = float(_runtime_tradable(runtime, name).get("contract_size", 1.0))
+        abs_count = abs_count + p
+        abs_notional = abs_notional + p * price * cs
+    avg_notional = abs_notional / abs_count.clamp_min(1.0e-9)
+    return -coef * _exp_linear_ramp(abs_count - total_limit, threshold) * avg_notional
 
 
 def reward_and_terminal_payoff(prev_state, state, bundle, runtime):
@@ -796,12 +801,15 @@ def reward_and_terminal_payoff(prev_state, state, bundle, runtime):
         reward = torch.zeros(batch_size, dtype=torch.float32, device=device)
     else:
         reward = _dense_tracking_reward(prev_state, state, runtime).to(device=device, dtype=torch.float32)
-    naked = _naked_position_penalty(state, bundle, runtime)
-    if naked is not None:
-        reward = reward + naked.to(device=device, dtype=torch.float32)
     expiry = _expiry_holding_penalty(state, bundle, runtime)
     if expiry is not None:
         reward = reward + expiry.to(device=device, dtype=torch.float32)
+    post_deal = _post_deal_trade_penalty(prev_state, state, bundle, runtime)
+    if post_deal is not None:
+        reward = reward + post_deal.to(device=device, dtype=torch.float32)
+    bounds = _position_bounds_penalty(state, bundle, runtime)
+    if bounds is not None:
+        reward = reward + bounds.to(device=device, dtype=torch.float32)
     terminal_payoff = torch.zeros(batch_size, dtype=torch.float32, device=device)
     pnl_excess = torch.zeros(batch_size, dtype=torch.float32, device=device)
     liability_value = state.get("cumulative_liability_value", torch.zeros(batch_size, dtype=torch.float32, device=device)).to(device=device, dtype=torch.float32)
@@ -809,27 +817,24 @@ def reward_and_terminal_payoff(prev_state, state, bundle, runtime):
     # across the batch (the simulator advances all scenarios together). Avoids a `.item()` sync on
     # every rollout step.
     if is_terminal:
-        done_mask = state["done"].to(dtype=torch.bool)
         # pnl_excess = portfolio change since inception; the asymmetric utility evaluates against
         # this (NOT absolute portfolio value) so the seed cash baseline doesn't bias the floor.
         pnl_excess = _pnl_excess(state, runtime).to(device=device, dtype=torch.float32)
         terminal_reward = _evaluate_objective(pnl_excess, liability_value, runtime).to(device=device, dtype=torch.float32)
-        reward = reward + torch.where(done_mask, terminal_reward, torch.zeros_like(reward))
-        terminal_payoff = torch.where(done_mask, liability_value, terminal_payoff)
+        reward = reward + terminal_reward
+        terminal_payoff = liability_value
     return {"reward": reward, "terminal_payoff": terminal_payoff, "pnl_excess": pnl_excess, "liability_value": liability_value}
 
 
 def _bundle_scenario_dates(bundle):
+    # Cached at bundle build; falls back to recompute only if a caller passes a bundle that
+    # never went through `_build_torchrl_bundle` (e.g. handcrafted test fixtures).
+    cached = bundle.get("scenario_dates")
+    if cached is not None:
+        return cached
     base_date = pd.Timestamp(bundle.get("meta", {}).get("base_date"))
     days = torch.as_tensor(bundle["time_grid_days"]).detach().cpu().to(dtype=torch.int64).tolist()
     return pd.DatetimeIndex([base_date + pd.Timedelta(days=int(d)) for d in days])
-
-
-def _is_business_date(date, bundle):
-    bday = bundle.get("meta", {}).get("business_day")
-    if bday is not None and hasattr(bday, "is_on_offset"):
-        return bool(bday.is_on_offset(pd.Timestamp(date)))
-    return pd.Timestamp(date).weekday() < 5
 
 
 def _decision_interval_business_days_for_epoch(settings, epoch, *, evaluation):
@@ -850,20 +855,10 @@ def _decision_interval_business_days_for_epoch(settings, epoch, *, evaluation):
 
 
 def _decision_time_indices(bundle, settings, *, epoch, evaluation):
-    dates = _bundle_scenario_dates(bundle)
-    if dates.empty:
-        return tuple()
-    last = max(len(dates) - 1, 0)
-    days = bundle["time_grid_days"].detach().cpu().to(dtype=torch.int64).tolist()
-    # Anchor decisions at the live-simulation window: history rows have negative `days[i]` and
-    # are unreachable from the rollout (which starts at sim-day-0). Counting them in the
-    # business-day stream silently shifts what `interval=N` means — users expect "every N
-    # business days starting from sim-day-0", not "starting from history-day-0".
-    initial_time_index = next((i for i, d in enumerate(days) if int(d) >= 0), len(days))
-    business = [
-        i for i, d in enumerate(dates[:last])
-        if _is_business_date(d, bundle) and i >= initial_time_index
-    ]
+    # `business_indices` is precomputed at bundle build (cached list of business-day
+    # rollout indices in the live-sim window, history rows excluded). Per-epoch only
+    # the curriculum-driven stride changes — no GPU sync, no date re-walk per call.
+    business = bundle.get("business_indices", ())
     if not business:
         return tuple()
     interval = max(_decision_interval_business_days_for_epoch(settings, epoch, evaluation=evaluation), 1)
@@ -876,7 +871,7 @@ def _optimizer_settings(runtime):
         "epochs": int(p.get("epochs", 20)),
         "ppo_epochs": int(p.get("ppo_epochs", 4)),
         "minibatch_size": int(p.get("minibatch_size", 4096)),
-        "gamma": float(p.get("gamma", 0.99)),
+        "gamma": float(p.get("gamma", 1.0)),
         "gae_lambda": float(p.get("gae_lambda", 0.95)),
         "learning_rate": float(p.get("learning_rate", 3.0e-4)),
         "lr_schedule": str(p.get("lr_schedule", "constant")).lower(),
@@ -887,11 +882,9 @@ def _optimizer_settings(runtime):
         "entropy_coef": float(p.get("entropy_coef", 0.01)),
         "entropy_schedule": str(p.get("entropy_schedule", "constant")).lower(),
         "entropy_coef_min": float(p.get("entropy_coef_min", 0.0)),
-        "reward_normalize": bool(p.get("reward_normalize", False)),
         "warm_start_epochs": int(p.get("warm_start_epochs", 0)),
         "max_grad_norm": float(p.get("max_grad_norm", 0.5)),
         "reward_scale": float(p.get("reward_scale", 1.0)),
-        "action_sparsity_coef": float(p.get("action_sparsity_coef", 0.0)),
         "validation_fraction": float(p.get("validation_fraction", 0.25)),
         "validation_min_batch": int(p.get("validation_min_batch", 256)),
         "decision_interval_curriculum": tuple(dict(s) for s in p.get("decision_interval_curriculum", ())),
@@ -1024,7 +1017,9 @@ def _textbook_targets_per_step(bundle, runtime, *, buyback_days=21):
             if t < tn_idx:
                 target[t] = min_pos
             elif t < tn_idx + buyback_days:
-                u = (t - tn_idx) / buyback_days
+                # Front-loaded ramp: u = (i+1)/N so day-1 of the averaging window already
+                # steps off -short instead of wasting it as a no-op.
+                u = (t - tn_idx + 1) / buyback_days
                 target[t] = min_pos * (1.0 - u)
             else:
                 target[t] = 0.0
@@ -1048,8 +1043,10 @@ def _collect_textbook_rollout(policy, bundle, runtime, decision_indices, *, rewa
         return None
     # Host-side caches: avoid a per-step-per-instrument .item() sync (was ~3 syncs per decision).
     target_table = {name: targets_per_step[name].tolist() for name in instrument_order}
-    min_trade_floats = policy._min_trade_delta.reshape(-1).to(dtype=torch.float32).tolist()
-    max_trade_floats = [min_trade_floats[i] + n_bins[i] - 1 for i in range(len(instrument_order))]
+    # Per-instrument valid delta tables (handles non-contiguous spaces with gaps; padded slots
+    # in `policy._trade_deltas` are excluded by slicing to n_bins[i]).
+    valid_deltas_per_inst = [policy._trade_deltas[i, :n_bins[i]].to(device=device, dtype=torch.float32)
+                              for i in range(len(instrument_order))]
     entity_snapshots = []
     privileged_snapshots = []
     position_snapshots = []
@@ -1066,10 +1063,14 @@ def _collect_textbook_rollout(policy, bundle, runtime, decision_indices, *, rewa
             for i, name in enumerate(instrument_order):
                 target_scalar = target_table[name][t]
                 cur_pos = state["positions"][name].to(device=device, dtype=torch.float32)
-                delta = (torch.full_like(cur_pos, target_scalar) - cur_pos).round().clamp(
-                    min_trade_floats[i], max_trade_floats[i],
-                )
-                trade_per_instr[name] = delta
+                raw = (torch.full_like(cur_pos, target_scalar) - cur_pos).round()
+                # Snap to nearest valid discrete delta. searchsorted-then-pick-listed-value
+                # would silently mismatch against off-list values (e.g. raw=-48 → searchsorted
+                # bin=-45, but env executes the raw -48 — recorded action_bin would not match
+                # the actual trade). Argmin against the valid list is correct + straight-line.
+                vd = valid_deltas_per_inst[i]
+                best = (vd.unsqueeze(0) - raw.unsqueeze(-1)).abs().argmin(dim=-1)
+                trade_per_instr[name] = vd[best]
             step_action = _realized_structured_action(
                 {"trade_deltas": trade_per_instr}, state["positions"], runtime,
                 batch_size=batch_size, device=device,
@@ -1160,12 +1161,12 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
     values = []
     rewards = []
     dones = []
-    pending_reward = None
-    pending_index = -1
-    last_state = state
-    # Loop bounded by Python-side time_index — `done` becomes True iff time_index hits the bundle's
-    # last index, so the tensor.all().item() sync was equivalent and just forced a CUDA-CPU sync
-    # every step. With B=4096 and ~200 sim steps × ppo_epochs the syncs become measurable on GPU.
+    # Always-on reward accumulator: pre-first-decision transitions (e.g. when sim-day-0 is a
+    # holiday and the first business day is t>0) accumulate here and get rolled into the first
+    # decision's reward bucket. Previously pending_reward was None until the first decision,
+    # silently dropping any pre-decision transition rewards.
+    pending_reward = torch.zeros(batch_size, dtype=torch.float32, device=device)
+    seen_first_decision = False
     last_idx = _last_time_index(bundle)
     while int(state["time_index"]) < last_idx:
         t = int(state["time_index"])
@@ -1176,9 +1177,11 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
         # by the decision interval and biasing early-curriculum policies toward the floor.
         step_action = None
         if t in decision_set:
-            if pending_reward is not None:
+            if seen_first_decision:
                 rewards.append(pending_reward)
                 dones.append(state["done"].to(dtype=torch.float32, device=device))
+                pending_reward = torch.zeros(batch_size, dtype=torch.float32, device=device)
+            seen_first_decision = True
             # Materialize entity_state lazily on the decision step. The cheap refresh path skips
             # this on non-decision steps (interval=10 → 9× saved per decision).
             state = _ensure_decision_views(state, bundle, runtime)
@@ -1203,9 +1206,7 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
             privileged_snapshots.append({k: v.detach().clone() for k, v in priv.items()})
             position_snapshots.append(positions_t.detach().clone())
             # Record the SAMPLED bins (feasible by construction under the policy's mask) and their
-            # log_prob. step_action["action_bins"] is post-clip from _enforce_position_limits, which
-            # uses float clamping vs the policy mask's int64 cast — they can drift by 1 bin under
-            # fractional positions, decoupling action_bins from log_prob and biasing the PPO ratio.
+            # log_prob.
             action_bins_list.append(output["action_bins"].detach())
             if anchor_target_table is not None:
                 # Unclipped target_delta[b, i] = target_pos[t] - cur_pos[b]. May exceed the action
@@ -1232,15 +1233,11 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
                 entropy_per_instr = -(probs_per * safe_log).sum(dim=-1)
                 entropy_list.append(entropy_per_instr.sum(dim=-1))
                 n_feasible_list.append(torch.isfinite(logits_det).sum(dim=-1).sum(dim=-1).to(dtype=torch.int32))
-            pending_reward = torch.zeros(batch_size, dtype=torch.float32, device=device)
-            pending_index = len(entity_snapshots) - 1
         next_state = step_runtime_state(state, step_action, bundle, runtime)
         transition = reward_and_terminal_payoff(state, next_state, bundle, runtime)
-        if pending_reward is not None:
-            pending_reward = pending_reward + transition["reward"].to(device=device, dtype=torch.float32) * reward_scale
-        last_state = next_state
+        pending_reward = pending_reward + transition["reward"].to(device=device, dtype=torch.float32) * reward_scale
         state = next_state
-    if pending_reward is not None and pending_index == len(entity_snapshots) - 1:
+    if seen_first_decision:
         rewards.append(pending_reward)
         dones.append(state["done"].to(dtype=torch.float32, device=device))
     if not entity_snapshots:
@@ -1263,34 +1260,9 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
         "values": torch.stack(values, dim=0),
         "rewards": torch.stack(rewards, dim=0),
         "dones": torch.stack(dones, dim=0),
-        "terminal_state": last_state,
-        "terminal_transition": {**transition, "state": last_state},
+        "terminal_state": state,
+        "terminal_transition": {**transition, "state": state},
     }
-
-
-class _RunningRewardStd:
-    """Running variance estimate of per-step rewards for PPO reward normalization. Rewards are
-    divided by sqrt(running_var) before GAE so value targets stay roughly unit-variance across
-    iterations. Tracks raw reward variance (no discounting) — discounting per-decision rewards
-    would need gamma_stage = gamma**interval, and the curriculum can change interval mid-training,
-    silently shifting the normalizer. Raw variance is curriculum-safe and a common simpler choice."""
-
-    def __init__(self, eps=1e-8):
-        self.var = 1.0
-        self.count = eps
-
-    def update_from_rollout(self, rewards):
-        n = rewards.numel()
-        if n == 0:
-            return
-        new_var = float(rewards.var(unbiased=False).item())
-        tot = self.count + n
-        self.var = (self.var * self.count + new_var * n) / tot
-        self.count = tot
-
-    @property
-    def scale(self):
-        return max(self.var ** 0.5, 1.0e-8)
 
 
 def _compute_gae(rewards, values, dones, gamma, lam, *, last_value=None, last_done=None):
@@ -1432,16 +1404,6 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1, ep
                 sq_clipped = w_clipped * sq_clipped
             value_loss = 0.5 * torch.max(sq_unclipped, sq_clipped).mean()
             entropy_bonus = entropy.mean()
-            # Action-sparsity penalty: expected |trade_delta| under the current policy, normalized
-            # by per-instrument action range. Discourages over-trading when the gradient signal
-            # is weak. Computed as Σ_k softmax(logits)[k] · |bin_to_delta(k)| so the term flows
-            # gradient back through the policy logits — using the rollout's discrete `mb_actions`
-            # (detached int64) would give a zero-gradient regularizer.
-            bin_indices = torch.arange(policy._max_bins, device=device).reshape(1, 1, -1)
-            trade_per_bin = (bin_indices + policy._min_trade_delta.unsqueeze(-1)).to(dtype=torch.float32)
-            probs = torch.softmax(logits, dim=-1)
-            expected_abs_delta = (probs * trade_per_bin.abs()).sum(dim=-1)
-            action_sparsity_loss = (expected_abs_delta / policy._action_feature_scale).mean()
             # KL-anchor: forward KL(π_textbook || π_current) — pulls policy mass toward textbook
             # modes (right form when we want π to *cover* the prior rather than match marginals).
             # π_textbook is a Gaussian over bin-deltas centered on the unclipped textbook target,
@@ -1449,13 +1411,15 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1, ep
             anchor_loss = torch.zeros((), dtype=torch.float32, device=device)
             if flat_target_deltas is not None:
                 mb_target_deltas = flat_target_deltas[idx]  # (mb, n_inst)
+                # Per-instrument delta lookup table — handles non-contiguous deltas
+                # (e.g. [-50,-45,...,-10,-9,...,9,10,15,...,50]). Shape (1, n_inst, max_bins).
+                trade_per_bin = policy._trade_deltas.unsqueeze(0).to(dtype=torch.float32)
                 # Clip textbook target to feasible bin-delta range before centering the Gaussian.
-                # When target is far out-of-range (e.g., target=-50, action range ±10), the
-                # unclipped Gaussian underflows to zero across all feasible bins in float32, and
-                # the prior provides no signal. Clipping puts the Gaussian center on the boundary
-                # bin, which is the right behaviour: "as far in the textbook direction as feasible".
+                # When target is far out-of-range, the unclipped Gaussian underflows to zero across
+                # all feasible bins in float32 and the prior provides no signal. Clipping puts the
+                # Gaussian center on the boundary bin — "as far in the textbook direction as feasible".
                 min_trade_per_inst = policy._min_trade_delta.to(dtype=torch.float32)  # (1, n_inst)
-                max_trade_per_inst = min_trade_per_inst + torch.tensor(policy._action_bins, device=device, dtype=torch.float32).unsqueeze(0) - 1.0
+                max_trade_per_inst = policy._max_trade_delta.to(dtype=torch.float32)  # (1, n_inst)
                 mb_target_clipped = mb_target_deltas.clamp(min_trade_per_inst, max_trade_per_inst)
                 sq_dev = (trade_per_bin - mb_target_clipped.unsqueeze(-1)).pow(2)
                 target_unnorm = torch.exp(-anchor_sharpness * sq_dev)
@@ -1476,7 +1440,6 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1, ep
                 policy_loss
                 + settings["value_coef"] * value_loss
                 - settings["entropy_coef"] * entropy_bonus
-                + settings["action_sparsity_coef"] * action_sparsity_loss
                 + anchor_beta * anchor_loss
                 + entropy_floor_coef * entropy_floor_loss
             )
@@ -1574,6 +1537,22 @@ def evaluate_torchrl_policy(bundle, runtime):
     artifact_path = (runtime.get("policy") or {}).get("artifact_path")
     if artifact_path:
         policy = load_policy_artifact(artifact_path, device=device)
+        # Verify the eval runtime's privileged_layout matches the layout the policy was
+        # trained against. If the runtime was built without `stoch_factors` (or with a
+        # different set), the encoder's input dim won't match what the policy expects and
+        # the value head will see a wrong-shaped tensor downstream — better to fail loud
+        # here with a clear cause than to chase a cryptic shape error.
+        train_layout = dict(policy.privileged_layout or {})
+        eval_layout = dict(runtime.get("privileged_layout") or {})
+        if train_layout.keys() != eval_layout.keys():
+            raise ValueError(
+                "Privileged-layout mismatch between loaded policy and current runtime. "
+                f"Policy expects {sorted(train_layout.keys())}; runtime provides "
+                f"{sorted(eval_layout.keys())}. Typical cause: "
+                "construct_torchrl_runtime was called with stoch_factors=None or a "
+                "different stoch_factors set than at training. Rebuild the runtime with "
+                "the same stoch_factors used during training."
+            )
     else:
         policy = _make_structured_policy(runtime, device=device)
     decision_indices = _decision_time_indices(bundle, settings, epoch=None, evaluation=True)
@@ -1638,7 +1617,6 @@ def train_torchrl_policy(bundle, runtime):
     entropy_start = settings["entropy_coef"]
     entropy_end = settings["entropy_coef_min"]
     epochs_total = max(int(settings["epochs"]), 1)
-    reward_normalizer = _RunningRewardStd() if settings["reward_normalize"] else None
     warm_start_epochs = int(settings.get("warm_start_epochs", 0))
     if warm_start_epochs > 0:
         warm_indices = _decision_time_indices(train_bundle, settings, epoch=0, evaluation=False)
@@ -1658,19 +1636,32 @@ def train_torchrl_policy(bundle, runtime):
         rollout_time = float(time.perf_counter() - rollout_started)
         if rollout is None:
             continue
-        if reward_normalizer is not None:
-            reward_normalizer.update_from_rollout(rollout["rewards"])
-            rollout["rewards"] = rollout["rewards"] / reward_normalizer.scale
         update_started = time.perf_counter()
         diag = _ppo_update(policy, optimizer, rollout, settings, decision_interval=decision_interval, epoch=epoch)
         update_time = float(time.perf_counter() - update_started)
         if scheduler is not None:
             scheduler.step()
         terminal_reward = float(rollout["terminal_transition"]["reward"].mean().item())
-        net_pnl = float((rollout["terminal_transition"]["pnl_excess"] + rollout["terminal_transition"]["liability_value"]).mean().item())
-        # action stats: action_bins are integer [0, n_bins). trade_delta = bin + min_trade.
-        trade_deltas_seen = rollout["action_bins"] + policy._min_trade_delta
+        net_pnl_t = (rollout["terminal_transition"]["pnl_excess"] + rollout["terminal_transition"]["liability_value"]).to(dtype=torch.float64)
+        net_pnl = float(net_pnl_t.mean().item())
+        std_net_pnl = float(net_pnl_t.std().item())
+        worst_net_pnl = float(net_pnl_t.min().item())
+        p5_net_pnl = float(torch.quantile(net_pnl_t, 0.05).item())
+        # action_bins are integer [0, n_bins); deltas may be non-contiguous (e.g.
+        # [-50,-45,...,-10,-9,...,9,10,15,...,50]) so look up the actual delta from
+        # `policy._trade_deltas[i, bin]` instead of assuming bin + min.
+        bins = rollout["action_bins"]  # (D, B, I)
+        inst_idx = torch.arange(policy._trade_deltas.shape[0], device=policy._trade_deltas.device)
+        trade_deltas_seen = policy._trade_deltas[inst_idx, bins]
         action_abs_mean = float(trade_deltas_seen.float().abs().mean().item())
+        # Per-decision entropy / feasibility — summary across the rollout's decision steps.
+        # Surfaces entropy-collapse and over-restricted feasibility before they show up in
+        # the rollout-averaged `entropy` from PPO update diag (which can hide a single
+        # collapsed decision step inside a healthy rollout-mean).
+        ent_per_dec = rollout["entropy_per_decision"].to(dtype=torch.float32)        # (D, B)
+        nfe_per_dec = rollout["n_feasible_per_decision"].to(dtype=torch.float32)     # (D, B)
+        min_entropy_decision = float(ent_per_dec.mean(dim=-1).min().item())
+        min_n_feasible_decision = float(nfe_per_dec.mean(dim=-1).min().item())
         epoch_diag.append({
             "epoch": epoch,
             "policy_loss": diag["policy_loss"],
@@ -1682,15 +1673,30 @@ def train_torchrl_policy(bundle, runtime):
             "advantage_std": diag["advantage_std"],
             "average_reward": terminal_reward,
             "average_net_pnl": net_pnl,
+            "std_net_pnl": std_net_pnl,
+            "worst_net_pnl": worst_net_pnl,
+            "p5_net_pnl": p5_net_pnl,
             "action_abs_mean": action_abs_mean,
+            "min_entropy_decision": min_entropy_decision,
+            "min_n_feasible_decision": min_n_feasible_decision,
             "rollout_time_seconds": rollout_time,
             "update_time_seconds": update_time,
             "decision_interval_business_days": decision_interval,
         })
+        # Live per-epoch dump for buffered-stdout-blind monitoring. Atomic via temp+rename
+        # so a reader never sees a partial write. Skipped when no path is set in runtime.
+        live_path = runtime.get("live_diag_path")
+        if live_path:
+            import json as _jsonlib, os as _os
+            tmp = live_path + ".tmp"
+            with open(tmp, "w") as _f:
+                _jsonlib.dump({"epochs": epoch_diag, "current_epoch": int(epoch),
+                               "total_epochs": int(settings["epochs"])}, _f)
+            _os.replace(tmp, live_path)
         anchor_str = f" anc_kl={diag['anchor_loss']:.3f} β={diag['anchor_beta']:.3f}" if diag["anchor_beta"] > 0.0 else ""
         print(
             f"epoch={epoch:>2} interval={decision_interval}d "
-            f"net_pnl={net_pnl:>+12.0f} "
+            f"net_pnl={net_pnl:>+12.0f} std={std_net_pnl:>10.0f} worst={worst_net_pnl:>+12.0f} "
             f"reward={terminal_reward:>+10.2f} "
             f"|trade|={action_abs_mean:.2f} "
             f"pol_l={diag['policy_loss']:+.4f} val_l={diag['value_loss']:.2e} ent={diag['entropy']:.3f}{anchor_str} "

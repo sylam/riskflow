@@ -1850,48 +1850,51 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # CPU mirror of the time grid for hot-path feature builders that need scalar `current_day`
         # values per decision step. Avoids a CUDA→CPU sync per (decision step × feature builder).
         bundle['time_grid_days_cpu'] = bundle['time_grid_days'].detach().cpu().to(dtype=torch.int64).tolist()
+        # Cache scenario dates + business-day decision indices so `_decision_time_indices` can
+        # be re-evaluated per-epoch (curriculum-driven interval) without re-syncing the time
+        # grid or re-walking the date list. Computed once at bundle build, immutable thereafter.
+        days_cpu = bundle['time_grid_days_cpu']
+        base_ts = pd.Timestamp(base_date)
+        scenario_dates = pd.DatetimeIndex([base_ts + pd.Timedelta(days=int(d)) for d in days_cpu])
+        bundle['scenario_dates'] = scenario_dates
+        bday = (bundle.get('meta') or {}).get('business_day')
+        if bday is not None and hasattr(bday, 'is_on_offset'):
+            bd_mask = [bool(bday.is_on_offset(d)) for d in scenario_dates]
+        else:
+            bd_mask = [d.weekday() < 5 for d in scenario_dates]
+        # Decisions only fire at sim-day-0 onward (history rows excluded); strict-less-than the
+        # final index because the env terminates on the last step before the next action would fire.
+        initial_time_index = next((i for i, d in enumerate(days_cpu) if int(d) >= 0), len(days_cpu))
+        last = max(len(scenario_dates) - 1, 0)
+        bundle['business_indices'] = tuple(
+            i for i in range(min(last, len(bd_mask)))
+            if bd_mask[i] and i >= initial_time_index
+        )
         # Total leg notional |Σ Volume| — constant across the episode, used by the global
         # delta-coverage feature. Cache as a Python float once at bundle build instead of
         # re-summing + .item()-ing every decision step.
+        # Last time index where any leg still has time_to_payment > 0; steps with
+        # index strictly greater are post-settlement (all legs paid). Used by the
+        # post-deal-trade penalty in the reward path.
         if bundle.get('legs') is not None and bundle['legs'].get('features') is not None:
             from .hedge_features import LEG_FEATURE_NAMES
             feat_names = tuple(bundle['legs'].get('feature_names', LEG_FEATURE_NAMES))
+            feats = bundle['legs']['features']
             if 'volume' in feat_names:
-                vol_idx = feat_names.index('volume')
-                leg_vol = bundle['legs']['features'][..., vol_idx]
+                leg_vol = feats[..., feat_names.index('volume')]
                 while leg_vol.ndim > 1:
                     leg_vol = leg_vol[0]
                 bundle['total_leg_volume'] = float(leg_vol.abs().sum().item())
-        # Last time index where any leg still has time_to_payment > 0; steps with
-        # index strictly greater are post-settlement (all legs paid). Used by the
-        # naked-position penalty in the reward path.
-        if bundle.get('legs') is not None and bundle['legs'].get('features') is not None:
-            from .hedge_features import LEG_FEATURE_NAMES
-            ttp_idx = LEG_FEATURE_NAMES.index('time_to_payment')
-            ttp = bundle['legs']['features'][..., ttp_idx]
-            while ttp.ndim > 2:
-                ttp = ttp[:, 0]
-            active = (ttp > 0).any(dim=-1) if ttp.ndim == 2 else (ttp > 0)
-            if bool(active.any()):
-                bundle['last_settlement_index'] = int(active.nonzero(as_tuple=False).max().item())
+            if 'time_to_payment' in feat_names:
+                ttp = feats[..., feat_names.index('time_to_payment')]
+                while ttp.ndim > 2:
+                    ttp = ttp[:, 0]
+                active = (ttp > 0).any(dim=-1) if ttp.ndim == 2 else (ttp > 0)
+                if bool(active.any()):
+                    bundle['last_settlement_index'] = int(active.nonzero(as_tuple=False).max().item())
         # Naked-penalty normalization scale: total max-notional across hedge instruments at the
         # first time step. Lets the naked-penalty coef have a unit-free interpretation (fraction
         # of full hedge book per step) rather than scaling with raw dollar notional in the millions.
-        if runtime is not None:
-            position_limits = runtime.get('accounting', {}).get('position_limits', {})
-            hedge_names = (runtime.get('names') or {}).get('hedges', ())
-            runtime_tradables = runtime.get('tradables') or {}
-            scale = 0.0
-            for hedge_name in hedge_names:
-                lim = position_limits.get(hedge_name) or {}
-                max_pos = max(abs(float(lim.get('min_position', 0))), abs(float(lim.get('max_position', 0))))
-                if max_pos == 0 or hedge_name not in bundle['tradables']:
-                    continue
-                cs = float((runtime_tradables.get(hedge_name) or {}).get('contract_size', 1.0))
-                first_price = float(bundle['tradables'][hedge_name][0, 0].item())
-                scale += max_pos * first_price * cs
-            if scale > 0.0:
-                bundle['naked_scale'] = float(scale)
         bundle['spot_realized_vol'] = compute_spot_realized_vol(bundle)
         # Direction-aware trend signals: annualised log-return over 20d / 60d (signed),
         # plus a vol-normalised stretch from the 20d MA. These let the policy identify

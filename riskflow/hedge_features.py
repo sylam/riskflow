@@ -319,20 +319,26 @@ def assemble_privileged_factors(privileged_factor_blocks, stoch_factors):
     }
 
 
-def _temporal_window(bundle, time_index, batch_size, device, *, window=TEMPORAL_WINDOW):
+def _temporal_window(bundle, time_index, batch_size, device, *, window=TEMPORAL_WINDOW, commodities=None):
     """Build a (B, K, n_features) tensor of the last `window` business days of trajectory
     signals at the current decision step. Features per timepoint: per-commodity spot prices
     (using the full history+sim timeline) followed by the global liability MtM. The history
     prefix added at bundle build (`_prepend_history_prefix`) ensures the lookback is always
-    in-bounds for any sim-time decision step. Channel ordering is deterministic — same as the
-    iteration order of `bundle['spot_price_history']`."""
+    in-bounds for any sim-time decision step.
+
+    Channel ordering: caller passes `commodities` (typically
+    `layout['globals']['referenced_commodities']`) so the runtime channel order matches the
+    metadata `channel_names` exactly. Falls back to `bundle['spot_price_history']` keys when
+    not supplied — equivalent only when the two iteration orders coincide (single-commodity
+    or accidental dict-order alignment)."""
     spot_history = bundle.get('spot_price_history') or {}
     liability_mtm = bundle.get('liability_mtm')
     K = int(window)
     t_end = int(time_index) + 1
     t_start = max(0, t_end - K)
     channels = []
-    for commodity in spot_history.keys():
+    iter_order = tuple(commodities) if commodities is not None else tuple(spot_history.keys())
+    for commodity in iter_order:
         S = _full_spot_timeline(bundle, commodity)
         if S is None:
             continue
@@ -463,110 +469,6 @@ def compute_spot_stretch(bundle, *, window):
         else:
             denom = (rv * S).clamp_min(1e-9)
         out[commodity] = (S - ma) / denom
-    return out
-
-
-def compute_implied_atm_vol(bundle, price_models, *, tenor_days=30, factor_module='LogOUSpotModel'):
-    """Per-commodity implied ATM volatility for a `tenor_days` option (calendar days), derived
-    from LogOU process parameters. Closed-form: integrated log-variance V(T) = σ²(1-e^(-2κT))/(2κ),
-    annualized IV = √(V(T)/T). Constant across (t, b) in synthetic mode (one set of OU params per
-    bundle); in production this would be replaced by a JSON `Implied_ATM_Vol_History` block."""
-    spot_history = bundle.get('spot_price_history') or {}
-    factors = bundle.get('factors') or {}
-    if not spot_history or not price_models:
-        return {}
-    import math as _math
-    T = float(tenor_days) / utils.DAYS_IN_YEAR
-    out = {}
-    for commodity in spot_history.keys():
-        # `commodity` is the canonical factor name (e.g. 'CommodityPrice.PLATINUM').
-        # The bundle keys factors by the same name. price_models is keyed by model name
-        # (e.g. 'LogOUSpotModel.PLATINUM') — derive the bare underlying via tuple split.
-        if commodity not in factors:
-            continue
-        bare_commodity = commodity.split('.', 1)[1] if '.' in commodity else commodity
-        model_key = f'{factor_module}.{bare_commodity}'
-        if model_key not in price_models:
-            continue
-        params = price_models[model_key]
-        kappa = max(float(params['Kappa']), 1e-9)
-        sigma = float(params['Sigma'])
-        integrated_var = sigma * sigma * (1.0 - _math.exp(-2.0 * kappa * T)) / (2.0 * kappa)
-        iv = _math.sqrt(max(integrated_var / max(T, 1e-9), 0.0))
-        sim = factors[commodity]
-        T_full, B = sim.shape
-        out[commodity] = torch.full((T_full, B), float(iv), dtype=torch.float32, device=sim.device)
-    return out
-
-
-def compute_spot_zscore(bundle, window=PRICE_ZSCORE_WINDOW, min_periods=5, eps=1e-6):
-    """Per-commodity rolling z-score of underlying spot: (S - SMA_w(S)) / STD_w(S), per scenario.
-    Captures overbought/oversold regime in the underlying.
-    Returns {commodity: tensor (H+T, B)}."""
-    spot_history = bundle.get('spot_price_history') or {}
-    if not spot_history:
-        return {}
-    out = {}
-    for commodity in spot_history.keys():
-        S = _full_spot_timeline(bundle, commodity)
-        if S is None:
-            continue
-        T = S.shape[0]
-        cum = torch.cat([torch.zeros_like(S[:1]), S.cumsum(dim=0)], dim=0)
-        sq_cum = torch.cat([torch.zeros_like(S[:1]), (S * S).cumsum(dim=0)], dim=0)
-        idx = torch.arange(T + 1, device=S.device)
-        lo = (idx - window).clamp_min(0)
-        count = (idx - lo).to(dtype=torch.float32).clamp_min(1.0).unsqueeze(-1)
-        sum_w = cum[idx[1:]] - cum[lo[1:]]
-        sum_sq_w = sq_cum[idx[1:]] - sq_cum[lo[1:]]
-        n = count[1:]
-        mean = sum_w / n
-        var = (sum_sq_w / n) - mean * mean
-        std = var.clamp_min(0.0).sqrt()
-        z = (S - mean) / (std + eps)
-        z[:min_periods] = 0.0
-        out[commodity] = z
-    return out
-
-
-def compute_cross_delta(bundle, window=PRICE_ZSCORE_WINDOW, eps=1e-6):
-    """Per-instrument PATH-LOCAL BACKWARD-LOOKING rolling hedge ratio. For each path b at time t:
-        beta[t, b, c] = Σ_{s=max(0,t-window)..t-1} dP_c[s,b] * dL[s,b]
-                        / Σ_{s=max(0,t-window)..t-1} dP_c[s,b]^2 + eps
-    Uses only data observable on path b at or before time t — deployable in production where the
-    agent has only its own realized history. No look-ahead (window ends at t-1, not t+1) and no
-    cross-section privilege (regression is along the time axis of path b, not across paths)."""
-    liability_mtm = bundle.get('liability_mtm')
-    tradables = bundle.get('tradables') or {}
-    if liability_mtm is None or not tradables:
-        return {}
-    # _prepend_history_prefix replicates `mtm[0]` for the H history rows AND keeps `mtm[0]` at
-    # index H (concat of prefix + original), so dL = 0 for every transition s < H. Without
-    # excluding those transitions, the rolling regression's denominator (Σ dP² over history)
-    # dominates while the numerator stays zero — cross_delta reads artificially flat-at-zero
-    # for the first ~window sim days, exactly when the early hedging decisions matter. Zero dP
-    # at history transitions so both num and den exclude them cleanly.
-    days = bundle.get('time_grid_days')
-    history_size = int((days < 0).sum().item()) if days is not None else 0
-    L = liability_mtm.to(dtype=torch.float32)
-    dL = L[1:] - L[:-1]
-    out = {}
-    for name, price in tradables.items():
-        P = price.to(dtype=torch.float32)
-        dP = P[1:] - P[:-1]
-        if history_size > 0:
-            dP = dP.clone()
-            dP[:history_size] = 0
-        T = P.shape[0]
-        zeros = torch.zeros_like(dP[:1])
-        # cumulative sums prepended with zero so cum_sum[t] = Σ_{s=0..t-1} (dP·dL)[s]
-        num_cum = torch.cat([zeros, (dP * dL).cumsum(dim=0)], dim=0)
-        den_cum = torch.cat([zeros, (dP * dP).cumsum(dim=0)], dim=0)
-        idx = torch.arange(T, device=P.device)
-        lo = (idx - window).clamp_min(0)
-        num = num_cum[idx] - num_cum[lo]
-        den = den_cum[idx] - den_cum[lo]
-        out[name] = num / (den + eps)
     return out
 
 
@@ -820,6 +722,7 @@ def build_entity_state(bundle, state, time_index, layout):
     temporal = _temporal_window(
         bundle, time_index, batch_size, device,
         window=int(layout.get('temporal', {}).get('window', TEMPORAL_WINDOW)),
+        commodities=layout.get('globals', {}).get('referenced_commodities'),
     )
 
     return TensorDict({
@@ -835,27 +738,6 @@ def build_entity_state(bundle, state, time_index, layout):
         'globals': globals_features,
         'temporal': temporal,
     }, batch_size=[batch_size])
-
-
-def flatten_entity_features(entity_state):
-    parts = []
-    for name in ('legs', 'instruments', 'cash_accounts'):
-        features = entity_state[name]
-        if features.shape[1] == 0:
-            continue
-        mask = entity_state[name + '_mask'].unsqueeze(-1).to(features.dtype)
-        parts.append((features * mask).flatten(start_dim=1))
-    parts.append(entity_state['globals'])
-    return torch.cat(parts, dim=1)
-
-
-def entity_feature_dim(layout):
-    return (
-        layout['legs']['feature_dim'] * layout['legs']['max_cardinality']
-        + layout['instruments']['feature_dim'] * layout['instruments']['max_cardinality']
-        + layout['cash_accounts']['feature_dim'] * layout['cash_accounts']['max_cardinality']
-        + layout['globals']['feature_dim']
-    )
 
 
 if __name__ == '__main__':

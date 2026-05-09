@@ -43,6 +43,15 @@ class StructuredActionSpace:
             assert min_trade_delta is not None and max_trade_delta is not None, (
                 "StructuredActionSpace requires either trade_deltas or "
                 "(min_trade_delta + max_trade_delta)")
+            import warnings
+            warnings.warn(
+                "StructuredActionSpace(min_trade_delta=, max_trade_delta=) is deprecated; "
+                "pass `trade_deltas=` (per-instrument list of allowed integer deltas) "
+                "instead. The min/max form expands to a uniform unit-step range and is "
+                "scheduled for removal. Reachable today only when loading a pre-schema-v? "
+                "policy artifact.",
+                DeprecationWarning, stacklevel=2,
+            )
             normalized = tuple(
                 tuple(range(int(lo), int(hi) + 1))
                 for lo, hi in zip(min_trade_delta, max_trade_delta))
@@ -318,10 +327,18 @@ class StructuredRebalancePolicy(nn.Module):
         # the temporal token when present (n_channels > 0).
         temporal_present = int(entity_layout.get('temporal', {}).get('n_channels', 0)) > 0
         self._ctx_pool_dim = self.token_dim * (5 if temporal_present else 4)
+        # Wider 2-hidden-layer value head. Earlier single-hidden head at width=token_dim
+        # (=64) had insufficient capacity to fit terminal-rewards spanning 6+ orders of
+        # magnitude, leaving val_loss plateaued. Start at 2×token_dim (=128) — minimal
+        # capacity bump that tests the binary "is V capacity-bound?" hypothesis. If it
+        # still plateaus, capacity isn't the issue. If it converges, can scale to 4× later.
+        v_hidden = 2 * self.token_dim
         self.value_head = nn.Sequential(
-            nn.Linear(self._ctx_pool_dim + self._privileged_dim, self.token_dim),
+            nn.Linear(self._ctx_pool_dim + self._privileged_dim, v_hidden),
             nn.GELU(),
-            nn.Linear(self.token_dim, 1),
+            nn.Linear(v_hidden, v_hidden),
+            nn.GELU(),
+            nn.Linear(v_hidden, 1),
         ).to(self.device)
 
         # Per-instrument allowed-deltas tensor padded to (n_instruments, max_bins) with the
@@ -353,11 +370,6 @@ class StructuredRebalancePolicy(nn.Module):
         bin_indices = torch.arange(self._max_bins, device=self.device).unsqueeze(0)
         invalid = bin_indices >= bins_tensor.unsqueeze(1)
         self.register_buffer("_logit_mask", invalid, persistent=False)
-        self.register_buffer(
-            "_action_feature_scale",
-            torch.maximum(self._max_trade_delta.abs(), self._min_trade_delta.abs()).clamp_min(1).to(dtype=torch.float32),
-            persistent=False,
-        )
         # Per-instrument hard position limits for feasibility masking at sample/evaluate time.
         # Without this, the policy proposes bins that get silently clipped by the evaluator and
         # the PPO ratio is biased: log_prob is over the unconstrained distribution but the
@@ -469,16 +481,6 @@ class StructuredRebalancePolicy(nn.Module):
         deltas = self._trade_deltas.unsqueeze(0).expand(action_bins.shape[0], -1, -1)
         return deltas.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
 
-    def _trade_deltas_to_bins(self, trade_deltas):
-        # trade_deltas: int64 [B, I]. Reverse lookup via searchsorted on the (sorted) per-
-        # instrument allowed-deltas list. Allowed deltas are sorted in StructuredActionSpace
-        # construction, so searchsorted with right=False returns the matching index for any
-        # delta that's actually in the list. Out-of-list deltas would clip to a valid index;
-        # callers must only pass legal deltas.
-        # Shape contract: searchsorted(sorted=(I, max_bins), values=(I, B)) → (I, B).
-        bins_T = torch.searchsorted(self._trade_deltas, trade_deltas.transpose(0, 1).contiguous())
-        return bins_T.transpose(0, 1).contiguous()
-
     def forward(self, entity_state, privileged_state=None, positions=None):
         logits, ctx = self._policy_outputs(entity_state, positions=positions)
         return TensorDict({'logits': logits, 'value': self._value(ctx, privileged_state)}, batch_size=[logits.shape[0]])
@@ -533,14 +535,10 @@ class StructuredRebalancePolicy(nn.Module):
                 result[key] = output[key]
         return result
 
-    def action_features(self, output):
-        ordered = torch.as_tensor(output['ordered_trade_deltas'], dtype=torch.float32, device=self.device)
-        return ordered / self._action_feature_scale
-
     def to_artifact(self):
         state = self.state_dict()
         return {
-            "artifact_version": 6,
+            "artifact_version": 7,  # bumped for the wider value head (3 Linear/2 hidden vs 2/1)
             "policy_object_type": "StructuredRebalancePolicy",
             "entity_layout": self.entity_layout,
             "privileged_layout": dict(self.privileged_layout),

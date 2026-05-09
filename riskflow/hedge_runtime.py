@@ -145,7 +145,7 @@ def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -
         "ppo_epochs": int(optimizer_config.get("PPO_Epochs", 4)),
         "minibatch_size": int(optimizer_config.get("Minibatch_Size", 4096)),
         # Per-business-day discounts; effective per-decision values are gamma**interval, lam**interval
-        "gamma": float(optimizer_config.get("Gamma", 0.999)),
+        "gamma": float(optimizer_config.get("Gamma", 1.0)),
         "gae_lambda": float(optimizer_config.get("GAE_Lambda", 0.995)),
         "learning_rate": float(optimizer_config.get("Learning_Rate", 3.0e-4)),
         "lr_schedule": str(optimizer_config.get("LR_Schedule", "constant")).lower(),
@@ -156,12 +156,10 @@ def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -
         "entropy_coef": float(optimizer_config.get("Entropy_Coef", 0.01)),
         "entropy_schedule": str(optimizer_config.get("Entropy_Schedule", "constant")).lower(),
         "entropy_coef_min": float(optimizer_config.get("Entropy_Coef_Min", 0.0)),
-        "reward_normalize": bool(optimizer_config.get("Reward_Normalize", False)),
         "warm_start_epochs": int(optimizer_config.get("Warm_Start_Epochs", 0)),
         "max_grad_norm": float(optimizer_config.get("Max_Grad_Norm", 0.5)),
         "reward_scale": float(optimizer_config.get("Reward_Scale", 1.0)),
         "debug_strict_bins": bool(optimizer_config.get("Debug_Strict_Bins", False)),
-        "action_sparsity_coef": float(optimizer_config.get("Action_Sparsity_Coef", 0.0)),
         "dense_tracking_reward_scale": float(optimizer_config.get("Dense_Tracking_Reward_Scale", 0.0)),
         "dense_tracking_reward_clip": float(optimizer_config.get("Dense_Tracking_Reward_Clip", 0.0)),
         "dense_reward_mode": str(optimizer_config.get("Dense_Reward_Mode", "asymmetric")).lower(),
@@ -190,9 +188,18 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
         "floor_penalty": float(objective_config.get("Floor_Penalty", 1.0)),
         "surplus_reward": float(objective_config.get("Surplus_Reward", 1.0)),
         "power": float(objective_config.get("Power", 1.0)),
-        "naked_penalty": float(objective_config.get("Naked_Penalty", 0.0)),
         "expiry_penalty": float(objective_config.get("Expiry_Penalty", 0.0)),
         "expiry_threshold_days": float(objective_config.get("Expiry_Threshold_Days", 4.0)),
+        "post_deal_trade_penalty": float(objective_config.get("Post_Deal_Trade_Penalty", 0.0)),
+        # NOTE: despite the name, `Position_Bounds_Penalty` controls ONLY the
+        # portfolio-total Σ|pos_i| ramp (against `Evaluator.Total_Position_Abs_Limit`).
+        # Per-instrument [Min_Position, Max_Position] bounds are HARD-enforced upstream
+        # by `StructuredRebalancePolicy._feasible_mask` (logit -∞ on out-of-range bins),
+        # so a per-instrument soft term would always be zero. The naming pre-dates that
+        # clarification; behavior is portfolio-only. Rename to `Total_Position_Abs_Penalty`
+        # if it becomes worth the JSON / CSV / docs churn.
+        "position_bounds_penalty": float(objective_config.get("Position_Bounds_Penalty", 0.0)),
+        "position_bounds_threshold": float(objective_config.get("Position_Bounds_Threshold", 5.0)),
     }
 
 
@@ -222,6 +229,15 @@ def _normalize_action_space(policy_config: Mapping[str, Any]) -> Dict[str, Any]:
                 "Trade_Deltas length must match Instrument_Order length; "
                 f"got {len(per_instrument)} delta-lists for {len(instrument_order)} instruments")
     else:
+        import warnings
+        warnings.warn(
+            "Action_Space.Min_Trade_Delta/Max_Trade_Delta is deprecated; use "
+            "Action_Space.Trade_Deltas (per-instrument list of allowed integer deltas). "
+            "The min/max form expands to a uniform unit-step range and is scheduled for "
+            "removal — non-uniform spacings (e.g. fine bins near 0, coarse at extremes) "
+            "are now standard.",
+            DeprecationWarning, stacklevel=2,
+        )
         min_trade_delta = tuple(int(value) for value in action_space.get("Min_Trade_Delta", ()))
         max_trade_delta = tuple(int(value) for value in action_space.get("Max_Trade_Delta", ()))
         if instrument_order and not (
@@ -246,6 +262,22 @@ def _normalize_action_space(policy_config: Mapping[str, Any]) -> Dict[str, Any]:
             instrument_name: max(deltas)
             for instrument_name, deltas in zip(instrument_order, per_instrument)
         },
+    }
+
+
+def _build_instrument_cash_account_map(normalized_tradables, cash_account_names):
+    """Static instrument→cash_account routing by currency. First cash account whose
+    currency matches the instrument's currency wins; falls back to the first cash account
+    if none match. Computed once at runtime construction; consumed by the env step loop."""
+    accounts = list(cash_account_names)
+    fallback = accounts[0] if accounts else None
+    by_currency = {}
+    for account in accounts:
+        ccy = normalized_tradables.get(account, {}).get("currency")
+        by_currency.setdefault(ccy, account)
+    return {
+        name: by_currency.get(meta.get("currency"), fallback)
+        for name, meta in normalized_tradables.items()
     }
 
 
@@ -388,21 +420,9 @@ def construct_torchrl_runtime(
         if str(account_name) not in tradables:
             raise ValueError(f"Evaluator cash account '{account_name}' is not in Tradable_Instruments")
     position_limits = _normalize_position_limits(evaluator_config)
-    allow_short = bool(evaluator_config.get("Allow_Short", True))
-    if not allow_short:
-        invalid_shorts = [
-            instrument_name
-            for instrument_name, limit in position_limits.items()
-            if int(limit["min_position"]) < 0
-        ]
-        if invalid_shorts:
-            raise ValueError(
-                "Evaluator.Allow_Short is False but Position_Limits allow short positions for "
-                f"{invalid_shorts}"
-            )
     hedge_names = tuple(
         instrument_name
-        for instrument_name in position_limits.keys()
+        for instrument_name in tradables.keys()
         if instrument_name not in cash_account_names
     )
     liability_expiry = None
@@ -460,12 +480,26 @@ def construct_torchrl_runtime(
                 }
                 for account_name in cash_account_names
             },
+            # Precomputed instrument→cash_account routing by currency match. Avoids
+            # per-step rebuild in env loops; static for the lifetime of the runtime.
+            "instrument_to_cash_account": _build_instrument_cash_account_map(
+                normalized_tradables, cash_account_names),
             "transaction_cost_per_unit": float(evaluator_config.get("Transaction_Cost_Per_Unit", 0.0)),
             "bid_offer_spread_bps": float(evaluator_config.get("Bid_Offer_Spread_Bps", 0.0)),
             "force_flat_at_end": bool(evaluator_config.get("Force_Flat_At_End", True)),
-            "allow_short": allow_short,
+            "total_position_abs_limit": float(evaluator_config.get("Total_Position_Abs_Limit", 0.0)),
         },
     }
+    # Sanity check: Position_Bounds_Penalty is silently no-op'd when Total_Position_Abs_Limit
+    # is unset, since the penalty's only active branch is the portfolio-total ramp.
+    if (runtime["objective"]["position_bounds_penalty"] > 0.0
+            and runtime["accounting"]["total_position_abs_limit"] <= 0.0):
+        raise ValueError(
+            "Objective.Position_Bounds_Penalty > 0 requires "
+            "Evaluator.Total_Position_Abs_Limit > 0 — otherwise the penalty is silently "
+            "disabled (no per-instrument soft bound exists; per-instrument enforcement "
+            "is via the policy's feasibility mask on Position_Limits)."
+        )
     runtime["entity_layout"] = build_entity_layout(runtime)
     runtime["privileged_layout"] = derive_privileged_layout(stoch_factors)
     return runtime

@@ -138,12 +138,13 @@ if __name__=='__main__':
                     },
                     "Objective": {
                         "Object": "TerminalFloorThenSurplusUtility",
-                        "Floor_Penalty": 10.0,
+                        "Floor_Penalty": 50.0,
                         "Surplus_Reward": 1.0,
                         "Power": 1.0,
-                        "Naked_Penalty": 5.0,
                         "Expiry_Penalty": 1.0,
-                        "Expiry_Threshold_Days": 4.0
+                        "Expiry_Threshold_Days": 4.0,
+                        "Post_Deal_Trade_Penalty": 1.0,
+                        "Position_Bounds_Penalty": 1.0
                     },
                     "Liabilities": {
                         "FloatingEnergyDeal": {
@@ -217,22 +218,21 @@ if __name__=='__main__':
                             "USD_CASH"
                         ],
                         "Force_Flat_At_End": true,
-                        "Allow_Short": true,
-                        "Fail_On_Unhedgeable_Intent": false,
                         "Transaction_Cost_Per_Unit": 0.0,
                         "Bid_Offer_Spread_Bps": 10.0,
                         "Position_Limits": {
                             "PL_APR_2026": {"Min_Position": -50, "Max_Position": 0},
                             "PL_JUL_2026": {"Min_Position": -50, "Max_Position": 0},
                             "PL_OCT_2026": {"Min_Position": -50, "Max_Position": 0}
-                        }
+                        },
+                        "Total_Position_Abs_Limit": 50
                     },
                     "Optimizer": {
                         "Object": "PPO",
                         "Epochs": 80,
                         "PPO_Epochs": 4,
                         "Minibatch_Size": 8192,
-                        "Gamma": 0.999,
+                        "Gamma": 1.0,
                         "GAE_Lambda": 0.995,
                         "Learning_Rate": 0.0003,
                         "LR_Schedule": "cosine",
@@ -256,7 +256,6 @@ if __name__=='__main__':
                         "Entropy_Floor_Coef": 0.0,
                         "Validation_Fraction": 0.25,
                         "Validation_Min_Batch": 512,
-                        "Validation_Shards": 4,
                         "Decision_Interval_Curriculum": [
                             {"Start_Epoch": 1, "End_Epoch": 80, "Interval_Business_Days": 1}
                         ],

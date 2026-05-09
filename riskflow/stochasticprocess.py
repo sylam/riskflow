@@ -2085,14 +2085,10 @@ class MarkovHMMSpotModel(StochasticProcess):
         Z_dt = Z.to(dtype=dtype)
         if nu_per_state is not None:
             nu = nu_per_state.to(device=device, dtype=dtype)                        # (n_states,)
-            # Draw W~Chi²(ν_z) per (T, B). Generate one Chi² stack per state then gather
-            # along the regime path. Memory: n_states × T × B floats.
-            W_per_state = torch.stack([
-                torch.distributions.Chi2(float(nu[s])).sample((T, B)).to(device=device, dtype=dtype)
-                for s in range(self.n_states)
-            ])                                                                       # (n_states, T, B)
-            W = W_per_state.gather(0, regimes.unsqueeze(0)).squeeze(0)              # (T, B)
             nu_t = nu[regimes]                                                       # (T, B)
+            # Sample W ~ Chi²(ν_t) directly using Chi²(ν) ≡ Gamma(ν/2, rate=1/2).
+            # Avoids the n_states-wide stack-then-gather pattern (n_states× memory).
+            W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype)  # (T, B)
             # Student-t innovation with df=ν, var=ν/(ν-2). Rescale so the marginal
             # daily variance matches σ² (i.e. neutralise the t variance amplification).
             t_innov = Z_dt * torch.sqrt(nu_t / W)                                    # std-t
