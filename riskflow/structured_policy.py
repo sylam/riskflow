@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping
 
 import torch
 import torch.nn as nn
@@ -370,43 +369,18 @@ class StructuredRebalancePolicy(nn.Module):
         bin_indices = torch.arange(self._max_bins, device=self.device).unsqueeze(0)
         invalid = bin_indices >= bins_tensor.unsqueeze(1)
         self.register_buffer("_logit_mask", invalid, persistent=False)
-        # Per-instrument hard position limits for feasibility masking at sample/evaluate time.
-        # Without this, the policy proposes bins that get silently clipped by the evaluator and
-        # the PPO ratio is biased: log_prob is over the unconstrained distribution but the
-        # observed reward is from the clipped action.
-        BIG = 10**9
+        # No-trade bin invariant: every instrument's action space must include delta=0.
+        # Without it, the agent is forced to trade every decision step (no idle option). The
+        # validation also ensures `_logit_mask`-only rows always have at least one valid bin,
+        # so log_softmax never produces NaN. Per-instrument [Min_Position, Max_Position] limits
+        # are now enforced via the reward-side `_per_instrument_bounds_penalty` (consistent with
+        # the portfolio-total bounds penalty); the policy distribution is unconstrained.
         instrument_order = action_space.instrument_order
-        pl = self.position_limits or {}
-        min_pos = tuple(int(pl.get(name, {}).get('min_position', -BIG)) for name in instrument_order)
-        max_pos = tuple(int(pl.get(name, {}).get('max_position', +BIG)) for name in instrument_order)
-        self.register_buffer(
-            "_min_position",
-            torch.tensor(min_pos, dtype=torch.int64, device=self.device).reshape(1, -1),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_max_position",
-            torch.tensor(max_pos, dtype=torch.int64, device=self.device).reshape(1, -1),
-            persistent=False,
-        )
-        # Structural invariant: the no-trade bin (delta=0) must be representable AND must keep the
-        # position inside [min_position, max_position]. The env enforces position-in-bounds via
-        # `_enforce_position_limits`, so delta=0 always preserves the invariant — i.e. the no-trade
-        # bin is always feasible. Without this, a fully-masked logit row produces NaN through
-        # log_softmax (not -inf) and silently corrupts the PPO loss.
-        for i, name in enumerate(instrument_order):
-            deltas = action_space.trade_deltas[i]
+        for name, deltas in zip(instrument_order, action_space.trade_deltas):
             if 0 not in deltas:
                 raise ValueError(
                     f"Action_Space for instrument {name!r} must include the no-trade delta 0; "
-                    f"got Trade_Deltas={list(deltas)}. Without this the policy can encounter "
-                    "fully-masked logit rows (no feasible bin), producing NaN in log_softmax."
-                )
-            if min_pos[i] > max_pos[i]:
-                raise ValueError(
-                    f"Position_Limits for instrument {name!r} are empty: "
-                    f"Min_Position={min_pos[i]} > Max_Position={max_pos[i]}."
-                )
+                    f"got Trade_Deltas={list(deltas)}.")
 
     def _entity_state_to_device(self, entity_state):
         return entity_state.to(self.device)
@@ -433,27 +407,15 @@ class StructuredRebalancePolicy(nn.Module):
             parts.append(t.squeeze(1))
         return torch.cat(parts, dim=-1)
 
-    def _feasible_mask(self, positions):
-        """Returns a (B, I, max_bins) bool tensor with True for bins whose resulting position
-        would violate `position_limits`. With the explicit-deltas action space, the trade
-        delta of bin k for instrument i is `_trade_deltas[i, k]`, so the resulting position
-        is `positions[b,i] + _trade_deltas[i, k]`. Mask any bin whose result falls outside
-        [min_position[i], max_position[i]]."""
-        positions_t = positions.to(dtype=torch.int64, device=self.device)
-        # Broadcast: positions (B, I, 1) + _trade_deltas (1, I, max_bins) → (B, I, max_bins)
-        resulting = positions_t.unsqueeze(-1) + self._trade_deltas.unsqueeze(0)
-        below = resulting < self._min_position.unsqueeze(-1)
-        above = resulting > self._max_position.unsqueeze(-1)
-        return below | above
-
     def _policy_outputs(self, entity_state, positions=None):
         es = self._entity_state_to_device(entity_state)
         ctx = self.backbone(es)
-        # logits: [B, I, max_bins]; mask invalid bins to -inf so they get probability 0
+        # logits: [B, I, max_bins]; mask only the bin-count truncation (when bins differ across
+        # instruments). Per-instrument [Min, Max] position limits are enforced reward-side via
+        # `_per_instrument_bounds_penalty`, NOT at the policy distribution. `positions` is kept
+        # in the signature for caller-compatibility but is no longer consumed here.
         logits = self.policy_head(ctx['instruments'])
         logits = logits.masked_fill(self._logit_mask.unsqueeze(0), float('-inf'))
-        if positions is not None:
-            logits = logits.masked_fill(self._feasible_mask(positions), float('-inf'))
         return logits, ctx
 
     def _value(self, ctx, privileged_state=None):
@@ -569,9 +531,10 @@ def save_policy_artifact(artifact, file_path):
     return path
 
 
-def load_policy_artifact(file_path, *, device="cpu"):
-    path = Path(file_path)
-    artifact = json.loads(path.read_text(encoding="utf-8"))
+def policy_from_artifact(artifact, *, device="cpu"):
+    """Reconstruct a StructuredRebalancePolicy from an in-memory artifact dict (the value
+    stored on `HedgeRuntimeExecutionResult.policy_artifact`)."""
+    artifact = dict(artifact)
     model = dict(artifact["model"])
     action_space_payload = dict(artifact["action_space"])
     # Backward compat: older artifacts stored min/max only; newer artifacts store an explicit
@@ -610,6 +573,12 @@ def load_policy_artifact(file_path, *, device="cpu"):
     policy.load_state_dict(state_dict)
     policy.eval()
     return policy
+
+
+def load_policy_artifact(file_path, *, device="cpu"):
+    """Load a saved policy artifact from disk. Thin wrapper around `policy_from_artifact`."""
+    artifact = json.loads(Path(file_path).read_text(encoding="utf-8"))
+    return policy_from_artifact(artifact, device=device)
 
 
 if __name__ == '__main__':

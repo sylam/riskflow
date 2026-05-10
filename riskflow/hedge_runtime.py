@@ -17,43 +17,6 @@ from . import utils
 from .hedge_features import build_entity_layout, derive_privileged_layout
 
 
-class TerminalFloorThenSurplusUtility:
-    def __init__(self, params: Optional[Mapping[str, Any]] = None, **kwargs):
-        config = dict(params or {})
-        config.update(kwargs)
-
-        self.floor_penalty = float(config['Floor_Penalty'] if 'Floor_Penalty' in config else config['floor_penalty'])
-        self.surplus_reward = float(config['Surplus_Reward'] if 'Surplus_Reward' in config else config['surplus_reward'])
-        self.power = float(config['Power'] if 'Power' in config else config['power'])
-
-        if self.floor_penalty < 0.0:
-            raise ValueError("Objective.Floor_Penalty must be non-negative")
-        if self.surplus_reward < 0.0:
-            raise ValueError("Objective.Surplus_Reward must be non-negative")
-        if self.power <= 0.0:
-            raise ValueError("Objective.Power must be positive")
-
-    def evaluate_terminal_outcome(self, *, hedge_pnl, liability, net_pnl):
-        del hedge_pnl, liability
-        if net_pnl >= 0.0:
-            return self.surplus_reward * (net_pnl ** self.power)
-        shortfall = -net_pnl
-        return -self.floor_penalty * (shortfall ** self.power)
-
-    def evaluate_episode(self, episode):
-        return self.evaluate_terminal_outcome(
-            hedge_pnl=float(episode.hedge_pnl),
-            liability=float(episode.liability),
-            net_pnl=float(episode.net_pnl),
-        )
-
-
-def construct_objective(config: Mapping[str, Any]):
-    if str(config["Object"]) != "TerminalFloorThenSurplusUtility":
-        raise ValueError(f"Unsupported objective: {config['Object']}")
-    return TerminalFloorThenSurplusUtility(config)
-
-
 def _unwrap_calc_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
     if "Hedging_Problem" in config:
         return config
@@ -156,7 +119,6 @@ def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -
         "entropy_coef": float(optimizer_config.get("Entropy_Coef", 0.01)),
         "entropy_schedule": str(optimizer_config.get("Entropy_Schedule", "constant")).lower(),
         "entropy_coef_min": float(optimizer_config.get("Entropy_Coef_Min", 0.0)),
-        "warm_start_epochs": int(optimizer_config.get("Warm_Start_Epochs", 0)),
         "max_grad_norm": float(optimizer_config.get("Max_Grad_Norm", 0.5)),
         "reward_scale": float(optimizer_config.get("Reward_Scale", 1.0)),
         "debug_strict_bins": bool(optimizer_config.get("Debug_Strict_Bins", False)),
@@ -166,25 +128,27 @@ def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -
         "validation_fraction": float(optimizer_config.get("Validation_Fraction", 0.25)),
         "validation_min_batch": int(optimizer_config.get("Validation_Min_Batch", 256)),
         "decision_interval_curriculum": tuple(decision_interval_curriculum),
-        "anchor_beta": float(optimizer_config.get("Anchor_Beta", 0.0)),
-        "anchor_beta_floor": float(optimizer_config.get("Anchor_Beta_Floor", 0.0)),
-        "anchor_anneal_epochs": int(optimizer_config.get("Anchor_Anneal_Epochs", 0)),
-        "anchor_bin_sharpness": float(optimizer_config.get("Anchor_Bin_Sharpness", 2.0)),
-        "anchor_target": str(optimizer_config.get("Anchor_Target", "delta1_jul")).lower(),
         "cvar_alpha": float(optimizer_config.get("CVaR_Alpha", 0.0)),
         "cvar_lambda": float(optimizer_config.get("CVaR_Lambda", 0.0)),
         "value_loss_asym_weight": float(optimizer_config.get("Value_Loss_Asym_Weight", 1.0)),
         "entropy_floor_h_min": float(optimizer_config.get("Entropy_Floor_H_Min", 0.0)),
         "entropy_floor_coef": float(optimizer_config.get("Entropy_Floor_Coef", 0.0)),
         "seed": optimizer_config.get("Seed"),
+        # Optional path for atomic per-epoch diag dump. None disables. Reader (a separate
+        # script) can tail this file for live progress without parsing buffered stdout.
+        "live_diag_path": optimizer_config.get("Live_Diag_Path"),
     }
 
 
 def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
     if objective_config is None:
         return None
+    explicit = objective_config.get("Utility_Scale_Explicit")
     return {
-        "object": str(objective_config["Object"]),
+        # Canonical lowercased form — every dispatch site compares against the lowercase
+        # literal (e.g. "asymmetricutility_symlog"), so normalize once at the boundary
+        # rather than re-lowercasing on every reward call.
+        "object": str(objective_config["Object"]).lower(),
         "floor_penalty": float(objective_config.get("Floor_Penalty", 1.0)),
         "surplus_reward": float(objective_config.get("Surplus_Reward", 1.0)),
         "power": float(objective_config.get("Power", 1.0)),
@@ -200,6 +164,15 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
         # if it becomes worth the JSON / CSV / docs churn.
         "position_bounds_penalty": float(objective_config.get("Position_Bounds_Penalty", 0.0)),
         "position_bounds_threshold": float(objective_config.get("Position_Bounds_Threshold", 5.0)),
+        # Per-instrument [Min_Position, Max_Position] enforcement (soft, reward-side).
+        # Replaces the prior hard mask in `StructuredRebalancePolicy._feasible_mask`.
+        "per_instrument_bounds_penalty": float(objective_config.get("Per_Instrument_Bounds_Penalty", 0.0)),
+        "per_instrument_bounds_threshold": float(objective_config.get("Per_Instrument_Bounds_Threshold", 5.0)),
+        # Utility-transform scale. Only consumed when Object == "AsymmetricUtility_Symlog";
+        # legacy "TerminalFloorThenSurplusUtility" path ignores both fields. `utility_scale`
+        # is mirrored from `bundle["utility_scale"]` at rollout start (see _collect_ppo_rollout).
+        "utility_scale_mode": str(objective_config.get("Utility_Scale_Mode", "vol_scaled_notional")).lower(),
+        "utility_scale_explicit": None if explicit is None else float(explicit),
     }
 
 
@@ -491,14 +464,23 @@ def construct_torchrl_runtime(
         },
     }
     # Sanity check: Position_Bounds_Penalty is silently no-op'd when Total_Position_Abs_Limit
-    # is unset, since the penalty's only active branch is the portfolio-total ramp.
+    # is unset, since the penalty's only active branch is the portfolio-total ramp. (Per-
+    # instrument enforcement is a separate coefficient: Per_Instrument_Bounds_Penalty.)
     if (runtime["objective"]["position_bounds_penalty"] > 0.0
             and runtime["accounting"]["total_position_abs_limit"] <= 0.0):
         raise ValueError(
             "Objective.Position_Bounds_Penalty > 0 requires "
-            "Evaluator.Total_Position_Abs_Limit > 0 — otherwise the penalty is silently "
-            "disabled (no per-instrument soft bound exists; per-instrument enforcement "
-            "is via the policy's feasibility mask on Position_Limits)."
+            "Evaluator.Total_Position_Abs_Limit > 0 — otherwise the penalty is silently disabled."
+        )
+    # Sanity check: Per_Instrument_Bounds_Penalty needs per-instrument Position_Limits; without
+    # them the per-instrument penalty is silently no-op'd (every instrument has [-∞, +∞] bounds
+    # so violations are never registered).
+    if (runtime["objective"]["per_instrument_bounds_penalty"] > 0.0
+            and not runtime["accounting"]["position_limits"]):
+        raise ValueError(
+            "Objective.Per_Instrument_Bounds_Penalty > 0 requires Evaluator.Position_Limits "
+            "to be set on at least one instrument — otherwise the per-instrument penalty is "
+            "silently disabled."
         )
     runtime["entity_layout"] = build_entity_layout(runtime)
     runtime["privileged_layout"] = derive_privileged_layout(stoch_factors)

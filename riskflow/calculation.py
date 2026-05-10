@@ -42,12 +42,8 @@ from .pricing import SensitivitiesEstimator
 # import the documentation and utils modules
 from . import utils, pricing, construct_instrument
 from .hedge_runtime import construct_torchrl_runtime
-from .torchrl_hedge import run_torchrl_execution
-from .hedge_features import (
-    assemble_privileged_factors,
-    compute_spot_realized_vol,
-    compute_spot_trend, compute_spot_stretch,
-    compute_hawkes_intensities,
+from .torchrl_hedge import (
+    run_torchrl_execution, HedgeRuntimeExecutionResult, build_torchrl_bundle,
 )
 
 
@@ -1607,66 +1603,6 @@ class Base_Revaluation(Calculation):
         return {'Netting': self.netting_sets, 'Stats': self.calc_stats, 'Results': self.report()}
 
 
-@dataclass
-class HedgeScenarioResult:
-    """Output of ``HedgeMonteCarlo.execute()``.
-
-    All arrays use a consistent path axis N = ``batch_size * simulation_batches``.
-
-    Attributes
-    ----------
-    base_date:
-        Simulation start date (t = 0).
-    time_grid_days:
-        Integer day offsets from ``base_date`` for each scenario step, shape [T].
-    factor_paths:
-        Raw stochastic factor paths keyed by ``utils.Factor``.  Shape is [T, N]
-        for scalar factors (e.g. spot, carry) or [T, n_tenors, N] for curve factors.
-    n_paths:
-        Total number of simulated paths (``batch_size * simulation_batches``).
-    n_time_steps:
-        Number of scenario time steps T.
-    sim_instruments:
-        RiskFlow-priced MTM paths for every tradable instrument priced in the
-        hedging problem,
-        keyed by the instrument's ``Reference`` label.  Shape is [T, N].
-        These are the primary outputs used by downstream adapters and policies.
-    metadata:
-        Miscellaneous run parameters (dates, batch config, calc stats).
-    """
-    base_date: pd.Timestamp
-    business_day: pd.offsets.CustomBusinessDay
-    time_grid_days: np.ndarray                       # [T]
-    factor_paths: Dict['utils.Factor', np.ndarray]  # factor_key -> [T, ..., N]
-    n_paths: int
-    n_time_steps: int
-    metadata: Dict[str, Any]
-    sim_instruments: Dict[str, np.ndarray] = field(default_factory=dict)  # label -> [T, N]
-
-    @property
-    def scenario_dates(self) -> pd.DatetimeIndex:
-        """DatetimeIndex corresponding to ``time_grid_days``."""
-        return pd.DatetimeIndex(
-            [self.base_date + pd.Timedelta(days=int(d)) for d in self.time_grid_days]
-        )
-
-
-@dataclass
-class HedgeRuntimeExecutionResult:
-    """High-level result for HedgeMonteCarlo's TorchRL bundle handoff.
-
-    ``scenario_result`` optionally retains the full materialized scenario data.
-    ``torchrl_bundle`` is the generic tensor package for downstream TorchRL
-    consumption. Evaluation output is a plain dict for the active TorchRL path.
-    """
-    scenario_result: Optional[HedgeScenarioResult]
-    torchrl_bundle: Optional[Dict[str, Any]]
-    evaluation_summary: Optional[Any]
-    optimizer_diagnostics: Optional[Dict[str, Any]]
-    policy_artifact: Optional[Any]
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
 class HedgeMonteCarlo(Credit_Monte_Carlo):
     documentation = ('Calculations', [
         'A specialisation of `Credit_Monte_Carlo` that wires the same simulated scenario',
@@ -1684,9 +1620,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         '  temporal encoder) that consumes the entity-tokenised bundle slice at each',
         '  decision step and emits a discrete trade per instrument.',
         '- A **PPO optimiser** that updates the policy from the rollouts. Supports',
-        '  asymmetric utility rewards, dense tracking shaping, naked-position penalties,',
-        '  CVaR-α path-level advantage weighting, asymmetric Huber on the value head, an',
-        '  entropy floor, and a textbook KL-anchor — all gated behind config flags.',
+        '  asymmetric utility rewards, dense tracking shaping, per-step penalties,',
+        '  CVaR-α path-level advantage weighting, asymmetric Huber on the value head, and',
+        '  an entropy floor — all gated behind config flags.',
         '',
         'The configuration contract is documented in the',
         '[Hedging_Problem](../json/index.md#calculation) section of the JSON reference.',
@@ -1696,15 +1632,16 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         '- `Execution_Mode = "optimize_policy"` — train the policy in-process. Returns the',
         '  trained policy artifact alongside diagnostic metrics (per-epoch losses,',
         '  reward / |trade| / entropy, advantage stats).',
-        '- `Execution_Mode = "simulate_only"` — build the bundle and exit without training.',
-        '  Useful for offline analysis, evaluation against a saved policy, or computing',
-        '  textbook benchmarks against the same scenarios the optimiser would have seen.',
+        '- `Execution_Mode = "simulate_only"` — build the bundle and run a deterministic',
+        '  argmax eval against a saved policy artifact (or an untrained policy if no',
+        '  artifact is set). Useful for offline analysis and post-training reporting.',
         '',
         '### Output',
         '',
         '`out[\'Results\']` contains the trained policy artifact (when `optimize_policy`),',
-        'a textbook-vs-policy comparison table, the simulated bundle, and optimiser',
-        'diagnostics. Wallclock and device statistics are in `out[\'Stats\']`.',
+        'the simulated bundle, the normalized runtime, and an evaluation summary with',
+        'terminal P&L statistics and a position-limit audit. Wallclock and device',
+        'statistics are in `out[\'Stats\']`.',
         '',
         '### Reusing the inherited Credit Monte Carlo simulator',
         '',
@@ -1719,291 +1656,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
     @staticmethod
     def _factor_bundle_key(factor_key):
         return utils.check_tuple_name(factor_key) if hasattr(factor_key, 'type') and hasattr(factor_key, 'name') else factor_key
-
-    def _build_scenario_result(self, base_date, business_day, time_grid_days, factor_blocks, params):
-        trade_mtm = {
-            x.Instrument.field['Reference']: np.concatenate(x.Calc_res['Value'], 1)
-            for x in self.netting_sets.dependencies
-            if x.Calc_res.get('Value')
-        }
-        factor_paths = {key: np.concatenate(blocks, axis=-1) for key, blocks in factor_blocks.items()}
-        return HedgeScenarioResult(
-            base_date=base_date,
-            business_day=business_day,
-            time_grid_days=time_grid_days.copy(),
-            factor_paths=factor_paths,
-            n_paths=self.numscenarios,
-            n_time_steps=len(time_grid_days),
-            sim_instruments=trade_mtm,
-            metadata={
-                'base_date': str(base_date),
-                'time_grid': params['Time_Grid'],
-                'batch_size': self.batch_size,
-                'num_batches': params['Simulation_Batches'],
-                'random_seed': params['Random_Seed'],
-                'n_stoch_factors': self.num_factors,
-                'calc_stats': dict(self.calc_stats),
-            },
-        )
-
-    def _build_torchrl_bundle(self, base_date, business_day, time_grid_days, tradable_blocks, factor_tensor_blocks, hedge_profile_blocks, num_batches, runtime=None, privileged_factor_blocks=None):
-        def pad_time_axis(tensor, target_steps):
-            current_steps = int(tensor.shape[0])
-            if current_steps >= target_steps:
-                return tensor[:target_steps]
-            if current_steps == 0:
-                raise ValueError('Cannot pad an empty tensor along the time axis')
-            pad_shape = (target_steps - current_steps,) + tuple(tensor.shape[1:])
-            pad_block = tensor[-1:].expand(*pad_shape)
-            return torch.cat([tensor, pad_block], dim=0)
-
-        tradables = {
-            instrument_name: torch.cat(blocks, dim=1)
-            for instrument_name, blocks in tradable_blocks.items()
-        }
-        factors = {
-            factor_name: torch.cat(blocks, dim=-1)
-            for factor_name, blocks in factor_tensor_blocks.items()
-        }
-        legs_bundle = None
-        if hedge_profile_blocks and hedge_profile_blocks.get('legs_features'):
-            legs_bundle = {
-                'features': torch.cat(hedge_profile_blocks['legs_features'], dim=1),
-                'ids': list(hedge_profile_blocks['legs_ids'] or ()),
-                'feature_names': tuple(hedge_profile_blocks.get('legs_feature_names') or ()),
-                'id_names': tuple(hedge_profile_blocks.get('legs_id_names') or ()),
-            }
-        liability_mtm = torch.cat(hedge_profile_blocks['mtm'], dim=1) if hedge_profile_blocks.get('mtm') else None
-        # Per-(tradable, factor) hedge ratios — already in contract units, computed per-batch
-        # in the sim loop. Concat along batch dim per (tradable, factor).
-        hedge_ratio_blocks = hedge_profile_blocks.get('hedge_ratios') or {}
-        hedge_ratios_pre_pad = {}
-        for tradable_name, blocks in hedge_ratio_blocks.items():
-            if not blocks:
-                continue
-            factor_names = list(blocks[0].keys())
-            hedge_ratios_pre_pad[tradable_name] = {
-                name: torch.cat([block[name] for block in blocks], dim=1)
-                for name in factor_names
-            }
-        realized_cashflows = {
-            currency: torch.cat(blocks, dim=1)
-            for currency, blocks in (hedge_profile_blocks.get('realized_cashflows') or {}).items()
-        }
-        if legs_bundle is not None:
-            aligned_time_steps = int(legs_bundle['features'].shape[0])
-        else:
-            candidate_lengths = [int(time_grid_days.shape[0])]
-            candidate_lengths.extend(int(tensor.shape[0]) for tensor in tradables.values())
-            candidate_lengths.extend(int(tensor.shape[0]) for tensor in factors.values())
-            aligned_time_steps = min(candidate_lengths) if candidate_lengths else 0
-        bundle = {
-            'time_grid_days': pad_time_axis(time_grid_days, aligned_time_steps),
-            'tradables': {
-                instrument_name: pad_time_axis(tensor, aligned_time_steps)
-                for instrument_name, tensor in tradables.items()
-            },
-            'meta': {
-                'base_date': base_date,
-                'business_day': business_day,
-                'num_batches': int(num_batches),
-            },
-        }
-        if factors:
-            bundle['factors'] = {
-                factor_name: pad_time_axis(tensor, aligned_time_steps)
-                for factor_name, tensor in factors.items()
-            }
-        if legs_bundle is not None:
-            bundle['legs'] = {
-                'features': pad_time_axis(legs_bundle['features'], aligned_time_steps),
-                'ids': legs_bundle['ids'],
-                'feature_names': legs_bundle['feature_names'],
-                'id_names': legs_bundle['id_names'],
-            }
-        if liability_mtm is not None:
-            bundle['liability_mtm'] = pad_time_axis(liability_mtm, aligned_time_steps)
-        # Pad each (tradable, factor) hedge ratio to the common time grid. Each tradable's
-        # native T equals its lifetime (expires at maturity); zero-pad post-expiry rows since
-        # the contract can't be traded there. Don't use the shared `pad_time_axis` helper:
-        # it repeats the last row, which would leak the at-expiry ratio into post-expiry steps.
-        if hedge_ratios_pre_pad:
-            hedge_ratios = {}
-            for tradable_name, by_factor in hedge_ratios_pre_pad.items():
-                hedge_ratios[tradable_name] = {}
-                for factor_name, tensor in by_factor.items():
-                    cur_T = int(tensor.shape[0])
-                    if cur_T >= aligned_time_steps:
-                        padded = tensor[:aligned_time_steps]
-                    else:
-                        zeros = tensor.new_zeros((aligned_time_steps - cur_T,) + tuple(tensor.shape[1:]))
-                        padded = torch.cat([tensor, zeros], dim=0)
-                    hedge_ratios[tradable_name][factor_name] = padded
-            bundle['hedge_ratios'] = hedge_ratios
-        if realized_cashflows:
-            bundle['realized_cashflows'] = {
-                currency: pad_time_axis(tensor, aligned_time_steps)
-                for currency, tensor in realized_cashflows.items()
-            }
-        if runtime is not None:
-            self._prepend_history_prefix(bundle, runtime, base_date)
-        # CPU mirror of the time grid for hot-path feature builders that need scalar `current_day`
-        # values per decision step. Avoids a CUDA→CPU sync per (decision step × feature builder).
-        bundle['time_grid_days_cpu'] = bundle['time_grid_days'].detach().cpu().to(dtype=torch.int64).tolist()
-        # Cache scenario dates + business-day decision indices so `_decision_time_indices` can
-        # be re-evaluated per-epoch (curriculum-driven interval) without re-syncing the time
-        # grid or re-walking the date list. Computed once at bundle build, immutable thereafter.
-        days_cpu = bundle['time_grid_days_cpu']
-        base_ts = pd.Timestamp(base_date)
-        scenario_dates = pd.DatetimeIndex([base_ts + pd.Timedelta(days=int(d)) for d in days_cpu])
-        bundle['scenario_dates'] = scenario_dates
-        bday = (bundle.get('meta') or {}).get('business_day')
-        if bday is not None and hasattr(bday, 'is_on_offset'):
-            bd_mask = [bool(bday.is_on_offset(d)) for d in scenario_dates]
-        else:
-            bd_mask = [d.weekday() < 5 for d in scenario_dates]
-        # Decisions only fire at sim-day-0 onward (history rows excluded); strict-less-than the
-        # final index because the env terminates on the last step before the next action would fire.
-        initial_time_index = next((i for i, d in enumerate(days_cpu) if int(d) >= 0), len(days_cpu))
-        last = max(len(scenario_dates) - 1, 0)
-        bundle['business_indices'] = tuple(
-            i for i in range(min(last, len(bd_mask)))
-            if bd_mask[i] and i >= initial_time_index
-        )
-        # Total leg notional |Σ Volume| — constant across the episode, used by the global
-        # delta-coverage feature. Cache as a Python float once at bundle build instead of
-        # re-summing + .item()-ing every decision step.
-        # Last time index where any leg still has time_to_payment > 0; steps with
-        # index strictly greater are post-settlement (all legs paid). Used by the
-        # post-deal-trade penalty in the reward path.
-        if bundle.get('legs') is not None and bundle['legs'].get('features') is not None:
-            from .hedge_features import LEG_FEATURE_NAMES
-            feat_names = tuple(bundle['legs'].get('feature_names', LEG_FEATURE_NAMES))
-            feats = bundle['legs']['features']
-            if 'volume' in feat_names:
-                leg_vol = feats[..., feat_names.index('volume')]
-                while leg_vol.ndim > 1:
-                    leg_vol = leg_vol[0]
-                bundle['total_leg_volume'] = float(leg_vol.abs().sum().item())
-            if 'time_to_payment' in feat_names:
-                ttp = feats[..., feat_names.index('time_to_payment')]
-                while ttp.ndim > 2:
-                    ttp = ttp[:, 0]
-                active = (ttp > 0).any(dim=-1) if ttp.ndim == 2 else (ttp > 0)
-                if bool(active.any()):
-                    bundle['last_settlement_index'] = int(active.nonzero(as_tuple=False).max().item())
-        # Naked-penalty normalization scale: total max-notional across hedge instruments at the
-        # first time step. Lets the naked-penalty coef have a unit-free interpretation (fraction
-        # of full hedge book per step) rather than scaling with raw dollar notional in the millions.
-        bundle['spot_realized_vol'] = compute_spot_realized_vol(bundle)
-        # Direction-aware trend signals: annualised log-return over 20d / 60d (signed),
-        # plus a vol-normalised stretch from the 20d MA. These let the policy identify
-        # benign-trend scenarios where smaller hedges suffice. Realised vol on its own
-        # is direction-blind and doesn't carry that signal.
-        bundle['spot_trend_20'] = compute_spot_trend(bundle, window=20)
-        bundle['spot_trend_60'] = compute_spot_trend(bundle, window=60)
-        bundle['spot_stretch_20'] = compute_spot_stretch(bundle, window=20)
-        # Bivariate marked Hawkes intensities — only populated when the underlying uses a
-        # process that exposes `last_h_plus_path`/`last_h_minus_path` (currently
-        # `HawkesRegimeLogOUSpotModel`). Pad with the same history-prefix the rest of the
-        # bundle already carries so the time axis matches `spot_price_history`.
-        H_prefix = int(runtime.get('history_lookback_business_days', 0)) if runtime else 0
-        h_plus, h_minus, h_ratio = compute_hawkes_intensities(
-            privileged_factor_blocks or {}, self.stoch_factors, history_prefix=H_prefix)
-        bundle['hawkes_h_plus'] = h_plus
-        bundle['hawkes_h_minus'] = h_minus
-        bundle['hawkes_ratio'] = h_ratio
-        # Privileged factors come from the live stoch-process objects (each emits its own surface
-        # via privileged_factors()). Per-batch tensors were collected during the simulation loop;
-        # concatenate along batch dim using the same multi-commodity convention as the layout.
-        bundle['privileged_factors'] = assemble_privileged_factors(privileged_factor_blocks or {}, self.stoch_factors)
-        # Match the history-prefix already applied to factors/tradables so per-step indexing at
-        # sim time agrees with `bundle['time_grid_days']`. We do it here (not in
-        # `_prepend_history_prefix`) because privileged factors are assembled after that pass.
-        H = int(runtime.get('history_lookback_business_days', 0)) if runtime else 0
-        if H > 0 and bundle['privileged_factors']:
-            bundle['privileged_factors'] = {
-                name: torch.cat(
-                    [tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous(), tensor], dim=0,
-                )
-                for name, tensor in bundle['privileged_factors'].items()
-            }
-        return bundle
-
-    @staticmethod
-    def _prepend_history_prefix(bundle, runtime, base_date):
-        """Prepend H rows of realized history to all time-axis tensors in the bundle so that
-        rolling-window features at sim-day-0 already have a populated lookback. Historical rows
-        are broadcast across the batch dim (one realized series per commodity).
-
-        Adds bundle['spot_price_history'][commodity] of shape (H, B) — broadcast historical spot.
-        Adjusts bundle['time_grid_days'], bundle['tradables'][name], bundle['liability_mtm'],
-        bundle['realized_cashflows'][currency], bundle['legs']['features'], bundle['factors'][name].
-        """
-        H = int(runtime.get('history_lookback_business_days', 0))
-        spot_history = (runtime.get('portfolio_state') or {}).get('spot_price_history') or {}
-        if H <= 0 or not spot_history:
-            return
-        device = bundle['time_grid_days'].device
-        dtype = bundle['time_grid_days'].dtype
-        base_ts = pd.Timestamp(base_date)
-        any_tradable = next(iter(bundle['tradables'].values())) if bundle.get('tradables') else None
-        batch_size = int(any_tradable.shape[1]) if any_tradable is not None else 1
-        # All commodities share the same Dates timeline (validator enforces this); take the first.
-        ref_commodity = next(iter(spot_history))
-        ref_dates = spot_history[ref_commodity]['dates'][-H:]
-        prefix_days = torch.tensor(
-            [int((d - base_ts).days) for d in ref_dates],
-            dtype=dtype, device=device,
-        )
-        bundle['time_grid_days'] = torch.cat([prefix_days, bundle['time_grid_days']], dim=0)
-        # Build per-commodity historical-spot tensors keyed by commodity name.
-        commodity_history_tensors = {}
-        for commodity, payload in spot_history.items():
-            prices = torch.tensor(payload['prices'][-H:], dtype=torch.float32, device=device)
-            commodity_history_tensors[commodity] = prices.unsqueeze(1).expand(-1, batch_size).contiguous()
-        bundle['spot_price_history'] = commodity_history_tensors
-        # Per-tradable: prefix with its OWN commodity's history. Tradables without a Commodity
-        # field (cash accounts, equities) fall back to row[0] broadcast — they're not affected by
-        # commodity-history-driven features.
-        runtime_tradables = runtime.get('tradables') or {}
-        new_tradables = {}
-        for name, tensor in bundle['tradables'].items():
-            commodity = (runtime_tradables.get(name, {}).get('params') or {}).get('Commodity')
-            if commodity is not None and commodity in commodity_history_tensors:
-                prefix = commodity_history_tensors[commodity].to(dtype=tensor.dtype)
-            else:
-                prefix = tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous()
-            new_tradables[name] = torch.cat([prefix, tensor], dim=0)
-        bundle['tradables'] = new_tradables
-        if bundle.get('liability_mtm') is not None:
-            mtm = bundle['liability_mtm']
-            mtm_prefix = mtm[:1].expand(H, -1).contiguous()
-            bundle['liability_mtm'] = torch.cat([mtm_prefix, mtm], dim=0)
-        if bundle.get('hedge_ratios'):
-            new_ratios = {}
-            for tradable_name, by_factor in bundle['hedge_ratios'].items():
-                new_ratios[tradable_name] = {}
-                for factor_name, tensor in by_factor.items():
-                    r_prefix = tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous()
-                    new_ratios[tradable_name][factor_name] = torch.cat([r_prefix, tensor], dim=0)
-            bundle['hedge_ratios'] = new_ratios
-        if bundle.get('realized_cashflows'):
-            new_cf = {}
-            for currency, tensor in bundle['realized_cashflows'].items():
-                cf_prefix = torch.zeros((H,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
-                new_cf[currency] = torch.cat([cf_prefix, tensor], dim=0)
-            bundle['realized_cashflows'] = new_cf
-        if bundle.get('legs') is not None and bundle['legs'].get('features') is not None:
-            feats = bundle['legs']['features']
-            feats_prefix = feats[:1].expand((H,) + tuple(feats.shape[1:])).contiguous()
-            bundle['legs']['features'] = torch.cat([feats_prefix, feats], dim=0)
-        if bundle.get('factors'):
-            new_factors = {}
-            for factor_name, tensor in bundle['factors'].items():
-                f_prefix = tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous()
-                new_factors[factor_name] = torch.cat([f_prefix, tensor], dim=0)
-            bundle['factors'] = new_factors
 
     def update_factors(self, params, base_date, job_id, num_jobs):
         """Override: build dependent_factors from the generic Scenario_Factors JSON dict."""
@@ -2068,7 +1720,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         self.calc_stats['Random_Seed'] = params['Random_Seed']
 
         execution_mode = params.get('Execution_Mode', 'simulate_only')
-        retain_scenario_result = params.get('Retain_Scenario_Result','Yes')=='Yes'
         hedging_problem = params.get('Hedging_Problem', {})
 
         instruments = read_instruments(hedging_problem.get('Tradable_Instruments', {}))
@@ -2094,8 +1745,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             params, stoch_factors=self.stoch_factors,
         )
 
-        # Accumulate one numpy array per stochastic factor across batches
-        factor_blocks = {k: [] for k in self.stoch_factors} if retain_scenario_result else {}
         factor_tensor_blocks = {
             self._factor_bundle_key(key): [] for key in self.stoch_factors
         }
@@ -2166,10 +1815,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     dense[int(t_idx)] = payoff
                 hedge_profile_blocks['realized_cashflows'][str(currency)].append(dense.detach().clone())
 
-            if retain_scenario_result:
-                for key in self.stoch_factors:
-                    factor_blocks[key].append(shared_mem.t_Scenario_Buffer[key].cpu().detach().numpy())
-
             if factor_tensor_blocks is not None:
                 for key in self.stoch_factors:
                     factor_tensor_blocks[self._factor_bundle_key(key)].append(
@@ -2219,9 +1864,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         self.calc_stats[execution_label] = time.monotonic() - self.calc_stats[execution_label]
 
-        scenario_result = self._build_scenario_result(
-            base_date, bus_day, t_days_arr, factor_blocks, params) if retain_scenario_result else None
-        torchrl_bundle = None if normalized_runtime is None else self._build_torchrl_bundle(
+        torchrl_bundle = None if normalized_runtime is None else build_torchrl_bundle(
             base_date,
             bus_day,
             shared_mem.one.new_tensor(t_days_arr),
@@ -2229,6 +1872,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             factor_tensor_blocks,
             hedge_profile_blocks,
             params['Simulation_Batches'],
+            self.stoch_factors,
             runtime=normalized_runtime,
             privileged_factor_blocks=privileged_factor_blocks,
         )
@@ -2260,15 +1904,14 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             }
 
         return HedgeRuntimeExecutionResult(
-            scenario_result=scenario_result,
             torchrl_bundle=torchrl_bundle,
+            runtime=normalized_runtime,
             evaluation_summary=evaluation_summary,
             optimizer_diagnostics=optimizer_diagnostics,
             policy_artifact=policy_artifact,
             metadata={
                 'execution_mode': execution_mode,
                 'torchrl_bundle_present': torchrl_bundle is not None,
-                'retain_scenario_result': retain_scenario_result,
                 'num_batches': params['Simulation_Batches'],
                 'num_paths': self.numscenarios,
                 'optimizer_diagnostics_present': optimizer_diagnostics is not None,
