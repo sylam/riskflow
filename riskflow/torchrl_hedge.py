@@ -326,6 +326,16 @@ def _utility_wrap(x_dollars, runtime):
     return torch.log1p(x_dollars / c)
 
 
+def _utility_wrap_signed(x_dollars, runtime):
+    """Signed-input variant of `_utility_wrap`: u(x; c) = sign(x) · log1p(|x| / c) for
+    symlog, identity for legacy. Use this when the input can be either sign (e.g. net_pnl
+    in `_evaluate_objective`); `_utility_wrap` rejects negatives by docstring."""
+    if not _is_symlog_objective(runtime):
+        return x_dollars
+    c = _require_utility_scale(runtime)
+    return torch.sign(x_dollars) * torch.log1p(x_dollars.abs() / c)
+
+
 def resolve_utility_scale(bundle, runtime):
     """Compute the dollar scale `c` used by `AsymmetricUtility_Symlog` to map dollars to
     log-utility: u(x; c) = sign(x) · log1p(|x| / c). Single source of truth — every reward
@@ -388,12 +398,15 @@ def resolve_utility_scale(bundle, runtime):
             f"spot timeline for {commodity!r} has length "
             f"{0 if full is None else int(full.shape[0])} ≤ history_lookback H={H}"
         )
-    # At index H (history/sim boundary) both tensors are batch-broadcast: history rows are
-    # shared across batch, and the rolling-vol window at H spans only those broadcast rows.
-    # `[H, 0]` is cheaper than `[H].median()` and equally correct given that invariant.
-    initial_spot = float(full[H, 0].item())
+    # Take batch-median at index H (history/sim boundary) rather than slot [H, 0]. The
+    # rolling-vol window at H spans broadcast history rows, so all batch entries are equal
+    # in well-behaved cases — but `full[H]` is the FIRST sim step, and any process emitting
+    # a stochastic initial draw (some HMM variants, jump-diffusion with state-sampling)
+    # would silently make c path-dependent off slot 0. Median is defensive: deterministic
+    # when batch is uniform, robust when it's not. Negligible cost (one (B,) reduce).
+    initial_spot = float(full[H].median().item())
     rv = rv_by_commodity.get(commodity)
-    sigma = float(rv[H, 0].item()) if rv is not None and H < int(rv.shape[0]) else 0.0
+    sigma = float(rv[H].median().item()) if rv is not None and H < int(rv.shape[0]) else 0.0
     if sigma <= 0.0:
         return _degenerate(
             f"realized vol for {commodity!r} is non-positive (σ={sigma}) — "
@@ -469,12 +482,44 @@ def log_symlog_penalty_calibration(bundle, runtime):
     # space (≈ [-100, 100]) so a small Reward_Scale crushes the gradient signal flat.
     reward_scale = float((runtime.get('optimizer') or {}).get('reward_scale', 1.0))
     if reward_scale != 1.0:
-        flag = ''
-        if reward_scale < 0.1 or reward_scale > 10.0:
-            flag = ' (suspicious under symlog — likely a stale dollar-tuned value; canonical is 1.0)'
-        lines.append(f'  reward_scale = {reward_scale:g}{flag}')
+        lines.append(f'  reward_scale = {reward_scale:g} (canonical for symlog is 1.0)')
     lines.append('  if any bite << dense_tracking, that penalty is unlikely to influence the policy — coef may need 10-1000x scaling vs the legacy dollar-tuned value')
     logging.info('\n'.join(lines))
+
+    # Standalone warnings (logging.WARNING level so they're visible in noisy training logs)
+    # for two symlog footguns that survive from legacy dollar-tuned configs:
+    #
+    #   1. Reward_Scale ≪ 1: was needed under legacy ($1M-$100M reward range); under
+    #      symlog (utility units ~[-100, +100]) it just crushes the gradient signal.
+    #
+    #   2. Value_Loss_Asym_Weight > 1: justified under legacy heavy-tailed downside
+    #      (8-order-of-magnitude V-target span); under symlog the target distribution
+    #      has bounded tails, so asymmetric V-loss is unmotivated.
+    if reward_scale < 0.1 or reward_scale > 10.0:
+        logging.warning(
+            f"Reward_Scale={reward_scale:g} under AsymmetricUtility_Symlog: canonical "
+            f"value is 1.0. Symlog rewards are utility-units (~[-100, +100]); a small "
+            f"Reward_Scale crushes the gradient signal flat. If this is a stale legacy "
+            f"dollar-tuned config, set Optimizer.Reward_Scale=1.0."
+        )
+    asym_weight = float((runtime.get('optimizer') or {}).get('value_loss_asym_weight', 1.0))
+    if asym_weight != 1.0:
+        logging.warning(
+            f"Value_Loss_Asym_Weight={asym_weight:g} under AsymmetricUtility_Symlog: "
+            f"canonical is 1.0 (symmetric V-loss). The asymmetric V-loss countered "
+            f"median-bias on heavy-tailed dollar targets; symlog bounds the tails so "
+            f"the motivation evaporates. Consider Optimizer.Value_Loss_Asym_Weight=1.0."
+        )
+    power = float(objective.get('power', 1.0))
+    if power != 1.0:
+        logging.warning(
+            f"Power={power:g} under AsymmetricUtility_Symlog: surplus/shortfall = "
+            f"sr·log1p(net_pnl/c)^p — a *compound* concave-then-power compression "
+            f"that differs in shape from legacy sr·net_pnl^p (dollar-domain "
+            f"convexification). Legacy `Power>1` amplified large wins/losses; under "
+            f"symlog the same `Power>1` double-compresses tails. Coefficients tuned "
+            f"for legacy Power!=1 may not transfer meaningfully. Canonical for symlog is 1.0."
+        )
 
 
 def _dense_tracking_reward(prev_state, next_state, runtime):
@@ -493,13 +538,20 @@ def _dense_tracking_reward(prev_state, next_state, runtime):
         With rs=2, fp=10, sr=1 the agent is optimized as if effective fp ≈ 30 vs sr=1.
         Use rs=1 for terminal-parity (effective fp ≈ 2·fp), rs=0 to disable shaping.
 
-    `Dense_Reward_Mode = "potential_based"` (Ng et al. 1999 PBRS):
+    `Dense_Reward_Mode = "potential_based"` (Ng et al. 1999 PBRS-shaped):
         Φ(s) = −fp · max(−err(s), 0); shaping_t = γ·Φ(s_{t+1}) − Φ(s_t).
-        Same terminal-zero applies; the PBRS invariance theorem holds for the
-        kept-transitions sum γ^{T-1}·Φ(s_{T-1}) − Φ(s_0). Use this mode when you
-        want densified credit assignment WITHOUT shifting the asymmetry of the
-        terminal utility. `Dense_Tracking_Reward_Scale` is ignored in this mode
-        (scaling Φ would break the invariance theorem)."""
+        Same terminal-zero applies. **Note**: strict PBRS invariance requires Φ at
+        boundaries to be policy-independent (Φ(terminal) = 0 by convention OR boundary
+        states reached deterministically). Our terminal-zero implementation effectively
+        sets Φ(terminal) = Φ(s_{T-1}), which IS policy-dependent (tracking error at
+        T−1 depends on action history). The kept-transitions sum is therefore
+        γ^{T-1}·Φ(s_{T-1}) − Φ(s_0), with a small policy-dependent residual
+        γ^{T-1}·(−fp·log1p(down_{T-1}/c)) on top of the terminal asymmetric utility.
+        Practically the two modes are scalar-multiples of each other modulo rs:
+        asymmetric at rs=1 equals fp·(prev_down − next_down) which is exactly PBRS
+        shaping with Φ = −fp·down. So the *behavior* is roughly equivalent; the
+        "invariance" claim is approximate, not strict. `Dense_Tracking_Reward_Scale`
+        is ignored in this mode (scaling Φ would multiply the residual too)."""
     settings = dict(runtime.get("optimizer") or {})
     fp = float((runtime.get("objective") or {}).get("floor_penalty", 1.0))
     prev_err = _tracking_error_value(prev_state, runtime)
@@ -508,7 +560,8 @@ def _dense_tracking_reward(prev_state, next_state, runtime):
     mode = str(settings.get("dense_reward_mode", "asymmetric")).lower()
     # Symlog: replace dollar-valued downside `clamp(-err, 0)` with `log1p(clamp(-err, 0)/c)`.
     # The PBRS theorem (Ng-Harada-Russell 1999) requires only that Φ be a state function — it is
-    # silent on Φ's shape — so utility-wrapping preserves optimal policy invariance at γ=1.
+    # silent on Φ's shape — so utility-wrapping doesn't change the invariance status (which is
+    # already approximate, not strict, per the docstring above).
     prev_down = torch.clamp(-prev_err, min=0.0)
     next_down = torch.clamp(-next_err, min=0.0)
     prev_down = _utility_wrap(prev_down, runtime)
@@ -519,7 +572,16 @@ def _dense_tracking_reward(prev_state, next_state, runtime):
         next_pot = -fp * next_down
         shaping = gamma * next_pot - prev_pot
         if rc > 0.0:
-            shaping = torch.clamp(shaping, min=-rc, max=rc)
+            # Match asymmetric mode's documented semantics: `rc` is the pre-fp-scale
+            # clip on the down-change (`prev_down - next_down`, or its PBRS-discounted
+            # analog `prev_down - gamma·next_down`). Asymmetric mode clips
+            # `prev_down - next_down` at ±rc BEFORE multiplying by `rs · fp` → effective
+            # post-scale clip = `rs · fp · rc`. The PBRS shaping expands to
+            # `fp · (prev_down - gamma · next_down)` — its `fp` factor is baked in
+            # before the clamp, so to apply the same pre-scale clip we multiply the
+            # clamp bound by `fp` (the PBRS analog of asymmetric's rs=1 post-scale clip).
+            clip_bound = rc * fp
+            shaping = torch.clamp(shaping, min=-clip_bound, max=clip_bound)
         return shaping
     # Asymmetric mode preserves original clip-before-scale semantics: rc is in (utility or dollar)
     # units of downside change depending on objective; `rs · fp` scales the clipped shaping.
@@ -542,18 +604,15 @@ def _evaluate_objective(pnl_excess, liability, runtime):
     fp = float(objective.get("floor_penalty", 1.0))
     sr = float(objective.get("surplus_reward", 1.0))
     p = float(objective.get("power", 1.0))
-    if _is_symlog_objective(runtime):
-        # Wrap dollar-valued net_pnl through symlog: u(x;c) = sign(x)·log1p(|x|/c). Asymmetry
-        # (fp>>sr) is preserved on the utility-space outcome — the floor still hurts more than
-        # the surplus rewards, but both sides have bounded log-tails.
-        c = _require_utility_scale(runtime)
-        u_pnl = torch.sign(net_pnl) * torch.log1p(net_pnl.abs() / c)
-        surplus = sr * torch.pow(torch.clamp(u_pnl, min=0.0), p)
-        shortfall = -fp * torch.pow(torch.clamp(-u_pnl, min=0.0), p)
-        return torch.where(net_pnl >= 0.0, surplus, shortfall)
-    surplus = sr * torch.pow(torch.clamp(net_pnl, min=0.0), p)
-    shortfall = -fp * torch.pow(torch.clamp(-net_pnl, min=0.0), p)
-    return torch.where(net_pnl >= 0.0, surplus, shortfall)
+    # `_utility_wrap_signed` returns sign(x)·log1p(|x|/c) for symlog, identity for legacy.
+    # The clamps below are sign-disjoint (one is zero where the other isn't), so adding
+    # surplus + shortfall is exact — no `torch.where` needed. Clamps are still load-bearing:
+    # `torch.pow` of a negative base with non-integer p produces NaN, so we clamp the base
+    # to non-negative before pow.
+    u_pnl = _utility_wrap_signed(net_pnl, runtime)
+    surplus = sr * torch.pow(torch.clamp(u_pnl, min=0.0), p)
+    shortfall = -fp * torch.pow(torch.clamp(-u_pnl, min=0.0), p)
+    return surplus + shortfall
 
 
 def _cash_account_for_instrument(name, runtime):
@@ -579,6 +638,42 @@ def _resolve_trade_deltas(action, runtime, *, batch_size, device):
     return resolved
 
 
+def _action_space_padded_deltas(runtime, *, device):
+    """Return the (I, max_bins) int64 padded-deltas tensor for the action space. Built
+    once per runtime/device and cached on `runtime["policy"]["action_space"]["_padded_deltas"]`
+    — avoids the per-decision-step Python-list-to-tensor allocation in the rollout hot loop."""
+    action_space = runtime["policy"]["action_space"]
+    cache_key = f"_padded_deltas_dev_{device}"
+    cached = action_space.get(cache_key)
+    if cached is not None:
+        return cached
+    deltas_map = action_space.get("trade_deltas")
+    if not deltas_map:
+        return None
+    instrument_order = tuple(str(n) for n in _runtime_names(runtime, "action_instruments"))
+    per_instrument = [tuple(deltas_map[n]) for n in instrument_order]
+    max_bins = max(len(d) for d in per_instrument) if per_instrument else 1
+    padded = [list(d) + [d[-1]] * (max_bins - len(d)) for d in per_instrument]
+    tensor = torch.tensor(padded, dtype=torch.int64, device=device)
+    action_space[cache_key] = tensor
+    return tensor
+
+
+def _action_space_min_deltas(runtime, *, device):
+    """Cached per-runtime/device min-trade-delta tensor for the legacy unit-step fallback path."""
+    action_space = runtime["policy"]["action_space"]
+    cache_key = f"_min_deltas_dev_{device}"
+    cached = action_space.get(cache_key)
+    if cached is not None:
+        return cached
+    min_map = action_space.get("min_trade_delta", {})
+    instrument_order = tuple(str(n) for n in _runtime_names(runtime, "action_instruments"))
+    tensor = torch.tensor([int(min_map.get(n, 0)) for n in instrument_order],
+                          dtype=torch.int64, device=device)
+    action_space[cache_key] = tensor
+    return tensor
+
+
 def _realized_structured_action(action, current_positions, runtime, *, batch_size, device):
     if action is None:
         return None
@@ -587,23 +682,14 @@ def _realized_structured_action(action, current_positions, runtime, *, batch_siz
     ordered = torch.stack([executed[n] for n in instrument_order], dim=1).round().to(dtype=torch.int64)
     # Action bins from realized deltas — searchsorted reverse-lookup against the per-instrument
     # sorted delta list. Since limits are now reward-side rather than clipped, executed ≡ proposed.
-    deltas_map = runtime.get("policy", {}).get("action_space", {}).get("trade_deltas", {})
-    if deltas_map:
-        per_instrument = [tuple(deltas_map[n]) for n in instrument_order]
-        max_bins = max(len(d) for d in per_instrument) if per_instrument else 1
-        padded = [list(d) + [d[-1]] * (max_bins - len(d)) for d in per_instrument]
-        deltas_tensor = torch.tensor(padded, dtype=torch.int64, device=ordered.device)  # (I, max_bins)
+    deltas_tensor = _action_space_padded_deltas(runtime, device=ordered.device)
+    if deltas_tensor is not None:
         # searchsorted(sorted=(I, max_bins), values=(I, B)) → (I, B)
         bins_T = torch.searchsorted(deltas_tensor, ordered.transpose(0, 1).contiguous())
         bins = bins_T.transpose(0, 1).contiguous()
     else:
         # Fallback: legacy unit-step ranges. bin = delta - min.
-        min_map = runtime.get("policy", {}).get("action_space", {}).get("min_trade_delta", {})
-        min_trade_delta = torch.tensor(
-            [int(min_map.get(n, 0)) for n in instrument_order],
-            dtype=torch.int64, device=ordered.device,
-        )
-        bins = ordered - min_trade_delta
+        bins = ordered - _action_space_min_deltas(runtime, device=ordered.device)
     return {
         **action,
         "action_bins": bins,
@@ -885,12 +971,23 @@ def _expiry_holding_penalty(state, bundle, runtime):
     no marginal incentive to *exit* an already-expired contract — so the
     multiplier must keep growing once we cross zero.
 
+    Gated on `bundle["last_settlement_index"]`: penalty only fires AFTER the deal
+    has fully settled. During the deal's active life, holding contracts close to
+    their own expiry is legitimate hedging (e.g. an averaging deal whose window
+    ends ~contract expiry — the textbook hedge holds JUL contracts up to JUL's
+    last trade date, and the framework must not punish that). Once the deal is
+    over (`current > last_settle`), any remaining position is non-hedge exposure
+    and contract-expiry physical-delivery risk applies; the penalty fires then.
+
     Coef from `Expiry_Penalty`; threshold from `Expiry_Threshold_Days` (default 4).
-    Disabled when objective.expiry_penalty <= 0.
+    Disabled when objective.expiry_penalty <= 0 or `last_settlement_index` missing.
     """
     objective = runtime.get("objective") or {}
     coef = float(objective.get("expiry_penalty", 0.0))
     if coef <= 0.0:
+        return None
+    last_settle = bundle.get("last_settlement_index")
+    if last_settle is None or int(state["time_index"]) <= int(last_settle):
         return None
     threshold = float(objective.get("expiry_threshold_days", 4.0))
     layout_instruments = (runtime.get("entity_layout", {})
@@ -994,7 +1091,6 @@ def _per_instrument_bounds_penalty(state, bundle, runtime):
     device = bundle["time_grid_days"].device
     batch_size = _batch_size_from_bundle(bundle)
     penalty = torch.zeros(batch_size, dtype=torch.float32, device=device)
-    any_active = False
     for name in _runtime_names(runtime, "action_instruments"):
         if name not in state["positions"] or name not in position_limits:
             continue
@@ -1003,11 +1099,11 @@ def _per_instrument_bounds_penalty(state, bundle, runtime):
         max_pos = float(limits["max_position"])
         pos = state["positions"][name]
         violation = (pos - max_pos).clamp_min(0.0) + (min_pos - pos).clamp_min(0.0)
-        if not bool((violation > 0).any()):
-            continue
+        # `_exp_linear_ramp(0, threshold) == 0`, so summing inactive instruments adds
+        # only zeros. Skipping was a `.any()` sync per (instrument, step) — 3·250=750
+        # CUDA-CPU syncs per epoch — for negligible compute savings.
         penalty = penalty - coef * _exp_linear_ramp(violation, threshold)
-        any_active = True
-    return penalty if any_active else None
+    return penalty
 
 
 def _position_bounds_penalty(state, bundle, runtime):
@@ -1259,9 +1355,13 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
         step_action = None
         if t in decision_set:
             if seen_first_decision:
-                rewards.append(pending_reward)
+                # Snapshot the accumulated reward, then reset the accumulator in place.
+                # Without the clone, the in-place .zero_() below would also zero the
+                # tensor we just appended to `rewards`. Cheaper than allocating a
+                # fresh zeros tensor every decision step.
+                rewards.append(pending_reward.clone())
                 dones.append(state["done"].to(dtype=torch.float32, device=device))
-                pending_reward = torch.zeros(batch_size, dtype=torch.float32, device=device)
+                pending_reward.zero_()
             seen_first_decision = True
             # Materialize entity_state lazily on the decision step. The cheap refresh path skips
             # this on non-decision steps (interval=10 → 9× saved per decision).
@@ -1270,7 +1370,7 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
             positions_t = _positions_tensor(state, instrument_order, device=device)
             output = policy.sample(
                 state["entity_state"], deterministic=deterministic,
-                privileged_state=priv, positions=positions_t,
+                privileged_state=priv,
             )
             step_action = _realized_structured_action(policy.map_actions(output), state["positions"], runtime, batch_size=batch_size, device=device)
             # Optional invariant check: the sampled bins (under the policy's int64-cast feasibility
@@ -1306,10 +1406,10 @@ def _collect_ppo_rollout(policy, bundle, runtime, decision_indices, *, determini
                 n_feasible_list.append(torch.isfinite(logits_det).sum(dim=-1).sum(dim=-1).to(dtype=torch.int32))
         next_state = step_runtime_state(state, step_action, bundle, runtime)
         transition = reward_and_terminal_payoff(state, next_state, bundle, runtime)
-        pending_reward = pending_reward + transition["reward"].to(device=device, dtype=torch.float32) * reward_scale
+        pending_reward.add_(transition["reward"].to(device=device, dtype=torch.float32), alpha=reward_scale)
         state = next_state
     if seen_first_decision:
-        rewards.append(pending_reward)
+        rewards.append(pending_reward)  # loop exited — no further mutation, no need to clone
         dones.append(state["done"].to(dtype=torch.float32, device=device))
     if not entity_snapshots:
         return None
@@ -1400,8 +1500,9 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1, ep
     flat_privileged = {}
     for name, t in (rollout.get("privileged_states") or {}).items():
         flat_privileged[name] = t.reshape(D * B, -1)
-    rollout_positions = rollout.get("positions")
-    flat_positions = rollout_positions.reshape(D * B, -1) if rollout_positions is not None else None
+    # Note: rollout["positions"] is recorded only for `_post_settle_holding_metrics`
+    # diagnostics. The policy no longer consumes per-decision positions (per-instrument
+    # limits are reward-side, not mask-side), so we don't reshape it into minibatches.
     N = D * B
     mb = max(int(settings["minibatch_size"]), 1)
     # Accumulate per-minibatch losses as device-side tensors and sync once at the end of the
@@ -1423,8 +1524,7 @@ def _ppo_update(policy, optimizer, rollout, settings, *, decision_interval=1, ep
             mb_adv = flat_advantages[idx]
             mb_ret = flat_returns[idx]
             mb_privileged = {name: t[idx] for name, t in flat_privileged.items()} if flat_privileged else None
-            mb_positions = flat_positions[idx] if flat_positions is not None else None
-            new_lp, entropy, value, logits = policy.evaluate_action(mb_state, mb_actions, privileged_state=mb_privileged, positions=mb_positions)
+            new_lp, entropy, value, logits = policy.evaluate_action(mb_state, mb_actions, privileged_state=mb_privileged)
             # Per-element entropy floor: hinge loss penalizing any minibatch element whose entropy
             # falls below H_min. Standard `-coef × entropy.mean()` regularization can leave a
             # low-entropy *minimum* coexisting with a healthy mean — the failing-paths signature
@@ -1659,6 +1759,18 @@ def train_torchrl_policy(bundle, runtime):
         train_bundle = _slice_bundle_episodes(bundle, perm[val_count:].to(dtype=torch.int64))
         val_bundle = _slice_bundle_episodes(bundle, perm[:val_count].to(dtype=torch.int64))
     else:
+        # No-split fallback is silent + dangerous: train_bundle == val_bundle means the
+        # "evaluation_summary" is the training-set metric, not held-out. Raise loud so
+        # any caller running training MUST configure Batch_Size and Validation_Min_Batch
+        # to admit a real hold-out, or explicitly accept by setting Validation_Fraction=0.
+        if val_fraction > 0.0:
+            raise ValueError(
+                f"Validation hold-out impossible: Batch_Size={total} but "
+                f"Validation_Min_Batch={val_min} (need Batch_Size > 2*Validation_Min_Batch). "
+                f"Either raise Batch_Size, lower Validation_Min_Batch, or set "
+                f"Validation_Fraction=0 to explicitly disable hold-out (evaluation will be "
+                f"on the training set — overfitting risk)."
+            )
         train_bundle = bundle
         val_bundle = bundle
 
@@ -1743,6 +1855,29 @@ def train_torchrl_policy(bundle, runtime):
             "update_time_seconds": update_time,
             "decision_interval_business_days": decision_interval,
         })
+        # Validation-set rollout every 10 epochs (and on the final epoch). Deterministic /
+        # no-grad; surfaces the train/val gap during training so overfitting is visible in
+        # the live log instead of only at the final evaluation_summary.
+        val_log_suffix = ""
+        if val_bundle is not train_bundle and ((epoch % 10 == 0) or (epoch == settings["epochs"] - 1)):
+            with torch.no_grad():
+                val_decision_indices = _decision_time_indices(val_bundle, settings, epoch=epoch, evaluation=True)
+                val_rollout = _collect_ppo_rollout(policy, val_bundle, runtime, val_decision_indices, deterministic=True)
+            if val_rollout is not None:
+                v_net = (val_rollout["terminal_transition"]["pnl_excess"] + val_rollout["terminal_transition"]["liability_value"]).to(dtype=torch.float64)
+                val_mean = float(v_net.mean().item())
+                val_std = float(v_net.std().item())
+                val_worst = float(v_net.min().item())
+                val_p5 = float(torch.quantile(v_net, 0.05).item())
+                val_sortino = val_mean - max(0.0, -val_p5)
+                epoch_diag[-1]["val_average_net_pnl"] = val_mean
+                epoch_diag[-1]["val_std_net_pnl"] = val_std
+                epoch_diag[-1]["val_worst_net_pnl"] = val_worst
+                epoch_diag[-1]["val_p5_net_pnl"] = val_p5
+                val_log_suffix = (
+                    f"\n  [val] mean={val_mean:>+12.0f} std={val_std:>10.0f} "
+                    f"worst={val_worst:>+12.0f} p5={val_p5:>+12.0f} sortino={val_sortino:>+12.0f}"
+                )
         # Live per-epoch dump for buffered-stdout-blind monitoring. Atomic via temp+rename
         # so a reader never sees a partial write. Skipped when no path is set in JSON config
         # (Optimizer.Live_Diag_Path) or directly on runtime (legacy).
@@ -1760,7 +1895,8 @@ def train_torchrl_policy(bundle, runtime):
             f"reward={terminal_reward:>+10.2f} "
             f"|trade|={action_abs_mean:.2f} "
             f"pol_l={diag['policy_loss']:+.4f} val_l={diag['value_loss']:.2e} ent={diag['entropy']:.3f} "
-            f"t={rollout_time + update_time:.2f}s",
+            f"t={rollout_time + update_time:.2f}s"
+            f"{val_log_suffix}",
             flush=True,
         )
 
@@ -2032,9 +2168,8 @@ def _diag_rollout_policy(policy, bundle, runtime):
         if t in decision_set:
             state = _ensure_decision_views(state, bundle, runtime)
             priv = _privileged_state_at(bundle, t, batch_size, device)
-            positions_t = _positions_tensor(state, instrument_order, device=device)
             output = policy.sample(state['entity_state'], deterministic=True,
-                                   privileged_state=priv, positions=positions_t)
+                                   privileged_state=priv)
             mapped = _realized_structured_action(policy.map_actions(output), state['positions'],
                                                  runtime, batch_size=batch_size, device=device)
             times.append(t)

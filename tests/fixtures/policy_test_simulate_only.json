@@ -251,7 +251,7 @@
                       ".Timestamp": "2026-07-31"
                     },
                     "Volume": 2500.0,
-                    "Fixed_Basis": -2055.0,
+                    "Fixed_Basis": -2045.0,
                     "Price_Multiplier": 1.0,
                     "FX_Period_Start": {
                       ".Timestamp": "2026-07-01"

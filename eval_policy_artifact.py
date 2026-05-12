@@ -83,6 +83,18 @@ def main():
     print(f"  max_per_instrument_position = {post.get('max_per_instrument_position', 0):>+6.1f}")
     print(f"  min_per_instrument_position = {post.get('min_per_instrument_position', 0):>+6.1f}")
     print(f"  max_total_abs_position      = {post.get('max_total_abs_position', 0):>6.1f}")
+    # No-trade reference + delta — built into evaluation_summary when the rollout includes
+    # no_trade_terminal (always the case in evaluate_torchrl_policy).
+    ref = summary.get('reference', {})
+    if ref:
+        nt = ref.get('no_trade', {}).get('metrics', {})
+        diff = ref.get('policy_minus_no_trade', {})
+        print()
+        print('vs no_trade baseline on same bundle:')
+        print(f"  no_trade mean  = {nt.get('average_net_pnl', 0):>+12,.0f}  "
+              f"worst = {nt.get('worst_net_pnl', 0):>+12,.0f}")
+        print(f"  Δ mean         = {diff.get('average_net_pnl', 0):>+12,.0f}  "
+              f"Δ worst = {diff.get('worst_net_pnl', 0):>+12,.0f}")
 
 
 if __name__ == '__main__':

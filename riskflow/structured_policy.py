@@ -88,8 +88,13 @@ def _vocab_size(registry, name):
 
 
 def _sanitize_features(features):
+    # log1p compresses dollar magnitudes (and any other potentially large feature) into
+    # a roughly stable scale for the encoder. Clamp bound: log1p(|x|) ≈ 20 saturates at
+    # |x| ≈ $5B, well past anything realistic for hedge features (notional, liability_mtm,
+    # cumulative_pnl); ±16 (~$9M) was too tight — tail-path features like liability_mtm
+    # at $100M+ all squashed to the same value, blinding V on bad paths.
     sanitized = torch.nan_to_num(features.to(dtype=torch.float32), nan=0.0, posinf=1.0e6, neginf=-1.0e6)
-    return (torch.sign(sanitized) * torch.log1p(sanitized.abs())).clamp(min=-16.0, max=16.0)
+    return (torch.sign(sanitized) * torch.log1p(sanitized.abs())).clamp(min=-20.0, max=20.0)
 
 
 class _EntityEncoder(nn.Module):
@@ -326,16 +331,10 @@ class StructuredRebalancePolicy(nn.Module):
         # the temporal token when present (n_channels > 0).
         temporal_present = int(entity_layout.get('temporal', {}).get('n_channels', 0)) > 0
         self._ctx_pool_dim = self.token_dim * (5 if temporal_present else 4)
-        # Wider 2-hidden-layer value head. Earlier single-hidden head at width=token_dim
-        # (=64) had insufficient capacity to fit terminal-rewards spanning 6+ orders of
-        # magnitude, leaving val_loss plateaued. Start at 2×token_dim (=128) — minimal
-        # capacity bump that tests the binary "is V capacity-bound?" hypothesis. If it
-        # still plateaus, capacity isn't the issue. If it converges, can scale to 4× later.
-        v_hidden = 2 * self.token_dim
+        
+        v_hidden = self.token_dim
         self.value_head = nn.Sequential(
             nn.Linear(self._ctx_pool_dim + self._privileged_dim, v_hidden),
-            nn.GELU(),
-            nn.Linear(v_hidden, v_hidden),
             nn.GELU(),
             nn.Linear(v_hidden, 1),
         ).to(self.device)
@@ -407,13 +406,12 @@ class StructuredRebalancePolicy(nn.Module):
             parts.append(t.squeeze(1))
         return torch.cat(parts, dim=-1)
 
-    def _policy_outputs(self, entity_state, positions=None):
+    def _policy_outputs(self, entity_state):
         es = self._entity_state_to_device(entity_state)
         ctx = self.backbone(es)
         # logits: [B, I, max_bins]; mask only the bin-count truncation (when bins differ across
         # instruments). Per-instrument [Min, Max] position limits are enforced reward-side via
-        # `_per_instrument_bounds_penalty`, NOT at the policy distribution. `positions` is kept
-        # in the signature for caller-compatibility but is no longer consumed here.
+        # `_per_instrument_bounds_penalty`, NOT at the policy distribution.
         logits = self.policy_head(ctx['instruments'])
         logits = logits.masked_fill(self._logit_mask.unsqueeze(0), float('-inf'))
         return logits, ctx
@@ -443,12 +441,12 @@ class StructuredRebalancePolicy(nn.Module):
         deltas = self._trade_deltas.unsqueeze(0).expand(action_bins.shape[0], -1, -1)
         return deltas.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
 
-    def forward(self, entity_state, privileged_state=None, positions=None):
-        logits, ctx = self._policy_outputs(entity_state, positions=positions)
+    def forward(self, entity_state, privileged_state=None):
+        logits, ctx = self._policy_outputs(entity_state)
         return TensorDict({'logits': logits, 'value': self._value(ctx, privileged_state)}, batch_size=[logits.shape[0]])
 
-    def sample(self, entity_state, *, deterministic=False, privileged_state=None, positions=None):
-        logits, ctx = self._policy_outputs(entity_state, positions=positions)
+    def sample(self, entity_state, *, deterministic=False, privileged_state=None):
+        logits, ctx = self._policy_outputs(entity_state)
         log_probs_per_instr = torch.log_softmax(logits, dim=-1)
         if deterministic:
             action_bins = log_probs_per_instr.argmax(dim=-1)
@@ -467,8 +465,8 @@ class StructuredRebalancePolicy(nn.Module):
             'value': value,
         }, batch_size=[logits.shape[0]])
 
-    def evaluate_action(self, entity_state, action_bins, privileged_state=None, positions=None):
-        logits, ctx = self._policy_outputs(entity_state, positions=positions)
+    def evaluate_action(self, entity_state, action_bins, privileged_state=None):
+        logits, ctx = self._policy_outputs(entity_state)
         log_probs_per_instr = torch.log_softmax(logits, dim=-1)
         action_bin_log_probs = log_probs_per_instr.gather(-1, action_bins.unsqueeze(-1)).squeeze(-1)
         log_prob = action_bin_log_probs.sum(-1)
