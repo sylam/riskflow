@@ -2032,6 +2032,7 @@ class YieldInflationCashflowListDeal(Deal):
     # dependent price factors for this instrument
     factor_fields = {'Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
+                     'Repo_Rate': ['InterestRate'],
                      'Index': ['InflationRate']}
 
     documentation = ('Inflation', ['This pays a fixed coupon on an inflation indexed principal. Define the following: ',
@@ -2075,6 +2076,8 @@ class YieldInflationCashflowListDeal(Deal):
 
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
+        field['Repo_Rate'] = utils.check_rate_name(self.field['Repo_Rate']) if self.field.get('Repo_Rate') else \
+            field['Discount_Rate']
         field['PriceIndex'] = utils.check_rate_name(get_inflation_index_name(field['Index'], all_factors))
 
         field_index = {
@@ -2084,6 +2087,8 @@ class YieldInflationCashflowListDeal(Deal):
                 field['PriceIndex'], static_offsets, stochastic_offsets),
             'Discount': get_discount_factor(
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
+            'Repo_Rate': get_interest_factor(
+                field['Repo_Rate'], static_offsets, stochastic_offsets, all_tenors),
             'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
         }
 

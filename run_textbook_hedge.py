@@ -36,6 +36,8 @@ def parse_args():
                    help='Random seed (default: from fixture)')
     p.add_argument('--hedge_instrument', type=str, default='PL_JUL_2026',
                    help='Contract to short and ramp back (default: %(default)s)')
+    p.add_argument('--strike', type=float, default=2055.0,
+                   help='fixed strike (default: %(default)s)')
     p.add_argument('--output_root', type=str, default='artifacts/textbook_runs')
     p.add_argument('--tag', type=str, default='')
     return p.parse_args()
@@ -50,6 +52,9 @@ def _build_simulate_config(args):
         calc['Batch_Size'] = args.batch_size
     if args.seed is not None:
         calc['Random_Seed'] = args.seed
+    if args.strike is not None:
+        calc['Hedging_Problem']['Liabilities']['FloatingEnergyDeal'][
+            args.hedge_instrument]['Payments']['Items'][0]['Fixed_Basis'] = -args.strike
     return cfg
 
 

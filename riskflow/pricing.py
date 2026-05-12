@@ -2512,6 +2512,7 @@ def pv_index_cashflows(shared, time_grid, deal_data, settle_cash=True):
     last_published_index = utils.calc_time_grid_spot_rate(factor_dep['PriceIndex'], deal_time, shared)
     index_forecast = utils.calc_time_grid_curve_rate(factor_dep['ForecastIndex'], deal_time, shared)
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+    repo = utils.calc_time_grid_curve_rate(factor_dep['Repo_Rate'], deal_time, shared)
 
     base_resets = factor_dep['Base_Resets'].reinitialize(shared.one)
     final_resets = factor_dep['Final_Resets'].reinitialize(shared.one)
@@ -2522,8 +2523,8 @@ def pv_index_cashflows(shared, time_grid, deal_data, settle_cash=True):
     start_index, start_counts = np.unique(cash_start_idx, return_counts=True)
     last_pub_blocks = np.split(last_published, start_counts.cumsum())
 
-    for index, (forecast_block, discount_block, last_index_block) in enumerate(
-            utils.split_counts([index_forecast, discounts, last_published_index], start_counts, shared)):
+    for index, (forecast_block, discount_block, repo_block, last_index_block) in enumerate(
+            utils.split_counts([index_forecast, discounts, repo, last_published_index], start_counts, shared)):
 
         last_pub_block = last_pub_blocks[index]
         # cashflows is a dual representation (numpy and tensor) of the same cashflows
@@ -2560,8 +2561,21 @@ def pv_index_cashflows(shared, time_grid, deal_data, settle_cash=True):
             payments = torch.stack([payment.sum(dim=1) for payment in torch.split(
                 payment_all, tuple(cash_counts), dim=1)], dim=1)
 
+        asset_pv = torch.sum(payments * discount_rates, dim=1)
+
+        if factor_dep['Settlement_Date'] is not None:
+            settlement_days = (factor_dep['Settlement_Date'] - time_block).clip(min=0).reshape(-1, 1)
+            repo_discount = torch.squeeze(utils.calc_discount_rate(repo_block, settlement_days, shared), dim=1)
+            settlement_discount = torch.squeeze(
+                utils.calc_discount_rate(discount_block, settlement_days, shared), dim=1)
+            # For forward-style deals, carry the post-settlement indexed bond value to the
+            # forward date on repo, then discount that settlement value on the bond curve.
+            mtm = asset_pv * settlement_discount / repo_discount
+        else:
+            mtm = asset_pv
+
         # add it to the list
-        mtm_list.append(torch.sum(payments * discount_rates, dim=1))
+        mtm_list.append(mtm)
 
         # settle any cashflows
         if settle_cash:

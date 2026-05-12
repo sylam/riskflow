@@ -2204,7 +2204,7 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
             max_tenor = time_grid.max() + factor_tenor.max()
             tnr = np.append(tnr, max_tenor)
             # flat extrapolated gradient
-            point_at_inf = tensor[-1:] + max_tenor * (tensor[-1:] - tensor[-2:-1]) / (
+            point_at_inf = tensor[-1:] + time_grid.max() * (tensor[-1:] - tensor[-2:-1]) / (
                     factor_tenor[-1] - factor_tenor[-2])
             amended_tensor = torch.cat([tensor, point_at_inf])
 
