@@ -33,6 +33,8 @@ INSTRUMENT_FEATURE_NAMES = (
     # over the per-instrument tradable; the AAD-derived `hedge_ratio_*` globals now
     # provide the exact derivative, making cross_delta the noisy version of a feature
     # we have cleanly.
+    'basis_zscore_20',  # rolling z-score of (F_i - S) over 20 bd — tenor-distinct
+                        # carry/richness signal attached to each future's own token.
 )
 
 PRICE_MOMENTUM_LOOKBACK = 1
@@ -58,20 +60,6 @@ GLOBAL_BASE_FEATURE_NAMES = (
     'far_position_value',        # ttf >= 180d
 )
 
-# Direct factor reads exposed as globals, in addition to the per-commodity stack
-# below. Each tuple is (factor_key, slot_index_or_None, exposed_name): for curve-shaped
-# factors (e.g. ForwardRate.PLATINUM_CARRY → 3 contract slots), pick the slot index;
-# for scalar factors (e.g. CommodityBasis.LME_CME), use None. The simulator publishes
-# these factors to bundle['factors'] each step, so this is a zero-cost look-through.
-# Add a tuple here to expose another factor's value as a feature; order is preserved
-# in the global-feature name list.
-EXTRA_FACTOR_GLOBALS = (
-    ('ForwardRate.PLATINUM_CARRY',  0, 'carry_front'),
-    ('ForwardRate.PLATINUM_CARRY',  1, 'carry_mid'),
-    ('ForwardRate.PLATINUM_CARRY',  2, 'carry_back'),
-    ('CommodityBasis.LME_CME',      None, 'basis_lme_cme'),
-)
-
 # Per-commodity globals appended after the base block, suffixed with the commodity name.
 # (bundle_key, name_prefix) pairs — order is preserved in feature names.
 PER_COMMODITY_GLOBAL_FEATURES = (
@@ -86,13 +74,6 @@ PER_COMMODITY_GLOBAL_FEATURES = (
     ('spot_trend_20', 'spot_trend_20d'),
     ('spot_trend_60', 'spot_trend_60d'),
     ('spot_stretch_20', 'spot_stretch_20d'),
-    # Bivariate marked Hawkes intensities (only populated when the underlying uses
-    # `HawkesRegimeLogOUSpotModel`; zero-filled for non-Hawkes processes via the
-    # runtime feeder's missing-key handling). h_plus/h_minus capture self- and cross-
-    # excitation magnitudes; ratio = H- / (H+ + H-) summarises directional bias.
-    ('hawkes_h_plus', 'hawkes_h_plus'),
-    ('hawkes_h_minus', 'hawkes_h_minus'),
-    ('hawkes_ratio', 'hawkes_ratio'),
 )
 
 # Trajectory lookbacks (business days) on liability_mtm and per-commodity spot. Generic
@@ -116,8 +97,6 @@ TEMPORAL_WINDOW = 20
 
 def build_global_feature_names(referenced_commodities, hedge_ratio_pairs=()):
     names = list(GLOBAL_BASE_FEATURE_NAMES)
-    for _factor_key, _slot, exposed in EXTRA_FACTOR_GLOBALS:
-        names.append(exposed)
     for commodity in referenced_commodities:
         for _bundle_key, prefix in PER_COMMODITY_GLOBAL_FEATURES:
             names.append(f'{prefix}_{commodity}')
@@ -256,39 +235,6 @@ def _id_lookup(registry, vocab, name):
 def _privileged_name(factor_name, attr_name, multi):
     """Multi-commodity runs prefix factor attribute names with `<factor>_` to disambiguate."""
     return f'{factor_name.lower()}_{attr_name}' if multi else attr_name
-
-
-def compute_hawkes_intensities(privileged_factor_blocks, stoch_factors, history_prefix=0):
-    """Pull bivariate Hawkes intensities (H+, H-, ratio) from the per-batch privileged-factor
-    accumulator, concatenate across batches, and prepend `history_prefix` zero rows so the time
-    axis aligns with the post-prefix bundle. Returns three per-commodity dicts keyed by the
-    canonical factor name (matching `bundle['spot_price_history']` keys), each with shape
-    (history_prefix + T_sim, B_total).
-
-    Reading from `privileged_factor_blocks` rather than `process.last_*` is correct because the
-    simulator runs in per-batch chunks; only the *last* batch's tensors live on the process
-    instance. Commodities whose process doesn't emit Hawkes intensities are simply absent."""
-    h_plus_out, h_minus_out, ratio_out = {}, {}, {}
-    for factor, process in (stoch_factors or {}).items():
-        factor_name = factor.name[0] if factor.name else str(factor)
-        plus_blocks = privileged_factor_blocks.get((factor_name, 'hawkes_h_plus_total'))
-        minus_blocks = privileged_factor_blocks.get((factor_name, 'hawkes_h_minus_total'))
-        if not plus_blocks or not minus_blocks:
-            continue
-        # Each per-batch tensor is (T_sim, B_batch, 1). Concatenate along batch dim, squeeze.
-        h_plus = torch.cat(plus_blocks, dim=1).squeeze(-1)    # (T_sim, B_total)
-        h_minus = torch.cat(minus_blocks, dim=1).squeeze(-1)  # (T_sim, B_total)
-        if history_prefix > 0:
-            zero = torch.zeros((int(history_prefix),) + tuple(h_plus.shape[1:]),
-                               device=h_plus.device, dtype=h_plus.dtype)
-            h_plus = torch.cat([zero, h_plus], dim=0)
-            h_minus = torch.cat([zero, h_minus], dim=0)
-        ratio = h_minus / (h_plus + h_minus + 1e-8)
-        commodity = utils.check_tuple_name(factor)
-        h_plus_out[commodity] = h_plus
-        h_minus_out[commodity] = h_minus
-        ratio_out[commodity] = ratio
-    return h_plus_out, h_minus_out, ratio_out
 
 
 def _privileged_multi(stoch_factors):
@@ -472,6 +418,54 @@ def compute_spot_stretch(bundle, *, window):
     return out
 
 
+def compute_basis_zscore(bundle, *, window=20, eps=1e-9):
+    """Per-future basis z-score over a rolling window:
+
+        basis_i(t)   = F_i(t) - S(t)
+        zscore_i(t)  = (basis_i(t) - MA_W(basis_i)) / std_W(basis_i)
+
+    Returns dict {instrument_name → (T, B) z-score tensor}.
+
+    Tells the policy which contract is rich/cheap vs its own recent history — a
+    tenor-distinct carry signal attached to each future's own token (the global
+    per-commodity carry slots were dropped once this was in place).
+
+    Single-commodity assumption: all instruments are taken to track the first
+    spot factor in `bundle['spot_price_history']`. Multi-commodity support would
+    require threading a per-instrument underlying mapping through the bundle.
+
+    Note on the history prefix: for the first `H` rows the bundle replaces F_i
+    with the spot history, so `basis ≡ 0` there. The 20-bd rolling stats are
+    therefore mildly biased for the first ~20 sim days; clean from sim-day 20
+    onwards.
+    """
+    spot_history = bundle.get('spot_price_history') or {}
+    tradables = bundle.get('tradables') or {}
+    if not spot_history or not tradables:
+        return {}
+    commodity = next(iter(spot_history))
+    S = _full_spot_timeline(bundle, commodity)
+    if S is None:
+        return {}
+    out = {}
+    for name, F_i in tradables.items():
+        F = F_i.to(dtype=torch.float32)
+        S_t = S.to(dtype=torch.float32, device=F.device)
+        basis = F - S_t                                                 # (T, B)
+        T = basis.shape[0]
+        cum = torch.cat([torch.zeros_like(basis[:1]), basis.cumsum(dim=0)], dim=0)
+        idx = torch.arange(T, device=basis.device)
+        lo = (idx - window + 1).clamp_min(0)
+        count = (idx - lo + 1).to(dtype=torch.float32).clamp_min(1.0).unsqueeze(-1)
+        ma = (cum[idx + 1] - cum[lo]) / count
+        sq = (basis - ma).pow(2)
+        cum_sq = torch.cat([torch.zeros_like(sq[:1]), sq.cumsum(dim=0)], dim=0)
+        window_sq = cum_sq[idx + 1] - cum_sq[lo]
+        std = (window_sq / count).clamp_min(eps).sqrt()
+        out[name] = (basis - ma) / std
+    return out
+
+
 def _legs_state(bundle, time_index, layout, batch_size, device):
     leg_dim = layout['legs']['feature_dim']
     id_dim = layout['legs']['id_dim']
@@ -517,6 +511,7 @@ def _instruments_state(bundle, state, time_index, layout, batch_size, device):
     cumulative_pnl_state = state.get('cumulative_pnl', {})
     time_held_state = state.get('time_held', {})
     tradables_bundle = bundle.get('tradables') or {}
+    basis_zscore_bundle = bundle.get('basis_zscore_20') or {}
     prev_index = max(time_index - PRICE_MOMENTUM_LOOKBACK, 0)
     for entry in meta:
         name = entry['name']
@@ -540,7 +535,14 @@ def _instruments_state(bundle, state, time_index, layout, batch_size, device):
             if price_prev.shape[0] == 1 and price_prev.shape[0] != batch_size:
                 price_prev = price_prev.expand(batch_size).contiguous()
             price_change = price - price_prev
-        columns.append(torch.stack([price, price_change, position, position_value, tte, flag, cum_pnl, held_years], dim=-1))
+        bz_tensor = basis_zscore_bundle.get(name)
+        if bz_tensor is None:
+            basis_z = torch.zeros_like(price)
+        else:
+            basis_z = bz_tensor[time_index].to(device=device, dtype=torch.float32)
+            if basis_z.shape[0] == 1 and basis_z.shape[0] != batch_size:
+                basis_z = basis_z.expand(batch_size).contiguous()
+        columns.append(torch.stack([price, price_change, position, position_value, tte, flag, cum_pnl, held_years, basis_z], dim=-1))
         ids_rows.append([entry['currency_id'], entry['underlying_id'], entry['instrument_type_id']])
     features = torch.stack(columns, dim=1)
     ids = torch.tensor(ids_rows, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1, -1).contiguous()
@@ -640,21 +642,6 @@ def _globals_state(bundle, state, layout, time_index, batch_size, device):
 
     referenced = layout['globals'].get('referenced_commodities', ())
     extras = []
-    # Direct factor reads: ForwardRate.PLATINUM_CARRY (per slot) and CommodityBasis.LME_CME
-    # are visible at sim time t and informative for the policy (carry regime dominates
-    # textbook P&L by ~6× over strike). Read from bundle['factors'] which the simulator
-    # publishes each step. Missing factor → zero-fill so the policy learns to ignore it.
-    bundle_factors = bundle.get('factors') or {}
-    for factor_key, slot, _exposed in EXTRA_FACTOR_GLOBALS:
-        path = bundle_factors.get(factor_key)
-        if path is None:
-            extras.append(torch.zeros((batch_size, 1), dtype=torch.float32, device=device))
-            continue
-        slice_t = path[int(time_index)] if slot is None else path[int(time_index), slot]
-        slice_t = slice_t.to(device=device, dtype=torch.float32).reshape(-1, 1)
-        if slice_t.shape[0] == 1 and slice_t.shape[0] != batch_size:
-            slice_t = slice_t.expand(batch_size, 1).contiguous()
-        extras.append(slice_t)
     for commodity in referenced:
         for bundle_key, _prefix in PER_COMMODITY_GLOBAL_FEATURES:
             extras.append(_commodity_scalar(bundle_key, commodity))

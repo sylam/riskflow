@@ -15,7 +15,7 @@ from .hedge_features import (
     build_entity_state, _full_spot_timeline, LEG_FEATURE_NAMES,
     assemble_privileged_factors,
     compute_spot_realized_vol, compute_spot_trend, compute_spot_stretch,
-    compute_hawkes_intensities,
+    compute_basis_zscore,
 )
 from .structured_policy import StructuredActionSpace, StructuredRebalancePolicy
 
@@ -66,8 +66,7 @@ def _slice_bundle_episodes(bundle, episode_indices):
         }
     for key in ("privileged_factors", "spot_realized_vol",
                 "spot_trend_20", "spot_trend_60", "spot_stretch_20",
-                "hawkes_h_plus", "hawkes_h_minus", "hawkes_ratio",
-                "spot_price_history"):
+                "basis_zscore_20", "spot_price_history"):
         store = bundle.get(key)
         if store:
             sliced[key] = {n: _slice_episode_tensor(t, episode_indices, batch_size) for n, t in store.items()}
@@ -1998,13 +1997,12 @@ def build_torchrl_bundle(base_date, business_day, time_grid_days, tradable_block
                           stoch_factors, runtime=None, privileged_factor_blocks=None):
     """Assemble the per-batch tensor blocks (produced by the HedgeMonteCarlo simulator) into
     a single torchrl-consumable bundle: concatenates blocks along the batch axis, prepends
-    history-prefix rows, derives feature surfaces (realized vol, trend, stretch, hawkes
-    intensities, privileged factors, utility scale), and caches CPU mirrors of the time grid
-    + business-day decision indices.
+    history-prefix rows, derives feature surfaces (realized vol, trend, stretch, privileged
+    factors, utility scale), and caches CPU mirrors of the time grid + business-day decision
+    indices.
 
     `stoch_factors` is the simulator's stochastic-factor map (factor_key → process). Used
-    by `compute_hawkes_intensities` and `assemble_privileged_factors` to wire up per-process
-    privileged surfaces.
+    by `assemble_privileged_factors` to wire up per-process privileged surfaces.
     """
     def pad_time_axis(tensor, target_steps):
         current_steps = int(tensor.shape[0])
@@ -2121,12 +2119,7 @@ def build_torchrl_bundle(base_date, business_day, time_grid_days, tradable_block
     bundle['spot_trend_20'] = compute_spot_trend(bundle, window=20)
     bundle['spot_trend_60'] = compute_spot_trend(bundle, window=60)
     bundle['spot_stretch_20'] = compute_spot_stretch(bundle, window=20)
-    H_prefix = int(runtime.get('history_lookback_business_days', 0)) if runtime else 0
-    h_plus, h_minus, h_ratio = compute_hawkes_intensities(
-        privileged_factor_blocks or {}, stoch_factors, history_prefix=H_prefix)
-    bundle['hawkes_h_plus'] = h_plus
-    bundle['hawkes_h_minus'] = h_minus
-    bundle['hawkes_ratio'] = h_ratio
+    bundle['basis_zscore_20'] = compute_basis_zscore(bundle, window=20)
     bundle['privileged_factors'] = assemble_privileged_factors(privileged_factor_blocks or {}, stoch_factors)
     H = int(runtime.get('history_lookback_business_days', 0)) if runtime else 0
     if H > 0 and bundle['privileged_factors']:
