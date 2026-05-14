@@ -2047,67 +2047,106 @@ class MarkovHMMSpotModel(StochasticProcess):
         self.P_cum = _t(np.cumsum(P_per_step, axis=2))
         self.pi0_cum = _t(np.cumsum(self.param['Initial_State_Probs']))
 
-        # Initial spot — broadcast scalar or keep per-scenario tensor.
-        # AAD: keep spot0 on the autograd graph so payoff sensitivities w.r.t. the
-        # initial spot flow through. `tensor` is the factor's `Spot` (always scalar for
-        # a CommodityPrice); reshape to 0-d preserves grad.
-        self.spot0 = tensor.reshape(())
+        # Initial spot. AAD: keep spot0 on the autograd graph so payoff sensitivities
+        # w.r.t. the initial spot flow through. Stored as-is so inner-MC mode can pass
+        # a `(B,)` vector of per-outer-path initial spots; outer mode is the framework's
+        # usual `(1,)` scalar (broadcast at generate-time).
+        self.spot0 = tensor
 
     @property
     def correlation_name(self):
         return 'MarkovHMMSpotProcess', [()]
 
     def generate(self, shared_mem):
-        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]      # (T, B)
-        T, B = Z.shape
+        # Z is (T, B) in outer mode, (T, B, B2) in inner mode.
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
         device = Z.device
         dtype = torch.float32
 
-        u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, T + 1)[1].contiguous()
         pi0_cum = self.pi0_cum.to(device=device, dtype=dtype)
         P_cum = self.P_cum.to(device=device, dtype=dtype)
-        state = torch.searchsorted(pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
-
-        regimes = torch.empty((T, B), dtype=torch.long, device=device)
-        regimes[0] = state
-        for t in range(1, T):
-            cdf_rows = P_cum[t - 1].index_select(0, state)
-            state = (cdf_rows < u_regime[t].unsqueeze(1)).sum(dim=1).clamp_max_(self.n_states - 1)
-            regimes[t] = state
-
         mu = self.mu_per_state.to(device=device, dtype=dtype)
         sigma = self.sigma_per_state.to(device=device, dtype=dtype)
         dt = self.dt_per_step.to(device=device, dtype=dtype)
-
-        # Student-t emission via Z·sqrt(ν/W), W ~ Chi²(ν) internal. Falls back to
-        # Gaussian if Nu absent on every state.
         nu_per_state = getattr(self, 'nu_per_state', None)
-        Z_dt = Z.to(dtype=dtype)
-        if nu_per_state is not None:
-            nu = nu_per_state.to(device=device, dtype=dtype)                        # (n_states,)
-            nu_t = nu[regimes]                                                       # (T, B)
-            # Sample W ~ Chi²(ν_t) directly using Chi²(ν) ≡ Gamma(ν/2, rate=1/2).
-            # Avoids the n_states-wide stack-then-gather pattern (n_states× memory).
-            W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype)  # (T, B)
-            # Student-t innovation with df=ν, var=ν/(ν-2). Rescale so the marginal
-            # daily variance matches σ² (i.e. neutralise the t variance amplification).
-            t_innov = Z_dt * torch.sqrt(nu_t / W)                                    # std-t
-            scale_to_unit_var = torch.sqrt((nu_t - 2.0).clamp_min(1.0e-3) / nu_t)
-            innov = t_innov * scale_to_unit_var
-        else:
-            innov = Z_dt
+        nu = nu_per_state.to(device=device, dtype=dtype) if nu_per_state is not None else None
 
-        # Per-step emission: ΔS_t = μ_s·δ + σ_s·√δ·innov_t (additive, price space).
-        mu_t = mu[regimes] * dt.view(T, 1)                                          # (T, B)
-        std_t = sigma[regimes] * dt.view(T, 1).sqrt()
-        ds = mu_t + std_t * innov
+        if Z.ndim == 2:
+            # Outer mode: (T, B). Bit-exact preserves of legacy behavior.
+            T, B = Z.shape
+            u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, T + 1)[1].contiguous()
+            state = torch.searchsorted(pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
+            regimes = torch.empty((T, B), dtype=torch.long, device=device)
+            regimes[0] = state
+            for t in range(1, T):
+                cdf_rows = P_cum[t - 1].index_select(0, state)
+                state = (cdf_rows < u_regime[t].unsqueeze(1)).sum(dim=1).clamp_max_(self.n_states - 1)
+                regimes[t] = state
 
-        s0 = self.spot0.expand(B)
-        if self.log_price:
-            log_path = s0.log().unsqueeze(0) + ds.cumsum(dim=0)                     # (T, B)
-            spot_path = log_path.exp()
+            Z_dt = Z.to(dtype=dtype)
+            if nu is not None:
+                nu_t = nu[regimes]                                                   # (T, B)
+                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype)
+                t_innov = Z_dt * torch.sqrt(nu_t / W)
+                scale_to_unit_var = torch.sqrt((nu_t - 2.0).clamp_min(1.0e-3) / nu_t)
+                innov = t_innov * scale_to_unit_var
+            else:
+                innov = Z_dt
+
+            mu_t = mu[regimes] * dt.view(T, 1)                                       # (T, B)
+            std_t = sigma[regimes] * dt.view(T, 1).sqrt()
+            ds = mu_t + std_t * innov
+
+            s0 = self.spot0.expand(B)                                                # (1,) -> (B,)
+            if self.log_price:
+                log_path = s0.log().unsqueeze(0) + ds.cumsum(dim=0)                  # (T, B)
+                spot_path = log_path.exp()
+            else:
+                spot_path = s0.unsqueeze(0) + ds.cumsum(dim=0)                       # (T, B)
         else:
-            spot_path = s0.unsqueeze(0) + ds.cumsum(dim=0)                          # (T, B)
+            # Inner mode: (T, B, B2). One regime path per outer × inner.
+            T, B, B2 = Z.shape
+            u_flat = shared_mem.quasi_rng(B * B2, T + 1)[1].contiguous()             # (T+1, B*B2)
+            u_regime = u_flat.reshape(T + 1, B, B2)
+
+            regime0_override = shared_mem.t_Scenario_Buffer.get(
+                (self.factor_key, 'regime0_inner'), None)
+            regimes = torch.empty((T, B, B2), dtype=torch.long, device=device)
+            if regime0_override is not None:
+                # Per-outer-path initial regime: shape (B,), expanded across the B2 inner fan-out.
+                state = regime0_override.to(device=device, dtype=torch.long)\
+                    .view(B, 1).expand(B, B2).contiguous()
+            else:
+                state = torch.searchsorted(pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
+            regimes[0] = state
+            n_states = self.n_states
+            for t in range(1, T):
+                cdf_rows = P_cum[t - 1].index_select(0, state.flatten())\
+                    .reshape(B, B2, n_states)
+                state = (cdf_rows < u_regime[t].unsqueeze(-1)).sum(dim=-1)\
+                    .clamp_max_(n_states - 1)
+                regimes[t] = state
+
+            Z_dt = Z.to(dtype=dtype)
+            if nu is not None:
+                nu_t = nu[regimes]                                                   # (T, B, B2)
+                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype)
+                t_innov = Z_dt * torch.sqrt(nu_t / W)
+                scale_to_unit_var = torch.sqrt((nu_t - 2.0).clamp_min(1.0e-3) / nu_t)
+                innov = t_innov * scale_to_unit_var
+            else:
+                innov = Z_dt
+
+            mu_t = mu[regimes] * dt.view(T, 1, 1)                                    # (T, B, B2)
+            std_t = sigma[regimes] * dt.view(T, 1, 1).sqrt()
+            ds = mu_t + std_t * innov
+
+            s0 = self.spot0                                                          # (B,)
+            if self.log_price:
+                log_path = s0.view(B, 1).log() + ds.cumsum(dim=0)                    # (T, B, B2)
+                spot_path = log_path.exp()
+            else:
+                spot_path = s0.view(B, 1) + ds.cumsum(dim=0)                         # (T, B, B2)
 
         # Stashed for privileged_factors() called immediately after generate() in the sim loop;
         # also published for cross-process consumers under the (factor_key, kind) convention.
@@ -2436,8 +2475,11 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
         M_np = (1.0 - alpha0)[:, None] * D_slot_per_step[0, idx0 - 1, :] \
                + alpha0[:, None] * D_slot_per_step[0, idx0, :]                         # (3, 3)
         M_t = shared.one.new_tensor(M_np)
-        curve0 = tensor.reshape(-1)
-        X0 = torch.linalg.solve(M_t, curve0.unsqueeze(-1)).squeeze(-1)                 # (3,)
+        # tensor: (3,) outer / (3, B) inner — fed directly to solve. linalg.solve
+        # treats 1D RHS as a vector and N-D RHS as a batch of column-vector solves
+        # (PyTorch's natural broadcasting), so X0 inherits tensor's batch dims.
+        curve0 = tensor
+        X0 = torch.linalg.solve(M_t, curve0)                                           # (3,) or (3, B)
 
         # Round-trip verification: M·X_0 must reproduce today's curve at the dated knots.
         # Catches boundary issues in the searchsorted/clip bracketing where contract_T0
@@ -2457,27 +2499,49 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
         self.X0 = X0                                                                   # (3,) — non-leaf, on `tensor`'s graph
 
     def generate(self, shared_mem):
+        # Z: (3, T, B) outer / (3, T, B, B2) inner.
         Z = shared_mem.t_random_numbers[
-            self.z_offset:self.z_offset + 3, :self.scenario_horizon]                   # (3, T, B)
-        _, T, B = Z.shape
+            self.z_offset:self.z_offset + 3, :self.scenario_horizon]
         n_contracts = self.contract_T.shape[1]
 
-        mean = self.mean_vec.view(3, 1)                                                # (3, 1)
-        X = self.X0.view(3, 1).expand(3, B).clone()                                    # (3, B)
-        out = torch.empty((T, n_contracts, B), dtype=Z.dtype, device=Z.device)
-        for t in range(T):
-            X = mean + self.Phi_per_step[t] @ (X - mean) \
-                + self.sigma_per_step[t].view(3, 1) * Z[:, t, :]                       # (3, B)
-            c_slot = self.D_slot_per_step[t] @ X                                       # (3, B)
-            ts = self.tau_slot_per_step[t]                                             # (3,) ascending
-            cT_t = self.contract_T[t]                                                  # (n_contracts,)
-            # Bracket cT_t inside one of [ts[0], ts[1]] or [ts[1], ts[2]]; outside the
-            # range, extrapolate from the closest segment (linear in c_slot vs ts).
-            idx = torch.clamp(torch.searchsorted(ts, cT_t, right=False), 1, 2)
-            alpha = ((cT_t - ts[idx - 1]) / (ts[idx] - ts[idx - 1])).unsqueeze(-1)     # (n_contracts, 1)
-            out_t = (1.0 - alpha) * c_slot[idx - 1] + alpha * c_slot[idx]              # (n_contracts, B)
-            out[t] = torch.where(self.contract_expired[t].unsqueeze(-1),
-                                 torch.zeros_like(out_t), out_t)
+        # einsum is used in both modes for the (3,3) × (3, *batch_shape) products.
+        # `@` would silently misinterpret the leading 3 of (3, B, B2) as a batch dim
+        # rather than the matmul contraction axis; einsum keeps the contraction explicit.
+        if Z.ndim == 3:
+            # Outer mode: (3, T, B).
+            _, T, B = Z.shape
+            mean = self.mean_vec.view(3, 1)                                            # (3, 1)
+            X = self.X0.view(3, 1).expand(3, B).clone()                                # (3, B)
+            out = torch.empty((T, n_contracts, B), dtype=Z.dtype, device=Z.device)
+            for t in range(T):
+                X = mean + torch.einsum('ij,j...->i...', self.Phi_per_step[t], X - mean) \
+                    + self.sigma_per_step[t].view(3, 1) * Z[:, t, :]                   # (3, B)
+                c_slot = torch.einsum('ij,j...->i...', self.D_slot_per_step[t], X)     # (3, B)
+                ts = self.tau_slot_per_step[t]
+                cT_t = self.contract_T[t]
+                idx = torch.clamp(torch.searchsorted(ts, cT_t, right=False), 1, 2)
+                alpha = ((cT_t - ts[idx - 1]) / (ts[idx] - ts[idx - 1])).unsqueeze(-1) # (n_contracts, 1)
+                out_t = (1.0 - alpha) * c_slot[idx - 1] + alpha * c_slot[idx]          # (n_contracts, B)
+                out[t] = torch.where(self.contract_expired[t].unsqueeze(-1),
+                                     torch.zeros_like(out_t), out_t)
+        else:
+            # Inner mode: (3, T, B, B2). X carries the fan-out batch dims through.
+            _, T, B, B2 = Z.shape
+            mean = self.mean_vec.view(3, 1, 1)                                         # (3, 1, 1)
+            X = self.X0.unsqueeze(-1).expand(3, B, B2).clone()                         # (3, B, B2)
+            out = torch.empty((T, n_contracts, B, B2), dtype=Z.dtype, device=Z.device)
+            for t in range(T):
+                X = mean + torch.einsum('ij,j...->i...', self.Phi_per_step[t], X - mean) \
+                    + self.sigma_per_step[t].view(3, 1, 1) * Z[:, t, :, :]             # (3, B, B2)
+                c_slot = torch.einsum('ij,j...->i...', self.D_slot_per_step[t], X)     # (3, B, B2)
+                ts = self.tau_slot_per_step[t]
+                cT_t = self.contract_T[t]
+                idx = torch.clamp(torch.searchsorted(ts, cT_t, right=False), 1, 2)
+                alpha = ((cT_t - ts[idx - 1]) / (ts[idx] - ts[idx - 1]))\
+                    .view(-1, 1, 1)                                                    # (n_contracts, 1, 1)
+                out_t = (1.0 - alpha) * c_slot[idx - 1] + alpha * c_slot[idx]          # (n_contracts, B, B2)
+                expired_view = self.contract_expired[t].view(-1, 1, 1)                 # (n_contracts, 1, 1)
+                out[t] = torch.where(expired_view, torch.zeros_like(out_t), out_t)
         return out
 
 
@@ -2640,13 +2704,13 @@ class BasisLinkedSpotModel(StochasticProcess):
         self.Mu = float(self.param.get('Mu', 0.0))
         self.sigma_by_state = shared.one.new_tensor(np.array(self.param['Sigma_By_State'], dtype=np.float64))
         # AAD: keep b0 on the autograd graph so sensitivities of payoffs w.r.t. the
-        # observed initial basis flow through. `tensor` is the factor's `Spot` value
-        # (always scalar for a basis); reshape to 0-d preserves grad.
-        self.b0 = tensor.reshape(())
+        # observed initial basis flow through. Stored as-is so inner-MC mode can pass
+        # a `(B,)` vector of per-outer-path initial bases; outer mode is `(1,)`.
+        self.b0 = tensor
 
     def generate(self, shared_mem):
-        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]      # (T, B), correlated
-        T, B = Z.shape
+        # Z is (T, B) outer / (T, B, B2) inner, correlated.
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
         device = Z.device
         dtype = Z.dtype
 
@@ -2654,32 +2718,40 @@ class BasisLinkedSpotModel(StochasticProcess):
         # `dependant_fields` declaration on CommodityBasis enforces the ordering by
         # making CommodityPrice a dependency, so the simulator topo-orders it before us.
         # The linked spot path is in *price level* (dollars), not log-space — the HMM
-        # process exp()s its log-cumsum before publishing.
-        lme_path = shared_mem.t_Scenario_Buffer[self.linked_key]                     # (T, B)
-        regimes = shared_mem.t_Scenario_Buffer[(self.linked_key, 'regimes')]         # (T, B) long
+        # process exp()s its log-cumsum before publishing. Path/regime shapes match
+        # this process's Z, since both processes ran in the same inner/outer mode.
+        lme_path = shared_mem.t_Scenario_Buffer[self.linked_key]
+        regimes = shared_mem.t_Scenario_Buffer[(self.linked_key, 'regimes')]
         assert (lme_path > 0).all(), 'lme_path expected to be price levels in dollars'
 
-        sigma_t = self.sigma_by_state[regimes]                                       # (T, B)
+        sigma_t = self.sigma_by_state[regimes]
 
         # Student-t innovation: η_t = sigma_t · ε_t · √((ν-2)/ν), ε_t ~ t_ν.
         # Identity: ε_t = Z · √(ν/W) where W ~ Chi²(ν). Combine the rescaling so the
-        # marginal variance of η_t is sigma_t² regardless of ν. Chi² comes from
-        # torch.distributions (CPU/default dtype), so .to() bridges to the framework's.
+        # marginal variance of η_t is sigma_t² regardless of ν.
         nu = self.Nu
-        W = torch.distributions.Chi2(nu).sample((T, B)).to(device=device, dtype=dtype)
-        eta = sigma_t * Z * torch.sqrt((nu - 2.0) / W)
-
-        # Sequential AR(1): b[0] = b0 (deterministic, anchors on observed basis); for
-        # t≥1, b[t] = a·ΔLME[t] + φ·b[t-1] + η[t]. eta[0] is computed but unused — the
-        # framework's correlated-Z indexing requires Z[0] be consumed even at the
-        # privileged-init step so cross-process correlations stay aligned for t≥1.
         phi = float(self.Phi)
         a = float(self.A)
-        b_init = self.b0.expand(B)
-        out = torch.empty((T, B), device=device, dtype=dtype)
-        out[0] = b_init
-        for t in range(1, T):
-            out[t] = a * (lme_path[t] - lme_path[t - 1]) + phi * out[t - 1] + eta[t]
+
+        if Z.ndim == 2:
+            # Outer mode: (T, B). Bit-exact preserve of legacy behavior.
+            T, B = Z.shape
+            W = torch.distributions.Chi2(nu).sample((T, B)).to(device=device, dtype=dtype)
+            eta = sigma_t * Z * torch.sqrt((nu - 2.0) / W)
+            b_init = self.b0.expand(B)
+            out = torch.empty((T, B), device=device, dtype=dtype)
+            out[0] = b_init
+            for t in range(1, T):
+                out[t] = a * (lme_path[t] - lme_path[t - 1]) + phi * out[t - 1] + eta[t]
+        else:
+            # Inner mode: (T, B, B2).
+            T, B, B2 = Z.shape
+            W = torch.distributions.Chi2(nu).sample((T, B, B2)).to(device=device, dtype=dtype)
+            eta = sigma_t * Z * torch.sqrt((nu - 2.0) / W)
+            out = torch.empty((T, B, B2), device=device, dtype=dtype)
+            out[0] = self.b0.unsqueeze(-1).expand(B, B2)
+            for t in range(1, T):
+                out[t] = a * (lme_path[t] - lme_path[t - 1]) + phi * out[t - 1] + eta[t]
         return out
 
 

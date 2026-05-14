@@ -476,6 +476,46 @@ class CMC_State(utils.Calculation_State):
         self.t_Buffer.clear()
 
 
+class CMC_State_Inner(CMC_State):
+    """Inner-MC variant of CMC_State for nested simulation. Each of `simulation_batch`
+    outer-path states fans out into `simulation_sub_batch` (B2) independent forward
+    sample paths. Base `reset()` is inherited unchanged so outer-mode usage of this
+    state object is transparent. `reset_inner()` swaps in the inner-shape random
+    numbers: `(num_factors, T, simulation_batch, simulation_sub_batch)` instead of
+    the base `(num_factors, T, simulation_batch)`. Stochastic processes dispatch on
+    `Z.ndim` to pick between outer and inner code paths. Antithetic sampling is not
+    supported in inner mode. quasi_rng is inherited — callers handle any reshape."""
+
+    def __init__(self, cholesky, static_buffer, batch_size, one, mcmc_sims, report_currency,
+                 seed, job_id, num_jobs, simulation_sub_batch,
+                 scale_survival=False, nomodel='Constant', keep_tensor=False):
+        if simulation_sub_batch <= 1:
+            raise ValueError(
+                f'CMC_State_Inner requires simulation_sub_batch > 1; got {simulation_sub_batch}. '
+                f'Use the base CMC_State for outer-only simulation.')
+        super().__init__(cholesky, static_buffer, batch_size, one, mcmc_sims, report_currency,
+                         seed, job_id, num_jobs, scale_survival=scale_survival,
+                         nomodel=nomodel, keep_tensor=keep_tensor)
+        self.simulation_sub_batch = simulation_sub_batch
+
+    def reset_inner(self, num_factors, time_grid: utils.TimeGrid, use_antithetic=False):
+        if use_antithetic:
+            raise ValueError('CMC_State_Inner.reset_inner does not support antithetic sampling.')
+        T = time_grid.scen_time_grid.size
+        B = self.simulation_batch
+        B2 = self.simulation_sub_batch
+        # Sobol-based correlated Gaussian: draw T*B*B2 quasi-normal vectors of dim num_factors,
+        # transpose to (num_factors, T*B*B2), correlate via cholesky, reshape.
+        Z_normal, _ = self.quasi_rng(num_factors, T * B * B2)                        # (T*B*B2, num_factors)
+        correlated_sample = torch.matmul(
+            self.t_cholesky, Z_normal.transpose(0, 1)
+        ).reshape(num_factors, T, B, B2)
+        self.t_random_numbers = correlated_sample
+
+        self.reset_cashflows(time_grid)
+        self.t_Buffer.clear()
+
+
 class Credit_Monte_Carlo(Calculation):
     documentation = ('Calculations', [
         'A profile is a curve $V(t)$ with values specified at a discrete set of future dates $0=t_0<t_1<...<t_m$ with',
