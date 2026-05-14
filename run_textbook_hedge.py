@@ -17,6 +17,7 @@ import json as jsonlib
 import os
 import time
 from datetime import datetime
+from typing import Any, Optional
 
 import pandas as pd
 import torch
@@ -25,6 +26,171 @@ import riskflow as rf
 
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tests', 'fixtures',
                         'policy_test_simulate_only.json')
+
+
+def _resolve_config_path(source_job_path: str, referenced_path: Optional[str]) -> Optional[str]:
+    if not referenced_path:
+        return referenced_path
+
+    normalized = os.path.normpath(str(referenced_path))
+    if os.path.isabs(normalized) and os.path.exists(normalized):
+        return normalized
+
+    job_dir = os.path.dirname(os.path.abspath(source_job_path))
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    for base_dir in (job_dir, repo_root):
+        candidate = os.path.normpath(os.path.join(base_dir, normalized))
+        if os.path.exists(candidate):
+            return candidate
+
+    return referenced_path
+
+
+def _normalize_external_references(cfg: dict[str, Any], source_job_path: str) -> dict[str, Any]:
+    calc = cfg.get('Calc', {})
+    merge_market_data = calc.get('MergeMarketData', {})
+    if isinstance(merge_market_data, dict):
+        merge_market_data['MarketDataFile'] = _resolve_config_path(
+            source_job_path, merge_market_data.get('MarketDataFile'))
+        merge_market_data['StressedMarketDataFile'] = _resolve_config_path(
+            source_job_path, merge_market_data.get('StressedMarketDataFile'))
+
+    if calc.get('CalendDataFile') is not None:
+        calc['CalendDataFile'] = _resolve_config_path(source_job_path, calc.get('CalendDataFile'))
+
+    return cfg
+
+
+def load_job_config(job_path: Optional[str] = None) -> dict[str, Any]:
+    resolved_job_path = job_path or FIXTURE
+    with open(resolved_job_path, encoding='utf-8') as handle:
+        cfg = jsonlib.load(handle)
+    return _normalize_external_references(cfg, resolved_job_path)
+
+
+def apply_simulation_overrides(
+    cfg: dict[str, Any],
+    *,
+    batch_size: Optional[int] = None,
+    seed: Optional[int] = None,
+    strike: Optional[float] = None,
+    liability_name: Optional[str] = None,
+) -> dict[str, Any]:
+    calc = cfg['Calc']['Calculation']
+    calc['Execution_Mode'] = 'simulate_only'
+    calc['Simulation_Batches'] = 1
+    if batch_size is not None:
+        calc['Batch_Size'] = batch_size
+    if seed is not None:
+        calc['Random_Seed'] = seed
+    if strike is not None:
+        liability_key = liability_name or next(iter(calc['Hedging_Problem']['Liabilities']['FloatingEnergyDeal']))
+        calc['Hedging_Problem']['Liabilities']['FloatingEnergyDeal'][liability_key]['Payments']['Items'][0]['Fixed_Basis'] = -strike
+    return cfg
+
+
+def load_simulation_config(
+    job_path: Optional[str] = None,
+    *,
+    batch_size: Optional[int] = None,
+    seed: Optional[int] = None,
+    strike: Optional[float] = None,
+    liability_name: Optional[str] = None,
+) -> dict[str, Any]:
+    cfg = load_job_config(job_path)
+    return apply_simulation_overrides(
+        cfg,
+        batch_size=batch_size,
+        seed=seed,
+        strike=strike,
+        liability_name=liability_name,
+    )
+
+
+def run_simulation_config(cfg: dict[str, Any]):
+    cx = rf.Context()
+    cx.load_json((jsonlib.dumps(cfg), 'textbook.json'))
+    _, result = cx.run_job()
+    return result
+
+
+def runtime_instrument_order(result) -> list[str]:
+    policy = result.runtime.get('policy', {})
+    action_space = policy.get('action_space', {})
+    order = list(action_space.get('instrument_order', ()))
+    if order:
+        return order
+    return list(result.runtime.get('tradables', {}).keys())
+
+
+def build_schedule_rows(result, instruments: Optional[list[str]] = None) -> list[dict[str, Any]]:
+    bundle = result.torchrl_bundle
+    dates = bundle['scenario_dates']
+    business_day = bundle['meta']['business_day']
+    decision_indices = set(bundle.get('business_indices', ()))
+    chosen_instruments = instruments or runtime_instrument_order(result)
+    rows: list[dict[str, Any]] = []
+    for idx, date in enumerate(dates):
+        row = {
+            'date': pd.Timestamp(date).strftime('%Y-%m-%d'),
+            'is_business_day': bool(business_day.is_on_offset(date)),
+            'is_decision_step': idx in decision_indices,
+        }
+        for instrument in chosen_instruments:
+            row[instrument] = ''
+        rows.append(row)
+    return rows
+
+
+def position_targets_from_rows(rows: list[dict[str, Any]], instruments: list[str]) -> dict[str, dict[str, int]]:
+    targets: dict[str, dict[str, int]] = {}
+    current = {instrument: 0 for instrument in instruments}
+    for row in rows:
+        date_key = pd.Timestamp(row['date']).strftime('%Y-%m-%d')
+        row_targets = dict(current)
+        for instrument in instruments:
+            value = row.get(instrument, '')
+            if value in ('', None):
+                continue
+            row_targets[instrument] = int(round(float(value)))
+        current = row_targets
+        targets[date_key] = row_targets
+    return targets
+
+
+def run_position_target_schedule(result, target_positions_by_date: dict[str, dict[str, int]]):
+    stepper = result.create_stepper()
+    last = None
+    instruments = runtime_instrument_order(result)
+    while not stepper.done:
+        if not stepper.is_decision_step:
+            last = stepper.step(None)
+            continue
+        observed = stepper.observe()
+        date_key = pd.Timestamp(result.torchrl_bundle['scenario_dates'][stepper.time_index]).strftime('%Y-%m-%d')
+        targets = target_positions_by_date.get(date_key)
+        if not targets:
+            last = stepper.step(None)
+            continue
+        deltas = {}
+        for instrument in instruments:
+            current_pos = float(observed['positions'][instrument][0].item())
+            target = int(targets.get(instrument, round(current_pos)))
+            delta = target - int(round(current_pos))
+            if delta:
+                deltas[instrument] = delta
+        last = stepper.step(deltas or None)
+    return stepper, last
+
+
+def summarize_terminal_pnl(last):
+    pnl = (last['transition_pnl_excess'] + last['transition_liability_value']).to(dtype=torch.float64)
+    return {
+        'mean': float(pnl.mean()),
+        'median': float(torch.quantile(pnl, 0.5)),
+        'min': float(pnl.min()),
+        'std': float(pnl.std()),
+    }
 
 
 def parse_args():
@@ -44,18 +210,12 @@ def parse_args():
 
 
 def _build_simulate_config(args):
-    cfg = jsonlib.load(open(FIXTURE))
-    calc = cfg['Calc']['Calculation']
-    calc['Execution_Mode'] = 'simulate_only'
-    calc['Simulation_Batches'] = 1
-    if args.batch_size is not None:
-        calc['Batch_Size'] = args.batch_size
-    if args.seed is not None:
-        calc['Random_Seed'] = args.seed
-    if args.strike is not None:
-        calc['Hedging_Problem']['Liabilities']['FloatingEnergyDeal'][
-            args.hedge_instrument]['Payments']['Items'][0]['Fixed_Basis'] = -args.strike
-    return cfg
+    return load_simulation_config(
+        batch_size=args.batch_size,
+        seed=args.seed,
+        strike=args.strike,
+        liability_name=args.hedge_instrument,
+    )
 
 
 def _textbook_targets(result, hedge_instrument):
@@ -124,9 +284,7 @@ def main():
     print(f'Config:    {cfg_path}\n')
 
     t_start = time.monotonic()
-    cx = rf.Context()
-    cx.load_json(cfg_path)
-    _, result = cx.run_job()
+    result = run_simulation_config(cfg)
     sim_elapsed = time.monotonic() - t_start
 
     short_at_start, tn_idx, target_at_idx = _textbook_targets(result, args.hedge_instrument)
@@ -137,13 +295,13 @@ def main():
     last = _run_textbook(stepper, args.hedge_instrument, short_at_start, tn_idx, target_at_idx)
     stepper.write_diagnostic_csvs(out_dir, label='textbook')
 
-    pnl = (last['transition_pnl_excess'] + last['transition_liability_value']).to(dtype=torch.float64)
+    summary = summarize_terminal_pnl(last)
     elapsed = time.monotonic() - t_start
     print('=' * 78)
-    print(f"  textbook P&L:  mean=${float(pnl.mean()):>+12,.0f}  "
-          f"median=${float(torch.quantile(pnl, 0.5)):>+12,.0f}  "
-          f"worst=${float(pnl.min()):>+12,.0f}  "
-          f"std=${float(pnl.std()):>10,.0f}")
+    print(f"  textbook P&L:  mean=${summary['mean']:>+12,.0f}  "
+          f"median=${summary['median']:>+12,.0f}  "
+          f"worst=${summary['min']:>+12,.0f}  "
+          f"std=${summary['std']:>10,.0f}")
     print(f'  paths CSV:    {os.path.join(out_dir, "textbook_paths.csv")}')
     print(f'  summary CSV:  {os.path.join(out_dir, "textbook_summary.csv")}')
     print(f'  (simulate {sim_elapsed:.1f}s, total {elapsed:.1f}s)')
