@@ -719,6 +719,26 @@ class TimeGrid(object):
                 currency_lookup[settlement_dates] = np.arange(len(settlement_dates))
                 self.CurrencyMap.setdefault(currency, currency_lookup)
 
+    def truncate_to(self, original_base_date, t_days):
+        """Return a new TimeGrid covering [t_days, T] of the original, with base shifted
+        forward by t_days. Used by nested-simulation drivers (inner MC) to construct a
+        truncated horizon starting at an outer timestep. `original_base_date` is the
+        base date this grid was originally set against (caller's responsibility — TimeGrid
+        does not store its base date)."""
+        new_base_date = original_base_date + pd.Timedelta(days=int(t_days))
+        new_scenario_dates = [d for d in sorted(self.scenario_dates) if d >= new_base_date]
+        new_mtm_dates = [d for d in sorted(self.mtm_dates) if d >= new_base_date]
+        new_base_mtm = [d for d in self.base_MTM_dates if d in new_mtm_dates]
+        new_grid = TimeGrid(new_scenario_dates, new_mtm_dates, new_base_mtm)
+        if new_scenario_dates:
+            new_grid.set_base_date(new_base_date)
+        else:
+            # Past-end caller's grid: keep `scen_time_grid` queryable (empty) so size
+            # checks like `grid.scen_time_grid.size < 2` work without AttributeError.
+            new_grid.scen_time_grid = np.array([], dtype=np.int64)
+            new_grid.time_grid_years = np.array([], dtype=np.float64)
+        return new_grid
+
     def calc_deal_grid(self, dates):
         try:
             dynamic_dates = self.base_time_grid.union([self.date_lookup[x] for x in dates])

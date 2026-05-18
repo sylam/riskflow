@@ -17,6 +17,7 @@
 ########################################################################
 
 # import standard libraries
+import copy
 import itertools
 
 # 3rd party libraries
@@ -143,6 +144,15 @@ class StochasticProcess(object):
         self.factor = factor
         self.param = param
         self.params_ok = True
+
+    def copy(self):
+        """Shallow copy. Use case: forking a process for nested simulation (inner MC)
+        so the fork can be precalculated against a different shared state / time grid
+        without clobbering the outer instance's precalc-derived attributes (`spot0`,
+        `scenario_horizon`, `z_offset`, etc.). Construction-time references (`factor`,
+        `param`, `implied`) are shared by reference, which is intentional — these are
+        read-only after setup."""
+        return copy.copy(self)
 
     def link_references(self, implied_tensor, implied_var, implied_factors):
         """link market variables across different risk factors"""
@@ -950,7 +960,12 @@ class CSForwardPriceModel(StochasticProcess):
         return mu, np.sqrt(var)
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-        self.initial_curve = tensor.reshape(1, -1, 1)
+        # tensor: (n_tenors,) outer / (n_tenors, B) inner. Only `initial_curve` depends
+        # on tensor — vol/drift are time-grid + param functions and stay (T, n_tenors, 1).
+        if tensor.ndim == 1:
+            self.initial_curve = tensor.reshape(1, -1, 1)                   # (1, n_tenors, 1)
+        else:
+            self.initial_curve = tensor.unsqueeze(0).unsqueeze(-1)          # (1, n_tenors, B, 1)
         # store randomnumber id's
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size
@@ -992,11 +1007,16 @@ class CSForwardPriceModel(StochasticProcess):
         return 'ClewlowStricklandProcess', [()]
 
     def generate(self, shared_mem):
-        z_portion = torch.unsqueeze(
-            shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
-            dim=1) * self.vol
-
-        return self.initial_curve * torch.exp(self.drift + torch.cumsum(z_portion, dim=0))
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        if Z.ndim == 2:
+            # Outer mode: Z is (T, B). Bit-exact preserves legacy behavior.
+            z_portion = Z.unsqueeze(1) * self.vol                       # (T, n_tenors, B)
+            return self.initial_curve * torch.exp(self.drift + torch.cumsum(z_portion, dim=0))
+        # Inner mode: Z is (T, B, B2). One path per outer × inner.
+        vol4 = self.vol.unsqueeze(-1)                                   # (T, n_tenors, 1, 1)
+        drift4 = self.drift.unsqueeze(-1)                               # (T, n_tenors, 1, 1)
+        z_portion = Z.unsqueeze(1) * vol4                               # (T, n_tenors, B, B2)
+        return self.initial_curve * torch.exp(drift4 + torch.cumsum(z_portion, dim=0))
 
 
 class CSImpliedForwardPriceModel(CSForwardPriceModel):
@@ -1141,43 +1161,62 @@ class PCAInterestRateModel(StochasticProcess):
         # normalize the eigenvectors
         self.evecs = shared.one.new_tensor(B.T[:, np.newaxis, :, np.newaxis])
 
-        # also need to pre-calculate the forward curves at time_grid given and pass that to the cuda kernel
+        # Forward curve at each time-grid point. `tensor` is the current zero curve:
+        # (n_tenors,) in outer mode, (n_tenors, B) in inner mode (per-outer-path init).
+        factor_tenor_t = shared.one.new_tensor(factor_tenor.reshape(1, -1))                    # [1, n_tenors]
         if self.param['Rate_Drift_Model'] == 'Drift_To_Blend':
             hist_mean = scipy.interpolate.interp1d(*np.hstack(
                 ([[0.0], [self.param['Historical_Yield'].array.T[-1][0]]],
                  self.param['Historical_Yield'].array.T)), kind='linear', bounds_error=False,
                     fill_value=self.param['Historical_Yield'].array.T[-1][-1])
-            curve_t0 = self.factor.current_value(self.factor.tenors)
-            omega = hist_mean(self.factor.tenors)
-            # R_τ(t) = exp(-α t) r_τ(0) + (1 - exp(-α t)) Θ_τ  vectorised over [T, n_tenors]
-            decay    = shared.one.new_tensor(np.exp(-alpha * time_grid_years).reshape(-1, 1))  # [T, 1]
-            curve_t0 = shared.one.new_tensor(curve_t0.reshape(1, -1))                          # [1, n_tenors]
-            omega    = shared.one.new_tensor(omega.reshape(1, -1))                              # [1, n_tenors]
-            fwd_curve = decay * curve_t0 + (1.0 - decay) * omega                               # [T, n_tenors]
-
+            omega = shared.one.new_tensor(hist_mean(self.factor.tenors).reshape(1, -1))        # [1, n_tenors]
+            decay = shared.one.new_tensor(np.exp(-alpha * time_grid_years).reshape(-1, 1))     # [T, 1]
+            # R_τ(t) = exp(-α t) r_τ(0) + (1 - exp(-α t)) Θ_τ
+            if tensor.ndim == 1:
+                curve_t0 = tensor.reshape(1, -1)                                                # [1, n_tenors]
+                fwd_curve = decay * curve_t0 + (1.0 - decay) * omega                            # [T, n_tenors]
+            else:
+                curve_t0 = tensor.unsqueeze(0)                                                  # [1, n_tenors, B]
+                decay_b = decay.unsqueeze(-1)                                                   # [T, 1, 1]
+                omega_b = omega.unsqueeze(-1)                                                   # [1, n_tenors, 1]
+                fwd_curve = decay_b * curve_t0 + (1.0 - decay_b) * omega_b                      # [T, n_tenors, B]
         else:
-            # calculate the forward curve across time
-            fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared) / shared.one.new_tensor(
-                factor_tenor.reshape(1, -1))
+            if tensor.ndim == 1:
+                fwd_curve = utils.calc_curve_forwards(
+                    self.factor, tensor, time_grid_years, shared) / factor_tenor_t             # [T, n_tenors]
+            else:
+                # Per-outer-path forwards: loop over B and stack. Inner pass runs under
+                # no_grad so no autograd graph cost; vectorise later if profiling shows it.
+                fwd_curve = torch.stack([
+                    utils.calc_curve_forwards(
+                        self.factor, tensor[:, b], time_grid_years, shared) / factor_tenor_t
+                    for b in range(tensor.shape[1])
+                ], dim=-1)                                                                       # [T, n_tenors, B]
 
-        self.fwd_component = torch.unsqueeze(fwd_curve, dim=2)
+        self.fwd_component = fwd_curve.unsqueeze(-1)  # [..., 1] — trailing dim is the inner B2 / outer scenario axis
 
     def calc_factors(self, factors):
-        # factors: [n_factors, T, n_scenarios]
+        # factors: [n_factors, T, B] outer / [n_factors, T, B, B2] inner. Branch on ndim;
+        # closed-form OU vectorisation is identical, only the broadcasting shapes differ.
         #
         # Closed-form vectorisation of Y_{k+1} = d_k * Y_k + n_k * Z_k  (Y_0 = 0):
-        #
-        #   Y_out[k] = D[k] * cumsum( n[i]/D[i] * Z[i] )[k]
-        #   D[k] = cumprod(d)[k] = prod_{j=0}^{k} d[j]
-        #
-        # Replaces the T-step Python loop with two O(T) CUDA-native ops (cumprod, cumsum).
-        # Numerically stable for typical PCA α values (0.01–0.3); avoid α >> 1 on long grids.
+        #   Y_out[k] = D[k] * cumsum( n[i]/D[i] * Z[i] )[k],  D[k] = cumprod(d)[k]
+        # Two O(T) CUDA-native ops (cumprod, cumsum) replace the T-step Python loop.
+        # Numerically stable for typical PCA α (0.01–0.3); avoid α >> 1 on long grids.
         evecs_mat = self.evecs[:, 0, :, 0]                              # [n_factors, n_tenors]
         D = torch.cumprod(self.ou_decay, dim=0)                         # [T, 1]
-        Y = D.unsqueeze(0) * torch.cumsum(
-            (self.ou_noise / D).unsqueeze(0) * factors, dim=1)          # [n_factors, T, n_scenarios]
-        projected = torch.einsum('jt,jks->kts', evecs_mat, Y)          # [T, n_tenors, n_scenarios]
-        return self.drift + self.vols_tensor.unsqueeze(0) * projected   # [T, n_tenors, n_scenarios]
+
+        if factors.ndim == 3:
+            Y = D.unsqueeze(0) * torch.cumsum(
+                (self.ou_noise / D).unsqueeze(0) * factors, dim=1)      # [n_factors, T, B]
+            projected = torch.einsum('jt,jks->kts', evecs_mat, Y)       # [T, n_tenors, B]
+            return self.drift + self.vols_tensor.unsqueeze(0) * projected
+        else:
+            D4 = D.view(1, -1, 1, 1)                                    # [1, T, 1, 1]
+            noise4 = (self.ou_noise / D).view(1, -1, 1, 1)              # [1, T, 1, 1]
+            Y = D4 * torch.cumsum(noise4 * factors, dim=1)              # [n_factors, T, B, B2]
+            projected = torch.einsum('jt,jkbs->ktbs', evecs_mat, Y)     # [T, n_tenors, B, B2]
+            return self.drift.unsqueeze(-1) + self.vols_tensor.view(1, -1, 1, 1) * projected
 
     @property
     def correlation_name(self):
@@ -2106,7 +2145,9 @@ class MarkovHMMSpotModel(StochasticProcess):
         else:
             # Inner mode: (T, B, B2). One regime path per outer × inner.
             T, B, B2 = Z.shape
-            u_flat = shared_mem.quasi_rng(B * B2, T + 1)[1].contiguous()             # (T+1, B*B2)
+            # Sobol dim = T+1 (inner timesteps, ≪ 21201 cap); samples = B*B2 paths (unbounded).
+            # Each path is one (T+1)-dim Sobol point; transpose so timesteps lead.
+            u_flat = shared_mem.quasi_rng(T + 1, B * B2)[1].transpose(0, 1).contiguous()  # (T+1, B*B2)
             u_regime = u_flat.reshape(T + 1, B, B2)
 
             regime0_override = shared_mem.t_Scenario_Buffer.get(

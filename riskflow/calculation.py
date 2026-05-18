@@ -487,18 +487,19 @@ class CMC_State_Inner(CMC_State):
     supported in inner mode. quasi_rng is inherited — callers handle any reshape."""
 
     def __init__(self, cholesky, static_buffer, batch_size, one, mcmc_sims, report_currency,
-                 seed, job_id, num_jobs, simulation_sub_batch,
+                 seed, job_id, num_jobs, simulation_sub_batch=0,
                  scale_survival=False, nomodel='Constant', keep_tensor=False):
-        if simulation_sub_batch <= 1:
-            raise ValueError(
-                f'CMC_State_Inner requires simulation_sub_batch > 1; got {simulation_sub_batch}. '
-                f'Use the base CMC_State for outer-only simulation.')
         super().__init__(cholesky, static_buffer, batch_size, one, mcmc_sims, report_currency,
                          seed, job_id, num_jobs, scale_survival=scale_survival,
                          nomodel=nomodel, keep_tensor=keep_tensor)
+        # 0 (default) = inner mode unused; base `reset()` works, `reset_inner()` raises.
         self.simulation_sub_batch = simulation_sub_batch
 
     def reset_inner(self, num_factors, time_grid: utils.TimeGrid, use_antithetic=False):
+        if self.simulation_sub_batch <= 1:
+            raise ValueError(
+                f'reset_inner requires simulation_sub_batch > 1; got {self.simulation_sub_batch}. '
+                f'Pass a positive Inner_Sub_Batch in params to enable nested simulation.')
         if use_antithetic:
             raise ValueError('CMC_State_Inner.reset_inner does not support antithetic sampling.')
         T = time_grid.scen_time_grid.size
@@ -805,7 +806,7 @@ class Credit_Monte_Carlo(Calculation):
                         current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
 
         # set up the device and allocate memory
-        shared_mem = self.__init_shared_mem(
+        shared_mem = self._init_shared_mem(
             int(params['Random_Seed']), params.get('NoModel', 'Constant'),
             params['Currency'], params.get('MCMC_Simulations', 2048),
             job_id, num_jobs, calc_greeks=sensitivities if greeks else None)
@@ -938,8 +939,9 @@ class Credit_Monte_Carlo(Calculation):
         # return the cholesky decomp
         return torch.linalg.cholesky(correlation_matrix)
 
-    def __init_shared_mem(self, seed, nomodel, reporting_currency, mcmc_sim, job_id, num_jobs, calc_greeks=None):
-        # check if we need to report gradients
+    def _init_shared_mem(self, seed, nomodel, reporting_currency, mcmc_sim, job_id, num_jobs, calc_greeks=None):
+        # Single-underscore (overridable): HedgeMonteCarlo overrides to construct
+        # CMC_State_Inner with simulation_sub_batch from params.
         if calc_greeks is not None:
             implied_vars = list(itertools.chain(*[x.items() for x in self.implied_var.values()]))
             if calc_greeks == 'Implied':
@@ -948,22 +950,17 @@ class Credit_Monte_Carlo(Calculation):
                 self.all_var = self.stoch_var + self.static_var
             else:
                 self.all_var = implied_vars + list(self.stoch_var.items()) + list(self.static_var.items())
-            # build our index
             self.make_factor_index(self.all_var)
 
-        # Now create a shared state with the cholesky decomp
-        # check the calculation parameters to see if we need to tweak the calculation a bit:
-        scale_by_survival = False
-        if self.params.get('Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
-            scale_by_survival = True
+        scale_by_survival = (
+            self.params.get('Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes')
 
-        shared_mem = CMC_State(
+        return CMC_State(
             self.get_cholesky_decomp(), self.static_var, self.batch_size,
             torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
                 utils.check_rate_name(reporting_currency), self.static_factors, self.stoch_factors),
-            seed, job_id, num_jobs, scale_by_survival, keep_tensor=self.params.get('Keep_Tensor', 'No')=='Yes')
-
-        return shared_mem
+            seed, job_id, num_jobs, scale_by_survival,
+            keep_tensor=self.params.get('Keep_Tensor', 'No') == 'Yes')
 
     def report(self, output):
         for result, data in output.items():
@@ -1697,6 +1694,18 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
     def _factor_bundle_key(factor_key):
         return utils.check_tuple_name(factor_key) if hasattr(factor_key, 'type') and hasattr(factor_key, 'name') else factor_key
 
+    def _init_shared_mem(self, seed, nomodel, reporting_currency, mcmc_sim, job_id, num_jobs, calc_greeks=None):
+        """Override: HedgeMonteCarlo doesn't compute greeks or FVA, so skip the parent's
+        make_factor_index / scale_survival setup. Build CMC_State_Inner directly so the
+        same shared_mem hosts outer (inherited `reset()`) and inner (`reset_inner()`) modes."""
+        return CMC_State_Inner(
+            self.get_cholesky_decomp(), self.static_var, self.batch_size,
+            torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
+                utils.check_rate_name(reporting_currency), self.static_factors, self.stoch_factors),
+            seed, job_id, num_jobs,
+            simulation_sub_batch=int(self.params.get('Inner_Sub_Batch', 0)),
+            keep_tensor=self.params.get('Keep_Tensor', 'No') == 'Yes')
+
     def update_factors(self, params, base_date, job_id, num_jobs):
         """Override: build dependent_factors from the generic Scenario_Factors JSON dict."""
         dependent_factors, stochastic_factors, _, reset_dates, settlement_currencies = self.config.calculate_dependencies(
@@ -1784,6 +1793,15 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         normalized_runtime = construct_torchrl_runtime(
             params, stoch_factors=self.stoch_factors,
         )
+
+        # Inner-MC setup. Copies are forked after outer setup precalc has populated
+        # `factor_key`/`spot0`/etc., so inner-mode precalc on the copies doesn't clobber
+        # outer-instance attrs read by outer generate each batch. `shared_mem` is a
+        # CMC_State_Inner — outer batches use inherited `reset()`, inner uses `reset_inner()`.
+        conditional_features_blocks = [] if params.get('Inner_MC_Enabled', 'No')=='Yes' else None
+        tradable_refs = sorted(normalized_runtime['names']['hedges']) if conditional_features_blocks is not None else ()
+        if conditional_features_blocks is not None:
+            self.stoch_factors_inner = {k: proc.copy() for k, proc in self.stoch_factors.items()}
 
         factor_tensor_blocks = {
             self._factor_bundle_key(key): [] for key in self.stoch_factors
@@ -1900,6 +1918,10 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                         hedge_profile_blocks['hedge_ratios'][instrument_name].append(ratios)
                     tradable_blocks[instrument_name].append(instrument_tensor.detach().clone())
 
+            if conditional_features_blocks is not None:
+                conditional_features_blocks.append(self._run_inner_mc_pass(
+                    run, shared_mem, base_date, params, tradable_refs).cpu())
+
             shared_mem.t_Buffer.clear()
 
         self.calc_stats[execution_label] = time.monotonic() - self.calc_stats[execution_label]
@@ -1916,6 +1938,17 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             runtime=normalized_runtime,
             privileged_factor_blocks=privileged_factor_blocks,
         )
+        if torchrl_bundle is not None and conditional_features_blocks:
+            torchrl_bundle['conditional_features'] = torch.cat(
+                conditional_features_blocks, dim=1)
+            torchrl_bundle['conditional_feature_names'] = [
+                'prob_loss',
+                'expected_loss_given_loss',
+            ] + [
+                f'{stat}_{ref}'
+                for ref in tradable_refs
+                for stat in ('expected_terminal_move_given_loss', 'expected_min_move_given_loss')
+            ]
         evaluation_summary = None
         optimizer_diagnostics = None
         policy_artifact = None
@@ -1959,6 +1992,149 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 'runtime_diagnostics': runtime_diagnostics,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Inner-MC subsystem
+    #
+    # Parallel to the outer-loop body inlined in `execute()`. Forks the simulator
+    # from each outer-path state at each outer timestep, runs inner MC to terminal
+    # under `no_grad`, reduces to conditional features per outer path. Outer process
+    # instances are not touched — inner uses shallow copies (`StochasticProcess.copy`)
+    # so per-instance precalc state (spot0, scenario_horizon, z_offset, ...) doesn't
+    # bleed across the outer/inner boundary.
+    # ------------------------------------------------------------------
+
+    def _find_spot_key(self):
+        """Return the unique CommodityPrice factor key from self.stoch_factors. Raises
+        if zero or multiple — v1 inner-MC is specified for a single-spot regime."""
+        spot_keys = [k for k in self.stoch_factors if k.type == 'CommodityPrice']
+        if len(spot_keys) != 1:
+            raise ValueError(
+                f'Inner MC expects exactly one CommodityPrice factor; found {len(spot_keys)}: {spot_keys}'
+            )
+        return spot_keys[0]
+
+    def _get_implied_for(self, key):
+        """Mirror of the outer `_build_factor_state` implied-tensor derivation. Returns
+        None if the factor has no implied variables."""
+        if key in self.implied_var:
+            return {k.name[-1]: v for k, v in self.implied_var[key].items()}
+        return None
+
+    def _extract_outer_state_at(self, t, key, scenario_buffer):
+        """Per-outer-path initial state for `key` at outer timestep `t`. Returned shape
+        matches what each process's `precalculate` expects in inner mode (one slot per
+        outer path along the last dim)."""
+        outer = scenario_buffer[key]
+        if key.type in ('CommodityPrice', 'CommodityBasis'):
+            return outer[t, :]
+        if key.type in ('ForwardRate', 'ForwardPrice', 'InterestRate'):
+            return outer[t, :, :]
+        raise NotImplementedError(
+            f'Inner MC has no per-path initial-state extractor for factor type {key.type!r}'
+        )
+
+    def _calc_inner_features(self, inner_mtm, inner_trade_tensors, tradable_refs):
+        """Per-outer-path features from inner-MC outputs: P(L_T > 0), E[L_T | loss],
+        and per-tradable E[F_T - F_0 | loss] / E[min_t F_t - F_0 | loss]. `clamp_min(1)`
+        sentinel: zero-loss paths yield all-zero features; `prob_loss == 0` flags them."""
+        L_T = inner_mtm[-1]                                            # (B_outer, B_inner)
+        loss_mask = (L_T > 0).to(dtype=L_T.dtype)                      # float, same dtype as L_T
+        loss_count = loss_mask.sum(dim=-1).clamp_min(1)
+
+        prob_loss = loss_mask.mean(dim=-1)                             # (B_outer,)
+        expected_loss_given_loss = (L_T * loss_mask).sum(dim=-1) / loss_count
+
+        per_contract = []
+        for ref in tradable_refs:
+            td = inner_trade_tensors[ref]                              # (T_inner, B_outer, B_inner)
+            df_terminal = td[-1] - td[0]
+            df_min = td.min(dim=0).values - td[0]
+            per_contract.append((df_terminal * loss_mask).sum(dim=-1) / loss_count)
+            per_contract.append((df_min * loss_mask).sum(dim=-1) / loss_count)
+
+        return torch.stack([prob_loss, expected_loss_given_loss] + per_contract, dim=-1)
+
+    def _run_inner_mc_pass(self, run, shared_mem, base_date, params, tradable_refs):
+        """Fork the simulator from each outer-path state at each outer timestep, run
+        inner MC under no_grad to terminal, reduce to conditional features.
+        Returns `(T_outer, B_outer, 2 + 2 * len(tradable_refs))`.
+
+        Process state is isolated via `self.stoch_factors_inner` (shallow copies of the
+        outer processes); `shared_mem` is the same instance the outer pass uses — its
+        t_Scenario_Buffer / t_Buffer are scratch and get overwritten cleanly.
+
+        Pricer-shape boundary: processes publish 4D (T, [tenor,] B, SB) to t_Scenario_Buffer
+        so cross-process reads (e.g. basis reading spot's (linked_key, 'regimes')) see the
+        structured (B, SB) split. The pricer machinery, however, is 2D-spot / 3D-curve
+        only — so we flatten the published process outputs (B, SB) → (B*SB) just before
+        resolve_structure, bump simulation_batch to match (sizes the cashflow buffer
+        correctly), then reshape pricing outputs back to (T, B, SB) for feature extraction."""
+        B_outer = shared_mem.simulation_batch
+        B_inner = shared_mem.simulation_sub_batch
+        B_flat = B_outer * B_inner
+        n_features = 2 + 2 * len(tradable_refs)
+        spot_key = self._find_spot_key()
+        # Snapshot holds tensor refs against in-place clears of `t_Scenario_Buffer` later.
+        outer_scenario_buffer = dict(shared_mem.t_Scenario_Buffer)
+        outer_regimes = outer_scenario_buffer[(spot_key, 'regimes')]   # (T_outer, B_outer) long
+
+        per_t = []
+        with torch.no_grad():
+            for t in range(self.time_grid.scen_time_grid.size):
+                t_days = int(self.time_grid.scen_time_grid[t])
+                inner_time_grid = self.time_grid.truncate_to(base_date, t_days)
+
+                # Terminal / past-end — emit zeros; `prob_loss == 0` flags this downstream.
+                if inner_time_grid.scen_time_grid.size < 2:
+                    per_t.append(shared_mem.one.new_zeros(B_outer, n_features))
+                    continue
+
+                inner_base_date = base_date + pd.Timedelta(days=t_days)
+                shared_mem.reset_inner(self.num_factors, inner_time_grid)
+                # Per-outer-path initial regime — read by the inner HMM generate.
+                shared_mem.t_Scenario_Buffer[(spot_key, 'regime0_inner')] = outer_regimes[t]
+
+                for key, proc_inner in self.stoch_factors_inner.items():
+                    if key.type in utils.DimensionLessFactors:
+                        continue
+                    proc_inner.precalculate(
+                        inner_base_date, inner_time_grid,
+                        self._extract_outer_state_at(t, key, outer_scenario_buffer),
+                        shared_mem, self.process_ofs[key],
+                        implied_tensor=self._get_implied_for(key),
+                    )
+                    shared_mem.t_Scenario_Buffer[key] = proc_inner.generate(shared_mem)
+
+                # Pricer boundary: collapse trailing (B, SB) on published process outputs and
+                # match simulation_batch so cashflow zeros size correctly.
+                for key in self.stoch_factors_inner:
+                    if key.type in utils.DimensionLessFactors:
+                        continue
+                    buf = shared_mem.t_Scenario_Buffer[key]
+                    shared_mem.t_Scenario_Buffer[key] = buf.reshape(*buf.shape[:-2], B_flat)
+                shared_mem.simulation_batch = B_flat
+
+                self.netting_sets.resolve_structure(shared_mem, inner_time_grid)
+                shared_mem.reset_cashflows(inner_time_grid)
+                inner_mtm_flat = self.liabilities.resolve_hedge_structure(
+                    shared_mem, inner_time_grid)['mtm']
+                # Reshape pricer outputs back to structured (T, [tenor,] B_outer, B_inner).
+                inner_mtm = inner_mtm_flat.reshape(*inner_mtm_flat.shape[:-1], B_outer, B_inner)
+                inner_trade_tensors = {
+                    x.Instrument.field['Reference']: x.Calc_res['tensor'].reshape(
+                        *x.Calc_res['tensor'].shape[:-1], B_outer, B_inner)
+                    for x in self.netting_sets.dependencies
+                    if x.Calc_res.get('tensor') is not None
+                }
+                per_t.append(self._calc_inner_features(
+                    inner_mtm, inner_trade_tensors, tradable_refs))
+
+                shared_mem.simulation_batch = B_outer
+                shared_mem.t_Buffer.clear()
+                shared_mem.t_Scenario_Buffer.clear()
+
+        return torch.stack(per_t, dim=0)
 
 
 def construct_calculation(calc_type, config, **kwargs):
