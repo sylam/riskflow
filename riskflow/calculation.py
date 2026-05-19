@@ -1711,8 +1711,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         dependent_factors, stochastic_factors, _, reset_dates, settlement_currencies = self.config.calculate_dependencies(
             params, base_date, self.input_time_grid)
 
-        # Size the time grid from Futures_Expiries (or a 2-year fallback)
-        max_expiry = max(reset_dates)
+        # Size the time grid from Futures_Expiries (or a 2-year fallback). If a
+        # liability-end cap was set upstream, clip max_expiry there — hedge maturities
+        # past liability end are dropped from the simulation horizon; the hedges
+        # themselves will be priced through liability end and any residual position
+        # closes out at fair value there.
+        max_expiry = min(max(reset_dates), self.liability_end_date)
         reset_dates = self.config.parse_grid(base_date, max_expiry, self.input_time_grid, past_max_date=True)
         reset_dates.update({base_date, max_expiry})
         # generate scerarios at each grid date
@@ -1775,6 +1779,21 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         liabilities = read_instruments(hedging_problem.get('Liabilities', {}))
         # store it away for deal resolution
         self.config.deals['Deals']['Children'] = instruments + liabilities
+        # Liability-driven time-grid cap. Design choice (not a bug): historically the
+        # simulator priced every hedge instrument to its own maturity, which extended
+        # the time grid to the latest hedge expiry. For hedge-MC that's wasteful —
+        # past the liability terminal there is nothing to hedge, and any residual
+        # hedge position is closed out at fair value at that point. Cap the global
+        # time grid at the liability's last cashflow / reval date so outer and inner
+        # sim both stop there. Picked up by update_factors below.
+        # `reset(holidays)` populates each liability's reval_dates / settlement_currencies
+        # from its `field` — this is the same call walk_groups makes a moment later, so
+        # the double-reset is idempotent. Without it the attrs don't exist yet.
+        liability_dates = set()
+        for liab in liabilities:
+            liab['Instrument'].reset(self.config.holidays)
+            liability_dates |= liab['Instrument'].get_reval_dates(clip_expiry=True)
+        self.liability_end_date = max(liability_dates)
         shared_mem = self.update_factors(params, base_date, job_id, num_jobs)
         # Build the valuation structure first; the hedging runtime will consume
         # the live factor and instrument tensors produced by this same loop.
@@ -2035,11 +2054,20 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         )
 
     def _calc_inner_features(self, inner_mtm, inner_trade_tensors, tradable_refs):
-        """Per-outer-path features from inner-MC outputs: P(L_T > 0), E[L_T | loss],
+        """Per-outer-path features from inner-MC outputs: P(L_T < 0), E[L_T | loss],
         and per-tradable E[F_T - F_0 | loss] / E[min_t F_t - F_0 | loss]. `clamp_min(1)`
-        sentinel: zero-loss paths yield all-zero features; `prob_loss == 0` flags them."""
-        L_T = inner_mtm[-1]                                            # (B_outer, B_inner)
-        loss_mask = (L_T > 0).to(dtype=L_T.dtype)                      # float, same dtype as L_T
+        sentinel: zero-loss paths yield all-zero features; `prob_loss == 0` flags them.
+
+        Sign convention: `liability` MTM follows the deal's natural Payer/Receiver sign
+        (see `_evaluate_objective`: net_pnl = pnl_excess + liability). For a Receiver,
+        L > 0 = money flows in = profit; L < 0 = loss. The hedger conditions on the
+        loss tail, so the mask is `L_T < 0`.
+
+        `inner_mtm[-2]` (not [-1]): the time-grid construction appends one extra date
+        past the liability terminal to show the netting set settling to zero ("clean
+        exit"). [-1] is that zero; [-2] is the pre-settlement terminal MTM."""
+        L_T = inner_mtm[-2]                                            # (B_outer, B_inner)
+        loss_mask = (L_T < 0).to(dtype=L_T.dtype)                      # float, same dtype as L_T
         loss_count = loss_mask.sum(dim=-1).clamp_min(1)
 
         prob_loss = loss_mask.mean(dim=-1)                             # (B_outer,)
@@ -2083,6 +2111,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         with torch.no_grad():
             for t in range(self.time_grid.scen_time_grid.size):
                 t_days = int(self.time_grid.scen_time_grid[t])
+                # self.time_grid is already capped at the liability terminal (see the
+                # liability-driven cap in execute()), so truncate_to(base+t) suffices —
+                # no additional end_date bound is needed here.
                 inner_time_grid = self.time_grid.truncate_to(base_date, t_days)
 
                 # Terminal / past-end — emit zeros; `prob_loss == 0` flags this downstream.
@@ -2107,7 +2138,14 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     shared_mem.t_Scenario_Buffer[key] = proc_inner.generate(shared_mem)
 
                 # Pricer boundary: collapse trailing (B, SB) on published process outputs and
-                # match simulation_batch so cashflow zeros size correctly.
+                # match simulation_batch so cashflow zeros size correctly. Iterates the
+                # factor-key registry only — auxiliaries published under tuple keys
+                # ((factor_key, 'regimes'), (factor_key, 'regime0_inner') etc.) are left
+                # in their (T, B, SB) / (B,) shapes. Safe for the inner loop because no
+                # downstream consumer here reads those auxiliaries (Basis read them during
+                # its own generate, which already ran), and t_Scenario_Buffer is cleared
+                # at the end of every inner-t iteration. If a future inner-loop consumer
+                # of regimes appears, switch to a shape-dispatched flatten.
                 for key in self.stoch_factors_inner:
                     if key.type in utils.DimensionLessFactors:
                         continue

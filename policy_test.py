@@ -17,7 +17,7 @@ if __name__=='__main__':
                     ".Timestamp": "2026-04-10"
                 },
                 "Simulation_Batches": 4,
-                "Batch_Size": 512,
+                "Batch_Size": 256,
                 "Random_Seed": 42,
                 "Currency": "USD",
                 "Calendar": "Chicago",

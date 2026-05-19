@@ -454,6 +454,14 @@ class Deal(object):
     def get_settlement_currencies(self):
         return self.settlement_currencies
 
+    def refresh_dependencies(self, base_date, time_grid, deal_data):
+        """Inner-MC hook: rebase any date-anchored entries in `deal_data.Factor_dep` /
+        `deal_data.Time_dep` to a new (base_date, time_grid). Default is a no-op for
+        deals whose dependencies don't carry the outer base date. Overrides should
+        mutate the existing dicts in place (DealDataType is a NamedTuple, so the
+        Factor_dep / Time_dep references themselves cannot be reassigned)."""
+        return
+
     def calculate(self, shared, time_grid, deal_data):
         try:
             # generate the theo price
