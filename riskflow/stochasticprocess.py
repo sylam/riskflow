@@ -786,7 +786,7 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
 
         if delta_var.size:
             # needed for numerical stability
-            delta_var[delta_var <= 0.0] = delta_var[delta_var > 0.0].min()
+            delta_var[delta_var < 0.0] = delta_var[delta_var >= 0.0].min()
         self.delta_vol = shared.one.new_tensor(np.sqrt(np.hstack((0.0, delta_var))).reshape(-1, 1))
 
         self.AtT = shared.one.new_tensor(AtT)
@@ -1145,8 +1145,12 @@ class PCAInterestRateModel(StochasticProcess):
         self.vols = np.interp(factor_tenor, *self.param['Yield_Volatility'].array.T)
         alpha = self.param['Reversion_Speed']
 
+        # Anchor at time_grid_years[0] so per-step dt and elapsed time are correct in both
+        # outer mode (time_grid_years[0] = 0) and inner-MC kept-base mode (> 0). `elapsed`
+        # is time since sim start, used wherever the legacy code used absolute time_grid_years.
         # Exact OU discretisation: Y_{k+1} = exp(-α Δt_k) Y_k + sqrt((1-exp(-2α Δt_k))/(2α)) Z_{k+1}
-        dt_steps   = np.diff(np.append([0.0], time_grid_years))              # [T]
+        dt_steps   = np.diff(np.append([time_grid_years[0]], time_grid_years))  # [T]
+        elapsed    = dt_steps.cumsum()                                        # [T] — time since sim start
         ou_decay   = np.exp(-alpha * dt_steps)                               # [T]
         ou_std     = np.sqrt((1.0 - np.exp(-2.0 * alpha * dt_steps)) / (2.0 * alpha))  # [T]
         self.ou_decay    = shared.one.new_tensor(ou_decay.reshape(-1, 1))    # [T, 1]
@@ -1154,7 +1158,7 @@ class PCAInterestRateModel(StochasticProcess):
         self.vols_tensor = shared.one.new_tensor(self.vols.reshape(-1, 1))   # [n_tenors, 1]
 
         # Ito drift: -½ σ_τ² Var(Y(t_k)) = -½ σ_τ² (1-exp(-2α t_k))/(2α)  (full value at each t_k)
-        ou_var_cumul = (1.0 - np.exp(-2.0 * alpha * time_grid_years)) / (2.0 * alpha)  # [T]
+        ou_var_cumul = (1.0 - np.exp(-2.0 * alpha * elapsed)) / (2.0 * alpha)  # [T]
         self.drift = shared.one.new_tensor(np.expand_dims(
             -0.5 * (self.vols * self.vols).reshape(1, -1) * ou_var_cumul.reshape(-1, 1), axis=2))
 
@@ -1170,8 +1174,8 @@ class PCAInterestRateModel(StochasticProcess):
                  self.param['Historical_Yield'].array.T)), kind='linear', bounds_error=False,
                     fill_value=self.param['Historical_Yield'].array.T[-1][-1])
             omega = shared.one.new_tensor(hist_mean(self.factor.tenors).reshape(1, -1))        # [1, n_tenors]
-            decay = shared.one.new_tensor(np.exp(-alpha * time_grid_years).reshape(-1, 1))     # [T, 1]
-            # R_τ(t) = exp(-α t) r_τ(0) + (1 - exp(-α t)) Θ_τ
+            decay = shared.one.new_tensor(np.exp(-alpha * elapsed).reshape(-1, 1))             # [T, 1]
+            # R_τ(t) = exp(-α t) r_τ(0) + (1 - exp(-α t)) Θ_τ  (t is time since sim start)
             if tensor.ndim == 1:
                 curve_t0 = tensor.reshape(1, -1)                                                # [1, n_tenors]
                 fwd_curve = decay * curve_t0 + (1.0 - decay) * omega                            # [T, n_tenors]
@@ -1183,13 +1187,13 @@ class PCAInterestRateModel(StochasticProcess):
         else:
             if tensor.ndim == 1:
                 fwd_curve = utils.calc_curve_forwards(
-                    self.factor, tensor, time_grid_years, shared) / factor_tenor_t             # [T, n_tenors]
+                    self.factor, tensor, elapsed, shared) / factor_tenor_t                     # [T, n_tenors]
             else:
                 # Per-outer-path forwards: loop over B and stack. Inner pass runs under
                 # no_grad so no autograd graph cost; vectorise later if profiling shows it.
                 fwd_curve = torch.stack([
                     utils.calc_curve_forwards(
-                        self.factor, tensor[:, b], time_grid_years, shared) / factor_tenor_t
+                        self.factor, tensor[:, b], elapsed, shared) / factor_tenor_t
                     for b in range(tensor.shape[1])
                 ], dim=-1)                                                                       # [T, n_tenors, B]
 
@@ -1238,7 +1242,7 @@ class PCAInterestRateCalibration(object):
 
     def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
         min_rate = data_frame.min().min()
-        force_positive = 0.0 if min_rate > 0.0 else -5.0 * min_rate
+        force_positive = 0.0 #if min_rate > 0.0 else -5.0 * min_rate
         tenor = np.array([(x.split(',')[1]) for x in data_frame.columns], dtype=np.float64)
         stats, correlation, delta = utils.calc_statistics(data_frame + force_positive, method='Log',
                                                           num_business_days=num_business_days, max_alpha=4.0)
@@ -2050,7 +2054,10 @@ class MarkovHMMSpotModel(StochasticProcess):
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size
 
-        dt_arr = np.diff(np.hstack(([0.0], time_grid.time_grid_years)))
+        # Anchor at time_grid_years[0] so per-step dt is correct under both outer mode
+        # (scen_time_grid[0] = 0) and inner-MC kept-base mode (scen_time_grid[0] > 0).
+        tg_years = time_grid.time_grid_years
+        dt_arr = np.diff(np.hstack(([tg_years[0]], tg_years)))
         states = self.param['States']
         self.n_states = len(states)
         T = len(dt_arr)
@@ -2409,7 +2416,10 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
 
         dt_calib = float(self.param['Calibration_DT_Years'])
         sim_t = time_grid.time_grid_years
-        dt_arr = np.diff(np.hstack(([0.0], sim_t)))                                    # (T,)
+        # Anchor at sim_t[0] so per-step dt is correct under both outer mode (sim_t[0] = 0)
+        # and inner-MC kept-base mode (sim_t[0] > 0). Slot-ladder roll count below uses
+        # absolute sim_t intentionally — rolls happen at physical calendar dates.
+        dt_arr = np.diff(np.hstack(([sim_t[0]], sim_t)))                                # (T,)
 
         # σ_step uses a Brownian approximation σ_calib·√(δ/δ_calib) which assumes i.i.d.
         # innovations. The exact VAR(1) per-step covariance is V_stat − Φ^(δ/δ_calib)

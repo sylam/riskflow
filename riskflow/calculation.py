@@ -2053,7 +2053,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             f'Inner MC has no per-path initial-state extractor for factor type {key.type!r}'
         )
 
-    def _calc_inner_features(self, inner_mtm, inner_trade_tensors, tradable_refs):
+    def _calc_inner_features(self, inner_mtm, inner_trade_tensors, tradable_refs, cutoff_idx):
         """Per-outer-path features from inner-MC outputs: P(L_T < 0), E[L_T | loss],
         and per-tradable E[F_T - F_0 | loss] / E[min_t F_t - F_0 | loss]. `clamp_min(1)`
         sentinel: zero-loss paths yield all-zero features; `prob_loss == 0` flags them.
@@ -2065,7 +2065,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         `inner_mtm[-2]` (not [-1]): the time-grid construction appends one extra date
         past the liability terminal to show the netting set settling to zero ("clean
-        exit"). [-1] is that zero; [-2] is the pre-settlement terminal MTM."""
+        exit"). [-1] is that zero; [-2] is the pre-settlement terminal MTM.
+
+        Tradable tensors are sliced at `cutoff_idx` — the post-gather per-deal tensor
+        covers `[0, expiry]` over the full outer interp, and positions `[0, cutoff_idx)`
+        hold garbage from the post-gather interpolation against a sliced deal_time_grid
+        (legitimately unused — we never read them). The valid future is `[cutoff_idx:]`."""
         L_T = inner_mtm[-2]                                            # (B_outer, B_inner)
         loss_mask = (L_T < 0).to(dtype=L_T.dtype)                      # float, same dtype as L_T
         loss_count = loss_mask.sum(dim=-1).clamp_min(1)
@@ -2075,7 +2080,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         per_contract = []
         for ref in tradable_refs:
-            td = inner_trade_tensors[ref]                              # (T_inner, B_outer, B_inner)
+            td = inner_trade_tensors[ref][cutoff_idx:]                 # (T_inner, B_outer, B_inner)
             df_terminal = td[-1] - td[0]
             df_min = td.min(dim=0).values - td[0]
             per_contract.append((df_terminal * loss_mask).sum(dim=-1) / loss_count)
@@ -2083,27 +2088,58 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         return torch.stack([prob_loss, expected_loss_given_loss] + per_contract, dim=-1)
 
+    def _restricted_struct(self, outer_struct, cutoff_mtm_idx):
+        """Build a fresh DealStructure mirroring outer_struct but with each deal's
+        Time_dep restricted to events at mtm positions >= cutoff_mtm_idx via
+        `DealTimeDependencies.copy_restricted`. Factor_dep is shared by reference
+        (static factor lookups, time-grid-independent for the deal types used in
+        inner-MC); Calc_res is fresh so inner pricing doesn't clobber outer storage.
+        Returns a DealStructure with possibly fewer dependencies (deals fully in
+        the past are dropped). Does not recurse into sub_structures — inner-MC use
+        case has a flat dependency list."""
+        inner = DealStructure(outer_struct.obj.Instrument, store_results=outer_struct.store_results)
+        for dd in outer_struct.dependencies:
+            new_td = dd.Time_dep.copy_restricted(cutoff_mtm_idx)
+            if new_td is None:
+                continue
+            inner.dependencies.append(utils.DealDataType(
+                Instrument=dd.Instrument,
+                Factor_dep=dd.Factor_dep,
+                Time_dep=new_td,
+                Calc_res={} if outer_struct.store_results else None,
+            ))
+        return inner
+
     def _run_inner_mc_pass(self, run, shared_mem, base_date, params, tradable_refs):
         """Fork the simulator from each outer-path state at each outer timestep, run
         inner MC under no_grad to terminal, reduce to conditional features.
         Returns `(T_outer, B_outer, 2 + 2 * len(tradable_refs))`.
 
-        Process state is isolated via `self.stoch_factors_inner` (shallow copies of the
-        outer processes); `shared_mem` is the same instance the outer pass uses — its
-        t_Scenario_Buffer / t_Buffer are scratch and get overwritten cleanly.
+        Two coordinate systems coexist per iteration:
 
-        Pricer-shape boundary: processes publish 4D (T, [tenor,] B, SB) to t_Scenario_Buffer
-        so cross-process reads (e.g. basis reading spot's (linked_key, 'regimes')) see the
-        structured (B, SB) split. The pricer machinery, however, is 2D-spot / 3D-curve
-        only — so we flatten the published process outputs (B, SB) → (B*SB) just before
-        resolve_structure, bump simulation_batch to match (sizes the cashflow buffer
-        correctly), then reshape pricing outputs back to (T, B, SB) for feature extraction."""
+        - Process side: `inner_time_grid` (shifted-base truncation) feeds precalc + generate.
+          With the process anchor-fix in stochasticprocess.py, dt[0]=0 and the inner sim
+          starts at inner_base regardless of whether the grid is shifted or kept-base.
+
+        - Pricer side: the FULL outer `self.time_grid`. Deal Factor_dep is unchanged; each
+          deal's Time_dep is restricted via `copy_restricted(cutoff_mtm_idx)` so pricers
+          iterate only future deal events (the perf win) while past-fixing lookups via
+          `get_simulated_resets` find values at past calendar dates in the stuffed buffer.
+
+        Buffer stuffing: per published factor, prepend outer past `[:cutoff_idx]` (broadcast
+        across B_inner) to the inner-generated future, then flatten `(B_outer, B_inner) →
+        B_outer * B_inner` for the pricer's standard 2D-spot / 3D-curve scenario shape.
+        Past positions in the stuffed buffer hold the same outer-realized value across all
+        B_inner sub-paths of a given outer path — exactly what path-dependent payoffs need
+        (Asian averaging picks the realized fixings; barrier touch flags read the realized
+        levels)."""
         B_outer = shared_mem.simulation_batch
         B_inner = shared_mem.simulation_sub_batch
         B_flat = B_outer * B_inner
         n_features = 2 + 2 * len(tradable_refs)
         spot_key = self._find_spot_key()
-        # Snapshot holds tensor refs against in-place clears of `t_Scenario_Buffer` later.
+        # Snapshot holds outer-tensor refs against the per-iteration t_Scenario_Buffer
+        # clears at the end of each inner-t iteration.
         outer_scenario_buffer = dict(shared_mem.t_Scenario_Buffer)
         outer_regimes = outer_scenario_buffer[(spot_key, 'regimes')]   # (T_outer, B_outer) long
 
@@ -2111,15 +2147,16 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         with torch.no_grad():
             for t in range(self.time_grid.scen_time_grid.size):
                 t_days = int(self.time_grid.scen_time_grid[t])
-                # self.time_grid is already capped at the liability terminal (see the
-                # liability-driven cap in execute()), so truncate_to(base+t) suffices —
-                # no additional end_date bound is needed here.
                 inner_time_grid = self.time_grid.truncate_to(base_date, t_days)
 
                 # Terminal / past-end — emit zeros; `prob_loss == 0` flags this downstream.
                 if inner_time_grid.scen_time_grid.size < 2:
                     per_t.append(shared_mem.one.new_zeros(B_outer, n_features))
                     continue
+
+                # In HedgeMonteCarlo scen_time_grid == mtm_time_grid (dynamic_scenario_dates),
+                # so the same `t` indexes both the scenario buffer and the mtm grid.
+                cutoff_idx = t
 
                 inner_base_date = base_date + pd.Timedelta(days=t_days)
                 shared_mem.reset_inner(self.num_factors, inner_time_grid)
@@ -2137,36 +2174,41 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     )
                     shared_mem.t_Scenario_Buffer[key] = proc_inner.generate(shared_mem)
 
-                # Pricer boundary: collapse trailing (B, SB) on published process outputs and
-                # match simulation_batch so cashflow zeros size correctly. Iterates the
-                # factor-key registry only — auxiliaries published under tuple keys
-                # ((factor_key, 'regimes'), (factor_key, 'regime0_inner') etc.) are left
-                # in their (T, B, SB) / (B,) shapes. Safe for the inner loop because no
-                # downstream consumer here reads those auxiliaries (Basis read them during
-                # its own generate, which already ran), and t_Scenario_Buffer is cleared
-                # at the end of every inner-t iteration. If a future inner-loop consumer
-                # of regimes appears, switch to a shape-dispatched flatten.
+                # Stuff outer past into each published factor buffer + flatten (B, SB) →
+                # (B*SB) for the pricer. Auxiliaries under tuple keys (e.g. regime paths)
+                # are not touched — they were consumed during inner generate; t_Scenario_Buffer
+                # is cleared at iteration end.
                 for key in self.stoch_factors_inner:
                     if key.type in utils.DimensionLessFactors:
                         continue
-                    buf = shared_mem.t_Scenario_Buffer[key]
-                    shared_mem.t_Scenario_Buffer[key] = buf.reshape(*buf.shape[:-2], B_flat)
+                    inner_path = shared_mem.t_Scenario_Buffer[key]                  # (T_inner, ..., B, SB)
+                    outer_path = outer_scenario_buffer[key]                          # (T_outer, ..., B)
+                    outer_past = outer_path[:cutoff_idx]                             # (cutoff, ..., B)
+                    outer_past_b2 = outer_past.unsqueeze(-1).expand(*outer_past.shape, B_inner)
+                    stuffed = torch.cat([outer_past_b2, inner_path], dim=0)          # (T_outer, ..., B, SB)
+                    shared_mem.t_Scenario_Buffer[key] = stuffed.reshape(
+                        *stuffed.shape[:-2], B_flat)
                 shared_mem.simulation_batch = B_flat
 
-                self.netting_sets.resolve_structure(shared_mem, inner_time_grid)
-                shared_mem.reset_cashflows(inner_time_grid)
-                inner_mtm_flat = self.liabilities.resolve_hedge_structure(
-                    shared_mem, inner_time_grid)['mtm']
-                # Reshape pricer outputs back to structured (T, [tenor,] B_outer, B_inner).
+                # Per-iteration restricted DealStructures: same instruments + Factor_dep,
+                # fresh Time_dep slicing off past events, fresh Calc_res.
+                inner_netting_sets = self._restricted_struct(self.netting_sets, cutoff_idx)
+                inner_liabilities = self._restricted_struct(self.liabilities, cutoff_idx)
+
+                inner_netting_sets.resolve_structure(shared_mem, self.time_grid)
+                shared_mem.reset_cashflows(self.time_grid)
+                inner_mtm_flat = inner_liabilities.resolve_hedge_structure(
+                    shared_mem, self.time_grid)['mtm']
+                # Aggregated liability mtm shape (mtm_time_grid.size, B_flat); reshape last dim.
                 inner_mtm = inner_mtm_flat.reshape(*inner_mtm_flat.shape[:-1], B_outer, B_inner)
                 inner_trade_tensors = {
                     x.Instrument.field['Reference']: x.Calc_res['tensor'].reshape(
                         *x.Calc_res['tensor'].shape[:-1], B_outer, B_inner)
-                    for x in self.netting_sets.dependencies
+                    for x in inner_netting_sets.dependencies
                     if x.Calc_res.get('tensor') is not None
                 }
                 per_t.append(self._calc_inner_features(
-                    inner_mtm, inner_trade_tensors, tradable_refs))
+                    inner_mtm, inner_trade_tensors, tradable_refs, cutoff_idx))
 
                 shared_mem.simulation_batch = B_outer
                 shared_mem.t_Buffer.clear()

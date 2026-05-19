@@ -646,6 +646,17 @@ class DealTimeDependencies(object):
         # store the indices for linear interpolation
         self.update_indices()
 
+    def copy_restricted(self, cutoff_mtm_index):
+        """Fresh DealTimeDependencies covering only deal events at mtm positions
+        >= cutoff_mtm_index. delta/interp/indices/alpha are recomputed via __init__
+        for the sliced view, so the post-pricing interpolate path produces output
+        aligned with mtm_time_grid (terminal lands at the deal's expiry position).
+        Returns None if all events are past the cutoff."""
+        keep = self.deal_time_grid >= cutoff_mtm_index
+        if not keep.any():
+            return None
+        return type(self)(self.mtm_time_grid, self.deal_time_grid[keep])
+
     def update_indices(self):
         self.index = np.searchsorted(self.deal_time_grid, np.arange(self.interp.size), side='right') - 1
         self.index_next = (self.index + 1).clip(0, self.deal_time_grid.size - 1)
