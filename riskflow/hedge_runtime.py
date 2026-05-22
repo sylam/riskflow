@@ -140,6 +140,45 @@ def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -
     }
 
 
+def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Normalize the `Solver` config block (Execution_Mode='solve_hedge'). Mirrors
+    `_normalize_optimizer_config`: accepts None (non-solve modes), requires `Object`."""
+    if solver_config is None:
+        return None
+    if "Object" not in solver_config:
+        raise ValueError("Hedging_Problem['Solver'] requires an 'Object' field")
+    value_fn = dict(solver_config.get("Value_Fn", {}))
+    return {
+        "object": str(solver_config["Object"]).lower(),
+        "training_action_grid_levels_per_axis":
+            int(solver_config.get("Training_Action_Grid_Levels_Per_Axis", 11)),
+        "training_action_chunk_size": int(solver_config.get("Training_Action_Chunk_Size", 64)),
+        "decision_action_search": str(solver_config.get("Decision_Action_Search", "fine_grid")).lower(),
+        "decision_action_grid_levels_per_axis":
+            int(solver_config.get("Decision_Action_Grid_Levels_Per_Axis", 51)),
+        "turnover_cost_padding_multiplier":
+            float(solver_config.get("Turnover_Cost_Padding_Multiplier", 1.0)),
+        "range_projection_alpha":
+            float(solver_config.get("Range_Projection_Alpha", 1.0e-3)),
+        "include_dynamic_features_in_value_inputs":
+            bool(solver_config.get("Include_Dynamic_Features_In_Value_Inputs", False)),
+        "multi_seed_count": int(solver_config.get("Multi_Seed_Count", 1)),
+        "run_hindsight_diagnostic": bool(solver_config.get("Run_Hindsight_Diagnostic", False)),
+        "run_mpc_comparison": bool(solver_config.get("Run_Mpc_Comparison", False)),
+        "run_textbook_benchmark": bool(solver_config.get("Run_Textbook_Benchmark", False)),
+        "textbook_allocation": str(solver_config.get("Textbook_Allocation", "maturity_matched")).lower(),
+        "value_fn": {
+            "ols_refit_cadence_daily_solves": int(value_fn.get("OLS_Refit_Cadence_Daily_Solves", 5)),
+            "buffer_max_age_daily_solves": int(value_fn.get("Buffer_Max_Age_Daily_Solves", 60)),
+            "mlp_hidden": list(value_fn.get("MLP_Hidden", [64, 64, 64])),
+            "mlp_activation": str(value_fn.get("MLP_Activation", "gelu")).lower(),
+            "mlp_train_steps_per_solve": int(value_fn.get("MLP_Train_Steps_Per_Solve", 200)),
+            "mlp_adam_lr": float(value_fn.get("MLP_Adam_LR", 1.0e-3)),
+            "mlp_final_init_scale": float(value_fn.get("MLP_Final_Init_Scale", 0.0)),
+        },
+    }
+
+
 def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
     if objective_config is None:
         return None
@@ -383,8 +422,9 @@ def construct_torchrl_runtime(
     evaluator_config = hedging_problem["Evaluator"]
     liabilities = _normalize_liabilities(hedging_problem)
     objective_config = hedging_problem.get("Objective")
-    policy_config = hedging_problem["Policy"]
+    policy_config = hedging_problem.get("Policy")
     optimizer_config = hedging_problem.get("Optimizer")
+    solver_config = hedging_problem.get("Solver")
     tradables = _flatten_tradable_entries(hedging_problem["Tradable_Instruments"])
     execution_mode = _normalize_execution_mode(config)
     accounting_mode = _normalize_accounting_mode(evaluator_config)
@@ -417,12 +457,26 @@ def construct_torchrl_runtime(
     }
     if execution_mode == "optimize_policy" and optimizer_config is None:
         raise ValueError("Execution_Mode 'optimize_policy' requires Hedging_Problem['Optimizer']")
-    policy = _normalize_policy_config(policy_config)
+    if execution_mode == "solve_hedge":
+        if solver_config is None:
+            raise ValueError("Execution_Mode 'solve_hedge' requires Hedging_Problem['Solver']")
+        if str(config.get("Inner_MC_Enabled", "No")) != "Yes":
+            raise ValueError("Execution_Mode 'solve_hedge' requires Inner_MC_Enabled='Yes'")
+        if int(config.get("Inner_Sub_Batch", 0)) < 128:
+            raise ValueError("Execution_Mode 'solve_hedge' requires Inner_Sub_Batch >= 128")
+        if str((objective_config or {}).get("Object", "")).lower() != "asymmetricutility_symlog":
+            raise ValueError(
+                "Execution_Mode 'solve_hedge' requires Objective.Object='AsymmetricUtility_Symlog'. "
+                "The DP recursion lives in utility space: a non-symlog (identity) objective leaves "
+                "V-hat unbounded in dollars and the backward sweep blows up multiplicatively.")
+    # Policy is optional under solve_hedge — the DP/MPC solver replaces the RL policy track.
+    policy = _normalize_policy_config(policy_config) if policy_config is not None else None
     names = {
         "tradables": tuple(normalized_tradables.keys()),
         "hedges": hedge_names,
         "cash_accounts": cash_account_names,
-        "action_instruments": tuple(policy["action_space"]["instrument_order"]),
+        "action_instruments": (tuple(policy["action_space"]["instrument_order"])
+                               if policy is not None else hedge_names),
         "liabilities": tuple(liabilities.keys()),
     }
     history_lookback = int(hedging_problem.get("History_Lookback_Business_Days", 30))
@@ -439,6 +493,7 @@ def construct_torchrl_runtime(
         "objective": _normalize_objective_config(objective_config),
         "policy": policy,
         "optimizer": _normalize_optimizer_config(optimizer_config),
+        "solver": _normalize_solver_config(solver_config),
         "history_lookback_business_days": history_lookback,
         "portfolio_state": _normalize_portfolio_state(
             hedging_problem,

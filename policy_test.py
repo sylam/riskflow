@@ -1,9 +1,16 @@
-import os
-
-
 if __name__=='__main__':
+    import argparse
+    import re
     import riskflow as rf
-    from riskflow.structured_policy import save_policy_artifact
+
+    parser = argparse.ArgumentParser(description='Run the solve_hedge test job.')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random_Seed — seeds the outer Sobol and the torch global '
+                             'RNG behind the inner-MC Student-t draws. Vary it across '
+                             'instances for independent V_0 estimates.')
+    parser.add_argument('--multi-seed-count', type=int, default=1,
+                        help='Solver.Multi_Seed_Count — inner-MC re-seed repeats per run.')
+    args = parser.parse_args()
 
     cx = rf.Context()
 
@@ -16,14 +23,14 @@ if __name__=='__main__':
                 "Base_Date": {
                     ".Timestamp": "2026-04-10"
                 },
-                "Simulation_Batches": 4,
+                "Simulation_Batches": 1,
                 "Batch_Size": 256,
                 "Random_Seed": 42,
                 "Currency": "USD",
                 "Calendar": "Chicago",
-                "Execution_Mode": "optimize_policy",
+                "Execution_Mode": "solve_hedge",
                 "Inner_MC_Enabled": "Yes",
-                "Inner_Sub_Batch": 256,
+                "Inner_Sub_Batch": 128,
                 "Hedging_Problem": {
                     "History_Lookback_Business_Days": 30,
                     "Tradable_Instruments": {
@@ -139,7 +146,7 @@ if __name__=='__main__':
                         }
                     },
                     "Objective": {
-                        "Object": "TerminalFloorThenSurplusUtility",
+                        "Object": "AsymmetricUtility_Symlog",
                         "Floor_Penalty": 50.0,
                         "Surplus_Reward": 1.0,
                         "Power": 1.0,
@@ -187,32 +194,6 @@ if __name__=='__main__':
                             }
                         }
                     },
-                    "Policy": {
-                        "Object": "StructuredRebalancePolicy",
-                        "Action_Space": {
-                            "Instrument_Order": [
-                                "PL_APR_2026", "PL_JUL_2026", "PL_OCT_2026"
-                            ],
-                            "Trade_Deltas": [
-                                [-50, -45, -40, -35, -30, -25, -20, -15,
-                                 -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                                 15, 20, 25, 30, 35, 40, 45, 50],
-                                [-50, -45, -40, -35, -30, -25, -20, -15,
-                                 -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                                 15, 20, 25, 30, 35, 40, 45, 50],
-                                [-50, -45, -40, -35, -30, -25, -20, -15,
-                                 -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                                 15, 20, 25, 30, 35, 40, 45, 50]
-                            ]
-                        },
-                        "Model": {
-                            "Object": "EntityTransformer",
-                            "Token_Dim": 64,
-                            "Emb_Dim": 8,
-                            "N_Heads": 4,
-                            "N_Layers": 2
-                        }
-                    },
                     "Evaluator": {
                         "Object": "DynamicHedgeEvaluator",
                         "Accounting_Mode": "futures",
@@ -229,39 +210,26 @@ if __name__=='__main__':
                         },
                         "Total_Position_Abs_Limit": 50
                     },
-                    "Optimizer": {
-                        "Object": "PPO",
-                        "Epochs": 80,
-                        "PPO_Epochs": 4,
-                        "Minibatch_Size": 8192,
-                        "Gamma": 1.0,
-                        "GAE_Lambda": 0.995,
-                        "Learning_Rate": 0.0003,
-                        "LR_Schedule": "cosine",
-                        "LR_Min": 1.0e-5,
-                        "Clip_Eps": 0.2,
-                        "Value_Coef": 0.1,
-                        "Entropy_Coef": 0.001,
-                        "Max_Grad_Norm": 0.5,
-                        "Reward_Scale": 1.0e-6,
-                        "Dense_Tracking_Reward_Scale": 2.0,
-                        "Dense_Reward_Mode": "asymmetric",
-                        "Anchor_Beta": 0.0,
-                        "Anchor_Beta_Floor": 0.0,
-                        "Anchor_Anneal_Epochs": 0,
-                        "Anchor_Bin_Sharpness": 2.0,
-                        "Anchor_Target": "delta1_jul",
-                        "CVaR_Alpha": 0.0,
-                        "CVaR_Lambda": 0.0,
-                        "Value_Loss_Asym_Weight": 1.0,
-                        "Entropy_Floor_H_Min": 0.0,
-                        "Entropy_Floor_Coef": 0.0,
-                        "Validation_Fraction": 0.25,
-                        "Validation_Min_Batch": 512,
-                        "Decision_Interval_Curriculum": [
-                            {"Start_Epoch": 1, "End_Epoch": 80, "Interval_Business_Days": 1}
-                        ],
-                        "Seed": 42
+                    "Solver": {
+                        "Object": "LsmDpSolver",
+                        "Training_Action_Grid_Levels_Per_Axis": 11,
+                        "Training_Action_Chunk_Size": 64,
+                        "Decision_Action_Search": "fine_grid",
+                        "Decision_Action_Grid_Levels_Per_Axis": 51,
+                        "Turnover_Cost_Padding_Multiplier": 1.5,
+                        "Range_Projection_Alpha": 0.001,
+                        "Value_Fn": {
+                            "MLP_Hidden": [64, 64, 64],
+                            "MLP_Activation": "gelu",
+                            "MLP_Train_Steps_Per_Solve": 0,
+                            "MLP_Adam_LR": 1.0e-3,
+                            "MLP_Final_Init_Scale": 0.0
+                        },
+                        "Include_Dynamic_Features_In_Value_Inputs": false,
+                        "Multi_Seed_Count": 1,
+                        "Run_Hindsight_Diagnostic": true,
+                        "Run_Mpc_Comparison": true,
+                        "Run_Textbook_Benchmark": true
                     }
                 }
             },
@@ -899,13 +867,13 @@ if __name__=='__main__':
     }
     '''
 
+    json, n = re.subn(r'"Random_Seed":\s*\d+', f'"Random_Seed": {args.seed}', json)
+    assert n == 1, f'expected exactly one Random_Seed in the config, found {n}'
+    json, n = re.subn(r'"Multi_Seed_Count":\s*\d+',
+                      f'"Multi_Seed_Count": {args.multi_seed_count}', json)
+    assert n == 1, f'expected exactly one Multi_Seed_Count in the config, found {n}'
+
     cx.load_json((json, 'hedge_test.json'))
     calc, result = cx.run_job()
 
-    artifact_path = save_policy_artifact(
-        result.policy_artifact,
-        os.path.join('artifacts', 'policy_test_policy_artifact.json'),
-    )
-
     print(result.evaluation_summary)
-    print({'policy_artifact_path': str(artifact_path)})

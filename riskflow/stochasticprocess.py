@@ -18,6 +18,7 @@
 
 # import standard libraries
 import copy
+import logging
 import itertools
 
 # 3rd party libraries
@@ -2132,7 +2133,9 @@ class MarkovHMMSpotModel(StochasticProcess):
             Z_dt = Z.to(dtype=dtype)
             if nu is not None:
                 nu_t = nu[regimes]                                                   # (T, B)
-                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype)
+                # Floor the chi-square draw — an underflow to 0 makes sqrt(nu/W) blow
+                # up to inf (or 0*inf=NaN), corrupting ds before the log-path clamp.
+                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype).clamp_min(1.0e-6)
                 t_innov = Z_dt * torch.sqrt(nu_t / W)
                 scale_to_unit_var = torch.sqrt((nu_t - 2.0).clamp_min(1.0e-3) / nu_t)
                 innov = t_innov * scale_to_unit_var
@@ -2146,7 +2149,10 @@ class MarkovHMMSpotModel(StochasticProcess):
             s0 = self.spot0.expand(B)                                                # (1,) -> (B,)
             if self.log_price:
                 log_path = s0.log().unsqueeze(0) + ds.cumsum(dim=0)                  # (T, B)
-                spot_path = log_path.exp()
+                # Floor the log-path before exp(): a fat-tailed Student-t innovation can
+                # drive it below the float underflow threshold, where exp() returns 0.0
+                # and breaks the strictly-positive price-level invariant downstream.
+                spot_path = log_path.clamp_min(-10.0).exp()
             else:
                 spot_path = s0.unsqueeze(0) + ds.cumsum(dim=0)                       # (T, B)
         else:
@@ -2178,7 +2184,9 @@ class MarkovHMMSpotModel(StochasticProcess):
             Z_dt = Z.to(dtype=dtype)
             if nu is not None:
                 nu_t = nu[regimes]                                                   # (T, B, B2)
-                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype)
+                # Floor the chi-square draw — an underflow to 0 makes sqrt(nu/W) blow
+                # up to inf (or 0*inf=NaN), corrupting ds before the log-path clamp.
+                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype).clamp_min(1.0e-6)
                 t_innov = Z_dt * torch.sqrt(nu_t / W)
                 scale_to_unit_var = torch.sqrt((nu_t - 2.0).clamp_min(1.0e-3) / nu_t)
                 innov = t_innov * scale_to_unit_var
@@ -2192,9 +2200,27 @@ class MarkovHMMSpotModel(StochasticProcess):
             s0 = self.spot0                                                          # (B,)
             if self.log_price:
                 log_path = s0.view(B, 1).log() + ds.cumsum(dim=0)                    # (T, B, B2)
-                spot_path = log_path.exp()
+                spot_path = log_path.clamp_min(-10.0).exp()                          # floor: see outer branch
             else:
                 spot_path = s0.view(B, 1) + ds.cumsum(dim=0)                         # (T, B, B2)
+
+        # A simulated spot must be finite and strictly positive. Rare numerical garbage
+        # that survives the upstream clamps is floored here, with a logged count + the
+        # stats of the upstream tensors (s0 / ds) so the *source* is visible: a bad s0
+        # points at the outer pass, a bad ds at the innovation, a clean s0+ds means it
+        # is the log/exp. A handful of bad paths is a tail artifact the MC average
+        # absorbs; a large count means the result itself is contaminated.
+        bad = ~(torch.isfinite(spot_path) & (spot_path > 0.0))
+        if bad.any():
+            logging.warning(
+                'MarkovHMMSpotModel %s: %d/%d spot values bad (nan=%d inf=%d <=0=%d) | '
+                's0 nan=%d min=%.4g | ds nan=%d +inf=%d -inf=%d — flooring to 1e-6',
+                self.factor_key, int(bad.sum()), spot_path.numel(),
+                int(spot_path.isnan().sum()), int(spot_path.isinf().sum()),
+                int((spot_path <= 0.0).sum()), int(s0.isnan().sum()), float(s0.amin()),
+                int(ds.isnan().sum()), int((ds == float('inf')).sum()),
+                int((ds == float('-inf')).sum()))
+            spot_path = torch.where(bad, spot_path.new_full((), 1.0e-6), spot_path)
 
         # Stashed for privileged_factors() called immediately after generate() in the sim loop;
         # also published for cross-process consumers under the (factor_key, kind) convention.
@@ -2530,23 +2556,28 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
         # treats 1D RHS as a vector and N-D RHS as a batch of column-vector solves
         # (PyTorch's natural broadcasting), so X0 inherits tensor's batch dims.
         curve0 = tensor
-        X0 = torch.linalg.solve(M_t, curve0)                                           # (3,) or (3, B)
-
-        # Round-trip verification: M·X_0 must reproduce today's curve at the dated knots.
-        # Catches boundary issues in the searchsorted/clip bracketing where contract_T0
-        # exactly equals slot_t0[0] or slot_t0[2] — `side='left'` with the clip can land on
-        # the wrong segment. Tolerance is scaled to dtype precision: tight for float64
-        # (1e-10), loose for float32 (1e-5) since the framework's default precision is
-        # float32 and the round-trip error tracks machine epsilon × curve magnitude.
-        # `.item()` is only used for the bounds check; X_0 itself stays on the graph.
-        roundtrip_err_t = (M_t @ X0 - curve0).abs().max()
-        rt_tol = 1.0e-10 if M_t.dtype == torch.float64 else 1.0e-5
-        if roundtrip_err_t.item() > rt_tol:
-            raise ValueError(
-                f'X_0 round-trip failed: max |M·X_0 - curve_0| = {roundtrip_err_t.item():.2e}'
-                f' (tol {rt_tol:.0e} for dtype {M_t.dtype}). '
-                f'Likely boundary mishandling in the slot-bracketing (contract_T0={contract_T0}, '
-                f'slot_t0={slot_t0}).')
+        # M_t goes singular when the contract ladder degenerates — fewer than 3 live
+        # contracts (e.g. an inner-MC fork started late in the horizon, after the front
+        # contracts have expired) collapse the bracketing onto coincident rows. In that
+        # case recover X_0 by a ridge-regularised least-squares solve and skip the exact
+        # round-trip check (the recovery is approximate by construction). When the ladder
+        # is well-conditioned, keep the exact solve + round-trip guard (it catches genuine
+        # searchsorted/clip bracketing bugs).
+        if float(torch.linalg.cond(M_t)) < 1.0e8:
+            X0 = torch.linalg.solve(M_t, curve0)                                       # (3,) or (3, B)
+            roundtrip_err_t = (M_t @ X0 - curve0).abs().max()
+            rt_tol = 1.0e-10 if M_t.dtype == torch.float64 else 1.0e-5
+            if roundtrip_err_t.item() > rt_tol:
+                raise ValueError(
+                    f'X_0 round-trip failed: max |M·X_0 - curve_0| = {roundtrip_err_t.item():.2e}'
+                    f' (tol {rt_tol:.0e} for dtype {M_t.dtype}). '
+                    f'Likely boundary mishandling in the slot-bracketing (contract_T0={contract_T0}, '
+                    f'slot_t0={slot_t0}).')
+        else:
+            gram = M_t.transpose(-1, -2) @ M_t
+            ridge = 1.0e-6 * gram.diagonal().mean() * torch.eye(
+                3, dtype=M_t.dtype, device=M_t.device)
+            X0 = torch.linalg.solve(gram + ridge, M_t.transpose(-1, -2) @ curve0)
         self.X0 = X0                                                                   # (3,) — non-leaf, on `tensor`'s graph
 
     def generate(self, shared_mem):
@@ -2771,12 +2802,11 @@ class BasisLinkedSpotModel(StochasticProcess):
         # The linked spot path is in *price level* (dollars), not log-space — the HMM
         # process exp()s its log-cumsum before publishing. Path/regime shapes match
         # this process's Z, since both processes ran in the same inner/outer mode.
-        lme_path = shared_mem.t_Scenario_Buffer[self.linked_key]
+        linked_path = shared_mem.t_Scenario_Buffer[self.linked_key]
         regimes = shared_mem.t_Scenario_Buffer[(self.linked_key, 'regimes')]
-        assert (lme_path > 0).all(), 'lme_path expected to be price levels in dollars'
+        assert (linked_path > 0).all(), 'linked_path expected to be all positive'
 
         sigma_t = self.sigma_by_state[regimes]
-
         # Student-t innovation: η_t = sigma_t · ε_t · √((ν-2)/ν), ε_t ~ t_ν.
         # Identity: ε_t = Z · √(ν/W) where W ~ Chi²(ν). Combine the rescaling so the
         # marginal variance of η_t is sigma_t² regardless of ν.
@@ -2787,22 +2817,23 @@ class BasisLinkedSpotModel(StochasticProcess):
         if Z.ndim == 2:
             # Outer mode: (T, B). Bit-exact preserve of legacy behavior.
             T, B = Z.shape
-            W = torch.distributions.Chi2(nu).sample((T, B)).to(device=device, dtype=dtype)
+            # Floor the chi-square draw — same inf/NaN guard as the linked spot.
+            W = torch.distributions.Chi2(nu).sample((T, B)).to(device=device, dtype=dtype).clamp_min(1.0e-6)
             eta = sigma_t * Z * torch.sqrt((nu - 2.0) / W)
             b_init = self.b0.expand(B)
             out = torch.empty((T, B), device=device, dtype=dtype)
             out[0] = b_init
             for t in range(1, T):
-                out[t] = a * (lme_path[t] - lme_path[t - 1]) + phi * out[t - 1] + eta[t]
+                out[t] = a * (linked_path[t] - linked_path[t - 1]) + phi * out[t - 1] + eta[t]
         else:
             # Inner mode: (T, B, B2).
             T, B, B2 = Z.shape
-            W = torch.distributions.Chi2(nu).sample((T, B, B2)).to(device=device, dtype=dtype)
+            W = torch.distributions.Chi2(nu).sample((T, B, B2)).to(device=device, dtype=dtype).clamp_min(1.0e-6)
             eta = sigma_t * Z * torch.sqrt((nu - 2.0) / W)
             out = torch.empty((T, B, B2), device=device, dtype=dtype)
             out[0] = self.b0.unsqueeze(-1).expand(B, B2)
             for t in range(1, T):
-                out[t] = a * (lme_path[t] - lme_path[t - 1]) + phi * out[t - 1] + eta[t]
+                out[t] = a * (linked_path[t] - linked_path[t - 1]) + phi * out[t - 1] + eta[t]
         return out
 
 

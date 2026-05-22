@@ -1920,7 +1920,11 @@ def train_torchrl_policy(bundle, runtime):
 def run_torchrl_execution(bundle, runtime):
     if runtime is None or bundle is None:
         return None
-    if str(runtime.get("execution_mode", "")) == "optimize_policy":
+    mode = str(runtime.get("execution_mode", ""))
+    if mode == "solve_hedge":
+        from .hedge_solver import solve_hedge
+        return solve_hedge(bundle, runtime)
+    if mode == "optimize_policy":
         return train_torchrl_policy(bundle, runtime)
     return evaluate_torchrl_policy(bundle, runtime)
 
@@ -1990,6 +1994,41 @@ def _prepend_history_prefix(bundle, runtime, base_date):
             f_prefix = tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous()
             new_factors[factor_name] = torch.cat([f_prefix, tensor], dim=0)
         bundle['factors'] = new_factors
+
+
+def _static_portfolio_descriptors(legs_features, feat_names, ref_price):
+    """Deterministic per-outer-t portfolio descriptors from the leg-feature tensor —
+    identical for every batch element (book composition is deterministic). Returns
+    `(T, 7)`: aggregate_notional, weighted_avg_strike, weighted_avg_tte,
+    weighted_moneyness, expiry_dispersion, strike_dispersion, fraction_in_window.
+
+    `|fixed_basis|` is used as the strike level — the energy-Asian payoff references
+    `Fixed_Basis`, and LEG_FEATURE_NAMES carries no separate strike field. Volume is the
+    notional weight. For a single-leg book the dispersions are identically zero."""
+    names = tuple(feat_names)
+    lf = legs_features
+    while lf.ndim > 3:                      # (T, B, L, F) -> (T, L, F)
+        lf = lf[:, 0]
+    fixed_basis = lf[..., names.index('fixed_basis')]              # (T, L)
+    volume = lf[..., names.index('volume')]
+    ttps = lf[..., names.index('time_to_period_start')]
+    ttp = lf[..., names.index('time_to_payment')]
+    w = volume.abs()                                                # (T, L)
+    w_sum = w.sum(dim=-1).clamp_min(1.0e-8)                          # (T,)
+    strike = fixed_basis.abs()
+    aggregate_notional = w.sum(dim=-1)
+    weighted_avg_strike = (w * strike).sum(-1) / w_sum
+    weighted_avg_tte = (w * ttp).sum(-1) / w_sum
+    weighted_moneyness = weighted_avg_strike / max(float(ref_price), 1.0e-8)
+    expiry_dispersion = torch.sqrt(
+        ((w * (ttp - weighted_avg_tte.unsqueeze(-1)) ** 2).sum(-1) / w_sum).clamp_min(0.0))
+    strike_dispersion = torch.sqrt(
+        ((w * (strike - weighted_avg_strike.unsqueeze(-1)) ** 2).sum(-1) / w_sum).clamp_min(0.0))
+    in_window = ((ttps <= 0.0) & (ttp > 0.0)).to(w.dtype)           # period started, unpaid
+    fraction_in_window = (w * in_window).sum(-1) / w_sum
+    return torch.stack([
+        aggregate_notional, weighted_avg_strike, weighted_avg_tte, weighted_moneyness,
+        expiry_dispersion, strike_dispersion, fraction_in_window], dim=-1)               # (T, 7)
 
 
 def build_torchrl_bundle(base_date, business_day, time_grid_days, tradable_blocks,
@@ -2093,6 +2132,9 @@ def build_torchrl_bundle(base_date, business_day, time_grid_days, tradable_block
     else:
         bd_mask = [d.weekday() < 5 for d in scenario_dates]
     initial_time_index = next((i for i, d in enumerate(days_cpu) if int(d) >= 0), len(days_cpu))
+    # Index where the history prefix ends and the simulation grid begins. Solvers strip
+    # this offset so they can index time tensors by simulation-grid t (inner_mc_fn coords).
+    bundle['initial_time_index'] = int(initial_time_index)
     last = max(len(scenario_dates) - 1, 0)
     bundle['business_indices'] = tuple(
         i for i in range(min(last, len(bd_mask))) if bd_mask[i] and i >= initial_time_index
@@ -2112,6 +2154,13 @@ def build_torchrl_bundle(base_date, business_day, time_grid_days, tradable_block
             active = (ttp > 0).any(dim=-1) if ttp.ndim == 2 else (ttp > 0)
             if bool(active.any()):
                 bundle['last_settlement_index'] = int(active.nonzero(as_tuple=False).max().item())
+        # Static (batch-independent) portfolio descriptors for the solver state vector.
+        ref_price = 1.0
+        if bundle.get('tradables'):
+            first_trad = next(iter(bundle['tradables'].values()))
+            ref_price = float(first_trad[min(initial_time_index, first_trad.shape[0] - 1)].mean())
+        bundle['static_portfolio_descriptors'] = _static_portfolio_descriptors(
+            feats, feat_names, ref_price)
     bundle['spot_realized_vol'] = compute_spot_realized_vol(bundle)
     bundle['utility_scale'] = resolve_utility_scale(bundle, runtime or {})
     logging.info('utility_scale (symlog c) resolved to {0:.2f}'.format(bundle['utility_scale']))

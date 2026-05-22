@@ -77,10 +77,10 @@ def __(GROUP_KEYS, cells_27, cells_8, mo, px):
         figs = []
         for k in GROUP_KEYS:
             agg = src.groupby(k)["asym"].agg(["mean", "min", "max"]).reset_index()
-            fig = px.scatter(agg, x=k, y="mean", error_y=agg["max"] - agg["mean"],
-                             error_y_minus=agg["mean"] - agg["min"], log_x=True,
-                             title=f"{k} → asymmetric_score")
-            figs.append(fig)
+            scatter_fig = px.scatter(agg, x=k, y="mean", error_y=agg["max"] - agg["mean"],
+                                     error_y_minus=agg["mean"] - agg["min"], log_x=True,
+                                     title=f"{k} → asymmetric_score")
+            figs.append(scatter_fig)
         plots = mo.hstack(figs)
     plots
     return
