@@ -451,7 +451,8 @@ class CMC_State(utils.Calculation_State):
 
         if sample_key not in self.t_quasi_rng:
             sample_sobol = self.sobol[dimension].draw(sample_size, dtype=self.one.dtype)
-            u = (0.5 + (1 - torch.finfo(sample_sobol.dtype).eps) * (sample_sobol - 0.5)).to(self.one.device)
+            margin = 1.0e-6
+            u = sample_sobol.clamp(min=margin, max=1.0 - margin).to(self.one.device)
             self.t_quasi_rng[sample_key] = (utils.norm_icdf(u), u)
 
         # update the batch key

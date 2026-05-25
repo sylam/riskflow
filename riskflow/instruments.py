@@ -1997,7 +1997,7 @@ class CFFloatingInterestListDeal(Deal):
             base_date, time_grid, 1 if self.field['Buy_Sell'] == 'Buy' else -1, self.field['Cashflows'])
 
         field_index['CompoundingMethod'] = self.field['Cashflows'].get('Compounding_Method', 'None')
-        field_index['Averaging Method'] = self.field['Cashflows'].get('Averaging_Method', 'None')
+        field_index['AveragingMethod'] = self.field['Cashflows'].get('Averaging_Method', 'None')
 
         # check if the CompoundingMethod is null (None)
         if field_index['CompoundingMethod'] is None:
@@ -2011,6 +2011,13 @@ class CFFloatingInterestListDeal(Deal):
             # (groupsize -1 means group resets per cashflow - not 1 cashflow 1 reset)
             field_index['Cashflows'] = utils.compress_no_compounding(
                 float_cashflows, groupsize=-1, check_resets=False)
+            if field_index['AveragingMethod']=='Post_Aggregation':
+                bus_day_offset = calendars.get(
+                    self.field.get('Calendar'), {'businessday': pd.offsets.BDay(1)})['businessday']
+                end_dates = base_date + pd.to_timedelta(
+                    field_index['Cashflows'].schedule[:, utils.CASHFLOW_INDEX_End_Day], unit='D')
+                field_index['Cashflows'].schedule[:, utils.CASHFLOW_INDEX_End_Adj] = (
+                    end_dates - bus_day_offset - base_date).days
         else:
             field_index['Cashflows'] = float_cashflows
 
@@ -2359,18 +2366,16 @@ class SwaptionDeal(Deal):
             self.add_reval_dates({self.field['Settlement_Date']}, self.field['Currency'])
 
     def finalize_dates(self, parser, base_date, grid, node_children, node_resets, node_settlements):
-        # have to reset the original instrument and let the child node decide
-        super(SwaptionDeal, self).reset()
-        self.add_reval_dates({self.field['Option_Expiry_Date']}, self.field['Currency'])
+        # reset initialises reval_dates correctly for both Cash (expiry+settlement only)
+        # and Physical (expiry+swap dates) - so no need to duplicate that logic here
+        self.reset(None)
 
         if self.field['Settlement_Style'] == 'Cash':
-            # cash settle - do not include node cashflows
+            # discard child swap dates from the time grid
             node_resets.clear()
             node_settlements.clear()
-            self.add_reval_dates({self.field['Settlement_Date']}, self.field['Currency'])
         else:
             self.add_reval_dates(node_resets, self.field['Currency'])
-
             for child in node_children:
                 child.add_reval_dates({self.field['Option_Expiry_Date']}, self.field['Currency'])
                 child.add_reval_date_offset(1)
@@ -3889,11 +3894,8 @@ class EquitySwapletListDeal(Deal):
         field_index['SettleCurrency'] = self.field['Currency']
 
         # check if we need to adjust the settlement days
-        if self.field.get('Accrual_Calendars'):
-            bus_day_offset = calendars.get(
-                self.field['Accrual_Calendars'], {'businessday': pd.offsets.Day(0)})['businessday']
-        else:
-            bus_day_offset = pd.offsets.Day(0)
+        bus_day_offset = calendars.get(
+            self.field.get('Accrual_Calendars'), {'businessday': pd.offsets.Day(0)})['businessday']
 
         field_index['Currency'] = get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
         field_index['Discount'] = get_discount_factor(
@@ -3996,11 +3998,8 @@ class EquitySwapLeg(Deal):
                        'SettleCurrency': self.field['Currency']}
 
         # check if we need to adjust the settlement days
-        if self.field.get('Accrual_Calendars'):
-            bus_day = calendars.get(
-                self.field['Accrual_Calendars'], {'businessday': pd.offsets.Day(0)})['businessday']
-        else:
-            bus_day = pd.offsets.Day(0)
+        bus_day = calendars.get(
+            self.field.get('Accrual_Calendars'), {'businessday': pd.offsets.Day(0)})['businessday']
 
         self.isQuanto = field['Payoff_Currency'] != field['Currency']
 

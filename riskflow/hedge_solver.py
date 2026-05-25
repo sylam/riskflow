@@ -315,10 +315,30 @@ class ValueFunctionApproximator(torch.nn.Module):
         zn = (z - self.z_mean) / self.z_std
         phi = self._basis(zn)                                             # (N, P)
         gram = phi.transpose(-1, -2) @ phi
-        # Per-column ridge ∝ each column's own Gram diagonal — regularizes every basis
-        # column equally in relative terms regardless of its norm.
-        ridge = torch.diag(1.0e-6 * gram.diagonal().clamp_min(1.0e-12))
-        self.beta = torch.linalg.solve(gram + ridge, phi.transpose(-1, -2) @ v_target)
+        # Scale-aware ridge + absolute floor.
+        # Scale-aware part handles disparate column norms.
+        # Absolute floor handles zero-variance columns (e.g. bilinear terms where
+        # one factor is identically zero on the training set — happens when a
+        # rare regime has zero occupancy at this t for this seed).
+        diag = gram.diagonal()
+        ridge_vec = 1.0e-6 * diag.clamp_min(1.0e-12) + 1.0e-8
+        ridge = torch.diag(ridge_vec)
+
+        # Log degenerate columns once if any — useful diagnostic
+        n_degenerate = (diag < 1e-10).sum().item()
+        if n_degenerate > 0:
+            logging.debug(f"VFA fit: {n_degenerate}/{diag.numel()} basis columns near-zero variance")
+
+        try:
+            self.beta = torch.linalg.solve(gram + ridge, phi.transpose(-1, -2) @ v_target)
+        except torch._C._LinAlgError:
+            # Fallback: lstsq is rank-deficient-tolerant via SVD. Slower but bulletproof.
+            # If we hit this, something is structurally wrong with the basis at this t/seed —
+            # worth investigating but not worth crashing the whole sweep.
+            logging.warning(f"VFA fit: gram singular even with ridge, falling back to lstsq")
+            rhs = phi.transpose(-1, -2) @ v_target
+            self.beta = torch.linalg.lstsq(gram + ridge, rhs.unsqueeze(-1)).solution.squeeze(-1)
+
         ols_pred = phi @ self.beta
         ss_res = ((v_target - ols_pred) ** 2).sum()
         ss_tot = ((v_target - v_target.mean()) ** 2).sum()

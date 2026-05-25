@@ -2286,7 +2286,13 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
 
             # check if we need extra information to price caps or floors
             if cashflow_pricer in [pricer_cap, pricer_floor]:
-                expiries = cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day] - time_slice
+                # adjust the expiry date to adjust the vol
+                if factor_dep['AveragingMethod']=='Post_Aggregation':
+                    t_k = cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day] - time_slice
+                    t_kp1 = cashflows.np[:, utils.CASHFLOW_INDEX_End_Adj] - time_slice
+                    expiries = t_kp1 - (2/3)*(t_kp1 - t_k)
+                else:
+                    expiries = cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day] - time_slice
                 # note that the tenor (Year Frac) is averaged
                 # all the cashflows are supposed to have the same year frac
                 # (but practically not - should be ok to do this)

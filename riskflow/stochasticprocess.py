@@ -2204,24 +2204,6 @@ class MarkovHMMSpotModel(StochasticProcess):
             else:
                 spot_path = s0.view(B, 1) + ds.cumsum(dim=0)                         # (T, B, B2)
 
-        # A simulated spot must be finite and strictly positive. Rare numerical garbage
-        # that survives the upstream clamps is floored here, with a logged count + the
-        # stats of the upstream tensors (s0 / ds) so the *source* is visible: a bad s0
-        # points at the outer pass, a bad ds at the innovation, a clean s0+ds means it
-        # is the log/exp. A handful of bad paths is a tail artifact the MC average
-        # absorbs; a large count means the result itself is contaminated.
-        bad = ~(torch.isfinite(spot_path) & (spot_path > 0.0))
-        if bad.any():
-            logging.warning(
-                'MarkovHMMSpotModel %s: %d/%d spot values bad (nan=%d inf=%d <=0=%d) | '
-                's0 nan=%d min=%.4g | ds nan=%d +inf=%d -inf=%d — flooring to 1e-6',
-                self.factor_key, int(bad.sum()), spot_path.numel(),
-                int(spot_path.isnan().sum()), int(spot_path.isinf().sum()),
-                int((spot_path <= 0.0).sum()), int(s0.isnan().sum()), float(s0.amin()),
-                int(ds.isnan().sum()), int((ds == float('inf')).sum()),
-                int((ds == float('-inf')).sum()))
-            spot_path = torch.where(bad, spot_path.new_full((), 1.0e-6), spot_path)
-
         # Stashed for privileged_factors() called immediately after generate() in the sim loop;
         # also published for cross-process consumers under the (factor_key, kind) convention.
         self.last_regime_path = regimes

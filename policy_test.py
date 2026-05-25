@@ -1,6 +1,8 @@
 if __name__=='__main__':
     import argparse
+    import os
     import re
+    import torch
     import riskflow as rf
 
     parser = argparse.ArgumentParser(description='Run the solve_hedge test job.')
@@ -24,13 +26,13 @@ if __name__=='__main__':
                     ".Timestamp": "2026-04-10"
                 },
                 "Simulation_Batches": 1,
-                "Batch_Size": 256,
+                "Batch_Size": 2048,
                 "Random_Seed": 42,
                 "Currency": "USD",
                 "Calendar": "Chicago",
                 "Execution_Mode": "solve_hedge",
                 "Inner_MC_Enabled": "Yes",
-                "Inner_Sub_Batch": 128,
+                "Inner_Sub_Batch": 512,
                 "Hedging_Problem": {
                     "History_Lookback_Business_Days": 30,
                     "Tradable_Instruments": {
@@ -874,6 +876,10 @@ if __name__=='__main__':
     assert n == 1, f'expected exactly one Multi_Seed_Count in the config, found {n}'
 
     cx.load_json((json, 'hedge_test.json'))
+
     calc, result = cx.run_job()
+    if torch.cuda.is_available():
+        print(f'[peak GPU allocated] {torch.cuda.max_memory_allocated() // (1024 * 1024)} MB '
+              f'(reserved {torch.cuda.max_memory_reserved() // (1024 * 1024)} MB)', flush=True)
 
     print(result.evaluation_summary)
