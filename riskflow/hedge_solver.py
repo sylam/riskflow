@@ -264,7 +264,7 @@ class ValueFunctionApproximator(torch.nn.Module):
     backward DP recursion compounds any off-hull inflation geometrically. Clamping makes
     V̂ flat outside its hull, keeping the recursion bounded."""
 
-    def __init__(self, statepack, mlp_hidden, device):
+    def __init__(self, statepack, mlp_hidden, device, tail_saturating_columns=()):
         super().__init__()
         self.pos_slice = statepack.pos_slice
         self.market_slice = statepack.market_slice
@@ -278,6 +278,12 @@ class ValueFunctionApproximator(torch.nn.Module):
         self.z_hi = None
         self.z_mean = None
         self.z_std = None
+        # Tail-saturating columns: indices of the standardized deep-state vector to push
+        # through tanh before the basis. Bounds what V̂ sees on load-bearing breach columns
+        # — outer-MC training covers the small-σ core; inner-MC queries explore tails to
+        # many σ where the linear basis has no training support. tanh saturates beyond
+        # ~2σ, silencing the extrapolation. Empty = identity (off).
+        self.tail_saturating_columns = tuple(int(c) for c in tail_saturating_columns)
 
     def _build_mlp(self):
         """Zero-initialized residual head — `V̂ == β·φ` until the head is trained."""
@@ -299,6 +305,17 @@ class ValueFunctionApproximator(torch.nn.Module):
         pos_market = (pos.unsqueeze(-1) * market.unsqueeze(-2)).flatten(-2)
         return torch.cat([ones, z, pos * pos, pos_market], dim=-1)
 
+    def _apply_tail_saturation(self, zn):
+        """tanh-saturate the configured columns of the standardized input. No-op when
+        `tail_saturating_columns` is empty. Applied identically at fit and query so the
+        OLS basis is consistent — otherwise V̂ would be biased."""
+        if not self.tail_saturating_columns:
+            return zn
+        cols = list(self.tail_saturating_columns)
+        out = zn.clone()
+        out[..., cols] = torch.tanh(out[..., cols])
+        return out
+
     def fit(self, z, v_target, train_steps, lr):
         """Fit OLS β (per-column ridge — robust to basis columns of disparate norm) then
         the MLP on the OLS residual. Records the training hull + standardization stats.
@@ -313,6 +330,7 @@ class ValueFunctionApproximator(torch.nn.Module):
         # intercept absorbs the constant.
         self.z_std = torch.where(std > 1.0e-6, std, torch.ones_like(std))
         zn = (z - self.z_mean) / self.z_std
+        zn = self._apply_tail_saturation(zn)
         phi = self._basis(zn)                                             # (N, P)
         gram = phi.transpose(-1, -2) @ phi
         # Scale-aware ridge + absolute floor.
@@ -369,6 +387,7 @@ class ValueFunctionApproximator(torch.nn.Module):
         if clamp:
             z = torch.minimum(torch.maximum(z, self.z_lo), self.z_hi)
         zn = (z - self.z_mean) / self.z_std
+        zn = self._apply_tail_saturation(zn)
         v = self._basis(zn) @ self.beta
         if self.mlp is not None:
             v = v + self.mlp(zn).squeeze(-1)
@@ -757,8 +776,13 @@ class LsmDpSolver:
                 # Asymmetric Double-V (variant 2): head A is fit on V_t^(A→B), head B on
                 # V_t^(B→A) — each head's target value is the *other* head's evaluation,
                 # so neither head ever trains on a target maxed over its own noise.
-                vfa_A = ValueFunctionApproximator(statepack, vf_cfg["mlp_hidden"], device)
-                vfa_B = ValueFunctionApproximator(statepack, vf_cfg["mlp_hidden"], device)
+                tail_sat = vf_cfg.get("tail_saturating_columns", ())
+                vfa_A = ValueFunctionApproximator(
+                    statepack, vf_cfg["mlp_hidden"], device,
+                    tail_saturating_columns=tail_sat)
+                vfa_B = ValueFunctionApproximator(
+                    statepack, vf_cfg["mlp_hidden"], device,
+                    tail_saturating_columns=tail_sat)
                 r2_A = vfa_A.fit(state_t, v_t_AB,
                                  vf_cfg["mlp_train_steps_per_solve"], vf_cfg["mlp_adam_lr"])
                 r2_B = vfa_B.fit(state_t, v_t_BA,

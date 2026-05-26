@@ -175,6 +175,11 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
             "mlp_train_steps_per_solve": int(value_fn.get("MLP_Train_Steps_Per_Solve", 200)),
             "mlp_adam_lr": float(value_fn.get("MLP_Adam_LR", 1.0e-3)),
             "mlp_final_init_scale": float(value_fn.get("MLP_Final_Init_Scale", 0.0)),
+            # Tail-saturating columns: deep-state indices to push through tanh after
+            # standardization, before the OLS basis. Bounds the V̂ input on load-bearing
+            # breach columns (outer-MC training covers ~σ, inner-MC queries explore tails
+            # to many σ where the linear basis has no support). Empty = off.
+            "tail_saturating_columns": [int(c) for c in value_fn.get("Tail_Saturating_Columns", [])],
         },
     }
 
