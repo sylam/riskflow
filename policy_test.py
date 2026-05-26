@@ -1,8 +1,14 @@
 if __name__=='__main__':
     import argparse
+    import logging
     import os
     import re
     import torch
+
+    # Surface logging.info from the solver — otherwise every diagnostic we add to
+    # hedge_solver.py is silently dropped by Python's WARNING-level default root logger.
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
+
     import riskflow as rf
 
     parser = argparse.ArgumentParser(description='Run the solve_hedge test job.')
@@ -12,6 +18,13 @@ if __name__=='__main__':
                              'instances for independent V_0 estimates.')
     parser.add_argument('--multi-seed-count', type=int, default=1,
                         help='Solver.Multi_Seed_Count — inner-MC re-seed repeats per run.')
+    parser.add_argument('--alpha', type=float, default=None,
+                        help='Range_Projection_Alpha override. If unset, config default applies.')
+    parser.add_argument('--tail-saturation-scale', type=float, default=None,
+                        help='Tail_Saturation_Scale override. Multiplier applied to the '
+                             'standardized input before tanh in V̂. scale=1 leaves the '
+                             'knee at 1σ; scale>1 shifts curvature inward toward the '
+                             'operating point. If unset, config default (1.0) applies.')
     args = parser.parse_args()
 
     cx = rf.Context()
@@ -26,7 +39,7 @@ if __name__=='__main__':
                     ".Timestamp": "2026-04-10"
                 },
                 "Simulation_Batches": 1,
-                "Batch_Size": 2048,
+                "Batch_Size": 4096,
                 "Random_Seed": 42,
                 "Currency": "USD",
                 "Calendar": "Chicago",
@@ -225,7 +238,9 @@ if __name__=='__main__':
                             "MLP_Activation": "gelu",
                             "MLP_Train_Steps_Per_Solve": 0,
                             "MLP_Adam_LR": 1.0e-3,
-                            "MLP_Final_Init_Scale": 0.0
+                            "MLP_Final_Init_Scale": 0.0,
+                            "Tail_Saturating_Columns": [0, 1, 2],
+                            "Tail_Saturation_Scale": 1.0
                         },
                         "Include_Dynamic_Features_In_Value_Inputs": false,
                         "Multi_Seed_Count": 1,
@@ -874,6 +889,14 @@ if __name__=='__main__':
     json, n = re.subn(r'"Multi_Seed_Count":\s*\d+',
                       f'"Multi_Seed_Count": {args.multi_seed_count}', json)
     assert n == 1, f'expected exactly one Multi_Seed_Count in the config, found {n}'
+    if args.alpha is not None:
+        json, n = re.subn(r'"Range_Projection_Alpha":\s*[0-9.eE+-]+',
+                          f'"Range_Projection_Alpha": {args.alpha}', json)
+        assert n == 1, f'expected exactly one Range_Projection_Alpha in the config, found {n}'
+    if args.tail_saturation_scale is not None:
+        json, n = re.subn(r'"Tail_Saturation_Scale":\s*[0-9.eE+-]+',
+                          f'"Tail_Saturation_Scale": {args.tail_saturation_scale}', json)
+        assert n == 1, f'expected exactly one Tail_Saturation_Scale in the config, found {n}'
 
     cx.load_json((json, 'hedge_test.json'))
 

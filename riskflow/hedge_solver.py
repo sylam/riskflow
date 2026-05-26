@@ -264,7 +264,11 @@ class ValueFunctionApproximator(torch.nn.Module):
     backward DP recursion compounds any off-hull inflation geometrically. Clamping makes
     V̂ flat outside its hull, keeping the recursion bounded."""
 
-    def __init__(self, statepack, mlp_hidden, device, tail_saturating_columns=()):
+    # Module-level guard for the one-shot "tail saturation active" log.
+    _tail_sat_logged = False
+
+    def __init__(self, statepack, mlp_hidden, device,
+                 tail_saturating_columns=(), tail_saturation_scale=1.0):
         super().__init__()
         self.pos_slice = statepack.pos_slice
         self.market_slice = statepack.market_slice
@@ -283,7 +287,17 @@ class ValueFunctionApproximator(torch.nn.Module):
         # — outer-MC training covers the small-σ core; inner-MC queries explore tails to
         # many σ where the linear basis has no training support. tanh saturates beyond
         # ~2σ, silencing the extrapolation. Empty = identity (off).
+        # `tail_saturation_scale` (default 1.0) is the multiplier on the standardized input
+        # before tanh: scale > 1 tightens the knee inward in raw units (more aggressive
+        # saturation closer to the operating point), scale = 1 keeps the knee at 1σ.
         self.tail_saturating_columns = tuple(int(c) for c in tail_saturating_columns)
+        self.tail_saturation_scale = float(tail_saturation_scale)
+        if self.tail_saturating_columns and not ValueFunctionApproximator._tail_sat_logged:
+            logging.info(
+                'ValueFunctionApproximator: tail saturation ACTIVE on z columns %s '
+                '(scale=%.3g)',
+                list(self.tail_saturating_columns), self.tail_saturation_scale)
+            ValueFunctionApproximator._tail_sat_logged = True
 
     def _build_mlp(self):
         """Zero-initialized residual head — `V̂ == β·φ` until the head is trained."""
@@ -308,12 +322,15 @@ class ValueFunctionApproximator(torch.nn.Module):
     def _apply_tail_saturation(self, zn):
         """tanh-saturate the configured columns of the standardized input. No-op when
         `tail_saturating_columns` is empty. Applied identically at fit and query so the
-        OLS basis is consistent — otherwise V̂ would be biased."""
+        OLS basis is consistent — otherwise V̂ would be biased. `tail_saturation_scale`
+        multiplies the standardized input before tanh: the sech² curvature band moves to
+        |z| ∈ [1/scale, 3/scale], shifting V̂'s nonlinearity toward (or away from) the
+        operating point of the recovered policy."""
         if not self.tail_saturating_columns:
             return zn
         cols = list(self.tail_saturating_columns)
         out = zn.clone()
-        out[..., cols] = torch.tanh(out[..., cols])
+        out[..., cols] = torch.tanh(self.tail_saturation_scale * out[..., cols])
         return out
 
     def fit(self, z, v_target, train_steps, lr):
@@ -562,6 +579,20 @@ class LsmDpSolver:
         action_grid = build_action_grid(
             runtime, solver_cfg["training_action_grid_levels_per_axis"], device)
         n_actions = action_grid.shape[0]
+        # Count reachable actions under the L1 position cap for diagnostic logging only.
+        # n_prev training rows are NOT restricted to this set: V̂'s OLS basis needs
+        # estimation-variance margin around the L1 boundary at |n|_1 = total_abs_limit,
+        # which max_a queries densely once the value approximator starts clamp-saturating.
+        # Pre-fix-2 (full-grid sampling) keeps the L1 boundary inside the convex hull of
+        # the training support (which extends to |n|_1 ≈ 3 * action_grid.max() at the
+        # three-corner); valid-only sampling makes the L1 boundary the hull boundary,
+        # where OLS variance x'(X'X)^{-1}x is maximal. max_a then preferentially picks
+        # the action whose V̂ is variance-inflated upward, hits the projection clamp,
+        # and the backward recursion saturates.
+        if total_abs_limit > 0.0:
+            n_valid_actions = int((action_grid.abs().sum(dim=-1) <= total_abs_limit).sum())
+        else:
+            n_valid_actions = action_grid.shape[0]
         chunk_size = solver_cfg["training_action_chunk_size"]
 
         value_fns: Dict[int, ValueFunctionApproximator] = {}
@@ -593,17 +624,28 @@ class LsmDpSolver:
                 # fitted hull and the backward recursion blows up geometrically.
                 f_t_h = torch.stack([tradables_sim[h][t].to(device) for h in hedges], dim=0)
                 dstep = torch.stack([inner["F_t1"][h] for h in hedges], dim=0) - f_t_h.unsqueeze(-1)
-                pnl_step = float((action_grid.abs().amax(dim=0) * contract_size
-                                  * dstep.abs().amax(dim=(1, 2))).sum())
+                # Per-axis-sum bound on one-step hedge P&L over the action grid.
+                # NOTE: the L1-dual bound `total_abs_limit * max_i(c_i * |dstep_i|)` is
+                # mathematically tighter under the L1 position cap, but in practice
+                # narrows V̂'s G-training support to the point where queries at the L1
+                # position-boundary land near the edge of the OLS fit hull, where basis
+                # estimation variance is maximal. Keeping the looser per-axis-sum bound
+                # gives V̂ off-hull margin on the G axis at the cost of overprovisioning.
+                per_axis_term = contract_size * dstep.abs().amax(dim=(1, 2))   # (n_hedge,)
+                pnl_step = float((action_grid.abs().amax(dim=0) * per_axis_term).sum())
                 g_halfwidth = max(4.0 * pnl_step, c)
 
                 # Fit rows: sample per-outer-path pre-decision inventory + cash. At t=0 the
                 # true decision state is flat (n_prev=0, G_0=0) — evaluate it exactly.
+                # n_prev is drawn from the FULL action grid, not just reachable actions —
+                # see comment at the top of the solve loop for the OLS edge-effect rationale.
                 if t == 0:
                     n_prev = torch.zeros(b_outer, len(hedges), device=device)
                     g_t = torch.zeros(b_outer, device=device)
                 else:
-                    n_prev = action_grid[torch.randint(0, n_actions, (b_outer,), device=device)]
+                    n_prev = action_grid[
+                        torch.randint(0, action_grid.shape[0], (b_outer,), device=device)
+                    ]
                     g_t = (torch.rand(b_outer, device=device) - 0.5) * (2.0 * g_halfwidth)
                 zero_b = torch.zeros(b_outer, device=device)
 
@@ -642,8 +684,18 @@ class LsmDpSolver:
                         # Subsample per chunk so the pooled terminal-u sample stays
                         # bounded at any (B_outer, B_inner, n_actions) scale — ~200k per
                         # chunk is ample for the (alpha, 1-alpha) projection quantiles.
-                        flat = v.detach().reshape(-1)
-                        terminal_u_pool.append(flat[::max(1, flat.numel() // 200_000)])
+                        # Filter to valid actions so the projection quantiles reflect
+                        # only positions reachable under the position-limit constraint.
+                        if total_abs_limit > 0.0:
+                            valid = action.abs().sum(dim=-1) <= total_abs_limit
+                            valid_mask = valid.unsqueeze(-1).expand_as(v)
+                            if valid_mask.any():
+                                filtered = v[valid_mask].reshape(-1)
+                                stride = max(1, filtered.numel() // 200_000)
+                                terminal_u_pool.append(filtered.detach()[::stride])
+                        else:
+                            flat = v.detach().reshape(-1)
+                            terminal_u_pool.append(flat[::max(1, flat.numel() // 200_000)])
                     else:
                         # Asymmetric Double-V (variant 2): a single V̂_{t+1} head scores
                         # the whole batch — the caller passes the selecting head on the
@@ -687,8 +739,10 @@ class LsmDpSolver:
                     action_grid, lambda a: objective_fn(a.unsqueeze(1), inner_B, head_B),
                     chunk_size=chunk_size, total_abs_limit=total_abs_limit)
                 v_t_BA = objective_fn(n_star_BA.unsqueeze(0), inner_A, head_A).squeeze(0)
-                # Report the mean of the two cross-fit estimates.
-                n_star = 0.5 * (n_star_AB + n_star_BA)
+                # n_star reported as a discrete grid action — pick the better
+                # cross-fit pass. Value estimate continues to use the cross-fit average.
+                chose_AB = float(v_t_AB.mean()) >= float(v_t_BA.mean())
+                n_star = n_star_AB if chose_AB else n_star_BA
                 v_t = 0.5 * (v_t_AB + v_t_BA)
                 actions[t], values[t] = n_star, v_t
                 diag_by_t[t] = {
@@ -708,6 +762,7 @@ class LsmDpSolver:
                     # the heads agree and the backward recursion is stable.
                     "head_disagree_mean": float((v_t_AB - v_t_BA).mean()),
                     "head_disagree_std": float((v_t_AB - v_t_BA).std()),
+                    "chosen_pass": "AB" if chose_AB else "BA",
                 }
                 # Hull/query diagnostic: pair the deep-state region queried against
                 # V̂_{t+1} during this step's action search with V̂_{t+1}'s training
@@ -764,6 +819,16 @@ class LsmDpSolver:
                     logging.info('LsmDpSolver: range projection [%.4g, %.4g] '
                                  '(alpha=%.1e, %d terminal-u samples)',
                                  u_min_proj, u_max_proj, alpha, pool.numel())
+                    if total_abs_limit > 0.0:
+                        logging.info(
+                            'LsmDpSolver: terminal pool from %d/%d valid actions (%.1f%%)',
+                            n_valid_actions, n_actions,
+                            100.0 * n_valid_actions / n_actions)
+
+                logging.info(
+                    'LsmDpSolver: V̂_t=%d fit on %d rows, n_prev sampled from full '
+                    'action grid (%d points; %d reachable under L1 cap)',
+                    t, b_outer, n_actions, n_valid_actions)
 
                 # Fit V̂_t: state_t carries the sampled (n_prev, G_t) + outer-realized
                 # market state at t + tradable prices + static descriptors + time-to-T.
@@ -777,12 +842,15 @@ class LsmDpSolver:
                 # V_t^(B→A) — each head's target value is the *other* head's evaluation,
                 # so neither head ever trains on a target maxed over its own noise.
                 tail_sat = vf_cfg.get("tail_saturating_columns", ())
+                tail_sat_scale = vf_cfg.get("tail_saturation_scale", 1.0)
                 vfa_A = ValueFunctionApproximator(
                     statepack, vf_cfg["mlp_hidden"], device,
-                    tail_saturating_columns=tail_sat)
+                    tail_saturating_columns=tail_sat,
+                    tail_saturation_scale=tail_sat_scale)
                 vfa_B = ValueFunctionApproximator(
                     statepack, vf_cfg["mlp_hidden"], device,
-                    tail_saturating_columns=tail_sat)
+                    tail_saturating_columns=tail_sat,
+                    tail_saturation_scale=tail_sat_scale)
                 r2_A = vfa_A.fit(state_t, v_t_AB,
                                  vf_cfg["mlp_train_steps_per_solve"], vf_cfg["mlp_adam_lr"])
                 r2_B = vfa_B.fit(state_t, v_t_BA,
@@ -801,9 +869,29 @@ class LsmDpSolver:
                               for i in range(statepack.deep_dim)]
                 worst = max(range(statepack.deep_dim), key=lambda i: abs(resid_corr[i]))
                 dim_names = statepack.dim_names()
-                # beta index of the (standardized) cash term: basis = [ones(1), z(deep_dim),
-                # ...], and cash sits at z-index n_hedge (after the n_hedge positions).
-                diag_by_t[t]["dVhat_dG_normalized"] = float(vfa_A.beta[1 + statepack.n_hedge])
+                # Basis layout (see ValueFunctionApproximator._basis):
+                #   [0]                                            ones (intercept)
+                #   [1 : 1+deep_dim]                               linear in z; pos linear
+                #                                                  at [1 : 1+n_hedge]
+                #   [1+deep_dim : 1+deep_dim+n_hedge]              pos * pos (per-leg
+                #                                                  quadratic; sign tells us
+                #                                                  concave vs convex in
+                #                                                  inventory)
+                #   [1+deep_dim+n_hedge : end]                     pos_market (n_hedge ×
+                #                                                  market_dim, flattened)
+                # All on standardized z, so coefficients are in standardized units. Sign of
+                # the pos² block is the key diagnostic for "is V̂ concave in inventory":
+                # negative → interior max exists; positive → max_a pushes to L1 boundary.
+                nh = statepack.n_hedge
+                dd = statepack.deep_dim
+                beta_pos_lin = vfa_A.beta[1 : 1 + nh].detach().cpu()
+                beta_pos_sq = vfa_A.beta[1 + dd : 1 + dd + nh].detach().cpu()
+                beta_pos_market = vfa_A.beta[1 + dd + nh :].detach().cpu()
+                diag_by_t[t]["dVhat_dG_normalized"] = float(vfa_A.beta[1 + nh])
+                diag_by_t[t]["beta_pos_lin"] = beta_pos_lin.tolist()
+                diag_by_t[t]["beta_pos_sq"] = beta_pos_sq.tolist()
+                diag_by_t[t]["beta_pos_market_absmean"] = float(beta_pos_market.abs().mean())
+                diag_by_t[t]["beta_pos_market_absmax"] = float(beta_pos_market.abs().max())
                 diag_by_t[t]["ols_r2"] = min(r2_A, r2_B)
                 diag_by_t[t]["resid_corr"] = resid_corr
                 diag_by_t[t]["resid_corr_worst"] = (dim_names[worst], resid_corr[worst])
@@ -815,6 +903,13 @@ class LsmDpSolver:
                     0.5 * (d["asym_gap_AB_mean"] + d["asym_gap_BA_mean"]),
                     d["head_disagree_mean"], d["vhat_query_abs_max"],
                     dim_names[worst], resid_corr[worst], min(r2_A, r2_B))
+                logging.info(
+                    'LsmDpSolver t=%d beta: pos_lin=%s pos_sq=%s '
+                    'pos_market(|.|mean=%.3g, |.|max=%.3g)',
+                    t,
+                    ['%+.3g' % b for b in beta_pos_lin.tolist()],
+                    ['%+.3g' % b for b in beta_pos_sq.tolist()],
+                    d["beta_pos_market_absmean"], d["beta_pos_market_absmax"])
                 if min(r2_A, r2_B) < 0.7:
                     logging.warning(
                         'LsmDpSolver: OLS R^2=%.3f at t=%d (<0.7) — linear backbone weak',

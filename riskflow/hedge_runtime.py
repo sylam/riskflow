@@ -180,6 +180,10 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
             # breach columns (outer-MC training covers ~σ, inner-MC queries explore tails
             # to many σ where the linear basis has no support). Empty = off.
             "tail_saturating_columns": [int(c) for c in value_fn.get("Tail_Saturating_Columns", [])],
+            # Steepness multiplier on the standardized input before tanh. scale > 1
+            # tightens the saturation knee inward in raw units; scale = 1 keeps the knee
+            # at the 1σ point of the training distribution.
+            "tail_saturation_scale": float(value_fn.get("Tail_Saturation_Scale", 1.0)),
         },
     }
 
