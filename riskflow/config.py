@@ -703,8 +703,9 @@ class Config(object):
             # now sort the factors taking any factor dependencies into account
             sorted_factors = utils.topological_sort(dependent_factors)
             # merge missing tenors
+            v_max = max(reset_dates)
             for k, v in missing_tenors.items():
-                dependent_factor_tenors.setdefault(k, set()).update(v)
+                dependent_factor_tenors.setdefault(k, set()).update(x for x in v if x<=v_max)
             # now get the last tenor for each factor
             dependent_factors = {k: max(dependent_factor_tenors.get(k, reset_dates)) for k in sorted_factors}
 
