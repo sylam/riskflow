@@ -987,8 +987,8 @@ class CurveTensor(object):
         t = time_grid[:, 1].reshape(-1, 1)
         T = points + t
         return self.interpolate_curve(
-            curve_component, t, time_multiplier) - self.interpolate_curve(
-            curve_component, T, time_multiplier)
+            curve_component, T, time_multiplier) - self.interpolate_curve(
+            curve_component, t, time_multiplier)
 
     def interpolate_curve(self, curve_component, points, time_factor):
         # our tensor object

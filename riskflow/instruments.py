@@ -1810,6 +1810,7 @@ class SwapInterestDeal(Deal):
 
 class CFFixedInterestListDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
+                     'Repo_Rate': ['InterestRate'],
                      'Discount_Rate': ['DiscountRate']}
 
     documentation = (
@@ -1835,6 +1836,8 @@ class CFFixedInterestListDeal(Deal):
         field = {'Currency': utils.check_rate_name(self.field['Currency'])}
         field['Discount_Rate'] = utils.check_rate_name(self.field['Discount_Rate']) if self.field['Discount_Rate'] else \
             field['Currency']
+        field['Repo_Rate'] = utils.check_rate_name(self.field['Repo_Rate']) if self.field.get('Repo_Rate') else \
+            field['Discount_Rate']
 
         field_index = {}
         buy_sell = 1 if self.field['Buy_Sell'] == 'Buy' else -1
@@ -1843,6 +1846,8 @@ class CFFixedInterestListDeal(Deal):
             field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
         field_index['Discount'] = get_discount_factor(
             field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
+        field_index['Repo_Rate'] = get_interest_factor(
+            field['Repo_Rate'], static_offsets, stochastic_offsets, all_tenors)
         field_index['Cashflows'] = utils.make_fixed_cashflows(
             base_date, buy_sell, self.field['Cashflows'], self.field.get('Settlement_Date'))
 
