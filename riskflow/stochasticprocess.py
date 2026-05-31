@@ -2092,7 +2092,10 @@ class MarkovHMMSpotModel(StochasticProcess):
         for t, dt in enumerate(dt_arr):
             P_per_step[t] = np.real(matrix_expm(Q * dt)) if dt > 1.0e-12 else np.eye(self.n_states)
         self.P_cum = _t(np.cumsum(P_per_step, axis=2))
+        # Raw P kept for the forward belief filter (the cumulative form is sampling-only).
+        self.P_per_step = _t(P_per_step)
         self.pi0_cum = _t(np.cumsum(self.param['Initial_State_Probs']))
+        self.pi0_probs = _t(np.array(self.param['Initial_State_Probs'], dtype=np.float64))
 
         # Initial spot. AAD: keep spot0 on the autograd graph so payoff sensitivities
         # w.r.t. the initial spot flow through. Stored as-is so inner-MC mode can pass
@@ -2155,6 +2158,21 @@ class MarkovHMMSpotModel(StochasticProcess):
                 spot_path = log_path.clamp_min(-10.0).exp()
             else:
                 spot_path = s0.unsqueeze(0) + ds.cumsum(dim=0)                       # (T, B)
+            # Forward HMM belief filter — outer-mode only. The differential-ML build
+            # uses `P(regime_t | prices_{0..t})` as the regime coordinate of `market_t`
+            # (the privileged true regime is unavailable to a decision rule at runtime).
+            # Detach from autograd: belief is consumed as a state coordinate, not a
+            # quantity we differentiate through; the simulator's price-path autograd
+            # graph is preserved separately for the deal pricer.
+            # Phase 3c: published to BOTH `privileged_factors()` (B-axis dim=1 → ok concat)
+            # AND `t_Scenario_Buffer` with B-LAST shape (T, n_states, B) so the buffer's
+            # dim=-1 concat works, enabling `_extract_outer_state_at(privileged=True)` to
+            # route belief into the V̂ deep-state market block.
+            with torch.no_grad():
+                belief_path = self._forward_belief(spot_path.detach(), device, dtype)
+            self.last_regime_belief = belief_path
+            shared_mem.t_Scenario_Buffer[(self.factor_key, 'regime_belief')] = \
+                belief_path.permute(0, 2, 1).contiguous()                            # (T, n_states, B)
         else:
             # Inner mode: (T, B, B2). One regime path per outer × inner.
             T, B, B2 = Z.shape
@@ -2213,14 +2231,90 @@ class MarkovHMMSpotModel(StochasticProcess):
     @classmethod
     def privileged_layout(cls, param):
         n = len(param.get('States') or [])
-        return {'regime_onehot': n}
+        return {'regime_onehot': n, 'regime_belief': n}
 
     def privileged_factors(self, simulated):
         regimes = self.last_regime_path
-        return {
+        belief = getattr(self, 'last_regime_belief', None)
+        out = {
             'regime_onehot': torch.nn.functional.one_hot(
                 regimes, num_classes=self.n_states).to(dtype=torch.float32),
         }
+        if belief is not None:
+            # Shape (T, B, n_states); accumulator concatenates along batch dim (last but one).
+            out['regime_belief'] = belief.to(dtype=torch.float32)
+        return out
+
+    def _forward_belief(self, spot_path, device, dtype):
+        """Forward HMM belief filter — outer-mode only. Returns belief (T, B, n_states)
+        where `belief[t, b, r] = P(regime_t = r | observed diffs through time t, path b)`,
+        computed in log-space (logsumexp predict + logsumexp normalize) for numerical
+        robustness under fat-tailed Student-t emissions. Per-step emission parameters and
+        transition matrix match the simulator's exactly (same `mu_per_state`,
+        `sigma_per_state`, `nu_per_state`, `dt_per_step`, `P_per_step`) — so on held-out
+        sim data the filter is calibrated against the model that generated it.
+        """
+        T, B = spot_path.shape
+        n_states = self.n_states
+
+        pi0_probs = self.pi0_probs.to(device=device, dtype=dtype)
+        P_step = self.P_per_step.to(device=device, dtype=dtype)            # (T, n, n)
+        dt = self.dt_per_step.to(device=device, dtype=dtype)               # (T,)
+        mu = self.mu_per_state.to(device=device, dtype=dtype)              # (n,)
+        sigma = self.sigma_per_state.to(device=device, dtype=dtype)        # (n,)
+        nu_per_state = getattr(self, 'nu_per_state', None)
+        nu = nu_per_state.to(device=device, dtype=dtype) if nu_per_state is not None else None
+
+        # Observed per-step diffs: log returns if Log_Price, raw price diffs otherwise.
+        # diffs[t-1] is the observation arriving at time t.
+        if self.log_price:
+            log_path = spot_path.clamp_min(1.0e-30).log()
+            diffs = log_path[1:] - log_path[:-1]                           # (T-1, B)
+        else:
+            diffs = spot_path[1:] - spot_path[:-1]                         # (T-1, B)
+
+        log_belief = torch.empty((T, B, n_states), dtype=dtype, device=device)
+        log_belief[0] = pi0_probs.clamp_min(1.0e-30).log().expand(B, n_states)
+
+        log_2pi = float(np.log(2.0 * np.pi))
+        log_pi = float(np.log(np.pi))
+        for t in range(1, T):
+            # Predict: log_b_pred[r'] = logsumexp_r (log_b[t-1, r] + log_P[t-1, r, r'])
+            log_P = P_step[t - 1].clamp_min(1.0e-30).log()                 # (n, n)
+            log_b_pred = torch.logsumexp(
+                log_belief[t - 1].unsqueeze(-1) + log_P.unsqueeze(0), dim=-2)  # (B, n)
+
+            dt_t = dt[t]
+            if float(dt_t) < 1.0e-12:
+                # Degenerate step (e.g. forked grid where t=0's neighbour is zero); skip
+                # the update — predict-only is a valid filter step under no observation.
+                log_belief[t] = log_b_pred - torch.logsumexp(log_b_pred, dim=-1, keepdim=True)
+                continue
+
+            mean_r = mu * dt_t                                              # (n,)
+            std_r = sigma * dt_t.sqrt()                                     # (n,)
+            d = diffs[t - 1].unsqueeze(-1)                                  # (B, 1)
+            z = (d - mean_r.unsqueeze(0)) / std_r.unsqueeze(0)              # (B, n)
+            if nu is not None:
+                # Scaled-t log-pdf (model rescales innov to unit variance ⇒ σ is marginal std).
+                #   log f(d) = lgamma((ν+1)/2) − lgamma(ν/2)
+                #            − 0.5·log((ν−2)π) − log σ_r
+                #            − 0.5·(ν+1)·log(1 + z²/(ν−2))
+                nu_eff = (nu - 2.0).clamp_min(1.0e-3)
+                log_L = (
+                    torch.lgamma((nu + 1.0) / 2.0)
+                    - torch.lgamma(nu / 2.0)
+                    - 0.5 * (nu_eff.log() + log_pi)
+                    - std_r.log()
+                ).unsqueeze(0) - 0.5 * (nu + 1.0).unsqueeze(0) * torch.log1p(z.pow(2) / nu_eff.unsqueeze(0))
+            else:
+                # Gaussian log-pdf: -0.5·log(2π σ²·dt) − 0.5·z²
+                log_L = (-0.5 * (log_2pi + 2.0 * std_r.log())).unsqueeze(0) - 0.5 * z.pow(2)
+
+            log_b_unnorm = log_b_pred + log_L
+            log_belief[t] = log_b_unnorm - torch.logsumexp(log_b_unnorm, dim=-1, keepdim=True)
+
+        return log_belief.exp()
 
 
 class MarkovHMMSpotCalibration(object):

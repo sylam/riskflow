@@ -160,6 +160,17 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
             float(solver_config.get("Turnover_Cost_Padding_Multiplier", 1.0)),
         "range_projection_alpha":
             float(solver_config.get("Range_Projection_Alpha", 1.0e-3)),
+        # λ-return blend between one-step bootstrap (λ=0, the legacy LSM-DP target)
+        # and a buy-and-hold value-only rollout to T_dec (λ=1, removes V̂ from the
+        # target entirely). See differential_ml_redesign_v14.md §2.2.
+        "lambda_return": float(solver_config.get("Lambda_Return", 0.0)),
+        # Differential-ML twin-loss weight (Huge–Savine): stacked least-squares
+        # `‖v - X·β‖² + λ_diff · ‖v_grad - X_grad·β‖²` in V̂.fit, with X_grad the
+        # Jacobian of the OLS basis w.r.t. the differentiable deep-state columns and
+        # v_grad the pathwise gradient of the cross-fit target through the AAD inner-MC.
+        # 0 disables the differential branch (bit-exact baseline). See
+        # differential_ml_redesign_v14.md §2.3.
+        "lambda_diff": float(solver_config.get("Lambda_Diff", 0.0)),
         "include_dynamic_features_in_value_inputs":
             bool(solver_config.get("Include_Dynamic_Features_In_Value_Inputs", False)),
         "multi_seed_count": int(solver_config.get("Multi_Seed_Count", 1)),
@@ -528,8 +539,8 @@ def construct_torchrl_runtime(
         },
     }
     # Sanity check: Position_Bounds_Penalty is silently no-op'd when Total_Position_Abs_Limit
-    # is unset, since the penalty's only active branch is the portfolio-total ramp. (Per-
-    # instrument enforcement is a separate coefficient: Per_Instrument_Bounds_Penalty.)
+    # is unset, since the penalty's only active branch is the portfolio-total ramp. (Per-instrument
+    # enforcement is a separate coefficient: Per_Instrument_Bounds_Penalty.)
     if (runtime["objective"]["position_bounds_penalty"] > 0.0
             and runtime["accounting"]["total_position_abs_limit"] <= 0.0):
         raise ValueError(

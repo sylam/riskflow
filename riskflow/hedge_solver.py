@@ -319,6 +319,76 @@ class ValueFunctionApproximator(torch.nn.Module):
         pos_market = (pos.unsqueeze(-1) * market.unsqueeze(-2)).flatten(-2)
         return torch.cat([ones, z, pos * pos, pos_market], dim=-1)
 
+    def _basis_jacobian_rows(self, zn, grad_columns):
+        """Per-row, per-differentiable-column basis Jacobian `dφ/dzn[b, c, :]` evaluated
+        in STANDARDIZED space at `zn[b]` for each fit row `b` and each deep-state column
+        `c ∈ grad_columns`. Returns `(N, K, P)` where `K = len(grad_columns)` and `P` is
+        the basis dim.
+
+        Operates in standardized space — caller is responsible for transforming raw
+        gradient labels via `g_zn[b,c] = z_std[c] · g_raw[b,c]` so the LS constraint
+        `β·(dφ/dzn)[b,c,:] = g_zn[b,c]` is dimensionally consistent with the value rows
+        `β·φ(zn) = v` (both rhs have value-space scale, both J/φ rows have basis-coef
+        scale O(1)). Working in standardized space avoids the `1/z_std` blowup on near-
+        degenerate columns that would otherwise let the differential constraint dwarf
+        the value constraint at any lambda_diff > 0.
+
+        Tail-saturation chain rule remains: `dφ/dzn` on a tail-saturating column carries
+        an extra `scale·sech²(scale·zn)` factor from the tanh squash applied pre-basis.
+
+        Per-basis-block Jacobian in zn-space:
+          intercept p=0          → 0 always
+          linear p ∈ [1, 1+D)    → sat_chain[b,c] if p-1 == c else 0
+          pos² p ∈ [1+D, 1+D+nh) → 2·zn[b,c]·sat_chain[b,c] if c == pos_slice[p-1-D]
+                                   else 0
+          pos⊗market p ∈ [...]   → zn[b, market[j]]·sat_chain[b,c] if c == pos[i],
+                                   zn[b, pos[i]]·sat_chain[b,c]    if c == market[j],
+                                   else 0
+        where (i, j) indexes the pos⊗market flatten.
+
+        Only emits constraints for `grad_columns` (columns with KNOWN gradient labels).
+        """
+        N = zn.shape[0]
+        D = self.deep_dim
+        nh = self.pos_slice.stop - self.pos_slice.start
+        md = self.market_slice.stop - self.market_slice.start
+        pos_start = self.pos_slice.start
+        market_start = self.market_slice.start
+        K = len(grad_columns)
+        if K == 0:
+            return zn.new_zeros((N, 0, 1 + D + nh + nh * md))
+
+        # Tail-saturation chain rule (scale · sech²); identity elsewhere.
+        sat_chain = torch.ones_like(zn)
+        if self.tail_saturating_columns:
+            cols = list(self.tail_saturating_columns)
+            scale = self.tail_saturation_scale
+            sat_chain[..., cols] = scale * (
+                1.0 - torch.tanh(scale * zn[..., cols]) ** 2)
+
+        rows = []
+        for c in grad_columns:
+            sc = sat_chain[:, c]                                    # (N,) — chain at col c
+            intercept_row = zn.new_zeros((N, 1))
+            linear_row = zn.new_zeros((N, D))
+            linear_row[:, c] = sc
+            pos_sq_row = zn.new_zeros((N, nh))
+            if pos_start <= c < pos_start + nh:
+                i_pos = c - pos_start
+                pos_sq_row[:, i_pos] = 2.0 * zn[:, c] * sc
+            pos_mkt_row = zn.new_zeros((N, nh * md))
+            if pos_start <= c < pos_start + nh:
+                i_pos = c - pos_start
+                zn_market = zn[:, market_start:market_start + md]   # (N, md)
+                pos_mkt_row[:, i_pos * md:(i_pos + 1) * md] = zn_market * sc.unsqueeze(-1)
+            elif market_start <= c < market_start + md:
+                j_mkt = c - market_start
+                zn_pos = zn[:, pos_start:pos_start + nh]            # (N, nh)
+                pos_mkt_row[:, j_mkt::md] = zn_pos * sc.unsqueeze(-1)
+            rows.append(torch.cat([intercept_row, linear_row, pos_sq_row, pos_mkt_row],
+                                  dim=-1))
+        return torch.stack(rows, dim=1)                             # (N, K, P)
+
     def _apply_tail_saturation(self, zn):
         """tanh-saturate the configured columns of the standardized input. No-op when
         `tail_saturating_columns` is empty. Applied identically at fit and query so the
@@ -333,10 +403,20 @@ class ValueFunctionApproximator(torch.nn.Module):
         out[..., cols] = torch.tanh(self.tail_saturation_scale * out[..., cols])
         return out
 
-    def fit(self, z, v_target, train_steps, lr):
+    def fit(self, z, v_target, train_steps, lr, *,
+            v_grad_labels=None, grad_columns=None, lambda_diff=0.0):
         """Fit OLS β (per-column ridge — robust to basis columns of disparate norm) then
         the MLP on the OLS residual. Records the training hull + standardization stats.
-        Returns the OLS R²."""
+        Returns the OLS R².
+
+        Optional differential-ML labels (Huge–Savine twin loss): when `v_grad_labels` is
+        provided and `lambda_diff > 0`, the OLS is solved as stacked LS
+            ‖φ·β - v‖² + λ_diff · Σ_b Σ_{c ∈ grad_columns} ((dφ/dz)[b,c,:]·β - g[b,c])²
+        where `g = v_grad_labels` has shape `(N, K)`, `K = len(grad_columns)`, and each
+        gradient row enforces the basis prediction's c-th partial derivative at fit row b
+        to match the autograd-supplied label. Only `grad_columns` (columns with KNOWN
+        gradient labels) contribute — non-differentiable columns are left unconstrained,
+        so the pos² and pos⊗market β components are not artificially zeroed out."""
         self.z_lo = z.amin(dim=0)
         self.z_hi = z.amax(dim=0)
         self.z_mean = z.mean(dim=0)
@@ -349,7 +429,26 @@ class ValueFunctionApproximator(torch.nn.Module):
         zn = (z - self.z_mean) / self.z_std
         zn = self._apply_tail_saturation(zn)
         phi = self._basis(zn)                                             # (N, P)
-        gram = phi.transpose(-1, -2) @ phi
+        use_diff = (
+            v_grad_labels is not None and grad_columns is not None
+            and len(grad_columns) > 0 and lambda_diff > 0.0)
+        if use_diff:
+            # The Jacobian rows are evaluated in standardized space (no 1/z_std factor),
+            # so the gradient labels must be transformed: `g_zn[b,c] = z_std[c] · g_raw[b,c]`
+            # to keep the LS dimensionally consistent (both phi rows and J rows then have
+            # O(1) basis-coef norm; near-degenerate columns don't blow up the LS).
+            z_std_cols = self.z_std[torch.tensor(grad_columns, device=self.z_std.device)]
+            g_zn = v_grad_labels * z_std_cols                              # (N, K)
+            j_rows = self._basis_jacobian_rows(zn, grad_columns)           # (N, K, P)
+            n, k, p = j_rows.shape
+            w = float(lambda_diff) ** 0.5
+            j_flat = (w * j_rows).reshape(n * k, p)
+            y_grad_flat = (w * g_zn).reshape(n * k)
+            phi_stacked = torch.cat([phi, j_flat], dim=0)
+            y_stacked = torch.cat([v_target, y_grad_flat], dim=0)
+        else:
+            phi_stacked, y_stacked = phi, v_target
+        gram = phi_stacked.transpose(-1, -2) @ phi_stacked
         # Scale-aware ridge + absolute floor.
         # Scale-aware part handles disparate column norms.
         # Absolute floor handles zero-variance columns (e.g. bilinear terms where
@@ -365,15 +464,19 @@ class ValueFunctionApproximator(torch.nn.Module):
             logging.debug(f"VFA fit: {n_degenerate}/{diag.numel()} basis columns near-zero variance")
 
         try:
-            self.beta = torch.linalg.solve(gram + ridge, phi.transpose(-1, -2) @ v_target)
+            self.beta = torch.linalg.solve(
+                gram + ridge, phi_stacked.transpose(-1, -2) @ y_stacked)
         except torch._C._LinAlgError:
             # Fallback: lstsq is rank-deficient-tolerant via SVD. Slower but bulletproof.
             # If we hit this, something is structurally wrong with the basis at this t/seed —
             # worth investigating but not worth crashing the whole sweep.
             logging.warning(f"VFA fit: gram singular even with ridge, falling back to lstsq")
-            rhs = phi.transpose(-1, -2) @ v_target
+            rhs = phi_stacked.transpose(-1, -2) @ y_stacked
             self.beta = torch.linalg.lstsq(gram + ridge, rhs.unsqueeze(-1)).solution.squeeze(-1)
 
+        # R² and the MLP residual fit are computed on the VALUE rows only — the
+        # differential constraint pulls β toward gradient-consistency, but the
+        # value-fit quality is the headline diagnostic we report.
         ols_pred = phi @ self.beta
         ss_res = ((v_target - ols_pred) ** 2).sum()
         ss_tot = ((v_target - v_target.mean()) ** 2).sum()
@@ -573,6 +676,14 @@ class LsmDpSolver:
         alpha = float(solver_cfg.get("range_projection_alpha", 1.0e-3))
         project = alpha > 0.0
         u_min_proj, u_max_proj = float("-inf"), float("inf")
+        lambda_return = float(solver_cfg.get("lambda_return", 0.0))
+        lambda_diff = float(solver_cfg.get("lambda_diff", 0.0))
+        differential_labels = lambda_diff > 0.0 and "inner_mc_grad_fn" in bundle
+        if lambda_diff > 0.0 and "inner_mc_grad_fn" not in bundle:
+            logging.warning(
+                'LsmDpSolver: Lambda_Diff=%g requested but bundle has no '
+                'inner_mc_grad_fn — running with value labels only', lambda_diff)
+        n_h = len(hedges)
 
         tradables_sim, static_sim, t_outer = _bundle_sim_views(bundle)
         statepack = None        # built lazily — market_dim is known only once inner MC runs
@@ -607,7 +718,14 @@ class LsmDpSolver:
 
         with torch.no_grad():
             for t in range(t_outer - 2, -1, -1):
-                inner = bundle["inner_mc_fn"](t)
+                # Differential branch: fork inner MC with AAD attached to per-process
+                # state-at-t leaves. `torch.enable_grad()` re-enables autograd inside the
+                # surrounding no_grad — same pattern as vfa.fit's Adam loop.
+                if differential_labels:
+                    with torch.enable_grad():
+                        inner = bundle["inner_mc_grad_fn"](t)
+                else:
+                    inner = bundle["inner_mc_fn"](t)
                 if inner.get("L_T") is None:
                     continue                          # terminal / past-end — no inner horizon
                 L_T = inner["L_T"]                    # (B_outer, B_inner)
@@ -654,10 +772,16 @@ class LsmDpSolver:
 
                 # Cross-fit split: half the inner paths select the argmax action, the
                 # disjoint other half scores it (`_split_inner_axis` slices by shape).
+                # On the differential path: re-enable grad so the slice preserves the
+                # autograd connection back to the inner-MC leaves (slicing inside the
+                # outer no_grad would strip requires_grad).
                 b_inner = L_T.shape[1]
                 half = b_inner // 2
-                inner_A = _split_inner_axis(inner, slice(0, half), b_inner)
-                inner_B = _split_inner_axis(inner, slice(half, 2 * half), b_inner)
+                split_ctx = (torch.enable_grad if differential_labels
+                             else torch.no_grad)
+                with split_ctx():
+                    inner_A = _split_inner_axis(inner, slice(0, half), b_inner)
+                    inner_B = _split_inner_axis(inner, slice(half, 2 * half), b_inner)
 
                 # Instrumentation: objective magnitude over the grid (pre-argmax), the
                 # per-component deep-state hull queried against V̂_{t+1}, and V̂_{t+1}'s
@@ -702,17 +826,34 @@ class LsmDpSolver:
                         # argmax pass and the *other*, disjoint head on the evaluation
                         # pass, so the fitted target is never maxed over its own noise.
                         # V̂ standardizes its input internally — pass the raw deep state.
-                        v = vhead(deep_next)
-                        vhat_query_abs_max = torch.maximum(vhat_query_abs_max, v.abs().max())
-                        # Range projection: V̂ provably lies in [u_min, u_max]; clamp before
-                        # the max_a so it cannot exploit off-hull extrapolation upward.
+                        v_boot = vhead(deep_next)
+                        vhat_query_abs_max = torch.maximum(vhat_query_abs_max, v_boot.abs().max())
                         if project:
-                            v = v.clamp(u_min_proj, u_max_proj)
-                        # Hull/query diagnostic: per-component min/max of the deep state
-                        # actually queried against V̂_{t+1} during this step's search.
+                            v_boot = v_boot.clamp(u_min_proj, u_max_proj)
                         flat_dn = deep_next.reshape(-1, deep_next.shape[-1])
                         query_lo = torch.minimum(query_lo, flat_dn.amin(dim=0))
                         query_hi = torch.maximum(query_hi, flat_dn.amax(dim=0))
+                        if lambda_return > 0.0:
+                            # λ-return target: blend bootstrap with a buy-and-hold rollout
+                            # to T_dec, computed from inner-MC outputs (L_T, dF_T). At λ=1
+                            # the fitted V̂ is never queried inside the target — strips the
+                            # recursive max-over-V̂-extrapolation pathology entirely.
+                            # Approximation: "frozen-policy rollout" is replaced by "buy-and-
+                            # hold from t with the chosen action" — cheaper, value-only, no
+                            # autograd through future-policy decisions.
+                            cost_kb = _turnover_cost(action - n_prev, kappa)     # (K, B_outer)
+                            dF_T_h = torch.stack(
+                                [inner_set["dF_T"][h] for h in hedges], dim=0)   # (n_h, B_outer, B_inner)
+                            scaled_a = (action * contract_size).expand(
+                                action.shape[0], b_outer, n_h)                   # (K, B_outer, n_h)
+                            roll_pnl = torch.einsum(
+                                "kbi,ibn->kbn", scaled_a, dF_T_h)                # (K, B_outer, B_inner)
+                            post_cash = g_t.view(1, -1, 1) - cost_kb.unsqueeze(-1)
+                            wealth_T_bh = post_cash + roll_pnl + inner_set["L_T"].unsqueeze(0)
+                            v_roll = _utility_wrap_signed(wealth_T_bh, runtime)
+                            v = v_boot + lambda_return * (v_roll - v_boot)
+                        else:
+                            v = v_boot
                     out = v.mean(dim=-1)                               # (K, B_outer)
                     obj_abs_max = torch.maximum(obj_abs_max, out.abs().max())
                     return out
@@ -734,11 +875,105 @@ class LsmDpSolver:
                 n_star_AB, v_sel_AB = search_action_grid(
                     action_grid, lambda a: objective_fn(a.unsqueeze(1), inner_A, head_A),
                     chunk_size=chunk_size, total_abs_limit=total_abs_limit)
-                v_t_AB = objective_fn(n_star_AB.unsqueeze(0), inner_B, head_B).squeeze(0)
+                # The cross-fit-evaluator score for the selected action is the value
+                # target for the OTHER head. On the differential path it must be
+                # autograd-attached to the inner-MC leaves so autograd.grad below works;
+                # the surrounding torch.no_grad() suppresses tracking by default. The
+                # discrete argmax above stays under no_grad (no gradient through actions).
+                eval_ctx = (torch.enable_grad if differential_labels
+                            else torch.no_grad)
+                with eval_ctx():
+                    v_t_AB = objective_fn(
+                        n_star_AB.unsqueeze(0), inner_B, head_B).squeeze(0)
                 n_star_BA, v_sel_BA = search_action_grid(
                     action_grid, lambda a: objective_fn(a.unsqueeze(1), inner_B, head_B),
                     chunk_size=chunk_size, total_abs_limit=total_abs_limit)
-                v_t_BA = objective_fn(n_star_BA.unsqueeze(0), inner_A, head_A).squeeze(0)
+                with eval_ctx():
+                    v_t_BA = objective_fn(
+                        n_star_BA.unsqueeze(0), inner_A, head_A).squeeze(0)
+                # Differential ML: extract pathwise gradients ∂v_t/∂state_t through the
+                # AAD inner-MC BEFORE detaching v_t_AB/v_t_BA. The grads live on the per-
+                # process leaves published in inner['state_t_leaves']; only leaves whose
+                # raw shape == privileged-block width (1:1 column mapping) can be
+                # projected into the deep-state grad_columns — see the projection block
+                # below.
+                grad_columns, v_grad_labels_AB, v_grad_labels_BA = (), None, None
+                if differential_labels and "state_t_leaves" in inner:
+                    leaves = inner["state_t_leaves"]
+                    leaf_widths = inner["state_t_leaf_widths"]
+                    leaf_keys = [k for k, _ in leaf_widths]
+                    leaf_list = [leaves[k] for k in leaf_keys]
+                    with torch.enable_grad():
+                        g_AB = torch.autograd.grad(
+                            v_t_AB.sum(), leaf_list,
+                            retain_graph=True, allow_unused=True)
+                        g_BA = torch.autograd.grad(
+                            v_t_BA.sum(), leaf_list,
+                            retain_graph=False, allow_unused=True)
+                    # Walk the market block in iteration order; pick out per-leaf grads
+                    # whose raw shape lines up with the privileged-block width (i.e. a
+                    # 1:1 mapping: ForwardRate per-tenor, CommodityBasis raw scalar).
+                    # CommodityPrice/HMM (leaf=raw spot vs priv=regime one-hot) and
+                    # ForwardPrice/InterestRate (priv-empty) are SKIPPED — recorded only
+                    # in the diagnostic g-norm log.
+                    market_offset = statepack.market_slice.start
+                    f_t_col_start = market_offset - n_h       # tradable_prices block start
+                    cols = []
+                    g_AB_cols = []
+                    g_BA_cols = []
+                    g_norms = {}
+                    col = market_offset
+                    # Spot-channel gradient lands on the tradable_prices columns rather
+                    # than on the market block (whose CommodityPrice slot is the regime
+                    # one-hot — non-differentiable w.r.t. raw spot). For a single-spot
+                    # setup, the inner-MC fork-init leaf at t IS the outer spot at t, so
+                    # ∂v_t/∂spot_leaf ≡ ∂v_t/∂spot_t. Each tradable's F_t is a function
+                    # of that spot — to first order ∂F_t[i]/∂spot ≈ 1 for short tenors;
+                    # projecting g_spot uniformly across all F_t columns captures the
+                    # dominant sensitivity. Multi-spot setups would need a per-tradable
+                    # underlying mapping; deferred (the gate3 toy has a single
+                    # CommodityPrice).
+                    spot_grads_AB, spot_grads_BA = [], []
+                    for (key, priv_w), gA, gB, leaf in zip(
+                            leaf_widths, g_AB, g_BA, leaf_list):
+                        leaf_raw_w = leaf.numel() // b_outer
+                        if gA is not None:
+                            g_norms[str(key.type)] = float(gA.abs().mean())
+                        if priv_w > 0 and leaf_raw_w == priv_w and gA is not None:
+                            # 1:1 market-block mapping (ForwardRate per-tenor,
+                            # CommodityBasis scalar).
+                            gA2 = gA.reshape(priv_w, b_outer)
+                            gB2 = (gB if gB is not None
+                                   else torch.zeros_like(gA)).reshape(priv_w, b_outer)
+                            for i in range(priv_w):
+                                cols.append(col + i)
+                                g_AB_cols.append(gA2[i].detach())
+                                g_BA_cols.append(gB2[i].detach())
+                        elif key.type == 'CommodityPrice' and gA is not None:
+                            # Spot channel: project to tradable_prices columns below.
+                            spot_grads_AB.append(gA.detach())
+                            spot_grads_BA.append((gB if gB is not None
+                                                  else torch.zeros_like(gA)).detach())
+                        col += priv_w
+                    if spot_grads_AB:
+                        # Aggregate spot gradients across all CommodityPrice leaves (toy
+                        # case: one); broadcast to every F_t column.
+                        g_spot_AB = torch.stack(spot_grads_AB, dim=0).sum(dim=0)  # (B,)
+                        g_spot_BA = torch.stack(spot_grads_BA, dim=0).sum(dim=0)
+                        for i in range(n_h):
+                            cols.append(f_t_col_start + i)
+                            g_AB_cols.append(g_spot_AB)
+                            g_BA_cols.append(g_spot_BA)
+                    if cols:
+                        grad_columns = tuple(cols)
+                        v_grad_labels_AB = torch.stack(g_AB_cols, dim=1)  # (B_outer, K)
+                        v_grad_labels_BA = torch.stack(g_BA_cols, dim=1)
+                    inner["_diff_g_norms"] = g_norms
+                    inner["_diff_active_columns"] = len(cols)
+                # Detach v_t targets BEFORE any storage / fit — otherwise the inner-MC
+                # autograd tape would survive across t iterations and balloon memory.
+                v_t_AB = v_t_AB.detach()
+                v_t_BA = v_t_BA.detach()
                 # n_star reported as a discrete grid action — pick the better
                 # cross-fit pass. Value estimate continues to use the cross-fit average.
                 chose_AB = float(v_t_AB.mean()) >= float(v_t_BA.mean())
@@ -852,9 +1087,15 @@ class LsmDpSolver:
                     tail_saturating_columns=tail_sat,
                     tail_saturation_scale=tail_sat_scale)
                 r2_A = vfa_A.fit(state_t, v_t_AB,
-                                 vf_cfg["mlp_train_steps_per_solve"], vf_cfg["mlp_adam_lr"])
+                                 vf_cfg["mlp_train_steps_per_solve"], vf_cfg["mlp_adam_lr"],
+                                 v_grad_labels=v_grad_labels_AB,
+                                 grad_columns=grad_columns,
+                                 lambda_diff=lambda_diff if differential_labels else 0.0)
                 r2_B = vfa_B.fit(state_t, v_t_BA,
-                                 vf_cfg["mlp_train_steps_per_solve"], vf_cfg["mlp_adam_lr"])
+                                 vf_cfg["mlp_train_steps_per_solve"], vf_cfg["mlp_adam_lr"],
+                                 v_grad_labels=v_grad_labels_BA,
+                                 grad_columns=grad_columns,
+                                 lambda_diff=lambda_diff if differential_labels else 0.0)
                 value_fns[t], r2_by_t[t] = (vfa_A, vfa_B), min(r2_A, r2_B)
                 # Record V̂_t's training hull — paired against next step's query range.
                 diag_by_t[t]["train_hull_lo"] = state_t.amin(dim=0).tolist()
@@ -895,6 +1136,23 @@ class LsmDpSolver:
                 diag_by_t[t]["ols_r2"] = min(r2_A, r2_B)
                 diag_by_t[t]["resid_corr"] = resid_corr
                 diag_by_t[t]["resid_corr_worst"] = (dim_names[worst], resid_corr[worst])
+                if differential_labels:
+                    n_active = inner.get("_diff_active_columns", 0)
+                    g_norms = inner.get("_diff_g_norms", {})
+                    diag_by_t[t]["differential_active_columns"] = n_active
+                    diag_by_t[t]["differential_g_norms"] = g_norms
+                    label_absmean = (float(v_grad_labels_AB.abs().mean())
+                                     if v_grad_labels_AB is not None else 0.0)
+                    diag_by_t[t]["differential_label_absmean"] = label_absmean
+                    leaf_widths = inner.get("state_t_leaf_widths", [])
+                    width_summary = ", ".join(
+                        f"{k.type}:{w}" for k, w in leaf_widths)
+                    logging.info(
+                        'LsmDpSolver t=%d diff: active_cols=%d label_absmean=%.4g '
+                        'g_norms=%s | leaf_widths=[%s]',
+                        t, n_active, label_absmean,
+                        {k: '%.3g' % v for k, v in g_norms.items()},
+                        width_summary)
                 d = diag_by_t[t]
                 logging.info(
                     'LsmDpSolver t=%d: |V_t|max=%.3g V_t.mean=%.3g asym_gap=%.3g '
