@@ -705,7 +705,7 @@ class Config(object):
             # merge missing tenors
             v_max = max(reset_dates)
             for k, v in missing_tenors.items():
-                dependent_factor_tenors.setdefault(k, set()).update(x for x in v if x<=v_max)
+                dependent_factor_tenors.setdefault(k, set()).update(min(x, v_max) for x in v)
             # now get the last tenor for each factor
             dependent_factors = {k: max(dependent_factor_tenors.get(k, reset_dates)) for k in sorted_factors}
 

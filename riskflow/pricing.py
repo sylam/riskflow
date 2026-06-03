@@ -2370,7 +2370,9 @@ def pv_fixed_cashflows(shared, time_grid, deal_data, ignore_fixed_rate=False, se
     cash_start_idx = factor_dep['Cashflows'].get_cashflow_start_index(deal_time)
     settlement_amt = factor_dep.get('Settlement_Amount', 0.0)
     discounts = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
-    repo = utils.calc_time_grid_curve_rate(factor_dep['Repo_Rate'], deal_time, shared)
+    # there could be a repo curve if this is settled in future
+    repo_code = factor_dep.get('Repo_Rate', factor_dep['Discount'])
+    repo = utils.calc_time_grid_curve_rate(repo_code, deal_time, shared)
 
     start_index, counts = np.unique(cash_start_idx, return_counts=True)
 
