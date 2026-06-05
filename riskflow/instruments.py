@@ -1811,6 +1811,7 @@ class SwapInterestDeal(Deal):
 class CFFixedInterestListDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Repo_Rate': ['InterestRate'],
+                     'Settlement_Rate': ['InterestRate'],
                      'Discount_Rate': ['DiscountRate']}
 
     documentation = (
@@ -1838,6 +1839,8 @@ class CFFixedInterestListDeal(Deal):
             field['Currency']
         field['Repo_Rate'] = utils.check_rate_name(self.field['Repo_Rate']) if self.field.get('Repo_Rate') else \
             field['Discount_Rate']
+        field['Settlement_Rate'] = utils.check_rate_name(self.field['Settlement_Rate']) if self.field.get(
+            'Settlement_Rate') else field['Discount_Rate']
 
         field_index = {}
         buy_sell = 1 if self.field['Buy_Sell'] == 'Buy' else -1
@@ -1848,6 +1851,8 @@ class CFFixedInterestListDeal(Deal):
             field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
         field_index['Repo_Rate'] = get_interest_factor(
             field['Repo_Rate'], static_offsets, stochastic_offsets, all_tenors)
+        field_index['Settlement_Rate'] = get_interest_factor(
+            field['Settlement_Rate'], static_offsets, stochastic_offsets, all_tenors)
         field_index['Cashflows'] = utils.make_fixed_cashflows(
             base_date, buy_sell, self.field['Cashflows'], self.field.get('Settlement_Date'))
 
@@ -2054,6 +2059,7 @@ class YieldInflationCashflowListDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
                      'Repo_Rate': ['InterestRate'],
+                     'Settlement_Rate': ['InterestRate'],
                      'Index': ['InflationRate']}
 
     documentation = ('Inflation', ['This pays a fixed coupon on an inflation indexed principal. Define the following: ',
@@ -2099,6 +2105,8 @@ class YieldInflationCashflowListDeal(Deal):
             field['Currency']
         field['Repo_Rate'] = utils.check_rate_name(self.field['Repo_Rate']) if self.field.get('Repo_Rate') else \
             field['Discount_Rate']
+        field['Settlement_Rate'] = utils.check_rate_name(self.field['Settlement_Rate']) if self.field.get(
+            'Settlement_Rate') else field['Discount_Rate']
         field['PriceIndex'] = utils.check_rate_name(get_inflation_index_name(field['Index'], all_factors))
 
         field_index = {
@@ -2110,6 +2118,8 @@ class YieldInflationCashflowListDeal(Deal):
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Repo_Rate': get_interest_factor(
                 field['Repo_Rate'], static_offsets, stochastic_offsets, all_tenors),
+            'Settlement_Rate': get_interest_factor(
+                field['Settlement_Rate'], static_offsets, stochastic_offsets, all_tenors),
             'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets)
         }
 
