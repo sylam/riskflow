@@ -2076,6 +2076,24 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             torchrl_bundle['inner_mc_grad_fn'] = lambda t: self._run_inner_mc_at_t(
                 t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
                 with_grad=True)
+            # One-step variant for the diff-ML twin-loss bootstrap label gen — fork
+            # at `t`, advance ONE step to `t+1` under autograd, skip the pricing chain
+            # (the deal pricer needs the full horizon and would produce meaningless
+            # `L_T` against a 2-point grid). Returns `market_t`, `market_t1`, and the
+            # per-process `state_t_leaves` autograd leaves. Restricting the AAD tape to
+            # a single step is what keeps the spec's twin-loss architecture on a 3090.
+            torchrl_bundle['inner_mc_grad_fn_one_step'] = lambda t: self._run_inner_mc_at_t(
+                t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
+                with_grad=True, max_inner_steps=1, return_market_only=True)
+            # Calc handle for DifferentialSolver's `sample_exogenous` seam (gate4
+            # diff-ML build): the solver reads `_outer_scenario_buffer` + uses
+            # `_extract_outer_state_at` directly; no monkey-patching of framework
+            # primitives. **TODO refactor (A):** promote `sample_exogenous` to a
+            # `HedgeMonteCarlo` bundle source (i.e., emit per-t exogenous slices into
+            # `torchrl_bundle` so the solver doesn't reach back into the calc) — until
+            # then this attribute lets the solver read what's already there without
+            # owning the buffer.
+            torchrl_bundle['_calc_handle'] = self
         evaluation_summary = None
         optimizer_diagnostics = None
         policy_artifact = None
@@ -2599,7 +2617,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         return inner
 
     def _run_inner_mc_at_t(self, t, outer_scenario_buffer, shared_mem, base_date,
-                           tradable_refs, want_raw_samples=True, with_grad=False):
+                           tradable_refs, want_raw_samples=True, with_grad=False,
+                           max_inner_steps=None, return_market_only=False):
         """Run inner MC at a single outer timestep `t`, forking from `outer_scenario_buffer`
         — a snapshot of the outer `t_Scenario_Buffer` (factor keys plus the
         `(spot_key,'regimes')` aux key, batch dim B_outer).
@@ -2651,11 +2670,30 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         cutoff_idx = t
         inner_base_date = base_date + pd.Timedelta(days=t_days)
 
+        # `max_inner_steps=1` truncates the inner grid to {t, t+1} for the diff-ML
+        # one-step bootstrap-label generation (`inner_mc_grad_fn_one_step` closure on
+        # the bundle). Restricting the AAD tape to a single forward step is the whole
+        # reason the spec's twin-loss design fits on a 3090 — a full t→T_dec inner
+        # horizon would multiply the tape by ~30× for no use (the bootstrap label only
+        # reads `market_{t+1}`). `return_market_only=True` (paired) then skips the
+        # deal-pricing chain, which would produce meaningless `L_T` against a 2-point
+        # grid anyway (`_restricted_struct` drops deals whose horizon extends past t+1).
+        if max_inner_steps is not None and \
+                inner_time_grid.scen_time_grid.size > max_inner_steps + 1:
+            dates_sorted = sorted(inner_time_grid.scenario_dates)[:max_inner_steps + 1]
+            kept = set(dates_sorted)
+            inner_time_grid = utils.TimeGrid(
+                kept,
+                kept & set(inner_time_grid.mtm_dates),
+                kept & set(inner_time_grid.base_MTM_dates))
+            inner_time_grid.set_base_date(inner_base_date)
+
         chunk = max(1, _INNER_MC_FLAT_LIMIT // B_inner)
         if chunk >= B_outer:
             return self._run_inner_mc_chunk(
                 t, cutoff_idx, outer_scenario_buffer, shared_mem, inner_base_date,
-                inner_time_grid, tradable_refs, want_raw_samples, with_grad=with_grad)
+                inner_time_grid, tradable_refs, want_raw_samples, with_grad=with_grad,
+                return_market_only=return_market_only)
         if with_grad:
             # Chunked grad mode would require gradient accumulation across chunks via
             # per-chunk .backward()'s; punt on that until a real B_outer needs it.
@@ -2668,11 +2706,13 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             outer_buf = {k: v[..., lo:hi] for k, v in outer_scenario_buffer.items()}
             results.append(self._run_inner_mc_chunk(
                 t, cutoff_idx, outer_buf, shared_mem, inner_base_date,
-                inner_time_grid, tradable_refs, want_raw_samples))
+                inner_time_grid, tradable_refs, want_raw_samples,
+                return_market_only=return_market_only))
         return _concat_inner_chunks(results, want_raw_samples)
 
     def _run_inner_mc_chunk(self, t, cutoff_idx, outer_buf, shared_mem, inner_base_date,
-                            inner_time_grid, tradable_refs, want_raw_samples, with_grad=False):
+                            inner_time_grid, tradable_refs, want_raw_samples,
+                            with_grad=False, return_market_only=False):
         """Inner MC for one outer-path sub-chunk — generation, buffer stuffing, a single
         pricing pass, extraction — all at `B_outer_chunk × B_inner` flat. Peak memory is
         the chunk, not the full B_outer; `_run_inner_mc_at_t` loops this and concatenates.
@@ -2729,6 +2769,41 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     s = self._extract_outer_state_at(
                         1, key, shared_mem.t_Scenario_Buffer, privileged=True)
                     market_t1_parts.append(s.reshape(-1, B_outer, B_inner))
+
+            # Diff-ML one-step short-circuit — skip the pricing chain (`_restricted_struct`
+            # would drop deals whose horizon extends past t+1, producing meaningless
+            # `L_T`). The AAD leaves are already attached to the inner generate, so
+            # backward through `market_t1` reaches `state_t_leaves` — exactly what the
+            # twin-loss differential label gen needs. `L_T`/`F_t1`/`dF_T` return as
+            # `None`/empty dicts; the diff-ML solver never reads them on this path.
+            if return_market_only and want_raw_samples:
+                market_t1 = torch.cat(market_t1_parts, dim=0).permute(1, 2, 0).contiguous()
+                market_t_parts, market_t_widths = [], []
+                for key in self.stoch_factors_inner:
+                    if key.type in utils.DimensionLessFactors:
+                        continue
+                    block = self._extract_outer_state_at(
+                        t, key, outer_buf, privileged=True).reshape(-1, B_outer)
+                    market_t_parts.append(block)
+                    market_t_widths.append((key, block.shape[0]))
+                market_t = torch.cat(market_t_parts, dim=0).permute(1, 0).contiguous()
+                # `features` placeholder — the RL feature builder is pricing-dependent
+                # and explicitly skipped on the one-step diff-ML path. Consumers on
+                # this branch never read it.
+                _n_features = 3 + 2 * len(tradable_refs)
+                result = {'features': shared_mem.one.new_zeros(B_outer, _n_features)}
+                result.update(
+                    t=t, cutoff_idx=cutoff_idx, L_T=None,
+                    F_t1={}, dF_T={}, dF_min={},
+                    market_t=market_t, market_t1=market_t1)
+                if with_grad:
+                    result['state_t_leaves'] = state_t_leaves
+                    result['state_t_leaf_widths'] = market_t_widths
+                shared_mem.simulation_batch = B_outer
+                shared_mem.t_Buffer.clear()
+                shared_mem.t_Scenario_Buffer.clear()
+                shared_mem.t_quasi_rng.clear()
+                return result
 
             # Stuff the outer-realized past into each factor buffer + flatten (B,SB)→B*SB.
             for key in self.stoch_factors_inner:

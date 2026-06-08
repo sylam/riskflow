@@ -312,13 +312,18 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         vol_tenor = self.implied.param['Vol'].array[:, 0]
         self.V = torch.unsqueeze(integrate_piecewise_linear(
             (calc_vol, 1.0), shared, time_grid.time_grid_years, vol_tenor, implied_tensor['Vol']), dim=1)
-        # calc the incremental vol
-        self.delta_vol = F.pad(torch.sqrt(self.V[1:] - self.V[:-1]), (0, 0, 1, 0))
-        self.delta_scen_t = np.insert(np.diff(time_grid.scen_time_grid), 0, 0).reshape(-1, 1)
+        # per-step incremental vol, anchored at V(0)=0 so the first step evolves from today (t=0)
+        self.delta_vol = torch.sqrt(self.V - F.pad(self.V[:-1], (0, 0, 1, 0)))
+        # we always evolve from today: prepend 0 to the sample times so the step sizes are the diffs
+        # [t_1, t_2 - t_1, ...] and each step's drift is read from the curve as-of its start node
+        # [0, t_1, ..., t_{N-1}] (when t_1 = 0 the first step is a no-op and we match spot today)
+        self.delta_scen_t = np.diff(np.insert(time_grid.scen_time_grid, 0, 0)).reshape(-1, 1)
         # store a reference to the current tensor
         self.spot = tensor
-        # store the scenario grid
-        self.scen_grid = time_grid.scenario_grid
+        # the curve-read grid is the step starts: today (t=0) followed by all but the final sample
+        today = time_grid.scenario_grid[:1].copy()
+        today[:, utils.TIME_GRID_MTM] = 0.0
+        self.scen_grid = np.vstack([today, time_grid.scenario_grid[:-1]])
         # check if we need to calculate the quanto fx vol
         if self.factor_type == 'EquityPrice' and self.quanto_fx_tenor is not None:
             # need to get the quantofx rate if necessary

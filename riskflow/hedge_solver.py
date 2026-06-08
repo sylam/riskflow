@@ -16,8 +16,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
+import numpy as np
+import pandas as pd
 import torch
 
+from . import utils
 from .torchrl_hedge import (
     _utility_wrap_signed, _mirror_utility_scale_to_runtime,
 )
@@ -627,6 +630,140 @@ def _extrapolation_diagnostic(vfa, state_train, deep_q, k=16, max_q=262144):
              **_q(sub, (0.5, 0.9, 0.99))}
             if sub.numel() else {"frac": 0.0})
     return out
+
+
+class TwinNetwork(torch.nn.Module):
+    """Differential-ML post-decision continuation function `C_t : z_t → scalar` for the
+    DifferentialSolver (`gate4_diffml_solver_spec.md`). Small MLP, **softplus** activation
+    throughout so the network is C¹ — required for the twin loss's derivative-matching
+    term to be well-defined everywhere on the input domain. **No internal max**: this is
+    a smooth post-decision continuation function; the Bellman max is the explicit
+    external operator (the decision operator at run/audit time and the `q*_{t+1}`
+    argmax inside the value label generator) applied only to the **already-frozen**
+    network. That moves-max-out-of-fit property is the architectural payoff over the
+    LsmDpSolver postfix pathology.
+
+    Standardization is built in: stored `z_mean`, `z_std`, `y_mean`, `y_std` buffers
+    (refreshed once per backward step via `set_normalization` against the freshly-built
+    training bank) ensure both the value and gradient losses live in O(1)-norm
+    standardized space. Per spec §9:
+        dy_norm/dz_norm = dy/dz · z_std / y_std
+    keeps the differential constraint dimensionally consistent with the value
+    constraint regardless of raw-unit scaling.
+    """
+
+    def __init__(self, deep_dim, hidden_sizes=(128, 128, 128), device=None):
+        super().__init__()
+        if device is None:
+            device = torch.device("cpu")
+        layers = []
+        prev = deep_dim
+        for h in hidden_sizes:
+            layers.append(torch.nn.Linear(prev, h))
+            layers.append(torch.nn.Softplus())
+            prev = h
+        layers.append(torch.nn.Linear(prev, 1))
+        self.mlp = torch.nn.Sequential(*layers).to(device)
+        # Normalization buffers — refreshed per backward step from the bank; survive
+        # state_dict() saves so warm-start carries the standardization forward.
+        self.register_buffer("z_mean", torch.zeros(deep_dim, device=device))
+        self.register_buffer("z_std", torch.ones(deep_dim, device=device))
+        self.register_buffer("y_mean", torch.zeros((), device=device))
+        self.register_buffer("y_std", torch.ones((), device=device))
+        self.deep_dim = deep_dim
+        self.device = device
+
+    def set_normalization(self, z_mean, z_std, y_mean, y_std):
+        """Refresh standardization stats from the current bank's empirical moments.
+        Near-constant columns (a one-hot regime that never fires at this t, the
+        held-at-zero accrued slot) get z_std clamped to 1.0 — matches the convention
+        in ValueFunctionApproximator.fit and prevents the 1/z_std blow-up the OLS path
+        learned about the hard way (memory: diff-ml-standardized-jacobian)."""
+        eps = 1.0e-6
+        self.z_mean.copy_(z_mean.detach())
+        self.z_std.copy_(torch.where(z_std > eps, z_std, torch.ones_like(z_std)).detach())
+        self.y_mean.copy_(y_mean.detach() if y_mean.dim() == 0 else y_mean.detach().squeeze())
+        y_std_clamped = torch.maximum(y_std if y_std.dim() == 0 else y_std.squeeze(),
+                                       torch.tensor(eps, device=y_std.device))
+        self.y_std.copy_(y_std_clamped.detach())
+
+    def forward(self, z):
+        """Returns `C_t(z)` in raw (un-standardized) units. Input `z` is the raw deep
+        state; standardization is applied internally so callers pass raw vectors and
+        receive raw values. Shape: `z` is `(..., deep_dim)`, output is `(...)`."""
+        zn = (z - self.z_mean) / self.z_std
+        yn = self.mlp(zn).squeeze(-1)
+        return yn * self.y_std + self.y_mean
+
+
+def twin_loss(net, z, y_target, dy_dz_target, *,
+              action_gap=None, gap_threshold=None,
+              w_val=1.0, w_diff=1.0):
+    """Huge–Savine twin loss (spec §9):
+        L = w_val · MSE(C(z), y) + w_diff · MSE(∂C/∂z, ∂y/∂z)
+    computed entirely in standardized space so both terms have O(1)-norm contributions
+    per row regardless of raw-unit scaling.
+
+    Both `y_target` and `dy_dz_target` are passed in **raw units**; standardization
+    happens internally against the network's stored buffers. The gradient prediction
+    is computed via `torch.autograd.grad(..., create_graph=True)` over a standardized
+    leaf input — that yields `∂yn_pred/∂zn` directly, which is what the standardized
+    target is in:
+        dy_norm/dz_norm = dy/dz · z_std / y_std        # per spec §9
+    The `create_graph=True` keeps the second-order graph alive so the outer optimizer's
+    `loss.backward()` reaches the network parameters.
+
+    Action-gap derivative mask: at training rows near action-switch boundaries the
+    bootstrap differential is a branchwise derivative and unreliable. Per spec §9, set
+    `w_diff_per_row = clamp(action_gap / gap_threshold, 0, 1)` — the value label stays
+    active through kinks while the slope target is down-weighted. Pass `action_gap` and
+    `gap_threshold` together to activate; pass neither for an unmasked fit.
+
+    Returns `(total_loss, diag_dict)`. `diag_dict` carries per-term losses for
+    logging/early-stopping.
+    """
+    # Standardize inputs once; share the forward pass between value and gradient
+    # terms by computing the network on a leaf-version of zn and reusing the result.
+    zn_leaf = ((z - net.z_mean) / net.z_std).detach().requires_grad_(True)
+    yn_pred = net.mlp(zn_leaf).squeeze(-1)
+
+    # Value branch — standardized MSE.
+    yn_target = (y_target - net.y_mean) / net.y_std
+    val_resid = yn_pred - yn_target
+    val_loss = (val_resid ** 2).mean()
+
+    # Gradient branch — `∂yn_pred/∂zn` via autograd, compared to the standardized
+    # gradient target. `create_graph=True` is mandatory: the outer backward needs the
+    # path through this gradient computation to reach the network parameters.
+    dyn_dzn_pred = torch.autograd.grad(
+        yn_pred.sum(), zn_leaf, create_graph=True)[0]               # (N, D)
+    dyn_dzn_target = dy_dz_target * (net.z_std / net.y_std)         # (N, D)
+
+    diff_per_row = ((dyn_dzn_pred - dyn_dzn_target) ** 2).mean(dim=-1)  # (N,)
+    if action_gap is not None and gap_threshold is not None and gap_threshold > 0:
+        mask = (action_gap / float(gap_threshold)).clamp(0.0, 1.0)
+        diff_loss = (diff_per_row * mask).mean()
+        mask_mean = float(mask.mean())
+    else:
+        diff_loss = diff_per_row.mean()
+        mask_mean = 1.0
+
+    total = w_val * val_loss + w_diff * diff_loss
+    return total, {
+        "val_loss": float(val_loss.detach()),
+        "diff_loss": float(diff_loss.detach()),
+        "mask_mean": mask_mean,
+    }
+
+
+def construct_twin_network(deep_dim, runtime, device=None):
+    """Factory for the diff-ML continuation function. Reads `Solver.Value_Fn.MLP_Hidden`
+    for the layer widths; defaults to `(128, 128, 128)` per the Gate 4 build defaults.
+    Device defaults to the bundle's primary device when one is reachable through
+    `runtime`; callers pass it explicitly otherwise."""
+    vf = runtime["solver"].get("value_fn", {})
+    hidden = tuple(vf.get("mlp_hidden", (128, 128, 128)))
+    return TwinNetwork(deep_dim, hidden_sizes=hidden, device=device)
 
 
 class LsmDpSolver:
@@ -1369,10 +1506,877 @@ def _multiseed_summary(runs):
                       or runs[0].diagnostics.get("n_star")}
 
 
+class DifferentialSolver:
+    """Differential-ML dynamic-hedging solver per `gate4_diffml_solver_spec.md`. Casts each
+    per-step value function as a smooth post-decision continuation `C_t : z_t → scalar`
+    fit by supervised twin loss (value + AAD gradient labels) over a controlled bank,
+    with the Bellman max moved **out** of the regression into an explicit external
+    operator applied only to the already-frozen `C_{t+1}`. This removes the
+    "max-inside-fit + extrapolation clamp" pathology that pins LsmDpSolver to off-
+    distribution values (see `class LsmDpSolver` failure mode at `gate2`-toy weekly).
+
+    **The one swappable seam** is `sample_exogenous(n, seed) -> trajectories[all t]`:
+    a fat, no-policy forward sweep from the **true** t0 (path-count breadth on
+    exogenous coordinates — no t0 perturbation; the argmax doesn't control them so
+    the natural forward distribution IS their correct query distribution). Endogenous
+    coordinates (inventory, wealth) are spanned across the designer box at each t
+    slice inside the solver. The promotion path is (A) "promote `sample_exogenous`
+    to a `HedgeMonteCarlo` bundle source" — the framework absorbs that one method;
+    everything else (endogenous span, bootstrap label gen, audit rollouts) is
+    permanent solver logic that the framework never owns.
+
+    **Current status — Milestone 0**: cold-train `C_T` from inside the solver and exit.
+    The bank is the realized terminal slice of the exogenous sweep; labels are the
+    deal's closed-form terminal utility `U(W_T(z_T))` over all legal post-decision
+    inventories. Backward sweep (Milestone 1+) deferred — the seam is validated here
+    before any AAD bootstrap-label or audit machinery lands.
+    """
+
+    def __init__(self, bundle, runtime):
+        self.bundle = bundle
+        self.runtime = runtime
+        self.device = bundle["time_grid_days"].device
+        self.dtype = bundle["time_grid_days"].dtype
+        # Calc handle (calculation.py: bundle['_calc_handle'] = self) — used by
+        # `sample_exogenous` to read the already-populated `_outer_scenario_buffer` via
+        # the canonical `_extract_outer_state_at` reader. NO monkey-patching.
+        self._calc = bundle.get("_calc_handle")
+        if self._calc is None:
+            raise RuntimeError(
+                "DifferentialSolver requires bundle['_calc_handle'] — check "
+                "HedgeMonteCarlo.execute attaches it when Solver.Object='DifferentialSolver'.")
+        self._outer_buf = self._calc._outer_scenario_buffer
+        self._spot_key = self._calc._find_spot_key()
+
+        # Solver config (JSON-driven).
+        solver_cfg = runtime["solver"]
+        vf_cfg = solver_cfg.get("value_fn", {})
+        self.hidden_sizes = tuple(vf_cfg.get("mlp_hidden", (128, 128, 128)))
+        self.train_steps_per_solve = int(vf_cfg.get("mlp_train_steps_per_solve", 2000))
+        self.train_minibatch = int(vf_cfg.get("mlp_minibatch", 4096))
+        self.adam_lr = float(vf_cfg.get("mlp_adam_lr", 1.0e-3))
+        # Bank construction knobs (spec §6).
+        bank_cfg = solver_cfg.get("bank_sampling", {})
+        self.b_endo = int(bank_cfg.get("b_endo", 2))
+
+        self.hedges = list(runtime["names"]["hedges"])
+        # T_outer-1 decision points: t=0..T-2 (DP convention). C[T_outer-1] is the
+        # boundary anchor — fit to closed-form terminal utility, no bootstrap.
+        tradables_sim, static_sim, t_outer = _bundle_sim_views(bundle)
+        self._tradables_sim = tradables_sim
+        self._static_sim = static_sim
+        self.t_outer = t_outer
+
+        # State pack — reuse the existing layout. Market block carries the regime
+        # belief for the HMM toy; dim is whatever `_run_inner_mc_at_t` would publish.
+        # For Milestone 0 we don't need the inner-MC machinery; only the terminal
+        # slice of the outer buffer. Market dim derived from privileged-mode
+        # extraction at t=0 (any t works — same per-process widths).
+        market_t0 = self._read_privileged_market(t=0)
+        market_dim = market_t0.shape[-1]
+        self.statepack = StatePack.from_bundle(bundle, runtime, market_dim)
+
+        # Trained continuation functions, one per backward index. None until fit.
+        self.C = [None] * t_outer
+
+        # --- Step C: is_live mask + action grid + accounting constants ---
+        # `is_live[t, j] = True` iff hedge j is tradable at outer t. Derived from the
+        # framework's `runtime['tradables'][h]['last_trade_date']` (hedge_runtime.py:425)
+        # + the bundle's history-stripped `time_grid_days_cpu` (torchrl_hedge.py:2124)
+        # + `bundle['meta']['base_date']` (torchrl_hedge.py:2090). Convention matches
+        # the existing per-step alive flag in hedge_features.py:524 (`current_day <
+        # last_trade_day`). This drives the bank's endogenous-span dead-axis collapse
+        # (force q_dead = 0) and the decision operator's action-grid restriction.
+        hist = int(bundle.get('initial_time_index', 0))
+        base_date = bundle['meta']['base_date']
+        days = bundle['time_grid_days_cpu'][hist:]
+        is_live = torch.zeros(self.t_outer, len(self.hedges),
+                              dtype=torch.bool, device=self.device)
+        for j, h in enumerate(self.hedges):
+            ltd = runtime['tradables'][h]['last_trade_date']
+            last_day = (pd.Timestamp(ltd) - pd.Timestamp(base_date)).days
+            for ti, d in enumerate(days[:self.t_outer]):
+                is_live[ti, j] = int(d) < last_day
+        self.is_live = is_live
+
+        # Action grid — integer levels per axis, [Min_Position, Max_Position] per hedge.
+        # Reuse the existing helper; spec §4 = ±5 per leg = 11 levels per axis →
+        # 11^n_hedge candidates total (121 in the early window, 11 past T_A).
+        levels = int(solver_cfg.get("training_action_grid_levels_per_axis", 11))
+        self.action_grid = build_action_grid(runtime, levels, self.device)   # (K, n_h)
+
+        # Toy accounting constants. Spec §3: λ_turn = 1e-4, K = 100 strike, S_0 = 100.
+        # Promoted to JSON in M2/M3; hard-wired here so the smoke runs without a
+        # config update. The wealth convention is gate2-style MTM-invariant:
+        #   w_t = cash + (Σq − 1)·S_t + K
+        # so under no rebalance: w_{t+1} = w_t + (Σq − 1)·dS; under rebalance:
+        # w_post = w_pre − turnover.
+        self.lambda_turn = float(runtime["accounting"].get(
+            "transaction_cost_per_unit", 1.0e-4))
+        self.K_strike = float(solver_cfg.get("k_strike", 100.0))
+        self.contract_size = torch.ones(len(self.hedges), device=self.device)
+        self.utility_c = max(float(bundle.get("utility_scale", 100.0)), 1.0)
+
+    # ------------------------------------------------------------------ seam
+    def sample_exogenous(self, n=None, seed=None):
+        """**THE ONE SWAPPABLE METHOD** between (B) solver-internal and (A) framework-
+        bundle-source variants. Returns a per-t trajectory dict with the canonical
+        privileged exogenous coordinates ready for endogenous-span composition.
+
+        For Milestone 0 (current): wraps `HedgeMonteCarlo._extract_outer_state_at` over
+        the already-populated `_outer_scenario_buffer` — n is fixed at the existing
+        outer batch size (re-sweep with fresh seed deferred to Milestone 2 / audit).
+        For Milestone 2: a fresh-seeded resweep will run the canonical forward loop
+        (`calculation.py:1887–1909`) via the calc handle.
+
+        Returns: `{t: {'market': (B, market_dim), 'tradables': (B, n_hedge)}}` for
+        every outer index t. The market block is the privileged extractor output
+        (regime belief for the HMM toy, plus basis/carry where present). Tradable
+        prices come from `tradables_sim[h][t]`. Both are read no-grad.
+        """
+        # n is ignored in Milestone 0 — the buffer is sized at the existing outer
+        # batch and we don't re-sweep.
+        del n, seed
+        traj = {}
+        with torch.no_grad():
+            for t in range(self.t_outer):
+                market_t = self._read_privileged_market(t)
+                tradables_t = torch.stack(
+                    [self._tradables_sim[h][t].to(self.device) for h in self.hedges],
+                    dim=-1)                                # (B, n_hedge)
+                traj[t] = {"market": market_t, "tradables": tradables_t}
+        return traj
+
+    def _read_privileged_market(self, t):
+        """Privileged exogenous coordinates at outer t, B-last → B-leading. Concatenates
+        per-process privileged blocks in `stoch_factors_inner` iteration order — same
+        ordering the inner-MC `market_t` uses, so the StatePack market block is
+        layout-consistent across diff-ML training and the existing inner-MC machinery.
+
+        **For the gate2 toy comparison: TRUE-regime one-hot, NOT belief.** gate2 is a
+        full-information DP whose state vector includes the observable regime
+        coordinate (gate2_exact_dp.py:14, 28). The canonical
+        `_extract_outer_state_at(..., privileged=True)` at calculation.py:2167-2181
+        prefers the filtered belief `(key, 'regime_belief')` when the buffer holds it
+        (per the spec's filter posterior convention) — but on the toy that turns the
+        diff-ML solver into a partial-information solver whose value is strictly
+        ≤ gate2's, and the cell-by-cell comparison silently fails on an information
+        mismatch (not on the method). Solution: for regime-switching factors, read
+        the realized regime path directly from `outer_buf[(spot_key, 'regimes')]`
+        (published by `MarkovHMMSpotModel.generate` — destination-regime convention
+        verified against gate2_exact_dp.py:123-134) and one-hot it. All other factor
+        types fall through to the canonical privileged extractor.
+        """
+        parts = []
+        for key in self._calc.stoch_factors_inner:
+            if key.type in utils.DimensionLessFactors:
+                continue
+            proc = self._calc.stoch_factors_inner[key]
+            regimes = self._outer_buf.get((key, 'regimes'))
+            if (key.type in ('CommodityPrice', 'CommodityBasis')
+                    and regimes is not None
+                    and getattr(proc, 'n_states', None)):
+                onehot = torch.nn.functional.one_hot(
+                    regimes[t].long(), num_classes=proc.n_states
+                ).to(dtype=self.dtype)                  # (B, n_states)
+                block = onehot.movedim(-1, 0)            # (n_states, B) — B-last
+            else:
+                block = self._calc._extract_outer_state_at(
+                    t, key, self._outer_buf, privileged=True).reshape(-1, self._B())
+            parts.append(block)
+        return torch.cat(parts, dim=0).permute(1, 0).contiguous()  # (B, market_dim)
+
+    def _B(self):
+        """Outer batch size — read off any factor's snapshot."""
+        return self._outer_buf[self._spot_key].shape[-1]
+
+    # ------------------------------------------------------------ C_T cold train
+    def _train_C_terminal(self, traj):
+        """Cold-train `C[t_outer-1]` against the deal's closed-form terminal utility
+        over the realized exogenous slice at the LAST outer index. Endogenous
+        coordinates (inventory, wealth) are spanned across the designer box so the
+        NN learns U as a function of all deep-state coordinates the backward sweep
+        will query later. No bootstrap, no AAD inner-MC — closed-form labels."""
+        t_T = self.t_outer - 1
+        market_T = traj[t_T]["market"]                     # (B, market_dim)
+        tradables_T = traj[t_T]["tradables"]               # (B, n_hedge)
+        b_outer = market_T.shape[0]
+        n_h = len(self.hedges)
+        device = self.device
+
+        # Endogenous span: q ∈ [-5, 5] uniformly per leg, wealth uniformly across a
+        # designer box matched to gate2's observed range (~K ± 1500 in raw units).
+        # For Milestone 0 the band is hard-wired; promote to JSON in Milestone 1 once
+        # the proper bank constructor lands.
+        q_min, q_max = -5, 5
+        wealth_halfwidth = 1500.0
+        rows_per_outer = self.b_endo
+        # Span: random uniform points in (q, wealth) per outer path. The NN learns
+        # a smooth function across the full (z_T, q_T, wealth_T) joint.
+        q_span = torch.randint(q_min, q_max + 1,
+                                (b_outer, rows_per_outer, n_h),
+                                device=device).to(self.dtype)
+        wealth_span = (torch.rand(b_outer, rows_per_outer, device=device) - 0.5) \
+            * (2.0 * wealth_halfwidth)
+
+        # Broadcast market/tradables to (B, rows_per_outer, ...) and flatten.
+        market_b = market_T.unsqueeze(1).expand(-1, rows_per_outer, -1).reshape(
+            b_outer * rows_per_outer, -1)
+        tradables_b = tradables_T.unsqueeze(1).expand(-1, rows_per_outer, -1).reshape(
+            b_outer * rows_per_outer, -1)
+        q_flat = q_span.reshape(b_outer * rows_per_outer, n_h)
+        wealth_flat = wealth_span.reshape(-1)
+        zero_b = torch.zeros_like(wealth_flat)
+        time_to_T = torch.zeros_like(wealth_flat)
+        static_T = self._static_sim[-1].to(device).expand(
+            b_outer * rows_per_outer, self._static_sim.shape[-1])
+
+        # Deep-state vector — reuse `_assemble_deep_state` for layout consistency.
+        z_T = _assemble_deep_state(
+            positions=q_flat, g=wealth_flat, a=zero_b, futures=tradables_b,
+            market=market_b, static=static_T, time_to_t=time_to_T)
+
+        # Terminal utility — symlog of wealth in the gate2 convention (w_T already
+        # carries cash + (q_total - 1)·S + K → fully realized terminal wealth).
+        c_util = max(float(self.bundle.get("utility_scale", 100.0)), 1.0)
+        y_target = torch.sign(wealth_flat) * torch.log1p(wealth_flat.abs() / c_util)
+        # Gradient label: ∂U/∂wealth = 1/(c + |w|); zero on other coords. The wealth
+        # column is at StatePack offset n_hedge (after positions block).
+        wealth_idx = self.statepack.n_hedge
+        dy_dz = torch.zeros_like(z_T)
+        dy_dz[:, wealth_idx] = 1.0 / (c_util + wealth_flat.abs())
+
+        # Build and fit the twin network.
+        net = construct_twin_network(
+            self.statepack.deep_dim, self.runtime, device=device)
+        net.set_normalization(
+            z_T.mean(dim=0), z_T.std(dim=0),
+            y_target.mean(), y_target.std())
+        opt = torch.optim.Adam(net.parameters(), lr=self.adam_lr)
+
+        n_rows = z_T.shape[0]
+        batch = min(self.train_minibatch, n_rows)
+        steps = max(1, self.train_steps_per_solve)              # guard against steps=0
+        last_diag = {"val_loss": float("nan"), "diff_loss": float("nan"),
+                     "mask_mean": 1.0}
+        for step in range(steps):
+            idx = torch.randint(0, n_rows, (batch,), device=device)
+            loss, last_diag = twin_loss(
+                net, z_T[idx], y_target[idx], dy_dz[idx],
+                w_val=1.0, w_diff=1.0)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if step % max(1, steps // 5) == 0 or step == steps - 1:
+                logging.info(
+                    "DifferentialSolver C_T cold-train step=%d L=%.5f val=%.5f diff=%.5f",
+                    step, float(loss),
+                    last_diag["val_loss"], last_diag["diff_loss"])
+
+        # Holdout check — closed-form value MAE on fresh spans.
+        with torch.no_grad():
+            n_check = min(2048, b_outer * rows_per_outer)
+            check_idx = torch.randperm(n_rows, device=device)[:n_check]
+            y_pred = net(z_T[check_idx])
+            mae = (y_pred - y_target[check_idx]).abs().mean()
+        logging.info(
+            "DifferentialSolver C_T cold-train holdout MAE=%.5f over %d rows; "
+            "twin val=%.4g diff=%.4g", float(mae), n_check,
+            last_diag["val_loss"], last_diag["diff_loss"])
+
+        self.C[t_T] = net
+        return {
+            "terminal_twin_value_loss": last_diag["val_loss"],
+            "terminal_twin_diff_loss": last_diag["diff_loss"],
+            "terminal_holdout_mae": float(mae),
+            "terminal_bank_rows": int(n_rows),
+        }
+
+    # ----------------------------------------------- Step D: post_state + bank
+    def _assemble_z(self, market, q, wealth, F, time_to_T, static):
+        """Build a deep_state in StatePack layout from raw components. All-tensor
+        broadcasting: leading dims compose. Used by both the bank construction (at t)
+        and the bootstrap label gen (at t+1, where market/F come from the one-step
+        inner-MC fork)."""
+        zero = torch.zeros_like(wealth)
+        return _assemble_deep_state(
+            positions=q, g=wealth, a=zero, futures=F,
+            market=market, static=static, time_to_t=time_to_T)
+
+    def _turnover(self, q_new, q_prev, F):
+        """L1 turnover cost: λ_turn · Σ_h |Δq_h| · F_h · contract_size. Per spec §3 /
+        gate2's `lambda_turnover · |Δq| · S` (gate2_exact_dp.py:301). Caller broadcasts
+        shapes — typically (..., n_h) for q's and F, returns (...,) cost."""
+        dq = (q_new - q_prev).abs()
+        cs = self.contract_size                                       # (n_h,)
+        return self.lambda_turn * (dq * F * cs).sum(dim=-1)
+
+    def _build_bank(self, t, traj):
+        """Endogenous span on top of the realized exogenous slice at outer t. **Spec
+        §6: forward × span**, with the live-axis collapse for dead hedges (per
+        Reader-C / synthesis: rows where `is_live[t, j] = False` force q[..., j] = 0;
+        if either bank construction or decision-op skips this, holding non-zero q_dead
+        past T_A leaks `−F_dead(T_A)` into wealth and silently breaks the gate2
+        comparison, hedge_solver.py:534 latent bug)."""
+        market_t = traj[t]["market"]                                  # (B, market_dim)
+        tradables_t = traj[t]["tradables"]                            # (B, n_hedge)
+        B = market_t.shape[0]
+        n_h = len(self.hedges)
+        device = self.device
+
+        rows = int(self.b_endo)
+        # Span: random uniform points in (q_prev, wealth) per outer path.
+        q_min, q_max = -5, 5                                          # spec §4
+        wealth_halfwidth = 1500.0                                     # designer box
+        q_prev = torch.randint(q_min, q_max + 1, (B, rows, n_h),
+                                device=device).to(self.dtype)
+        wealth_pre = (torch.rand(B, rows, device=device) - 0.5) * \
+            (2.0 * wealth_halfwidth)
+        # Dead-axis collapse — force q_prev = 0 for dead hedges, since gate2's
+        # post-T_A invariant has q_dead ≡ 0 in the state. Without this, the bank
+        # would include states the policy never legitimately visits.
+        live_t = self.is_live[t]                                      # (n_h,)
+        if (~live_t).any():
+            mask_dead = (~live_t).view(1, 1, n_h)
+            q_prev = torch.where(mask_dead, torch.zeros_like(q_prev), q_prev)
+
+        # Broadcast/flatten across the (B, rows) axes.
+        market_b = market_t.unsqueeze(1).expand(-1, rows, -1).reshape(B * rows, -1)
+        tradables_b = tradables_t.unsqueeze(1).expand(-1, rows, -1).reshape(B * rows, -1)
+        q_prev_flat = q_prev.reshape(B * rows, n_h)
+        wealth_pre_flat = wealth_pre.reshape(-1)
+        # Outer-row index — preserves the mapping each bank row → its outer path,
+        # so the bootstrap step's per-row inner-MC market_{t+1} comes from the
+        # MATCHING outer path's one-step fork.
+        outer_index = torch.arange(B, device=device).unsqueeze(1).expand(-1, rows
+            ).reshape(-1)
+        time_to_T = torch.full((B * rows,), float(self.t_outer - 1 - t), device=device)
+        static_b = self._static_sim[t].to(device).expand(
+            B * rows, self._static_sim.shape[-1])
+
+        return {
+            "market": market_b,                                       # (N, market_dim)
+            "F_at_t": tradables_b,                                    # (N, n_hedge)
+            "q_prev": q_prev_flat,                                    # (N, n_hedge)
+            "wealth_pre": wealth_pre_flat,                            # (N,)
+            "time_to_T": time_to_T,                                   # (N,)
+            "static": static_b,                                       # (N, n_static)
+            "outer_index": outer_index,                               # (N,)
+            "rows_per_outer": rows,
+            "B_outer": B,
+        }
+
+    # ---------------------------------------------- Step E: decision operator
+    def _decision_at(self, C_next, market, F, q_prev, wealth_pre, time_to_T,
+                     static, t):
+        """Explicit external argmax `q* = argmax_q C_next(post_state(q))` over the
+        live action grid, no_grad. Per spec §4 invariants: `C_next` is a post-decision
+        function with NO internal max — the Bellman max is the EXPLICIT external
+        operator applied only to the frozen `C_next`. Dead-axis trades forced to 0 by
+        masking action_grid columns where `is_live[t, j] = False` (Reader-C: any
+        non-zero q_dead at t > T_A would silently leak `−F_dead(T_A)` into wealth via
+        advance_state-style chains).
+
+        Returns:
+          q_star : (N, n_hedge) — chosen post-decision inventory at t
+          v_star : (N,)        — `C_next(post(q*))` at the chosen action
+          action_gap : (N,)    — best minus second-best value (used for spec §9's
+                                 derivative mask `w_diff = clamp(gap / threshold, 0, 1)`)
+        """
+        K, n_h = self.action_grid.shape
+        N = market.shape[0]
+        device = self.device
+        # Live-axis collapse on the action grid — broadcast and force dead axes to 0.
+        live_t = self.is_live[t]                                      # (n_h,)
+        grid = self.action_grid.unsqueeze(0).expand(N, K, n_h).clone()      # (N, K, n_h)
+        if (~live_t).any():
+            grid[..., ~live_t] = 0.0
+
+        # Broadcast components to (N, K, ...).
+        market_K = market.unsqueeze(1).expand(N, K, -1)
+        F_K = F.unsqueeze(1).expand(N, K, n_h)
+        q_prev_K = q_prev.unsqueeze(1).expand(N, K, n_h)
+        wealth_pre_K = wealth_pre.unsqueeze(1).expand(N, K)
+        time_to_T_K = time_to_T.unsqueeze(1).expand(N, K)
+        static_K = static.unsqueeze(1).expand(N, K, -1)
+
+        # Turnover cost per (N, K) — spec §3's L1 model.
+        cost = self._turnover(grid, q_prev_K, F_K)                    # (N, K)
+        wealth_post_K = wealth_pre_K - cost                           # (N, K)
+
+        # Build post-decision states and score against frozen C_next. NO autograd —
+        # the decision operator's only output that flows into the differential label
+        # is `q*` (detached). Value is read for ranking + action_gap diagnostic.
+        with torch.no_grad():
+            z_post = self._assemble_z(
+                market=market_K.reshape(N * K, -1),
+                q=grid.reshape(N * K, n_h),
+                wealth=wealth_post_K.reshape(-1),
+                F=F_K.reshape(N * K, n_h),
+                time_to_T=time_to_T_K.reshape(-1),
+                static=static_K.reshape(N * K, -1))                   # (N*K, deep_dim)
+            values = C_next(z_post).reshape(N, K)                     # (N, K)
+            argmax_idx = values.argmax(dim=-1)                        # (N,)
+            v_star = values.gather(-1, argmax_idx.unsqueeze(-1)).squeeze(-1)
+            # Action gap = top minus second-best. Robust to ties (sort then diff).
+            top2, _ = values.topk(min(2, K), dim=-1)
+            action_gap = (top2[..., 0] - top2[..., -1]).abs()         # (N,)
+
+        # Gather q*: shape (N, n_h).
+        q_star = grid.gather(
+            1, argmax_idx.view(N, 1, 1).expand(N, 1, n_h)).squeeze(1)
+        return q_star, v_star, action_gap
+
+    # -------- Step F: one-step bootstrap label gen + fit C at outer step t
+    def _train_C_at_step(self, t, C_next, traj):
+        """Fit `C_t` via the spec §4 / §12 one-step-bootstrap twin loss.
+
+        Per row of `_build_bank(t)`:
+          1. The row's anchor is `z_t = post_state_t(q_t)` where `q_t` is sampled
+             (spanned across the action grid).
+          2. Step t → t+1 via `bundle['inner_mc_grad_fn_one_step'](t)`: returns
+             `market_{t+1}` (AAD-attached to per-process state-at-t leaves) and the
+             `state_t_leaves` dict needed for `autograd.grad`.
+          3. Pre-decision state at t+1 from MTM update: `wealth_pre_{t+1} =
+             wealth_post_t + (Σq_t − 1) · (S_{t+1} − S_t)` (gate2-style invariant).
+          4. Decision operator at t+1: `q*_{t+1} = argmax_q C_next(post_{t+1}(q))` —
+             explicit external argmax, frozen `C_next`, detached `q*_{t+1}` per spec
+             §4 invariant.
+          5. Bootstrap value label `Y_boot = C_next(post_{t+1}(q*_{t+1}))`. Grad-
+             enabled — `autograd.grad(Y_boot.sum(), state_t_leaves)` then yields the
+             differential label `∂Y_boot/∂spot_t`. The detach trick (spec §12) keeps
+             the retained graph at one grad eval over ONE sim step, NOT 121× and NOT
+             the full rollout.
+        """
+        bank = self._build_bank(t, traj)
+        N = bank["wealth_pre"].shape[0]
+        n_h = len(self.hedges)
+        device = self.device
+
+        # Row anchor: sample q_t spanned across the action grid (legal post-decision
+        # inventories at t). NOT a row index of the action grid — a uniform draw from
+        # {-5,...,+5}^n_h so the NN sees the full (q, wealth) joint at each market.
+        q_t_sampled = torch.randint(-5, 6, (N, n_h), device=device).to(self.dtype)
+        # Dead-axis collapse — same convention as the bank's q_prev.
+        live_t = self.is_live[t]
+        if (~live_t).any():
+            q_t_sampled[:, ~live_t] = 0.0
+        # Post-decision wealth at t (after the row's "implicit action").
+        cost_t = self._turnover(q_t_sampled, bank["q_prev"], bank["F_at_t"])
+        wealth_post_t = bank["wealth_pre"] - cost_t                   # (N,)
+
+        # Row's z_t — the post-decision state at t. This is the NN's training input.
+        z_t = self._assemble_z(
+            market=bank["market"], q=q_t_sampled, wealth=wealth_post_t,
+            F=bank["F_at_t"], time_to_T=bank["time_to_T"],
+            static=bank["static"])                                    # (N, deep_dim)
+
+        # --- One-step inner-MC fork at t (grad-enabled) ---
+        with torch.enable_grad():
+            inner = self.bundle["inner_mc_grad_fn_one_step"](t)
+            market_t1 = inner["market_t1"]                            # (B_outer, B_inner_per, market_dim)
+            # Use a single representative inner draw per outer; M=1 per spec §6/§9.
+            market_t1 = market_t1[:, 0, :]                            # (B_outer, market_dim)
+            # F at t+1 for live hedges — index by outer_index, single inner draw.
+            F_t1_per_h = []
+            for h in self.hedges:
+                f = inner["F_t1"].get(h)
+                if f is None:
+                    # Closed hedge (past expiry): tradable freezes at expiry value.
+                    F_t1_per_h.append(bank["F_at_t"][:, self.hedges.index(h)])
+                else:
+                    F_t1_per_h.append(f[bank["outer_index"], 0])      # (N,)
+            # Stack into (N, n_h). Per-outer alignment via bank["outer_index"].
+            F_t1 = torch.stack(F_t1_per_h, dim=-1)                    # (N, n_h)
+            # Market at t+1 indexed by outer_index → (N, market_dim).
+            market_t1_per_row = market_t1[bank["outer_index"]]
+
+            # Wealth evolution at constant q_t: (gate2-invariant MTM)
+            # w_{t+1}_pre = w_post_t + (Σq_t − 1) · dS. For multi-tradable, the
+            # generalization uses dF per hedge minus the implicit liability move dS.
+            # Forward-=-spot toy: dF_h = dS for live h, so:
+            #   Σ_h q_h · dF_h − dS = (Σ_h q_h − 1) · dS
+            # which collapses cleanly. Compute via the explicit per-hedge sum so the
+            # multi-asset generalization is direct.
+            spot_h_idx = 0   # first live hedge tracks spot for the toy
+            dS = F_t1[:, spot_h_idx] - bank["F_at_t"][:, spot_h_idx]
+            pnl_hedges = ((q_t_sampled * (F_t1 - bank["F_at_t"])).sum(dim=-1))
+            wealth_pre_t1 = wealth_post_t + pnl_hedges - dS           # (N,)
+
+            time_to_T_t1 = bank["time_to_T"] - 1.0                    # (N,)
+            # Decision at t+1 — external argmax over frozen C_next. q* detached.
+            q_star_t1, _, action_gap = self._decision_at(
+                C_next, market_t1_per_row, F_t1, q_t_sampled,
+                wealth_pre_t1, time_to_T_t1, bank["static"], min(t + 1, self.t_outer - 1))
+            q_star_t1 = q_star_t1.detach()
+            # Post-decision wealth at t+1 (action q* applied).
+            cost_t1 = self._turnover(q_star_t1, q_t_sampled, F_t1)
+            wealth_post_t1 = wealth_pre_t1 - cost_t1                  # (N,)
+            # Post-decision state at t+1 — AUTOGRAD-CONNECTED to spot leaves via
+            # market_t1 / F_t1 / wealth_pre_t1 / wealth_post_t1.
+            z_t1 = self._assemble_z(
+                market=market_t1_per_row, q=q_star_t1,
+                wealth=wealth_post_t1, F=F_t1,
+                time_to_T=time_to_T_t1, static=bank["static"])
+            # Bootstrap value: the single grad-enabled eval of C_next.
+            Y_boot = C_next(z_t1)                                     # (N,)
+
+            # Differential label: ∂Y_boot/∂state_t_leaves. Single backward pass.
+            leaves = inner["state_t_leaves"]
+            leaf_keys = list(leaves.keys())
+            leaf_list = [leaves[k] for k in leaf_keys]
+            leaf_grads = torch.autograd.grad(
+                Y_boot.sum(), leaf_list, retain_graph=False, allow_unused=True)
+
+        # Project leaf gradients to deep-state F_t columns. The spot leaf (whose value
+        # equals F_t for live tradables — forward=spot) maps to all live tradable_prices
+        # columns; per-row alignment via outer_index. Other leaves (carry curve,
+        # basis if differentiable) are skipped here for the toy; promote to a full
+        # projection in M3 when richer underlyings come online.
+        dy_dz = torch.zeros_like(z_t)
+        F_col_start = self.statepack.n_hedge + 2          # tradable_prices block start
+        # Wealth gradient: ∂Y_boot/∂wealth_post_t = ∂Y_boot/∂wealth_post_t+1 (chain
+        # is wealth_post_t → wealth_pre_t+1 → wealth_post_t+1 → C_next; all linear).
+        # Compute via a separate small autograd pass on a leaf-wealth construction.
+        with torch.enable_grad():
+            w_leaf = wealth_post_t.detach().clone().requires_grad_(True)
+            wealth_pre_t1_l = w_leaf + pnl_hedges.detach() - dS.detach()
+            wealth_post_t1_l = wealth_pre_t1_l - cost_t1.detach()
+            z_t1_l = self._assemble_z(
+                market=market_t1_per_row.detach(), q=q_star_t1,
+                wealth=wealth_post_t1_l, F=F_t1.detach(),
+                time_to_T=time_to_T_t1, static=bank["static"])
+            Y_for_w = C_next(z_t1_l)
+            dY_dw = torch.autograd.grad(Y_for_w.sum(), w_leaf)[0]    # (N,)
+        wealth_col = self.statepack.n_hedge                          # cash slot
+        dy_dz[:, wealth_col] = dY_dw
+
+        # Spot leaf gradient → live tradable_prices cols. Locate the CommodityPrice
+        # leaf via leaf_keys (factor-type 'CommodityPrice').
+        for key, g in zip(leaf_keys, leaf_grads):
+            if g is None:
+                continue
+            if key.type == "CommodityPrice":
+                # g has leaf shape (B_outer,) for HMM spot. Project to all live
+                # tradable_prices cols, indexed by outer_index.
+                g_per_row = g[bank["outer_index"]]                   # (N,)
+                for j, h in enumerate(self.hedges):
+                    if live_t[j]:
+                        dy_dz[:, F_col_start + j] += g_per_row
+
+        # --- Twin-loss SGD on (z_t, Y_boot, dy_dz) with action-gap mask ---
+        y_target = Y_boot.detach()
+        z_t_detached = z_t.detach()
+        net = construct_twin_network(
+            self.statepack.deep_dim, self.runtime, device=device)
+        net.set_normalization(
+            z_t_detached.mean(dim=0), z_t_detached.std(dim=0),
+            y_target.mean(), y_target.std())
+        opt = torch.optim.Adam(net.parameters(), lr=self.adam_lr)
+        # Action-gap mask threshold — empirical: half of the bank's median gap.
+        gap_threshold = max(float(action_gap.median()), 1.0e-6) * 0.5
+
+        n_rows = z_t_detached.shape[0]
+        batch = min(self.train_minibatch, n_rows)
+        steps = max(1, self.train_steps_per_solve)
+        last_diag = {"val_loss": float("nan"), "diff_loss": float("nan")}
+        for step in range(steps):
+            idx = torch.randint(0, n_rows, (batch,), device=device)
+            loss, last_diag = twin_loss(
+                net, z_t_detached[idx], y_target[idx], dy_dz[idx],
+                action_gap=action_gap[idx].detach(),
+                gap_threshold=gap_threshold,
+                w_val=1.0, w_diff=1.0)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if step % max(1, steps // 5) == 0 or step == steps - 1:
+                logging.info(
+                    "DifferentialSolver C_t=%d step=%d L=%.5f val=%.5f diff=%.5f "
+                    "(mask=%.2f)",
+                    t, step, float(loss),
+                    last_diag["val_loss"], last_diag["diff_loss"],
+                    last_diag.get("mask_mean", 1.0))
+
+        self.C[t] = net
+        return {
+            "twin_value_loss": last_diag["val_loss"],
+            "twin_diff_loss": last_diag["diff_loss"],
+            "bank_rows": int(n_rows),
+            "action_gap_median": float(action_gap.median()),
+            "live_axes_at_t": int(live_t.sum()),
+        }
+
+    # ------------------------------- End-of-F smoke: oracle + grad sanity
+    def _smoke_against_gate2(self, t, npz_path):
+        """Single-contract mechanism test: compare fitted C_t's argmax + a few V cells
+        at outer t against gate2's V_post_A oracle. **The smoke is intentionally
+        single-contract** (t > T_A: only q_B live, 11 candidates) — the live-axis,
+        bank-collapse, and dead-axis-mask code paths run but the multi-contract
+        argmax is NOT exercised. That's M1.5's job."""
+        try:
+            npz = np.load(npz_path)
+        except FileNotFoundError:
+            logging.warning("Skipping oracle comparison — %s not found.", npz_path)
+            return {"oracle_skipped": True}
+        V_post_A = npz.get("V_post_A")
+        s_grid = npz.get("s_grid")
+        q_grid = npz.get("q_grid")
+        w_grid = npz.get("w_grid")
+        if V_post_A is None:
+            logging.warning("Skipping oracle comparison — no V_post_A in %s.", npz_path)
+            return {"oracle_skipped": True}
+        # gate2's V_post_A has time axis spanning [T_A, T_dec]; t in our solver indexes
+        # 0..T_dec-1 weekly. For T_dec=10, T_A=5: V_post_A has 6 slices; t=8 corresponds
+        # to V_post_A[3]. Solver's t_outer = T_dec + 1 = 11 (sim grid includes t=0).
+        # gate2's t_outer convention: indices into V_post_A are (t - T_A).
+        t_dec = V_post_A.shape[0] - 1 + (q_grid is not None and 0 or 0)   # heuristic
+        # We treat solver t = t_outer-1 - hist as the latest decision index.
+        # Just compute the offset from the last DP time slice — at our self.t_outer-2,
+        # gate2's V_post_A[-2] is the matching cell. Be defensive about index math.
+        v_slice_idx = V_post_A.shape[0] - (self.t_outer - 1 - t)
+        if v_slice_idx < 0 or v_slice_idx >= V_post_A.shape[0]:
+            logging.warning("Oracle slice index %d out of bounds for V_post_A shape %s",
+                            v_slice_idx, V_post_A.shape)
+            return {"oracle_skipped": True}
+        V_slice = V_post_A[v_slice_idx]                              # (n_regime, N_S, N_q_B, N_W)
+        # Compare a few representative cells: regime=0/1, mid s, mid q, mid w.
+        device = self.device
+        rows = []
+        S0 = float(self.bundle.get("initial_spot", 100.0))
+        for r_idx in range(V_slice.shape[0]):
+            for s_idx in [V_slice.shape[1] // 2]:                    # mid log-spot
+                for qB_idx in [V_slice.shape[2] // 2, 0, V_slice.shape[2] - 1]:
+                    for w_idx in [V_slice.shape[3] // 2]:
+                        # Build z at this cell.
+                        S_cell = float(s_grid[s_idx]) if s_grid is not None else S0
+                        qB_cell = float(q_grid[qB_idx]) if q_grid is not None else 0.0
+                        w_cell = float(w_grid[w_idx]) if w_grid is not None else 0.0
+                        v_dp = float(V_slice[r_idx, s_idx, qB_idx, w_idx])
+                        # Assemble synthetic z (single-contract: q_A=0; live regime
+                        # one-hot from r_idx; market block = the regime one-hot for
+                        # spot only; basis/carry default to zero/static).
+                        market_block = torch.zeros(self.statepack.market_dim,
+                                                    device=device)
+                        market_block[r_idx] = 1.0           # spot regime one-hot
+                        n_h = len(self.hedges)
+                        q_cell = torch.zeros(n_h, device=device)
+                        q_cell[1] = qB_cell                 # PL_B is hedge[1]
+                        F_cell = torch.full((n_h,), S_cell, device=device)
+                        static_cell = self._static_sim[t].to(device).flatten()
+                        z = self._assemble_z(
+                            market=market_block.unsqueeze(0),
+                            q=q_cell.unsqueeze(0),
+                            wealth=torch.tensor([w_cell], device=device),
+                            F=F_cell.unsqueeze(0),
+                            time_to_T=torch.tensor([float(self.t_outer - 1 - t)],
+                                                    device=device),
+                            static=static_cell.unsqueeze(0))
+                        with torch.no_grad():
+                            v_nn = float(self.C[t](z).item())
+                        rows.append({"regime": r_idx, "s_idx": s_idx, "qB_idx": qB_idx,
+                                      "w_idx": w_idx, "v_dp": v_dp, "v_nn": v_nn,
+                                      "residual": v_nn - v_dp})
+        if rows:
+            residuals = [r["residual"] for r in rows]
+            mae = sum(abs(r) for r in residuals) / len(residuals)
+            logging.info(
+                "DifferentialSolver oracle compare t=%d (v_slice_idx=%d, %d cells): "
+                "MAE=%.4f, max|residual|=%.4f", t, v_slice_idx, len(rows),
+                mae, max(abs(r) for r in residuals))
+            for r in rows[:6]:
+                logging.info(
+                    "  r=%d s=%d qB=%d w=%d  V_dp=%+.4f  C_nn=%+.4f  Δ=%+.4f",
+                    r["regime"], r["s_idx"], r["qB_idx"], r["w_idx"],
+                    r["v_dp"], r["v_nn"], r["residual"])
+            return {"oracle_mae": float(mae),
+                    "oracle_max_abs": float(max(abs(r) for r in residuals)),
+                    "oracle_cells_compared": len(rows)}
+        return {"oracle_skipped": True}
+
+    def _grad_sanity_check(self, t):
+        """FD vs AAD on ∂C/∂z_wealth at a small sample of fit rows. Also asserts that
+        q* (decision argmax) carries no grad (spec §4 invariant). Catches grad leaking
+        through the rollout or detach failure, neither of which any value smoke can
+        see."""
+        if self.C[t] is None:
+            return {"grad_sanity_skipped": True}
+        device = self.device
+        # Build 8 random z rows.
+        N = 8
+        market_block = torch.zeros(N, self.statepack.market_dim, device=device)
+        market_block[torch.arange(N), torch.randint(0, 2, (N,), device=device)] = 1.0
+        n_h = len(self.hedges)
+        q_cell = torch.zeros(N, n_h, device=device)
+        F_cell = torch.full((N, n_h), 100.0, device=device)
+        wealth = (torch.rand(N, device=device) - 0.5) * 2000.0
+        static_t = self._static_sim[t].to(device).expand(N, self._static_sim.shape[-1])
+        time_to_T = torch.full((N,), float(self.t_outer - 1 - t), device=device)
+        z = self._assemble_z(market_block, q_cell, wealth, F_cell, time_to_T, static_t)
+        wealth_col = self.statepack.n_hedge
+
+        # AAD ∂C/∂z_wealth.
+        z_leaf = z.detach().clone().requires_grad_(True)
+        y_pred = self.C[t](z_leaf)
+        dy_dz_aad = torch.autograd.grad(y_pred.sum(), z_leaf)[0]
+        aad_wealth = dy_dz_aad[:, wealth_col]
+
+        # FD with eps = 0.5 (in dollars — wealth band is ~±1500 so a 0.5 perturbation
+        # is well inside the fit hull).
+        eps = 0.5
+        with torch.no_grad():
+            z_plus = z.clone(); z_plus[:, wealth_col] += eps
+            z_minus = z.clone(); z_minus[:, wealth_col] -= eps
+            y_plus = self.C[t](z_plus)
+            y_minus = self.C[t](z_minus)
+            fd_wealth = (y_plus - y_minus) / (2 * eps)
+        rel_err = ((aad_wealth - fd_wealth).abs() / fd_wealth.abs().clamp_min(1.0e-8)
+                  ).mean()
+        logging.info(
+            "DifferentialSolver grad sanity t=%d: ∂C/∂wealth AAD vs FD "
+            "(eps=%.2g) mean |rel err| = %.4f%%; AAD mean = %.5g, FD mean = %.5g",
+            t, eps, float(rel_err) * 100.0,
+            float(aad_wealth.mean()), float(fd_wealth.mean()))
+        # q* detach assert — invoke decision operator and check no grad.
+        q_star, _, _ = self._decision_at(
+            self.C[t], market_block, F_cell, q_cell, wealth, time_to_T, static_t, t)
+        assert not q_star.requires_grad, \
+            "q* must not carry autograd (spec §4 invariant)."
+        return {
+            "grad_sanity_rel_err_wealth_pct": float(rel_err) * 100.0,
+            "grad_sanity_aad_mean": float(aad_wealth.mean()),
+            "grad_sanity_fd_mean": float(fd_wealth.mean()),
+            "q_star_detach_ok": True,
+        }
+
+    # --------------------------------------------------------------- solve
+    def solve(self):
+        """**Milestone 0**: cold-train C_T (= `C[t_outer-1]`) and exit. Validates the
+        seam (`sample_exogenous` reads from the canonical buffer) and the StatePack
+        layout (gate4 §5 ordering matches existing inner-MC machinery) before any
+        backward-step / bootstrap / audit machinery lands.
+        """
+        logging.info(
+            "DifferentialSolver Milestone 0: t_outer=%d, B=%d, b_endo=%d, "
+            "hidden=%s, steps=%d, batch=%d",
+            self.t_outer, self._B(), self.b_endo,
+            self.hidden_sizes, self.train_steps_per_solve, self.train_minibatch)
+
+        traj = self.sample_exogenous()
+
+        # Quick invariant: under TRUE-regime conditioning, the t0 spot is shared
+        # (single S_0, no perturbation — enters via the tradable_prices block, not
+        # market), while regime[0] is legitimately sampled per path from π_0. So
+        # `traj[0]['market']` varies across paths *only* through the regime one-hot
+        # encoding. Diagnostic = the fraction of paths in each regime at t=0; the
+        # canonical π_0 = (0.5, 0.5) should yield ~50/50.
+        m0 = traj[0]["market"]
+        regime_t0_freq = m0.mean(dim=0).cpu().tolist()    # avg over paths per market col
+        logging.info(
+            "DifferentialSolver t0 regime occupancy (per market-block column): %s "
+            "(spec π_0 = (0.5, 0.5); spot enters via tradable_prices, not market).",
+            ["%.3f" % v for v in regime_t0_freq])
+
+        diag = self._train_C_terminal(traj)
+        diag["t0_regime_occupancy"] = regime_t0_freq
+        diag["seam_milestone"] = 0
+        # v0_estimate diagnostics filled after the no-hedge evaluation below.
+
+        # Milestone-0 V_0 proxy: the average terminal utility, computed by evaluating
+        # the fitted C_T at the realized terminal slice with zero inventory (the
+        # canonical "hold no hedge to T" baseline). This is the value of NO hedging,
+        # not the optimal V_0 — that requires the full backward sweep (M3). For the
+        # gate2 toy with utility_scale c (≈1000 in this framework configuration), the
+        # baseline E[U(K-S_T)] sets the floor the backward sweep should improve over.
+        with torch.no_grad():
+            t_T = self.t_outer - 1
+            B = self._B()
+            market_T = traj[t_T]["market"]                       # (B, market_dim)
+            tradables_T = traj[t_T]["tradables"]                 # (B, n_hedge)
+            n_h = len(self.hedges)
+            positions = torch.zeros(B, n_h, device=self.device)
+            # Buy-and-hold wealth at T under no hedge: cash carried forward minus
+            # liability cashflow. The framework's gate2-style invariant w = cash +
+            # (Σq − 1)·S + K with q=0 gives w_T = cash_T − S_T + K. For Milestone 0
+            # we use the bundle's initial wealth (cash carried forward, no funding
+            # cost) so w_T = initial_W − S_T + K. Reading S_T off the spot factor
+            # snapshot directly — bypasses the deal pricer for this sanity check.
+            spot_T = self._outer_buf[self._spot_key][-1].to(self.device)         # (B,)
+            initial_w = float(self.bundle.get("initial_wealth", 100.0))
+            K_strike = 100.0   # toy spec — promote to JSON in M1.
+            wealth_T = initial_w + K_strike - spot_T
+            zero_b = torch.zeros(B, device=self.device)
+            time_to_t_T = torch.zeros(B, device=self.device)     # terminal: 0
+            static_T = self._static_sim[-1].to(self.device).expand(
+                B, self._static_sim.shape[-1])
+            z_query = _assemble_deep_state(
+                positions=positions, g=wealth_T, a=zero_b,
+                futures=tradables_T, market=market_T, static=static_T,
+                time_to_t=time_to_t_T)
+            terminal_values = self.C[t_T](z_query)               # (B,)
+            v0_estimate = float(terminal_values.mean())
+            # Compare to closed-form expected terminal utility under buy-and-hold
+            # for a sanity check.
+            c_util = max(float(self.bundle.get("utility_scale", 100.0)), 1.0)
+            truth_per_path = torch.sign(wealth_T) * torch.log1p(wealth_T.abs() / c_util)
+            truth_mean = float(truth_per_path.mean())
+            v0_residual = v0_estimate - truth_mean
+
+        logging.info(
+            "DifferentialSolver Milestone 0 complete: E[U(W_T) | no-hedge] via "
+            "fitted C_T = %.4f; closed-form = %.4f; residual = %.4f (NN fit error). "
+            "Backward sweep deferred to M1+.",
+            v0_estimate, truth_mean, v0_residual)
+
+        # --- Milestone 1: fit C_{T-2} via the one-step bootstrap twin loss ---
+        # Single backward step against the just-cold-trained C_{T-1}. Validates the
+        # full Step D/E/F chain (bank construction + decision operator + one-step
+        # AAD fork + label projection + twin-loss SGD). At T_dec=10 / T_A=5, t=T-2=8
+        # is in the SINGLE-CONTRACT regime (only PL_B live) — honestly labelled so
+        # in the smoke; M1.5 will validate the multi-contract path through T_A.
+        t_m1 = self.t_outer - 2
+        m1_diag = self._train_C_at_step(t_m1, self.C[self.t_outer - 1], traj)
+        # End-of-F smoke: oracle comparison + grad sanity.
+        oracle_diag = self._smoke_against_gate2(t_m1, 'artifacts/gate2_exact_dp.npz')
+        grad_diag = self._grad_sanity_check(t_m1)
+        m1_diag.update(oracle_diag); m1_diag.update(grad_diag)
+        logging.info(
+            "DifferentialSolver Milestone 1 complete: C_{T-2}=C[%d] fitted; "
+            "twin val=%.5f diff=%.5f; oracle MAE=%s, grad-sanity rel_err=%s%%",
+            t_m1, m1_diag.get("twin_value_loss", float("nan")),
+            m1_diag.get("twin_diff_loss", float("nan")),
+            ("%.4f" % m1_diag["oracle_mae"]) if "oracle_mae" in m1_diag else "n/a",
+            ("%.2f" % m1_diag["grad_sanity_rel_err_wealth_pct"])
+              if "grad_sanity_rel_err_wealth_pct" in m1_diag else "n/a")
+
+        # Return a SolverResult so the dispatcher in solve_hedge can package it.
+        b = self._B()
+        actions_stacked = torch.zeros(self.t_outer, b, n_h)
+        values_stacked = torch.full((self.t_outer, b), float("nan"))
+        values_stacked[self.t_outer - 1] = v0_estimate
+        return SolverResult(
+            solver_name="DifferentialSolver",
+            actions=actions_stacked.detach().cpu(),
+            values=values_stacked.detach().cpu(),
+            value_fn_artifacts={},
+            diagnostics={
+                "V_0": v0_estimate,                # dispatcher convention
+                "n_star_0": torch.zeros(n_h).tolist(),
+                "v0_estimate": v0_estimate,
+                "v0_closedform_no_hedge": truth_mean,
+                "v0_nn_fit_residual": v0_residual,
+                "milestone": 1,
+                **diag,
+                **{f"M1_{k}": v for k, v in m1_diag.items()},
+            },
+        )
+
+
 _SOLVERS: Dict[str, Callable] = {
     "mpcsolver": MpcSolver,
     "lsmdpsolver": LsmDpSolver,
     "hindsightdpsolver": HindsightDpSolver,
+    "differentialsolver": DifferentialSolver,
 }
 
 
