@@ -1558,6 +1558,11 @@ class DifferentialSolver:
         # Bank construction knobs (spec §6).
         bank_cfg = solver_cfg.get("bank_sampling", {})
         self.b_endo = int(bank_cfg.get("b_endo", 2))
+        # Backward sweep depth — t_min = 0 is the full sweep (Milestone 3); M1.5
+        # uses t_min = T_A − 1 to validate the multi-contract path across the T_A
+        # transition without committing to the full 30-step sweep. Configurable via
+        # JSON `Solver.T_Min`; default 0 = sweep all the way to the initial decision.
+        self.t_min = int(solver_cfg.get("t_min", 0))
 
         self.hedges = list(runtime["names"]["hedges"])
         # T_outer-1 decision points: t=0..T-2 (DP convention). C[T_outer-1] is the
@@ -1811,59 +1816,57 @@ class DifferentialSolver:
         cs = self.contract_size                                       # (n_h,)
         return self.lambda_turn * (dq * F * cs).sum(dim=-1)
 
-    def _build_bank(self, t, traj):
-        """Endogenous span on top of the realized exogenous slice at outer t. **Spec
-        §6: forward × span**, with the live-axis collapse for dead hedges (per
-        Reader-C / synthesis: rows where `is_live[t, j] = False` force q[..., j] = 0;
-        if either bank construction or decision-op skips this, holding non-zero q_dead
-        past T_A leaks `−F_dead(T_A)` into wealth and silently breaks the gate2
-        comparison, hedge_solver.py:534 latent bug)."""
+    def _build_bank(self, t, traj, outer_indices=None, rows_per_outer=None):
+        """Endogenous span on top of the realized exogenous slice at outer t.
+
+        `outer_indices`: optional 1-D long tensor of outer-path indices to include.
+        Defaults to all `B_outer` paths. M2 uses this to (a) exclude the audit slices
+        from training and (b) oversample flagged buckets for correction rounds.
+        `rows_per_outer`: defaults to `self.b_endo`; can be raised to densify the
+        endogenous span within a flagged-bucket correction sample.
+
+        Spec §6 forward × span + the live-axis collapse for dead hedges (rows where
+        `is_live[t, j] = False` force `q[..., j] = 0`)."""
         market_t = traj[t]["market"]                                  # (B, market_dim)
         tradables_t = traj[t]["tradables"]                            # (B, n_hedge)
-        B = market_t.shape[0]
-        n_h = len(self.hedges)
         device = self.device
+        if outer_indices is None:
+            outer_indices = torch.arange(market_t.shape[0], device=device)
+        B = int(outer_indices.shape[0])
+        n_h = len(self.hedges)
 
-        rows = int(self.b_endo)
-        # Span: random uniform points in (q_prev, wealth) per outer path.
-        q_min, q_max = -5, 5                                          # spec §4
-        wealth_halfwidth = 1500.0                                     # designer box
+        rows = int(rows_per_outer if rows_per_outer is not None else self.b_endo)
+        q_min, q_max = -5, 5
+        wealth_halfwidth = 1500.0
         q_prev = torch.randint(q_min, q_max + 1, (B, rows, n_h),
                                 device=device).to(self.dtype)
         wealth_pre = (torch.rand(B, rows, device=device) - 0.5) * \
             (2.0 * wealth_halfwidth)
-        # Dead-axis collapse — force q_prev = 0 for dead hedges, since gate2's
-        # post-T_A invariant has q_dead ≡ 0 in the state. Without this, the bank
-        # would include states the policy never legitimately visits.
-        live_t = self.is_live[t]                                      # (n_h,)
+        live_t = self.is_live[t]
         if (~live_t).any():
             mask_dead = (~live_t).view(1, 1, n_h)
             q_prev = torch.where(mask_dead, torch.zeros_like(q_prev), q_prev)
 
-        # Broadcast/flatten across the (B, rows) axes.
-        market_b = market_t.unsqueeze(1).expand(-1, rows, -1).reshape(B * rows, -1)
-        tradables_b = tradables_t.unsqueeze(1).expand(-1, rows, -1).reshape(B * rows, -1)
+        # Gather the selected exogenous rows then broadcast across endogenous spans.
+        market_sel = market_t[outer_indices]                          # (B, market_dim)
+        tradables_sel = tradables_t[outer_indices]                    # (B, n_hedge)
+        market_b = market_sel.unsqueeze(1).expand(-1, rows, -1).reshape(B * rows, -1)
+        tradables_b = tradables_sel.unsqueeze(1).expand(-1, rows, -1).reshape(B * rows, -1)
         q_prev_flat = q_prev.reshape(B * rows, n_h)
         wealth_pre_flat = wealth_pre.reshape(-1)
-        # Outer-row index — preserves the mapping each bank row → its outer path,
-        # so the bootstrap step's per-row inner-MC market_{t+1} comes from the
-        # MATCHING outer path's one-step fork.
-        outer_index = torch.arange(B, device=device).unsqueeze(1).expand(-1, rows
-            ).reshape(-1)
+        # `outer_index` is the index INTO THE OUTER MC BATCH (not into the bank's
+        # selected subset) — needed for inner-MC alignment when the label generator
+        # slices `inner['F_t1'][h]` / `market_t1` per row.
+        outer_index = outer_indices.unsqueeze(1).expand(-1, rows).reshape(-1)
         time_to_T = torch.full((B * rows,), float(self.t_outer - 1 - t), device=device)
         static_b = self._static_sim[t].to(device).expand(
             B * rows, self._static_sim.shape[-1])
-
         return {
-            "market": market_b,                                       # (N, market_dim)
-            "F_at_t": tradables_b,                                    # (N, n_hedge)
-            "q_prev": q_prev_flat,                                    # (N, n_hedge)
-            "wealth_pre": wealth_pre_flat,                            # (N,)
-            "time_to_T": time_to_T,                                   # (N,)
-            "static": static_b,                                       # (N, n_static)
-            "outer_index": outer_index,                               # (N,)
-            "rows_per_outer": rows,
-            "B_outer": B,
+            "market": market_b, "F_at_t": tradables_b,
+            "q_prev": q_prev_flat, "wealth_pre": wealth_pre_flat,
+            "time_to_T": time_to_T, "static": static_b,
+            "outer_index": outer_index,
+            "rows_per_outer": rows, "B_outer": B,
         }
 
     # ---------------------------------------------- Step E: decision operator
@@ -1927,49 +1930,33 @@ class DifferentialSolver:
             1, argmax_idx.view(N, 1, 1).expand(N, 1, n_h)).squeeze(1)
         return q_star, v_star, action_gap
 
-    # -------- Step F: one-step bootstrap label gen + fit C at outer step t
-    def _train_C_at_step(self, t, C_next, traj):
-        """Fit `C_t` via the spec §4 / §12 one-step-bootstrap twin loss.
-
-        Per row of `_build_bank(t)`:
-          1. The row's anchor is `z_t = post_state_t(q_t)` where `q_t` is sampled
-             (spanned across the action grid).
-          2. Step t → t+1 via `bundle['inner_mc_grad_fn_one_step'](t)`: returns
-             `market_{t+1}` (AAD-attached to per-process state-at-t leaves) and the
-             `state_t_leaves` dict needed for `autograd.grad`.
-          3. Pre-decision state at t+1 from MTM update: `wealth_pre_{t+1} =
-             wealth_post_t + (Σq_t − 1) · (S_{t+1} − S_t)` (gate2-style invariant).
-          4. Decision operator at t+1: `q*_{t+1} = argmax_q C_next(post_{t+1}(q))` —
-             explicit external argmax, frozen `C_next`, detached `q*_{t+1}` per spec
-             §4 invariant.
-          5. Bootstrap value label `Y_boot = C_next(post_{t+1}(q*_{t+1}))`. Grad-
-             enabled — `autograd.grad(Y_boot.sum(), state_t_leaves)` then yields the
-             differential label `∂Y_boot/∂spot_t`. The detach trick (spec §12) keeps
-             the retained graph at one grad eval over ONE sim step, NOT 121× and NOT
-             the full rollout.
-        """
-        bank = self._build_bank(t, traj)
+    def _compute_labels_for_bank(self, t, bank, C_next):
+        """Generate `(z_t, y_target, dy_dz, action_gap)` for a bank of pre-decision
+        rows via the spec §4/§12 one-step-bootstrap pipeline:
+          • sample q_t spanned across the action grid (per-row anchor)
+          • assemble `z_t` post-decision after applying q_t
+          • call `bundle['inner_mc_grad_fn_one_step'](t)` ONCE per call
+            (AAD-attached `market_{t+1}` + per-process `state_t_leaves`)
+          • propagate to t+1 (gate2 MTM-invariant wealth)
+          • decision at t+1 via `argmax_q C_next(post_{t+1}(q))` (q* detached)
+          • `Y_boot = C_next(post_{t+1}(q*))`
+          • `dy_dz` via `autograd.grad(Y_boot, leaves)` + closed-form wealth chain
+        Used both by initial training-bank label gen and by per-round correction-row
+        label gen (M2). The expensive inner-MC fork runs ONCE per call; M2's
+        audit-correct loop re-invokes this method per round on a grown bank."""
         N = bank["wealth_pre"].shape[0]
         n_h = len(self.hedges)
         device = self.device
-
-        # Row anchor: sample q_t spanned across the action grid (legal post-decision
-        # inventories at t). NOT a row index of the action grid — a uniform draw from
-        # {-5,...,+5}^n_h so the NN sees the full (q, wealth) joint at each market.
-        q_t_sampled = torch.randint(-5, 6, (N, n_h), device=device).to(self.dtype)
-        # Dead-axis collapse — same convention as the bank's q_prev.
         live_t = self.is_live[t]
+        q_t_sampled = torch.randint(-5, 6, (N, n_h), device=device).to(self.dtype)
         if (~live_t).any():
             q_t_sampled[:, ~live_t] = 0.0
-        # Post-decision wealth at t (after the row's "implicit action").
         cost_t = self._turnover(q_t_sampled, bank["q_prev"], bank["F_at_t"])
-        wealth_post_t = bank["wealth_pre"] - cost_t                   # (N,)
-
-        # Row's z_t — the post-decision state at t. This is the NN's training input.
+        wealth_post_t = bank["wealth_pre"] - cost_t
         z_t = self._assemble_z(
             market=bank["market"], q=q_t_sampled, wealth=wealth_post_t,
             F=bank["F_at_t"], time_to_T=bank["time_to_T"],
-            static=bank["static"])                                    # (N, deep_dim)
+            static=bank["static"])
 
         # --- One-step inner-MC fork at t (grad-enabled) ---
         with torch.enable_grad():
@@ -2063,49 +2050,403 @@ class DifferentialSolver:
                 for j, h in enumerate(self.hedges):
                     if live_t[j]:
                         dy_dz[:, F_col_start + j] += g_per_row
+        return z_t.detach(), Y_boot.detach(), dy_dz.detach(), action_gap.detach()
 
-        # --- Twin-loss SGD on (z_t, Y_boot, dy_dz) with action-gap mask ---
-        y_target = Y_boot.detach()
-        z_t_detached = z_t.detach()
-        net = construct_twin_network(
-            self.statepack.deep_dim, self.runtime, device=device)
-        net.set_normalization(
-            z_t_detached.mean(dim=0), z_t_detached.std(dim=0),
-            y_target.mean(), y_target.std())
+    def _fit_twin_sgd(self, net, z, y, dy_dz, action_gap, steps, log_label=""):
+        """One SGD pass over the supplied (z, y, dy_dz, action_gap) bank. Used by
+        both the initial round and any correction-round refit. The action-gap mask
+        threshold is recomputed per call against the current bank's median gap."""
+        device = self.device
         opt = torch.optim.Adam(net.parameters(), lr=self.adam_lr)
-        # Action-gap mask threshold — empirical: half of the bank's median gap.
         gap_threshold = max(float(action_gap.median()), 1.0e-6) * 0.5
-
-        n_rows = z_t_detached.shape[0]
+        n_rows = z.shape[0]
         batch = min(self.train_minibatch, n_rows)
-        steps = max(1, self.train_steps_per_solve)
+        steps = max(1, int(steps))
         last_diag = {"val_loss": float("nan"), "diff_loss": float("nan")}
         for step in range(steps):
             idx = torch.randint(0, n_rows, (batch,), device=device)
             loss, last_diag = twin_loss(
-                net, z_t_detached[idx], y_target[idx], dy_dz[idx],
-                action_gap=action_gap[idx].detach(),
-                gap_threshold=gap_threshold,
+                net, z[idx], y[idx], dy_dz[idx],
+                action_gap=action_gap[idx], gap_threshold=gap_threshold,
                 w_val=1.0, w_diff=1.0)
             opt.zero_grad()
             loss.backward()
             opt.step()
-            if step % max(1, steps // 5) == 0 or step == steps - 1:
-                logging.info(
-                    "DifferentialSolver C_t=%d step=%d L=%.5f val=%.5f diff=%.5f "
-                    "(mask=%.2f)",
-                    t, step, float(loss),
-                    last_diag["val_loss"], last_diag["diff_loss"],
-                    last_diag.get("mask_mean", 1.0))
+        return last_diag
 
-        self.C[t] = net
+    # ------------------ M2: audit-correct-refit loop for C_t at one t step ----
+    def _train_C_at_step(self, t, C_next, traj, training_outer_idx=None,
+                          audit_slices=None):
+        """Fit `C_t` with the spec §2 audit-correct-refit loop.
+
+        Per round:
+          1. (Re)build bank from `accumulated_outer_idx` (starts as training_outer_idx;
+             grows with correction rows from prior flagged audits)
+          2. Compute one-step bootstrap labels via `_compute_labels_for_bank`
+          3. SGD on the twin loss (warm-started from the previous round's weights)
+          4. Audit `C_t` against `audit_slices[round]` via `_audit_at`
+          5. Pass → break. Fail with shrinking δ → append correction rows targeting
+             flagged buckets, continue. Fail with non-shrinking δ → escalate flag
+             and break (spec §14: residual is label bias, not fit error — λ-mix case;
+             do NOT spin)."""
+        device = self.device
+        n_h = len(self.hedges)
+        live_t = self.is_live[t]
+        # Default: all outer paths for training (no audit slices reserved).
+        if training_outer_idx is None:
+            training_outer_idx = torch.arange(self._B(), device=device)
+        if audit_slices is None:
+            audit_slices = []
+        max_rounds = max(1, len(audit_slices))
+
+        # Net initialized once; warm-starts across correction rounds.
+        net = construct_twin_network(
+            self.statepack.deep_dim, self.runtime, device=device)
+        # Initialize the net's standardization from the first round's bank.
+        accumulated_outer_idx = training_outer_idx.clone()
+        delta_history = []      # mean|delta| per round, for shrinkage check
+        rounds_taken = 0
+        final_diag = {"val_loss": float("nan"), "diff_loss": float("nan")}
+        escalation_flag = None
+        per_round_audits = []
+
+        for round_num in range(max_rounds):
+            rounds_taken = round_num + 1
+            # 1. Build bank from accumulated outer indices.
+            bank = self._build_bank(t, traj, outer_indices=accumulated_outer_idx)
+            # 2. Compute labels.
+            z_t, y_target, dy_dz, action_gap = self._compute_labels_for_bank(
+                t, bank, C_next)
+            # On round 0 (first fit), refresh the net's standardization stats.
+            if round_num == 0:
+                net.set_normalization(
+                    z_t.mean(dim=0), z_t.std(dim=0),
+                    y_target.mean(), y_target.std())
+            # 3. SGD pass (per-round step budget = full budget; warm-start makes this
+            #    incremental on rounds 2+).
+            final_diag = self._fit_twin_sgd(
+                net, z_t, y_target, dy_dz, action_gap,
+                steps=self.train_steps_per_solve,
+                log_label=f"C_t={t}_r={round_num}")
+            self.C[t] = net      # so the audit can call `self.C[t]` via decision op
+            logging.info(
+                "DifferentialSolver C_t=%d round=%d fit: live_axes=%d bank=%d "
+                "twin val=%.5f diff=%.5f action_gap=%.4g",
+                t, round_num, int(live_t.sum()), z_t.shape[0],
+                final_diag["val_loss"], final_diag["diff_loss"],
+                float(action_gap.median()))
+
+            # 4. Audit — if no slices reserved (e.g., M1 single-round usage), break.
+            if round_num >= len(audit_slices):
+                break
+            audit_outer_idx = audit_slices[round_num].to(device)
+            audit = self._audit_at(t, net, traj, audit_outer_idx, round_num)
+            per_round_audits.append({
+                r: {k: v for k, v in b.items() if isinstance(v, (int, float, bool))}
+                for r, b in audit["buckets"].items()
+            })
+            delta_abs_mean = float(audit["delta"].abs().mean())
+            delta_history.append(delta_abs_mean)
+
+            if not audit["any_flagged"]:
+                logging.info(
+                    "DifferentialSolver C_t=%d audit round=%d PASS — accepting C_t.",
+                    t, round_num)
+                break
+
+            # 5a. Delta-shrinkage gate. If round-over-round |δ| isn't shrinking by
+            # at least 5%, the residual is LABEL bias (max-amplification through
+            # C_{t+1}), not fit-error. Spec §14: deferred λ-mix; don't add more rows.
+            if len(delta_history) >= 2:
+                shrink = delta_history[-2] - delta_history[-1]
+                shrink_rel = shrink / max(delta_history[-2], 1.0e-9)
+                if shrink_rel < 0.05:
+                    escalation_flag = (
+                        f"delta not shrinking across rounds "
+                        f"(|δ|: {delta_history[-2]:.4f} → {delta_history[-1]:.4f}, "
+                        f"shrink {shrink_rel*100:.1f}%); residual is label-bias "
+                        f"(§14 λ-mix territory), NOT fit-error. Stop appending rows.")
+                    logging.warning(
+                        "DifferentialSolver C_t=%d audit round=%d ESCALATE — %s",
+                        t, round_num, escalation_flag)
+                    break
+
+            # 5b. Append correction rows targeting flagged buckets — oversample
+            # outer paths in the existing batch that LAND in flagged regimes at t.
+            flagged_regimes = [r for r, b in audit["buckets"].items()
+                                if b.get("flagged", False)]
+            if not flagged_regimes:
+                break
+            regime_at_t_all = self._outer_buf[(self._spot_key, 'regimes')][t]
+            extra_idx_list = []
+            for r in flagged_regimes:
+                mask_r = (regime_at_t_all == r)
+                idx_r = mask_r.nonzero(as_tuple=True)[0]
+                if idx_r.numel() == 0:
+                    logging.info(
+                        "DifferentialSolver C_t=%d round=%d: regime=%d flagged but "
+                        "no outer paths land there at t=%d — thin bucket, skip.",
+                        t, round_num, r, t)
+                    continue
+                # Oversample with replacement to densify endogenous span within
+                # flagged regime — same path indices, fresh (q_prev, wealth) draws
+                # via _build_bank's random sampling at the next call.
+                oversample_n = min(int(idx_r.numel() * 2), int(idx_r.numel()))
+                pick = torch.randint(0, idx_r.numel(), (oversample_n,), device=device)
+                extra_idx_list.append(idx_r[pick])
+            if not extra_idx_list:
+                break
+            extra_idx = torch.cat(extra_idx_list)
+            accumulated_outer_idx = torch.cat([accumulated_outer_idx, extra_idx])
+            logging.info(
+                "DifferentialSolver C_t=%d audit round=%d FLAGGED regimes=%s; "
+                "appending %d correction outer paths (bank grows %d → %d).",
+                t, round_num, flagged_regimes, int(extra_idx.shape[0]),
+                int(accumulated_outer_idx.shape[0] - extra_idx.shape[0]),
+                int(accumulated_outer_idx.shape[0]))
+
         return {
-            "twin_value_loss": last_diag["val_loss"],
-            "twin_diff_loss": last_diag["diff_loss"],
-            "bank_rows": int(n_rows),
-            "action_gap_median": float(action_gap.median()),
+            "twin_value_loss": final_diag["val_loss"],
+            "twin_diff_loss": final_diag["diff_loss"],
+            "bank_rows": int(accumulated_outer_idx.shape[0]) * int(self.b_endo),
             "live_axes_at_t": int(live_t.sum()),
+            "rounds_taken": rounds_taken,
+            "delta_history_abs_mean": delta_history,
+            "per_round_audits": per_round_audits,
+            "escalation_flag": escalation_flag,
         }
+
+    # --------------------------------- M2: audit rollout + correction loop
+    def _rollout_no_grad_to_T(self, t_start, outer_indices, q_post_t, wealth_post_t,
+                              traj):
+        """Frozen-policy no-grad rollout from post-decision state at `t_start` to
+        terminal `T_dec`. Returns `Y_eval` = realized terminal utility per audit row.
+
+        At each future step u ∈ [t_start, t_outer−2]:
+          • read realized (market_{u+1}, F_{u+1}) from `traj[u+1]` at the audit row's
+            outer index (no fresh inner-MC needed — the audit path's outer trajectory
+            IS the realized market evolution we're auditing the policy against).
+          • evolve wealth: `wealth_pre_{u+1} = wealth_post_u + Σ_h q_post_u[h]·dF_h − dS`
+            (gate2's MTM-invariant: forward=spot ⇒ collapses to `(Σq−1)·dS`).
+          • pick `q*_{u+1} = argmax_q C[u+1](post_{u+1}(q))` over live action grid.
+          • `wealth_post_{u+1} = wealth_pre_{u+1} − turnover(q*_{u+1} − q_post_u)`.
+        At terminal u = t_outer−1: `Y_eval = U(w_terminal)` via symlog.
+
+        This is the rollout the spec §7 audit uses to test whether the model's fitted
+        `C_t` matches realized utility under its own policy. Disagreement = bias.
+        """
+        N = outer_indices.shape[0]
+        n_h = len(self.hedges)
+        device = self.device
+        # Carry forward state — q (post-decision inventory) and wealth (post-decision).
+        q_carry = q_post_t.clone()                              # (N, n_h)
+        wealth = wealth_post_t.clone()                          # (N,)
+        with torch.no_grad():
+            for u in range(t_start, self.t_outer - 1):
+                # Read the realized (market_{u+1}, F_{u+1}) for the audit rows.
+                market_u1 = traj[u + 1]["market"][outer_indices]    # (N, market_dim)
+                F_u1 = traj[u + 1]["tradables"][outer_indices]      # (N, n_h)
+                # Wealth MTM: w_pre_{u+1} = w_post_u + Σ_h q_h·(F_{u+1,h}−F_u,h) − (S_{u+1}−S_u)
+                # where S = first tradable (forward=spot toy). Generalizes per-hedge
+                # for multi-asset.
+                F_u = traj[u]["tradables"][outer_indices]
+                dF = F_u1 - F_u                                     # (N, n_h)
+                dS = dF[:, 0]                                       # (N,) — spot move
+                pnl_hedges = (q_carry * dF).sum(dim=-1)             # (N,)
+                wealth_pre_u1 = wealth + pnl_hedges - dS            # (N,)
+                # Decision at u+1 with frozen C[u+1] (or terminal U if u+1 = T-1).
+                if u + 1 >= self.t_outer - 1 or self.C[u + 1] is None:
+                    # No further continuation function — apply terminal utility.
+                    # At terminal there's no action; carry q_carry, wealth = wealth_pre.
+                    wealth = wealth_pre_u1
+                    break
+                static_u1 = self._static_sim[u + 1].to(device).expand(
+                    N, self._static_sim.shape[-1])
+                time_to_T_u1 = torch.full((N,), float(self.t_outer - 1 - (u + 1)),
+                                           device=device)
+                q_star_u1, _, _ = self._decision_at(
+                    self.C[u + 1], market_u1, F_u1, q_carry,
+                    wealth_pre_u1, time_to_T_u1, static_u1, u + 1)
+                cost_u1 = self._turnover(q_star_u1, q_carry, F_u1)
+                wealth = wealth_pre_u1 - cost_u1
+                q_carry = q_star_u1
+            # Terminal utility under symlog at the framework's c (typically 100 for the
+            # gate2 toy after the M4 reconciliation).
+            c_util = self.utility_c
+            Y_eval = torch.sign(wealth) * torch.log1p(wealth.abs() / c_util)
+        return Y_eval
+
+    def _audit_at(self, t, net, traj, audit_outer_indices, round_num):
+        """Spec §7 audit at time t. For each audit row:
+          1. Sample pre-decision (q_prev, wealth_pre) within the designer endogenous
+             box (same span as training to keep the audit on the same domain `C_t` is
+             supposed to model).
+          2. Compute decision `q*_t = argmax_q C_t(post_t(q))`.
+          3. `Y_boot = C_t(z_t)` where `z_t = post_t(q*_t)` — the **fitted** value at
+             the audit state. Per spec §7's "current bootstrap value (frozen stack)";
+             using C_t directly catches the TOTAL deviation (fit error + label bias),
+             which is what compounds backward — `C_{t-1}`'s labels are
+             `max_q C_t(post_t(q))`, so the thing `C_{t-1}` reads is the *fitted* C_t.
+          4. `Y_eval` via `_rollout_no_grad_to_T` from `z_t` using frozen C-stack.
+          5. `delta = Y_eval − Y_boot`. Bucket by **regime at t** (spec §7 mentions
+             (time, inventory, action_gap, tail) — for the toy's regime-conditional
+             bias, regime is the load-bearing axis; promote to richer bucketing only
+             if p95 flags but the location is ambiguous).
+          6. Per-bucket: mean δ, p95|δ|, n_in_bucket. Flag if `|mean|>MEAN_TOL` OR
+             `p95>P95_TOL` (per-bucket p95 catches tail-concentrated bias the mean
+             washes out — the classic max-bias signature).
+        """
+        N_audit = audit_outer_indices.shape[0]
+        n_h = len(self.hedges)
+        device = self.device
+        # Audit-row endogenous sampling — same designer box as training, fresh draws.
+        # `q_prev` uniform integer, `wealth_pre` uniform on ±1500.
+        q_min, q_max = -5, 5
+        wealth_halfwidth = 1500.0
+        q_prev = torch.randint(q_min, q_max + 1, (N_audit, n_h),
+                                device=device).to(self.dtype)
+        wealth_pre = (torch.rand(N_audit, device=device) - 0.5) * (2.0 * wealth_halfwidth)
+        live_t = self.is_live[t]
+        if (~live_t).any():
+            q_prev[:, ~live_t] = 0.0
+
+        market_t_audit = traj[t]["market"][audit_outer_indices]
+        F_t_audit = traj[t]["tradables"][audit_outer_indices]
+        static_t_audit = self._static_sim[t].to(device).expand(
+            N_audit, self._static_sim.shape[-1])
+        time_to_T_t = torch.full((N_audit,), float(self.t_outer - 1 - t), device=device)
+
+        # Decision at t: q*_t via C_t (which we're auditing).
+        q_star_t, _, action_gap = self._decision_at(
+            net, market_t_audit, F_t_audit, q_prev, wealth_pre, time_to_T_t,
+            static_t_audit, t)
+        cost_t = self._turnover(q_star_t, q_prev, F_t_audit)
+        wealth_post_t = wealth_pre - cost_t
+
+        # Y_boot via C_t at the chosen post-decision state.
+        with torch.no_grad():
+            z_t_audit = self._assemble_z(
+                market=market_t_audit, q=q_star_t, wealth=wealth_post_t,
+                F=F_t_audit, time_to_T=time_to_T_t, static=static_t_audit)
+            Y_boot = net(z_t_audit)                                    # (N_audit,)
+
+        # Y_eval via rollout to T.
+        Y_eval = self._rollout_no_grad_to_T(
+            t_start=t, outer_indices=audit_outer_indices,
+            q_post_t=q_star_t, wealth_post_t=wealth_post_t, traj=traj)
+        delta = Y_eval - Y_boot                                       # (N_audit,)
+
+        # Bucket by regime at t. Regime is one-hot in the market block (spot regime
+        # is the first n_states cols by `_read_privileged_market` iteration order).
+        # Extract via argmax over the regime block.
+        proc_spot = self._calc.stoch_factors_inner[self._spot_key]
+        n_states = int(getattr(proc_spot, 'n_states', 1))
+        # `outer_buf[(spot_key, 'regimes')]` is the realized regime path (T, B) long.
+        # Read regime at t for the audit's outer indices.
+        regime_at_t = self._outer_buf[(self._spot_key, 'regimes')][t][audit_outer_indices]
+
+        buckets = {}
+        any_flagged = False
+        MEAN_TOL = float(self.runtime["solver"].get("audit_mean_tol", 0.05))
+        P95_TOL = float(self.runtime["solver"].get("audit_p95_tol", 0.20))
+        bucket_min_count = int(self.runtime["solver"].get("audit_bucket_min_count", 8))
+        for r in range(n_states):
+            mask_r = (regime_at_t == r)
+            n_r = int(mask_r.sum())
+            if n_r == 0:
+                buckets[r] = {"n": 0, "skipped": True, "reason": "no audit rows"}
+                continue
+            delta_r = delta[mask_r]
+            mean_r = float(delta_r.mean())
+            p95_r = float(delta_r.abs().quantile(0.95)) if n_r >= 3 else float(delta_r.abs().max())
+            flagged = (abs(mean_r) > MEAN_TOL) or (p95_r > P95_TOL)
+            buckets[r] = {
+                "n": n_r,
+                "mean_delta": mean_r,
+                "p95_abs_delta": p95_r,
+                "flagged": flagged,
+                "thin": n_r < bucket_min_count,
+            }
+            if flagged:
+                any_flagged = True
+
+        logging.info(
+            "DifferentialSolver audit t=%d round=%d: %s",
+            t, round_num,
+            "; ".join(f"r={r} n={b.get('n',0)} mean={b.get('mean_delta',float('nan')):+.4f} "
+                       f"p95={b.get('p95_abs_delta',float('nan')):.4f}"
+                       f"{' FLAG' if b.get('flagged') else ''}"
+                       f"{' (thin)' if b.get('thin') else ''}"
+                       for r, b in buckets.items()))
+
+        return {
+            "buckets": buckets,
+            "any_flagged": any_flagged,
+            "delta": delta.detach(),
+            "regime_at_t": regime_at_t.detach(),
+            "q_prev": q_prev.detach(),
+            "wealth_pre": wealth_pre.detach(),
+            "audit_outer_indices": audit_outer_indices,
+        }
+
+    def _grade_against_oracle_policy(self, npz_path):
+        """Compare learned argmax policy `n*_0` per regime at t=0 against gate2's
+        `initial_policy`. Per user's mandate: 'V_0 climbs' is necessary but not
+        sufficient — the policy must become regime-conditional and match the DP's
+        actions. Returns per-regime (q_oracle, q_learned, match) tuples."""
+        try:
+            npz = np.load(npz_path, allow_pickle=True)
+        except FileNotFoundError:
+            return {"oracle_policy_skipped": True}
+        # gate2 stores summary separately as JSON; load `initial_policy` from the
+        # summary that pairs with this npz (next to it in artifacts/).
+        try:
+            with open(npz_path.replace('.npz', '_summary.json'), 'r') as f:
+                import json
+                summary = json.load(f)
+            initial_policy = summary.get("initial_policy", {})
+        except (FileNotFoundError, KeyError):
+            return {"oracle_policy_skipped": True}
+
+        if not initial_policy:
+            return {"oracle_policy_skipped": True}
+
+        device = self.device
+        n_h = len(self.hedges)
+        results = {}
+        for regime_key, oracle_q in initial_policy.items():
+            r_idx = int(regime_key.split('=')[1]) if '=' in regime_key else int(regime_key)
+            q_oracle = [int(oracle_q.get("q_A_value", 0)),
+                        int(oracle_q.get("q_B_value", 0))]
+            # Build a canonical t=0 state in this regime.
+            market_block = torch.zeros(1, self.statepack.market_dim, device=device)
+            market_block[0, r_idx] = 1.0
+            q_prev = torch.zeros(1, n_h, device=device)
+            F_t = torch.full((1, n_h), 100.0, device=device)
+            wealth_pre = torch.full((1,), float(self.bundle.get("initial_wealth", 100.0)),
+                                     device=device)
+            time_to_T = torch.full((1,), float(self.t_outer - 1), device=device)
+            static_t = self._static_sim[0].to(device).flatten().unsqueeze(0)
+            if self.C[0] is None:
+                continue
+            q_star, _, _ = self._decision_at(
+                self.C[0], market_block, F_t, q_prev, wealth_pre, time_to_T,
+                static_t, t=0)
+            q_learned = q_star[0].cpu().tolist()
+            match = (int(round(q_learned[0])) == q_oracle[0]
+                      and int(round(q_learned[1])) == q_oracle[1])
+            results[r_idx] = {
+                "q_oracle": q_oracle,
+                "q_learned": [float(x) for x in q_learned],
+                "match": match,
+            }
+            logging.info(
+                "DifferentialSolver oracle policy r=%d: oracle=%s, learned=%s — %s",
+                r_idx, q_oracle, [float(x) for x in q_learned],
+                "MATCH" if match else "MISMATCH")
+        return {"oracle_policy_per_regime": results,
+                "oracle_policy_match_rate": sum(1 for v in results.values() if v["match"])
+                                              / max(1, len(results))}
 
     # ------------------------------- End-of-F smoke: oracle + grad sanity
     def _smoke_against_gate2(self, t, npz_path):
@@ -2328,26 +2669,140 @@ class DifferentialSolver:
             "Backward sweep deferred to M1+.",
             v0_estimate, truth_mean, v0_residual)
 
-        # --- Milestone 1: fit C_{T-2} via the one-step bootstrap twin loss ---
-        # Single backward step against the just-cold-trained C_{T-1}. Validates the
-        # full Step D/E/F chain (bank construction + decision operator + one-step
-        # AAD fork + label projection + twin-loss SGD). At T_dec=10 / T_A=5, t=T-2=8
-        # is in the SINGLE-CONTRACT regime (only PL_B live) — honestly labelled so
-        # in the smoke; M1.5 will validate the multi-contract path through T_A.
-        t_m1 = self.t_outer - 2
-        m1_diag = self._train_C_at_step(t_m1, self.C[self.t_outer - 1], traj)
-        # End-of-F smoke: oracle comparison + grad sanity.
-        oracle_diag = self._smoke_against_gate2(t_m1, 'artifacts/gate2_exact_dp.npz')
-        grad_diag = self._grad_sanity_check(t_m1)
-        m1_diag.update(oracle_diag); m1_diag.update(grad_diag)
+        # --- Backward sweep: fit C_{t} for t = T_outer-2 down to t_min with M2's
+        # audit-correct loop. At sweep entry we partition the B_outer paths into one
+        # training subset and MAX_ROUNDS mutually-disjoint audit slices. Per the
+        # user's correction: a single reserved holdout reused across rounds leaks
+        # info into the correction-row placement and drifts optimistic; disjoint
+        # per-round slices preserve the §7 re-audit-fresh invariant within one
+        # outer sweep (no per-round re-sim cost).
+        max_rounds = int(self.runtime["solver"].get("audit_max_rounds", 3))
+        B = self._B()
+        # Reserve ~25% for audit (split into MAX_ROUNDS slices); the rest is training.
+        n_audit_total = max(max_rounds * 8, int(B * 0.25))
+        n_audit_total = min(n_audit_total, B // 2)        # cap at 50%
+        n_train = B - n_audit_total
+        perm = torch.randperm(B, device=self.device)
+        training_outer_idx = perm[:n_train]
+        audit_slice_size = n_audit_total // max_rounds
+        audit_slices_global = [
+            perm[n_train + r * audit_slice_size : n_train + (r + 1) * audit_slice_size]
+            for r in range(max_rounds)
+        ]
         logging.info(
-            "DifferentialSolver Milestone 1 complete: C_{T-2}=C[%d] fitted; "
-            "twin val=%.5f diff=%.5f; oracle MAE=%s, grad-sanity rel_err=%s%%",
-            t_m1, m1_diag.get("twin_value_loss", float("nan")),
-            m1_diag.get("twin_diff_loss", float("nan")),
-            ("%.4f" % m1_diag["oracle_mae"]) if "oracle_mae" in m1_diag else "n/a",
-            ("%.2f" % m1_diag["grad_sanity_rel_err_wealth_pct"])
-              if "grad_sanity_rel_err_wealth_pct" in m1_diag else "n/a")
+            "DifferentialSolver M2 setup: B=%d  training=%d  audit=%d ÷ %d rounds × %d/slice  "
+            "(disjoint per spec §7 re-audit-fresh invariant)",
+            B, n_train, n_audit_total, max_rounds, audit_slice_size)
+        per_t_diag = {}
+        logging.info(
+            "DifferentialSolver backward sweep: t = %d → %d (T_A live transition "
+            "expected at the step where live_axes drops from 2 → 1)",
+            self.t_outer - 2, self.t_min)
+        for t_step in range(self.t_outer - 2, self.t_min - 1, -1):
+            t_diag = self._train_C_at_step(
+                t_step, self.C[t_step + 1], traj,
+                training_outer_idx=training_outer_idx,
+                audit_slices=audit_slices_global)
+            per_t_diag[t_step] = t_diag
+            logging.info(
+                "DifferentialSolver C[%d] fitted: live_axes=%d  rounds=%d  "
+                "twin val=%.5f diff=%.5f  bank=%d%s",
+                t_step, t_diag["live_axes_at_t"], t_diag.get("rounds_taken", 1),
+                t_diag["twin_value_loss"], t_diag["twin_diff_loss"],
+                t_diag["bank_rows"],
+                " ESCALATED" if t_diag.get("escalation_flag") else "")
+
+        # Grad sanity at three representative t values: end-of-sweep (t_min),
+        # mid-sweep, and just-past-the-T_A-transition. Catches grad propagation
+        # bugs that any single-t smoke misses.
+        t_sample = sorted({self.t_min, self.t_outer - 2,
+                            (self.t_outer - 2 + self.t_min) // 2})
+        grad_sanity = {}
+        for t_s in t_sample:
+            if self.C[t_s] is not None:
+                grad_sanity[t_s] = self._grad_sanity_check(t_s)
+
+        # Oracle comparison at the mid t (still single-contract for T_dec=10 / T_A=5
+        # if mid > T_A; gives the c=1000 vs c=100 scale-mismatch baseline that M4 will
+        # reconcile, plus a "shape matches" diagnostic in the meantime).
+        mid_t = (self.t_outer - 2 + self.t_min) // 2
+        oracle_diag = self._smoke_against_gate2(mid_t, 'artifacts/gate2_exact_dp.npz')
+
+        # M2 final grade: regime-conditional `n*_0` against gate2's initial_policy.
+        # Per the user's mandate: V_0 climbing is necessary but not sufficient — the
+        # policy must become regime-conditional and match the DP's actions. This is
+        # the smoke check that exercises whether the audit-correct loop actually
+        # un-biased the policy (vs just shifting V_0 toward the right number).
+        oracle_policy_diag = self._grade_against_oracle_policy(
+            'artifacts/gate2_exact_dp.npz')
+
+        # V_0 estimate via the decision operator at t_min: q*_t_min = argmax_q
+        # C[t_min](post_state_t_min(q)). For the M1.5 toy (t_min = T_A - 1) this is
+        # the value at the first multi-contract decision step. For M3 (t_min = 0)
+        # this is the true V_0.
+        with torch.no_grad():
+            market_tm = traj[self.t_min]["market"]
+            tradables_tm = traj[self.t_min]["tradables"]
+            B = market_tm.shape[0]
+            zero_q = torch.zeros(B, n_h, device=self.device)
+            # Initial wealth at t_min — gate2 MTM-invariant convention: w_0 = cash +
+            # (Σq − 1)·S + K. With q=0, cash=initial_W (=100), S=S_0 (=100), K=100:
+            # w_t_min ≈ initial_W (under no-rebalance forward sim from t=0).
+            initial_w = float(self.bundle.get("initial_wealth", 100.0))
+            wealth_tm = torch.full((B,), initial_w, device=self.device)
+            time_to_T_tm = torch.full((B,), float(self.t_outer - 1 - self.t_min),
+                                       device=self.device)
+            static_tm = self._static_sim[self.t_min].to(self.device).expand(
+                B, self._static_sim.shape[-1])
+            if self.C[self.t_min] is not None:
+                q_opt, v_opt, gap_opt = self._decision_at(
+                    self.C[self.t_min], market_tm, tradables_tm, zero_q,
+                    wealth_tm, time_to_T_tm, static_tm, self.t_min)
+                v0_decision = float(v_opt.mean())
+                q_opt_mean = q_opt.mean(dim=0).cpu().tolist()
+            else:
+                v0_decision = float("nan")
+                q_opt_mean = None
+
+        # Aggregate sweep diagnostics.
+        sweep_summary = {
+            "t_min": self.t_min,
+            "t_max": self.t_outer - 2,
+            "C_fitted_count": sum(1 for c in self.C if c is not None),
+            "per_t_diagnostics": {
+                t_step: {k: v for k, v in d.items()
+                          if isinstance(v, (int, float))}
+                for t_step, d in per_t_diag.items()
+            },
+            "grad_sanity_at_t": {t_s: g.get("grad_sanity_rel_err_wealth_pct",
+                                            float("nan"))
+                                  for t_s, g in grad_sanity.items()},
+            "v0_decision_at_t_min": v0_decision,
+            "q_opt_t_min_mean": q_opt_mean,
+        }
+        sweep_summary.update(oracle_diag)
+        sweep_summary.update(oracle_policy_diag)
+        logging.info(
+            "DifferentialSolver sweep complete: %d C_t functions fitted "
+            "(t ∈ [%d, %d]); V_0_decision @ t=%d = %.4f; n*_t_min mean = %s",
+            sweep_summary["C_fitted_count"], self.t_min, self.t_outer - 1,
+            self.t_min, v0_decision, q_opt_mean)
+        # M2 engagement trajectory — per-t rounds, escalation flag, and δ history.
+        # Each value is one t step; pattern shows whether audit-correct converged
+        # (rounds<MAX), fixed via correction (rounds>1 then PASS), or escalated
+        # (label bias detected — spec §14 λ-mix territory).
+        diff_engagement = [d["twin_diff_loss"] for _, d in sorted(per_t_diag.items())]
+        rounds_per_t = [d.get("rounds_taken", 1) for _, d in sorted(per_t_diag.items())]
+        escalated_t = [t_step for t_step, d in sorted(per_t_diag.items())
+                        if d.get("escalation_flag")]
+        logging.info(
+            "DifferentialSolver M2 trajectory (t %d→%d): "
+            "rounds_per_t=[%s], diff_loss=[%s], escalated_t=%s",
+            self.t_outer - 2, self.t_min,
+            ", ".join(str(r) for r in rounds_per_t),
+            ", ".join("%.3g" % v for v in diff_engagement),
+            escalated_t)
+        m1_diag = sweep_summary
 
         # Return a SolverResult so the dispatcher in solve_hedge can package it.
         b = self._B()
