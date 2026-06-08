@@ -873,8 +873,8 @@ class Credit_Monte_Carlo(Calculation):
             mtm_dates = base_mtm_dates.union(dynamic_dates)
         else:
             # we are only running the calc till the last period specified (and clipping everything else)
-            max_date = base_date + self.config.periodparser.parseString(
-                self.input_time_grid.strip().split(' ')[-1].upper())[0]
+            max_date = min(max(dynamic_dates), base_date + self.config.periodparser.parseString(
+                self.input_time_grid.strip().split(' ')[-1].upper())[0])
             base_mtm_dates = self.config.parse_grid(base_date, max_date, self.input_time_grid)
             reset_dates = [x for x in dynamic_dates if x <= max_date]
             mtm_dates = base_mtm_dates.union(reset_dates)
