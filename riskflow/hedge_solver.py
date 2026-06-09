@@ -1622,6 +1622,115 @@ class DifferentialSolver:
         self.contract_size = torch.ones(len(self.hedges), device=self.device)
         self.utility_c = max(float(bundle.get("utility_scale", 100.0)), 1.0)
 
+        # ------- Advantage decomposition (spec §14 promoted to main path) -------
+        # `C_t(z) = B_t(z) + A_t(z)` with `B_t` a closed-form buy-and-hold baseline
+        # (analytic, bounded, action-dependent through Σq) and `A_t` the NN's
+        # residual. Bounds magnitudes that otherwise compound geometrically through
+        # the backward chain (observed +0.028 error-vs-depth slope at T_dec=30
+        # without it; |δ| growing ~3×/step). Decision argmaxes B_t+A_t.
+        self._advantage_decomp = bool(solver_cfg.get("use_advantage_decomp", True))
+        if self._advantage_decomp:
+            # Pre-compute baseline parameters once. The drift comes from the spot
+            # factor's per-state μ (annualised). dt comes from the spot's per-step
+            # dt (constant for the weekly toy). The regime cols in the market block
+            # are discovered by walking the same factor-iteration order as
+            # `_read_privileged_market`'s privileged path — robust to factor reorder.
+            spot_proc = self._calc.stoch_factors_inner.get(self._spot_key)
+            mu_t = getattr(spot_proc, 'mu_per_state', None)
+            if mu_t is None:
+                self._advantage_decomp = False
+                logging.warning(
+                    "DifferentialSolver advantage decomp requested but spot factor "
+                    "has no `mu_per_state` — falling back to the no-baseline path.")
+            else:
+                self._mu_per_regime = mu_t.to(self.device, dtype=self.dtype)
+                # dt source: outer scenario grid (`time_grid_days_cpu`) is the
+                # canonical authoritative source. Compute the OUTER per-step dt in
+                # years from consecutive grid days, converted by 1/365.25 (calendar
+                # convention — see memory `calendar-vs-business-day`). spot_proc's
+                # `dt_per_step` reflects the INNER fork's dt and is zero on the
+                # one-step diff-ML path; not what we want.
+                days = bundle['time_grid_days_cpu'][hist:]
+                # `time_grid_days_cpu` is a python list of day indices.
+                if len(days) >= 2:
+                    self._dt_per_step = float(int(days[1]) - int(days[0])) / 365.25
+                else:
+                    self._dt_per_step = 7.0 / 365.25      # weekly toy fallback
+                # Discover regime col range in the market block by replicating
+                # `_read_privileged_market`'s column accounting.
+                col = 0
+                self._regime_cols_in_market = None
+                for key in self._calc.stoch_factors_inner:
+                    if key.type in utils.DimensionLessFactors:
+                        continue
+                    width = self._calc._extract_outer_state_at(
+                        0, key, self._outer_buf, privileged=True).shape[0]
+                    if key == self._spot_key and width > 0:
+                        self._regime_cols_in_market = (col, col + width)
+                        break
+                    col += width
+                if self._regime_cols_in_market is None:
+                    self._advantage_decomp = False
+                    logging.warning(
+                        "DifferentialSolver advantage decomp: couldn't locate spot "
+                        "regime cols in market block — falling back to no-baseline.")
+                else:
+                    logging.info(
+                        "DifferentialSolver advantage decomp ENABLED: "
+                        "regime_cols=%s, μ_per_regime=%s, dt_per_step=%.6f",
+                        self._regime_cols_in_market,
+                        self._mu_per_regime.cpu().tolist(),
+                        self._dt_per_step)
+
+    def _baseline_B(self, z):
+        """Closed-form buy-and-hold baseline `B_t(z)` for advantage decomposition.
+
+        For deep state z at time t (with `time_to_T` encoded), this is the symlog
+        utility of the EXPECTED terminal wealth under the policy 'hold current q
+        from t through T':
+            B_t(z) = symlog(z.wealth + (Σq − 1) · S · (E[S_T/S_t] − 1), c)
+                   ≈ symlog(z.wealth + (Σq − 1) · S · (exp(μ̄ · ttot) − 1), c)
+        where μ̄ is the expected per-time-unit drift given the current regime
+        (one-hot or belief vector in the market block).
+
+        Action-dependent through Σq (separates long/short policies), regime-
+        dependent through μ̄ (encodes long-bull / short-bear), depth-dependent
+        through ttot. Bounded by symlog(|max wealth| + |max Σq · S · drift|, c).
+        AAD-safe — every op is differentiable in pytorch."""
+        if not self._advantage_decomp:
+            return torch.zeros(z.shape[:-1], device=z.device, dtype=z.dtype)
+        n_h = self.statepack.n_hedge
+        market_dim = self.statepack.market_dim
+        # StatePack layout: positions | wealth | accrued | futures | market | static | time
+        positions = z[..., :n_h]
+        wealth = z[..., n_h]
+        futures = z[..., n_h + 2 : 2 * n_h + 2]
+        market_start = 2 * n_h + 2
+        market = z[..., market_start : market_start + market_dim]
+        time_to_T = z[..., -1]
+
+        sum_q = positions.sum(dim=-1)                                # (..., )
+        S = futures[..., 0]                                          # spot tracker
+        r_lo, r_hi = self._regime_cols_in_market
+        regime_block = market[..., r_lo:r_hi]                        # (..., n_states)
+        # Expected per-time drift = Σ_r regime_block[r] · μ_r (one-hot → picks μ).
+        expected_mu = (regime_block * self._mu_per_regime).sum(dim=-1)
+        ttot_years = time_to_T * self._dt_per_step
+        drift_factor = torch.expm1(expected_mu * ttot_years)         # exp(x)-1, stable
+        E_wealth_T = wealth + (sum_q - 1.0) * S * drift_factor
+        return torch.sign(E_wealth_T) * torch.log1p(
+            E_wealth_T.abs() / self.utility_c)
+
+    def _C_full(self, net, z):
+        """Evaluate the full continuation value `C_t(z) = B_t(z) + A_t(z)` where
+        `A_t = net` is the NN's residual. Under advantage decomposition, the NN
+        learns only the small bounded residual; under the legacy no-baseline mode
+        (`use_advantage_decomp=False`), `B_t ≡ 0` and this collapses to `net(z)`.
+        Both call sites that previously did `net(z)` should route through here so
+        the decomposition is transparent to the rest of the solver."""
+        nn_out = net(z)
+        return nn_out + self._baseline_B(z)
+
     # ------------------------------------------------------------------ seam
     def sample_exogenous(self, n=None, seed=None):
         """**THE ONE SWAPPABLE METHOD** between (B) solver-internal and (A) framework-
@@ -1744,12 +1853,22 @@ class DifferentialSolver:
         # Terminal utility — symlog of wealth in the gate2 convention (w_T already
         # carries cash + (q_total - 1)·S + K → fully realized terminal wealth).
         c_util = max(float(self.bundle.get("utility_scale", 100.0)), 1.0)
-        y_target = torch.sign(wealth_flat) * torch.log1p(wealth_flat.abs() / c_util)
-        # Gradient label: ∂U/∂wealth = 1/(c + |w|); zero on other coords. The wealth
-        # column is at StatePack offset n_hedge (after positions block).
         wealth_idx = self.statepack.n_hedge
-        dy_dz = torch.zeros_like(z_T)
-        dy_dz[:, wealth_idx] = 1.0 / (c_util + wealth_flat.abs())
+        if self._advantage_decomp:
+            # Under advantage decomp the NN fits the RESIDUAL A_T = C_T − B_T(z).
+            # At terminal (`time_to_T = 0`), `B_T(z) = symlog(wealth)` exactly
+            # (drift_factor = e^0 − 1 = 0), so A_T = symlog(W_T) − symlog(z.wealth)
+            # = 0 identically. Both value and gradient targets collapse to 0; the
+            # NN trains to ~zero output and the full continuation is recovered as
+            # `B_T(z) + A_T(z) ≈ symlog(z.wealth) + 0`.
+            y_target = torch.zeros_like(wealth_flat)
+            dy_dz = torch.zeros_like(z_T)
+        else:
+            y_target = torch.sign(wealth_flat) * torch.log1p(wealth_flat.abs() / c_util)
+            # Gradient label: ∂U/∂wealth = 1/(c + |w|); zero on other coords. The
+            # wealth column is at StatePack offset n_hedge (after positions block).
+            dy_dz = torch.zeros_like(z_T)
+            dy_dz[:, wealth_idx] = 1.0 / (c_util + wealth_flat.abs())
 
         # Build and fit the twin network.
         net = construct_twin_network(
@@ -1918,7 +2037,10 @@ class DifferentialSolver:
                 F=F_K.reshape(N * K, n_h),
                 time_to_T=time_to_T_K.reshape(-1),
                 static=static_K.reshape(N * K, -1))                   # (N*K, deep_dim)
-            values = C_next(z_post).reshape(N, K)                     # (N, K)
+            # Advantage decomposition: argmax the SUM B_t + A_t, NOT A_t alone.
+            # The decomposition is transparent: legacy no-baseline path collapses
+            # `_C_full` to `C_next(z_post)` since `_baseline_B` returns zero.
+            values = self._C_full(C_next, z_post).reshape(N, K)       # (N, K)
             argmax_idx = values.argmax(dim=-1)                        # (N,)
             v_star = values.gather(-1, argmax_idx.unsqueeze(-1)).squeeze(-1)
             # Action gap = top minus second-best. Robust to ties (sort then diff).
@@ -2005,8 +2127,11 @@ class DifferentialSolver:
                 market=market_t1_per_row, q=q_star_t1,
                 wealth=wealth_post_t1, F=F_t1,
                 time_to_T=time_to_T_t1, static=bank["static"])
-            # Bootstrap value: the single grad-enabled eval of C_next.
-            Y_boot = C_next(z_t1)                                     # (N,)
+            # Bootstrap value: the single grad-enabled eval of C_next. Advantage
+            # decomp: `_C_full` adds the closed-form baseline at t+1, so Y_boot is
+            # the FULL value (baseline + NN residual). The NN at t is then trained
+            # against Y_boot − B_t(z_t) — fitting only the small bounded residual.
+            Y_boot = self._C_full(C_next, z_t1)                       # (N,)
 
             # Differential label: ∂Y_boot/∂state_t_leaves. Single backward pass.
             leaves = inner["state_t_leaves"]
@@ -2033,7 +2158,7 @@ class DifferentialSolver:
                 market=market_t1_per_row.detach(), q=q_star_t1,
                 wealth=wealth_post_t1_l, F=F_t1.detach(),
                 time_to_T=time_to_T_t1, static=bank["static"])
-            Y_for_w = C_next(z_t1_l)
+            Y_for_w = self._C_full(C_next, z_t1_l)
             dY_dw = torch.autograd.grad(Y_for_w.sum(), w_leaf)[0]    # (N,)
         wealth_col = self.statepack.n_hedge                          # cash slot
         dy_dz[:, wealth_col] = dY_dw
@@ -2050,7 +2175,21 @@ class DifferentialSolver:
                 for j, h in enumerate(self.hedges):
                     if live_t[j]:
                         dy_dz[:, F_col_start + j] += g_per_row
-        return z_t.detach(), Y_boot.detach(), dy_dz.detach(), action_gap.detach()
+
+        # Advantage decomposition: subtract B_t(z_t) from the value label so the
+        # NN fits the residual A_t = C_t − B_t. The gradient label is LEFT
+        # UNCHANGED — it remains ∂Y_boot/∂z (= ∂C_t/∂z under the bootstrap
+        # approximation), not ∂A_t/∂z. Pragmatically this gives the NN a gradient
+        # target close to A_t's true gradient when B's gradient is small (the
+        # baseline is bounded in symlog units, so ∂B/∂z = O(1/c)). Subtracting
+        # ∂B/∂z exactly turned out to drive the standardized diff-loss target to
+        # ~10× the value target and destabilize twin-loss training; the small
+        # asymptotic bias from leaving it in is preferred over the instability.
+        if self._advantage_decomp:
+            y_target = Y_boot.detach() - self._baseline_B(z_t).detach()
+        else:
+            y_target = Y_boot.detach()
+        return z_t.detach(), y_target, dy_dz.detach(), action_gap.detach()
 
     def _fit_twin_sgd(self, net, z, y, dy_dz, action_gap, steps, log_label=""):
         """One SGD pass over the supplied (z, y, dy_dz, action_gap) bank. Used by
@@ -2063,12 +2202,21 @@ class DifferentialSolver:
         batch = min(self.train_minibatch, n_rows)
         steps = max(1, int(steps))
         last_diag = {"val_loss": float("nan"), "diff_loss": float("nan")}
+        # Under advantage decomposition the gradient label `dy_dz` is for the FULL
+        # `C_t` (= ∂Y_boot/∂z), not the residual `A_t = C_t − B_t` that the NN
+        # actually fits. Subtracting `∂B/∂z` to make targets consistent destabilized
+        # twin loss training (large standardized targets at positions cols when the
+        # action grid expands to 121). Cheaper: drop `w_diff` to 0 under advantage
+        # decomp — let the NN focus on the value-only fit. The differential premise
+        # of diff-ML is then traded for stability; the gradient information re-enters
+        # through the value labels themselves (which are derived from the AAD chain).
+        w_diff = 0.0 if self._advantage_decomp else 1.0
         for step in range(steps):
             idx = torch.randint(0, n_rows, (batch,), device=device)
             loss, last_diag = twin_loss(
                 net, z[idx], y[idx], dy_dz[idx],
                 action_gap=action_gap[idx], gap_threshold=gap_threshold,
-                w_val=1.0, w_diff=1.0)
+                w_val=1.0, w_diff=w_diff)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -2323,12 +2471,15 @@ class DifferentialSolver:
         cost_t = self._turnover(q_star_t, q_prev, F_t_audit)
         wealth_post_t = wealth_pre - cost_t
 
-        # Y_boot via C_t at the chosen post-decision state.
+        # Y_boot via C_t at the chosen post-decision state. Routes through
+        # `_C_full` so advantage decomposition's `A_t + B_t` is measured as a
+        # whole — auditing `net(z)` alone under decomp would compare raw A_t to
+        # Y_eval (in symlog units), making δ meaningless.
         with torch.no_grad():
             z_t_audit = self._assemble_z(
                 market=market_t_audit, q=q_star_t, wealth=wealth_post_t,
                 F=F_t_audit, time_to_T=time_to_T_t, static=static_t_audit)
-            Y_boot = net(z_t_audit)                                    # (N_audit,)
+            Y_boot = self._C_full(net, z_t_audit)                      # (N_audit,)
 
         # Y_eval via rollout to T.
         Y_eval = self._rollout_no_grad_to_T(
@@ -2456,6 +2607,136 @@ class DifferentialSolver:
                 "oracle_policy_match_rate": sum(1 for v in results.values() if v["match"])
                                               / max(1, len(results))}
 
+    def _action_error_vs_depth(self, npz_path, traj):
+        """Per-t oracle-policy match across the full backward sweep — the structural
+        validation gate per spec: 'ranking survives depth'. Distinguishes a
+        compounding failure mode (action-error growing backward with depth) from
+        a clean per-step bias (flat action-error across t).
+
+        Probe is canonical-state-per-regime (q_prev=(0,0), w=K, s=mid) to keep the
+        signal interpretable; per-t variation reveals depth-driven degradation.
+
+        Requires gate2 to have saved policy tensors (`pol_pre_A_qA`, `pol_pre_A_qB`,
+        `pol_post_A_qB`); silently skips if absent (gate2 npz from before the
+        save-policy patch).
+        """
+        try:
+            npz = np.load(npz_path, allow_pickle=True)
+        except FileNotFoundError:
+            return {"action_error_vs_depth_skipped": "npz_not_found"}
+        if 'pol_pre_A_qA' not in npz.files:
+            return {"action_error_vs_depth_skipped": "policy_tensors_absent"}
+
+        pol_pre_A_qA = npz['pol_pre_A_qA']           # (T_A, R, N_S, N_Q, N_Q, N_W)
+        pol_pre_A_qB = npz['pol_pre_A_qB']
+        pol_post_A_qB = npz['pol_post_A_qB']         # (T_dec-T_A, R, N_S, N_Q, N_W)
+        q_grid = npz['q_grid']                       # (N_Q,) values
+        s_grid = npz['s_grid']
+        w_grid = npz['w_grid']
+
+        T_A_oracle = int(npz['T_A'])                 # scalars saved by gate2
+        T_dec_oracle = int(npz['T_dec'])
+        # Map solver outer t to oracle t. Solver's t_outer = T_dec_oracle + 2
+        # (sim grid has T_dec_oracle + 1 weekly points + a base date). Probe at
+        # solver t = oracle t (1:1 in the weekly toy).
+        if self.t_outer - 2 != T_dec_oracle:
+            logging.warning(
+                "action_error_vs_depth: solver t_outer=%d implies T_dec=%d, but oracle "
+                "T_dec=%d — depth mismatch, skipping.",
+                self.t_outer, self.t_outer - 2, T_dec_oracle)
+            return {"action_error_vs_depth_skipped": "horizon_mismatch"}
+
+        s_mid_idx = s_grid.shape[0] // 2
+        K = float(self.bundle.get("initial_wealth", 100.0))
+        w_init_idx = int(np.argmin(np.abs(w_grid - K)))
+        q0_idx = int(np.where(q_grid == 0)[0][0])
+        n_h = len(self.hedges)
+
+        device = self.device
+        regimes_per_t = self._outer_buf[(self._spot_key, 'regimes')]      # (T, B)
+
+        per_t = []
+        for t in range(self.t_outer - 1):
+            if self.C[t] is None or t >= len(traj) or t >= T_dec_oracle:
+                continue                              # no decision past T_dec - 1
+            traj_market_t = traj[t]["market"]
+            regimes_at_t = regimes_per_t[t]
+            row = {"t": t, "matches": [], "regime_results": {}}
+            for r_idx in (0, 1):
+                in_regime = (regimes_at_t == r_idx).nonzero(as_tuple=True)[0]
+                if in_regime.numel() == 0:
+                    continue
+                src = int(in_regime[0])
+                market_block = traj_market_t[src:src+1]
+                q_prev = torch.zeros(1, n_h, device=device)
+                F_t = torch.full((1, n_h), 100.0, device=device, dtype=self.dtype)
+                wealth_pre = torch.full((1,), K, device=device, dtype=self.dtype)
+                time_to_T = torch.full((1,), float(self.t_outer - 1 - t),
+                                        device=device, dtype=self.dtype)
+                static_t = self._static_sim[t].to(device).flatten().unsqueeze(0)
+                q_star, _, _ = self._decision_at(
+                    self.C[t], market_block, F_t, q_prev, wealth_pre,
+                    time_to_T, static_t, t=t)
+                q_learned = q_star[0].cpu().tolist()
+                # Oracle action at this canonical state.
+                if t < T_A_oracle:
+                    qA_oracle_idx = int(pol_pre_A_qA[t, r_idx, s_mid_idx,
+                                                       q0_idx, q0_idx, w_init_idx])
+                    qB_oracle_idx = int(pol_pre_A_qB[t, r_idx, s_mid_idx,
+                                                       q0_idx, q0_idx, w_init_idx])
+                    q_oracle = [int(q_grid[qA_oracle_idx]), int(q_grid[qB_oracle_idx])]
+                else:
+                    # post_A: q_A=0 forced; oracle pol_post_A_qB indexed at (t-T_A).
+                    qB_oracle_idx = int(pol_post_A_qB[t - T_A_oracle, r_idx,
+                                                       s_mid_idx, q0_idx, w_init_idx])
+                    q_oracle = [0, int(q_grid[qB_oracle_idx])]
+                match = (int(round(q_learned[0])) == q_oracle[0]
+                          and int(round(q_learned[1])) == q_oracle[1])
+                row["matches"].append(match)
+                row["regime_results"][r_idx] = {
+                    "q_oracle": q_oracle,
+                    "q_learned": [float(x) for x in q_learned],
+                    "match": match,
+                }
+            if row["matches"]:
+                row["match_rate"] = sum(row["matches"]) / len(row["matches"])
+                per_t.append(row)
+
+        # Log the depth profile as a compact table.
+        logging.info(
+            "DifferentialSolver ACTION-ERROR vs DEPTH — per-t oracle match "
+            "at canonical (q_prev=0, w=K, s=mid). flat curve = no compounding; "
+            "growing backward = compounding signature:")
+        logging.info("  t    r=0 oracle vs learned       r=1 oracle vs learned       match")
+        for r in per_t:
+            r0 = r["regime_results"].get(0, {})
+            r1 = r["regime_results"].get(1, {})
+            r0_str = (f"{r0.get('q_oracle')} vs {r0.get('q_learned')}"
+                       + ("✓" if r0.get('match') else "✗")) if r0 else "—"
+            r1_str = (f"{r1.get('q_oracle')} vs {r1.get('q_learned')}"
+                       + ("✓" if r1.get('match') else "✗")) if r1 else "—"
+            logging.info("  %3d  %-29s  %-29s  %d/%d",
+                          r["t"], r0_str, r1_str,
+                          sum(r["matches"]), len(r["matches"]))
+
+        # Aggregate: match rate vs depth.
+        match_rates = [r["match_rate"] for r in per_t]
+        overall = sum(match_rates) / max(1, len(match_rates))
+        # Compounding signature: action-error trend across t. Linear regression
+        # slope of (1 - match_rate) vs (t_outer - 2 - t) [depth from terminal].
+        if len(match_rates) >= 4:
+            depths = np.array([self.t_outer - 2 - r["t"] for r in per_t])
+            errors = 1.0 - np.array(match_rates)
+            slope = float(np.polyfit(depths, errors, 1)[0]) if errors.std() > 1e-6 else 0.0
+        else:
+            slope = float('nan')
+        logging.info(
+            "ACTION-ERROR vs DEPTH SUMMARY: %d t-points; overall match rate=%.2f%%; "
+            "error-vs-depth slope=%+.4f (positive = compounding signature; ~0 = flat = no compounding)",
+            len(match_rates), overall * 100, slope)
+        return {"action_error_per_t": per_t, "action_error_overall_match_rate": overall,
+                "action_error_depth_slope": slope}
+
     # ------------------------------- End-of-F smoke: oracle + grad sanity
     def _smoke_against_gate2(self, t, npz_path):
         """Single-contract mechanism test: compare fitted C_t's argmax + a few V cells
@@ -2522,7 +2803,7 @@ class DifferentialSolver:
                                                     device=device),
                             static=static_cell.unsqueeze(0))
                         with torch.no_grad():
-                            v_nn = float(self.C[t](z).item())
+                            v_nn = float(self._C_full(self.C[t], z).item())
                         rows.append({"regime": r_idx, "s_idx": s_idx, "qB_idx": qB_idx,
                                       "w_idx": w_idx, "v_dp": v_dp, "v_nn": v_nn,
                                       "residual": v_nn - v_dp})
@@ -2659,7 +2940,7 @@ class DifferentialSolver:
                                       torch.tensor([time_to_T], device=device),
                                       static_t.unsqueeze(0))
                 with torch.no_grad():
-                    v_nn = float(self.C[t](z).item())
+                    v_nn = float(self._C_full(self.C[t], z).item())
                 per_cell.append({"r": r_idx, "qB": int(qB_cell), "v_dp": v_dp,
                                   "v_nn": v_nn, "delta": v_nn - v_dp})
             if not per_cell:
@@ -2779,9 +3060,10 @@ class DifferentialSolver:
         z = self._assemble_z(market_block, q_cell, wealth, F_cell, time_to_T, static_t)
         wealth_col = self.statepack.n_hedge
 
-        # AAD ∂C/∂z_wealth.
+        # AAD ∂C/∂z_wealth. Under advantage decomp, C = B + A so the gradient
+        # includes both contributions — `_C_full` is the right query.
         z_leaf = z.detach().clone().requires_grad_(True)
-        y_pred = self.C[t](z_leaf)
+        y_pred = self._C_full(self.C[t], z_leaf)
         dy_dz_aad = torch.autograd.grad(y_pred.sum(), z_leaf)[0]
         aad_wealth = dy_dz_aad[:, wealth_col]
 
@@ -2791,8 +3073,8 @@ class DifferentialSolver:
         with torch.no_grad():
             z_plus = z.clone(); z_plus[:, wealth_col] += eps
             z_minus = z.clone(); z_minus[:, wealth_col] -= eps
-            y_plus = self.C[t](z_plus)
-            y_minus = self.C[t](z_minus)
+            y_plus = self._C_full(self.C[t], z_plus)
+            y_minus = self._C_full(self.C[t], z_minus)
             fd_wealth = (y_plus - y_minus) / (2 * eps)
         rel_err = ((aad_wealth - fd_wealth).abs() / fd_wealth.abs().clamp_min(1.0e-8)
                   ).mean()
@@ -2877,7 +3159,7 @@ class DifferentialSolver:
                 positions=positions, g=wealth_T, a=zero_b,
                 futures=tradables_T, market=market_T, static=static_T,
                 time_to_t=time_to_t_T)
-            terminal_values = self.C[t_T](z_query)               # (B,)
+            terminal_values = self._C_full(self.C[t_T], z_query)  # (B,)
             v0_estimate = float(terminal_values.mean())
             # Compare to closed-form expected terminal utility under buy-and-hold
             # for a sanity check.
@@ -3010,6 +3292,9 @@ class DifferentialSolver:
         depth_diag = self._depth_profile_diagnostic(
             'artifacts/gate2_exact_dp.npz', traj)
         sweep_summary.update(depth_diag)
+        action_depth_diag = self._action_error_vs_depth(
+            'artifacts/gate2_exact_dp.npz', traj)
+        sweep_summary.update(action_depth_diag)
         logging.info(
             "DifferentialSolver sweep complete: %d C_t functions fitted "
             "(t ∈ [%d, %d]); V_0_decision @ t=%d = %.4f; n*_t_min mean = %s",
