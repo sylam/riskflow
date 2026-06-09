@@ -2772,10 +2772,23 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
             # Diff-ML one-step short-circuit — skip the pricing chain (`_restricted_struct`
             # would drop deals whose horizon extends past t+1, producing meaningless
-            # `L_T`). The AAD leaves are already attached to the inner generate, so
-            # backward through `market_t1` reaches `state_t_leaves` — exactly what the
-            # twin-loss differential label gen needs. `L_T`/`F_t1`/`dF_T` return as
-            # `None`/empty dicts; the diff-ML solver never reads them on this path.
+            # `L_T` AND tripping CUDA index asserts on per-deal curve reads that
+            # assume the full time grid). The diff-ML label generator
+            # (`hedge_solver._compute_labels_for_bank`) reads `inner['F_t1'][h]` to
+            # compute the t→t+1 wealth-channel motion `wealth_pre_t1 = wealth_post_t
+            # + (Σq − 1)·dS`; returning an empty `F_t1` dict structurally zeros dS
+            # → frozen wealth channel → degenerate bootstrap labels.
+            #
+            # Populate `F_t1` directly from the spot factor's simulated path at
+            # inner-time index 1 (= outer t+1). For the diff-ML toy validation
+            # (carry σ ≡ 0 ⇒ F_h ≡ spot for every live hedge — matches gate2's
+            # MTM-invariant wealth dynamics), this is the correct forward at t+1.
+            # AAD: `shared_mem.t_Scenario_Buffer[spot_key]` is the live output of
+            # the spot factor's inner `generate()` above (with_grad=True attached
+            # leaves at line 2755-2756), so `.clone()` preserves
+            # `∂F_t1/∂state_t_leaves[spot_key] ≠ 0`. For a fuller term-structure
+            # model (non-zero carry, per-tradable per-tenor forwards), this path
+            # needs the per-tradable pricing pass — defer until the toy lands.
             if return_market_only and want_raw_samples:
                 market_t1 = torch.cat(market_t1_parts, dim=0).permute(1, 2, 0).contiguous()
                 market_t_parts, market_t_widths = [], []
@@ -2787,6 +2800,11 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     market_t_parts.append(block)
                     market_t_widths.append((key, block.shape[0]))
                 market_t = torch.cat(market_t_parts, dim=0).permute(1, 0).contiguous()
+                # Per-tradable forward at t+1. Spot factor's simulated path is in
+                # the inner buffer at index 1; broadcast to every hedge tradable.
+                spot_path = shared_mem.t_Scenario_Buffer[spot_key]
+                spot_at_t1 = spot_path[1].reshape(B_outer, B_inner).clone()
+                F_t1 = {ref: spot_at_t1 for ref in tradable_refs}
                 # `features` placeholder — the RL feature builder is pricing-dependent
                 # and explicitly skipped on the one-step diff-ML path. Consumers on
                 # this branch never read it.
@@ -2794,7 +2812,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 result = {'features': shared_mem.one.new_zeros(B_outer, _n_features)}
                 result.update(
                     t=t, cutoff_idx=cutoff_idx, L_T=None,
-                    F_t1={}, dF_T={}, dF_min={},
+                    F_t1=F_t1, dF_T={}, dF_min={},
                     market_t=market_t, market_t1=market_t1)
                 if with_grad:
                     result['state_t_leaves'] = state_t_leaves

@@ -2389,46 +2389,54 @@ class DifferentialSolver:
             "audit_outer_indices": audit_outer_indices,
         }
 
-    def _grade_against_oracle_policy(self, npz_path):
+    def _grade_against_oracle_policy(self, npz_path, traj):
         """Compare learned argmax policy `n*_0` per regime at t=0 against gate2's
         `initial_policy`. Per user's mandate: 'V_0 climbs' is necessary but not
         sufficient — the policy must become regime-conditional and match the DP's
         actions. Returns per-regime (q_oracle, q_learned, match) tuples."""
         try:
-            npz = np.load(npz_path, allow_pickle=True)
+            np.load(npz_path, allow_pickle=True)
         except FileNotFoundError:
             return {"oracle_policy_skipped": True}
-        # gate2 stores summary separately as JSON; load `initial_policy` from the
-        # summary that pairs with this npz (next to it in artifacts/).
+        # gate2 stores the policy summary in `artifacts/gate2_summary.json` next to
+        # the npz — fixed name, not derived from the npz path.
+        import os, json
+        summary_path = os.path.join(os.path.dirname(npz_path), 'gate2_summary.json')
         try:
-            with open(npz_path.replace('.npz', '_summary.json'), 'r') as f:
-                import json
+            with open(summary_path, 'r') as f:
                 summary = json.load(f)
             initial_policy = summary.get("initial_policy", {})
         except (FileNotFoundError, KeyError):
             return {"oracle_policy_skipped": True}
 
-        if not initial_policy:
+        if not initial_policy or self.C[0] is None:
             return {"oracle_policy_skipped": True}
 
         device = self.device
         n_h = len(self.hedges)
+        # In-distribution market probe — pull a real market block from traj[0]
+        # filtered by regime, same approach as `_depth_profile_diagnostic`. A
+        # synthetic one-hot `market[0, r_idx] = 1.0` would set the wrong columns
+        # (the regime one-hot is not at index 0 in the market block; see
+        # `_depth_profile_diagnostic` for details).
+        regimes_at_0 = self._outer_buf[(self._spot_key, 'regimes')][0]
+        traj_market_0 = traj[0]["market"]
         results = {}
         for regime_key, oracle_q in initial_policy.items():
             r_idx = int(regime_key.split('=')[1]) if '=' in regime_key else int(regime_key)
             q_oracle = [int(oracle_q.get("q_A_value", 0)),
                         int(oracle_q.get("q_B_value", 0))]
-            # Build a canonical t=0 state in this regime.
-            market_block = torch.zeros(1, self.statepack.market_dim, device=device)
-            market_block[0, r_idx] = 1.0
+            in_regime = (regimes_at_0 == r_idx).nonzero(as_tuple=True)[0]
+            if in_regime.numel() == 0:
+                continue
+            src = int(in_regime[0])
+            market_block = traj_market_0[src:src+1]
             q_prev = torch.zeros(1, n_h, device=device)
             F_t = torch.full((1, n_h), 100.0, device=device)
             wealth_pre = torch.full((1,), float(self.bundle.get("initial_wealth", 100.0)),
                                      device=device)
             time_to_T = torch.full((1,), float(self.t_outer - 1), device=device)
             static_t = self._static_sim[0].to(device).flatten().unsqueeze(0)
-            if self.C[0] is None:
-                continue
             q_star, _, _ = self._decision_at(
                 self.C[0], market_block, F_t, q_prev, wealth_pre, time_to_T,
                 static_t, t=0)
@@ -2534,6 +2542,221 @@ class DifferentialSolver:
                     "oracle_max_abs": float(max(abs(r) for r in residuals)),
                     "oracle_cells_compared": len(rows)}
         return {"oracle_skipped": True}
+
+    def _depth_profile_diagnostic(self, npz_path, traj):
+        """Decides whether M2's residual is COMPOUNDING (gap small at terminal anchor,
+        grows backward) or BOUNDARY BREAK (gap already large at the cold-trained
+        anchor / one step in). The two patterns need different fixes:
+
+        - **Compounding** (oracle Δ grows from t=T backward, regime-separation in
+          fitted C_t is PRESENT but slightly compressed) → λ-mix is the right remedy:
+          de-bias the optimistic max-label with a rollout target.
+        - **Boundary break** (oracle Δ is already large at C_T or C_{T-1}, regime
+          separation in fitted C_t is FLAT or wrong-signed) → the rot is in label-gen
+          / regime conditioning, NOT compounded max-of-noisy. λ-mix won't help; need
+          to look upstream at the label generator's regime sensitivity.
+
+        Per the user's diagnostic: "Pure max-of-noisy would, if anything, preserve or
+        amplify regime structure. Uniform-across-regime degradation points at the
+        regime signal being washed out in label-gen." So the test is two-part:
+          (a) oracle gap vs depth (grows backward = compounding)
+          (b) regime separation in fitted C_t at each depth (present = compounding-OK;
+              flat/uniform = label-gen problem)
+        """
+        try:
+            npz = np.load(npz_path)
+        except FileNotFoundError:
+            return {"depth_profile_skipped": True}
+        V_post_A = npz.get("V_post_A")
+        V_pre_A = npz.get("V_pre_A")
+        s_grid = npz.get("s_grid")
+        q_grid = npz.get("q_grid")
+        w_grid = npz.get("w_grid")
+        if V_post_A is None or V_pre_A is None:
+            return {"depth_profile_skipped": True}
+
+        device = self.device
+        n_h = len(self.hedges)
+        # Probe at t in {T-1 (boundary), T-2, mid, T_A+1, T_A-1 (post-mid pre-T_A)}.
+        T_outer_dec = self.t_outer - 1
+        probe_ts = sorted({T_outer_dec - 1, T_outer_dec - 2,
+                            (T_outer_dec + self.t_min) // 2,
+                            self.t_min})
+        probe_ts = [t for t in probe_ts if 0 <= t < self.t_outer
+                     and self.C[t] is not None]
+
+        results = {}
+        for t in probe_ts:
+            v_slice_idx = V_post_A.shape[0] - (T_outer_dec - t)
+            use_post_a = v_slice_idx >= 0
+            if use_post_a:
+                if v_slice_idx >= V_post_A.shape[0]:
+                    continue
+                V_slice = V_post_A[v_slice_idx]            # (n_reg, N_S, N_qB, N_W)
+                live_n_h = 1                                # only q_B
+            else:
+                # t is in the pre-T_A regime (both q_A, q_B live). V_pre_A slice.
+                v_pre_idx = V_pre_A.shape[0] - (V_post_A.shape[0] - v_slice_idx)
+                if v_pre_idx < 0 or v_pre_idx >= V_pre_A.shape[0]:
+                    continue
+                V_slice = V_pre_A[v_pre_idx]               # (n_reg, N_S, N_qA, N_qB, N_W)
+                live_n_h = 2
+
+            # Sample mid-spot, mid-wealth cells across the q_B axis (and q_A=0 in
+            # the post-A regime; q_A=mid in pre-A regime).
+            cells = []
+            s_idx = V_slice.shape[1] // 2
+            w_idx = V_slice.shape[-1] // 2
+            if use_post_a:
+                # V_slice indexed as [r, s, qB, w]
+                for r_idx in range(V_slice.shape[0]):
+                    for qB_idx in [0, V_slice.shape[2] // 2, V_slice.shape[2] - 1]:
+                        v_dp = float(V_slice[r_idx, s_idx, qB_idx, w_idx])
+                        if abs(v_dp) > 1e8:
+                            continue   # off-grid sentinel
+                        cells.append((r_idx, s_idx, 0, qB_idx, w_idx, v_dp))
+            else:
+                # V_slice indexed as [r, s, qA, qB, w]
+                qA_mid = V_slice.shape[2] // 2
+                for r_idx in range(V_slice.shape[0]):
+                    for qB_idx in [0, V_slice.shape[3] // 2, V_slice.shape[3] - 1]:
+                        v_dp = float(V_slice[r_idx, s_idx, qA_mid, qB_idx, w_idx])
+                        if abs(v_dp) > 1e8:
+                            continue
+                        cells.append((r_idx, s_idx, qA_mid, qB_idx, w_idx, v_dp))
+
+            # Evaluate C_t at each cell, plus regime/action separation probes.
+            # IMPORTANT: use REAL market blocks from `traj[t]` filtered by
+            # `regime_at_t`, not a synthetic one-hot. A constructed market with
+            # `market[0, r_idx] = 1.0` would set the wrong columns (the regime
+            # one-hot is offset by ForwardRate's 3 carry tenors at indices 0-2 in
+            # the toy's market block; regime sits at cols 3-4), and feeding the NN
+            # an OOD market block makes the probe meaningless — the NN was trained
+            # on `traj[t]['market']` distribution, so we evaluate it there.
+            time_to_T = float(T_outer_dec - t)
+            static_t = self._static_sim[t].to(device).flatten()
+            regimes_at_t = self._outer_buf[(self._spot_key, 'regimes')][t]
+            traj_market_t = traj[t]["market"]
+            per_cell = []
+            for r_idx, si, qA_idx, qB_idx, wi, v_dp in cells:
+                # Find an outer path landing in regime r_idx at t and reuse its
+                # market block — that's the in-distribution probe.
+                in_regime = (regimes_at_t == r_idx).nonzero(as_tuple=True)[0]
+                if in_regime.numel() == 0:
+                    continue
+                src = int(in_regime[0])                # first match
+                market = traj_market_t[src:src+1]      # (1, market_dim)
+                # Other state coords from the oracle's grid (still synthetic — but
+                # only on coords the NN can correctly interpolate over).
+                qA_cell = float(q_grid[qA_idx]) if q_grid is not None else 0.0
+                qB_cell = float(q_grid[qB_idx]) if q_grid is not None else 0.0
+                w_cell = float(w_grid[wi]) if w_grid is not None else 0.0
+                S_cell = float(s_grid[si]) if s_grid is not None else 100.0
+                q = torch.tensor([[qA_cell, qB_cell]], device=device, dtype=self.dtype)
+                F = torch.full((1, n_h), S_cell, device=device, dtype=self.dtype)
+                w = torch.tensor([w_cell], device=device, dtype=self.dtype)
+                z = self._assemble_z(market, q, w, F,
+                                      torch.tensor([time_to_T], device=device),
+                                      static_t.unsqueeze(0))
+                with torch.no_grad():
+                    v_nn = float(self.C[t](z).item())
+                per_cell.append({"r": r_idx, "qB": int(qB_cell), "v_dp": v_dp,
+                                  "v_nn": v_nn, "delta": v_nn - v_dp})
+            if not per_cell:
+                continue
+            mae = sum(abs(c["delta"]) for c in per_cell) / len(per_cell)
+            r0 = [c for c in per_cell if c["r"] == 0]
+            r1 = [c for c in per_cell if c["r"] == 1]
+            r0_mean = sum(c["delta"] for c in r0) / max(1, len(r0))
+            r1_mean = sum(c["delta"] for c in r1) / max(1, len(r1))
+
+            # Regime separation in fitted C_t — paired comparison at matched (qB, w):
+            # |C_t(r=0,...) - C_t(r=1,...)| averaged. If FLAT → label-gen washing out
+            # regime. Pure max-of-noisy preserves regime structure.
+            r0_by_qB = {c["qB"]: c["v_nn"] for c in r0}
+            r1_by_qB = {c["qB"]: c["v_nn"] for c in r1}
+            paired_diffs = [abs(r0_by_qB[qB] - r1_by_qB[qB])
+                            for qB in r0_by_qB if qB in r1_by_qB]
+            regime_sep_nn = (sum(paired_diffs) / len(paired_diffs)
+                              if paired_diffs else 0.0)
+            # Same for the DP oracle — the right answer for "how much regime
+            # separation should C_t have at this t".
+            r0_dp_by_qB = {c["qB"]: c["v_dp"] for c in r0}
+            r1_dp_by_qB = {c["qB"]: c["v_dp"] for c in r1}
+            paired_dp = [abs(r0_dp_by_qB[qB] - r1_dp_by_qB[qB])
+                          for qB in r0_dp_by_qB if qB in r1_dp_by_qB]
+            regime_sep_dp = (sum(paired_dp) / len(paired_dp)
+                              if paired_dp else 0.0)
+
+            # Action separation in C_t — does it differentiate qB choices at all?
+            qB_vals_r0 = [c["v_nn"] for c in r0]
+            action_sep_nn = (max(qB_vals_r0) - min(qB_vals_r0)) if qB_vals_r0 else 0.0
+            qB_vals_r0_dp = [c["v_dp"] for c in r0]
+            action_sep_dp = ((max(qB_vals_r0_dp) - min(qB_vals_r0_dp))
+                              if qB_vals_r0_dp else 0.0)
+
+            results[t] = {
+                "v_slice_kind": "post_A" if use_post_a else "pre_A",
+                "v_slice_idx": v_slice_idx,
+                "n_cells": len(per_cell),
+                "mae": mae,
+                "r0_mean_delta": r0_mean,
+                "r1_mean_delta": r1_mean,
+                "regime_sep_nn": regime_sep_nn,
+                "regime_sep_dp": regime_sep_dp,
+                "regime_sep_ratio": (regime_sep_nn / regime_sep_dp
+                                      if regime_sep_dp > 1e-6 else float("nan")),
+                "action_sep_nn": action_sep_nn,
+                "action_sep_dp": action_sep_dp,
+                "action_sep_ratio": (action_sep_nn / action_sep_dp
+                                      if action_sep_dp > 1e-6 else float("nan")),
+            }
+
+        # Log the depth profile as a table — easier to scan than a JSON dump.
+        logging.info(
+            "DifferentialSolver DEPTH PROFILE — gap and separation vs depth "
+            "(compounding ↔ growing-backward ; boundary break ↔ already flat at T-1):")
+        logging.info(
+            "  t     kind    MAE      Δ(r=0)   Δ(r=1)   regime-sep(NN/DP)    "
+            "action-sep(NN/DP)")
+        for t in sorted(results.keys(), reverse=True):
+            r = results[t]
+            logging.info(
+                "  %3d   %-6s  %+.4f  %+.4f  %+.4f  %.4f/%.4f (%.2fx)  "
+                "%.4f/%.4f (%.2fx)",
+                t, r["v_slice_kind"], r["mae"],
+                r["r0_mean_delta"], r["r1_mean_delta"],
+                r["regime_sep_nn"], r["regime_sep_dp"], r["regime_sep_ratio"],
+                r["action_sep_nn"], r["action_sep_dp"], r["action_sep_ratio"])
+
+        # Verdict heuristic — compare MAE at T-1 (boundary) vs deepest probed t.
+        ts_sorted = sorted(results.keys(), reverse=True)
+        if len(ts_sorted) >= 2:
+            mae_boundary = results[ts_sorted[0]]["mae"]
+            mae_deep = results[ts_sorted[-1]]["mae"]
+            regime_sep_ratio_avg = (
+                sum(r["regime_sep_ratio"] for r in results.values()
+                     if not (isinstance(r["regime_sep_ratio"], float)
+                              and r["regime_sep_ratio"] != r["regime_sep_ratio"]))
+                / max(1, sum(1 for r in results.values()
+                              if not (isinstance(r["regime_sep_ratio"], float)
+                                       and r["regime_sep_ratio"] != r["regime_sep_ratio"]))))
+            if mae_boundary > 0.05 and regime_sep_ratio_avg < 0.5:
+                verdict = "BOUNDARY-BREAK: gap is already large at T-1 AND regime separation < 50% of DP. λ-mix WON'T fix this; look upstream at label-gen / regime conditioning."
+            elif mae_deep > 3 * mae_boundary and regime_sep_ratio_avg > 0.5:
+                verdict = "COMPOUNDING: gap grows backward AND regime separation is preserved. λ-mix is the right remedy."
+            else:
+                verdict = ("AMBIGUOUS — gap grows backward by factor "
+                            f"{mae_deep/max(mae_boundary,1e-9):.2f}, "
+                            f"regime_sep_ratio_avg={regime_sep_ratio_avg:.2f}. "
+                            "Inspect per-t numbers before deciding.")
+            logging.info("DEPTH PROFILE VERDICT — %s", verdict)
+            return {"depth_profile_per_t": results,
+                    "depth_profile_verdict": verdict,
+                    "mae_boundary": mae_boundary,
+                    "mae_deep": mae_deep,
+                    "regime_sep_ratio_avg": regime_sep_ratio_avg}
+        return {"depth_profile_per_t": results}
 
     def _grad_sanity_check(self, t):
         """FD vs AAD on ∂C/∂z_wealth at a small sample of fit rows. Also asserts that
@@ -2734,7 +2957,7 @@ class DifferentialSolver:
         # the smoke check that exercises whether the audit-correct loop actually
         # un-biased the policy (vs just shifting V_0 toward the right number).
         oracle_policy_diag = self._grade_against_oracle_policy(
-            'artifacts/gate2_exact_dp.npz')
+            'artifacts/gate2_exact_dp.npz', traj)
 
         # V_0 estimate via the decision operator at t_min: q*_t_min = argmax_q
         # C[t_min](post_state_t_min(q)). For the M1.5 toy (t_min = T_A - 1) this is
@@ -2782,6 +3005,11 @@ class DifferentialSolver:
         }
         sweep_summary.update(oracle_diag)
         sweep_summary.update(oracle_policy_diag)
+        # Depth-profile diagnostic — decisive on whether the M2 residual is
+        # COMPOUNDING (λ-mix fix) or BOUNDARY BREAK (label-gen/conditioning fix).
+        depth_diag = self._depth_profile_diagnostic(
+            'artifacts/gate2_exact_dp.npz', traj)
+        sweep_summary.update(depth_diag)
         logging.info(
             "DifferentialSolver sweep complete: %d C_t functions fitted "
             "(t ∈ [%d, %d]); V_0_decision @ t=%d = %.4f; n*_t_min mean = %s",
