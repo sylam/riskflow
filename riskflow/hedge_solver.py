@@ -1775,41 +1775,34 @@ class DifferentialSolver:
         return traj
 
     def _read_privileged_market(self, t):
-        """Privileged exogenous coordinates at outer t, B-last → B-leading. Concatenates
-        per-process privileged blocks in `stoch_factors_inner` iteration order — same
-        ordering the inner-MC `market_t` uses, so the StatePack market block is
-        layout-consistent across diff-ML training and the existing inner-MC machinery.
+        """Participant-visible exogenous coordinates at outer t, B-last → B-leading.
+        Concatenates per-process privileged blocks in `stoch_factors_inner`
+        iteration order — same ordering the inner-MC `market_t` uses, so the
+        StatePack market block is layout-consistent across diff-ML training and
+        the existing inner-MC machinery.
 
-        **For the gate2 toy comparison: TRUE-regime one-hot, NOT belief.** gate2 is a
-        full-information DP whose state vector includes the observable regime
-        coordinate (gate2_exact_dp.py:14, 28). The canonical
-        `_extract_outer_state_at(..., privileged=True)` at calculation.py:2167-2181
-        prefers the filtered belief `(key, 'regime_belief')` when the buffer holds it
-        (per the spec's filter posterior convention) — but on the toy that turns the
-        diff-ML solver into a partial-information solver whose value is strictly
-        ≤ gate2's, and the cell-by-cell comparison silently fails on an information
-        mismatch (not on the method). Solution: for regime-switching factors, read
-        the realized regime path directly from `outer_buf[(spot_key, 'regimes')]`
-        (published by `MarkovHMMSpotModel.generate` — destination-regime convention
-        verified against gate2_exact_dp.py:123-134) and one-hot it. All other factor
-        types fall through to the canonical privileged extractor.
+        **Belief, not regime** (validation_sandwich_spec.md §1, §2): the
+        canonical `_extract_outer_state_at(..., privileged=True)` returns the
+        HMM filter posterior `(key, 'regime_belief')` when the buffer publishes
+        it — the participant-visible coordinate. A market participant doesn't
+        observe the regime label; feeding the true regime one-hot is privileged
+        information and the resulting policy doesn't transfer to deployment.
+        For factor types that don't publish belief (carry curves, basis), the
+        canonical extractor's raw privileged state is the right input.
+
+        Historically this method had a custom one-hot shortcut for the gate2
+        toy comparison (the toy's full-information DP needed the privileged
+        coordinate to be apples-to-apples). The shortcut has been retired —
+        per the spec, the toy `V_0` is no longer the validation target and the
+        solver moves to a partial-information policy. The toy machinery still
+        runs as a regression test on the policy structure, not on `V_0`.
         """
         parts = []
         for key in self._calc.stoch_factors_inner:
             if key.type in utils.DimensionLessFactors:
                 continue
-            proc = self._calc.stoch_factors_inner[key]
-            regimes = self._outer_buf.get((key, 'regimes'))
-            if (key.type in ('CommodityPrice', 'CommodityBasis')
-                    and regimes is not None
-                    and getattr(proc, 'n_states', None)):
-                onehot = torch.nn.functional.one_hot(
-                    regimes[t].long(), num_classes=proc.n_states
-                ).to(dtype=self.dtype)                  # (B, n_states)
-                block = onehot.movedim(-1, 0)            # (n_states, B) — B-last
-            else:
-                block = self._calc._extract_outer_state_at(
-                    t, key, self._outer_buf, privileged=True).reshape(-1, self._B())
+            block = self._calc._extract_outer_state_at(
+                t, key, self._outer_buf, privileged=True).reshape(-1, self._B())
             parts.append(block)
         return torch.cat(parts, dim=0).permute(1, 0).contiguous()  # (B, market_dim)
 
