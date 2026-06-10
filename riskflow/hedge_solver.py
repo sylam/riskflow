@@ -1622,6 +1622,31 @@ class DifferentialSolver:
         self.contract_size = torch.ones(len(self.hedges), device=self.device)
         self.utility_c = max(float(bundle.get("utility_scale", 100.0)), 1.0)
 
+        # Bank's endogenous-span ranges. Toy default: ±5 positions, ±$1500 wealth
+        # (= $15 × c=100). Production: scale with the deal — q range from
+        # `position_limits` (one number per hedge), wealth halfwidth from
+        # `utility_scale` (= deal notional ≈ what the symlog response sees).
+        # Tunable via `Solver.Wealth_Sample_Halfwidth_C_Multiplier` (default 15.0,
+        # i.e. ±15c covers a couple of decades around the symlog knee).
+        c_mult = float(solver_cfg.get("wealth_sample_halfwidth_c_multiplier", 15.0))
+        self.bank_wealth_halfwidth = self.utility_c * c_mult
+        # Per-hedge integer position bounds, sourced from `position_limits`. For
+        # the production deal these are real contract counts; for the toy they
+        # collapse to ±5 by default. Bank samples q_prev/q_t in these bounds.
+        limits = runtime["accounting"].get("position_limits", {})
+        q_lo, q_hi = [], []
+        for name in self.hedges:
+            lim = limits.get(name, {})
+            q_lo.append(int(float(lim.get("min_position", -5))))
+            q_hi.append(int(float(lim.get("max_position", 5))))
+        self.bank_q_min = torch.tensor(q_lo, dtype=torch.long, device=self.device)
+        self.bank_q_max = torch.tensor(q_hi, dtype=torch.long, device=self.device)
+        logging.info(
+            "DifferentialSolver bank ranges: wealth_halfwidth=%.4g (c=%.4g × %.1f), "
+            "q_min=%s, q_max=%s",
+            self.bank_wealth_halfwidth, self.utility_c, c_mult,
+            self.bank_q_min.cpu().tolist(), self.bank_q_max.cpu().tolist())
+
         # ------- Advantage decomposition (spec §14 promoted to main path) -------
         # `C_t(z) = B_t(z) + A_t(z)` with `B_t` a closed-form buy-and-hold baseline
         # (analytic, bounded, action-dependent through Σq) and `A_t` the NN's
@@ -1826,18 +1851,18 @@ class DifferentialSolver:
 
         # Endogenous span: q ∈ [-5, 5] uniformly per leg, wealth uniformly across a
         # designer box matched to gate2's observed range (~K ± 1500 in raw units).
-        # For Milestone 0 the band is hard-wired; promote to JSON in Milestone 1 once
-        # the proper bank constructor lands.
-        q_min, q_max = -5, 5
-        wealth_halfwidth = 1500.0
+        # Endogenous span ranges — per-hedge q bounds from `position_limits`, wealth
+        # band scaled to `utility_scale` × multiplier. The NN learns a smooth function
+        # across the full (z_T, q_T, wealth_T) joint at deal-realistic scales.
         rows_per_outer = self.b_endo
-        # Span: random uniform points in (q, wealth) per outer path. The NN learns
-        # a smooth function across the full (z_T, q_T, wealth_T) joint.
-        q_span = torch.randint(q_min, q_max + 1,
-                                (b_outer, rows_per_outer, n_h),
-                                device=device).to(self.dtype)
+        q_span = torch.empty(b_outer, rows_per_outer, n_h, dtype=torch.long, device=device)
+        for j in range(n_h):
+            q_span[..., j] = torch.randint(
+                int(self.bank_q_min[j]), int(self.bank_q_max[j]) + 1,
+                (b_outer, rows_per_outer), device=device)
+        q_span = q_span.to(self.dtype)
         wealth_span = (torch.rand(b_outer, rows_per_outer, device=device) - 0.5) \
-            * (2.0 * wealth_halfwidth)
+            * (2.0 * self.bank_wealth_halfwidth)
 
         # Broadcast market/tradables to (B, rows_per_outer, ...) and flatten.
         market_b = market_T.unsqueeze(1).expand(-1, rows_per_outer, -1).reshape(
@@ -1961,12 +1986,14 @@ class DifferentialSolver:
         n_h = len(self.hedges)
 
         rows = int(rows_per_outer if rows_per_outer is not None else self.b_endo)
-        q_min, q_max = -5, 5
-        wealth_halfwidth = 1500.0
-        q_prev = torch.randint(q_min, q_max + 1, (B, rows, n_h),
-                                device=device).to(self.dtype)
+        q_prev = torch.empty(B, rows, n_h, dtype=torch.long, device=device)
+        for j in range(n_h):
+            q_prev[..., j] = torch.randint(
+                int(self.bank_q_min[j]), int(self.bank_q_max[j]) + 1,
+                (B, rows), device=device)
+        q_prev = q_prev.to(self.dtype)
         wealth_pre = (torch.rand(B, rows, device=device) - 0.5) * \
-            (2.0 * wealth_halfwidth)
+            (2.0 * self.bank_wealth_halfwidth)
         live_t = self.is_live[t]
         if (~live_t).any():
             mask_dead = (~live_t).view(1, 1, n_h)
@@ -2469,12 +2496,15 @@ class DifferentialSolver:
         n_h = len(self.hedges)
         device = self.device
         # Audit-row endogenous sampling — same designer box as training, fresh draws.
-        # `q_prev` uniform integer, `wealth_pre` uniform on ±1500.
-        q_min, q_max = -5, 5
-        wealth_halfwidth = 1500.0
-        q_prev = torch.randint(q_min, q_max + 1, (N_audit, n_h),
-                                device=device).to(self.dtype)
-        wealth_pre = (torch.rand(N_audit, device=device) - 0.5) * (2.0 * wealth_halfwidth)
+        # Per-hedge q range from position_limits, wealth band scaled with utility_c.
+        q_prev = torch.empty(N_audit, n_h, dtype=torch.long, device=device)
+        for j in range(n_h):
+            q_prev[..., j] = torch.randint(
+                int(self.bank_q_min[j]), int(self.bank_q_max[j]) + 1,
+                (N_audit,), device=device)
+        q_prev = q_prev.to(self.dtype)
+        wealth_pre = (torch.rand(N_audit, device=device) - 0.5) \
+            * (2.0 * self.bank_wealth_halfwidth)
         live_t = self.is_live[t]
         if (~live_t).any():
             q_prev[:, ~live_t] = 0.0
@@ -3248,19 +3278,19 @@ class DifferentialSolver:
             if self.C[t_s] is not None:
                 grad_sanity[t_s] = self._grad_sanity_check(t_s)
 
-        # Oracle comparison at the mid t (still single-contract for T_dec=10 / T_A=5
-        # if mid > T_A; gives the c=1000 vs c=100 scale-mismatch baseline that M4 will
-        # reconcile, plus a "shape matches" diagnostic in the meantime).
-        mid_t = (self.t_outer - 2 + self.t_min) // 2
-        oracle_diag = self._smoke_against_gate2(mid_t, 'artifacts/gate2_exact_dp.npz')
-
-        # M2 final grade: regime-conditional `n*_0` against gate2's initial_policy.
-        # Per the user's mandate: V_0 climbing is necessary but not sufficient — the
-        # policy must become regime-conditional and match the DP's actions. This is
-        # the smoke check that exercises whether the audit-correct loop actually
-        # un-biased the policy (vs just shifting V_0 toward the right number).
-        oracle_policy_diag = self._grade_against_oracle_policy(
-            'artifacts/gate2_exact_dp.npz', traj)
+        # Oracle comparison vs gate2's full-information DP — toy regression only.
+        # In production no such oracle exists; the BSS information-relaxation
+        # sandwich (gap = U − L) replaces this readout.
+        import os
+        _has_gate2 = os.path.exists('artifacts/gate2_exact_dp.npz')
+        if _has_gate2:
+            mid_t = (self.t_outer - 2 + self.t_min) // 2
+            oracle_diag = self._smoke_against_gate2(mid_t, 'artifacts/gate2_exact_dp.npz')
+            oracle_policy_diag = self._grade_against_oracle_policy(
+                'artifacts/gate2_exact_dp.npz', traj)
+        else:
+            oracle_diag = {}
+            oracle_policy_diag = {}
 
         # V_0 estimate via the decision operator at t_min: q*_t_min = argmax_q
         # C[t_min](post_state_t_min(q)). For the M1.5 toy (t_min = T_A - 1) this is
@@ -3306,16 +3336,22 @@ class DifferentialSolver:
             "v0_decision_at_t_min": v0_decision,
             "q_opt_t_min_mean": q_opt_mean,
         }
-        sweep_summary.update(oracle_diag)
-        sweep_summary.update(oracle_policy_diag)
-        # Depth-profile diagnostic — decisive on whether the M2 residual is
-        # COMPOUNDING (λ-mix fix) or BOUNDARY BREAK (label-gen/conditioning fix).
-        depth_diag = self._depth_profile_diagnostic(
-            'artifacts/gate2_exact_dp.npz', traj)
-        sweep_summary.update(depth_diag)
-        action_depth_diag = self._action_error_vs_depth(
-            'artifacts/gate2_exact_dp.npz', traj)
-        sweep_summary.update(action_depth_diag)
+        # Toy diagnostics — depth profile, action-error-vs-depth, oracle-policy
+        # comparisons against gate2's full-information DP. Only runs when the
+        # gate2 oracle npz is present (i.e. the toy validation harness). In
+        # production this skips silently — the validation readout there is the
+        # BSS information-relaxation sandwich (gap = U − L) + dollar floor per
+        # validation_sandwich_spec.md §3, §5, §8.
+        import os
+        if os.path.exists('artifacts/gate2_exact_dp.npz'):
+            sweep_summary.update(oracle_diag)
+            sweep_summary.update(oracle_policy_diag)
+            depth_diag = self._depth_profile_diagnostic(
+                'artifacts/gate2_exact_dp.npz', traj)
+            sweep_summary.update(depth_diag)
+            action_depth_diag = self._action_error_vs_depth(
+                'artifacts/gate2_exact_dp.npz', traj)
+            sweep_summary.update(action_depth_diag)
         logging.info(
             "DifferentialSolver sweep complete: %d C_t functions fitted "
             "(t ∈ [%d, %d]); V_0_decision @ t=%d = %.4f; n*_t_min mean = %s",
