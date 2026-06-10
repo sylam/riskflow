@@ -1119,7 +1119,7 @@ class NettingCollateralSet(Deal):
             else:
                 # collateral according to call_mask
                 Sim_Bt = [Bt[0]]
-                Call_mask = factor_dep['call_mask'][1:].astype(np.bool)
+                Call_mask = factor_dep['call_mask'].astype(bool)
                 for mr, mp, bt, cm in zip(Mr[1:], Mp[1:], Bt_new[1:], Call_mask[1:]):
                     if cm:
                         mask = ((Sim_Bt[-1] < mr) | (Sim_Bt[-1] > mp))
