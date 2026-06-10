@@ -1629,6 +1629,19 @@ class DifferentialSolver:
         # the backward chain (observed +0.028 error-vs-depth slope at T_dec=30
         # without it; |δ| growing ~3×/step). Decision argmaxes B_t+A_t.
         self._advantage_decomp = bool(solver_cfg.get("use_advantage_decomp", True))
+        # λ-mix: blend the bootstrap value target with a no-grad rollout target.
+        # Spec §14 deferred lever. Indicated when a horizon-stable bounded residual
+        # V_0 gap survives advantage decomposition (the gap exists at T_dec=30:
+        # banked V_0 = 3.57 vs oracle 0.92 — bounded but persistent). Mixing in
+        # the rollout pulls the value labels toward realized utility, breaking the
+        # max-of-noisy compounding chain. Differential label is untouched (rollout
+        # has no grad); only the value label is blended. Default 0 = no mix.
+        self._lambda_mix = float(solver_cfg.get("lambda_mix", 0.0))
+        if self._lambda_mix > 0.0:
+            logging.info(
+                "DifferentialSolver λ-mix ENABLED: λ=%.3f (value label = "
+                "(1−λ)·Y_boot + λ·Y_rollout; gradient label unchanged)",
+                self._lambda_mix)
         if self._advantage_decomp:
             # Pre-compute baseline parameters once. The drift comes from the spot
             # factor's per-state μ (annualised). dt comes from the spot's per-step
@@ -2052,7 +2065,7 @@ class DifferentialSolver:
             1, argmax_idx.view(N, 1, 1).expand(N, 1, n_h)).squeeze(1)
         return q_star, v_star, action_gap
 
-    def _compute_labels_for_bank(self, t, bank, C_next):
+    def _compute_labels_for_bank(self, t, bank, C_next, traj=None):
         """Generate `(z_t, y_target, dy_dz, action_gap)` for a bank of pre-decision
         rows via the spec §4/§12 one-step-bootstrap pipeline:
           • sample q_t spanned across the action grid (per-row anchor)
@@ -2185,8 +2198,23 @@ class DifferentialSolver:
         # ∂B/∂z exactly turned out to drive the standardized diff-loss target to
         # ~10× the value target and destabilize twin-loss training; the small
         # asymptotic bias from leaving it in is preferred over the instability.
+        # λ-mix (when active): blend Y_boot with a no-grad rollout Y_rollout to
+        # break max-of-noisy compounding on the value labels. Rollout starts at
+        # the bank's post-decision state (q_t_sampled applied, wealth_post_t)
+        # and uses frozen C-stack for downstream decisions. Gradient label is
+        # untouched — only the value path gets mixed.
         if self._advantage_decomp:
-            y_target = Y_boot.detach() - self._baseline_B(z_t).detach()
+            B_at_z_t = self._baseline_B(z_t).detach()
+            Y_value = Y_boot.detach()
+            if self._lambda_mix > 0.0:
+                with torch.no_grad():
+                    Y_rollout = self._rollout_no_grad_to_T(
+                        t_start=t, outer_indices=bank["outer_index"],
+                        q_post_t=q_t_sampled.detach(),
+                        wealth_post_t=wealth_post_t.detach(), traj=traj)
+                Y_value = ((1.0 - self._lambda_mix) * Y_value
+                            + self._lambda_mix * Y_rollout)
+            y_target = Y_value - B_at_z_t
         else:
             y_target = Y_boot.detach()
         return z_t.detach(), y_target, dy_dz.detach(), action_gap.detach()
@@ -2264,7 +2292,7 @@ class DifferentialSolver:
             bank = self._build_bank(t, traj, outer_indices=accumulated_outer_idx)
             # 2. Compute labels.
             z_t, y_target, dy_dz, action_gap = self._compute_labels_for_bank(
-                t, bank, C_next)
+                t, bank, C_next, traj=traj)
             # On round 0 (first fit), refresh the net's standardization stats.
             if round_num == 0:
                 net.set_normalization(

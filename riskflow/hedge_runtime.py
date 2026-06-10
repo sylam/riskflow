@@ -171,6 +171,12 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # 0 disables the differential branch (bit-exact baseline). See
         # differential_ml_redesign_v14.md §2.3.
         "lambda_diff": float(solver_config.get("Lambda_Diff", 0.0)),
+        # λ-mix (DifferentialSolver advantage decomp): blend
+        # `(1-λ)·Y_boot + λ·Y_rollout` for the value label. Spec §14 deferred lever,
+        # indicated when a horizon-stable bounded residual V_0 gap survives advantage
+        # decomposition. Default 0 = pure bootstrap (banked behavior).
+        "lambda_mix": float(solver_config.get("Lambda_Mix", 0.0)),
+        "use_advantage_decomp": bool(solver_config.get("Use_Advantage_Decomp", True)),
         "include_dynamic_features_in_value_inputs":
             bool(solver_config.get("Include_Dynamic_Features_In_Value_Inputs", False)),
         "multi_seed_count": int(solver_config.get("Multi_Seed_Count", 1)),
