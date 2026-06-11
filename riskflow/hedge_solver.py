@@ -698,7 +698,7 @@ class TwinNetwork(torch.nn.Module):
 
 def twin_loss(net, z, y_target, dy_dz_target, *,
               action_gap=None, gap_threshold=None,
-              w_val=1.0, w_diff=1.0):
+              w_val=1.0, w_diff=1.0, col_mask=None):
     """Huge–Savine twin loss (spec §9):
         L = w_val · MSE(C(z), y) + w_diff · MSE(∂C/∂z, ∂y/∂z)
     computed entirely in standardized space so both terms have O(1)-norm contributions
@@ -718,6 +718,17 @@ def twin_loss(net, z, y_target, dy_dz_target, *,
     `w_diff_per_row = clamp(action_gap / gap_threshold, 0, 1)` — the value label stays
     active through kinks while the slope target is down-weighted. Pass `action_gap` and
     `gap_threshold` together to activate; pass neither for an unmasked fit.
+
+    Column mask (`col_mask`, optional `(D,)`): restricts the gradient MSE to the
+    columns where the label pipeline actually computed a pathwise derivative. The
+    one-step AAD label populates ONLY the wealth column and the live tradable_prices
+    columns; every other column of `dy_dz_target` is an uncomputed zero, not a
+    measured slope. Fitting against those zeros is wrong for the advantage-decomp
+    residual (whose positions-slope is `−∂B/∂q` away from zero), so the residual
+    path passes a mask and unlabeled columns contribute nothing. `None` (default)
+    reproduces the legacy all-columns mean exactly. The per-column mean is taken
+    over ACTIVE columns (`sum/Σmask`) so the diff-term scale is independent of how
+    many unlabeled columns the state layout carries.
 
     Returns `(total_loss, diag_dict)`. `diag_dict` carries per-term losses for
     logging/early-stopping.
@@ -739,7 +750,12 @@ def twin_loss(net, z, y_target, dy_dz_target, *,
         yn_pred.sum(), zn_leaf, create_graph=True)[0]               # (N, D)
     dyn_dzn_target = dy_dz_target * (net.z_std / net.y_std)         # (N, D)
 
-    diff_per_row = ((dyn_dzn_pred - dyn_dzn_target) ** 2).mean(dim=-1)  # (N,)
+    sq_resid = (dyn_dzn_pred - dyn_dzn_target) ** 2                 # (N, D)
+    if col_mask is not None:
+        cm = col_mask.to(sq_resid.dtype)
+        diff_per_row = (sq_resid * cm).sum(dim=-1) / cm.sum().clamp_min(1.0)
+    else:
+        diff_per_row = sq_resid.mean(dim=-1)                        # (N,)
     if action_gap is not None and gap_threshold is not None and gap_threshold > 0:
         mask = (action_gap / float(gap_threshold)).clamp(0.0, 1.0)
         diff_loss = (diff_per_row * mask).mean()
@@ -1610,42 +1626,57 @@ class DifferentialSolver:
         levels = int(solver_cfg.get("training_action_grid_levels_per_axis", 11))
         self.action_grid = build_action_grid(runtime, levels, self.device)   # (K, n_h)
 
-        # Toy accounting constants. Spec §3: λ_turn = 1e-4, K = 100 strike, S_0 = 100.
-        # Promoted to JSON in M2/M3; hard-wired here so the smoke runs without a
-        # config update. The wealth convention is gate2-style MTM-invariant:
-        #   w_t = cash + (Σq − 1)·S_t + K
-        # so under no rebalance: w_{t+1} = w_t + (Σq − 1)·dS; under rebalance:
-        # w_post = w_pre − turnover.
+        # Accounting constants pulled from the runtime — no toy defaults. The wealth
+        # convention is gate2-style MTM-invariant: `w_t = cash + (Σq − 1)·S_t + K`,
+        # so under no rebalance `w_{t+1} = w_t + (Σq − 1)·dS`; under rebalance,
+        # `w_post = w_pre − turnover`.
         self.lambda_turn = float(runtime["accounting"].get(
             "transaction_cost_per_unit", 1.0e-4))
         self.K_strike = float(solver_cfg.get("k_strike", 100.0))
-        self.contract_size = torch.ones(len(self.hedges), device=self.device)
+        # Real per-tradable contract sizes (50 oz for platinum futures, 1 for the
+        # toy). Was hardcoded to `ones(n_h)` which broke any deal where the
+        # tradable's price wasn't already denominated in deal units.
+        self.contract_size = torch.tensor(
+            [float(runtime["tradables"][h]["contract_size"]) for h in self.hedges],
+            device=self.device, dtype=self.dtype)
+        # `bundle['liability_mtm']` is not required by the diff-ML path — we use
+        # the closed form `dL = R_t · dS` instead (AAD-aware), which reduces to
+        # the framework's realised MTM change by construction for linear-average
+        # deals. The framework computes liability_mtm for the other solvers; we
+        # don't need it on the diff-ML training/rollout path.
         self.utility_c = max(float(bundle.get("utility_scale", 100.0)), 1.0)
 
-        # Bank's endogenous-span ranges. Toy default: ±5 positions, ±$1500 wealth
-        # (= $15 × c=100). Production: scale with the deal — q range from
-        # `position_limits` (one number per hedge), wealth halfwidth from
-        # `utility_scale` (= deal notional ≈ what the symlog response sees).
-        # Tunable via `Solver.Wealth_Sample_Halfwidth_C_Multiplier` (default 15.0,
-        # i.e. ±15c covers a couple of decades around the symlog knee).
-        c_mult = float(solver_cfg.get("wealth_sample_halfwidth_c_multiplier", 15.0))
-        self.bank_wealth_halfwidth = self.utility_c * c_mult
-        # Per-hedge integer position bounds, sourced from `position_limits`. For
-        # the production deal these are real contract counts; for the toy they
-        # collapse to ±5 by default. Bank samples q_prev/q_t in these bounds.
+        # Bank-sampling ranges, derived from the runtime — no separate JSON knob.
+        # `position_limits` is the same source `build_action_grid` reads (above), so
+        # the sampling range is consistent with the decision search space at every t.
+        # Wealth half-width sized to the symlog scale: 15 × c covers ±2.78 in symlog
+        # units, the meaningful dynamic range of the activation; at the toy
+        # (`utility_scale=100`) this lands on the prior ±$1500, at the production
+        # deal (`vol_scaled_notional ≈ deal notional`) it scales with the deal.
         limits = runtime["accounting"].get("position_limits", {})
-        q_lo, q_hi = [], []
-        for name in self.hedges:
-            lim = limits.get(name, {})
-            q_lo.append(int(float(lim.get("min_position", -5))))
-            q_hi.append(int(float(lim.get("max_position", 5))))
+        if not limits:
+            raise ValueError(
+                "DifferentialSolver requires `Evaluator.Position_Limits` per hedge; "
+                "got an empty dict. Set Min_Position / Max_Position per tradable.")
+        q_lo = [int(float(limits[h]["min_position"])) for h in self.hedges]
+        q_hi = [int(float(limits[h]["max_position"])) for h in self.hedges]
         self.bank_q_min = torch.tensor(q_lo, dtype=torch.long, device=self.device)
         self.bank_q_max = torch.tensor(q_hi, dtype=torch.long, device=self.device)
+        self.bank_wealth_halfwidth = 15.0 * self.utility_c
         logging.info(
-            "DifferentialSolver bank ranges: wealth_halfwidth=%.4g (c=%.4g × %.1f), "
-            "q_min=%s, q_max=%s",
-            self.bank_wealth_halfwidth, self.utility_c, c_mult,
-            self.bank_q_min.cpu().tolist(), self.bank_q_max.cpu().tolist())
+            "DifferentialSolver bank ranges: q_min=%s, q_max=%s, "
+            "wealth_halfwidth=%.4g (= 15·utility_c, utility_c=%.4g), "
+            "contract_size=%s",
+            q_lo, q_hi, self.bank_wealth_halfwidth, self.utility_c,
+            self.contract_size.cpu().tolist())
+
+        # Linear average-rate liability: R_t (remaining-fixing-weights sum, in
+        # deal units) and τ̄_t (duration-weighted remaining time in years) so the
+        # wealth update can use the AAD-aware closed form `dL = R_t · dS` and the
+        # baseline can absorb the liability drift via `D_liab = expm1(μ̄·τ̄_t)`.
+        # For weights = δ_T (single payment at terminal) this reduces to the
+        # toy's R_t ≡ 1, τ̄ = ttot exactly — bit-for-bit reproduction.
+        self._init_liability_R_tau(runtime, bundle)
 
         # ------- Advantage decomposition (spec §14 promoted to main path) -------
         # `C_t(z) = B_t(z) + A_t(z)` with `B_t` a closed-form buy-and-hold baseline
@@ -1720,6 +1751,63 @@ class DifferentialSolver:
                         self._mu_per_regime.cpu().tolist(),
                         self._dt_per_step)
 
+    def _init_liability_R_tau(self, runtime, bundle):
+        """Build `self._liability_R` (shape t_outer, deal-unit exposure remaining
+        at each t) and `self._liability_tau_bar_years` (duration-weighted remaining
+        time to fixing, in years) from the linear-average-rate liability cashflows.
+
+        For a deal with `Period_Start..Period_End` averaged-rate cashflows, each
+        calendar day in the period is a fixing with weight `Volume / N_days`.
+        - `R_t = Σ_{u : fix_u > t} w_u`   (remaining exposure)
+        - `τ̄_t = (Σ w_u · (fix_u − t)) / R_t`   (duration-weighted remaining time)
+
+        The toy (single payment at terminal, weights = δ_T) gives R_t ≡ 1 for
+        t < T_dec, τ̄_t = ttot — reproducing the prior code bit-for-bit.
+        """
+        import pandas as pd
+        hist = int(bundle.get('initial_time_index', 0))
+        days = bundle['time_grid_days_cpu'][hist:hist + self.t_outer]
+        base_date = pd.Timestamp(bundle['meta']['base_date'])
+        T = self.t_outer
+        R_t = torch.zeros(T, device=self.device, dtype=self.dtype)
+        wt_dt = torch.zeros(T, device=self.device, dtype=self.dtype)
+
+        for name, lib in runtime.get('liabilities', {}).items():
+            items = (lib.get('params', {}).get('Payments') or {}).get('Items') or []
+            for cf in items:
+                volume = float(cf.get('Volume', 0.0))
+                ps_raw = cf.get('Period_Start')
+                pe_raw = cf.get('Period_End')
+                # Handle the framework's {.Timestamp: 'YYYY-MM-DD'} envelope.
+                if isinstance(ps_raw, dict):
+                    ps_raw = ps_raw.get('.Timestamp')
+                if isinstance(pe_raw, dict):
+                    pe_raw = pe_raw.get('.Timestamp')
+                if ps_raw is None or pe_raw is None or volume == 0.0:
+                    continue
+                ps = pd.Timestamp(ps_raw)
+                pe = pd.Timestamp(pe_raw)
+                n_fix_days = max(int((pe - ps).days) + 1, 1)
+                weight_per_day = volume / n_fix_days
+                for d_offset in range(n_fix_days):
+                    fix_day = int((ps + pd.Timedelta(days=d_offset) - base_date).days)
+                    for t_idx in range(T):
+                        day_t = int(days[t_idx])
+                        if fix_day > day_t:
+                            R_t[t_idx] = R_t[t_idx] + weight_per_day
+                            wt_dt[t_idx] = wt_dt[t_idx] + weight_per_day * (fix_day - day_t)
+
+        tau_days = torch.where(R_t > 1e-12, wt_dt / R_t.clamp_min(1e-12),
+                                torch.zeros_like(R_t))
+        self._liability_R = R_t                                # (T,) deal units
+        self._liability_tau_bar_years = tau_days / 365.25       # (T,) years
+        logging.info(
+            "DifferentialSolver liability R/τ̄ — R[0]=%.3f, R[T_dec]=%.3f; "
+            "τ̄_years[0]=%.4f, τ̄_years[T_dec]=%.4f",
+            float(R_t[0]), float(R_t[-1]),
+            float(self._liability_tau_bar_years[0]),
+            float(self._liability_tau_bar_years[-1]))
+
     def _baseline_B(self, z):
         """Closed-form buy-and-hold baseline `B_t(z)` for advantage decomposition.
 
@@ -1747,17 +1835,51 @@ class DifferentialSolver:
         market = z[..., market_start : market_start + market_dim]
         time_to_T = z[..., -1]
 
-        sum_q = positions.sum(dim=-1)                                # (..., )
+        # Deal-unit exposure: q is in contracts; contract_size converts to the
+        # units S is quoted in (50 oz platinum futures; 1 on the toy). Must match
+        # the PnL lines in `_compute_labels_for_bank` / `_rollout_no_grad_to_T`
+        # and `_turnover` — B's q-slope feeds the residual differential label
+        # ∂A/∂z = ∂C/∂z − ∂B/∂z, so a units mismatch here corrupts the labels.
+        # `_dB_dz` (autograd through this method) inherits the change for free.
+        sum_q = (positions * self.contract_size).sum(dim=-1)         # (..., )
         S = futures[..., 0]                                          # spot tracker
         r_lo, r_hi = self._regime_cols_in_market
         regime_block = market[..., r_lo:r_hi]                        # (..., n_states)
         # Expected per-time drift = Σ_r regime_block[r] · μ_r (one-hot → picks μ).
         expected_mu = (regime_block * self._mu_per_regime).sum(dim=-1)
         ttot_years = time_to_T * self._dt_per_step
-        drift_factor = torch.expm1(expected_mu * ttot_years)         # exp(x)-1, stable
-        E_wealth_T = wealth + (sum_q - 1.0) * S * drift_factor
+        # Hedges drift over the full ttot; liability drifts over τ̄_t (duration-
+        # weighted remaining time to fixings). Toy single-fixing-at-terminal:
+        # τ̄ = ttot → both drift factors equal → recovers `(Σq·cs − 1)·S·D`.
+        D_hedges = torch.expm1(expected_mu * ttot_years)             # (...,)
+        t_idx = (self.t_outer - 1 - time_to_T).long().clamp(0, self.t_outer - 1)
+        R_per_row = self._liability_R[t_idx]
+        tau_bar_per_row = self._liability_tau_bar_years[t_idx]
+        D_liab = torch.expm1(expected_mu * tau_bar_per_row)
+        E_wealth_T = wealth + sum_q * S * D_hedges - R_per_row * S * D_liab
         return torch.sign(E_wealth_T) * torch.log1p(
             E_wealth_T.abs() / self.utility_c)
+
+    def _dB_dz(self, z):
+        """Exact gradient `∂B_t/∂z` of the closed-form baseline, same shape as `z`.
+
+        Computed by autograd through `_baseline_B` itself — a handful of closed-form
+        ops, no network — so it is exact to machine precision and can never drift
+        out of sync with the baseline definition. Validated against central finite
+        differences by `fd_check_dB.py` (the live-thread guard: a sign/layout error
+        here reproduces the instability that originally forced `w_diff = 0`).
+
+        Used to convert the AAD gradient label for the FULL value,
+        `∂Y_boot/∂z = ∂C_t/∂z`, into the residual's correct label
+        `∂A_t/∂z = ∂C_t/∂z − ∂B_t/∂z` on the columns where `∂C_t/∂z` is actually
+        computed (wealth + live tradable_prices)."""
+        if not self._advantage_decomp:
+            return torch.zeros_like(z)
+        with torch.enable_grad():
+            z_leaf = z.detach().clone().requires_grad_(True)
+            B = self._baseline_B(z_leaf)
+            (g,) = torch.autograd.grad(B.sum(), z_leaf, create_graph=False)
+        return g.detach()
 
     def _C_full(self, net, z):
         """Evaluate the full continuation value `C_t(z) = B_t(z) + A_t(z)` where
@@ -1849,13 +1971,13 @@ class DifferentialSolver:
         n_h = len(self.hedges)
         device = self.device
 
-        # Endogenous span: q ∈ [-5, 5] uniformly per leg, wealth uniformly across a
-        # designer box matched to gate2's observed range (~K ± 1500 in raw units).
-        # Endogenous span ranges — per-hedge q bounds from `position_limits`, wealth
-        # band scaled to `utility_scale` × multiplier. The NN learns a smooth function
+        # Endogenous span: q per-hedge from `position_limits`, wealth band scaled
+        # to the symlog c (15·c covers ±2.78 in symlog units — the meaningful
+        # dynamic range). Sampled uniform per row; the NN learns a smooth function
         # across the full (z_T, q_T, wealth_T) joint at deal-realistic scales.
         rows_per_outer = self.b_endo
-        q_span = torch.empty(b_outer, rows_per_outer, n_h, dtype=torch.long, device=device)
+        q_span = torch.empty(b_outer, rows_per_outer, n_h,
+                              dtype=torch.long, device=device)
         for j in range(n_h):
             q_span[..., j] = torch.randint(
                 int(self.bank_q_min[j]), int(self.bank_q_max[j]) + 1,
@@ -1986,14 +2108,15 @@ class DifferentialSolver:
         n_h = len(self.hedges)
 
         rows = int(rows_per_outer if rows_per_outer is not None else self.b_endo)
+        # q per-hedge from position_limits, wealth band scaled to symlog c.
         q_prev = torch.empty(B, rows, n_h, dtype=torch.long, device=device)
         for j in range(n_h):
             q_prev[..., j] = torch.randint(
                 int(self.bank_q_min[j]), int(self.bank_q_max[j]) + 1,
                 (B, rows), device=device)
         q_prev = q_prev.to(self.dtype)
-        wealth_pre = (torch.rand(B, rows, device=device) - 0.5) * \
-            (2.0 * self.bank_wealth_halfwidth)
+        wealth_pre = (torch.rand(B, rows, device=device) - 0.5) \
+            * (2.0 * self.bank_wealth_halfwidth)
         live_t = self.is_live[t]
         if (~live_t).any():
             mask_dead = (~live_t).view(1, 1, n_h)
@@ -2103,7 +2226,13 @@ class DifferentialSolver:
         n_h = len(self.hedges)
         device = self.device
         live_t = self.is_live[t]
-        q_t_sampled = torch.randint(-5, 6, (N, n_h), device=device).to(self.dtype)
+        # q_t sampled per-hedge from position_limits, then dead axes forced to 0.
+        q_t_sampled = torch.empty(N, n_h, dtype=torch.long, device=device)
+        for j in range(n_h):
+            q_t_sampled[..., j] = torch.randint(
+                int(self.bank_q_min[j]), int(self.bank_q_max[j]) + 1,
+                (N,), device=device)
+        q_t_sampled = q_t_sampled.to(self.dtype)
         if (~live_t).any():
             q_t_sampled[:, ~live_t] = 0.0
         cost_t = self._turnover(q_t_sampled, bank["q_prev"], bank["F_at_t"])
@@ -2133,17 +2262,23 @@ class DifferentialSolver:
             # Market at t+1 indexed by outer_index → (N, market_dim).
             market_t1_per_row = market_t1[bank["outer_index"]]
 
-            # Wealth evolution at constant q_t: (gate2-invariant MTM)
-            # w_{t+1}_pre = w_post_t + (Σq_t − 1) · dS. For multi-tradable, the
-            # generalization uses dF per hedge minus the implicit liability move dS.
-            # Forward-=-spot toy: dF_h = dS for live h, so:
-            #   Σ_h q_h · dF_h − dS = (Σ_h q_h − 1) · dS
-            # which collapses cleanly. Compute via the explicit per-hedge sum so the
-            # multi-asset generalization is direct.
-            spot_h_idx = 0   # first live hedge tracks spot for the toy
+            # Wealth evolution: hedge PnL minus liability MTM change.
+            # Linear average-rate liability has the closed form `dL = R_t · dS`
+            # where R_t is the remaining-fixing-weights sum (deal units) and
+            # dS is the spot move. Critically, `dS` is on the AAD tape (built
+            # from `F_t1` which the inner-MC fork attached as a leaf), so the
+            # gradient label on the spot column carries BOTH hedge (`+q·cs·sym′`)
+            # AND liability (`−R_t·sym′`) sensitivity — true `∂C/∂S ≈
+            # (Σq·cs − R_t)·sym′`. A detached `liability_mtm[t+1]−liability_mtm[t]`
+            # lookup would break the gradient label and resurrect the diff-loss
+            # instability (the same class that originally forced w_diff=0).
+            spot_h_idx = 0   # first hedge as spot proxy (near-month future)
             dS = F_t1[:, spot_h_idx] - bank["F_at_t"][:, spot_h_idx]
-            pnl_hedges = ((q_t_sampled * (F_t1 - bank["F_at_t"])).sum(dim=-1))
-            wealth_pre_t1 = wealth_post_t + pnl_hedges - dS           # (N,)
+            R_t_scalar = float(self._liability_R[t].item())
+            pnl_hedges = ((q_t_sampled * self.contract_size
+                           * (F_t1 - bank["F_at_t"])).sum(dim=-1))
+            dL = R_t_scalar * dS                                     # (N,) AAD-live
+            wealth_pre_t1 = wealth_post_t + pnl_hedges - dL          # (N,)
 
             time_to_T_t1 = bank["time_to_T"] - 1.0                    # (N,)
             # Decision at t+1 — external argmax over frozen C_next. q* detached.
@@ -2185,7 +2320,7 @@ class DifferentialSolver:
         # Compute via a separate small autograd pass on a leaf-wealth construction.
         with torch.enable_grad():
             w_leaf = wealth_post_t.detach().clone().requires_grad_(True)
-            wealth_pre_t1_l = w_leaf + pnl_hedges.detach() - dS.detach()
+            wealth_pre_t1_l = w_leaf + pnl_hedges.detach() - dL.detach()  # noqa
             wealth_post_t1_l = wealth_pre_t1_l - cost_t1.detach()
             z_t1_l = self._assemble_z(
                 market=market_t1_per_row.detach(), q=q_star_t1,
@@ -2210,14 +2345,22 @@ class DifferentialSolver:
                         dy_dz[:, F_col_start + j] += g_per_row
 
         # Advantage decomposition: subtract B_t(z_t) from the value label so the
-        # NN fits the residual A_t = C_t − B_t. The gradient label is LEFT
-        # UNCHANGED — it remains ∂Y_boot/∂z (= ∂C_t/∂z under the bootstrap
-        # approximation), not ∂A_t/∂z. Pragmatically this gives the NN a gradient
-        # target close to A_t's true gradient when B's gradient is small (the
-        # baseline is bounded in symlog units, so ∂B/∂z = O(1/c)). Subtracting
-        # ∂B/∂z exactly turned out to drive the standardized diff-loss target to
-        # ~10× the value target and destabilize twin-loss training; the small
-        # asymptotic bias from leaving it in is preferred over the instability.
+        # NN fits the residual A_t = C_t − B_t, and convert the gradient label to
+        # the residual's slope on the columns where a slope was actually computed:
+        #     ∂A_t/∂z = ∂Y_boot/∂z − ∂B_t/∂z        (∂B_t/∂z exact, closed form)
+        # `dy_dz` carries a genuine pathwise ∂C_t/∂z on exactly two column groups
+        # — wealth (closed-form chain above) and the live tradable_prices columns
+        # (spot-leaf projection). Every other column is an UNCOMPUTED zero, not a
+        # measured slope. The earlier attempt subtracted ∂B/∂z across ALL columns,
+        # which wrote `0 − ∂B/∂q` onto the positions block: a large slope target
+        # of the WRONG SIGN (B carries the dominant first-order q-dependence by
+        # design — that is its job), and standardization against the small
+        # residual y_std inflated it ~10× → the twin-loss instability that forced
+        # `w_diff = 0`. The w_diff=0 fallback in turn silently degraded the method
+        # to value-only regression, whose max-of-noisy over-optimism grows with
+        # backward depth — the measured horizon-scaling V_0 gap. Fix: subtract
+        # ∂B/∂z where ∂C/∂z exists and MASK the unlabeled columns out of the diff
+        # loss entirely (no target, no constraint) via `diff_col_mask`.
         # λ-mix (when active): blend Y_boot with a no-grad rollout Y_rollout to
         # break max-of-noisy compounding on the value labels. Rollout starts at
         # the bank's post-decision state (q_t_sampled applied, wealth_post_t)
@@ -2235,14 +2378,26 @@ class DifferentialSolver:
                 Y_value = ((1.0 - self._lambda_mix) * Y_value
                             + self._lambda_mix * Y_rollout)
             y_target = Y_value - B_at_z_t
+            diff_col_mask = torch.zeros(
+                z_t.shape[-1], device=z_t.device, dtype=self.dtype)
+            diff_col_mask[wealth_col] = 1.0
+            for j in range(n_h):
+                if live_t[j]:
+                    diff_col_mask[F_col_start + j] = 1.0
+            dy_dz = (dy_dz - self._dB_dz(z_t)) * diff_col_mask
         else:
             y_target = Y_boot.detach()
-        return z_t.detach(), y_target, dy_dz.detach(), action_gap.detach()
+            diff_col_mask = None
+        return (z_t.detach(), y_target, dy_dz.detach(), action_gap.detach(),
+                diff_col_mask)
 
-    def _fit_twin_sgd(self, net, z, y, dy_dz, action_gap, steps, log_label=""):
+    def _fit_twin_sgd(self, net, z, y, dy_dz, action_gap, steps, log_label="",
+                      col_mask=None):
         """One SGD pass over the supplied (z, y, dy_dz, action_gap) bank. Used by
         both the initial round and any correction-round refit. The action-gap mask
-        threshold is recomputed per call against the current bank's median gap."""
+        threshold is recomputed per call against the current bank's median gap.
+        `col_mask`: optional (D,) column mask restricting the differential loss to
+        the labeled columns (advantage-decomp path; see `_compute_labels_for_bank`)."""
         device = self.device
         opt = torch.optim.Adam(net.parameters(), lr=self.adam_lr)
         gap_threshold = max(float(action_gap.median()), 1.0e-6) * 0.5
@@ -2250,21 +2405,21 @@ class DifferentialSolver:
         batch = min(self.train_minibatch, n_rows)
         steps = max(1, int(steps))
         last_diag = {"val_loss": float("nan"), "diff_loss": float("nan")}
-        # Under advantage decomposition the gradient label `dy_dz` is for the FULL
-        # `C_t` (= ∂Y_boot/∂z), not the residual `A_t = C_t − B_t` that the NN
-        # actually fits. Subtracting `∂B/∂z` to make targets consistent destabilized
-        # twin loss training (large standardized targets at positions cols when the
-        # action grid expands to 121). Cheaper: drop `w_diff` to 0 under advantage
-        # decomp — let the NN focus on the value-only fit. The differential premise
-        # of diff-ML is then traded for stability; the gradient information re-enters
-        # through the value labels themselves (which are derived from the AAD chain).
-        w_diff = 0.0 if self._advantage_decomp else 1.0
+        # Differentials are ON in both modes. Under advantage decomposition the
+        # gradient label is the residual's own slope ∂A_t/∂z = ∂Y_boot/∂z − ∂B_t/∂z
+        # on the labeled columns (col_mask), with ∂B_t/∂z exact closed-form — the
+        # targets are now consistent with the function the NN fits, which removes
+        # the instability that previously forced w_diff = 0. The w_diff = 0
+        # fallback is retired: it silently degraded the method to value-only
+        # regression, the exact setting where max-of-noisy over-optimism compounds
+        # with backward depth (the measured horizon-scaling V_0 gap).
+        w_diff = 1.0
         for step in range(steps):
             idx = torch.randint(0, n_rows, (batch,), device=device)
             loss, last_diag = twin_loss(
                 net, z[idx], y[idx], dy_dz[idx],
                 action_gap=action_gap[idx], gap_threshold=gap_threshold,
-                w_val=1.0, w_diff=w_diff)
+                w_val=1.0, w_diff=w_diff, col_mask=col_mask)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -2311,8 +2466,8 @@ class DifferentialSolver:
             # 1. Build bank from accumulated outer indices.
             bank = self._build_bank(t, traj, outer_indices=accumulated_outer_idx)
             # 2. Compute labels.
-            z_t, y_target, dy_dz, action_gap = self._compute_labels_for_bank(
-                t, bank, C_next, traj=traj)
+            z_t, y_target, dy_dz, action_gap, diff_col_mask = \
+                self._compute_labels_for_bank(t, bank, C_next, traj=traj)
             # On round 0 (first fit), refresh the net's standardization stats.
             if round_num == 0:
                 net.set_normalization(
@@ -2323,7 +2478,8 @@ class DifferentialSolver:
             final_diag = self._fit_twin_sgd(
                 net, z_t, y_target, dy_dz, action_gap,
                 steps=self.train_steps_per_solve,
-                log_label=f"C_t={t}_r={round_num}")
+                log_label=f"C_t={t}_r={round_num}",
+                col_mask=diff_col_mask)
             self.C[t] = net      # so the audit can call `self.C[t]` via decision op
             logging.info(
                 "DifferentialSolver C_t=%d round=%d fit: live_axes=%d bank=%d "
@@ -2414,9 +2570,12 @@ class DifferentialSolver:
 
     # --------------------------------- M2: audit rollout + correction loop
     def _rollout_no_grad_to_T(self, t_start, outer_indices, q_post_t, wealth_post_t,
-                              traj):
+                              traj, *, return_raw_wealth=False):
         """Frozen-policy no-grad rollout from post-decision state at `t_start` to
-        terminal `T_dec`. Returns `Y_eval` = realized terminal utility per audit row.
+        terminal `T_dec`. By default returns `Y_eval = symlog(W_T)` per row (the
+        audit's utility-units residual). Pass `return_raw_wealth=True` to get the
+        raw realised terminal wealth in dollars — used by `_compute_dollar_floor`
+        (spec §6 step 2: lower bound L = realised $/oz).
 
         At each future step u ∈ [t_start, t_outer−2]:
           • read realized (market_{u+1}, F_{u+1}) from `traj[u+1]` at the audit row's
@@ -2442,14 +2601,18 @@ class DifferentialSolver:
                 # Read the realized (market_{u+1}, F_{u+1}) for the audit rows.
                 market_u1 = traj[u + 1]["market"][outer_indices]    # (N, market_dim)
                 F_u1 = traj[u + 1]["tradables"][outer_indices]      # (N, n_h)
-                # Wealth MTM: w_pre_{u+1} = w_post_u + Σ_h q_h·(F_{u+1,h}−F_u,h) − (S_{u+1}−S_u)
-                # where S = first tradable (forward=spot toy). Generalizes per-hedge
-                # for multi-asset.
+                # Wealth MTM: hedge PnL minus liability MTM change. Linear
+                # average-rate closed form `dL = R_u · dS` where dS = spot move
+                # (here approximated by the first hedge's dF; near-month future
+                # tracks spot tightly).
                 F_u = traj[u]["tradables"][outer_indices]
                 dF = F_u1 - F_u                                     # (N, n_h)
-                dS = dF[:, 0]                                       # (N,) — spot move
-                pnl_hedges = (q_carry * dF).sum(dim=-1)             # (N,)
-                wealth_pre_u1 = wealth + pnl_hedges - dS            # (N,)
+                dS = dF[:, 0]
+                pnl_hedges = (q_carry * self.contract_size
+                              * dF).sum(dim=-1)                     # (N,)
+                R_u_scalar = float(self._liability_R[u].item())
+                dL = R_u_scalar * dS                                # (N,)
+                wealth_pre_u1 = wealth + pnl_hedges - dL            # (N,)
                 # Decision at u+1 with frozen C[u+1] (or terminal U if u+1 = T-1).
                 if u + 1 >= self.t_outer - 1 or self.C[u + 1] is None:
                     # No further continuation function — apply terminal utility.
@@ -2466,11 +2629,78 @@ class DifferentialSolver:
                 cost_u1 = self._turnover(q_star_u1, q_carry, F_u1)
                 wealth = wealth_pre_u1 - cost_u1
                 q_carry = q_star_u1
+            if return_raw_wealth:
+                return wealth                                       # (N,) raw $
             # Terminal utility under symlog at the framework's c (typically 100 for the
             # gate2 toy after the M4 reconciliation).
             c_util = self.utility_c
             Y_eval = torch.sign(wealth) * torch.log1p(wealth.abs() / c_util)
         return Y_eval
+
+    def _compute_dollar_floor(self, traj):
+        """Spec §6 step 2: lower bound `L` = realised mean cost in $/oz of the
+        policy on a fresh MC set.
+
+        Rollout starts at `t_min` with `q_prev = 0`, `wealth_pre = 0`, and applies
+        the policy's argmax at t=t_min, then runs `_rollout_no_grad_to_T` with
+        `return_raw_wealth=True` to get realised terminal wealth in dollars per
+        path. The deal denominator is `bundle['total_leg_volume']` (already used
+        by `vol_scaled_notional` to size the symlog c, so the same source here is
+        consistent).
+
+        Returns mean / p95 / count + the $/oz floor for the ship-criterion
+        readout (`gap = U − L`, ship when floor clears the dealer margin)."""
+        device = self.device
+        n_h = len(self.hedges)
+        B = self._B()
+        outer_idx = torch.arange(B, device=device)
+        t0 = self.t_min
+        market_0 = traj[t0]["market"]
+        F_0 = traj[t0]["tradables"]
+        static_0 = self._static_sim[t0].to(device).expand(B, self._static_sim.shape[-1])
+        time_to_T_0 = torch.full((B,), float(self.t_outer - 1 - t0), device=device,
+                                  dtype=self.dtype)
+        q_prev = torch.zeros(B, n_h, device=device, dtype=self.dtype)
+        wealth_pre = torch.zeros(B, device=device, dtype=self.dtype)
+        with torch.no_grad():
+            q_star_0, _, _ = self._decision_at(
+                self.C[t0], market_0, F_0, q_prev, wealth_pre,
+                time_to_T_0, static_0, t0)
+            cost_0 = self._turnover(q_star_0, q_prev, F_0)
+            wealth_post_0 = wealth_pre - cost_0
+        terminal_wealth = self._rollout_no_grad_to_T(
+            t_start=t0, outer_indices=outer_idx,
+            q_post_t=q_star_0, wealth_post_t=wealth_post_0,
+            traj=traj, return_raw_wealth=True)             # (B,) raw $
+        volume_oz = float(self.bundle.get("total_leg_volume", 0.0))
+        if volume_oz <= 0.0:
+            logging.warning(
+                "DifferentialSolver dollar floor: bundle['total_leg_volume']=%.3g, "
+                "cannot compute $/oz. Reporting raw $ only.", volume_oz)
+            volume_oz = 1.0
+        mean_wealth = float(terminal_wealth.mean().item())
+        p5_wealth = float(terminal_wealth.quantile(0.05).item())
+        p95_wealth = float(terminal_wealth.quantile(0.95).item())
+        # `L` = realised cost in $/oz where COST = `−wealth/volume` (positive cost =
+        # we lost money, ship if cost ≤ margin). Negative cost = we made money.
+        L_cost_per_oz = -mean_wealth / volume_oz
+        L_p95_cost = -p5_wealth / volume_oz       # 95th-percentile worst case (cost ↑)
+        logging.info(
+            "DifferentialSolver L (realised $/oz): mean=%+.4f, "
+            "p5_wealth=%+.4g, p95_wealth=%+.4g, volume=%.1f oz, "
+            "L_cost=%.4f $/oz (positive=cost), L_p95_cost=%.4f $/oz",
+            mean_wealth / volume_oz,
+            p5_wealth, p95_wealth, volume_oz,
+            L_cost_per_oz, L_p95_cost)
+        return {
+            "L_mean_wealth_usd": mean_wealth,
+            "L_p5_wealth_usd": p5_wealth,
+            "L_p95_wealth_usd": p95_wealth,
+            "L_volume_oz": volume_oz,
+            "L_mean_per_oz_usd": mean_wealth / volume_oz,
+            "L_cost_per_oz_usd": L_cost_per_oz,
+            "L_p95_cost_per_oz_usd": L_p95_cost,
+        }
 
     def _audit_at(self, t, net, traj, audit_outer_indices, round_num):
         """Spec §7 audit at time t. For each audit row:
@@ -2496,7 +2726,7 @@ class DifferentialSolver:
         n_h = len(self.hedges)
         device = self.device
         # Audit-row endogenous sampling — same designer box as training, fresh draws.
-        # Per-hedge q range from position_limits, wealth band scaled with utility_c.
+        # q per-hedge from position_limits, wealth band scaled to symlog c.
         q_prev = torch.empty(N_audit, n_h, dtype=torch.long, device=device)
         for j in range(n_h):
             q_prev[..., j] = torch.randint(
@@ -3118,9 +3348,10 @@ class DifferentialSolver:
         dy_dz_aad = torch.autograd.grad(y_pred.sum(), z_leaf)[0]
         aad_wealth = dy_dz_aad[:, wealth_col]
 
-        # FD with eps = 0.5 (in dollars — wealth band is ~±1500 so a 0.5 perturbation
-        # is well inside the fit hull).
-        eps = 0.5
+        # FD eps scaled to the sampled wealth band (was hardcoded 0.5 against the
+        # toy's ±1500): 1/3000 of the band reproduces 0.5 on the toy exactly and
+        # stays well inside the fit hull at deal scales.
+        eps = self.bank_wealth_halfwidth / 3000.0
         with torch.no_grad():
             z_plus = z.clone(); z_plus[:, wealth_col] += eps
             z_minus = z.clone(); z_minus[:, wealth_col] -= eps
@@ -3278,19 +3509,19 @@ class DifferentialSolver:
             if self.C[t_s] is not None:
                 grad_sanity[t_s] = self._grad_sanity_check(t_s)
 
-        # Oracle comparison vs gate2's full-information DP — toy regression only.
-        # In production no such oracle exists; the BSS information-relaxation
-        # sandwich (gap = U − L) replaces this readout.
-        import os
-        _has_gate2 = os.path.exists('artifacts/gate2_exact_dp.npz')
-        if _has_gate2:
-            mid_t = (self.t_outer - 2 + self.t_min) // 2
-            oracle_diag = self._smoke_against_gate2(mid_t, 'artifacts/gate2_exact_dp.npz')
-            oracle_policy_diag = self._grade_against_oracle_policy(
-                'artifacts/gate2_exact_dp.npz', traj)
-        else:
-            oracle_diag = {}
-            oracle_policy_diag = {}
+        # Oracle comparison at the mid t (still single-contract for T_dec=10 / T_A=5
+        # if mid > T_A; gives the c=1000 vs c=100 scale-mismatch baseline that M4 will
+        # reconcile, plus a "shape matches" diagnostic in the meantime).
+        mid_t = (self.t_outer - 2 + self.t_min) // 2
+        oracle_diag = self._smoke_against_gate2(mid_t, 'artifacts/gate2_exact_dp.npz')
+
+        # M2 final grade: regime-conditional `n*_0` against gate2's initial_policy.
+        # Per the user's mandate: V_0 climbing is necessary but not sufficient — the
+        # policy must become regime-conditional and match the DP's actions. This is
+        # the smoke check that exercises whether the audit-correct loop actually
+        # un-biased the policy (vs just shifting V_0 toward the right number).
+        oracle_policy_diag = self._grade_against_oracle_policy(
+            'artifacts/gate2_exact_dp.npz', traj)
 
         # V_0 estimate via the decision operator at t_min: q*_t_min = argmax_q
         # C[t_min](post_state_t_min(q)). For the M1.5 toy (t_min = T_A - 1) this is
@@ -3336,12 +3567,13 @@ class DifferentialSolver:
             "v0_decision_at_t_min": v0_decision,
             "q_opt_t_min_mean": q_opt_mean,
         }
-        # Toy diagnostics — depth profile, action-error-vs-depth, oracle-policy
-        # comparisons against gate2's full-information DP. Only runs when the
-        # gate2 oracle npz is present (i.e. the toy validation harness). In
-        # production this skips silently — the validation readout there is the
-        # BSS information-relaxation sandwich (gap = U − L) + dollar floor per
-        # validation_sandwich_spec.md §3, §5, §8.
+        # Production validation: BSS sandwich lower bound L (realised $/oz of the
+        # policy on a fresh MC set). Runs unconditionally; computes mean, p5/p95,
+        # and the cost-per-oz that the dealer-margin ship criterion reads.
+        sweep_summary.update(self._compute_dollar_floor(traj))
+        # Toy diagnostics — depth/action-error/oracle-policy vs gate2's
+        # full-information DP. Only runs in toy regression mode (when the gate2
+        # oracle npz is present); skipped silently in production.
         import os
         if os.path.exists('artifacts/gate2_exact_dp.npz'):
             sweep_summary.update(oracle_diag)
