@@ -1105,6 +1105,12 @@ class Credit_Monte_Carlo(Calculation):
         # record how long it took to run the calc (python + pytorch)
         execution_label = 'Tensor_Execution_Time ({})'.format(self.device.type)
         self.calc_stats[execution_label] = time.monotonic()
+        # record the base currency
+        base_ccy = get_fxrate_factor(
+            utils.check_rate_name(self.config.params['System Parameters']['Base_Currency']),
+            self.static_factors, self.stoch_factors)
+        # record the report_grid index
+        time_index = self.time_grid.report_index
 
         for run in range(self.params['Simulation_Batches']):
 
@@ -1126,6 +1132,9 @@ class Credit_Monte_Carlo(Calculation):
 
             # is this the final run?
             final_run = run == self.params['Simulation_Batches'] - 1
+            # the mtm is in reporting currency - need to convert back to base currency
+            fx_report = utils.calc_fx_cross(
+                shared_mem.Report_Currency, base_ccy, self.time_grid.time_grid[time_index], shared_mem)
 
             # now calculate all the valuation adjustments (if necessary)
             if params.get('Collateral_Valuation_Adjustment', {}).get(
@@ -1167,24 +1176,17 @@ class Credit_Monte_Carlo(Calculation):
                         torch.max(torch.abs(liquidity_charge[tenor1]), torch.abs(liquidity_charge[tenor2])),
                         torch.abs(liquidity_charge[tenor1])+torch.abs(liquidity_charge[tenor2]))
 
-                # time_grid = self.netting_sets.sub_structures[0].obj.Time_dep.deal_time_grid
-                time_grid = self.time_grid.report_index
                 liq_w = pd.read_csv(params['Initial_Margin']['Liquidity_Weights'], index_col=0)
                 irs = pd.read_csv(params['Initial_Margin']['IRS_Weights'], index_col=0)
                 local_curves = [k for k, v in self.all_factors.items() if len(
                     k.name) == 1 and k.type == 'InterestRate' and (
                                     v.factor.param if hasattr(v, 'factor') else v.param).get(
                     'Currency') == params['Initial_Margin']['Local_Currency']]
-                base_ccy = get_fxrate_factor(
-                    utils.check_rate_name(self.config.params['System Parameters']['Base_Currency']),
-                    self.static_factors, self.stoch_factors)
-                fx_report = utils.calc_fx_cross(
-                    shared_mem.Report_Currency, base_ccy, self.time_grid.time_grid[time_grid], shared_mem)
                 IM_currency = get_fxrate_factor(
                     utils.check_rate_name(params['Initial_Margin']['IM_Currency']),
                     self.static_factors, self.stoch_factors)
                 fx_IM_report = utils.calc_fx_cross(
-                    base_ccy, IM_currency, self.time_grid.time_grid[time_grid], shared_mem)
+                    base_ccy, IM_currency, self.time_grid.time_grid[time_index], shared_mem)
                 if local_curves[0] in shared_mem.t_Scenario_Buffer:
                     scen_buf = shared_mem.t_Scenario_Buffer
                 else:
@@ -1248,8 +1250,7 @@ class Credit_Monte_Carlo(Calculation):
                 tensors['LCH_Margin'] = params['Initial_Margin']['Delta_Factor']*IM_delta_charge+IM_liquidity_charge
 
             if params.get('Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes':
-                time_grid = self.time_grid.report_index
-                mtm_grid = self.time_grid.mtm_time_grid[time_grid]
+                mtm_grid = self.time_grid.mtm_time_grid[time_index]
 
                 funding_cost = get_interest_factor(
                     utils.check_rate_name(params['Funding_Valuation_Adjustment']['Funding_Cost_Interest_Curve']),
@@ -1265,8 +1266,10 @@ class Credit_Monte_Carlo(Calculation):
                 DF_rf = torch.squeeze(torch.exp(-deflation.gather_weighted_curve(
                     shared_mem, mtm_grid.reshape(1, -1))), dim=0)
 
-                Vk_plus_ti = torch.relu(tensors['mtm'] * DF_rf)
-                Vk_minus_ti = torch.relu(-tensors['mtm'] * DF_rf)
+                # tensors['mtm'] is in reporting currency - we need to convert back to base
+                pv_exposure = (tensors['mtm'] * fx_report * DF_rf) / fx_report[0]
+                Vk_plus_ti = torch.relu(pv_exposure)
+                Vk_minus_ti = torch.relu(-pv_exposure)
                 Vk_star_ti_p = (Vk_plus_ti[1:] + Vk_plus_ti[:-1]) / 2
                 Vk_star_ti_m = (Vk_minus_ti[1:] + Vk_minus_ti[:-1]) / 2
 
@@ -1275,11 +1278,11 @@ class Credit_Monte_Carlo(Calculation):
                     delta_scen_t = np.diff(mtm_grid).reshape(-1, 1)
 
                     discount_fund_cost = utils.calc_time_grid_curve_rate(
-                        funding_cost, self.time_grid.time_grid[time_grid[:-1]], shared_mem)
+                        funding_cost, self.time_grid.time_grid[time_index[:-1]], shared_mem)
                     discount_fund_benefit = utils.calc_time_grid_curve_rate(
-                        funding_benefit, self.time_grid.time_grid[time_grid[:-1]], shared_mem)
+                        funding_benefit, self.time_grid.time_grid[time_index[:-1]], shared_mem)
                     discount_rf = utils.calc_time_grid_curve_rate(
-                        riskfree, self.time_grid.time_grid[time_grid[:-1]], shared_mem)
+                        riskfree, self.time_grid.time_grid[time_index[:-1]], shared_mem)
 
                     delta_fund_cost_rf = torch.squeeze(
                         torch.exp(discount_fund_cost.gather_weighted_curve(shared_mem, delta_scen_t)) -
@@ -1331,14 +1334,13 @@ class Credit_Monte_Carlo(Calculation):
                 recovery = get_recovery_rate(
                     utils.check_rate_name(params['Credit_Valuation_Adjustment']['Counterparty']), self.all_factors)
 
-                time_grid = self.time_grid.report_index
                 # Calculates unilateral CVA with or without stochastic deflation.
-                mtm_grid = self.time_grid.mtm_time_grid[time_grid]
+                mtm_grid = self.time_grid.mtm_time_grid[time_index]
                 delta_scen_t = np.hstack((0.0, np.diff(mtm_grid)))
 
                 if params['Credit_Valuation_Adjustment']['Deflate_Stochastically'] == 'Yes':
                     zero = utils.calc_time_grid_curve_rate(
-                        discount, self.time_grid.time_grid[time_grid], shared_mem)
+                        discount, self.time_grid.time_grid[time_index], shared_mem)
                     Dt_T = torch.exp(-torch.squeeze(zero.gather_weighted_curve(
                         shared_mem, delta_scen_t.reshape(-1, 1))).cumsum(dim=0))
                 else:
@@ -1346,11 +1348,12 @@ class Credit_Monte_Carlo(Calculation):
                     Dt_T = torch.squeeze(torch.exp(
                         -zero.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1))), dim=0)
 
-                pv_exposure = torch.relu(tensors['mtm'] * Dt_T)
+                # tensors['mtm'] is in reporting currency - we need to convert back to base
+                pv_exposure = (tensors['mtm'] * fx_report * Dt_T) / fx_report[0]
 
                 if params['Credit_Valuation_Adjustment']['Stochastic_Hazard_Rates'] == 'Yes':
                     surv = utils.calc_time_grid_curve_rate(
-                        survival, self.time_grid.time_grid[time_grid], shared_mem)
+                        survival, self.time_grid.time_grid[time_index], shared_mem)
                     St_T = torch.exp(-torch.cumsum(torch.squeeze(surv.gather_weighted_curve(
                         shared_mem, delta_scen_t.reshape(-1, 1), multiply_by_time=False), dim=1),
                         dim=0))
@@ -1731,7 +1734,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             simulation_sub_batch=int(self.params.get('Inner_Sub_Batch', 0)),
             keep_tensor=self.params.get('Keep_Tensor', 'No') == 'Yes')
 
-    def update_factors(self, params, base_date, job_id, num_jobs):
+    def update_factors(self, params, base_date, job_id, num_jobs, end_date):
         """Override: build dependent_factors from the generic Scenario_Factors JSON dict."""
         dependent_factors, stochastic_factors, _, reset_dates, settlement_currencies = self.config.calculate_dependencies(
             params, base_date, self.input_time_grid)
@@ -1741,7 +1744,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # past liability end are dropped from the simulation horizon; the hedges
         # themselves will be priced through liability end and any residual position
         # closes out at fair value there.
-        max_expiry = min(max(reset_dates), self.liability_end_date)
+        max_expiry = min(max(reset_dates), end_date)
         reset_dates = self.config.parse_grid(base_date, max_expiry, self.input_time_grid, past_max_date=True)
         reset_dates.update({base_date, max_expiry})
         # generate scerarios at each grid date
@@ -1818,8 +1821,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         for liab in liabilities:
             liab['Instrument'].reset(self.config.holidays)
             liability_dates |= liab['Instrument'].get_reval_dates(clip_expiry=True)
-        self.liability_end_date = max(liability_dates)
-        shared_mem = self.update_factors(params, base_date, job_id, num_jobs)
+        shared_mem = self.update_factors(params, base_date, job_id, num_jobs, end_date=max(liability_dates))
         # Build the valuation structure first; the hedging runtime will consume
         # the live factor and instrument tensors produced by this same loop.
         self.netting_sets = DealStructure(Aggregation('root'), store_results=True)
@@ -1851,11 +1853,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # a configured t (the differential-ML Gate 0 — see _gate0_fork_smoke). Needs the
         # same inner process copies and outer snapshot as solve_hedge.
         solve_hedge_mode = str(execution_mode).lower() == 'solve_hedge'
-        gate0_mode = str(execution_mode).lower() == 'gate0_fork_smoke'
-        gate1_mode = str(execution_mode).lower() == 'gate1_belief_check'
-        if conditional_features_blocks is not None or gate0_mode or gate1_mode:
+        if conditional_features_blocks is not None:
             self.stoch_factors_inner = {k: proc.copy() for k, proc in self.stoch_factors.items()}
-        outer_state_blocks = defaultdict(list) if (solve_hedge_mode or gate0_mode or gate1_mode) else None
+        outer_state_blocks = defaultdict(list) if solve_hedge_mode else None
 
         factor_tensor_blocks = {
             self._factor_bundle_key(key): [] for key in self.stoch_factors
@@ -1995,52 +1995,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 key: torch.cat(blocks, dim=-1) for key, blocks in outer_state_blocks.items()
             }
 
-        if gate0_mode:
-            # Differential-ML Gate 0: one-step differentiable fork smoke. No bundle, no
-            # solver, no runtime — the simulator's per-path init grad-pathway is the only
-            # thing under test. Return early with the diagnostic in evaluation_summary.
-            gate0_result = self._gate0_fork_smoke(params, shared_mem, base_date)
-            return HedgeRuntimeExecutionResult(
-                torchrl_bundle=None,
-                runtime=None,
-                evaluation_summary={'gate0': gate0_result},
-                optimizer_diagnostics=None,
-                policy_artifact=None,
-                metadata={
-                    'execution_mode': execution_mode,
-                    'torchrl_bundle_present': False,
-                    'num_batches': params['Simulation_Batches'],
-                    'num_paths': self.numscenarios,
-                    'optimizer_diagnostics_present': False,
-                    'runtime_present': False,
-                    'runtime_diagnostics': {},
-                },
-            )
-
-        if gate1_mode:
-            # Differential-ML Gate 1: forward HMM belief filter — (a) calibration check
-            # (bucket by predicted belief, empirical regime frequency matches) AND (b)
-            # discriminative-belief check (V_r per pure regime at an interior t — if the
-            # spread of V_r is meaningful, belief is informative for hedging value).
-            gate1_result = self._gate1_belief_check(
-                params, shared_mem, base_date, privileged_factor_blocks)
-            return HedgeRuntimeExecutionResult(
-                torchrl_bundle=None,
-                runtime=None,
-                evaluation_summary={'gate1': gate1_result},
-                optimizer_diagnostics=None,
-                policy_artifact=None,
-                metadata={
-                    'execution_mode': execution_mode,
-                    'torchrl_bundle_present': False,
-                    'num_batches': params['Simulation_Batches'],
-                    'num_paths': self.numscenarios,
-                    'optimizer_diagnostics_present': False,
-                    'runtime_present': False,
-                    'runtime_diagnostics': {},
-                },
-            )
-
         torchrl_bundle = None if normalized_runtime is None else build_torchrl_bundle(
             base_date,
             bus_day,
@@ -2065,6 +2019,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 for ref in tradable_refs
                 for stat in ('expected_terminal_move_given_loss', 'expected_min_move_given_loss')
             ]
+
         if torchrl_bundle is not None and solve_hedge_mode:
             # Closure lets the solver fork inner MC on demand without a calc handle —
             # captures `self` (the inner-MC machinery), the cached outer state, shared_mem.
@@ -2094,6 +2049,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             # then this attribute lets the solver read what's already there without
             # owning the buffer.
             torchrl_bundle['_calc_handle'] = self
+
         evaluation_summary = None
         optimizer_diagnostics = None
         policy_artifact = None
