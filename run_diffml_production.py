@@ -15,10 +15,13 @@ Pattern: load JSON, modify, cx.run_job. No internal imports, no monkey-patching.
 """
 import argparse
 import json as jsonlib
+import logging
 import os
 import sys
 
 import riskflow as rf
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 
 def main():

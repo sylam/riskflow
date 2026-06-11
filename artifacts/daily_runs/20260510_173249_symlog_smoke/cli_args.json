@@ -1,0 +1,23 @@
+{
+  "lr": null,
+  "reward_scale": null,
+  "entropy_coef": null,
+  "value_coef": null,
+  "epochs": 30,
+  "ppo_epochs": null,
+  "minibatch_size": null,
+  "batch_size": null,
+  "seed": null,
+  "dense_tracking_reward_clip": null,
+  "dense_tracking_reward_scale": null,
+  "objective_object": null,
+  "utility_scale_explicit": null,
+  "floor_penalty": null,
+  "expiry_penalty": null,
+  "expiry_threshold_days": null,
+  "post_deal_trade_penalty": null,
+  "position_bounds_penalty": null,
+  "output_root": "artifacts/daily_runs",
+  "tag": "symlog_smoke",
+  "timestamp": "20260510_173249"
+}
