@@ -3110,9 +3110,8 @@ def pv_equity_cashflows(shared, time_grid, deal_data):
 @utils.log_exception
 def pv_fixed_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
-                                 deal_time, shared)
-
+    FX_rep = utils.calc_fx_cross(
+        deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
     mtm = pv_fixed_cashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
@@ -3123,7 +3122,6 @@ def pv_energy_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     FX_rep = utils.calc_fx_cross(
         deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
-
     mtm = pv_energy_cashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
@@ -3132,8 +3130,8 @@ def pv_energy_leg(shared, time_grid, deal_data):
 @utils.log_exception
 def pv_float_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'][0], shared.Report_Currency,
-                                 deal_time, shared)
+    FX_rep = utils.calc_fx_cross(
+        deal_data.Factor_dep['Currency'][0], shared.Report_Currency, deal_time, shared)
     model = deal_data.Factor_dep.get('Model', pricer_float_cashflows)
     mtm = pv_float_cashflow_list(shared, time_grid, deal_data, model) * FX_rep
 
@@ -3143,9 +3141,8 @@ def pv_float_leg(shared, time_grid, deal_data):
 @utils.log_exception
 def pv_index_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency,
-                                 deal_time, shared)
-
+    FX_rep = utils.calc_fx_cross(
+        deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
     mtm = pv_index_cashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
@@ -3154,8 +3151,8 @@ def pv_index_leg(shared, time_grid, deal_data):
 @utils.log_exception
 def pv_cds_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency,
-                                 deal_time, shared)
+    FX_rep = utils.calc_fx_cross(
+        deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
     mtm = pv_credit_cashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
@@ -3164,8 +3161,8 @@ def pv_cds_leg(shared, time_grid, deal_data):
 @utils.log_exception
 def pv_credit_step_down_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-    FX_rep = utils.calc_fx_cross(deal_data.Factor_dep['Currency'], shared.Report_Currency,
-                                 deal_time, shared)
+    FX_rep = utils.calc_fx_cross(
+        deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
     mtm = pv_credit_step_down_cashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
@@ -3176,7 +3173,6 @@ def pv_equity_leg(shared, time_grid, deal_data):
     deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
     FX_rep = utils.calc_fx_cross(
         deal_data.Factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
-
     mtm = pv_equity_cashflows(shared, time_grid, deal_data) * FX_rep
 
     return mtm
