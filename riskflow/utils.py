@@ -1106,7 +1106,7 @@ def calc_cds_rates(R, survival, discount, base_date, CDS_tenors, all_factors, bu
     def calc_par_cds(S_j, cds_tenor, delta=0.0, start_time=None, end_time=None):
         if delta:
             S_vals = S_j.copy()
-            S_vals[start_time: end_time] += delta * S_ti[start_time: end_time]
+            S_vals[start_time: end_time] += delta * (S_ti[start_time: end_time] - S_ti[start_time])
         else:
             S_vals = S_j
 
@@ -1156,17 +1156,18 @@ def calc_cds_rates(R, survival, discount, base_date, CDS_tenors, all_factors, bu
         CDS_rates[tenor] = calc_par_cds(S_vals_0, tenor)
 
     if bump:
-        T = 0
         S_j = [S_vals_0]
+        start = 0
 
         for k, v in CDS_rates.items():
+            end = v[1] + 1
             delta_j = scipy.optimize.brentq(
-                lambda x: calc_par_cds(S_j[-1], k, delta=x, start_time=T, end_time=v[1] + 1)[0] - (v[0] + bump), -0.1,
+                lambda x: calc_par_cds(S_vals_0, k, delta=x, start_time=start, end_time=end)[0] - (v[0] + bump), -0.1,
                 0.1)
 
-            S_j.append(S_j[-1].copy())
-            S_j[-1][T: v[1] + 1] += delta_j * S_ti[T: v[1] + 1]
-            T = v[1] + 1
+            S_j.append(S_vals_0.copy())
+            S_j[-1][start: end] += delta_j * (S_ti[start: end] - S_ti[start])
+            start = v[1]
 
         return {k: v[0] for k, v in CDS_rates.items()}, S_ti, S_j
     else:

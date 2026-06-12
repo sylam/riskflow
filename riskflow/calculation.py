@@ -1356,7 +1356,7 @@ class Credit_Monte_Carlo(Calculation):
                         -zero.gather_weighted_curve(shared_mem, mtm_grid.reshape(1, -1))), dim=0)
 
                 # tensors['mtm'] is in reporting currency - we need to convert back to base
-                pv_exposure = (tensors['mtm'] * fx_report * Dt_T) / fx_report[0]
+                pv_exposure = torch.relu(tensors['mtm'] * fx_report * Dt_T) / fx_report[0]
 
                 if params['Credit_Valuation_Adjustment']['Stochastic_Hazard_Rates'] == 'Yes':
                     surv = utils.calc_time_grid_curve_rate(
