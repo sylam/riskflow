@@ -378,9 +378,8 @@ def resolve_utility_scale(bundle, runtime):
     explicit = objective.get('utility_scale_explicit')
     if explicit is not None:
         # `Utility_Scale_Explicit` is an EXPLICIT override — honor it exactly,
-        # including values below the $1k production-default floor. Use case: the
-        # gate2 toy uses c=100 to match the brute-force DP oracle's symlog scale;
-        # silently clamping to $1k would make the cell-by-cell comparison fail
+        # including values below the $1k production-default floor. Silently
+        # clamping to $1k would make a cell-by-cell oracle comparison fail
         # for a reason unrelated to the method. The $1k floor only applies to
         # the formula path (`vol_scaled_notional`) where a small c would indicate
         # a degenerate calc; explicit user input gets trust.

@@ -37,6 +37,13 @@ def main():
     p.add_argument('--margin-usd-per-oz', type=float, default=6.0,
                     help='Dealer margin to clear ($/oz). Spec §0: $6-8/oz; '
                          'default $6 per validation_sandwich_spec.md §7 ship criterion.')
+    p.add_argument('--randomize-t0', dest='randomize_t0', action='store_true',
+                    default=True,
+                    help='Per-path t=0 initial state for Huge-Savine diff-ML, drawn '
+                         'from the process\'s own T-step pushforward via a per-batch '
+                         'burn-in. Without it the t=0 exogenous slice has zero '
+                         'variance and the differential label is degenerate.')
+    p.add_argument('--no-randomize-t0', dest='randomize_t0', action='store_false')
     args = p.parse_args()
 
     if not os.path.exists(args.config):
@@ -53,6 +60,11 @@ def main():
     calc['Batch_Size'] = int(args.batch_size)
     calc['Inner_Sub_Batch'] = 128
     calc['Inner_MC_Enabled'] = 'Yes'
+
+    # Huge-Savine diff-ML needs variance in the t=0 exogenous slice. Single JSON
+    # switch; the per-batch burn-in inside HedgeMonteCarlo.execute does the rest.
+    if args.randomize_t0:
+        hp['Randomize_Initial_State'] = True
 
     # Sum the deal volume from cashflows so $/oz conversion has its denominator.
     total_volume_oz = 0.0

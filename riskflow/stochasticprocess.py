@@ -2130,7 +2130,16 @@ class MarkovHMMSpotModel(StochasticProcess):
             # Outer mode: (T, B). Bit-exact preserves of legacy behavior.
             T, B = Z.shape
             u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, T + 1)[1].contiguous()
-            state = torch.searchsorted(pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
+            # Per-path regime0 override (diff-ML t=0 randomization): if the buffer
+            # carries `(self.factor_key, 'regime0_outer')`, use it as the t=0
+            # regime sample instead of the calibrated π_0 draw. Mirrors the
+            # existing inner-mode `regime0_inner` pattern.
+            regime0_override = shared_mem.t_Scenario_Buffer.get(
+                (self.factor_key, 'regime0_outer'))
+            if regime0_override is not None:
+                state = regime0_override.to(device=device, dtype=torch.long)
+            else:
+                state = torch.searchsorted(pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
             regimes = torch.empty((T, B), dtype=torch.long, device=device)
             regimes[0] = state
             for t in range(1, T):

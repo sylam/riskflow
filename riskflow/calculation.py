@@ -840,6 +840,11 @@ class Credit_Monte_Carlo(Calculation):
         self.all_tenors = utils.update_tenors(self.base_date, self.all_factors)
 
         # now initialize all stochastic factors
+        # Cache per-factor (ScenarioTimeGrid, implied_tensor) so consumers that need to
+        # re-precalculate with a per-path initial state (e.g. diff-ML t=0 burn-in in
+        # HedgeMonteCarlo.execute) can call precalculate again without re-deriving the
+        # dependent_factors / time-grid plumbing.
+        self._factor_precalc_args = {}
         for key, value in self.stoch_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 if key in self.implied_var:
@@ -850,8 +855,10 @@ class Credit_Monte_Carlo(Calculation):
                 # Hand the process its own factor key so it can publish auxiliaries to
                 # t_Scenario_Buffer under the documented (factor_key, kind) convention.
                 value.factor_key = key
+                scenario_grid = ScenarioTimeGrid(dependent_factors[key], self.time_grid, base_date)
+                self._factor_precalc_args[key] = (scenario_grid, implied_tensor)
                 value.precalculate(
-                    base_date, ScenarioTimeGrid(dependent_factors[key], self.time_grid, base_date),
+                    base_date, scenario_grid,
                     self.stoch_var[key], shared_mem, self.process_ofs[key], implied_tensor=implied_tensor)
                 if not value.params_ok:
                     logging.warning('Stochastic factor {} has been modified'.format(utils.check_scope_name(key)))
@@ -1849,9 +1856,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         # solve_hedge: inner MC runs in the backward DP/MPC sweep, not the outer loop.
         # Cache the per-batch outer scenario buffer so inner MC can fork on demand later.
-        # gate0_fork_smoke: one-step differentiable fork from the outer-realised state at
-        # a configured t (the differential-ML Gate 0 — see _gate0_fork_smoke). Needs the
-        # same inner process copies and outer snapshot as solve_hedge.
         solve_hedge_mode = str(execution_mode).lower() == 'solve_hedge'
         if conditional_features_blocks is not None:
             self.stoch_factors_inner = {k: proc.copy() for k, proc in self.stoch_factors.items()}
@@ -1883,11 +1887,46 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # Identify which factors correspond to user-declared underlyings.
         # Spot_Price_History is keyed by commodity name; the matching factor key is
         declared_underlyings = self.params['Hedging_Problem']['Portfolio_State'].get('Spot_Price_History',{}).keys()
+        # Huge-Savine diff-ML needs variance in z_0 for the differential label at the
+        # boundary to be well-posed. We obtain it via a per-batch burn-in: run each
+        # process once from the calibrated t=0, snapshot the terminal state per path,
+        # then re-precalculate with that snapshot as the new t=0. The designer
+        # distribution is the process's own T-step pushforward — no separate sampler.
+        randomize_t0 = bool(hedging_problem.get('Randomize_Initial_State', False))
 
         for run in range(params['Simulation_Batches']):
             shared_mem.reset(
                 self.num_factors, self.time_grid,
                 use_antithetic=params.get('Antithetic', 'No') == 'Yes')
+
+            if randomize_t0:
+                # Scope: declared-underlying factors only. Other processes (curves,
+                # rates) treat the precalculate `tensor` arg as a calibrated vector
+                # of curve/factor values, not a scalar spot — passing them a (B,)
+                # tensor is process-specific and outside the diff-ML t=0 use case.
+                initial_t0 = {}
+                regime0_t0 = {}
+                for key, proc in self.stoch_factors.items():
+                    if utils.check_tuple_name(key) not in declared_underlyings:
+                        continue
+                    simulated = proc.generate(shared_mem)
+                    initial_t0[key] = simulated[-1].detach()
+                    regimes_aux = shared_mem.t_Scenario_Buffer.get((key, 'regimes'))
+                    if regimes_aux is not None:
+                        regime0_t0[key] = regimes_aux[-1].detach()
+                # Independent innovation stream for the main run (regenerates
+                # t_random_numbers via torch.randn; quasi-rng auto-advances).
+                shared_mem.reset(
+                    self.num_factors, self.time_grid,
+                    use_antithetic=params.get('Antithetic', 'No') == 'Yes')
+                for key, init_state in initial_t0.items():
+                    scenario_grid, implied_tensor = self._factor_precalc_args[key]
+                    self.stoch_factors[key].precalculate(
+                        self.base_date, scenario_grid, init_state,
+                        shared_mem, self.process_ofs[key],
+                        implied_tensor=implied_tensor)
+                for key, r0 in regime0_t0.items():
+                    shared_mem.t_Scenario_Buffer[(key, 'regime0_outer')] = r0
 
             for key, proc in self.stoch_factors.items():
                 simulated = proc.generate(shared_mem)
@@ -2040,10 +2079,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             torchrl_bundle['inner_mc_grad_fn_one_step'] = lambda t: self._run_inner_mc_at_t(
                 t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
                 with_grad=True, max_inner_steps=1, return_market_only=True)
-            # Calc handle for DifferentialSolver's `sample_exogenous` seam (gate4
-            # diff-ML build): the solver reads `_outer_scenario_buffer` + uses
-            # `_extract_outer_state_at` directly; no monkey-patching of framework
-            # primitives. **TODO refactor (A):** promote `sample_exogenous` to a
+            # Calc handle for DifferentialSolver's `sample_exogenous` seam: the
+            # solver reads `_outer_scenario_buffer` + uses `_extract_outer_state_at`
+            # directly; no monkey-patching of framework primitives. **TODO refactor (A):** promote `sample_exogenous` to a
             # `HedgeMonteCarlo` bundle source (i.e., emit per-t exogenous slices into
             # `torchrl_bundle` so the solver doesn't reach back into the calc) — until
             # then this attribute lets the solver read what's already there without
@@ -2165,342 +2203,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         raise NotImplementedError(
             f'Inner MC has no per-path initial-state extractor for factor type {key.type!r}'
         )
-
-    def _gate0_fork_smoke(self, params, shared_mem, base_date):
-        """Gate 0 of the differential-ML build (see differential_ml_redesign_v14.md §8 / 6.3).
-
-        Smoke-tests that the simulator can fork one step from an arbitrary per-path
-        observable state under autograd. PASS = (a) finite pathwise differentials of the
-        one-step factor outputs w.r.t. each process's initial state; (b) VAR `X_0`
-        round-trip guard holds (enforced in `precalculate` itself — exception propagates);
-        (c) the spot/regime/basis block forks jointly (basis reads the linked spot &
-        regimes from the buffer via `dependant_fields` topo order).
-
-        Designer-sampled states come from the outer scenario buffer (the simulator's
-        forward marginal at `t` from today's market — a correct joint draw across all
-        factors). For each, the per-process initial state is detached + re-attached as
-        a leaf with `requires_grad=True`, then the inner-mode `generate()` runs with
-        autograd ON. No pricing, no bundle, no solver.
-        """
-        gate0_cfg = params.get('Hedging_Problem', {}).get('Gate0', {})
-        scen_t = self.time_grid.scen_time_grid
-        t = int(gate0_cfg.get('Fork_T_Index', scen_t.size // 2))
-        if not (0 <= t < scen_t.size - 1):
-            raise ValueError(
-                f'Gate0.Fork_T_Index={t} out of range [0, {scen_t.size - 1}) — needs at '
-                f'least one outer step ahead to fork into.')
-        grad_finite_tol = float(gate0_cfg.get('Grad_Finite_Tolerance', 1.0e6))
-
-        spot_key = self._find_spot_key()
-        outer_buf = self._outer_scenario_buffer
-        B_outer = outer_buf[spot_key].shape[-1]
-        B_inner = shared_mem.simulation_sub_batch
-        if B_inner < 2:
-            raise ValueError(
-                f'Gate 0 requires Inner_Sub_Batch >= 2 (current: {B_inner}). The inner-MC '
-                f'random-number setup requires B_inner >= 2; set Inner_Sub_Batch in the JSON.')
-
-        t_days = int(scen_t[t])
-        inner_time_grid = self.time_grid.truncate_to(base_date, t_days)
-        inner_base_date = base_date + pd.Timedelta(days=t_days)
-        if inner_time_grid.scen_time_grid.size < 2:
-            raise ValueError(
-                f'Gate0.Fork_T_Index={t} leaves no inner horizon (truncated grid size '
-                f'{inner_time_grid.scen_time_grid.size}); pick an earlier t.')
-
-        shared_mem.simulation_batch = B_outer
-        shared_mem.reset_inner(self.num_factors, inner_time_grid)
-        shared_mem.t_Scenario_Buffer[(spot_key, 'regime0_inner')] = outer_buf[(spot_key, 'regimes')][t]
-
-        leaves = {}
-        outputs = {}
-
-        # Generate inner step per process, autograd ON. Topo order matches outer (basis
-        # depends on linked spot + regimes — `dependant_fields` enforces).
-        for key, proc_inner in self.stoch_factors_inner.items():
-            if key.type in utils.DimensionLessFactors:
-                continue
-            init_state = self._extract_outer_state_at(t, key, outer_buf).detach().clone()
-            init_state.requires_grad_(True)
-            leaves[key] = init_state
-
-            # VAR X_0 round-trip is enforced inside `precalculate` itself (stochastic
-            # process raises if max |M·X_0 - curve_0| exceeds tolerance, ~1e-5 fp32 /
-            # 1e-10 fp64) — reaching the next line means that gate passed.
-            proc_inner.precalculate(
-                inner_base_date, inner_time_grid, init_state, shared_mem, self.process_ofs[key],
-                implied_tensor=self._get_implied_for(key),
-            )
-            simulated = proc_inner.generate(shared_mem)
-            shared_mem.t_Scenario_Buffer[key] = simulated
-            # Inner-time index 0 = initial state, index 1 = one step ahead. Take t+1 slice.
-            outputs[key] = simulated[1] if simulated.dim() >= 1 else simulated
-
-        # Joint-fork sanity: by the time we reach here, basis (if present) has run, which
-        # required the linked spot + regimes from the buffer. So consistency is asserted by
-        # construction; just record what was visible at the time of basis.generate.
-        basis_keys = [k for k in outputs if k.type == 'CommodityBasis']
-        joint_fork_consistency = {
-            'spot_in_buffer_at_basis_call': spot_key in shared_mem.t_Scenario_Buffer,
-            'regime_aux_in_buffer_at_basis_call': (spot_key, 'regimes') in shared_mem.t_Scenario_Buffer,
-            'basis_factors_present': [str(k.name) for k in basis_keys],
-        }
-
-        # Scalar output to backprop from. Any non-finite output is a PASS-blocker on its
-        # own — record before backward so we still get partial diagnostics on the leaves.
-        nonfinite_outputs = []
-        output_sum = None
-        for key, out in outputs.items():
-            if not torch.isfinite(out).all():
-                nonfinite_outputs.append(str(key.name))
-            out_sum = out.sum()
-            output_sum = out_sum if output_sum is None else output_sum + out_sum
-
-        notes = []
-        pass_overall = True
-
-        if output_sum is None:
-            return {
-                'pass_overall': False, 'fork_t_index': t,
-                'B_outer': int(B_outer), 'B_inner': int(B_inner),
-                'per_process': {}, 'joint_fork_consistency': joint_fork_consistency,
-                'notes': ['no factor outputs produced — empty stoch_factors_inner?'],
-            }
-
-        if nonfinite_outputs:
-            pass_overall = False
-            notes.append(f'non-finite factor outputs at t+1: {nonfinite_outputs}')
-            # Still attempt backward; non-finite outputs will produce non-finite grads,
-            # which the per-process loop below will record.
-
-        output_sum.backward()
-
-        per_process = {}
-        for key, leaf in leaves.items():
-            g = leaf.grad
-            factor_name = '.'.join(key.name) if key.name else str(key)
-            rec = {
-                'factor_type': key.type,
-                'factor_name': factor_name,
-                'init_state_shape': tuple(leaf.shape),
-            }
-            if g is None:
-                rec.update({'grad_finite': False, 'grad_norm_mean': None,
-                            'grad_norm_max': None, 'grad_zero_frac': None})
-                pass_overall = False
-                notes.append(f'{factor_name} ({key.type}): grad is None')
-            else:
-                g_flat = g.flatten()
-                finite_mask = torch.isfinite(g_flat)
-                all_finite = bool(finite_mask.all().item())
-                if not all_finite:
-                    pass_overall = False
-                    notes.append(
-                        f'{factor_name} ({key.type}): {int((~finite_mask).sum().item())}/'
-                        f'{g_flat.numel()} non-finite grad entries')
-                g_abs = g_flat.abs().nan_to_num(0.0)
-                max_norm = float(g_abs.max().item())
-                if max_norm > grad_finite_tol:
-                    pass_overall = False
-                    notes.append(
-                        f'{factor_name} ({key.type}): max |grad| = {max_norm:.3e} > tol '
-                        f'{grad_finite_tol:.3e}')
-                # All-zero grad on a factor that physically influences the one-step output
-                # is also a smoke failure (means the autograd path was severed somewhere).
-                zero_frac = float((g_abs == 0).to(dtype=torch.float32).mean().item())
-                if zero_frac > 0.999:
-                    pass_overall = False
-                    notes.append(
-                        f'{factor_name} ({key.type}): grad is ~all-zero ({zero_frac:.3%}) — '
-                        f'autograd path severed?')
-                rec.update({
-                    'grad_finite': all_finite,
-                    'grad_norm_mean': float(g_abs.mean().item()),
-                    'grad_norm_max': max_norm,
-                    'grad_zero_frac': zero_frac,
-                })
-            per_process[factor_name] = rec
-
-        # Clean buffer state so this call doesn't leak into subsequent execute() runs.
-        shared_mem.t_Buffer.clear()
-        shared_mem.t_Scenario_Buffer.clear()
-        shared_mem.t_quasi_rng.clear()
-
-        return {
-            'pass_overall': pass_overall,
-            'fork_t_index': t,
-            't_days': t_days,
-            'B_outer': int(B_outer),
-            'B_inner': int(B_inner),
-            'per_process': per_process,
-            'joint_fork_consistency': joint_fork_consistency,
-            'notes': notes,
-        }
-
-    def _gate1_belief_check(self, params, shared_mem, base_date, privileged_factor_blocks):
-        """Gate 1 of the differential-ML build (see differential_ml_redesign_v14.md §7-R1b / §8).
-
-        Two checks on the forward HMM belief filter `P(regime_t | prices_{0..t})` that
-        replaces the privileged true regime as `market_t`'s regime coordinate in the new
-        architecture:
-
-        (a) **Calibration** — bucket all (t, path) pairs by `belief[r]` (each regime
-            independently); within each bucket the empirical frequency of (true regime
-            == r) should approximate the bucket midpoint. A miscalibrated filter would
-            confidently predict the wrong regime — diagnoses filter-bugs that produce
-            output but not truth.
-
-        (b) **Discriminative belief / non-trivial gradient** — the value function `C_t`
-            is approximately linear in belief locally (decomposition
-            `C_t(belief) ≈ Σ_r belief[r] · V_r` over a fixed observable state, where
-            V_r = E[U(W_T) | regime_t = r, other state held fixed]). So `∂C/∂belief[r] = V_r`
-            and the gradient is non-trivial iff V_r spread across r is non-trivial. We
-            compute V_r by inner-MC fork with `regime0_inner` forced constant per r at
-            an interior `t`, taking the symlog utility of the realized terminal liability
-            under the null hedge policy. Belief entropy distribution across paths is a
-            cheaper precondition (uniform-everywhere belief → V_r decomposition is moot).
-        """
-        gate1_cfg = params.get('Hedging_Problem', {}).get('Gate1', {})
-        n_buckets = int(gate1_cfg.get('Calibration_Buckets', 10))
-        min_samples = int(gate1_cfg.get('Calibration_Min_Samples', 50))
-        max_bucket_err = float(gate1_cfg.get('Calibration_Max_Abs_Err', 0.05))
-        min_v_r_spread_rel = float(gate1_cfg.get('Discriminative_Min_V_Spread_Rel', 0.05))
-
-        spot_key = self._find_spot_key()
-        spot_name = spot_key.name[0] if spot_key.name else str(spot_key)
-
-        belief_blocks = privileged_factor_blocks.get((spot_name, 'regime_belief'), [])
-        onehot_blocks = privileged_factor_blocks.get((spot_name, 'regime_onehot'), [])
-        if not belief_blocks or not onehot_blocks:
-            return {
-                'pass_overall': False,
-                'notes': [f'missing privileged blocks for spot {spot_name!r}: '
-                          f'belief_blocks={len(belief_blocks)}, onehot_blocks={len(onehot_blocks)}'],
-            }
-
-        belief = torch.cat(belief_blocks, dim=1)                       # (T, B, n_states)
-        onehot = torch.cat(onehot_blocks, dim=1)                       # (T, B, n_states)
-        T, B, n_states = belief.shape
-
-        # (a) Calibration check — marginal (gating) + per-bucket (diagnostic).
-        # Marginal calibration is the necessary property: E[belief[r]] should equal
-        # empirical P(true regime = r) by the tower property of conditional expectation.
-        # Per-bucket calibration is a finer (sufficient) check; for rare regimes it can
-        # legitimately miss at mid-confidence buckets (the optimal Bayesian filter trades
-        # off prior + likelihood, and the rare-regime prior dominates differently across
-        # buckets — see ML R1b discussion). We report both; gating is on marginal +
-        # extreme-bucket sanity (close-to-the-decision-boundary buckets at the tails).
-        max_marginal_err = float(gate1_cfg.get('Calibration_Max_Marginal_Err', 0.02))
-        marginal_calibration = {}
-        pass_calibration = True
-        notes = []
-        for r in range(n_states):
-            mean_belief = float(belief[..., r].mean().item())
-            emp_freq = float(onehot[..., r].mean().item())
-            err = abs(mean_belief - emp_freq)
-            marginal_calibration[r] = {
-                'mean_belief_r': mean_belief, 'empirical_freq_r': emp_freq, 'abs_err': err,
-            }
-            if err > max_marginal_err:
-                pass_calibration = False
-                notes.append(
-                    f'regime {r}: marginal calibration error {err:.4f} > tol {max_marginal_err:.4f} '
-                    f'(E[belief]={mean_belief:.4f} vs empirical={emp_freq:.4f})')
-
-        # Per-bucket detail (diagnostic only — does not gate PASS).
-        calibration_per_regime = {}
-        edges = torch.linspace(0.0, 1.0, n_buckets + 1)
-        for r in range(n_states):
-            b_r = belief[..., r].flatten()
-            true_r = onehot[..., r].flatten()
-            per_bucket = {}
-            for k in range(n_buckets):
-                lo, hi = float(edges[k]), float(edges[k + 1])
-                mask = (b_r >= lo) & ((b_r <= hi) if k == n_buckets - 1 else (b_r < hi))
-                n_in = int(mask.sum().item())
-                mid = (lo + hi) / 2.0
-                if n_in < min_samples:
-                    per_bucket[round(mid, 3)] = {'n': n_in, 'emp': None, 'err': None}
-                    continue
-                emp = float(true_r[mask].mean().item())
-                per_bucket[round(mid, 3)] = {'n': n_in, 'emp': emp, 'err': abs(emp - mid)}
-            calibration_per_regime[r] = per_bucket
-
-        # Belief entropy: how localized is the filter?
-        p = belief.clamp_min(1.0e-30)
-        H = -(p * p.log()).sum(dim=-1)                                # (T, B)
-        H_flat = H.flatten()
-        H_max = float(np.log(n_states))
-        belief_entropy_stats = {
-            'H_max': H_max,
-            'mean': float(H_flat.mean().item()),
-            'p10': float(H_flat.quantile(0.10).item()),
-            'p50': float(H_flat.quantile(0.50).item()),
-            'p90': float(H_flat.quantile(0.90).item()),
-            'frac_localized_below_95pct_H_max': float(
-                (H_flat < 0.95 * H_max).to(dtype=torch.float32).mean().item()),
-        }
-
-        # (b) Discriminative check: V_r at t_eval per pure regime, via inner-MC fork.
-        # t_eval defaults to T-2 (one inner step ahead exists; equivalently T_dec-1 for
-        # a deal whose last fixing matches the horizon).
-        scen_t = self.time_grid.scen_time_grid
-        t_eval = int(gate1_cfg.get('Discriminative_T_Index', scen_t.size - 2))
-        if not (0 <= t_eval < scen_t.size - 1):
-            raise ValueError(
-                f'Gate1.Discriminative_T_Index={t_eval} out of range [0, {scen_t.size - 1}).')
-
-        outer_buf = self._outer_scenario_buffer
-        outer_regimes = outer_buf[(spot_key, 'regimes')]               # (T, B) long
-        # Build per-regime versions of the buffer that override outer_regimes[t_eval] to a
-        # constant value of r. `_run_inner_mc_at_t` reads `outer_regimes[t_eval]` and feeds
-        # it into `(spot_key, 'regime0_inner')` for the inner HMM, so the override propagates.
-        L_T_per_regime = []
-        for r in range(n_states):
-            outer_buf_r = dict(outer_buf)
-            regimes_overridden = outer_regimes.clone()
-            regimes_overridden[t_eval] = r
-            outer_buf_r[(spot_key, 'regimes')] = regimes_overridden
-            res = self._run_inner_mc_at_t(
-                t_eval, outer_buf_r, shared_mem, base_date,
-                tradable_refs=(), want_raw_samples=True)
-            L_T_per_regime.append(res['L_T'])                          # (B_outer, B_inner)
-
-        # Shared utility scale across regimes: median(|L_T|) over all paths × regimes,
-        # floored to $1k (matches torchrl_hedge.resolve_utility_scale's degenerate-floor
-        # behaviour). c shared ⇒ V_r comparisons are on a common monotone transform.
-        all_abs = torch.cat([l.abs().flatten() for l in L_T_per_regime])
-        c = max(float(all_abs.median().item()), 1.0e3)
-
-        v_r_per_regime = []
-        for L_T in L_T_per_regime:
-            u = torch.sign(L_T) * torch.log1p(L_T.abs() / c)
-            v_r_per_regime.append(float(u.mean().item()))
-
-        v_max, v_min = max(v_r_per_regime), min(v_r_per_regime)
-        denom = max(abs(v_max), abs(v_min), 1.0e-30)
-        v_r_spread_rel = (v_max - v_min) / denom
-        pass_discriminative = v_r_spread_rel > min_v_r_spread_rel
-        if not pass_discriminative:
-            notes.append(
-                f'V_r spread {v_r_spread_rel:.3f} <= tol {min_v_r_spread_rel:.3f} — '
-                f'belief is degenerate w.r.t. value (uninformative for hedging)')
-
-        return {
-            'pass_overall': pass_calibration and pass_discriminative,
-            'pass_calibration': pass_calibration,
-            'pass_discriminative': pass_discriminative,
-            'T': int(T), 'B': int(B), 'n_states': int(n_states),
-            'marginal_calibration': marginal_calibration,
-            'calibration_per_regime': calibration_per_regime,
-            'belief_entropy_stats': belief_entropy_stats,
-            'discriminative_t_index': t_eval,
-            'utility_scale_c': c,
-            'v_r_per_regime': v_r_per_regime,
-            'v_r_spread_abs': v_max - v_min,
-            'v_r_spread_rel': v_r_spread_rel,
-            'notes': notes,
-        }
 
     def _calc_inner_features(self, inner_mtm, inner_trade_tensors, tradable_refs, cutoff_idx):
         """Per-outer-path features from inner-MC outputs: P(L_T<0), E[L_T|loss],
@@ -2737,7 +2439,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             #
             # Populate `F_t1` directly from the spot factor's simulated path at
             # inner-time index 1 (= outer t+1). For the diff-ML toy validation
-            # (carry σ ≡ 0 ⇒ F_h ≡ spot for every live hedge — matches gate2's
+            # (carry σ ≡ 0 ⇒ F_h ≡ spot for every live hedge — matches the
             # MTM-invariant wealth dynamics), this is the correct forward at t+1.
             # AAD: `shared_mem.t_Scenario_Buffer[spot_key]` is the live output of
             # the spot factor's inner `generate()` above (with_grad=True attached
