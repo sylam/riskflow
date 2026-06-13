@@ -2132,7 +2132,16 @@ def hermite_interpolation_tensor(t, rate_tensor):
     return gi, ci
 
 
-def make_curve_tensor(tensor, curve_component, time_grid, shared):
+def make_curve_tensor(tensor, curve_component, time_grid, shared, n_batch_dims=1):
+    # n_batch_dims > 1: the curve carries multiple trailing batch axes (e.g. a nested
+    # inner-MC curve shaped (scen, n_tenors, B, B2)). Collapse them into ONE batch axis
+    # up front so the rest of the curve stack — hermite params, the Interpolation
+    # (scen*n_tenors, batch) indexing, gather_scenario_interp's rank-adaptive alpha —
+    # stays rank-agnostic and unchanged. Default 1 preserves the legacy
+    # (scen, n_tenors, B) single-batch path exactly. The caller reshapes the gathered
+    # result's trailing batch axis back to (B, B2).
+    if n_batch_dims > 1:
+        tensor = tensor.reshape(*tensor.shape[:-n_batch_dims], -1)
     key_code = (curve_component[FACTOR_INDEX_Tenor_Index].type, curve_component[:2],
                 tuple(tensor.shape))
 
@@ -2178,24 +2187,29 @@ def make_curve_tensor(tensor, curve_component, time_grid, shared):
         return CurveTensor(shared.t_Buffer[key_code], np.zeros(1, dtype=np.int64), None)
 
 
-def calc_time_grid_curve_rate(code, time_grid, shared):
+def calc_time_grid_curve_rate(code, time_grid, shared, n_batch_dims=1):
+    # n_batch_dims > 1: gather a curve whose simulated state carries extra trailing batch
+    # axes (nested inner-MC: (scen, n_tenors, B, B2)). Threaded to make_curve_tensor, which
+    # collapses them to one batch axis; the gathered result's trailing axis is then B*B2,
+    # which the caller reshapes back. Default 1 = legacy single-batch behaviour, untouched.
     time_hash = time_grid[:, TIME_GRID_MTM].tobytes()
     code_hash = tuple(x[:2] for x in code)
 
-    key_code = ('curve', code_hash, time_hash)
+    key_code = ('curve', code_hash, time_hash, n_batch_dims)
 
     if key_code not in shared.t_Buffer:
         value = []
 
         for rate in code:
-            rate_code = ('curve_factor', rate[:2], time_hash)
+            rate_code = ('curve_factor', rate[:2], time_hash, n_batch_dims)
 
             # check if the curve factors are already available
             if rate_code not in shared.t_Buffer:
                 if rate[FACTOR_INDEX_Stoch]:
                     tensor = shared.t_Scenario_Buffer[rate[FACTOR_INDEX_Offset]]
-                    spread = make_curve_tensor(tensor, rate, time_grid, shared)
+                    spread = make_curve_tensor(tensor, rate, time_grid, shared, n_batch_dims=n_batch_dims)
                 else:
+                    # static curve: no scenario batch axes, n_batch_dims is irrelevant.
                     tensor = shared.t_Static_Buffer[rate[FACTOR_INDEX_Offset]]
                     spread = make_curve_tensor(tensor.reshape(1, -1, 1), rate, None, shared)
 

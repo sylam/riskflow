@@ -1900,16 +1900,23 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 use_antithetic=params.get('Antithetic', 'No') == 'Yes')
 
             if randomize_t0:
-                # Scope: declared-underlying factors only. Other processes (curves,
-                # rates) treat the precalculate `tensor` arg as a calibrated vector
-                # of curve/factor values, not a scalar spot — passing them a (B,)
-                # tensor is process-specific and outside the diff-ML t=0 use case.
+                # Every factor gets the burn-in — same iteration as the main
+                # generate loop below. Each process's `simulated[-1]` is the
+                # per-path shape its precalculate accepts as `tensor`; the
+                # inner-MC fork at `_run_inner_mc_at_t` uses exactly this
+                # contract (terminal slice via `_extract_outer_state_at`,
+                # re-precalc with it as init_state), so a curve process gets a
+                # (n_tenors, B) snapshot, a spot a (B,) snapshot, and so on.
                 initial_t0 = {}
                 regime0_t0 = {}
                 for key, proc in self.stoch_factors.items():
-                    if utils.check_tuple_name(key) not in declared_underlyings:
-                        continue
                     simulated = proc.generate(shared_mem)
+                    # Publish to the buffer as we go — linked factors (e.g.
+                    # BasisLinkedSpotModel) read their underlying's path from
+                    # t_Scenario_Buffer during their own generate. stoch_factors
+                    # is in topological order, so the underlying is present
+                    # before the linked factor runs (same as the main loop below).
+                    shared_mem.t_Scenario_Buffer[key] = simulated
                     initial_t0[key] = simulated[-1].detach()
                     regimes_aux = shared_mem.t_Scenario_Buffer.get((key, 'regimes'))
                     if regimes_aux is not None:

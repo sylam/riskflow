@@ -18,7 +18,6 @@
 
 # import standard libraries
 import copy
-import logging
 import itertools
 
 # 3rd party libraries
@@ -26,7 +25,6 @@ import numpy as np
 import pandas as pd
 import scipy.interpolate
 from scipy.linalg import expm as matrix_expm, logm as matrix_logm
-from scipy.optimize import minimize as scipy_minimize
 import torch
 import torch.nn.functional as F
 
@@ -173,6 +171,31 @@ class StochasticProcess(object):
         (T, B, dim) tensors keyed by name. `simulated` is this process's (T, B) path."""
         return {}
 
+    def forward_curve(self, tensor, time_grid_years, shared, mul_time=True):
+        """`utils.calc_curve_forwards` lifted to a per-path BATCH of curves. `tensor` is
+        the t=0 curve: `(n_tenors,)` calibrated, or `(n_tenors, B)` per-path (inner-MC
+        fork or diff-ML t=0 burn-in). Calibrated → one call returning `(T, n_tenors)`.
+        Per-path → loop the B columns and stack on a trailing batch axis → `(T, n_tenors, B)`.
+
+        The loop is the single SEAM: `utils.calc_curve_forwards` is 1-D-curve-only shared
+        valuation infrastructure. When it is later vectorised to take a batch of curves
+        directly, replace this body with one call and every curve process (PCA, HW1F/2F,
+        HW hazard) inherits the speed-up with no further change."""
+        if tensor.ndim == 1:
+            return utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared, mul_time=mul_time)
+        return torch.stack([
+            utils.calc_curve_forwards(self.factor, tensor[:, b], time_grid_years, shared, mul_time=mul_time)
+            for b in range(tensor.shape[1])
+        ], dim=-1)
+
+    @staticmethod
+    def align_rank(x, ndim):
+        """Right-pad `x` with trailing singleton axes to rank `ndim` so a canonical
+        lower-rank tensor (a calibrated `(T, n_tenors)` curve) broadcasts against a
+        higher-rank one (the `(T, n_tenors, B)` per-path or `(T, n_tenors, B, B2)`
+        inner stochastic component). Target rank is explicit; no-op when already there."""
+        return x.reshape(*x.shape, *([1] * (ndim - x.ndim)))
+
 
 class GBMAssetPriceModel(StochasticProcess):
     """The Geometric Brownian Motion Stochastic Process"""
@@ -226,9 +249,15 @@ class GBMAssetPriceModel(StochasticProcess):
         return 'LognormalDiffusionProcess', [()]
 
     def generate(self, shared_mem):
-        f1 = (self.drift + self.vol *
-              shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]).cumsum(axis=0)
-        return self.spot * torch.exp(f1)
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        if Z.ndim == 2:
+            f1 = (self.drift + self.vol * Z).cumsum(axis=0)
+            return self.spot * torch.exp(f1)
+        # Inner MC (T, B, B2): per-step drift/vol arrays (T,1) -> (T,1,1); the per-outer-
+        # path spot (B,)/(1,) -> (1,B,1)/(1,1,1) so each outer path's spot broadcasts
+        # across its B2 inner fan-out.
+        f1 = (self.drift.unsqueeze(-1) + self.vol.unsqueeze(-1) * Z).cumsum(axis=0)
+        return self.align_rank(self.spot.unsqueeze(0), Z.ndim) * torch.exp(f1)
 
 
 class GBMAssetPriceCalibration(object):
@@ -370,18 +399,30 @@ class GBMAssetPriceTSModelImplied(StochasticProcess):
         return 'LognormalDiffusionProcess', [()]
 
     def generate(self, shared_mem):
-        f1 = torch.cumsum(
-            self.delta_vol * shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], dim=0)
-
-        rt = utils.calc_time_grid_curve_rate(self.r_t, self.scen_grid, shared_mem)
-        qt = utils.calc_time_grid_curve_rate(self.q_t, self.scen_grid, shared_mem)
-
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        if Z.ndim == 2:
+            # Outer: drift from the foreign/domestic (or div/repo) zero curves; single batch.
+            rt = utils.calc_time_grid_curve_rate(self.r_t, self.scen_grid, shared_mem)
+            qt = utils.calc_time_grid_curve_rate(self.q_t, self.scen_grid, shared_mem)
+            rt_rates = rt.gather_weighted_curve(shared_mem, self.delta_scen_t)
+            qt_rates = qt.gather_weighted_curve(shared_mem, self.delta_scen_t)
+            drift = torch.cumsum(torch.squeeze(rt_rates - qt_rates, dim=1), dim=0)
+            f1 = torch.cumsum(self.delta_vol * Z, dim=0)
+            return self.spot * torch.exp(drift - self.rho * self.C - 0.5 * self.V + f1)
+        # Inner MC (T, B, B2): the rate curves are simulated to (scen, n_tenors, B, B2).
+        # Gather them with n_batch_dims=2 — the curve stack collapses (B,B2)->B*B2 — so the
+        # drift comes back (T, B*B2); reshape to (T, B, B2). Own per-step arrays (T,1) ->
+        # (T,1,1) and per-outer-path spot (B,)/(1,) -> (1,B,1)/(1,1,1) broadcast across B2.
+        B, B2 = Z.shape[1], Z.shape[2]
+        rt = utils.calc_time_grid_curve_rate(self.r_t, self.scen_grid, shared_mem, n_batch_dims=2)
+        qt = utils.calc_time_grid_curve_rate(self.q_t, self.scen_grid, shared_mem, n_batch_dims=2)
         rt_rates = rt.gather_weighted_curve(shared_mem, self.delta_scen_t)
         qt_rates = qt.gather_weighted_curve(shared_mem, self.delta_scen_t)
-
-        drift = torch.cumsum(torch.squeeze(rt_rates - qt_rates, dim=1), dim=0)
-
-        return self.spot * torch.exp(drift - self.rho * self.C - 0.5 * self.V + f1)
+        drift = torch.cumsum(torch.squeeze(rt_rates - qt_rates, dim=1), dim=0).reshape(-1, B, B2)
+        f1 = torch.cumsum(self.delta_vol.unsqueeze(-1) * Z, dim=0)
+        C = self.C.unsqueeze(-1) if torch.is_tensor(self.C) else self.C
+        return self.align_rank(self.spot.unsqueeze(0), Z.ndim) * torch.exp(
+            drift - self.rho * C - 0.5 * self.V.unsqueeze(-1) + f1)
 
 
 class GBMPriceIndexModel(StochasticProcess):
@@ -433,9 +474,14 @@ class GBMPriceIndexModel(StochasticProcess):
         return 'LognormalDiffusionProcess', [()]
 
     def generate(self, shared_mem):
-        f1 = torch.cumsum(self.drift + self.vol *
-                          shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], dim=0)
-        return self.spot * torch.exp(f1)
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        if Z.ndim == 2:
+            f1 = torch.cumsum(self.drift + self.vol * Z, dim=0)
+            return self.spot * torch.exp(f1)
+        # Inner MC (T, B, B2): per-step drift/vol (T,1) -> (T,1,1); per-outer-path spot
+        # (B,)/(1,) -> (1,B,1)/(1,1,1) so each outer path's spot broadcasts across B2.
+        f1 = torch.cumsum(self.drift.unsqueeze(-1) + self.vol.unsqueeze(-1) * Z, dim=0)
+        return self.align_rank(self.spot.unsqueeze(0), Z.ndim) * torch.exp(f1)
 
 
 class GBMPriceIndexCalibration(object):
@@ -494,15 +540,13 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
          'The increment is simulated using $LZ$ where $Z$ is a 2D vector of independent normals at',
          'time step $k$.'])
 
-    def __init__(self, factor, param, implied_factor, clip=(1e-5, 3.0)):
+    def __init__(self, factor, param, implied_factor):
         super(HullWhite2FactorImpliedInterestRateModel, self).__init__(factor, param)
         self.implied = implied_factor
         self.cache = {}
         self.factor_tenor = None
-        self.clip = clip
         self.grid_index = None
         self.BtT = None
-        self.C = None
 
     @staticmethod
     def num_factors():
@@ -534,20 +578,21 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
                 ref_date, t) for t in time_grid.scen_time_grid])
             # get the factor's tenor points
             self.factor_tenor = tensor.new(self.factor.get_tenor().reshape(-1, 1))
-            # store the forward curve
-            fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared)
             # flatten the tenor
             self.factor_tenor_full = tensor.new_tensor(self.factor.get_tenor(), dtype=torch.float64)
             # get the quanto vol
             self.quantofx = tensor.new_tensor(
                 self.implied.param['Quanto_FX_Volatility'].array[:, 1], dtype=torch.float64)
 
-            # cache tensors/variables
+            # cache the time-grid-derived tensors/variables
             self.cache['time_grid_years'] = time_grid_years
-            self.cache['fwd_curve'] = fwd_curve
             self.cache['t'] = tensor.new(time_grid_years.reshape(-1, 1))
 
-        return self.cache['time_grid_years'], self.cache['fwd_curve'], self.cache['t']
+        # `fwd_curve` depends on `tensor` (the t=0 curve) — recompute every call (not
+        # cached) so a per-path re-precalc (inner-MC fork / diff-ML t=0 burn-in) isn't
+        # shadowed by the first call's calibrated curve. Batch-aware via the base seam.
+        fwd_curve = self.forward_curve(tensor, self.cache['time_grid_years'], shared)
+        return self.cache['time_grid_years'], fwd_curve, self.cache['t']
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         # get the factor's tenor points
@@ -621,7 +666,7 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         else:
             # need to fix the cholesky
             cholesky = [tensor.new_zeros((2, 2), dtype=torch.float64)]
-            for i, C in enumerate(t_CtT[1:] - t_CtT[:-1]):
+            for i, C in enumerate(delta_CtT):
                 if (C[0] > 0.0) & (C[3] > 0.0) & (C[1] * C[2] < C[0] * C[3]):
                     cholesky.append(torch.linalg.cholesky(C.reshape(2, 2)))
                 else:
@@ -636,7 +681,6 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         self.YtT = [torch.exp(-alpha[i] * t).type(shared.one.dtype) for i in range(2)]
         self.KtT = [(quantofxcorr[i] * K[i].reshape(-1, 1)).type(shared.one.dtype) for i in range(2)]
         self.HtT = [(lam[i] * H[i].reshape(-1, 1)).type(shared.one.dtype) for i in range(2)]
-        self.alpha = [alpha[i].type(shared.one.dtype) for i in range(2)]
 
         # needed for factor calcs later
         self.F1 = C[:, 0, 0].reshape(-1, 1).type(shared.one.dtype)
@@ -646,13 +690,27 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
         if len(time_grid.scenario_grid) != time_grid_years.size:
             self.grid_index = time_grid.scen_time_grid.searchsorted(time_grid.scenario_grid[:, utils.TIME_GRID_MTM])
 
-        self.drift = torch.unsqueeze(fwd_curve + 0.5 * AtT.type(shared.one.dtype), 2)
+        # Canonical (mode-agnostic): (T, n_tenors) calibrated / (T, n_tenors, B) per-path.
+        # AtT is (T, n_tenors); align it to the curve rank so the sum broadcasts. generate
+        # appends the broadcast axis vs the stochastic component in `sim_curve`.
+        AtT = AtT.type(shared.one.dtype)
+        self.drift = fwd_curve + 0.5 * self.align_rank(AtT, fwd_curve.ndim)
 
     def calc_factors(self, factor1, factor1and2):
+        if factor1.ndim == 2:
+            F1, F2, KtT, HtT, YtT = self.F1, self.F2, self.KtT, self.HtT, self.YtT
+        else:
+            # Inner MC (T,B,B2): per-step (T,1) constants -> (T,1,1) and F2 (2,T,1) ->
+            # (2,T,1,1) so they broadcast against the (2,)(T,B,B2) random tensors.
+            F1 = self.F1.unsqueeze(-1)
+            F2 = self.F2.unsqueeze(-1)
+            KtT = [k.unsqueeze(-1) for k in self.KtT]
+            HtT = [h.unsqueeze(-1) for h in self.HtT]
+            YtT = [y.unsqueeze(-1) for y in self.YtT]
         f1 = torch.unsqueeze(
-            (torch.cumsum(factor1 * self.F1, dim=0) - self.KtT[0] + self.HtT[0]) * self.YtT[0], dim=1)
+            (torch.cumsum(factor1 * F1, dim=0) - KtT[0] + HtT[0]) * YtT[0], dim=1)
         f2 = torch.unsqueeze(
-            (torch.cumsum(torch.sum(factor1and2 * self.F2, dim=0), dim=0) - self.KtT[1] + self.HtT[1]) * self.YtT[1],
+            (torch.cumsum(torch.sum(factor1and2 * F2, dim=0), dim=0) - KtT[1] + HtT[1]) * YtT[1],
             dim=1)
         return f1, f2
 
@@ -664,11 +722,25 @@ class HullWhite2FactorImpliedInterestRateModel(StochasticProcess):
 
         def sim_curve(drift, Bt0, Bt1, f1, f2, factor_tenor):
             stoch_component = Bt0 * f1 + Bt1 * f2
-            return (drift + stoch_component) / factor_tenor
+            return (self.align_rank(drift, stoch_component.ndim) + stoch_component) / factor_tenor
 
+        rng1 = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
         factor1, factor2 = self.calc_factors(
-            shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon],
-            shared_mem.t_random_numbers[self.z_offset:self.z_offset + 2, :self.scenario_horizon])
+            rng1, shared_mem.t_random_numbers[self.z_offset:self.z_offset + 2, :self.scenario_horizon])
+
+        if rng1.ndim == 3:
+            # Inner MC (T,B,B2). Stochastic-deflation (dict-returning) mode is incompatible
+            # with nested simulation — the fork stores a single tensor per factor. Per-tenor
+            # coefficients (n_tenors,1) -> (n_tenors,1,1) to broadcast against the (T,1,B,B2)
+            # factor tensors; drift is rank-aligned inside sim_curve (per-outer-path curve
+            # (T,n_tenors,B) broadcasts across the B2 fan-out).
+            if self.grid_index is not None:
+                raise NotImplementedError(
+                    "HullWhite2FactorImpliedInterestRateModel stochastic-deflation (grid_index) "
+                    "mode returns a dict of curves and is not supported under nested (inner-MC) "
+                    "simulation. Run with Inner_MC_Enabled='No' or disable deflation.")
+            return sim_curve(self.drift, self.BtT[0].unsqueeze(-1), self.BtT[1].unsqueeze(-1),
+                             factor1, factor2, self.factor_tenor.unsqueeze(-1))
 
         # check if we need deflators
         if self.grid_index is not None:
@@ -728,10 +800,6 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
 
     def __init__(self, factor, param, implied_factor=None):
         super(HullWhite1FactorInterestRateModel, self).__init__(factor, param)
-        self.H = None
-        self.I = None
-        self.J = None
-        self.K = None
 
     @staticmethod
     def num_factors():
@@ -749,7 +817,7 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
         # store the forward curve
         time_grid_years = np.array([self.factor.get_day_count_accrual(
             ref_date, t) for t in time_grid.scen_time_grid])
-        self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared)
+        self.fwd_curve = self.forward_curve(tensor, time_grid_years, shared)
 
         # Really should implement this . . .
         quantofx = self.param['Quanto_FX_Volatility'].array.T if self.param['Quanto_FX_Volatility'] else np.zeros(
@@ -760,15 +828,15 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
         vols = self.param['Sigma'].array
 
         # calculate known functions
-        self.H = integrate_piecewise_linear(
+        H = integrate_piecewise_linear(
             hw_calc_H(alpha, np.exp), shared, time_grid_years, vols[:, 0], vols[:, 1])
-        self.I = integrate_piecewise_linear(
+        I = integrate_piecewise_linear(
             hw_calc_IJK(alpha, np.exp), shared, time_grid_years,
             vols[:, 0], vols[:, 1], vols[:, 0], vols[:, 1])
-        self.J = integrate_piecewise_linear(
+        J = integrate_piecewise_linear(
             hw_calc_IJK(2.0 * alpha, np.exp), shared, time_grid_years,
             vols[:, 0], vols[:, 1], vols[:, 0], vols[:, 1])
-        self.K = integrate_piecewise_linear(
+        K = integrate_piecewise_linear(
             hw_calc_IJK(alpha, np.exp), shared, time_grid_years,
             vols[:, 0], vols[:, 1], quantofx[:, 0], quantofx[:, 1])
 
@@ -776,18 +844,18 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
         BtT = (1.0 - np.exp(-alpha * factor_tenor)) / alpha
         AtT = np.array([(BtT / alpha) * np.exp(-alpha * t) * (
                 2.0 * It - (np.exp(-alpha * t) + np.exp(-alpha * (t + factor_tenor))) * Jt) for (It, Jt, t) in
-                        zip(self.I, self.J, time_grid_years)])
+                        zip(I, J, time_grid_years)])
 
         # get the deltas
         self.delta_KtT = shared.one.new_tensor(
-            np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid_years) * self.K)))
+            np.hstack((0.0, quantofxcorr * np.diff(np.exp(-alpha * time_grid_years) * K)))
         ).reshape(-1, 1)
 
         self.delta_HtT = shared.one.new_tensor(np.hstack(
-            (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid_years) * self.H)))
+            (0.0, self.param['Lambda'] * np.diff(np.exp(-alpha * time_grid_years) * H)))
         ).reshape(-1, 1)
 
-        delta_var = np.diff(self.J)
+        delta_var = np.diff(J)
         self.exp_minus_alpha_t = shared.one.new(np.exp(-alpha * time_grid_years)).reshape(-1, 1)
 
         if delta_var.size:
@@ -797,7 +865,9 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
 
         self.AtT = shared.one.new_tensor(AtT)
         self.BtT = shared.one.new_tensor(BtT.reshape(-1, 1))
-        self.fwd_component = torch.unsqueeze(self.fwd_curve + 0.5 * self.AtT, 2)
+        # Canonical (mode-agnostic): (T, n_tenors) calibrated / (T, n_tenors, B) per-path.
+        # AtT is (T, n_tenors); align it to the curve rank so the sum broadcasts.
+        self.fwd_component = self.fwd_curve + 0.5 * self.align_rank(self.AtT, self.fwd_curve.ndim)
         self.factor_tenor = shared.one.new_tensor(factor_tenor.reshape(-1, 1))
 
     @property
@@ -805,11 +875,20 @@ class HullWhite1FactorInterestRateModel(StochasticProcess):
         return 'HWInterestRate', [('F1',)]
 
     def generate(self, shared_mem):
-        f1 = (shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon] *
-              self.delta_vol - self.delta_KtT + self.delta_HtT).cumsum(axis=0) * self.exp_minus_alpha_t
-
-        stoch_component = self.BtT * torch.unsqueeze(f1, dim=1)
-        return (self.fwd_component + stoch_component) / self.factor_tenor
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        if Z.ndim == 2:
+            f1 = (Z * self.delta_vol - self.delta_KtT + self.delta_HtT).cumsum(axis=0) * self.exp_minus_alpha_t
+            stoch_component = self.BtT * torch.unsqueeze(f1, dim=1)
+            fwd_component = self.align_rank(self.fwd_component, stoch_component.ndim)
+            return (fwd_component + stoch_component) / self.factor_tenor
+        # Inner MC (T,B,B2): per-step (T,1) arrays -> (T,1,1); per-tenor coefficients
+        # BtT/factor_tenor (n_tenors,1) -> (n_tenors,1,1); fwd_component rank-aligned so a
+        # per-outer-path curve (T,n_tenors,B) broadcasts across the B2 fan-out.
+        f1 = (Z * self.delta_vol.unsqueeze(-1) - self.delta_KtT.unsqueeze(-1)
+              + self.delta_HtT.unsqueeze(-1)).cumsum(axis=0) * self.exp_minus_alpha_t.unsqueeze(-1)
+        stoch_component = self.BtT.unsqueeze(-1) * torch.unsqueeze(f1, dim=1)
+        fwd_component = self.align_rank(self.fwd_component, stoch_component.ndim)
+        return (fwd_component + stoch_component) / self.factor_tenor.unsqueeze(-1)
 
 
 class HWInterestRateCalibration(object):
@@ -822,7 +901,6 @@ class HWInterestRateCalibration(object):
         tenor = np.array([(x.split(',')[1]) for x in data_frame.columns], dtype=np.float64)
         stats, correlation, delta = utils.calc_statistics(data_frame, method='Diff',
                                                           num_business_days=num_business_days, max_alpha=4.0)
-        # alpha                       = np.percentile(stats['Mean Reversion Speed'], 50)#.mean()
         alpha = stats['Mean Reversion Speed'].mean()
         sigma = stats['Reversion Volatility'].mean()
         correlation_coef = np.array([np.array([1.0 / np.sqrt(correlation.values.sum())] * tenor.size)])
@@ -872,22 +950,24 @@ class HWHazardRateModel(StochasticProcess):
             ref_date, t) for t in time_grid.scen_time_grid])
 
         # store the forward curve    
-        self.fwd_curve = utils.calc_curve_forwards(self.factor, tensor, time_grid_years, shared, mul_time=False)
+        self.fwd_curve = self.forward_curve(tensor, time_grid_years, shared, mul_time=False)
         Bt = ((1.0 - np.exp(-alpha * time_grid_years)) / alpha).reshape(-1, 1)
         B2t = ((1.0 - np.exp(-2.0 * alpha * time_grid_years)) / alpha).reshape(-1, 1)
         sigma2 = self.param['Sigma'] ** 2
         BtT = ((1.0 - np.exp(-alpha * factor_tenor)) / alpha).reshape(1, -1)
         AtT = sigma2 * BtT * (0.5 * BtT * B2t + Bt ** 2)
 
-        # OU variance
-        var = (1.0 / (2.0 * alpha)) * (1.0 - np.exp(-2.0 * alpha * time_grid_years))
+        # OU variance: (1 - exp(-2αt)) / (2α) == 0.5 · B2t (reuse, don't recompute the exp)
+        var = 0.5 * B2t
         delta_var = np.diff(np.insert(var, 0, 0, axis=0), axis=0)
         self.delta_vol = shared.one.new_tensor(np.sqrt(delta_var).reshape(-1, 1))
 
         # convert to tensors
         self.AtT = shared.one.new_tensor(AtT)
         self.BtT = shared.one.new_tensor(BtT)
-        self.fwd_component = torch.unsqueeze(self.fwd_curve + 0.5 * self.AtT, dim=2)
+        # Canonical (mode-agnostic): (T, n_tenors) calibrated / (T, n_tenors, B) per-path.
+        # AtT is (T, n_tenors); align it to the curve rank so the sum broadcasts.
+        self.fwd_component = self.fwd_curve + 0.5 * self.align_rank(self.AtT, self.fwd_curve.ndim)
         self.Bt = shared.one.new_tensor(Bt) if self.param['Lambda'] else 0.0
 
     @property
@@ -895,11 +975,21 @@ class HWHazardRateModel(StochasticProcess):
         return 'HullWhiteProcess', [()]
 
     def generate(self, shared_mem):
-        f1 = (shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon] * self.delta_vol).cumsum(dim=0)
-        # add market price of risk (if non-zero):
-        f1 = f1 + self.param['Lambda']*self.Bt
-        stoch_component = self.param['Sigma'] * torch.unsqueeze(self.BtT, dim=2) * torch.unsqueeze(f1, dim=1)
-        return self.fwd_component + stoch_component
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        if Z.ndim == 2:
+            f1 = (Z * self.delta_vol).cumsum(dim=0)
+            # add market price of risk (if non-zero):
+            f1 = f1 + self.param['Lambda'] * self.Bt
+            stoch_component = self.param['Sigma'] * torch.unsqueeze(self.BtT, dim=2) * torch.unsqueeze(f1, dim=1)
+            return self.align_rank(self.fwd_component, stoch_component.ndim) + stoch_component
+        # Inner MC (T,B,B2): per-step delta_vol/Bt (T,1) -> (T,1,1); per-tenor BtT
+        # (1,n_tenors) -> (1,n_tenors,1,1); fwd_component rank-aligned across the B2 fan-out.
+        f1 = (Z * self.delta_vol.unsqueeze(-1)).cumsum(dim=0)
+        bt = self.Bt.unsqueeze(-1) if torch.is_tensor(self.Bt) else self.Bt
+        f1 = f1 + self.param['Lambda'] * bt
+        stoch_component = self.param['Sigma'] * torch.unsqueeze(self.BtT, dim=2).unsqueeze(-1) \
+            * torch.unsqueeze(f1, dim=1)
+        return self.align_rank(self.fwd_component, stoch_component.ndim) + stoch_component
 
 
 class HWHazardRateCalibration(object):
@@ -966,12 +1056,16 @@ class CSForwardPriceModel(StochasticProcess):
         return mu, np.sqrt(var)
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-        # tensor: (n_tenors,) outer / (n_tenors, B) inner. Only `initial_curve` depends
-        # on tensor — vol/drift are time-grid + param functions and stay (T, n_tenors, 1).
+        # tensor: (n_tenors,) calibrated / (n_tenors, B) per-path (inner-MC or t=0
+        # burn-in). Store `initial_curve` in a generate-mode-agnostic canonical form
+        # (leading time-broadcast axis + n_tenors[, B]); the mode-specific trailing
+        # axes are appended in `generate`, which knows outer vs inner from Z.ndim.
+        # precalc can't make that call — a per-path burn-in init and an inner-MC init
+        # are both (n_tenors, B). vol/drift are time-grid + param functions, (T, n_tenors, 1).
         if tensor.ndim == 1:
-            self.initial_curve = tensor.reshape(1, -1, 1)                   # (1, n_tenors, 1)
+            self.initial_curve = tensor.reshape(1, -1)                      # (1, n_tenors)
         else:
-            self.initial_curve = tensor.unsqueeze(0).unsqueeze(-1)          # (1, n_tenors, B, 1)
+            self.initial_curve = tensor.unsqueeze(0)                        # (1, n_tenors, B)
         # store randomnumber id's
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size
@@ -1017,12 +1111,17 @@ class CSForwardPriceModel(StochasticProcess):
         if Z.ndim == 2:
             # Outer mode: Z is (T, B). Bit-exact preserves legacy behavior.
             z_portion = Z.unsqueeze(1) * self.vol                       # (T, n_tenors, B)
-            return self.initial_curve * torch.exp(self.drift + torch.cumsum(z_portion, dim=0))
-        # Inner mode: Z is (T, B, B2). One path per outer × inner.
-        vol4 = self.vol.unsqueeze(-1)                                   # (T, n_tenors, 1, 1)
-        drift4 = self.drift.unsqueeze(-1)                               # (T, n_tenors, 1, 1)
-        z_portion = Z.unsqueeze(1) * vol4                               # (T, n_tenors, B, B2)
-        return self.initial_curve * torch.exp(drift4 + torch.cumsum(z_portion, dim=0))
+            path = torch.exp(self.drift + torch.cumsum(z_portion, dim=0))
+        else:
+            # Inner mode: Z is (T, B, B2). One path per outer × inner.
+            vol4 = self.vol.unsqueeze(-1)                              # (T, n_tenors, 1, 1)
+            drift4 = self.drift.unsqueeze(-1)                          # (T, n_tenors, 1, 1)
+            z_portion = Z.unsqueeze(1) * vol4                          # (T, n_tenors, B, B2)
+            path = torch.exp(drift4 + torch.cumsum(z_portion, dim=0))
+        # Align the canonical initial_curve ((1, n_tenors) calibrated, (1, n_tenors, B)
+        # per-path) to the path rank — broadcasts a calibrated curve across the batch,
+        # an inner/burn-in curve element-wise.
+        return self.align_rank(self.initial_curve, path.ndim) * path
 
 
 class CSImpliedForwardPriceModel(CSForwardPriceModel):
@@ -1142,7 +1241,6 @@ class PCAInterestRateModel(StochasticProcess):
             evecs[:, index] = np.interp(factor_tenor, *eigen_data['Eigenvector'].array.T)
             evals.append(eigen_data['Eigenvalue'])
 
-        evecs = np.array(evecs)
         # note that I don't need to divide by the volatility because I normalize
         # across tenors below . . .
         B = evecs.dot(np.diag(np.sqrt(evals)))
@@ -1169,11 +1267,10 @@ class PCAInterestRateModel(StochasticProcess):
             -0.5 * (self.vols * self.vols).reshape(1, -1) * ou_var_cumul.reshape(-1, 1), axis=2))
 
         # normalize the eigenvectors
-        self.evecs = shared.one.new_tensor(B.T[:, np.newaxis, :, np.newaxis])
+        self.evecs = shared.one.new_tensor(B.T)                         # [n_factors, n_tenors]
 
         # Forward curve at each time-grid point. `tensor` is the current zero curve:
         # (n_tenors,) in outer mode, (n_tenors, B) in inner mode (per-outer-path init).
-        factor_tenor_t = shared.one.new_tensor(factor_tenor.reshape(1, -1))                    # [1, n_tenors]
         if self.param['Rate_Drift_Model'] == 'Drift_To_Blend':
             hist_mean = scipy.interpolate.interp1d(*np.hstack(
                 ([[0.0], [self.param['Historical_Yield'].array.T[-1][0]]],
@@ -1191,19 +1288,18 @@ class PCAInterestRateModel(StochasticProcess):
                 omega_b = omega.unsqueeze(-1)                                                   # [1, n_tenors, 1]
                 fwd_curve = decay_b * curve_t0 + (1.0 - decay_b) * omega_b                      # [T, n_tenors, B]
         else:
-            if tensor.ndim == 1:
-                fwd_curve = utils.calc_curve_forwards(
-                    self.factor, tensor, elapsed, shared) / factor_tenor_t                     # [T, n_tenors]
-            else:
-                # Per-outer-path forwards: loop over B and stack. Inner pass runs under
-                # no_grad so no autograd graph cost; vectorise later if profiling shows it.
-                fwd_curve = torch.stack([
-                    utils.calc_curve_forwards(
-                        self.factor, tensor[:, b], elapsed, shared) / factor_tenor_t
-                    for b in range(tensor.shape[1])
-                ], dim=-1)                                                                       # [T, n_tenors, B]
+            # Batch-aware forward curve (calibrated (n_tenors,) → [T, n_tenors];
+            # per-path (n_tenors, B) → [T, n_tenors, B]) via the base-class seam, then
+            # divide by the tenor with the divisor rank-aligned to the curve.
+            fwd = self.forward_curve(tensor, elapsed, shared)
+            factor_tenor_t = shared.one.new_tensor(factor_tenor.reshape(1, -1))                 # [1, n_tenors]
+            fwd_curve = fwd / self.align_rank(factor_tenor_t, fwd.ndim)
 
-        self.fwd_component = fwd_curve.unsqueeze(-1)  # [..., 1] — trailing dim is the inner B2 / outer scenario axis
+        # Canonical (mode-agnostic) form: (T, n_tenors) calibrated / (T, n_tenors, B)
+        # per-path. The mode-specific trailing axis is appended in generate (it knows
+        # outer vs inner from the factor rank); precalc can't, since a per-path burn-in
+        # init and an inner-MC init are both (n_tenors, B).
+        self.fwd_component = fwd_curve
 
     def calc_factors(self, factors):
         # factors: [n_factors, T, B] outer / [n_factors, T, B, B2] inner. Branch on ndim;
@@ -1213,7 +1309,7 @@ class PCAInterestRateModel(StochasticProcess):
         #   Y_out[k] = D[k] * cumsum( n[i]/D[i] * Z[i] )[k],  D[k] = cumprod(d)[k]
         # Two O(T) CUDA-native ops (cumprod, cumsum) replace the T-step Python loop.
         # Numerically stable for typical PCA α (0.01–0.3); avoid α >> 1 on long grids.
-        evecs_mat = self.evecs[:, 0, :, 0]                              # [n_factors, n_tenors]
+        evecs_mat = self.evecs                                         # [n_factors, n_tenors]
         D = torch.cumprod(self.ou_decay, dim=0)                         # [T, 1]
 
         if factors.ndim == 3:
@@ -1237,7 +1333,10 @@ class PCAInterestRateModel(StochasticProcess):
             shared_mem.t_random_numbers[
             self.z_offset:self.z_offset + self.num_factors(), :self.scenario_horizon])
 
-        return self.fwd_component * torch.exp(stoch)
+        # Align the canonical fwd_component ((T, n_tenors) calibrated, (T, n_tenors, B)
+        # per-path) to stoch's rank ((T, n_tenors, B) outer, (T, n_tenors, B, B2) inner)
+        # — broadcasts a calibrated curve across the batch, a per-path curve element-wise.
+        return self.align_rank(self.fwd_component, stoch.ndim) * torch.exp(stoch)
 
 
 class PCAInterestRateCalibration(object):
@@ -1364,14 +1463,21 @@ class SingleRegimeOU1FactorKalmanModel(StochasticProcess):
 
     def generate(self, shared_mem):
         Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]  # [T, batch]
-        # Prefix cumprod of mean-reversion decay: A[k] = prod(a[0..k])       [T, 1]
-        A = torch.cumprod(self.a_arr, dim=0)
-        # Innovation at each step: b[k] = c[k] + vol[k] * Z[k]              [T, batch]
-        b = self.c_arr + self.vol_arr * Z
-        # Closed-form recurrence: x[k] = A[k] * (x0 + cumsum(b/A)[k])
-        # Derivation: unrolling x_k = a_k*x_{k-1}+b_k gives
-        #   x_k = A_k*x0 + sum_{j<k} (A_k/A_j)*b_j = A_k*(x0 + cumsum(b/A)[k])
-        return A * (self.x0 + torch.cumsum(b / A, dim=0))                    # [T, batch]
+        if Z.ndim == 2:
+            # Prefix cumprod of mean-reversion decay: A[k] = prod(a[0..k])       [T, 1]
+            A = torch.cumprod(self.a_arr, dim=0)
+            # Innovation at each step: b[k] = c[k] + vol[k] * Z[k]              [T, batch]
+            b = self.c_arr + self.vol_arr * Z
+            # Closed-form recurrence: x[k] = A[k] * (x0 + cumsum(b/A)[k])
+            # Derivation: unrolling x_k = a_k*x_{k-1}+b_k gives
+            #   x_k = A_k*x0 + sum_{j<k} (A_k/A_j)*b_j = A_k*(x0 + cumsum(b/A)[k])
+            return A * (self.x0 + torch.cumsum(b / A, dim=0))                    # [T, batch]
+        # Inner MC (T, B, B2): per-step arrays (T,1) -> (T,1,1); per-outer-path x0
+        # (B,)/(1,) -> (1,B,1)/(1,1,1) so each outer path's state broadcasts across B2.
+        A = torch.cumprod(self.a_arr.unsqueeze(-1), dim=0)
+        b = self.c_arr.unsqueeze(-1) + self.vol_arr.unsqueeze(-1) * Z
+        x0 = self.align_rank(self.x0.unsqueeze(0), Z.ndim)
+        return A * (x0 + torch.cumsum(b / A, dim=0))
 
 
 class SingleRegimeOU1FactorKalmanCalibration(object):
@@ -1735,9 +1841,10 @@ class LogOUSpotModel(StochasticProcess):
 
         self.e_kdt   = tensor.new(e_kdt.reshape(-1, 1))
         self.ou_vol  = tensor.new(np.sqrt(var_step).reshape(-1, 1))
-        # Initial log-spot. AAD: keep on graph — `tensor` is the factor's `Spot` (always
-        # scalar for a CommodityPrice/EquityPrice); reshape to 0-d preserves grad.
-        self.log_spot0 = torch.log(tensor.reshape(()))
+        # Initial log-spot. AAD: keep on graph. `tensor` is the factor's `Spot`: (1,)
+        # calibrated, or (B,) per-path (inner-MC fork / diff-ML t=0 burn-in). reshape(-1)
+        # keeps the batch axis (a calibrated (1,) broadcasts like the old 0-d scalar).
+        self.log_spot0 = torch.log(tensor).reshape(-1)
         # Anchor theta at the current spot rather than the calibrated long-run mean. Production
         # hedging shouldn't bet that today's price will revert to a historical average — the agent
         # should hedge variance around the current regime, not directional drift toward a stale θ.
@@ -1767,9 +1874,19 @@ class LogOUSpotModel(StochasticProcess):
 
     def generate(self, shared_mem):
         Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]  # [T, batch]
-        A = torch.cumprod(self.e_kdt, dim=0)                           # [T, 1]
-        b = self.theta * (1.0 - self.e_kdt) + self.ou_vol * Z         # [T, batch]
-        log_spot = A * (self.log_spot0 + torch.cumsum(b / A, dim=0))  # [T, batch]
+        if Z.ndim == 2:
+            A = torch.cumprod(self.e_kdt, dim=0)                           # [T, 1]
+            b = self.theta * (1.0 - self.e_kdt) + self.ou_vol * Z         # [T, batch]
+            log_spot = A * (self.log_spot0 + torch.cumsum(b / A, dim=0))  # [T, batch]
+            return torch.exp(log_spot)
+        # Inner MC (T, B, B2): per-step arrays (T,1) -> (T,1,1); per-outer-path theta /
+        # log_spot0 (B,)/(1,) -> (1,B,1)/(1,1,1) so each outer path broadcasts across B2.
+        e_kdt = self.e_kdt.unsqueeze(-1)
+        A = torch.cumprod(e_kdt, dim=0)
+        theta = self.align_rank(self.theta.unsqueeze(0), Z.ndim)
+        b = theta * (1.0 - e_kdt) + self.ou_vol.unsqueeze(-1) * Z
+        log_spot0 = self.align_rank(self.log_spot0.unsqueeze(0), Z.ndim)
+        log_spot = A * (log_spot0 + torch.cumsum(b / A, dim=0))
         return torch.exp(log_spot)
 
     @classmethod
@@ -1778,8 +1895,11 @@ class LogOUSpotModel(StochasticProcess):
 
     def privileged_factors(self, simulated):
         spot = simulated.to(dtype=torch.float32)
-        # Use self.theta (post-anchor) so the critic sees the actual θ used during simulation.
-        log_dev = (spot.clamp_min(1.0e-9).log() - float(self.theta)).unsqueeze(-1)
+        # Use self.theta (post-anchor) so the critic sees the actual θ used during
+        # simulation. theta is (1,) calibrated / (B,) per-path — broadcasts against spot's
+        # batch axis (each path subtracts its own θ); the trailing unsqueeze is the feature dim.
+        theta = self.theta.to(dtype=torch.float32).reshape(-1)
+        log_dev = (spot.clamp_min(1.0e-9).log() - theta).unsqueeze(-1)
         kappa_t = torch.full_like(log_dev, float(self.param['Kappa']))
         sigma_t = torch.full_like(log_dev, float(self.param['Sigma']))
         return {'log_deviation': log_dev, 'kappa': kappa_t, 'sigma': sigma_t}
@@ -1920,6 +2040,8 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
             ou_vol[i] = np.sqrt(np.clip(var_step, 0.0, None))
             thetas[i] = float(s['Theta'])
 
+        pi0 = np.array(self.param.get('Initial_State_Probs', [1.0 / self.n_states] * self.n_states))
+
         # Anchor theta at current spot rather than the calibrated long-run mean. Production
         # hedging shouldn't bet that today's price will revert to a stale historical average —
         # the agent should hedge variance around the current regime, not directional drift.
@@ -1928,7 +2050,6 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
         # Disable via `Anchor_Theta_At_Spot: false` for backtests that want absolute calibrated θ.
         if bool(self.param.get('Anchor_Theta_At_Spot', True)):
             log_spot_scalar = float(torch.log(tensor).mean().item()) if tensor.numel() > 1 else float(torch.log(tensor).item())
-            pi0 = np.array(self.param.get('Initial_State_Probs', [1.0 / self.n_states] * self.n_states))
             calibrated_log_mean = float((pi0 * thetas).sum())
             thetas = thetas + (log_spot_scalar - calibrated_log_mean)
             self.param = dict(self.param)  # don't mutate caller's dict
@@ -1946,7 +2067,6 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
             P_per_step[t] = np.real(matrix_expm(Q * dt)) if dt > 1.0e-12 else np.eye(self.n_states)
         P_cum = np.cumsum(P_per_step, axis=2)
 
-        pi0 = np.array(self.param.get('Initial_State_Probs', [1.0 / self.n_states] * self.n_states))
         pi0_cum = np.cumsum(pi0)
 
         def _t(arr):
@@ -1958,9 +2078,11 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
         self.P_cum = _t(P_cum)
         self.pi0_cum = _t(pi0_cum)
 
-        # AAD: keep on graph — `tensor` is the factor's `Spot` (always scalar for a
-        # CommodityPrice); reshape to 0-d preserves grad.
-        self.log_spot0 = torch.log(tensor.reshape(()))
+        # Initial log-spot. AAD: keep on graph. `tensor` is the factor's `Spot`: (1,)
+        # calibrated, or (B,) per-path (inner-MC fork / diff-ML t=0 burn-in). reshape(-1)
+        # keeps the batch axis; the per-state θ anchor above stays scalar (mean over paths),
+        # so paths share reversion targets but each starts at its own log-spot.
+        self.log_spot0 = torch.log(tensor).reshape(-1)
 
     @property
     def correlation_name(self):
@@ -1968,29 +2090,61 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
 
     def generate(self, shared_mem):
         Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
-        T, B = Z.shape
         device = Z.device
 
-        # quasi_rng(dim, sample_size) returns sobol.draw(sample_size) of shape (sample_size, dim).
-        # We want (T+1, B) — one initial draw plus one per transition — so pass dim=B, sample_size=T+1.
-        u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, T + 1)[1].contiguous()
+        if Z.ndim == 2:
+            T, B = Z.shape
+            # quasi_rng(dim, sample_size) returns sobol.draw(sample_size) of shape (sample_size, dim).
+            # We want (T+1, B) — one initial draw plus one per transition — so pass dim=B, sample_size=T+1.
+            u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, T + 1)[1].contiguous()
+            # Per-outer-path regime0 override (diff-ML t=0 randomization): honour the
+            # `(factor_key, 'regime0_outer')` the burn-in publishes, mirroring the inner
+            # `regime0_inner` path. Absent it, draw t=0 from the calibrated π_0.
+            regime0_override = shared_mem.t_Scenario_Buffer.get(
+                (self.factor_key, 'regime0_outer'))
+            if regime0_override is not None:
+                state = regime0_override.to(device=device, dtype=torch.long)
+            else:
+                state = torch.searchsorted(self.pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
+            regimes = torch.empty((T, B), dtype=torch.long, device=device)
+            regimes[0] = state
+            for t in range(1, T):
+                cdf_rows = self.P_cum[t - 1].index_select(0, state)
+                state = (cdf_rows < u_regime[t].unsqueeze(1)).sum(dim=1).clamp_max_(self.n_states - 1)
+                regimes[t] = state
+            t_idx = torch.arange(T, device=device).unsqueeze(1).expand(T, B)
+            log_spot0 = self.log_spot0                                            # (1,)/(B,)
+        else:
+            # Inner MC (T, B, B2): one regime path per outer × inner, mirroring
+            # MarkovHMMSpotModel's inner sampling. log_spot0 (B,)/(1,) -> (1,B,1) so each
+            # outer path's start broadcasts across its B2 fan-out; t_idx scales to (T,B,B2).
+            T, B, B2 = Z.shape
+            u_flat = shared_mem.quasi_rng(T + 1, B * B2)[1].transpose(0, 1).contiguous()
+            u_regime = u_flat.reshape(T + 1, B, B2)
+            regime0_override = shared_mem.t_Scenario_Buffer.get(
+                (self.factor_key, 'regime0_inner'), None)
+            regimes = torch.empty((T, B, B2), dtype=torch.long, device=device)
+            if regime0_override is not None:
+                state = regime0_override.to(device=device, dtype=torch.long)\
+                    .view(B, 1).expand(B, B2).contiguous()
+            else:
+                state = torch.searchsorted(self.pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
+            regimes[0] = state
+            for t in range(1, T):
+                cdf_rows = self.P_cum[t - 1].index_select(0, state.flatten())\
+                    .reshape(B, B2, self.n_states)
+                state = (cdf_rows < u_regime[t].unsqueeze(-1)).sum(dim=-1).clamp_max_(self.n_states - 1)
+                regimes[t] = state
+            t_idx = torch.arange(T, device=device).view(T, 1, 1).expand(T, B, B2)
+            log_spot0 = self.align_rank(self.log_spot0.unsqueeze(0), Z.ndim)       # (1,B,1)/(1,1,1)
 
-        state = torch.searchsorted(self.pi0_cum, u_regime[0]).clamp_max_(self.n_states - 1)
-        regimes = torch.empty((T, B), dtype=torch.long, device=device)
-        regimes[0] = state
-        for t in range(1, T):
-            cdf_rows = self.P_cum[t - 1].index_select(0, state)
-            state = (cdf_rows < u_regime[t].unsqueeze(1)).sum(dim=1).clamp_max_(self.n_states - 1)
-            regimes[t] = state
-
-        t_idx = torch.arange(T, device=device).unsqueeze(1).expand(T, B)
         e_kdt_t = self.e_kdt_per_state[regimes, t_idx]
         ou_vol_t = self.ou_vol_per_state[regimes, t_idx]
         theta_t = self.thetas[regimes]
 
         A = torch.cumprod(e_kdt_t, dim=0)
         b = theta_t * (1.0 - e_kdt_t) + ou_vol_t * Z
-        log_spot = A * (self.log_spot0 + torch.cumsum(b / A, dim=0))
+        log_spot = A * (log_spot0 + torch.cumsum(b / A, dim=0))
         # Stashed for privileged_factors() called immediately after generate() in the sim loop;
         # also published for cross-process consumers under the (factor_key, kind) convention.
         self.last_regime_path = regimes
@@ -2113,18 +2267,18 @@ class MarkovHMMSpotModel(StochasticProcess):
         return 'MarkovHMMSpotProcess', [()]
 
     def generate(self, shared_mem):
-        # Z is (T, B) in outer mode, (T, B, B2) in inner mode.
+        # Z is (T, B) in outer mode, (T, B, B2) in inner mode. Everything runs at the
+        # calculation's global precision (shared.one): the precalc tensors were built with
+        # shared.one.new_tensor, so they already carry the right dtype/device — no casts.
         Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
         device = Z.device
-        dtype = torch.float32
 
-        pi0_cum = self.pi0_cum.to(device=device, dtype=dtype)
-        P_cum = self.P_cum.to(device=device, dtype=dtype)
-        mu = self.mu_per_state.to(device=device, dtype=dtype)
-        sigma = self.sigma_per_state.to(device=device, dtype=dtype)
-        dt = self.dt_per_step.to(device=device, dtype=dtype)
-        nu_per_state = getattr(self, 'nu_per_state', None)
-        nu = nu_per_state.to(device=device, dtype=dtype) if nu_per_state is not None else None
+        pi0_cum = self.pi0_cum
+        P_cum = self.P_cum
+        mu = self.mu_per_state
+        sigma = self.sigma_per_state
+        dt = self.dt_per_step
+        nu = self.nu_per_state
 
         if Z.ndim == 2:
             # Outer mode: (T, B). Bit-exact preserves of legacy behavior.
@@ -2147,17 +2301,16 @@ class MarkovHMMSpotModel(StochasticProcess):
                 state = (cdf_rows < u_regime[t].unsqueeze(1)).sum(dim=1).clamp_max_(self.n_states - 1)
                 regimes[t] = state
 
-            Z_dt = Z.to(dtype=dtype)
             if nu is not None:
                 nu_t = nu[regimes]                                                   # (T, B)
                 # Floor the chi-square draw — an underflow to 0 makes sqrt(nu/W) blow
                 # up to inf (or 0*inf=NaN), corrupting ds before the log-path clamp.
-                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype).clamp_min(1.0e-6)
-                t_innov = Z_dt * torch.sqrt(nu_t / W)
+                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().clamp_min(1.0e-6)
+                t_innov = Z * torch.sqrt(nu_t / W)
                 scale_to_unit_var = torch.sqrt((nu_t - 2.0).clamp_min(1.0e-3) / nu_t)
                 innov = t_innov * scale_to_unit_var
             else:
-                innov = Z_dt
+                innov = Z
 
             mu_t = mu[regimes] * dt.view(T, 1)                                       # (T, B)
             std_t = sigma[regimes] * dt.view(T, 1).sqrt()
@@ -2183,7 +2336,7 @@ class MarkovHMMSpotModel(StochasticProcess):
             # dim=-1 concat works, enabling `_extract_outer_state_at(privileged=True)` to
             # route belief into the V̂ deep-state market block.
             with torch.no_grad():
-                belief_path = self._forward_belief(spot_path.detach(), device, dtype)
+                belief_path = self._forward_belief(spot_path.detach(), device)
             self.last_regime_belief = belief_path
             shared_mem.t_Scenario_Buffer[(self.factor_key, 'regime_belief')] = \
                 belief_path.permute(0, 2, 1).contiguous()                            # (T, n_states, B)
@@ -2213,17 +2366,16 @@ class MarkovHMMSpotModel(StochasticProcess):
                     .clamp_max_(n_states - 1)
                 regimes[t] = state
 
-            Z_dt = Z.to(dtype=dtype)
             if nu is not None:
                 nu_t = nu[regimes]                                                   # (T, B, B2)
                 # Floor the chi-square draw — an underflow to 0 makes sqrt(nu/W) blow
                 # up to inf (or 0*inf=NaN), corrupting ds before the log-path clamp.
-                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().to(dtype=dtype).clamp_min(1.0e-6)
-                t_innov = Z_dt * torch.sqrt(nu_t / W)
+                W = torch.distributions.Gamma(nu_t / 2.0, 0.5).sample().clamp_min(1.0e-6)
+                t_innov = Z * torch.sqrt(nu_t / W)
                 scale_to_unit_var = torch.sqrt((nu_t - 2.0).clamp_min(1.0e-3) / nu_t)
                 innov = t_innov * scale_to_unit_var
             else:
-                innov = Z_dt
+                innov = Z
 
             mu_t = mu[regimes] * dt.view(T, 1, 1)                                    # (T, B, B2)
             std_t = sigma[regimes] * dt.view(T, 1, 1).sqrt()
@@ -2259,7 +2411,7 @@ class MarkovHMMSpotModel(StochasticProcess):
             out['regime_belief'] = belief.to(dtype=torch.float32)
         return out
 
-    def _forward_belief(self, spot_path, device, dtype):
+    def _forward_belief(self, spot_path, device):
         """Forward HMM belief filter — outer-mode only. Returns belief (T, B, n_states)
         where `belief[t, b, r] = P(regime_t = r | observed diffs through time t, path b)`,
         computed in log-space (logsumexp predict + logsumexp normalize) for numerical
@@ -2271,13 +2423,12 @@ class MarkovHMMSpotModel(StochasticProcess):
         T, B = spot_path.shape
         n_states = self.n_states
 
-        pi0_probs = self.pi0_probs.to(device=device, dtype=dtype)
-        P_step = self.P_per_step.to(device=device, dtype=dtype)            # (T, n, n)
-        dt = self.dt_per_step.to(device=device, dtype=dtype)               # (T,)
-        mu = self.mu_per_state.to(device=device, dtype=dtype)              # (n,)
-        sigma = self.sigma_per_state.to(device=device, dtype=dtype)        # (n,)
-        nu_per_state = getattr(self, 'nu_per_state', None)
-        nu = nu_per_state.to(device=device, dtype=dtype) if nu_per_state is not None else None
+        pi0_probs = self.pi0_probs
+        P_step = self.P_per_step                                           # (T, n, n)
+        dt = self.dt_per_step                                              # (T,)
+        mu = self.mu_per_state                                             # (n,)
+        sigma = self.sigma_per_state                                       # (n,)
+        nu = self.nu_per_state
 
         # Observed per-step diffs: log returns if Log_Price, raw price diffs otherwise.
         # diffs[t-1] is the observation arriving at time t.
@@ -2287,7 +2438,7 @@ class MarkovHMMSpotModel(StochasticProcess):
         else:
             diffs = spot_path[1:] - spot_path[:-1]                         # (T-1, B)
 
-        log_belief = torch.empty((T, B, n_states), dtype=dtype, device=device)
+        log_belief = torch.empty((T, B, n_states), dtype=pi0_probs.dtype, device=device)
         log_belief[0] = pi0_probs.clamp_min(1.0e-30).log().expand(B, n_states)
 
         log_2pi = float(np.log(2.0 * np.pi))
@@ -2599,7 +2750,6 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
             W_per_step,
         ], axis=-1)                                                                    # (T, 3, 3)
         self.D_slot_per_step = shared.one.new_tensor(D_slot_per_step)
-        self.tau_slot_per_step = shared.one.new_tensor(slot_tenors)                    # (T, 3)
 
         # CSForward-style per-step contract tenors: factor_tenor is in absolute Excel
         # date offsets; convert to remaining years per sim step. Contracts past expiry
@@ -2611,6 +2761,16 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
         self.contract_expired = shared.one.new_tensor(
             (contract_T <= 0.0).astype(np.float64)).bool()                             # (T, n_contracts)
         self.contract_T = shared.one.new_tensor(np.maximum(contract_T, 0.0))           # (T, n_contracts)
+        # Slot-interpolation bracket is data-independent (calibration τs + sim grid only),
+        # so resolve idx/α once here, not per-step in the hot generate loop. The slot tenors
+        # are the middle column of D_slot_per_step; bracket each contract_T into [idx-1, idx]
+        # (clamped to the 3-slot ladder) and store the linear interpolation weight.
+        ts_t = self.D_slot_per_step[:, :, 1].contiguous()                              # (T, 3) slot tenors
+        idx = torch.clamp(torch.searchsorted(ts_t, self.contract_T, right=False), 1, 2)
+        ts_lo = torch.gather(ts_t, 1, idx - 1)
+        ts_hi = torch.gather(ts_t, 1, idx)
+        self.idx_per_step = idx                                                        # (T, n_contracts)
+        self.alpha_per_step = (self.contract_T - ts_lo) / (ts_hi - ts_lo)              # (T, n_contracts)
 
         # X_0 from t=0 carries: find X such that linearly-interpolating the slot values
         # c_slot = D_slot[0] @ X at slot τs onto contract Ts reproduces today's curve.
@@ -2683,16 +2843,14 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
             # Outer mode: (3, T, B).
             _, T, B = Z.shape
             mean = self.mean_vec.view(3, 1)                                            # (3, 1)
-            X = self.X0.view(3, 1).expand(3, B).clone()                                # (3, B)
+            X = self.X0.reshape(3, -1).expand(3, B)                                    # (3, B); reshape, not view, so a per-path (3, B) init survives
             out = torch.empty((T, n_contracts, B), dtype=Z.dtype, device=Z.device)
             for t in range(T):
                 X = mean + torch.einsum('ij,j...->i...', self.Phi_per_step[t], X - mean) \
                     + self.sigma_per_step[t].view(3, 1) * Z[:, t, :]                   # (3, B)
                 c_slot = torch.einsum('ij,j...->i...', self.D_slot_per_step[t], X)     # (3, B)
-                ts = self.tau_slot_per_step[t]
-                cT_t = self.contract_T[t]
-                idx = torch.clamp(torch.searchsorted(ts, cT_t, right=False), 1, 2)
-                alpha = ((cT_t - ts[idx - 1]) / (ts[idx] - ts[idx - 1])).unsqueeze(-1) # (n_contracts, 1)
+                idx = self.idx_per_step[t]
+                alpha = self.alpha_per_step[t].unsqueeze(-1)                           # (n_contracts, 1)
                 out_t = (1.0 - alpha) * c_slot[idx - 1] + alpha * c_slot[idx]          # (n_contracts, B)
                 out[t] = torch.where(self.contract_expired[t].unsqueeze(-1),
                                      torch.zeros_like(out_t), out_t)
@@ -2700,17 +2858,14 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
             # Inner mode: (3, T, B, B2). X carries the fan-out batch dims through.
             _, T, B, B2 = Z.shape
             mean = self.mean_vec.view(3, 1, 1)                                         # (3, 1, 1)
-            X = self.X0.unsqueeze(-1).expand(3, B, B2).clone()                         # (3, B, B2)
+            X = self.X0.unsqueeze(-1).expand(3, B, B2)                                 # (3, B, B2)
             out = torch.empty((T, n_contracts, B, B2), dtype=Z.dtype, device=Z.device)
             for t in range(T):
                 X = mean + torch.einsum('ij,j...->i...', self.Phi_per_step[t], X - mean) \
                     + self.sigma_per_step[t].view(3, 1, 1) * Z[:, t, :, :]             # (3, B, B2)
                 c_slot = torch.einsum('ij,j...->i...', self.D_slot_per_step[t], X)     # (3, B, B2)
-                ts = self.tau_slot_per_step[t]
-                cT_t = self.contract_T[t]
-                idx = torch.clamp(torch.searchsorted(ts, cT_t, right=False), 1, 2)
-                alpha = ((cT_t - ts[idx - 1]) / (ts[idx] - ts[idx - 1]))\
-                    .view(-1, 1, 1)                                                    # (n_contracts, 1, 1)
+                idx = self.idx_per_step[t]
+                alpha = self.alpha_per_step[t].view(-1, 1, 1)                          # (n_contracts, 1, 1)
                 out_t = (1.0 - alpha) * c_slot[idx - 1] + alpha * c_slot[idx]          # (n_contracts, B, B2)
                 expired_view = self.contract_expired[t].view(-1, 1, 1)                 # (n_contracts, 1, 1)
                 out[t] = torch.where(expired_view, torch.zeros_like(out_t), out_t)
@@ -2873,7 +3028,6 @@ class BasisLinkedSpotModel(StochasticProcess):
         self.A = float(self.param['A'])
         self.Phi = float(self.param['Phi'])
         self.Nu = float(self.param['Nu'])
-        self.Mu = float(self.param.get('Mu', 0.0))
         self.sigma_by_state = shared.one.new_tensor(np.array(self.param['Sigma_By_State'], dtype=np.float64))
         # AAD: keep b0 on the autograd graph so sensitivities of payoffs w.r.t. the
         # observed initial basis flow through. Stored as-is so inner-MC mode can pass
@@ -2901,14 +3055,14 @@ class BasisLinkedSpotModel(StochasticProcess):
         # Identity: ε_t = Z · √(ν/W) where W ~ Chi²(ν). Combine the rescaling so the
         # marginal variance of η_t is sigma_t² regardless of ν.
         nu = self.Nu
-        phi = float(self.Phi)
-        a = float(self.A)
+        phi = self.Phi
+        a = self.A
 
         if Z.ndim == 2:
             # Outer mode: (T, B). Bit-exact preserve of legacy behavior.
             T, B = Z.shape
             # Floor the chi-square draw — same inf/NaN guard as the linked spot.
-            W = torch.distributions.Chi2(nu).sample((T, B)).to(device=device, dtype=dtype).clamp_min(1.0e-6)
+            W = torch.distributions.Chi2(shared_mem.one.new_tensor(nu)).sample((T, B)).clamp_min(1.0e-6)
             eta = sigma_t * Z * torch.sqrt((nu - 2.0) / W)
             b_init = self.b0.expand(B)
             out = torch.empty((T, B), device=device, dtype=dtype)
@@ -2918,7 +3072,7 @@ class BasisLinkedSpotModel(StochasticProcess):
         else:
             # Inner mode: (T, B, B2).
             T, B, B2 = Z.shape
-            W = torch.distributions.Chi2(nu).sample((T, B, B2)).to(device=device, dtype=dtype).clamp_min(1.0e-6)
+            W = torch.distributions.Chi2(shared_mem.one.new_tensor(nu)).sample((T, B, B2)).clamp_min(1.0e-6)
             eta = sigma_t * Z * torch.sqrt((nu - 2.0) / W)
             out = torch.empty((T, B, B2), device=device, dtype=dtype)
             out[0] = self.b0.unsqueeze(-1).expand(B, B2)
