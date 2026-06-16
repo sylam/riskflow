@@ -2426,9 +2426,6 @@ class MarkovHMMSpotModel(StochasticProcess):
         pi0_probs = self.pi0_probs
         P_step = self.P_per_step                                           # (T, n, n)
         dt = self.dt_per_step                                              # (T,)
-        mu = self.mu_per_state                                             # (n,)
-        sigma = self.sigma_per_state                                       # (n,)
-        nu = self.nu_per_state
 
         # Observed per-step diffs: log returns if Log_Price, raw price diffs otherwise.
         # diffs[t-1] is the observation arriving at time t.
@@ -2441,45 +2438,72 @@ class MarkovHMMSpotModel(StochasticProcess):
         log_belief = torch.empty((T, B, n_states), dtype=pi0_probs.dtype, device=device)
         log_belief[0] = pi0_probs.clamp_min(1.0e-30).log().expand(B, n_states)
 
-        log_2pi = float(np.log(2.0 * np.pi))
-        log_pi = float(np.log(np.pi))
         for t in range(1, T):
             # Predict: log_b_pred[r'] = logsumexp_r (log_b[t-1, r] + log_P[t-1, r, r'])
             log_P = P_step[t - 1].clamp_min(1.0e-30).log()                 # (n, n)
             log_b_pred = torch.logsumexp(
                 log_belief[t - 1].unsqueeze(-1) + log_P.unsqueeze(0), dim=-2)  # (B, n)
-
-            dt_t = dt[t]
-            if float(dt_t) < 1.0e-12:
+            if float(dt[t]) < 1.0e-12:
                 # Degenerate step (e.g. forked grid where t=0's neighbour is zero); skip
                 # the update — predict-only is a valid filter step under no observation.
                 log_belief[t] = log_b_pred - torch.logsumexp(log_b_pred, dim=-1, keepdim=True)
                 continue
-
-            mean_r = mu * dt_t                                              # (n,)
-            std_r = sigma * dt_t.sqrt()                                     # (n,)
-            d = diffs[t - 1].unsqueeze(-1)                                  # (B, 1)
-            z = (d - mean_r.unsqueeze(0)) / std_r.unsqueeze(0)              # (B, n)
-            if nu is not None:
-                # Scaled-t log-pdf (model rescales innov to unit variance ⇒ σ is marginal std).
-                #   log f(d) = lgamma((ν+1)/2) − lgamma(ν/2)
-                #            − 0.5·log((ν−2)π) − log σ_r
-                #            − 0.5·(ν+1)·log(1 + z²/(ν−2))
-                nu_eff = (nu - 2.0).clamp_min(1.0e-3)
-                log_L = (
-                    torch.lgamma((nu + 1.0) / 2.0)
-                    - torch.lgamma(nu / 2.0)
-                    - 0.5 * (nu_eff.log() + log_pi)
-                    - std_r.log()
-                ).unsqueeze(0) - 0.5 * (nu + 1.0).unsqueeze(0) * torch.log1p(z.pow(2) / nu_eff.unsqueeze(0))
-            else:
-                # Gaussian log-pdf: -0.5·log(2π σ²·dt) − 0.5·z²
-                log_L = (-0.5 * (log_2pi + 2.0 * std_r.log())).unsqueeze(0) - 0.5 * z.pow(2)
-
-            log_b_unnorm = log_b_pred + log_L
+            # Update: multiply by the per-state emission density of the observed diff.
+            log_b_unnorm = log_b_pred + self._emission_log_likelihood(diffs[t - 1], t)  # (B, n)
             log_belief[t] = log_b_unnorm - torch.logsumexp(log_b_unnorm, dim=-1, keepdim=True)
 
         return log_belief.exp()
+
+    def _emission_log_likelihood(self, diff, t_idx):
+        """Per-state log emission density of an observed price diff arriving at step
+        `t_idx`. `diff` is any shape `(...)`; returns `(..., n_states)`. Gaussian, or the
+        unit-variance-rescaled scaled-Student-t when `nu_per_state` is set — matches the
+        simulator's emission exactly. Shared by the outer filter (`_forward_belief`) and
+        the inner-MC one-step filter (`inner_forward_belief`)."""
+        dt_t = self.dt_per_step[t_idx]
+        mean_r = self.mu_per_state * dt_t                                  # (n,)
+        std_r = self.sigma_per_state * dt_t.sqrt()                         # (n,)
+        z = (diff.unsqueeze(-1) - mean_r) / std_r                          # (..., n)
+        nu = self.nu_per_state
+        if nu is not None:
+            # log f = lgamma((ν+1)/2) − lgamma(ν/2) − ½·log((ν−2)π) − log σ_r
+            #         − ½·(ν+1)·log(1 + z²/(ν−2))
+            nu_eff = (nu - 2.0).clamp_min(1.0e-3)
+            return (torch.lgamma((nu + 1.0) / 2.0) - torch.lgamma(nu / 2.0)
+                    - 0.5 * (nu_eff.log() + float(np.log(np.pi))) - std_r.log()
+                    ) - 0.5 * (nu + 1.0) * torch.log1p(z.pow(2) / nu_eff)
+        # Gaussian: −½·log(2π σ²) − ½·z²
+        return (-0.5 * (float(np.log(2.0 * np.pi)) + 2.0 * std_r.log())) - 0.5 * z.pow(2)
+
+    def inner_forward_belief(self, inner_spot, belief0):
+        """One-step (few-step) HMM filter over an INNER-MC price path, seeded with the
+        outer entry posterior `belief0` — so the diff-ML bootstrap's `z_{t+1}` carries the
+        participant's genuine belief, NOT a privileged true-regime one-hot. Differentiable
+        in `inner_spot`: the belief column's pathwise slope falls out of the same AAD pass
+        that yields the wealth/price differentials.
+
+        `inner_spot`: `(T, B, B2)` inner price path (T=2 for the one-step bootstrap —
+        index 0 = outer t, index 1 = outer t+1). `belief0`: `(n_states, B)` outer posterior
+        at the fork step (B-last, as published to the buffer), broadcast across the B2
+        fan-out. Returns belief `(T, n_states, B, B2)` — the buffer's B-last convention, so
+        `_extract_outer_state_at(privileged=True)` returns `belief[τ] = (n_states, B, B2)`.
+
+        Predict uses the transition over the FULL step `P_per_step[τ] = expm(Q·dt[τ])` (the
+        real interval), not the dt=0 anchor `P_per_step[τ-1]=I`: the participant filters
+        under the true regime dynamics regardless of the inner sampler's anchor."""
+        T, B, B2 = inner_spot.shape
+        n = self.n_states
+        obs = inner_spot.clamp_min(1.0e-30).log() if self.log_price else inner_spot
+        diffs = obs[1:] - obs[:-1]                                         # (T-1, B, B2)
+        log_b = [belief0.movedim(0, -1).clamp_min(1.0e-30).log()           # (B, n)
+                 .unsqueeze(1).expand(B, B2, n)]                           # seed → (B, B2, n)
+        for tau in range(1, T):
+            log_P = self.P_per_step[tau].clamp_min(1.0e-30).log()          # (n, n) over dt[τ]
+            log_b_pred = torch.logsumexp(
+                log_b[tau - 1].unsqueeze(-1) + log_P, dim=-2)              # (B, B2, n)
+            log_unnorm = log_b_pred + self._emission_log_likelihood(diffs[tau - 1], tau)
+            log_b.append(log_unnorm - torch.logsumexp(log_unnorm, dim=-1, keepdim=True))
+        return torch.stack(log_b, dim=0).exp().movedim(-1, 1)              # (T, n, B, B2)
 
 
 class MarkovHMMSpotCalibration(object):

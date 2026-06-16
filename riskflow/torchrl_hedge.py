@@ -387,7 +387,7 @@ def resolve_utility_scale(bundle, runtime):
         if c_explicit < 1.0e3:
             logging.info(
                 'utility_scale Explicit override: c=%.4g (below the $1k '
-                'production floor — toy/test mode; trust mode active)', c_explicit)
+                'production floor — test mode; trust mode active)', c_explicit)
         return c_explicit
     H = int(runtime.get('history_lookback_business_days', 0))
     last_idx = bundle.get('last_settlement_index')

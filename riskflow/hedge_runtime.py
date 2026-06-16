@@ -177,6 +177,14 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # decomposition. Default 0 = pure bootstrap (banked behavior).
         "lambda_mix": float(solver_config.get("Lambda_Mix", 0.0)),
         "use_advantage_decomp": bool(solver_config.get("Use_Advantage_Decomp", True)),
+        # Backward-sweep depth: fit C_t for t in [t_outer-2 .. t_min]. 0 = full sweep
+        # to the initial decision; t_min near t_outer-1 = a shallow (bounded) sweep.
+        "t_min": int(solver_config.get("T_Min", 0)),
+        # Endogenous-span bank knob (DifferentialSolver): inventory/wealth replicas
+        # layered on each exogenous slice.
+        "bank_sampling": {
+            "b_endo": int((solver_config.get("Bank_Sampling") or {}).get("B_Endo", 2)),
+        },
         "include_dynamic_features_in_value_inputs":
             bool(solver_config.get("Include_Dynamic_Features_In_Value_Inputs", False)),
         "multi_seed_count": int(solver_config.get("Multi_Seed_Count", 1)),

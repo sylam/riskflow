@@ -1809,6 +1809,11 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         execution_mode = params.get('Execution_Mode', 'simulate_only')
         hedging_problem = params.get('Hedging_Problem', {})
+        # Diff-ML inner-MC belief coherence (validation_sandwich_spec §1/§4.2): when True,
+        # the bootstrap's z_{t+1} regime block is a one-step HMM filter posterior seeded
+        # from the outer belief, not the privileged true-regime one-hot. Default True;
+        # set False to reproduce the legacy one-hot bootstrap for A/B verdicts.
+        self._inner_belief_filter = bool(hedging_problem.get('Inner_Belief_Filter', True))
 
         instruments = read_instruments(hedging_problem.get('Tradable_Instruments', {}))
         liabilities = read_instruments(hedging_problem.get('Liabilities', {}))
@@ -2427,6 +2432,37 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 )
                 simulated = proc_inner.generate(shared_mem)
                 shared_mem.t_Scenario_Buffer[key] = simulated
+                # Diff-ML belief coherence (validation_sandwich_spec §1/§4.2): for a
+                # regime-switching spot, publish a one-step filtered belief so the
+                # privileged extractor below returns the participant's posterior instead
+                # of the true-regime one-hot fallback. Seeded from the outer entry belief
+                # (detached) and updated on the inner price move — differentiable in the
+                # inner price, so the belief-column slope is available to the twin loss.
+                # Disabled (→ one-hot) when Inner_Belief_Filter=False or the process has no
+                # filter / no outer belief was published.
+                belief0 = outer_buf.get((key, 'regime_belief'))
+                if (self._inner_belief_filter and belief0 is not None
+                        and hasattr(proc_inner, 'inner_forward_belief')):
+                    seed = belief0[t]
+                    if with_grad:
+                        # Belief seed as a grad leaf so the twin loss can supervise the
+                        # belief COLUMN: ∂Y_boot/∂belief_t flows through the filter's
+                        # predict step (∂belief_{t+1}/∂belief_t) into z_{t+1}. Independent
+                        # of the spot leaf, so the price-column gradient is unchanged.
+                        seed = seed.detach().clone().requires_grad_(True)
+                        state_t_leaves[(key, 'regime_belief')] = seed
+                    inner_belief = proc_inner.inner_forward_belief(simulated, seed)
+                    shared_mem.t_Scenario_Buffer[(key, 'regime_belief')] = inner_belief
+                    if not getattr(self, '_logged_inner_belief', False):
+                        self._logged_inner_belief = True
+                        sums = inner_belief.sum(dim=1)
+                        logging.info(
+                            'inner belief filter ACTIVE for %s: shape=%s n_states=%d '
+                            'normalized=%s (replaces the privileged true-regime one-hot '
+                            'in the bootstrap z_{t+1})',
+                            utils.check_tuple_name(key), tuple(inner_belief.shape),
+                            inner_belief.shape[1],
+                            bool(torch.allclose(sums, torch.ones_like(sums), atol=1.0e-4)))
                 if want_raw_samples:
                     # Market state at outer t+1 (inner-time index 1) — generic privileged
                     # extractor; reads the live buffer (factor path + any regime aux its
@@ -2445,7 +2481,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             # → frozen wealth channel → degenerate bootstrap labels.
             #
             # Populate `F_t1` directly from the spot factor's simulated path at
-            # inner-time index 1 (= outer t+1). For the diff-ML toy validation
+            # inner-time index 1 (= outer t+1). For the diff-ML one-step validation
             # (carry σ ≡ 0 ⇒ F_h ≡ spot for every live hedge — matches the
             # MTM-invariant wealth dynamics), this is the correct forward at t+1.
             # AAD: `shared_mem.t_Scenario_Buffer[spot_key]` is the live output of
@@ -2453,7 +2489,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             # leaves at line 2755-2756), so `.clone()` preserves
             # `∂F_t1/∂state_t_leaves[spot_key] ≠ 0`. For a fuller term-structure
             # model (non-zero carry, per-tradable per-tenor forwards), this path
-            # needs the per-tradable pricing pass — defer until the toy lands.
+            # needs the per-tradable pricing pass — defer until that pass lands.
             if return_market_only and want_raw_samples:
                 market_t1 = torch.cat(market_t1_parts, dim=0).permute(1, 2, 0).contiguous()
                 market_t_parts, market_t_widths = [], []

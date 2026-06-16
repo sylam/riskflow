@@ -1170,7 +1170,7 @@ class LsmDpSolver:
                                                   else torch.zeros_like(gA)).detach())
                         col += priv_w
                     if spot_grads_AB:
-                        # Aggregate spot gradients across all CommodityPrice leaves (toy
+                        # Aggregate spot gradients across all CommodityPrice leaves (single-underlying
                         # case: one); broadcast to every F_t column.
                         g_spot_AB = torch.stack(spot_grads_AB, dim=0).sum(dim=0)  # (B,)
                         g_spot_BA = torch.stack(spot_grads_BA, dim=0).sum(dim=0)
@@ -1650,7 +1650,7 @@ class DifferentialSolver:
         self.t_outer = t_outer
 
         # State pack — reuse the existing layout. Market block carries the regime
-        # belief for the HMM toy; dim is whatever `_run_inner_mc_at_t` would publish.
+        # belief for a regime-switching spot; dim is whatever `_run_inner_mc_at_t` would publish.
         # For Milestone 0 we don't need the inner-MC machinery; only the terminal
         # slice of the outer buffer. Market dim derived from privileged-mode
         # extraction at t=0 (any t works — same per-process widths).
@@ -1687,15 +1687,14 @@ class DifferentialSolver:
         levels = int(solver_cfg.get("training_action_grid_levels_per_axis", 11))
         self.action_grid = build_action_grid(runtime, levels, self.device)   # (K, n_h)
 
-        # Accounting constants pulled from the runtime — no toy defaults. The wealth
+        # Accounting constants pulled from the runtime (JSON) — no hardcoded defaults. The wealth
         # convention is MTM-invariant: `w_t = cash + (Σq − 1)·S_t + K`,
         # so under no rebalance `w_{t+1} = w_t + (Σq − 1)·dS`; under rebalance,
         # `w_post = w_pre − turnover`.
         self.lambda_turn = float(runtime["accounting"].get(
             "transaction_cost_per_unit", 1.0e-4))
-        self.K_strike = float(solver_cfg.get("k_strike", 100.0))
-        # Real per-tradable contract sizes (50 oz for platinum futures, 1 for the
-        # toy). Was hardcoded to `ones(n_h)` which broke any deal where the
+        # Real per-tradable contract sizes (50 oz for platinum futures). Was hardcoded
+        # to `ones(n_h)` which broke any deal where the
         # tradable's price wasn't already denominated in deal units.
         self.contract_size = torch.tensor(
             [float(runtime["tradables"][h]["contract_size"]) for h in self.hedges],
@@ -1711,7 +1710,7 @@ class DifferentialSolver:
         # `position_limits` is the same source `build_action_grid` reads (above), so
         # the sampling range is consistent with the decision search space at every t.
         # Wealth half-width sized to the symlog scale: 15 × c covers ±2.78 in symlog
-        # units, the meaningful dynamic range of the activation; at the toy
+        # units, the meaningful dynamic range of the activation; e.g.
         # (`utility_scale=100`) this lands on the prior ±$1500, at the production
         # deal (`vol_scaled_notional ≈ deal notional`) it scales with the deal.
         limits = runtime["accounting"].get("position_limits", {})
@@ -1737,7 +1736,7 @@ class DifferentialSolver:
         # `_liab_drift_state` (built in the advantage-decomp init below;
         # supersedes the τ̄ duration approximation inside B). `τ̄_t` is retained
         # for diagnostic logs only. Weights = δ_T (single payment at terminal)
-        # reduces to the toy's R_t ≡ 1 with a terminal-lag ladder — bit-for-bit.
+        # reduces to R_t ≡ 1 with a terminal-lag ladder — bit-for-bit.
         self._init_liability_R_tau(runtime, bundle)
 
         # ------- Advantage decomposition (spec §14 promoted to main path) -------
@@ -1763,7 +1762,7 @@ class DifferentialSolver:
         if self._advantage_decomp:
             # Pre-compute baseline parameters once. The drift comes from the spot
             # factor's per-state μ (annualised). dt comes from the spot's per-step
-            # dt (constant for the weekly toy). The regime cols in the market block
+            # dt (constant for a uniform grid). The regime cols in the market block
             # are discovered by walking the same factor-iteration order as
             # `_read_privileged_market`'s privileged path — robust to factor reorder.
             spot_proc = self._calc.stoch_factors_inner.get(self._spot_key)
@@ -1786,7 +1785,7 @@ class DifferentialSolver:
                 if len(days) >= 2:
                     self._dt_per_step = float(int(days[1]) - int(days[0])) / 365.25
                 else:
-                    self._dt_per_step = 7.0 / 365.25      # weekly toy fallback
+                    self._dt_per_step = 7.0 / 365.25      # degenerate single-point-grid fallback
                 # Discover regime col range in the market block by replicating
                 # `_read_privileged_market`'s column accounting.
                 col = 0
@@ -1863,7 +1862,7 @@ class DifferentialSolver:
         - `R_t = Σ_{u : fix_u > t} w_u`   (remaining exposure)
         - `τ̄_t = (Σ w_u · (fix_u − t)) / R_t`   (duration-weighted remaining time)
 
-        The toy (single payment at terminal, weights = δ_T) gives R_t ≡ 1 for
+        A single terminal payment (weights = δ_T) gives R_t ≡ 1 for
         t < T_dec, τ̄_t = ttot — reproducing the prior code bit-for-bit.
         """
         import pandas as pd
@@ -1928,6 +1927,14 @@ class DifferentialSolver:
         self._liability_R = R_t                                # (T,) deal units
         self._liability_tau_bar_years = tau_days / 365.25       # (T,) years
         self._liab_w_by_lag = w_by_lag                           # (T, T+1)
+        # Validation diagnostic: a single terminal payment gives R_t ≡ 1; a multi-fixing
+        # average-rate liability decays R_t over the averaging window — exercising the
+        # general dL = R_t·dS that a single-payment liability never does.
+        logging.info(
+            "DifferentialSolver liability R_t: first=%.4g last=%.4g min=%.4g max=%.4g "
+            "constant=%s (constant ⇒ single terminal payment; decaying ⇒ averaging window)",
+            float(R_t[0]), float(R_t[-1]), float(R_t.min()), float(R_t.max()),
+            bool(torch.allclose(R_t, R_t[0])))
         if float(R_t[-1]) > 1e-9:
             logging.warning(
                 "DifferentialSolver liability: R[t_outer-1] = %.4g > 0 — fixings "
@@ -1961,7 +1968,7 @@ class DifferentialSolver:
         term is fixing-ladder-exact (per-fixing lag buckets), superseding the
         duration-bucket τ̄ form. With `P = I` and a one-hot belief this reduces
         exactly to the previous `expm1(μ_r·ttot)` baseline (regression anchor);
-        the toy's single terminal fixing gives `w_by_lag[t] = δ_{ttot}` and
+        a single terminal fixing gives `w_by_lag[t] = δ_{ttot}` and
         recovers `(Σq·cs − 1)·S·D` bit-for-bit.
 
         Action-dependent through Σq·cs, belief-dependent linearly (the dots —
@@ -1983,7 +1990,7 @@ class DifferentialSolver:
         time_to_T = z[..., -1]
 
         # Deal-unit exposure: q is in contracts; contract_size converts to the
-        # units S is quoted in (50 oz platinum futures; 1 on the toy). Must match
+        # units S is quoted in (50 oz platinum futures). Must match
         # the PnL lines in `_compute_labels_for_bank` / `_rollout_no_grad_to_T`
         # and `_turnover` — B's q-slope feeds the residual differential label
         # ∂A/∂z = ∂C/∂z − ∂B/∂z, so a units mismatch here corrupts the labels.
@@ -2051,7 +2058,7 @@ class DifferentialSolver:
 
         Returns: `{t: {'market': (B, market_dim), 'tradables': (B, n_hedge)}}` for
         every outer index t. The market block is the privileged extractor output
-        (regime belief for the HMM toy, plus basis/carry where present). Tradable
+        (regime belief for a regime-switching spot, plus basis/carry where present). Tradable
         prices come from `tradables_sim[h][t]`. Both are read no-grad.
         """
         # n is ignored in Milestone 0 — the buffer is sized at the existing outer
@@ -2186,7 +2193,7 @@ class DifferentialSolver:
             if step % max(1, steps // 5) == 0 or step == steps - 1:
                 logging.info(
                     "DifferentialSolver C_T cold-train step=%d L=%.5f val=%.5f diff=%.5f",
-                    step, float(loss),
+                    step, float(loss.detach()),
                     last_diag["val_loss"], last_diag["diff_loss"])
 
         # Holdout check — closed-form value MAE on fresh spans.
@@ -2449,7 +2456,7 @@ class DifferentialSolver:
         # Project leaf gradients to deep-state F_t columns. The spot leaf (whose value
         # equals F_t for live tradables — forward=spot) maps to all live tradable_prices
         # columns; per-row alignment via outer_index. Other leaves (carry curve,
-        # basis if differentiable) are skipped here for the toy; promote to a full
+        # basis if differentiable) are skipped here for now; promote to a full
         # projection in M3 when richer underlyings come online.
         dy_dz = torch.zeros_like(z_t)
         F_col_start = self.statepack.n_hedge + 2          # tradable_prices block start
@@ -2469,12 +2476,22 @@ class DifferentialSolver:
         wealth_col = self.statepack.n_hedge                          # cash slot
         dy_dz[:, wealth_col] = dY_dw
 
-        # Spot leaf gradient → live tradable_prices cols. Locate the CommodityPrice
-        # leaf via leaf_keys (factor-type 'CommodityPrice').
+        # Spot leaf gradient → live tradable_prices cols (CommodityPrice factor leaf);
+        # belief seed leaf → the belief columns of the market block. `belief_cols` is set
+        # only when the inner belief filter populated a grad leaf, so it gates the unmask
+        # below (one-hot fallback leaves the regime block detached → no slope → stay masked).
+        belief_cols = None
         for key, g in zip(leaf_keys, leaf_grads):
             if g is None:
                 continue
-            if key.type == "CommodityPrice":
+            if isinstance(key, tuple) and key[1] == 'regime_belief':
+                # g is (n_states, B_outer): ∂Y_boot/∂belief_t. Project per-row via
+                # outer_index onto the belief slice of the market block.
+                ms = 2 * self.statepack.n_hedge + 2
+                r_lo, r_hi = self._regime_cols_in_market
+                dy_dz[:, ms + r_lo : ms + r_hi] = g[:, bank["outer_index"]].T
+                belief_cols = (ms + r_lo, ms + r_hi)
+            elif getattr(key, 'type', None) == "CommodityPrice":
                 # g has leaf shape (B_outer,) for HMM spot. Project to all live
                 # tradable_prices cols, indexed by outer_index.
                 g_per_row = g[bank["outer_index"]]                   # (N,)
@@ -2522,6 +2539,20 @@ class DifferentialSolver:
             for j in range(n_h):
                 if live_t[j]:
                     diff_col_mask[F_col_start + j] = 1.0
+            # Belief columns: supervised only when the filter computed ∂Y_boot/∂belief_t
+            # above. `∂B/∂belief` is already in `_dB_dz` (B is belief-linear), so the
+            # residual label ∂A/∂belief = ∂Y_boot/∂belief − ∂B/∂belief is correct here.
+            if belief_cols is not None:
+                diff_col_mask[belief_cols[0]:belief_cols[1]] = 1.0
+            if not getattr(self, "_logged_diffcols", False):
+                self._logged_diffcols = True
+                sup = [i for i in range(diff_col_mask.shape[0]) if float(diff_col_mask[i]) > 0]
+                logging.info(
+                    "DifferentialSolver diff-label supervised cols (StatePack idx)=%s "
+                    "[wealth=%d, live F=%s, belief=%s]; belief differential %s",
+                    sup, wealth_col, [F_col_start + j for j in range(n_h) if live_t[j]],
+                    list(belief_cols) if belief_cols else None,
+                    "ACTIVE (filtered)" if belief_cols else "masked (one-hot/off)")
             dy_dz = (dy_dz - self._dB_dz(z_t)) * diff_col_mask
         else:
             y_target = Y_boot.detach()
@@ -2852,7 +2883,7 @@ class DifferentialSolver:
              `max_q C_t(post_t(q))`, so the thing `C_{t-1}` reads is the *fitted* C_t.
           4. `Y_eval` via `_rollout_no_grad_to_T` from `z_t` using frozen C-stack.
           5. `delta = Y_eval − Y_boot`. Bucket by **regime at t** (spec §7 mentions
-             (time, inventory, action_gap, tail) — for the toy's regime-conditional
+             (time, inventory, action_gap, tail) — for regime-conditional
              bias, regime is the load-bearing axis; promote to richer bucketing only
              if p95 flags but the location is ambiguous).
           6. Per-bucket: mean δ, p95|δ|, n_in_bucket. Flag if `|mean|>MEAN_TOL` OR
@@ -2987,7 +3018,7 @@ class DifferentialSolver:
         aad_wealth = dy_dz_aad[:, wealth_col]
 
         # FD eps scaled to the sampled wealth band (was hardcoded 0.5 against the
-        # toy's ±1500): 1/3000 of the band reproduces 0.5 on the toy exactly and
+        # old ±1500): 1/3000 of the band reproduces 0.5 there exactly and
         # stays well inside the fit hull at deal scales.
         eps = self.bank_wealth_halfwidth / 3000.0
         with torch.no_grad():
@@ -3045,52 +3076,7 @@ class DifferentialSolver:
         diag = self._train_C_terminal(traj)
         diag["t0_regime_occupancy"] = regime_t0_freq
         diag["seam_milestone"] = 0
-        # v0_estimate diagnostics filled after the no-hedge evaluation below.
-
-        # Milestone-0 V_0 proxy: the average terminal utility, computed by evaluating
-        # the fitted C_T at the realized terminal slice with zero inventory (the
-        # canonical "hold no hedge to T" baseline). This is the value of NO hedging,
-        # not the optimal V_0 — that requires the full backward sweep (M3). The
-        # baseline E[U(K-S_T)] sets the floor the backward sweep should improve over.
-        with torch.no_grad():
-            t_T = self.t_outer - 1
-            B = self._B()
-            market_T = traj[t_T]["market"]                       # (B, market_dim)
-            tradables_T = traj[t_T]["tradables"]                 # (B, n_hedge)
-            n_h = len(self.hedges)
-            positions = torch.zeros(B, n_h, device=self.device)
-            # Buy-and-hold wealth at T under no hedge: cash carried forward minus
-            # liability cashflow. The framework's MTM-invariant w = cash +
-            # (Σq − 1)·S + K with q=0 gives w_T = cash_T − S_T + K. For Milestone 0
-            # we use the bundle's initial wealth (cash carried forward, no funding
-            # cost) so w_T = initial_W − S_T + K. Reading S_T off the spot factor
-            # snapshot directly — bypasses the deal pricer for this sanity check.
-            spot_T = self._outer_buf[self._spot_key][-1].to(self.device)         # (B,)
-            initial_w = float(self.bundle.get("initial_wealth", 100.0))
-            K_strike = 100.0   # toy spec — promote to JSON in M1.
-            wealth_T = initial_w + K_strike - spot_T
-            zero_b = torch.zeros(B, device=self.device)
-            time_to_t_T = torch.zeros(B, device=self.device)     # terminal: 0
-            static_T = self._static_sim[-1].to(self.device).expand(
-                B, self._static_sim.shape[-1])
-            z_query = _assemble_deep_state(
-                positions=positions, g=wealth_T, a=zero_b,
-                futures=tradables_T, market=market_T, static=static_T,
-                time_to_t=time_to_t_T)
-            terminal_values = self._C_full(self.C[t_T], z_query)  # (B,)
-            v0_estimate = float(terminal_values.mean())
-            # Compare to closed-form expected terminal utility under buy-and-hold
-            # for a sanity check.
-            c_util = max(float(self.bundle.get("utility_scale", 100.0)), 1.0)
-            truth_per_path = torch.sign(wealth_T) * torch.log1p(wealth_T.abs() / c_util)
-            truth_mean = float(truth_per_path.mean())
-            v0_residual = v0_estimate - truth_mean
-
-        logging.info(
-            "DifferentialSolver Milestone 0 complete: E[U(W_T) | no-hedge] via "
-            "fitted C_T = %.4f; closed-form = %.4f; residual = %.4f (NN fit error). "
-            "Backward sweep deferred to M1+.",
-            v0_estimate, truth_mean, v0_residual)
+        n_h = len(self.hedges)
 
         # --- Backward sweep: fit C_{t} for t = T_outer-2 down to t_min with M2's
         # audit-correct loop. At sweep entry we partition the B_outer paths into one
@@ -3146,7 +3132,7 @@ class DifferentialSolver:
                 grad_sanity[t_s] = self._grad_sanity_check(t_s)
 
         # V_0 estimate via the decision operator at t_min: q*_t_min = argmax_q
-        # C[t_min](post_state_t_min(q)). For the M1.5 toy (t_min = T_A - 1) this is
+        # C[t_min](post_state_t_min(q)). For the M1.5 path (t_min = T_A - 1) this is
         # the value at the first multi-contract decision step. For M3 (t_min = 0)
         # this is the true V_0.
         with torch.no_grad():
@@ -3219,18 +3205,18 @@ class DifferentialSolver:
         b = self._B()
         actions_stacked = torch.zeros(self.t_outer, b, n_h)
         values_stacked = torch.full((self.t_outer, b), float("nan"))
-        values_stacked[self.t_outer - 1] = v0_estimate
+        values_stacked[self.t_outer - 1] = v0_decision
         return SolverResult(
             solver_name="DifferentialSolver",
             actions=actions_stacked.detach().cpu(),
             values=values_stacked.detach().cpu(),
             value_fn_artifacts={},
             diagnostics={
-                "V_0": v0_estimate,                # dispatcher convention
-                "n_star_0": torch.zeros(n_h).tolist(),
-                "v0_estimate": v0_estimate,
-                "v0_closedform_no_hedge": truth_mean,
-                "v0_nn_fit_residual": v0_residual,
+                # Headline V_0 = the backward-sweep decision value at t_min (the actual
+                # optimal-policy value). Dispatcher convention: every solver exposes its
+                # headline under "V_0" (read by `_result_v0` → `v0_mean`).
+                "V_0": v0_decision,
+                "n_star_0": q_opt_mean if q_opt_mean is not None else torch.zeros(n_h).tolist(),
                 "milestone": 1,
                 **diag,
                 **{f"M1_{k}": v for k, v in m1_diag.items()},
