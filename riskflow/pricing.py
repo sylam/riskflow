@@ -50,7 +50,11 @@ def extract_spot_deltas(value_tensor, scenario_buffer):
     out = {}
 
     for key, leaf in leaves.items():
-        delta = torch.zeros_like(value_tensor)
+        # Delta carries the VALUE's time dimension but the LEAF's trailing (curve) dims:
+        # a scalar factor leaf (T_scen, B) → delta (T_, B); a curve factor leaf (e.g. a
+        # forward-rate carry curve) (T_scen, n_tenors, B) → delta (T_, n_tenors, B), one
+        # per-tenor sensitivity. (For a scalar leaf this matches zeros_like(value_tensor).)
+        delta = value_tensor.new_zeros((T_,) + tuple(leaf.shape[1:]))
         for t in range(T_):
             grads = torch.autograd.grad(
                 value_tensor[t].sum(), leaf,
@@ -58,9 +62,9 @@ def extract_spot_deltas(value_tensor, scenario_buffer):
             )
             g = grads[0]
             if g is not None:
-                # g has shape (T_scen, B). For per-(t,b) diagonal, take row t.
-                # If the scenario grid != mtm grid, you'd index via Time_dep mapping;
-                # for the common case where they match, plain row indexing works.
+                # g has the leaf's shape (T_scen, [n_tenors,] B). For the per-(t, ·)
+                # diagonal, take row t. If the scenario grid != mtm grid, you'd index via
+                # Time_dep mapping; for the common case where they match, plain row works.
                 delta[t] = g[t]
         out[utils.check_tuple_name(key)] = delta.detach()
 

@@ -79,6 +79,16 @@ def _slice_bundle_episodes(bundle, episode_indices):
             }
             for tradable, by_factor in bundle["hedge_ratios"].items()
         }
+    # forward_jacobian: same 2-deep {tradable: {factor: (T, [n_tenors,] B)}} shape as
+    # hedge_ratios; _slice_episode_tensor slices the trailing batch axis for 2D and 3D alike.
+    if bundle.get("forward_jacobian"):
+        sliced["forward_jacobian"] = {
+            tradable: {
+                factor: _slice_episode_tensor(t, episode_indices, batch_size)
+                for factor, t in by_factor.items()
+            }
+            for tradable, by_factor in bundle["forward_jacobian"].items()
+        }
     for scalar_key in ("last_settlement_index", "time_grid_days_cpu", "total_leg_volume",
                         "scenario_dates", "business_indices", "utility_scale"):
         if scalar_key in bundle:
@@ -2084,6 +2094,16 @@ def build_torchrl_bundle(base_date, business_day, time_grid_days, tradable_block
         hedge_ratios_pre_pad[tradable_name] = {
             name: torch.cat([block[name] for block in blocks], dim=1) for name in factor_names
         }
+    fwd_jac_blocks = hedge_profile_blocks.get('forward_jacobian') or {}
+    fwd_jac_pre_pad = {}
+    for tradable_name, blocks in fwd_jac_blocks.items():
+        if not blocks:
+            continue
+        factor_names = list(blocks[0].keys())
+        fwd_jac_pre_pad[tradable_name] = {
+            # Batch is the trailing axis for both scalar (T, B) and curve (T, n_tenors, B) deltas.
+            name: torch.cat([block[name] for block in blocks], dim=-1) for name in factor_names
+        }
     realized_cashflows = {
         currency: torch.cat(blocks, dim=1)
         for currency, blocks in (hedge_profile_blocks.get('realized_cashflows') or {}).items()
@@ -2125,6 +2145,21 @@ def build_torchrl_bundle(base_date, business_day, time_grid_days, tradable_block
                     padded = torch.cat([tensor, zeros], dim=0)
                 hedge_ratios[tradable_name][factor_name] = padded
         bundle['hedge_ratios'] = hedge_ratios
+    # Per-(tradable, factor) forward Jacobian ∂F_h/∂θ — same zero-pad-post-expiry as ratios;
+    # shape[1:] preserves the trailing curve dims for multi-tenor factors.
+    if fwd_jac_pre_pad:
+        forward_jacobian = {}
+        for tradable_name, by_factor in fwd_jac_pre_pad.items():
+            forward_jacobian[tradable_name] = {}
+            for factor_name, tensor in by_factor.items():
+                cur_T = int(tensor.shape[0])
+                if cur_T >= aligned_time_steps:
+                    padded = tensor[:aligned_time_steps]
+                else:
+                    zeros = tensor.new_zeros((aligned_time_steps - cur_T,) + tuple(tensor.shape[1:]))
+                    padded = torch.cat([tensor, zeros], dim=0)
+                forward_jacobian[tradable_name][factor_name] = padded
+        bundle['forward_jacobian'] = forward_jacobian
     if realized_cashflows:
         bundle['realized_cashflows'] = {
             currency: pad_time_axis(tensor, aligned_time_steps)

@@ -2417,8 +2417,14 @@ class DifferentialSolver:
             # (Σq·cs − R_t)·sym′`. A detached `liability_mtm[t+1]−liability_mtm[t]`
             # lookup would break the gradient label and resurrect the diff-loss
             # instability (the same class that originally forced w_diff=0).
-            spot_h_idx = 0   # first hedge as spot proxy (near-month future)
-            dS = F_t1[:, spot_h_idx] - bank["F_at_t"][:, spot_h_idx]
+            # Liability marks against the deal's reference SPOT, basis-free — NOT the front
+            # future. A futures move splits into spot content (hedgeable: offsets the liability)
+            # and basis/carry content (hedge-book tracking noise: never touches the liability).
+            # `dL = R_t·dF_0` conflated the two; `dL = R_t·d(spot)` keeps the liability on the
+            # hedgeable channel only. spot_t is the AAD leaf the fork seeded; spot_{t+1} its
+            # one-step evolution — both on the tape, so ∂(dL)/∂spot is exact and basis-free.
+            spot_t = inner["state_t_leaves"][self._spot_key][bank["outer_index"]]   # (N,)
+            dS = inner["spot_t1"][bank["outer_index"], 0] - spot_t                  # (N,) AAD-live
             R_t_scalar = float(self._liability_R[t].item())
             pnl_hedges = ((q_t_sampled * self.contract_size
                            * (F_t1 - bank["F_at_t"])).sum(dim=-1))
@@ -2498,6 +2504,27 @@ class DifferentialSolver:
                 for j, h in enumerate(self.hedges):
                     if live_t[j]:
                         dy_dz[:, F_col_start + j] += g_per_row
+
+        # Price-differential gate (diagnostic): snapshot the RAW pathwise ∂Y_boot/∂F_h
+        # on the live tradable_prices columns BEFORE the advantage-decomp baseline
+        # subtraction, so the gate isolates the spot→forward projection itself (∂B/∂F
+        # is per-contract and would otherwise mask the bug). The spot-broadcast makes
+        # every live F-column identical → distinctness ≡ 0; a correct per-contract
+        # projection makes them differ. Keyed by t (first round wins); only recorded
+        # where ≥2 hedges are live (the broadcast is invisible with a single live col).
+        if not hasattr(self, "_price_diff_gate"):
+            self._price_diff_gate = {}
+        if t not in self._price_diff_gate:
+            live_cols = [F_col_start + j for j in range(n_h) if live_t[j]]
+            if len(live_cols) >= 2:
+                col_means = dy_dz[:, live_cols].mean(dim=0)            # (n_live,)
+                spread = (col_means.max() - col_means.min()).abs()
+                scale = col_means.abs().max() + 1.0e-12
+                self._price_diff_gate[t] = {
+                    "n_live": len(live_cols),
+                    "raw_fcol_distinctness": float(spread / scale),
+                    "raw_fcol_means": [float(v) for v in col_means],
+                }
 
         # Advantage decomposition: subtract B_t(z_t) from the value label so the
         # NN fits the residual A_t = C_t − B_t, and convert the gradient label to
@@ -3174,6 +3201,10 @@ class DifferentialSolver:
                                   for t_s, g in grad_sanity.items()},
             "v0_decision_at_t_min": v0_decision,
             "q_opt_t_min_mean": q_opt_mean,
+            # Price-differential gate: per-t raw ∂Y_boot/∂F_h distinctness across live
+            # contracts (recorded only where ≥2 are live). Surfaces as
+            # M1_price_diff_gate_at_t. 0 ⇒ the broadcast bug; >0 ⇒ per-contract slopes.
+            "price_diff_gate_at_t": dict(getattr(self, "_price_diff_gate", {})),
         }
         # Production validation: BSS sandwich lower bound L (realised $/oz of the
         # policy on a fresh MC set). Runs unconditionally; computes mean, p5/p95,
