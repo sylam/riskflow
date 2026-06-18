@@ -1640,6 +1640,13 @@ class DifferentialSolver:
         # transition without committing to the full 30-step sweep. Configurable via
         # JSON `Solver.T_Min`; default 0 = sweep all the way to the initial decision.
         self.t_min = int(solver_cfg.get("t_min", 0))
+        # BSS sandwich (validation_sandwich_spec §4.1): the penalty's zero-mean dual-feasibility
+        # is graded on the INTERIOR, excluding the last `Penalty_Boundary_Steps` steps where the
+        # inner fork's latent-regime resimulation disperses the one-step move a few % more than
+        # the outer sim, leaving a small bounded Δ-ramp at the horizon edge (a variance effect;
+        # drift/dt/σ are identical fork-vs-outer). Reported, not chased — the U-DP handles the
+        # terminal force-flat specially. Default 2.
+        self._penalty_boundary_steps = int(solver_cfg.get("penalty_boundary_steps", 2))
 
         self.hedges = list(runtime["names"]["hedges"])
         # T_outer-1 decision points: t=0..T-2 (DP convention). C[T_outer-1] is the
@@ -1657,6 +1664,29 @@ class DifferentialSolver:
         market_t0 = self._read_privileged_market(t=0)
         market_dim = market_t0.shape[-1]
         self.statepack = StatePack.from_bundle(bundle, runtime, market_dim)
+
+        # Locate the spot factor's sub-coordinates within the market block. The privileged
+        # CommodityPrice block is [belief(n_states), spot_price(1)] (calculation.py
+        # `_extract_outer_state_at`): split it so the belief differential reads the regime
+        # columns and the baseline / spot label read the spot-price column. Walk the same
+        # factor-iteration order `_read_privileged_market` concatenates in. Both default to
+        # None (factor absent / no belief / no price) and callers guard accordingly.
+        self._regime_cols_in_market = None
+        self._spot_cols_in_market = None
+        _spot_proc0 = self._calc.stoch_factors_inner.get(self._spot_key)
+        _n_states0 = int(getattr(_spot_proc0, 'n_states', 0) or 0)
+        _col = 0
+        for _key in self._calc.stoch_factors_inner:
+            if _key.type in utils.DimensionLessFactors:
+                continue
+            _width = self._calc._extract_outer_state_at(
+                0, _key, self._outer_buf, privileged=True).shape[0]
+            if _key == self._spot_key and _width > 0:
+                self._regime_cols_in_market = (_col, _col + _n_states0)
+                if _width > _n_states0:
+                    self._spot_cols_in_market = (_col + _n_states0, _col + _width)
+                break
+            _col += _width
 
         # Trained continuation functions, one per backward index. None until fit.
         self.C = [None] * t_outer
@@ -1786,19 +1816,8 @@ class DifferentialSolver:
                     self._dt_per_step = float(int(days[1]) - int(days[0])) / 365.25
                 else:
                     self._dt_per_step = 7.0 / 365.25      # degenerate single-point-grid fallback
-                # Discover regime col range in the market block by replicating
-                # `_read_privileged_market`'s column accounting.
-                col = 0
-                self._regime_cols_in_market = None
-                for key in self._calc.stoch_factors_inner:
-                    if key.type in utils.DimensionLessFactors:
-                        continue
-                    width = self._calc._extract_outer_state_at(
-                        0, key, self._outer_buf, privileged=True).shape[0]
-                    if key == self._spot_key and width > 0:
-                        self._regime_cols_in_market = (col, col + width)
-                        break
-                    col += width
+                # Regime col range was located once in __init__ (`_regime_cols_in_market`,
+                # split from the [belief, spot_price] block); reuse it here.
                 if self._regime_cols_in_market is None:
                     self._advantage_decomp = False
                     logging.warning(
@@ -1996,7 +2015,13 @@ class DifferentialSolver:
         # ∂A/∂z = ∂C/∂z − ∂B/∂z, so a units mismatch here corrupts the labels.
         # `_dB_dz` (autograd through this method) inherits the change for free.
         sum_q = (positions * self.contract_size).sum(dim=-1)         # (..., )
-        S = futures[..., 0]                                          # spot tracker
+        # Mark against the real reference spot (the observable LME spot column in the market
+        # block), basis-free — the liability marks to spot, NOT the front future (which carries
+        # basis+carry). Fall back to the front future only when no spot column is present.
+        if self._spot_cols_in_market is not None:
+            S = market[..., self._spot_cols_in_market[0]]            # observable spot
+        else:
+            S = futures[..., 0]                                      # legacy front-future proxy
         r_lo, r_hi = self._regime_cols_in_market
         belief = market[..., r_lo:r_hi]                              # (..., n_states)
         # Production `time_to_T` is integer-valued (assembled as `T−1−t` at every
@@ -2358,15 +2383,16 @@ class DifferentialSolver:
         rows via the spec §4/§12 one-step-bootstrap pipeline:
           • sample q_t spanned across the action grid (per-row anchor)
           • assemble `z_t` post-decision after applying q_t
-          • call `bundle['inner_mc_grad_fn_one_step'](t)` ONCE per call
-            (AAD-attached `market_{t+1}` + per-process `state_t_leaves`)
-          • propagate to t+1 (MTM-invariant wealth)
+          • re-price t+1 on the REALIZED outer path (NO inner-MC fork): spot[t] the sole
+            pricing leaf, spot[t+1] its analytic re-seed, F/L from the persisted Jacobians,
+            belief[t+1] from a one-step filter on the realized move (belief[t] a leaf)
           • decision at t+1 via `argmax_q C_next(post_{t+1}(q))` (q* detached)
           • `Y_boot = C_next(post_{t+1}(q*))`
           • `dy_dz` via `autograd.grad(Y_boot, leaves)` + closed-form wealth chain
         Used both by initial training-bank label gen and by per-round correction-row
-        label gen (M2). The expensive inner-MC fork runs ONCE per call; M2's
-        audit-correct loop re-invokes this method per round on a grown bank."""
+        label gen (M2); re-invoked per round on a grown bank by M2's audit-correct loop.
+        Fork-free: makes ZERO `inner_mc_grad_fn_one_step` calls (that machinery remains for
+        the offline LSM yardstick only)."""
         N = bank["wealth_pre"].shape[0]
         n_h = len(self.hedges)
         device = self.device
@@ -2387,83 +2413,161 @@ class DifferentialSolver:
             F=bank["F_at_t"], time_to_T=bank["time_to_T"],
             static=bank["static"])
 
-        # --- One-step inner-MC fork at t (grad-enabled) ---
+        # --- One-step pathwise bootstrap label (real t+1 MtMs, spot[t] the sole pricing leaf) ---
+        # Fully reconstructed on the REALIZED outer path — no inner-MC fork. spot[t] is the sole
+        # pricing leaf; spot[t+1] is its analytic one-step re-seed (the spot is a regime random
+        # walk, so the increment is independent of spot_t ⇒ exact derivative, lands on the
+        # realized value); F_h and L at t and t+1 are reconstructed first-order from the
+        # persisted Jacobians J_F = ∂F/∂spot, J_L = ∂L/∂spot. Because J = G'(realized), the
+        # linear reconstruction equals the true slice re-price AT the realized point — exact
+        # value AND exact gradient — so no re-simulation is needed. Uses the OUTER spot process
+        # (precalculated on the outer grid; the inner proc's grid/state is for the LSM fork).
+        oi = bank["outer_index"]
+        t1 = min(t + 1, self.t_outer - 1)
+        spot_proc = self._calc.stoch_factors.get(self._spot_key)
+        spot_name = utils.check_tuple_name(self._spot_key)
+        hist = int(self.bundle.get("initial_time_index", 0))
+        # Realized endpoints. The outer spot buffer + tradables_sim views are sim-grid; the
+        # forward/liability Jacobians are sim-grid (NOT history-prefixed); liability_mtm IS
+        # history-prefixed (→ +hist). See torchrl_hedge._prepend_history_prefix.
+        spot_t_real = self._outer_buf[self._spot_key][t][oi]                  # (N,)
+        spot_t1_real = self._outer_buf[self._spot_key][t1][oi]                # (N,)
+        F_t1_real = torch.stack(
+            [self._tradables_sim[h][t1].to(self.device)[oi] for h in self.hedges], dim=-1)  # (N,n_h)
+        liab_mtm = self.bundle["liability_mtm"]                               # (hist+T, B)
+        L_t_real = liab_mtm[hist + t][oi]                                     # (N,)
+        L_t1_real = liab_mtm[hist + t1][oi]                                   # (N,)
+        zeroN = torch.zeros_like(spot_t_real)
+        fwd_jac = self.bundle.get("forward_jacobian", {})
+        liab_jac = self.bundle.get("liability_jacobian", {})
+
+        def _spot_jac(table, ti):
+            d = table.get(spot_name) if table is not None else None
+            return d[ti][oi] if d is not None else zeroN
+
+        JF_t = torch.stack([_spot_jac(fwd_jac.get(h, {}), t) for h in self.hedges], dim=-1)   # (N,n_h)
+        JF_t1 = torch.stack([_spot_jac(fwd_jac.get(h, {}), t1) for h in self.hedges], dim=-1) # (N,n_h)
+        JL_t = _spot_jac(liab_jac, t)                                         # (N,)
+        JL_t1 = _spot_jac(liab_jac, t1)                                       # (N,)
+        time_to_T_t1 = bank["time_to_T"] - 1.0                               # (N,)
+
+        # --- Fork-free t+1 market: read the realized privileged outer slice (carry, belief,
+        # spot, basis at the realized t+1); no inner-MC re-simulation, so the bootstrap state IS
+        # the realized outer path — every column from the same t+1 ⇒ the value is coherent.
+        market_t1_realized = self._read_privileged_market(t1)[oi]            # (N, market_dim)
+
+        # Belief differential (fork-free): seed a LEAF from the realized belief[t] and run ONE
+        # outer-grid filter step on the realized move → belief[t+1]. This EQUALS the belief the
+        # outer filter wrote to the buffer (value-coherent) but carries ∂belief[t+1]/∂belief[t],
+        # so the twin loss supervises the belief column. Independent of the spot leaf. Gated on
+        # the belief-filter flag; off ⇒ belief stays the detached realized value (no diff label).
+        belief_leaf = None
+        belief_t1_outer = None
+        belief_buf = self._outer_buf.get((self._spot_key, 'regime_belief'))
+        if (self._calc._inner_belief_filter and belief_buf is not None
+                and self._regime_cols_in_market is not None):
+            spot_t_outer = self._outer_buf[self._spot_key][t]               # (B_outer,)
+            spot_t1_outer = self._outer_buf[self._spot_key][t1]
+            belief_leaf = belief_buf[t].detach().clone().requires_grad_(True)   # (n_states, B_outer)
+            with torch.enable_grad():
+                belief_t1_outer = spot_proc.forward_belief_onestep(
+                    belief_leaf, spot_t_outer, spot_t1_outer, t1)           # (n_states, B_outer)
+            if not getattr(self, '_logged_belief_recon', False):
+                self._logged_belief_recon = True
+                logging.info(
+                    'DifferentialSolver realized-path belief differential ACTIVE (fork-free '
+                    'one-step filter; n_states=%d) — the belief column carries '
+                    '∂belief_{t+1}/∂belief_t on the realized move, replacing the inner-MC '
+                    'belief leaf; calibration is the outer filter (unchanged).',
+                    int(belief_t1_outer.shape[0]))
+
         with torch.enable_grad():
-            inner = self.bundle["inner_mc_grad_fn_one_step"](t)
-            market_t1 = inner["market_t1"]                            # (B_outer, B_inner_per, market_dim)
-            # Use a single representative inner draw per outer; M=1 per spec §6/§9.
-            market_t1 = market_t1[:, 0, :]                            # (B_outer, market_dim)
-            # F at t+1 for live hedges — index by outer_index, single inner draw.
-            F_t1_per_h = []
-            for h in self.hedges:
-                f = inner["F_t1"].get(h)
-                if f is None:
-                    # Closed hedge (past expiry): tradable freezes at expiry value.
-                    F_t1_per_h.append(bank["F_at_t"][:, self.hedges.index(h)])
-                else:
-                    F_t1_per_h.append(f[bank["outer_index"], 0])      # (N,)
-            # Stack into (N, n_h). Per-outer alignment via bank["outer_index"].
-            F_t1 = torch.stack(F_t1_per_h, dim=-1)                    # (N, n_h)
-            # Market at t+1 indexed by outer_index → (N, market_dim).
-            market_t1_per_row = market_t1[bank["outer_index"]]
+            # z_{t+1}'s market: realized columns, with the belief columns overridden by the
+            # grad-connected one-step filter (the spot column is overridden per-spot inside the
+            # closure). carry/basis stay realized-detached → fully coherent on the realized path.
+            market_t1_per_row = market_t1_realized
+            if belief_t1_outer is not None:
+                r_lo, r_hi = self._regime_cols_in_market
+                market_t1_per_row = market_t1_per_row.clone()
+                market_t1_per_row[:, r_lo:r_hi] = belief_t1_outer[:, oi].T   # (N, n_states), grad
 
-            # Wealth evolution: hedge PnL minus liability MTM change.
-            # Linear average-rate liability has the closed form `dL = R_t · dS`
-            # where R_t is the remaining-fixing-weights sum (deal units) and
-            # dS is the spot move. Critically, `dS` is on the AAD tape (built
-            # from `F_t1` which the inner-MC fork attached as a leaf), so the
-            # gradient label on the spot column carries BOTH hedge (`+q·cs·sym′`)
-            # AND liability (`−R_t·sym′`) sensitivity — true `∂C/∂S ≈
-            # (Σq·cs − R_t)·sym′`. A detached `liability_mtm[t+1]−liability_mtm[t]`
-            # lookup would break the gradient label and resurrect the diff-loss
-            # instability (the same class that originally forced w_diff=0).
-            # Liability marks against the deal's reference SPOT, basis-free — NOT the front
-            # future. A futures move splits into spot content (hedgeable: offsets the liability)
-            # and basis/carry content (hedge-book tracking noise: never touches the liability).
-            # `dL = R_t·dF_0` conflated the two; `dL = R_t·d(spot)` keeps the liability on the
-            # hedgeable channel only. spot_t is the AAD leaf the fork seeded; spot_{t+1} its
-            # one-step evolution — both on the tape, so ∂(dL)/∂spot is exact and basis-free.
-            spot_t = inner["state_t_leaves"][self._spot_key][bank["outer_index"]]   # (N,)
-            dS = inner["spot_t1"][bank["outer_index"], 0] - spot_t                  # (N,) AAD-live
-            R_t_scalar = float(self._liability_R[t].item())
-            pnl_hedges = ((q_t_sampled * self.contract_size
-                           * (F_t1 - bank["F_at_t"])).sum(dim=-1))
-            dL = R_t_scalar * dS                                     # (N,) AAD-live
-            wealth_pre_t1 = wealth_post_t + pnl_hedges - dL          # (N,)
+            # F-column hedge-book probe: a per-(row, hedge) ZERO leaf added to the position's
+            # entry price F_j(t). It enters Y_boot ONLY through the hedge PnL (not a coordinate
+            # of z_{t+1}), so ∂Y_boot/∂f_delta_j = ∂C_t/∂F_j(t) is the PURE hedge-book partial
+            # (spot held fixed) — the liability is a function of spot, not F_j, so it lives on
+            # ∂C/∂spot (once, total), NEVER on the F-columns. Per-contract via the position q_j.
+            f_delta = torch.zeros_like(bank["F_at_t"]).requires_grad_(True)  # (N, n_h)
+            spot_col = (self._spot_cols_in_market[0]
+                        if self._spot_cols_in_market is not None else None)
 
-            time_to_T_t1 = bank["time_to_T"] - 1.0                    # (N,)
-            # Decision at t+1 — external argmax over frozen C_next. q* detached.
+            def _y_boot_of_spot(spot_t, q_star, move_entry_F=True):
+                """Re-price t+1 from the realized path. `spot_t` always drives the predictive
+                channel — the re-seeded spot[t+1] → F_h[t+1], L[t+1], and the spot COLUMN of
+                z_{t+1} — and the liability's contemporaneous mark L[t] (the liability is a
+                function of spot, not a hedge coordinate). The contemporaneous ENTRY-price
+                channel (∂F_h[t]/∂spot) is included only when `move_entry_F`: it is the
+                F-columns' job, so the spot-column PARTIAL holds the current F_h fixed
+                (`move_entry_F=False`). The total (`True`) is kept only for the
+                `total = partial + Σ_h ∂C/∂F_h·∂F_h/∂spot` cross-check. q* frozen (envelope)."""
+                spot_t1 = spot_proc.reseed_one_step(spot_t, spot_t_real, spot_t1_real)  # (N,)
+                d_t = (spot_t - spot_t_real).unsqueeze(-1)                   # (N,1)
+                d_t1 = (spot_t1 - spot_t1_real).unsqueeze(-1)               # (N,1)
+                F_t = bank["F_at_t"] + f_delta                              # (N,n_h)
+                if move_entry_F:
+                    F_t = F_t + JF_t * d_t                                  # contemporaneous entry channel
+                F_t1 = F_t1_real + JF_t1 * d_t1                             # (N,n_h) forward channel
+                L_t = L_t_real + JL_t * d_t.squeeze(-1)                      # (N,) liability marks to spot
+                L_t1 = L_t1_real + JL_t1 * d_t1.squeeze(-1)                  # (N,)
+                pnl_hedges = (q_t_sampled * self.contract_size * (F_t1 - F_t)).sum(dim=-1)
+                wealth_pre_t1 = wealth_post_t + pnl_hedges - (L_t1 - L_t)    # (N,)
+                cost_t1 = self._turnover(q_star, q_t_sampled, F_t1)
+                wealth_post_t1 = wealth_pre_t1 - cost_t1
+                # z_{t+1}'s spot coordinate = the re-seeded spot[t+1] (grad-connected), so the
+                # predictive channel ∂C_{t+1}/∂spot_{t+1}·∂spot_{t+1}/∂spot_t flows into the
+                # label. The fork's market carries an inner-draw price there; override it with
+                # the realized re-seed so the bootstrap state is coherent on the realized path.
+                market_t1 = market_t1_per_row
+                if spot_col is not None:
+                    market_t1 = market_t1.clone()
+                    market_t1[:, spot_col] = spot_t1
+                z_t1 = self._assemble_z(
+                    market=market_t1, q=q_star, wealth=wealth_post_t1,
+                    F=F_t1, time_to_T=time_to_T_t1, static=bank["static"])
+                return self._C_full(C_next, z_t1)
+
+            # Decision at t+1 — external argmax over frozen C_next at the realized spot.
+            # Envelope theorem: q* frozen, so ∂max_q/∂spot = ∂/∂spot at the optimizing q*.
+            with torch.no_grad():
+                pnl_real = (q_t_sampled * self.contract_size
+                            * (F_t1_real - bank["F_at_t"])).sum(dim=-1)      # (N,)
+                dL_real = L_t1_real - L_t_real                               # (N,)
+                wp_t1_real = wealth_post_t + pnl_real - dL_real             # (N,)
             q_star_t1, _, action_gap = self._decision_at(
-                C_next, market_t1_per_row, F_t1, q_t_sampled,
-                wealth_pre_t1, time_to_T_t1, bank["static"], min(t + 1, self.t_outer - 1))
+                C_next, market_t1_per_row, F_t1_real, q_t_sampled,
+                wp_t1_real, time_to_T_t1, bank["static"], t1)
             q_star_t1 = q_star_t1.detach()
-            # Post-decision wealth at t+1 (action q* applied).
-            cost_t1 = self._turnover(q_star_t1, q_t_sampled, F_t1)
-            wealth_post_t1 = wealth_pre_t1 - cost_t1                  # (N,)
-            # Post-decision state at t+1 — AUTOGRAD-CONNECTED to spot leaves via
-            # market_t1 / F_t1 / wealth_pre_t1 / wealth_post_t1.
-            z_t1 = self._assemble_z(
-                market=market_t1_per_row, q=q_star_t1,
-                wealth=wealth_post_t1, F=F_t1,
-                time_to_T=time_to_T_t1, static=bank["static"])
-            # Bootstrap value: the single grad-enabled eval of C_next. Advantage
-            # decomp: `_C_full` adds the closed-form baseline at t+1, so Y_boot is
-            # the FULL value (baseline + NN residual). The NN at t is then trained
-            # against Y_boot − B_t(z_t) — fitting only the small bounded residual.
-            Y_boot = self._C_full(C_next, z_t1)                       # (N,)
+            cost_t1_real = self._turnover(q_star_t1, q_t_sampled, F_t1_real).detach()
 
-            # Differential label: ∂Y_boot/∂state_t_leaves. Single backward pass.
-            leaves = inner["state_t_leaves"]
-            leaf_keys = list(leaves.keys())
-            leaf_list = [leaves[k] for k in leaf_keys]
-            leaf_grads = torch.autograd.grad(
-                Y_boot.sum(), leaf_list, retain_graph=False, allow_unused=True)
+            # Bootstrap value + its differential label, single backward pass. `_C_full` adds
+            # the closed-form baseline at t+1 ⇒ Y_boot is the FULL value (baseline + residual).
+            # The spot-column label is the PARTIAL (move_entry_F=False): holding the current
+            # F_h fixed, since the F-columns carry ∂C/∂F_h. The VALUE is identical either way
+            # at the realized point (d_t=0), so Y_boot is correct for y_target regardless.
+            spot_t_leaf = spot_t_real.detach().clone().requires_grad_(True)  # (N,)
+            Y_boot = _y_boot_of_spot(spot_t_leaf, q_star_t1, move_entry_F=False)   # (N,)
+            grad_leaves = ([f_delta, spot_t_leaf]
+                           + ([belief_leaf] if belief_leaf is not None else []))
+            all_grads = torch.autograd.grad(
+                Y_boot.sum(), grad_leaves, retain_graph=False, allow_unused=True)
+            f_delta_grad = all_grads[0]                                      # (N,n_h) = ∂C/∂F_j(t)
+            g_spot = all_grads[1]                                           # (N,) = ∂C/∂spot|_F (partial)
+            belief_grad = all_grads[2] if belief_leaf is not None else None
 
-        # Project leaf gradients to deep-state F_t columns. The spot leaf (whose value
-        # equals F_t for live tradables — forward=spot) maps to all live tradable_prices
-        # columns; per-row alignment via outer_index. Other leaves (carry curve,
-        # basis if differentiable) are skipped here for now; promote to a full
-        # projection in M3 when richer underlyings come online.
+        # Assemble the differential label dy_dz on its three supervised column groups:
+        #   • tradable_prices F_j  ← the f_delta hedge-book probe (∂C_t/∂F_j, per-contract)
+        #   • wealth (cash slot)   ← the closed-form ∂C/∂wealth pass below
+        #   • belief (market block)← the inner-belief seed-leaf gradient
+        # Every other column is an uncomputed zero (masked out of the diff loss).
         dy_dz = torch.zeros_like(z_t)
         F_col_start = self.statepack.n_hedge + 2          # tradable_prices block start
         # Wealth gradient: ∂Y_boot/∂wealth_post_t = ∂Y_boot/∂wealth_post_t+1 (chain
@@ -2471,60 +2575,172 @@ class DifferentialSolver:
         # Compute via a separate small autograd pass on a leaf-wealth construction.
         with torch.enable_grad():
             w_leaf = wealth_post_t.detach().clone().requires_grad_(True)
-            wealth_pre_t1_l = w_leaf + pnl_hedges.detach() - dL.detach()  # noqa
-            wealth_post_t1_l = wealth_pre_t1_l - cost_t1.detach()
+            wealth_pre_t1_l = w_leaf + pnl_real - dL_real            # realized-point, detached
+            wealth_post_t1_l = wealth_pre_t1_l - cost_t1_real
+            # Same z_{t+1} as the main bootstrap: override the spot column with the realized
+            # re-seed spot[t+1] (the fork's market carries an inner-draw price there). Without
+            # this the wealth pass evaluates C_next at a different spot than `Y_boot`, breaking
+            # the machine-tight hedge-book identity f_delta_grad == -dY_dw·q·cs.
+            market_w = market_t1_per_row.detach()
+            if spot_col is not None:
+                market_w = market_w.clone()
+                market_w[:, spot_col] = spot_t1_real
             z_t1_l = self._assemble_z(
-                market=market_t1_per_row.detach(), q=q_star_t1,
-                wealth=wealth_post_t1_l, F=F_t1.detach(),
+                market=market_w, q=q_star_t1,
+                wealth=wealth_post_t1_l, F=F_t1_real.detach(),
                 time_to_T=time_to_T_t1, static=bank["static"])
             Y_for_w = self._C_full(C_next, z_t1_l)
             dY_dw = torch.autograd.grad(Y_for_w.sum(), w_leaf)[0]    # (N,)
         wealth_col = self.statepack.n_hedge                          # cash slot
         dy_dz[:, wealth_col] = dY_dw
 
-        # Spot leaf gradient → live tradable_prices cols (CommodityPrice factor leaf);
-        # belief seed leaf → the belief columns of the market block. `belief_cols` is set
+        # F-column labels: ∂C_t/∂F_j(t) = the hedge-book partial read straight off the
+        # f_delta probe (dY_dw · ∂pnl/∂F_j = −dY_dw·q_j·cs_j). Per-contract by construction —
+        # the per-row position q_j differs across contracts — so the columns are genuinely
+        # distinct, NOT the spot-leaf broadcast (one number on every column). NO liability
+        # term: the liability is a function of spot, not F_j, so it does not appear in the
+        # partial (it lives on ∂C/∂spot, once, total).
+        for j in range(n_h):
+            if live_t[j]:
+                dy_dz[:, F_col_start + j] = f_delta_grad[:, j]
+
+        # Belief seed leaf → the belief columns of the market block. `belief_cols` is set
         # only when the inner belief filter populated a grad leaf, so it gates the unmask
         # below (one-hot fallback leaves the regime block detached → no slope → stay masked).
         belief_cols = None
-        for key, g in zip(leaf_keys, leaf_grads):
-            if g is None:
-                continue
-            if isinstance(key, tuple) and key[1] == 'regime_belief':
-                # g is (n_states, B_outer): ∂Y_boot/∂belief_t. Project per-row via
-                # outer_index onto the belief slice of the market block.
-                ms = 2 * self.statepack.n_hedge + 2
-                r_lo, r_hi = self._regime_cols_in_market
-                dy_dz[:, ms + r_lo : ms + r_hi] = g[:, bank["outer_index"]].T
-                belief_cols = (ms + r_lo, ms + r_hi)
-            elif getattr(key, 'type', None) == "CommodityPrice":
-                # g has leaf shape (B_outer,) for HMM spot. Project to all live
-                # tradable_prices cols, indexed by outer_index.
-                g_per_row = g[bank["outer_index"]]                   # (N,)
-                for j, h in enumerate(self.hedges):
-                    if live_t[j]:
-                        dy_dz[:, F_col_start + j] += g_per_row
+        if belief_leaf is not None and belief_grad is not None:
+            # belief_grad is (n_states, B_outer): ∂Y_boot/∂belief_t (flows through the inner
+            # filter's predict step into z_{t+1}). Project per-row via outer_index onto the
+            # belief slice of the market block.
+            ms = 2 * self.statepack.n_hedge + 2
+            r_lo, r_hi = self._regime_cols_in_market
+            dy_dz[:, ms + r_lo : ms + r_hi] = belief_grad[:, oi].T
+            belief_cols = (ms + r_lo, ms + r_hi)
 
-        # Price-differential gate (diagnostic): snapshot the RAW pathwise ∂Y_boot/∂F_h
-        # on the live tradable_prices columns BEFORE the advantage-decomp baseline
-        # subtraction, so the gate isolates the spot→forward projection itself (∂B/∂F
-        # is per-contract and would otherwise mask the bug). The spot-broadcast makes
-        # every live F-column identical → distinctness ≡ 0; a correct per-contract
-        # projection makes them differ. Keyed by t (first round wins); only recorded
-        # where ≥2 hedges are live (the broadcast is invisible with a single live col).
+        # Spot column ← the PARTIAL ∂C/∂spot|_F (holds the current F fixed; the F-columns carry
+        # the hedge-book partial, so this is the liability + predictive channel that ISN'T on
+        # them). This is the off-manifold (basis-direction) sensitivity collinear value data
+        # cannot identify — exactly what the differential label supplies.
+        spot_market_col = None
+        if self._spot_cols_in_market is not None and g_spot is not None:
+            spot_market_col = 2 * self.statepack.n_hedge + 2 + self._spot_cols_in_market[0]
+            dy_dz[:, spot_market_col] = g_spot
+
+        # Price-differential gate (diagnostic): snapshot the RAW pathwise ∂Y_boot/∂F_h on the
+        # live tradable_prices columns BEFORE the advantage-decomp baseline subtraction, so the
+        # gate isolates the hedge-book partial itself (∂B/∂F is per-contract and would otherwise
+        # mask the bug). Distinctness is measured PER ROW (mean over rows of the max−min across
+        # live columns), NOT spread-of-column-means: the hedge-book label −dY_dw·q_j·cs_j differs
+        # across contracts via the per-row position q_j, but q_j has ~the same MEAN across
+        # contracts, so a column-mean spread would wash the signal out. The spot-broadcast makes
+        # every live F-column identical PER ROW → per-row spread ≡ 0; the per-contract label makes
+        # them differ per row. Keyed by t (first round wins); recorded only where ≥2 hedges are
+        # live (the broadcast is invisible with a single live col).
         if not hasattr(self, "_price_diff_gate"):
             self._price_diff_gate = {}
         if t not in self._price_diff_gate:
-            live_cols = [F_col_start + j for j in range(n_h) if live_t[j]]
+            live_idx = [j for j in range(n_h) if live_t[j]]
+            live_cols = [F_col_start + j for j in live_idx]
             if len(live_cols) >= 2:
-                col_means = dy_dz[:, live_cols].mean(dim=0)            # (n_live,)
-                spread = (col_means.max() - col_means.min()).abs()
-                scale = col_means.abs().max() + 1.0e-12
+                cols = dy_dz[:, live_cols]                             # (N, n_live)
+                per_row_spread = (cols.max(dim=1).values - cols.min(dim=1).values).abs()
+                scale = cols.abs().max() + 1.0e-12
+                # Hedge-book correctness: ∂C_t/∂F_j MUST equal the analytic partial
+                # −dY_dw·q_j·cs_j (a price gradient is the position MtM, spot held fixed; no
+                # liability). f_delta_grad and dY_dw are the SAME wealth gradient, so this is
+                # machine-tight — it catches the broadcast (no q_j dependence), a missing
+                # dY_dw factor, or a wrong contract size, none of which the coarse distinctness
+                # metric can see.
+                analytic = -(dY_dw.unsqueeze(-1) * q_t_sampled * self.contract_size)  # (N, n_h)
+                num = (f_delta_grad[:, live_idx] - analytic[:, live_idx]).abs()
+                den = analytic[:, live_idx].abs() + 1.0e-8
                 self._price_diff_gate[t] = {
                     "n_live": len(live_cols),
-                    "raw_fcol_distinctness": float(spread / scale),
-                    "raw_fcol_means": [float(v) for v in col_means],
+                    "raw_fcol_distinctness": float(per_row_spread.mean() / scale),
+                    "raw_fcol_means": [float(v) for v in cols.mean(dim=0)],
+                    "hedgebook_rel_err": float((num / den).max()),
                 }
+
+        # Spot-gradient FD gate (permanent diagnostic): validate the one-step pathwise
+        # ∂Y_boot/∂spot stays on-graph and the re-seed/Jacobian reconstruction is numerically
+        # exact. (1) bump spot[t] ±ε, recompute Y_boot through the IDENTICAL reconstruction
+        # with q* frozen (envelope), compare the central difference to the autograd label —
+        # a detached channel / wrong sign / mis-indexed Jacobian gives an O(1) error; a correct
+        # on-graph reconstruction stays «1e-2 (float32 FD floor) on the bounded operating
+        # region (R_t≠0). Near terminal (R_t=0, fixings exhausted) the C_next hull-clamp adds a
+        # kink that inflates the FD difference — graded out, per the established "grade at
+        # bounded operating points, not the blow-up" methodology; `Rt` is recorded so the gate
+        # is never silently vacuous. (2) liability-sign anchor (theta-free): the persisted
+        # autograd liability spot-delta J_L_t must SIGN-agree with the trusted closed-form
+        # remaining-fixing weight R_t (both are ∂L/∂spot in deal units). FD-vs-autograd is
+        # blind to a wealth-equation liability sign flip (both sides flip together); this
+        # anchors it. The realized L[t+1]−L[t] also carries liability theta, so it legitimately
+        # differs from R_t·dS in magnitude — only the spot-delta SIGN is the invariant.
+        if not hasattr(self, "_spot_grad_fd_gate"):
+            self._spot_grad_fd_gate = {}
+        if t not in self._spot_grad_fd_gate and g_spot is not None:
+            with torch.no_grad():
+                # FD-vs-autograd on the PARTIAL (the label): bump spot ±ε through the SAME
+                # move_entry_F=False closure, q* frozen.
+                eps = 1.0e-3 * (spot_t_real.abs() + 1.0)                    # (N,)
+                y_plus = _y_boot_of_spot(spot_t_real + eps, q_star_t1, move_entry_F=False)
+                y_minus = _y_boot_of_spot(spot_t_real - eps, q_star_t1, move_entry_F=False)
+                g_fd = (y_plus - y_minus) / (2.0 * eps)                     # (N,)
+                fd_scale = g_spot.abs().median() + 1.0e-8
+                rel = (g_fd - g_spot).abs() / (g_spot.abs() + fd_scale)
+                R_t = float(self._liability_R[t].item())
+                if R_t != 0.0:
+                    sgn_R = torch.tensor(R_t, device=JL_t.device).sign()
+                    liab_sign = float((JL_t.sign() == sgn_R).float().mean())
+                    liab_ratio = float((JL_t / R_t).median())
+                else:
+                    liab_sign = float('nan')
+                    liab_ratio = float('nan')
+                # J_L-based liveness + sign, recorded at EVERY t (independent of R_t). The
+                # label uses J_L_t (the framework on-day liability spot-delta), whose live
+                # region extends one step past R_t's strict `fix_day > day_t` convention (the
+                # last-fixing boundary: R_t=0 but J_L≠0). So the R_t sign-anchor above is
+                # vacated there; the test re-anchors the sign on this J_L-live region instead,
+                # asserting J_L's sign stays consistent with the R_t≠0 region across the
+                # boundary (a wealth-equation liability flip would invert it everywhere).
+                jl_mean_abs = float(JL_t.abs().mean())
+                jl_sign_median = int(torch.sign(JL_t.median()).item())
+                # Belief-coherence gate: `forward_belief_onestep` is a DERIVED replication of
+                # the outer `_forward_belief` step — VERIFY it, don't trust the derivation. The
+                # reconstructed (grad-connected) belief[t+1] MUST equal the outer filter's
+                # published belief in the buffer; any off-by-one (P index, emission, predict-only
+                # guard) would mark z[t+1] with a slightly-wrong belief, silently re-introducing
+                # the value-incoherence the fork-free path removed. Expect ~1e-6.
+                if belief_t1_outer is not None and belief_buf is not None:
+                    belief_coherence = float(
+                        (belief_t1_outer.detach() - belief_buf[t1]).abs().max())
+                else:
+                    belief_coherence = float('nan')
+            # Decomposition cross-check: the F-moving TOTAL must equal the partial plus the
+            # contemporaneous entry channel, total = partial + Σ_h ∂C/∂F_h·∂F_h/∂spot, with
+            # ∂C/∂F_h = f_delta_grad and ∂F_h/∂spot = JF_t. Exact to autograd precision; proves
+            # the partial/total split is the right decomposition (no double-counted F channel).
+            with torch.enable_grad():
+                spot_leaf_tot = spot_t_real.detach().clone().requires_grad_(True)
+                Y_tot = _y_boot_of_spot(spot_leaf_tot, q_star_t1, move_entry_F=True)
+                g_spot_total = torch.autograd.grad(Y_tot.sum(), spot_leaf_tot)[0]
+            recon = g_spot + (f_delta_grad * JF_t).sum(dim=-1)
+            decomp_scale = g_spot_total.abs().median() + 1.0e-8
+            decomp_rel = ((g_spot_total - recon).abs()
+                          / (g_spot_total.abs() + decomp_scale)).median()
+            self._spot_grad_fd_gate[t] = {
+                "n_rows": int(g_spot.shape[0]),
+                "Rt": R_t,
+                "fd_autograd_rel_err_median": float(rel.median()),
+                "fd_autograd_rel_err_p90": float(rel.quantile(0.90)),
+                "liab_delta_sign_agree_vs_Rt": liab_sign,
+                "liab_delta_ratio_vs_Rt_median": liab_ratio,
+                "liab_jl_mean_abs": jl_mean_abs,
+                "liab_jl_sign_median": jl_sign_median,
+                "belief_coherence_max_abs": belief_coherence,
+                "total_eq_partial_plus_Fchannel_rel_err": float(decomp_rel),
+                "eps_rel": 1.0e-3,
+            }
 
         # Advantage decomposition: subtract B_t(z_t) from the value label so the
         # NN fits the residual A_t = C_t − B_t, and convert the gradient label to
@@ -2571,14 +2787,19 @@ class DifferentialSolver:
             # residual label ∂A/∂belief = ∂Y_boot/∂belief − ∂B/∂belief is correct here.
             if belief_cols is not None:
                 diff_col_mask[belief_cols[0]:belief_cols[1]] = 1.0
+            # Spot column: the partial ∂C/∂spot|_F label. ∂B/∂spot is in `_dB_dz` (B marks the
+            # liability against the real spot column), so the residual ∂A/∂spot = ∂C/∂spot −
+            # ∂B/∂spot is correct here — B carries the bulk, A the residual.
+            if spot_market_col is not None:
+                diff_col_mask[spot_market_col] = 1.0
             if not getattr(self, "_logged_diffcols", False):
                 self._logged_diffcols = True
                 sup = [i for i in range(diff_col_mask.shape[0]) if float(diff_col_mask[i]) > 0]
                 logging.info(
                     "DifferentialSolver diff-label supervised cols (StatePack idx)=%s "
-                    "[wealth=%d, live F=%s, belief=%s]; belief differential %s",
+                    "[wealth=%d, live F=%s, belief=%s, spot=%s]; belief differential %s",
                     sup, wealth_col, [F_col_start + j for j in range(n_h) if live_t[j]],
-                    list(belief_cols) if belief_cols else None,
+                    list(belief_cols) if belief_cols else None, spot_market_col,
                     "ACTIVE (filtered)" if belief_cols else "masked (one-hot/off)")
             dy_dz = (dy_dz - self._dB_dz(z_t)) * diff_col_mask
         else:
@@ -2803,7 +3024,11 @@ class DifferentialSolver:
                 # tracks spot tightly).
                 F_u = traj[u]["tradables"][outer_indices]
                 dF = F_u1 - F_u                                     # (N, n_h)
-                dS = dF[:, 0]
+                # Liability marks to SPOT — the observable spot column, not the front
+                # future (`dF[:,0]` freezes at the front contract's expiry; see _spot_col).
+                spot_u = self._spot_col(traj[u]["market"][outer_indices])
+                dS = (self._spot_col(market_u1) - spot_u
+                      if spot_u is not None else dF[:, 0])
                 pnl_hedges = (q_carry * self.contract_size
                               * dF).sum(dim=-1)                     # (N,)
                 R_u_scalar = float(self._liability_R[u].item())
@@ -2895,6 +3120,227 @@ class DifferentialSolver:
             "L_mean_per_oz_usd": mean_wealth / volume_oz,
             "L_cost_per_oz_usd": L_cost_per_oz,
             "L_p95_cost_per_oz_usd": L_p95_cost,
+        }
+
+    def _spot_col(self, market):
+        """Observable spot price from a market block `(…, market_dim)` → `(…)`.
+
+        The average-rate liability marks to SPOT, so the wealth-evolution `dL = R_t·dS`
+        needs the SPOT increment. The historical `dS = dF[:,0]` (front-future move) proxy is
+        WRONG once the front contract expires — its price freezes (realised) / is zeroed
+        (inner fork), while the spot factor keeps simulating the whole horizon. The spot is
+        now a first-class observable market column (`_spot_cols_in_market`); reading it is the
+        only liability mark that stays valid across expiries. Returns None when no spot column
+        is published (caller falls back to the front-future move)."""
+        sc = self._spot_cols_in_market
+        return market[..., sc[0]] if sc is not None else None
+
+    def _continuation_value(self, C_next, market, F, q_prev, wealth_pre, t_next):
+        """Continuation VALUE of the pre-decision state at `t_next` under the frozen
+        `C_next` — the operator shared by the realised and inner-MC sides of the BSS
+        penalty so the martingale difference is symmetric (same C, same decision rule;
+        only the next-step noise differs).
+
+          • interior t_next: the Bellman envelope `max_q C_next(post_{t_next}(q))` over
+            the live action grid (`_decision_at`'s v_star), returning the argmax `q*` so
+            the realised rollout can advance.
+          • terminal t_next (= t_outer−1): no action — carry the inventory and read
+            `C_next` at the post-state directly (mirrors `_rollout_no_grad_to_T`'s
+            terminal handling). Returns `q*=None`.
+
+        All no_grad — this is a value read, not a label.
+        """
+        N = market.shape[0]
+        device = self.device
+        static = self._static_sim[t_next].to(device).expand(
+            N, self._static_sim.shape[-1])
+        time_to_T = torch.full((N,), float(self.t_outer - 1 - t_next), device=device,
+                               dtype=self.dtype)
+        if t_next >= self.t_outer - 1:
+            with torch.no_grad():
+                z = self._assemble_z(market=market, q=q_prev, wealth=wealth_pre, F=F,
+                                     time_to_T=time_to_T, static=static)
+                v = self._C_full(C_next, z)
+            return v, None
+        q_star, v_star, _ = self._decision_at(
+            C_next, market, F, q_prev, wealth_pre, time_to_T, static, t_next)
+        return v_star, q_star
+
+    def _compute_martingale_penalty_check(self, traj):
+        """BSS validation sandwich — penalty `π`'s martingale-difference terms `Δ_t`
+        and the dual-feasibility (zero-mean) HARD GATE (validation_sandwich_spec §3/§4.1;
+        brief §1/§2). This is the first sandwich checkpoint: `π` must be dual-feasible or
+        `U` is not a valid upper bound and the whole certificate is void.
+
+        Along the policy rollout from `t_min` to terminal (same trajectory `L` is measured
+        on — q=0/wealth=0 start, argmax policy), at each outer step `t` compute
+
+            Δ_t  =  C_{t+1}(s_{t+1})  −  Ê[ C_{t+1}(s'_{t+1}) | s_t, a_t ]
+
+          • `C_{t+1}(s_{t+1})` — the continuation VALUE (`_continuation_value`, the Bellman
+            envelope / terminal utility) at the REALISED next state on this outer path under
+            the policy action `a_t = q_carry`.
+          • `Ê[·|s_t,a_t]` — the conditional expectation over the next-step noise, estimated
+            on the retained inner-MC fork `bundle['inner_mc_fn'](t)` (offline; more draws than
+            training are afforded via `Inner_Sub_Batch`). Ê is an unbiased mean over `B_inner`
+            forks of the SAME continuation operator.
+
+        Both terms share the (s_t,a_t)-measurable endogenous state (`q_carry`, `wealth`) and
+        the SAME belief-filtered market extractor; they differ ONLY in the next-step noise
+        (realised outer move vs inner-MC draws). Hence `E[Δ_t|s_t,a_t]=0` exactly and the
+        sample mean of `Σ_t Δ_t` over paths is 0 up to MC error for ANY `C_t`. A non-zero
+        mean ⇒ `π` is not dual-feasible (outer/inner dynamics mismatch) — STOP, do not build
+        `U`.
+
+        GUARD 2 (information sets, §4.2): both sides read the participant-visible
+        belief-filtered market (`traj['market']` / inner `market_t1`, via the same
+        `_extract_outer_state_at(privileged=True)`), NEVER the hidden regime one-hot.
+
+        Returns the gate statistics + the per-`t` mean `Δ_t` profile (the §5 localisation
+        hook). Pure diagnostic — never a solver dependency, never shipped (same offline
+        status as the LSM / hindsight yardsticks)."""
+        device = self.device
+        n_h = len(self.hedges)
+        B = self._B()
+        t0 = self.t_min
+        cs = self.contract_size
+
+        if "inner_mc_fn" not in self.bundle:
+            logging.warning(
+                "DifferentialSolver penalty check: bundle has no 'inner_mc_fn' — cannot "
+                "estimate Ê[C_{t+1}|s_t,a_t]; skipping the BSS zero-mean gate.")
+            return {"penalty_zero_mean_skipped": True}
+
+        # Policy rollout start at t_min (mirrors _compute_dollar_floor exactly).
+        market_0 = traj[t0]["market"]
+        F_0 = traj[t0]["tradables"]
+        static_0 = self._static_sim[t0].to(device).expand(B, self._static_sim.shape[-1])
+        time_to_T_0 = torch.full((B,), float(self.t_outer - 1 - t0), device=device,
+                                  dtype=self.dtype)
+        q_prev = torch.zeros(B, n_h, device=device, dtype=self.dtype)
+        wealth_pre = torch.zeros(B, device=device, dtype=self.dtype)
+        with torch.no_grad():
+            q_star_0, _, _ = self._decision_at(
+                self.C[t0], market_0, F_0, q_prev, wealth_pre, time_to_T_0, static_0, t0)
+            cost_0 = self._turnover(q_star_0, q_prev, F_0)
+            wealth = wealth_pre - cost_0
+        q_carry = q_star_0                                       # a_{t_min} (post-decision)
+
+        delta_sum = torch.zeros(B, device=device, dtype=self.dtype)
+        delta_sum_interior = torch.zeros(B, device=device, dtype=self.dtype)
+        per_t_mean = {}
+        term_abs_total = 0.0
+        term_count = 0
+        n_steps_interior = 0
+        n_inner_used = None
+        with torch.no_grad():
+            for t in range(t0, self.t_outer - 1):
+                t1 = t + 1
+                C_next = self.C[t1]
+                if C_next is None:
+                    break
+
+                # --- realised next state under action a_t = q_carry (outer path) ---
+                market_t = traj[t]["market"]
+                F_t = traj[t]["tradables"]                       # (B, n_h)
+                F_t1_real = traj[t1]["tradables"]
+                market_t1_real = traj[t1]["market"]
+                dF_real = F_t1_real - F_t                         # (B, n_h)
+                # Liability marks to SPOT (front-future proxy freezes at expiry — see _spot_col).
+                spot_t = self._spot_col(market_t)
+                dS_real = (self._spot_col(market_t1_real) - spot_t
+                           if spot_t is not None else dF_real[:, 0])
+                pnl_real = (q_carry * cs * dF_real).sum(dim=-1)
+                R_t = float(self._liability_R[t].item())
+                wealth_pre_t1_real = wealth + pnl_real - R_t * dS_real
+                v_real, q_star_t1 = self._continuation_value(
+                    C_next, market_t1_real, F_t1_real, q_carry, wealth_pre_t1_real, t1)
+
+                # --- Ê[C_{t+1}|s_t,a_t]: inner-MC fork at t, same operator/state, fresh noise ---
+                inner = self.bundle["inner_mc_fn"](t)
+                m_t1 = inner.get("market_t1")
+                if m_t1 is None:
+                    # Degenerate inner horizon (no t+1 slice) — Δ_t undefined; stop here.
+                    break
+                B_inner = m_t1.shape[1]
+                n_inner_used = B_inner
+                F_t1_inner = torch.stack(
+                    [inner["F_t1"][h] for h in self.hedges], dim=-1)   # (B, B_inner, n_h)
+                dF_inner = F_t1_inner - F_t.unsqueeze(1)                # (B, B_inner, n_h)
+                # Same SPOT liability mark as the realised side (inner spot column at t+1).
+                dS_inner = (self._spot_col(m_t1) - spot_t.unsqueeze(1)
+                            if spot_t is not None else dF_inner[..., 0])
+                pnl_inner = (q_carry.unsqueeze(1) * cs * dF_inner).sum(dim=-1)
+                wealth_pre_t1_inner = wealth.unsqueeze(1) + pnl_inner - R_t * dS_inner
+                BI = B * B_inner
+                v_inner, _ = self._continuation_value(
+                    C_next,
+                    m_t1.reshape(BI, -1),
+                    F_t1_inner.reshape(BI, n_h),
+                    q_carry.unsqueeze(1).expand(B, B_inner, n_h).reshape(BI, n_h),
+                    wealth_pre_t1_inner.reshape(BI), t1)
+                E_hat = v_inner.reshape(B, B_inner).mean(dim=1)        # (B,)
+
+                delta_t = v_real - E_hat                               # (B,)
+                delta_sum = delta_sum + delta_t
+                # Interior accumulator excludes the last `boundary` steps. Near terminal the
+                # latent-regime resimulation in the inner fork disperses the one-step move a
+                # few % more than the realised outer move; under the concave near-terminal
+                # continuation that biases Ê low → a small, bounded Δ>0 ramp at the horizon
+                # edge (drift / dt / σ verified identical between fork and outer — it is a
+                # variance, not a mean, effect). Dual feasibility is graded on the INTERIOR;
+                # the boundary residual is reported, and the U-DP handles the terminal
+                # force-flat unwind specially anyway.
+                if t < self.t_outer - 1 - self._penalty_boundary_steps:
+                    delta_sum_interior = delta_sum_interior + delta_t
+                    n_steps_interior += 1
+                per_t_mean[t] = float(delta_t.mean().item())
+                term_abs_total += float(delta_t.abs().sum().item())
+                term_count += B
+
+                if q_star_t1 is None:                                  # terminal reached
+                    break
+                cost_t1 = self._turnover(q_star_t1, q_carry, F_t1_real)
+                wealth = wealth_pre_t1_real - cost_t1
+                q_carry = q_star_t1
+
+        def _zero_mean_stats(dsum, nsteps):
+            m = float(dsum.mean().item())
+            sd = float(dsum.std(unbiased=True).item()) if B > 1 else 0.0
+            se = sd / (B ** 0.5) if B > 0 else float("nan")
+            z = abs(m) / se if se > 0 else (0.0 if m == 0 else float("inf"))
+            return m, se, z, sd
+
+        n_steps = len(per_t_mean)
+        mean_delta_sum, stderr, z_stat, std_delta_sum = _zero_mean_stats(delta_sum, n_steps)
+        mean_int, stderr_int, z_int, _ = _zero_mean_stats(delta_sum_interior, n_steps_interior)
+        term_abs_mean = term_abs_total / term_count if term_count else 0.0
+        logging.info(
+            "DifferentialSolver BSS penalty zero-mean gate (§4.1): INTERIOR mean ΣΔ_t = %+.4g "
+            "(stderr %.4g, z=%.2f, %d steps) — the dual-feasibility grade; FULL mean ΣΔ_t = "
+            "%+.4g (z=%.2f, %d steps incl. last %d boundary). B=%d, B_inner=%s, mean|Δ_t|=%.4g. %s",
+            mean_int, stderr_int, z_int, n_steps_interior,
+            mean_delta_sum, z_stat, n_steps, self._penalty_boundary_steps,
+            B, n_inner_used, term_abs_mean,
+            "INTERIOR DUAL-FEASIBLE (≈0)" if z_int < 4.0
+            else "INTERIOR NOT zero-mean — π INFEASIBLE, U void")
+        return {
+            # Interior (excl. the last `boundary` steps) — the dual-feasibility grade.
+            "penalty_zero_mean_delta_sum": mean_int,
+            "penalty_zero_mean_stderr": stderr_int,
+            "penalty_zero_mean_z": z_int,
+            "penalty_n_steps_interior": n_steps_interior,
+            "penalty_boundary_steps": self._penalty_boundary_steps,
+            # Full sum (all steps incl. the near-terminal boundary ramp) — reported alongside.
+            "penalty_full_delta_sum": mean_delta_sum,
+            "penalty_full_z": z_stat,
+            "penalty_full_delta_sum_std": std_delta_sum,
+            "penalty_term_abs_mean": term_abs_mean,
+            "penalty_n_paths": B,
+            "penalty_n_inner": n_inner_used if n_inner_used is not None else 0,
+            "penalty_n_steps": n_steps,
+            "penalty_t_start": t0,
+            "penalty_delta_per_t_mean": per_t_mean,
         }
 
     def _audit_at(self, t, net, traj, audit_outer_indices, round_num):
@@ -3205,11 +3651,19 @@ class DifferentialSolver:
             # contracts (recorded only where ≥2 are live). Surfaces as
             # M1_price_diff_gate_at_t. 0 ⇒ the broadcast bug; >0 ⇒ per-contract slopes.
             "price_diff_gate_at_t": dict(getattr(self, "_price_diff_gate", {})),
+            # Spot-gradient FD gate: per-t FD-vs-autograd rel-err on ∂Y_boot/∂spot + the
+            # realized-dL vs R_t·dS sign cross-check. Surfaces as M1_spot_grad_fd_gate_at_t.
+            "spot_grad_fd_gate_at_t": dict(getattr(self, "_spot_grad_fd_gate", {})),
         }
         # Production validation: BSS sandwich lower bound L (realised $/oz of the
         # policy on a fresh MC set). Runs unconditionally; computes mean, p5/p95,
         # and the cost-per-oz that the dealer-margin ship criterion reads.
         sweep_summary.update(self._compute_dollar_floor(traj))
+        # BSS sandwich step 1+2: penalty π's martingale-difference terms + the
+        # dual-feasibility (zero-mean) HARD GATE (§4.1). Must be green before U is a
+        # valid upper bound. Surfaces as M1_penalty_*; the per-t mean Δ_t is the §5
+        # localisation hook. Offline yardstick — diagnostic only, never shipped.
+        sweep_summary.update(self._compute_martingale_penalty_check(traj))
         logging.info(
             "DifferentialSolver sweep complete: %d C_t functions fitted "
             "(t ∈ [%d, %d]); V_0_decision @ t=%d = %.4f; n*_t_min mean = %s",

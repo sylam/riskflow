@@ -2411,6 +2411,25 @@ class MarkovHMMSpotModel(StochasticProcess):
             out['regime_belief'] = belief.to(dtype=torch.float32)
         return out
 
+    def reseed_one_step(self, spot_t_leaf, spot_t_realized, spot_t1_realized):
+        """Analytic one-step transition re-seed for the diff-ML bootstrap.
+
+        Given the t-spot as an autograd LEAF and the realized (spot_t, spot_{t+1}) endpoints
+        from the stored outer path, return a spot_{t+1} that lands EXACTLY on the realized
+        value (so the bootstrap stays on the simulated path, not a fresh draw) but is
+        differentiable in the leaf, with the EXACT one-step derivative. This is the whole of
+        what the inner-MC fork's `generate()` provided — a live tape through one transition —
+        reconstructed analytically, because the spot is a regime random walk: the increment
+        `ds = μ[r]·dt + σ[r]·√dt·Z` is independent of spot_t, so the step is purely
+        multiplicative (Log_Price) or additive:
+            Log_Price:  spot_{t+1} = spot_t · (spot_{t+1}/spot_t)   ⇒ ∂/∂spot_t = spot_{t+1}/spot_t
+            level:      spot_{t+1} = spot_t + (spot_{t+1} − spot_t) ⇒ ∂/∂spot_t = 1
+        The realized ratio/increment carries the realized regime AND shock, so no re-draw and
+        no re-simulation — the buffer endpoints pin the transition exactly."""
+        if self.log_price:
+            return spot_t_leaf * (spot_t1_realized / spot_t_realized).detach()
+        return spot_t_leaf + (spot_t1_realized - spot_t_realized).detach()
+
     def _forward_belief(self, spot_path, device):
         """Forward HMM belief filter — outer-mode only. Returns belief (T, B, n_states)
         where `belief[t, b, r] = P(regime_t = r | observed diffs through time t, path b)`,
@@ -2504,6 +2523,31 @@ class MarkovHMMSpotModel(StochasticProcess):
             log_unnorm = log_b_pred + self._emission_log_likelihood(diffs[tau - 1], tau)
             log_b.append(log_unnorm - torch.logsumexp(log_unnorm, dim=-1, keepdim=True))
         return torch.stack(log_b, dim=0).exp().movedim(-1, 1)              # (T, n, B, B2)
+
+    def forward_belief_onestep(self, belief_prev, spot_prev, spot_cur, t_idx):
+        """One OUTER-grid filter step belief[t_idx-1] → belief[t_idx] on the REALIZED price
+        move, for the diff-ML bootstrap (the fork-free belief differential). Replicates
+        `_forward_belief`'s arrival-`t_idx` step EXACTLY — transition `P_per_step[t_idx-1]`,
+        emission at `t_idx`, same `dt[t_idx]<ε` predict-only guard — so the result equals the
+        belief the outer filter already published to the buffer (value-coherent), but seeded
+        from a `belief_prev` LEAF so the twin loss gets ∂belief[t_idx]/∂belief[t_idx-1] through
+        the predict step. The observed diff is DETACHED: belief stays independent of the spot
+        leaf (the price-column gradient is unchanged), exactly as the inner fork did. Shapes:
+        `belief_prev` and the return are `(n_states, B)` (the buffer's B-last convention);
+        `spot_prev`/`spot_cur` are `(B,)`; `t_idx` is the arrival outer index."""
+        obs_p = spot_prev.clamp_min(1.0e-30).log() if self.log_price else spot_prev
+        obs_c = spot_cur.clamp_min(1.0e-30).log() if self.log_price else spot_cur
+        diff = (obs_c - obs_p).detach()                                    # (B,)
+        log_b = belief_prev.movedim(0, -1).clamp_min(1.0e-30).log()        # (B, n)
+        log_P = self.P_per_step[t_idx - 1].clamp_min(1.0e-30).log()        # (n, n)
+        log_b_pred = torch.logsumexp(
+            log_b.unsqueeze(-1) + log_P.unsqueeze(0), dim=-2)             # (B, n)
+        if float(self.dt_per_step[t_idx]) < 1.0e-12:
+            log_b_cur = log_b_pred - torch.logsumexp(log_b_pred, dim=-1, keepdim=True)
+        else:
+            log_unnorm = log_b_pred + self._emission_log_likelihood(diff, t_idx)
+            log_b_cur = log_unnorm - torch.logsumexp(log_unnorm, dim=-1, keepdim=True)
+        return log_b_cur.exp().movedim(-1, 0)                              # (n_states, B)
 
 
 class MarkovHMMSpotCalibration(object):

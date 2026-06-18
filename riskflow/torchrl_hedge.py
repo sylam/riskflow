@@ -89,6 +89,12 @@ def _slice_bundle_episodes(bundle, episode_indices):
             }
             for tradable, by_factor in bundle["forward_jacobian"].items()
         }
+    # liability_jacobian: 1-deep {factor: (T, [n_tenors,] B)} — slice the trailing batch axis.
+    if bundle.get("liability_jacobian"):
+        sliced["liability_jacobian"] = {
+            factor: _slice_episode_tensor(t, episode_indices, batch_size)
+            for factor, t in bundle["liability_jacobian"].items()
+        }
     for scalar_key in ("last_settlement_index", "time_grid_days_cpu", "total_leg_volume",
                         "scenario_dates", "business_indices", "utility_scale"):
         if scalar_key in bundle:
@@ -2104,6 +2110,13 @@ def build_torchrl_bundle(base_date, business_day, time_grid_days, tradable_block
             # Batch is the trailing axis for both scalar (T, B) and curve (T, n_tenors, B) deltas.
             name: torch.cat([block[name] for block in blocks], dim=-1) for name in factor_names
         }
+    # Liability Jacobian ∂L/∂factor — a single {factor: (T,[n_tenors,]B)} dict per batch
+    # (not per-tradable, since the liability is one deal). Batch trailing, like fwd_jac.
+    liab_jac_blocks = hedge_profile_blocks.get('liability_jacobian') or []
+    liab_jac_pre_pad = {}
+    if liab_jac_blocks:
+        for name in list(liab_jac_blocks[0].keys()):
+            liab_jac_pre_pad[name] = torch.cat([blk[name] for blk in liab_jac_blocks], dim=-1)
     realized_cashflows = {
         currency: torch.cat(blocks, dim=1)
         for currency, blocks in (hedge_profile_blocks.get('realized_cashflows') or {}).items()
@@ -2160,6 +2173,18 @@ def build_torchrl_bundle(base_date, business_day, time_grid_days, tradable_block
                     padded = torch.cat([tensor, zeros], dim=0)
                 forward_jacobian[tradable_name][factor_name] = padded
         bundle['forward_jacobian'] = forward_jacobian
+    # Liability Jacobian — same zero-pad-post-expiry; single {factor: (T,[n_tenors,]B)} dict.
+    if liab_jac_pre_pad:
+        liability_jacobian = {}
+        for factor_name, tensor in liab_jac_pre_pad.items():
+            cur_T = int(tensor.shape[0])
+            if cur_T >= aligned_time_steps:
+                padded = tensor[:aligned_time_steps]
+            else:
+                zeros = tensor.new_zeros((aligned_time_steps - cur_T,) + tuple(tensor.shape[1:]))
+                padded = torch.cat([tensor, zeros], dim=0)
+            liability_jacobian[factor_name] = padded
+        bundle['liability_jacobian'] = liability_jacobian
     if realized_cashflows:
         bundle['realized_cashflows'] = {
             currency: pad_time_axis(tensor, aligned_time_steps)

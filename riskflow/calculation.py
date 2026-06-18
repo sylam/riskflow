@@ -1885,6 +1885,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             # diff-ML solver projects the value's factor-gradient onto the tradables through J
             # to get the per-contract price differential ∂C/∂F_h.
             'forward_jacobian': defaultdict(list),
+            # Liability Jacobian ∂L/∂factor — the per-factor spot-deltas of the deal MtM from
+            # extract_spot_deltas (already computed for hedge_ratios, previously discarded).
+            # The diff-ML bootstrap reconstructs the differentiable t±1 liability MtM from this
+            # + the spot leaf / re-seed, so ∂C/∂spot carries the REAL ∂L/∂spot (any deal),
+            # with no R_t hand-form. Keyed by factor name; one dict per batch.
+            'liability_jacobian': [],
             'realized_cashflows': defaultdict(list),
         }
         # Per-batch privileged-factor accumulator. Keyed by (factor_name, factor_attr) where
@@ -1989,6 +1995,10 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             if mtm is not None:
                 liability_spot_deltas = pricing.extract_spot_deltas(mtm, shared_mem.t_Scenario_Buffer)
                 hedge_profile_blocks['mtm'].append(mtm.detach().clone())
+                # Persist ∂L/∂factor (per-factor, full grid) for the diff-ML bootstrap's
+                # differentiable liability reconstruction — same source as hedge_ratios.
+                hedge_profile_blocks['liability_jacobian'].append(
+                    {fn: d.detach().clone() for fn, d in liability_spot_deltas.items()})
 
             mtm_grid_size = self.time_grid.mtm_time_grid.size
             for currency, by_time in (shared_mem.t_Cashflows or {}).items():
@@ -2226,12 +2236,20 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 # mass belief at the sampled regime; the V̂ was trained on belief vectors
                 # but a one-hot is at the boundary of belief space, so the query is well-
                 # defined though not statistically pure).
+                #
+                # The observable spot PRICE is appended as the LAST sub-coordinate of the
+                # block: the liability marks to it and it is deployable (the quoted LME spot),
+                # so it belongs in the value function's state. The regime stays LATENT — we
+                # expose the belief posterior (participant-inferable from prices), never the
+                # true regime. Belief-first / price-last keeps the regime-column offsets
+                # downstream unchanged; consumers split the block by `n_states`.
+                price = outer[t].unsqueeze(0)              # (1, ...batch) — raw spot level
                 belief = scenario_buffer.get((key, 'regime_belief'))
                 if belief is not None and belief.dim() == regimes.dim() + 1:
-                    return belief[t]                       # (n_states, ...batch) — B last
+                    return torch.cat([belief[t], price], dim=0)   # (n_states+1, ...batch)
                 onehot = torch.nn.functional.one_hot(
                     regimes[t].long(), num_classes=proc.n_states).to(dtype=outer.dtype)
-                return onehot.movedim(-1, 0)               # (n_states, ...batch)
+                return torch.cat([onehot.movedim(-1, 0), price], dim=0)  # (n_states+1, ...)
             return outer[t, :]
         if key.type == 'ForwardRate':
             return outer[t, :, :]                          # carry-factor curve (compact)
