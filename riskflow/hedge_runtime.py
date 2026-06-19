@@ -180,6 +180,7 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # Backward-sweep depth: fit C_t for t in [t_outer-2 .. t_min]. 0 = full sweep
         # to the initial decision; t_min near t_outer-1 = a shallow (bounded) sweep.
         "t_min": int(solver_config.get("T_Min", 0)),
+        "audit_max_rounds": int(solver_config.get("Audit_Max_Rounds", 3)),
         # Endogenous-span bank knob (DifferentialSolver): inventory/wealth replicas
         # layered on each exogenous slice.
         "bank_sampling": {
@@ -198,6 +199,7 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
             "mlp_hidden": list(value_fn.get("MLP_Hidden", [64, 64, 64])),
             "mlp_activation": str(value_fn.get("MLP_Activation", "gelu")).lower(),
             "mlp_train_steps_per_solve": int(value_fn.get("MLP_Train_Steps_Per_Solve", 200)),
+            "mlp_loss_tol": float(value_fn.get("MLP_Loss_Tol", 0.0)),
             "mlp_adam_lr": float(value_fn.get("MLP_Adam_LR", 1.0e-3)),
             "mlp_final_init_scale": float(value_fn.get("MLP_Final_Init_Scale", 0.0)),
             # Tail-saturating columns: deep-state indices to push through tanh after
@@ -496,8 +498,12 @@ def construct_torchrl_runtime(
             raise ValueError("Execution_Mode 'solve_hedge' requires Hedging_Problem['Solver']")
         if str(config.get("Inner_MC_Enabled", "No")) != "Yes":
             raise ValueError("Execution_Mode 'solve_hedge' requires Inner_MC_Enabled='Yes'")
-        if int(config.get("Inner_Sub_Batch", 0)) < 128:
-            raise ValueError("Execution_Mode 'solve_hedge' requires Inner_Sub_Batch >= 128")
+        solver_object = str(solver_config.get("Object", "")).lower()
+        min_inner = 2 if solver_object == "differentialsolver" else 128
+        if int(config.get("Inner_Sub_Batch", 0)) < min_inner:
+            raise ValueError(
+                "Execution_Mode 'solve_hedge' requires Inner_Sub_Batch >= "
+                f"{min_inner} for Solver.Object={solver_config.get('Object')!r}")
         if str((objective_config or {}).get("Object", "")).lower() != "asymmetricutility_symlog":
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires Objective.Object='AsymmetricUtility_Symlog'. "

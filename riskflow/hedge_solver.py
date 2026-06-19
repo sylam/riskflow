@@ -766,6 +766,7 @@ def twin_loss(net, z, y_target, dy_dz_target, *,
 
     total = w_val * val_loss + w_diff * diff_loss
     return total, {
+        "total_loss": float(total.detach()),
         "val_loss": float(val_loss.detach()),
         "diff_loss": float(diff_loss.detach()),
         "mask_mean": mask_mean,
@@ -1630,6 +1631,7 @@ class DifferentialSolver:
         vf_cfg = solver_cfg.get("value_fn", {})
         self.hidden_sizes = tuple(vf_cfg.get("mlp_hidden", (128, 128, 128)))
         self.train_steps_per_solve = int(vf_cfg.get("mlp_train_steps_per_solve", 2000))
+        self.train_loss_tol = float(vf_cfg.get("mlp_loss_tol", 0.0))
         self.train_minibatch = int(vf_cfg.get("mlp_minibatch", 4096))
         self.adam_lr = float(vf_cfg.get("mlp_adam_lr", 1.0e-3))
         # Bank construction knobs (spec §6).
@@ -2211,8 +2213,10 @@ class DifferentialSolver:
         n_rows = z_T.shape[0]
         batch = min(self.train_minibatch, n_rows)
         steps = max(1, self.train_steps_per_solve)              # guard against steps=0
-        last_diag = {"val_loss": float("nan"), "diff_loss": float("nan"),
-                     "mask_mean": 1.0}
+        last_diag = {"total_loss": float("nan"), "val_loss": float("nan"),
+                     "diff_loss": float("nan"), "mask_mean": 1.0,
+                     "steps_used": 0, "max_steps": steps,
+                     "stopped_early": False}
         for step in range(steps):
             idx = torch.randint(0, n_rows, (batch,), device=device)
             loss, last_diag = twin_loss(
@@ -2221,11 +2225,22 @@ class DifferentialSolver:
             opt.zero_grad()
             loss.backward()
             opt.step()
+            loss_value = float(loss.detach())
+            last_diag.update(
+                steps_used=step + 1, max_steps=steps,
+                stopped_early=self.train_loss_tol > 0.0
+                and loss_value <= self.train_loss_tol)
             if step % max(1, steps // 5) == 0 or step == steps - 1:
                 logging.info(
                     "DifferentialSolver C_T cold-train step=%d L=%.5f val=%.5f diff=%.5f",
-                    step, float(loss.detach()),
+                    step, loss_value,
                     last_diag["val_loss"], last_diag["diff_loss"])
+            if last_diag["stopped_early"]:
+                logging.info(
+                    "DifferentialSolver C_T cold-train early stop: loss %.5g <= tol %.5g "
+                    "after %d/%d steps",
+                    loss_value, self.train_loss_tol, step + 1, steps)
+                break
 
         # Holdout check — closed-form value MAE on fresh spans.
         with torch.no_grad():
@@ -2244,6 +2259,8 @@ class DifferentialSolver:
             "terminal_twin_diff_loss": last_diag["diff_loss"],
             "terminal_holdout_mae": float(mae),
             "terminal_bank_rows": int(n_rows),
+            "terminal_train_steps_used": int(last_diag["steps_used"]),
+            "terminal_train_stopped_early": bool(last_diag["stopped_early"]),
         }
 
     # ----------------------------------------------- Step D: post_state + bank
@@ -2827,7 +2844,9 @@ class DifferentialSolver:
         n_rows = z.shape[0]
         batch = min(self.train_minibatch, n_rows)
         steps = max(1, int(steps))
-        last_diag = {"val_loss": float("nan"), "diff_loss": float("nan")}
+        last_diag = {"total_loss": float("nan"), "val_loss": float("nan"),
+                 "diff_loss": float("nan"), "steps_used": 0,
+                 "max_steps": steps, "stopped_early": False}
         # Differentials are ON in both modes. Under advantage decomposition the
         # gradient label is the residual's own slope ∂A_t/∂z = ∂Y_boot/∂z − ∂B_t/∂z
         # on the labeled columns (col_mask), with ∂B_t/∂z exact closed-form — the
@@ -2846,6 +2865,13 @@ class DifferentialSolver:
             opt.zero_grad()
             loss.backward()
             opt.step()
+            loss_value = float(loss.detach())
+            last_diag.update(
+                steps_used=step + 1, max_steps=steps,
+                stopped_early=self.train_loss_tol > 0.0
+                and loss_value <= self.train_loss_tol)
+            if last_diag["stopped_early"]:
+                break
         return last_diag
 
     # ------------------ M2: audit-correct-refit loop for C_t at one t step ----
@@ -2880,7 +2906,10 @@ class DifferentialSolver:
         accumulated_outer_idx = training_outer_idx.clone()
         delta_history = []      # mean|delta| per round, for shrinkage check
         rounds_taken = 0
-        final_diag = {"val_loss": float("nan"), "diff_loss": float("nan")}
+        final_diag = {"total_loss": float("nan"), "val_loss": float("nan"),
+                  "diff_loss": float("nan"), "steps_used": 0,
+                  "max_steps": self.train_steps_per_solve,
+                  "stopped_early": False}
         escalation_flag = None
         per_round_audits = []
 
@@ -2906,9 +2935,12 @@ class DifferentialSolver:
             self.C[t] = net      # so the audit can call `self.C[t]` via decision op
             logging.info(
                 "DifferentialSolver C_t=%d round=%d fit: live_axes=%d bank=%d "
-                "twin val=%.5f diff=%.5f action_gap=%.4g",
+                "twin val=%.5f diff=%.5f steps=%d/%d%s action_gap=%.4g",
                 t, round_num, int(live_t.sum()), z_t.shape[0],
                 final_diag["val_loss"], final_diag["diff_loss"],
+                int(final_diag.get("steps_used", 0)),
+                int(final_diag.get("max_steps", self.train_steps_per_solve)),
+                " early" if final_diag.get("stopped_early") else "",
                 float(action_gap.median()))
 
             # 4. Audit — if no slices reserved (e.g., M1 single-round usage), break.
@@ -2983,6 +3015,10 @@ class DifferentialSolver:
         return {
             "twin_value_loss": final_diag["val_loss"],
             "twin_diff_loss": final_diag["diff_loss"],
+            "twin_total_loss": final_diag.get("total_loss", float("nan")),
+            "train_steps_used": int(final_diag.get("steps_used", 0)),
+            "train_max_steps": int(final_diag.get("max_steps", self.train_steps_per_solve)),
+            "train_stopped_early": bool(final_diag.get("stopped_early", False)),
             "bank_rows": int(accumulated_outer_idx.shape[0]) * int(self.b_endo),
             "live_axes_at_t": int(live_t.sum()),
             "rounds_taken": rounds_taken,

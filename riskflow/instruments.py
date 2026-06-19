@@ -1993,6 +1993,7 @@ class CFFloatingInterestListDeal(Deal):
             field['Discount_Rate']
 
         field_index = {
+            'Digital_Spread': self.options.get('Digital_Spread', 0.0),
             'SettleCurrency': self.field['Currency'],
             'Forward': get_interest_factor(
                 field['Forecast_Rate'], static_offsets, stochastic_offsets, all_tenors),

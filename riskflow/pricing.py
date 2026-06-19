@@ -2143,17 +2143,35 @@ def pricer_float_cashflows(all_resets, t_cash, shared):
 
 
 def _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, call_or_put, shared):
-    mn_option = -100.0 * (all_resets - t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1))
+    strike = t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1)
     expiry = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount](expiries)
     digital_payoff = factor_dep['Digital_Payoff_Rate'] if 'Digital_Payoff_Rate' in factor_dep else 0.0
-
-    vols = utils.calc_tenor_cap_time_grid_vol_rate(
-        factor_dep['VolSurface'], mn_option, expiry, tenor, shared)
     dist, shf = factor_dep['VolSurface'][0][utils.FACTOR_INDEX_SubType]
     pricing_fn = utils.black_european_option if dist=='Lognormal' else utils.bachelier_european_option
-    payoff = pricing_fn(
-        all_resets, t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1),
-        vols, expiry, 1.0, call_or_put, shared, cash_payoff=digital_payoff, shift=shf.amount)
+
+    if digital_payoff and factor_dep.get('Digital_Spread', 0.0) > 0:
+        # call/put spread replication: vols are re-queried at the two spread strikes so the
+        # smile is automatically picked up — no separate dvol/dK correction needed.
+        eps = factor_dep['Digital_Spread']
+        strike_lo = strike * (1.0 - eps)
+        strike_hi = strike * (1.0 + eps)
+        mn_lo = -100.0 * (all_resets - strike_lo)
+        mn_hi = -100.0 * (all_resets - strike_hi)
+        vols_lo = utils.calc_tenor_cap_time_grid_vol_rate(
+            factor_dep['VolSurface'], mn_lo, expiry, tenor, shared)
+        vols_hi = utils.calc_tenor_cap_time_grid_vol_rate(
+            factor_dep['VolSurface'], mn_hi, expiry, tenor, shared)
+        payoff = digital_payoff * (
+            pricing_fn(all_resets, strike_lo, vols_lo, expiry, 1.0, call_or_put, shared, shift=shf.amount) -
+            pricing_fn(all_resets, strike_hi, vols_hi, expiry, 1.0, call_or_put, shared, shift=shf.amount)
+        ) / (2.0 * eps * strike)
+    else:
+        mn_option = -100.0 * (all_resets - strike)
+        vols = utils.calc_tenor_cap_time_grid_vol_rate(
+            factor_dep['VolSurface'], mn_option, expiry, tenor, shared)
+        payoff = pricing_fn(
+            all_resets, strike, vols, expiry, 1.0, call_or_put, shared, 
+            cash_payoff=digital_payoff, shift=shf.amount)
 
     all_int = t_cash[:, utils.CASHFLOW_INDEX_Year_Frac].reshape(1, -1, 1) * payoff
     margin = shared.one.new_zeros(len(t_cash))
