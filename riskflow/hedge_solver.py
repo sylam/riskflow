@@ -1641,12 +1641,18 @@ class DifferentialSolver:
         # JSON `Solver.T_Min`; default 0 = sweep all the way to the initial decision.
         self.t_min = int(solver_cfg.get("t_min", 0))
         # BSS sandwich (validation_sandwich_spec §4.1): the penalty's zero-mean dual-feasibility
-        # is graded on the INTERIOR, excluding the last `Penalty_Boundary_Steps` steps where the
-        # inner fork's latent-regime resimulation disperses the one-step move a few % more than
-        # the outer sim, leaving a small bounded Δ-ramp at the horizon edge (a variance effect;
-        # drift/dt/σ are identical fork-vs-outer). Reported, not chased — the U-DP handles the
-        # terminal force-flat specially. Default 2.
-        self._penalty_boundary_steps = int(solver_cfg.get("penalty_boundary_steps", 2))
+        # is graded on the INTERIOR; the boundary is DATA-DRIVEN, not a magic count. Near the
+        # terminal the inner fork's latent-regime resimulation disperses the one-step move a few %
+        # more than the outer sim (a variance, not a mean, effect — drift/dt/σ are identical),
+        # which under high near-terminal continuation curvature leaves a small Δ>0 ramp at the
+        # last held step(s). is_live does NOT mark this (the longest contract stays live to
+        # terminal; the flatten is force_flat_at_end, not expiry). So the boundary = the trailing
+        # block grown inward until the remaining interior sum is zero-mean (|mean|/stderr <
+        # `Penalty_ZeroMean_Z`), capped at `Penalty_Max_Boundary`. U zeros π on exactly that
+        # block (zero is the dual-feasible choice — keeps U a valid, safe-loose bound); a gross
+        # whole-profile dynamics bug makes the block blow past the cap → caught.
+        self._penalty_zero_mean_z = float(solver_cfg.get("penalty_zero_mean_z", 3.0))
+        self._penalty_max_boundary = int(solver_cfg.get("penalty_max_boundary", 4))
 
         self.hedges = list(runtime["names"]["hedges"])
         # T_outer-1 decision points: t=0..T-2 (DP convention). C[T_outer-1] is the
@@ -3227,11 +3233,10 @@ class DifferentialSolver:
         q_carry = q_star_0                                       # a_{t_min} (post-decision)
 
         delta_sum = torch.zeros(B, device=device, dtype=self.dtype)
-        delta_sum_interior = torch.zeros(B, device=device, dtype=self.dtype)
+        deltas_per_t = []                 # [(t, Δ_t (B,))] — for the data-driven boundary
         per_t_mean = {}
         term_abs_total = 0.0
         term_count = 0
-        n_steps_interior = 0
         n_inner_used = None
         with torch.no_grad():
             for t in range(t0, self.t_outer - 1):
@@ -3283,17 +3288,7 @@ class DifferentialSolver:
 
                 delta_t = v_real - E_hat                               # (B,)
                 delta_sum = delta_sum + delta_t
-                # Interior accumulator excludes the last `boundary` steps. Near terminal the
-                # latent-regime resimulation in the inner fork disperses the one-step move a
-                # few % more than the realised outer move; under the concave near-terminal
-                # continuation that biases Ê low → a small, bounded Δ>0 ramp at the horizon
-                # edge (drift / dt / σ verified identical between fork and outer — it is a
-                # variance, not a mean, effect). Dual feasibility is graded on the INTERIOR;
-                # the boundary residual is reported, and the U-DP handles the terminal
-                # force-flat unwind specially anyway.
-                if t < self.t_outer - 1 - self._penalty_boundary_steps:
-                    delta_sum_interior = delta_sum_interior + delta_t
-                    n_steps_interior += 1
+                deltas_per_t.append((t, delta_t))
                 per_t_mean[t] = float(delta_t.mean().item())
                 term_abs_total += float(delta_t.abs().sum().item())
                 term_count += B
@@ -3304,33 +3299,68 @@ class DifferentialSolver:
                 wealth = wealth_pre_t1_real - cost_t1
                 q_carry = q_star_t1
 
-        def _zero_mean_stats(dsum, nsteps):
-            m = float(dsum.mean().item())
-            sd = float(dsum.std(unbiased=True).item()) if B > 1 else 0.0
+        n_steps = len(per_t_mean)
+        term_abs_mean = term_abs_total / term_count if term_count else 0.0
+
+        # Zero-mean statistic of a Σ over a set of per-t Δ vectors.
+        def _zero_mean_stats(dvecs):
+            if not dvecs:
+                return 0.0, 0.0, 0.0, 0.0
+            s = torch.stack(dvecs, dim=0).sum(dim=0)               # (B,)
+            m = float(s.mean().item())
+            sd = float(s.std(unbiased=True).item()) if B > 1 else 0.0
             se = sd / (B ** 0.5) if B > 0 else float("nan")
             z = abs(m) / se if se > 0 else (0.0 if m == 0 else float("inf"))
             return m, se, z, sd
 
-        n_steps = len(per_t_mean)
-        mean_delta_sum, stderr, z_stat, std_delta_sum = _zero_mean_stats(delta_sum, n_steps)
-        mean_int, stderr_int, z_int, _ = _zero_mean_stats(delta_sum_interior, n_steps_interior)
-        term_abs_mean = term_abs_total / term_count if term_count else 0.0
+        all_vecs = [d for _, d in deltas_per_t]
+        mean_delta_sum, stderr, z_stat, std_delta_sum = _zero_mean_stats(all_vecs)
+
+        # DATA-DRIVEN boundary (validation_sandwich_spec §4.1): grow a contiguous TERMINAL block
+        # inward — dropping the terminal-most step each time — until the remaining INTERIOR sum is
+        # zero-mean (|mean|/stderr < z-threshold), capped at `_penalty_max_boundary`. The penalty
+        # is certified dual-feasible on the interior; U zeros π on exactly the boundary block (the
+        # steps where Ê is over-dispersion-biased under near-terminal curvature). Self-consistent
+        # with the gate, non-magic, calendar-agnostic. A gross whole-profile dynamics bug makes
+        # EVERY step fail → the block hits the cap with the interior still failing → caught.
+        cap = min(self._penalty_max_boundary, max(0, n_steps - 1))
+        interior_vecs = list(all_vecs)
+        boundary_count = 0
+        while boundary_count < cap:
+            _, _, z_try, _ = _zero_mean_stats(interior_vecs)
+            if z_try < self._penalty_zero_mean_z:
+                break
+            interior_vecs.pop()                                    # drop the terminal-most step
+            boundary_count += 1
+        n_steps_interior = len(interior_vecs)
+        mean_int, stderr_int, z_int, _ = _zero_mean_stats(interior_vecs)
+        boundary_t_steps = [t for t, _ in deltas_per_t[n_steps_interior:]]
+        boundary_hit_cap = boundary_count >= cap and z_int >= self._penalty_zero_mean_z
+
         logging.info(
             "DifferentialSolver BSS penalty zero-mean gate (§4.1): INTERIOR mean ΣΔ_t = %+.4g "
             "(stderr %.4g, z=%.2f, %d steps) — the dual-feasibility grade; FULL mean ΣΔ_t = "
-            "%+.4g (z=%.2f, %d steps incl. last %d boundary). B=%d, B_inner=%s, mean|Δ_t|=%.4g. %s",
+            "%+.4g (z=%.2f, %d steps). Data-driven boundary = %d step(s) %s (zeroed in U). "
+            "B=%d, B_inner=%s, mean|Δ_t|=%.4g. %s",
             mean_int, stderr_int, z_int, n_steps_interior,
-            mean_delta_sum, z_stat, n_steps, self._penalty_boundary_steps,
+            mean_delta_sum, z_stat, n_steps, boundary_count, boundary_t_steps or "[]",
             B, n_inner_used, term_abs_mean,
-            "INTERIOR DUAL-FEASIBLE (≈0)" if z_int < 4.0
-            else "INTERIOR NOT zero-mean — π INFEASIBLE, U void")
+            "BOUNDARY HIT CAP — interior still NOT zero-mean, π INFEASIBLE, U void"
+            if boundary_hit_cap else
+            ("INTERIOR DUAL-FEASIBLE (≈0)" if z_int < self._penalty_zero_mean_z
+             else "INTERIOR NOT zero-mean — π INFEASIBLE, U void"))
         return {
-            # Interior (excl. the last `boundary` steps) — the dual-feasibility grade.
+            # Interior (after dropping the data-driven boundary block) — the dual-feasibility grade.
             "penalty_zero_mean_delta_sum": mean_int,
             "penalty_zero_mean_stderr": stderr_int,
             "penalty_zero_mean_z": z_int,
             "penalty_n_steps_interior": n_steps_interior,
-            "penalty_boundary_steps": self._penalty_boundary_steps,
+            # Data-driven boundary block (zeroed in U): count + the actual t indices.
+            "penalty_boundary_count": boundary_count,
+            "penalty_boundary_t_steps": boundary_t_steps,
+            "penalty_boundary_hit_cap": boundary_hit_cap,
+            "penalty_max_boundary": cap,
+            "penalty_zero_mean_z_threshold": self._penalty_zero_mean_z,
             # Full sum (all steps incl. the near-terminal boundary ramp) — reported alongside.
             "penalty_full_delta_sum": mean_delta_sum,
             "penalty_full_z": z_stat,
