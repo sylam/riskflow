@@ -29,11 +29,24 @@ def main():
     p.add_argument('--config', type=str,
                     default='artifacts/daily_runs/20260510_173249_symlog_smoke/train_daily.json',
                     help='Production daily-run JSON to base the solve on.')
-    p.add_argument('--batch-size', type=int, default=256,
-                    help='Outer paths for the smoke. Daily 60-step horizon × 3-leg '
-                         '1331-action grid is heavy; start small.')
+    p.add_argument('--batch-size', type=int, default=4096,
+                    help='Outer paths for the diff-ML bank. Huge-Savine style uses a '
+                         'fat outer batch with a tiny inner rollout fan.')
+    p.add_argument('--inner-sub-batch', type=int, default=4,
+                    help='Inner paths per outer state. DifferentialSolver is designed '
+                         'for tiny-inner labels/rollouts; 2 or 4 is usually enough.')
     p.add_argument('--bank-b-endo', type=int, default=2,
                     help='Per-outer endogenous span. 2 = spec §6 default.')
+    p.add_argument('--train-steps', type=int, default=2000,
+                    help='Maximum MLP training steps per C_t fit. Lower this for wiring smokes.')
+    p.add_argument('--loss-tol', type=float, default=1.0e-4,
+                    help='Early-stop tolerance on standardized twin loss. Set 0 to force max steps.')
+    p.add_argument('--action-grid-levels', type=int, default=11,
+                    help='Training/decision action grid levels per live hedge axis.')
+    p.add_argument('--t-min', type=int, default=0,
+                    help='Backward sweep stop index. 0 = full sweep to initial decision.')
+    p.add_argument('--audit-max-rounds', type=int, default=3,
+                    help='Max audit/correction rounds per fitted timestep.')
     p.add_argument('--margin-usd-per-oz', type=float, default=6.0,
                     help='Dealer margin to clear ($/oz). Spec §0: $6-8/oz; '
                          'default $6 per validation_sandwich_spec.md §7 ship criterion.')
@@ -58,7 +71,7 @@ def main():
     # Switch to the diff-ML stack — solve_hedge mode + DifferentialSolver.
     calc['Execution_Mode'] = 'solve_hedge'
     calc['Batch_Size'] = int(args.batch_size)
-    calc['Inner_Sub_Batch'] = 128
+    calc['Inner_Sub_Batch'] = int(args.inner_sub_batch)
     calc['Inner_MC_Enabled'] = 'Yes'
 
     # Huge-Savine diff-ML needs variance in the t=0 exogenous slice. Single JSON
@@ -77,9 +90,13 @@ def main():
     hp['Solver'] = {
         'Object': 'DifferentialSolver',
         'Bank_Sampling': {'B_Endo': int(args.bank_b_endo)},
+        'Training_Action_Grid_Levels_Per_Axis': int(args.action_grid_levels),
+        'Decision_Action_Grid_Levels_Per_Axis': int(args.action_grid_levels),
+        'Audit_Max_Rounds': int(args.audit_max_rounds),
         'Value_Fn': {
             'MLP_Hidden': [128, 128, 128],
-            'MLP_Train_Steps_Per_Solve': 2000,
+            'MLP_Train_Steps_Per_Solve': int(args.train_steps),
+            'MLP_Loss_Tol': float(args.loss_tol),
             'MLP_Adam_LR': 1.0e-3,
             'MLP_Minibatch': 4096,
         },
@@ -88,7 +105,7 @@ def main():
         # entirely per spec §5.
         'Lambda_Mix': 0.0,
         'Use_Advantage_Decomp': True,
-        'T_Min': 0,
+        'T_Min': int(args.t_min),
     }
 
     # Write to a temp file and load via cx.load_json (it expects a path).
@@ -106,11 +123,18 @@ def main():
     print('Production diff-ML smoke — DifferentialSolver on PLAT_JUL29 deal')
     print('=' * 78)
     print(f'Margin floor (ship if cleared): ${args.margin_usd_per_oz:.2f}/oz')
-    # Result schema depends on solve_hedge output; print what's there.
-    if isinstance(result, dict):
-        for k, v in result.items():
-            if isinstance(v, (str, int, float, bool)):
-                print(f'  {k}: {v}')
+    diagnostics = None
+    if hasattr(result, 'optimizer_diagnostics'):
+        diagnostics = result.optimizer_diagnostics
+    elif isinstance(result, dict):
+        diagnostics = result.get('optimizer_diagnostics') or result.get('diagnostics')
+    if isinstance(diagnostics, dict):
+        for key in (
+            'V_0', 'M1_v0_decision_at_t_min', 'M1_L_cost_per_oz_usd',
+            'M1_penalty_zero_mean_z', 'M1_penalty_boundary_hit_cap',
+            'M1_C_fitted_count'):
+            if key in diagnostics:
+                print(f'  {key}: {diagnostics[key]}')
 
 
 if __name__ == '__main__':
