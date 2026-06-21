@@ -5,11 +5,13 @@ visible coordinates (the regime substitution lives in DifferentialSolver itself,
 commit 7467fb1). This script just loads the latest daily-run JSON, overrides
 Solver.Object + Execution_Mode to the diff-ML stack, and calls cx.run_job.
 
-The L/π/U sandwich diagnostic is the next thing to wire into the solver; once
-it lands, the validation readout becomes `gap = U − L` + dollar floor (§3, §5),
-not toy V_0. For now this script just confirms the diff-ML stack runs to
-completion on the production deal structure (3 platinum futures, daily grid,
-2500 oz PLAT_JUL29 liability).
+The L/π/U validation sandwich is wired into DifferentialSolver, so the readout is
+`gap = U − L` (utility units) + the dollar floor (§3, §5), alongside toy V_0. U is
+the penalized clairvoyant upper bound; L the realised policy value; a WIDE gap is
+AMBIGUOUS (perfect-foresight + grid/turnover relaxation slack), NOT necessarily
+policy suboptimality. The penalty zero-mean gate must be green (boundary not at cap)
+for U to be a valid bound. Runs on the production deal (3 platinum futures, daily
+grid, 2500 oz PLAT_JUL29 liability).
 
 Pattern: load JSON, modify, cx.run_job. No internal imports, no monkey-patching.
 """
@@ -47,6 +49,29 @@ def main():
                     help='Backward sweep stop index. 0 = full sweep to initial decision.')
     p.add_argument('--audit-max-rounds', type=int, default=3,
                     help='Max audit/correction rounds per fitted timestep.')
+    p.add_argument('--run-upper-bound', dest='run_upper_bound', action='store_true',
+                    default=False,
+                    help='Compute the penalized clairvoyant UPPER bound U (gap = U − L). '
+                         'OPT-IN: the wealth-grid DP is O(P·G·K²·I) per step, so it is costly '
+                         'with many live hedge axes (K = levels^n_live near t0). The cheap '
+                         'penalty zero-mean gate always runs regardless.')
+    p.add_argument('--upper-bound-wealth-grid', type=int, default=81,
+                    help='Wealth-grid nodes for U. More = finer (watch σ/Δgrid ≥ 0.3) but slower.')
+    p.add_argument('--upper-bound-max-paths', type=int, default=128,
+                    help='Outer paths the U DP runs on (capped subset of Batch_Size).')
+    p.add_argument('--save-value-fn', type=str, default=None,
+                    help='Persist the fitted C-stack to this path after the sweep (for OOS reuse).')
+    p.add_argument('--load-value-fn', type=str, default=None,
+                    help='Load a saved C-stack, SKIP training, and run the L/π/U sandwich on '
+                         'this run\'s batch. Pair with a DIFFERENT --random-seed for genuine '
+                         'out-of-sample validation.')
+    p.add_argument('--random-seed', type=int, default=None,
+                    help='Outer-MC seed. Use a different value from the training run when '
+                         'loading a C-stack so the OOS sandwich runs on a fresh batch.')
+    p.add_argument('--oracle-action-match', type=str, default=None,
+                    help='Path to an exact-DP oracle npz (e.g. artifacts/gate2_exact_dp.npz.toy_t30) '
+                         'to score the fitted policy per-depth vs the optimal action. Only '
+                         'meaningful on the matching toy deal (configs_gate2_toy.json).')
     p.add_argument('--margin-usd-per-oz', type=float, default=6.0,
                     help='Dealer margin to clear ($/oz). Spec §0: $6-8/oz; '
                          'default $6 per validation_sandwich_spec.md §7 ship criterion.')
@@ -106,7 +131,20 @@ def main():
         'Lambda_Mix': 0.0,
         'Use_Advantage_Decomp': True,
         'T_Min': int(args.t_min),
+        # BSS sandwich upper bound (opt-in; gap = U − L surfaces in the readout below).
+        'Run_Upper_Bound': bool(args.run_upper_bound),
+        'Upper_Bound_Wealth_Grid': int(args.upper_bound_wealth_grid),
+        'Upper_Bound_Max_Paths': int(args.upper_bound_max_paths),
     }
+    # C-stack persistence for out-of-sample validation (train→save, then eval→load + new seed).
+    if args.save_value_fn:
+        hp['Solver']['Save_Value_Fn_Path'] = args.save_value_fn
+    if args.load_value_fn:
+        hp['Solver']['Load_Value_Fn_Path'] = args.load_value_fn
+    if args.oracle_action_match:
+        hp['Solver']['Oracle_Action_Match_Path'] = args.oracle_action_match
+    if args.random_seed is not None:
+        calc['Random_Seed'] = int(args.random_seed)
 
     # Write to a temp file and load via cx.load_json (it expects a path).
     import tempfile
@@ -130,11 +168,73 @@ def main():
         diagnostics = result.get('optimizer_diagnostics') or result.get('diagnostics')
     if isinstance(diagnostics, dict):
         for key in (
+            'loaded_value_fn', 'C_loaded_count',   # set on an OOS (load) run
             'V_0', 'M1_v0_decision_at_t_min', 'M1_L_cost_per_oz_usd',
             'M1_penalty_zero_mean_z', 'M1_penalty_boundary_hit_cap',
+            # BSS sandwich: lower L (utility), upper U = min(naive, penalized), gap, and the
+            # discretised-DP off-grid clamp gate (a high fraction means U is grid-biased).
+            'M1_U_lower_bound_L_util', 'M1_U_upper_bound', 'M1_U_gap',
+            'M1_U_naive', 'M1_U_penalized', 'M1_U_mean_ge_L',
+            'M1_U_off_grid_frac', 'M1_U_vol_over_gridstep', 'M1_U_skipped',
             'M1_C_fitted_count'):
             if key in diagnostics:
                 print(f'  {key}: {diagnostics[key]}')
+
+        # --- ASSUMPTIONS CHECK: is this run trustworthy? (mirrors the solver's consolidated
+        # log line). A FAIL means the V_0 / sandwich / action-match below it are suspect. ---
+        d = diagnostics
+        def _g(k, default=None):
+            return d.get(k, d.get('M1_' + k, default))
+        underfit = _g('conv_underfit_t', []); escalated = _g('conv_escalated_t', [])
+        conv_ok = (not underfit and not escalated) if ('M1_conv_n_fitted' in d or 'conv_n_fitted' in d) else None
+        v0_over = _g('v0_over_utility_bound')
+        pz = _g('penalty_zero_mean_z'); pen_cap = _g('penalty_boundary_hit_cap')
+        u_ge_l = _g('U_mean_ge_L')
+        print('  ── ASSUMPTIONS ──')
+        if conv_ok is not None:
+            print(f"  C_t converged: {'OK' if conv_ok else 'FAIL'}  "
+                  f"(underfit t={underfit}, escalated t={escalated}, "
+                  f"max val_loss={_g('conv_val_loss_max')} @t={_g('conv_val_loss_max_t')})")
+        if v0_over is not None:
+            print(f"  V_0 within utility bound: {'OK' if not v0_over else 'FAIL (over-optimism)'}")
+        if pz is not None:
+            print(f"  penalty dual-feasible: {'OK' if (pz < 3.0 and not pen_cap) else 'FAIL'}  (z={pz:.2f})")
+        if u_ge_l is not None:
+            print(f"  U ≥ L: {'OK' if u_ge_l else 'FAIL'}")
+
+        # --- §7 DOWNSIDE-PROTECTION VERDICT: learned vs unhedged vs best-static on the
+        # SAME shared-shock batch. The practical "did riskflow solve the hedge" check
+        # (there is no exact-DP oracle for the platinum deal). $/oz; down_sd = RMS of the
+        # loss side only. SOLVED iff learned down_sd ≤ unhedged AND ≤ static. ---
+        vol = _g('bench_volume_oz') or _g('L_volume_oz')
+        if vol and _g('bench_learned_downside_sd_usd') is not None:
+            print('  ── DOWNSIDE-PROTECTION VERDICT ($/oz) ──')
+            print(f"  {'policy':10s} {'mean':>10s} {'down_sd':>10s} {'5%worst':>10s} {'95%best':>10s}")
+            for name in ('unhedged', 'static', 'learned'):
+                print(f"  {name:10s} "
+                      f"{_g(f'bench_{name}_mean_usd')/vol:>+10.4f} "
+                      f"{_g(f'bench_{name}_downside_sd_usd')/vol:>10.4f} "
+                      f"{_g(f'bench_{name}_p5_usd')/vol:>+10.4f} "
+                      f"{_g(f'bench_{name}_p95_usd')/vol:>+10.4f}")
+            beats_un = _g('bench_learned_beats_unhedged_downside')
+            beats_st = _g('bench_learned_beats_static_downside')
+            print(f"  SOLVED: learned cuts downside vs unhedged={'OK' if beats_un else 'FAIL'}, "
+                  f"vs static={'OK' if beats_st else 'FAIL'}  (n*_static={_g('bench_n_star_static')})")
+            L_cost = _g('L_cost_per_oz_usd')
+            if L_cost is not None:
+                print(f"  SHIP CRITERION: L cost={L_cost:+.4f} $/oz vs margin "
+                      f"${args.margin_usd_per_oz:.2f}/oz → "
+                      f"{'CLEARS' if L_cost <= args.margin_usd_per_oz else 'MISSES'}")
+
+        # --- Exact-DP action-match verdict (if --oracle-action-match was set) ---
+        if _g('oracle_match_skipped') is False:
+            print('  ── EXACT-DP ACTION-MATCH ──')
+            print(f"  V_0={_g('v0_decision_at_t_min', d.get('V_0'))} vs oracle V_0={_g('oracle_V0')}")
+            print(f"  exact-match: all={100*_g('oracle_match_exact_frac',0):.1f}%  "
+                  f"preA={100*_g('oracle_match_exact_frac_preA',0):.1f}%  "
+                  f"postA={100*_g('oracle_match_exact_frac_postA',0):.1f}%  "
+                  f"mean|Δq|={_g('oracle_match_mean_abs_dq')}  "
+                  f"err-vs-depth slope={_g('oracle_match_err_vs_depth_slope')}")
 
 
 if __name__ == '__main__':

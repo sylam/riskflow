@@ -296,11 +296,28 @@ def _tracking_error_value(state, runtime):
     return pnl_excess + liability_mtm + cumulative_liability
 
 
+# The terminal-utility SHAPES (all map dollars→O(1) utility via the deal scale c: x = W/c).
+# symlog is odd/symmetric; huber and cara are asymmetric (downside-averse). Selected by
+# `Objective.Object`; the legacy `TerminalFloorThenSurplusUtility` is the identity path.
+# All consume the same scale `c` and live in "utility space" (the DP / value-fn recursion).
+_UTILITY_OBJECTS = (
+    "asymmetricutility_symlog", "asymmetricutility_huber", "asymmetricutility_cara")
+
+
 def _is_symlog_objective(runtime):
+    # TRUE symlog only — for symlog-SPECIFIC diagnostics (e.g. the −45 saturation tripwire,
+    # the log1p-floor penalty-bite report), which don't transfer to huber/cara shapes.
     # `objective["object"]` is canonical-lowercased at normalization time
     # (hedge_runtime._normalize_objective_config), so plain equality is sufficient here.
     obj = (runtime.get("objective") or {})
     return obj.get("object") == "asymmetricutility_symlog"
+
+
+def _is_utility_objective(runtime):
+    """True iff the objective transforms wealth through a utility shape (symlog/huber/cara) —
+    so the DP/value-fn live in utility space and a scale `c` is required. False for the legacy
+    identity objective."""
+    return (runtime.get("objective") or {}).get("object") in _UTILITY_OBJECTS
 
 
 def _mirror_utility_scale_to_runtime(bundle, runtime):
@@ -332,23 +349,44 @@ def _require_utility_scale(runtime):
 
 
 def _utility_wrap(x_dollars, runtime):
-    """Wrap a non-negative dollar quantity through the configured utility transform.
-    Returns x_dollars unchanged for non-symlog objectives. Caller must ensure x_dollars >= 0
-    (log1p is invalid on negative inputs)."""
-    if not _is_symlog_objective(runtime):
+    """log1p magnitude-COMPRESSION for reward shaping (PBRS potential, penalty magnitudes) —
+    a fixed compression primitive, independent of the terminal-utility SHAPE (which may be
+    symlog/huber/cara via `_utility_wrap_signed`). Active under any utility objective,
+    identity for the legacy objective. Caller ensures x_dollars >= 0 (log1p needs it)."""
+    if not _is_utility_objective(runtime):
         return x_dollars
-    c = _require_utility_scale(runtime)
-    return torch.log1p(x_dollars / c)
+    return torch.log1p(x_dollars / _require_utility_scale(runtime))
 
 
 def _utility_wrap_signed(x_dollars, runtime):
-    """Signed-input variant of `_utility_wrap`: u(x; c) = sign(x) · log1p(|x| / c) for
-    symlog, identity for legacy. Use this when the input can be either sign (e.g. net_pnl
-    in `_evaluate_objective`); `_utility_wrap` rejects negatives by docstring."""
-    if not _is_symlog_objective(runtime):
+    """The terminal UTILITY u(W) applied to signed wealth — the single source of truth for
+    the objective, the DP recursion, and the solver's value labels. Dispatches on the
+    configured shape (all in normalised wealth x = W / c), identity for the legacy objective:
+
+      symlog : sign(x)·log1p(|x|)                  — odd, tail-compressing (variance aversion)
+      huber  : x − [a·loss² | a·δ²+2aδ(loss−δ)]    — linear gains; quadratic small losses;
+               (loss = max(−x,0), knee δ)             linear deep tail (bounded scale, live grad)
+      cara   : (1 − exp(−γ·x)) / γ                  — bounded gains, exponentially-penalised loss
+
+    Shape params (huber a/δ, cara γ) are DIMENSIONLESS in c-units. Differentiable in `w`
+    (AAD path: twin-loss labels, DP penalty, baseline B) — huber's knee is C¹, cara is smooth."""
+    if not _is_utility_objective(runtime):
         return x_dollars
-    c = _require_utility_scale(runtime)
-    return torch.sign(x_dollars) * torch.log1p(x_dollars.abs() / c)
+    obj = runtime.get("objective") or {}
+    shape = obj.get("object")
+    x = x_dollars / _require_utility_scale(runtime)
+    if shape == "asymmetricutility_symlog":
+        return torch.sign(x) * torch.log1p(x.abs())
+    if shape == "asymmetricutility_huber":
+        a = float(obj.get("huber_aversion", 2.5))
+        d = float(obj.get("huber_delta", 1.0))
+        loss = (-x).clamp(min=0.0)
+        quad = a * loss * loss
+        lin = a * d * d + 2.0 * a * d * (loss - d)
+        return x - torch.where(loss <= d, quad, lin)
+    # asymmetricutility_cara
+    g = float(obj.get("cara_gamma", 1.0))
+    return (1.0 - torch.exp(-g * x)) / g
 
 
 def resolve_utility_scale(bundle, runtime):
@@ -370,12 +408,12 @@ def resolve_utility_scale(bundle, runtime):
     Multi-commodity TODO: use the deal's reference commodity; current scope is single-commodity.
     """
     objective = (runtime.get('objective') or {})
-    is_symlog = objective.get('object') == 'asymmetricutility_symlog'
+    needs_scale = _is_utility_objective(runtime)   # symlog / huber / cara all consume c
 
     def _degenerate(reason):
-        """Either raise (symlog — degraded c silently breaks tail compression) or return
-        the $1k floor (legacy — c isn't consumed)."""
-        if is_symlog:
+        """Either raise (a utility shape — degraded c silently breaks the wealth scaling) or
+        return the $1k floor (legacy — c isn't consumed)."""
+        if needs_scale:
             raise ValueError(
                 f"resolve_utility_scale: cannot compute a meaningful c — {reason}. "
                 "A floor-c symlog silently compresses tails and defeats the reward shape. "

@@ -181,6 +181,32 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # to the initial decision; t_min near t_outer-1 = a shallow (bounded) sweep.
         "t_min": int(solver_config.get("T_Min", 0)),
         "audit_max_rounds": int(solver_config.get("Audit_Max_Rounds", 3)),
+        # --- BSS validation sandwich (DifferentialSolver offline diagnostics) ---
+        # Penalty π zero-mean GATE (step 1+2): interior |mean ΣΔ|/stderr threshold for
+        # dual feasibility, and the cap on the data-driven terminal boundary block U zeros π on.
+        "penalty_zero_mean_z": float(solver_config.get("Penalty_ZeroMean_Z", 3.0)),
+        "penalty_max_boundary": int(solver_config.get("Penalty_Max_Boundary", 4)),
+        # Penalized clairvoyant UPPER bound U (step 3) — the wealth-grid backward DP. Cost
+        # ∝ P·G·K²·I per step, so it is OPT-IN (like Run_Hindsight_Diagnostic): off by default,
+        # enable for the validation readout. The cheap single-trajectory penalty gate above
+        # always runs. The caps below scope it (shallow/few-live first; raise for tightness).
+        "run_upper_bound": bool(solver_config.get("Run_Upper_Bound", False)),
+        "upper_bound_max_paths": int(solver_config.get("Upper_Bound_Max_Paths", 128)),
+        "upper_bound_wealth_grid": int(solver_config.get("Upper_Bound_Wealth_Grid", 41)),
+        "upper_bound_n_inner": int(solver_config.get("Upper_Bound_N_Inner", 4)),
+        "upper_bound_grid_pad": float(solver_config.get("Upper_Bound_Grid_Pad", 1.0)),
+        "upper_bound_chunk_rows": int(solver_config.get("Upper_Bound_Chunk_Rows", 200_000)),
+        "upper_bound_clamp_warn_frac":
+            float(solver_config.get("Upper_Bound_Clamp_Warn_Frac", 0.02)),
+        # C-stack persistence for OUT-OF-SAMPLE validation (DifferentialSolver). Save_* writes
+        # the fitted twin-net stack after the sweep; Load_* loads it, skips training, and runs
+        # the L/π/U sandwich on a fresh-seeded batch. Two config variants (train→save, eval→load
+        # + new Random_Seed), never both in one run.
+        "save_value_fn_path": solver_config.get("Save_Value_Fn_Path") or None,
+        "load_value_fn_path": solver_config.get("Load_Value_Fn_Path") or None,
+        # Offline gate4 diagnostic: per-depth action-match of the fitted policy vs an exact-DP
+        # oracle (gate2_exact_dp.npz). Gated path; toy-only; never shipped.
+        "oracle_action_match_path": solver_config.get("Oracle_Action_Match_Path") or None,
         # Endogenous-span bank knob (DifferentialSolver): inventory/wealth replicas
         # layered on each exogenous slice.
         "bank_sampling": {
@@ -243,11 +269,19 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
         # Replaces the prior hard mask in `StructuredRebalancePolicy._feasible_mask`.
         "per_instrument_bounds_penalty": float(objective_config.get("Per_Instrument_Bounds_Penalty", 0.0)),
         "per_instrument_bounds_threshold": float(objective_config.get("Per_Instrument_Bounds_Threshold", 5.0)),
-        # Utility-transform scale. Only consumed when Object == "AsymmetricUtility_Symlog";
-        # legacy "TerminalFloorThenSurplusUtility" path ignores both fields. `utility_scale`
-        # is mirrored from `bundle["utility_scale"]` at rollout start (see _collect_ppo_rollout).
+        # Utility-transform scale. Consumed by any utility Object (Symlog / Huber / CARA);
+        # legacy "TerminalFloorThenSurplusUtility" path ignores it. `utility_scale` is mirrored
+        # from `bundle["utility_scale"]` at rollout start (see _collect_ppo_rollout).
         "utility_scale_mode": str(objective_config.get("Utility_Scale_Mode", "vol_scaled_notional")).lower(),
         "utility_scale_explicit": None if explicit is None else float(explicit),
+        # Utility SHAPE params (DIMENSIONLESS, in units of the scale c — applied to x = W/c).
+        # Huber (AsymmetricUtility_Huber): linear gains, quadratic small losses with curvature
+        # `huber_aversion`, linear deep tail beyond the knee `huber_delta`. CARA
+        # (AsymmetricUtility_CARA): u = (1−e^{−γx})/γ with risk aversion `cara_gamma`. Symlog
+        # ignores all three. See torchrl_hedge._utility_wrap_signed for the exact forms.
+        "huber_aversion": float(objective_config.get("Huber_Aversion", 2.5)),
+        "huber_delta": float(objective_config.get("Huber_Delta", 1.0)),
+        "cara_gamma": float(objective_config.get("CARA_Gamma", 1.0)),
     }
 
 
@@ -504,10 +538,13 @@ def construct_torchrl_runtime(
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires Inner_Sub_Batch >= "
                 f"{min_inner} for Solver.Object={solver_config.get('Object')!r}")
-        if str((objective_config or {}).get("Object", "")).lower() != "asymmetricutility_symlog":
+        _utility_objects = ("asymmetricutility_symlog", "asymmetricutility_huber",
+                            "asymmetricutility_cara")
+        if str((objective_config or {}).get("Object", "")).lower() not in _utility_objects:
             raise ValueError(
-                "Execution_Mode 'solve_hedge' requires Objective.Object='AsymmetricUtility_Symlog'. "
-                "The DP recursion lives in utility space: a non-symlog (identity) objective leaves "
+                "Execution_Mode 'solve_hedge' requires a utility Objective.Object — one of "
+                "'AsymmetricUtility_Symlog' | 'AsymmetricUtility_Huber' | 'AsymmetricUtility_CARA'. "
+                "The DP recursion lives in utility space: an identity (legacy) objective leaves "
                 "V-hat unbounded in dollars and the backward sweep blows up multiplicatively.")
     # Policy is optional under solve_hedge — the DP/MPC solver replaces the RL policy track.
     policy = _normalize_policy_config(policy_config) if policy_config is not None else None

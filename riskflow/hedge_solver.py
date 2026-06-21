@@ -13,6 +13,7 @@ later milestones.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
@@ -1584,6 +1585,26 @@ def _multiseed_summary(runs):
                       or runs[0].diagnostics.get("n_star")}
 
 
+def _interp_wealth_grid(xs, ys, q):
+    """Linear interpolation of per-path values `ys` (P, G) over the shared wealth grid
+    `xs` (G,), queried at `q` (P, …). Port of `diffml_hedge_huber._interp_path`.
+
+    Queries are CLAMPED to `[xs[0], xs[-1]]`; the caller measures the clamp (off-grid)
+    fraction SEPARATELY and treats it as the discretised-DP bias gate (memory rule
+    `discretised-DP-boundary-clamp`: silent off-grid clamping biases `U` and can invert
+    the optimal policy direction — it must be a permanent diagnostic, not a hidden detail)."""
+    P, G = ys.shape
+    qf = q.reshape(P, -1)
+    qc = qf.clamp(float(xs[0]), float(xs[-1]))
+    idx = torch.searchsorted(xs, qc).clamp(1, G - 1)          # (P, M)
+    x0 = xs[idx - 1]
+    x1 = xs[idx]
+    y0 = ys.gather(1, idx - 1)
+    y1 = ys.gather(1, idx)
+    w = (qc - x0) / (x1 - x0)
+    return (y0 + w * (y1 - y0)).reshape(q.shape)
+
+
 class DifferentialSolver:
     """Differential-ML dynamic-hedging solver. Casts each
     per-step value function as a smooth post-decision continuation `C_t : z_t → scalar`
@@ -1655,6 +1676,27 @@ class DifferentialSolver:
         # whole-profile dynamics bug makes the block blow past the cap → caught.
         self._penalty_zero_mean_z = float(solver_cfg.get("penalty_zero_mean_z", 3.0))
         self._penalty_max_boundary = int(solver_cfg.get("penalty_max_boundary", 4))
+        # BSS sandwich step 3 — penalized clairvoyant upper bound `U` (the wealth-grid
+        # backward DP of `diffml_hedge_huber.penalized_upper`). All offline/diagnostic.
+        # `U` is the envelope×wealth-grid×inner-fork DP — cost ∝ P·G·K²·I per step — so the
+        # path count, grid size and inner-fork count are capped (scope shallow/few-live first;
+        # raise via JSON for a tighter, more expensive bound).
+        self._run_upper_bound = bool(solver_cfg.get("run_upper_bound", False))
+        self._upper_max_paths = int(solver_cfg.get("upper_bound_max_paths", 128))
+        self._upper_n_grid = int(solver_cfg.get("upper_bound_wealth_grid", 41))
+        self._upper_n_inner = int(solver_cfg.get("upper_bound_n_inner", 4))
+        self._upper_grid_pad = float(solver_cfg.get("upper_bound_grid_pad", 1.0))
+        self._upper_chunk_rows = int(solver_cfg.get("upper_bound_chunk_rows", 200_000))
+        # Off-grid (clamp) fraction above which `U` is flagged biased (memory:
+        # discretised-DP-boundary-clamp — silent clamping biases U / can invert the policy).
+        self._upper_clamp_warn = float(solver_cfg.get("upper_bound_clamp_warn_frac", 0.02))
+        # C-stack persistence (OUT-OF-SAMPLE validation). `save_value_fn_path`: write the fitted
+        # twin-net stack after the sweep. `load_value_fn_path`: load it, SKIP training, and run
+        # the L/π/U sandwich on THIS run's (fresh-seeded) outer batch. Two JSON-config variants
+        # (train → save; eval → load + new Random_Seed) — never both in one run.
+        self._save_value_fn_path = solver_cfg.get("save_value_fn_path") or None
+        self._load_value_fn_path = solver_cfg.get("load_value_fn_path") or None
+        self._oracle_action_match_path = solver_cfg.get("oracle_action_match_path") or None
 
         self.hedges = list(runtime["names"]["hedges"])
         # T_outer-1 decision points: t=0..T-2 (DP convention). C[T_outer-1] is the
@@ -2043,8 +2085,9 @@ class DifferentialSolver:
         D_hedges = (belief * torch.expm1(cum_hedge)).sum(dim=-1)     # (...,)
         liab_drift = (belief * self._liab_drift_state[t_idx]).sum(dim=-1)
         E_wealth_T = wealth + sum_q * S * D_hedges - S * liab_drift
-        return torch.sign(E_wealth_T) * torch.log1p(
-            E_wealth_T.abs() / self.utility_c)
+        # Baseline = the configured terminal utility of the buy-and-hold expected wealth
+        # (symlog / huber / cara — single source of truth). AAD-safe; A absorbs the residual.
+        return _utility_wrap_signed(E_wealth_T, self.runtime)
 
     def _dB_dz(self, z):
         """Exact gradient `∂B_t/∂z` of the closed-form baseline, same shape as `z`.
@@ -2073,9 +2116,26 @@ class DifferentialSolver:
         learns only the small bounded residual; under the legacy no-baseline mode
         (`use_advantage_decomp=False`), `B_t ≡ 0` and this collapses to `net(z)`.
         Both call sites that previously did `net(z)` should route through here so
-        the decomposition is transparent to the rest of the solver."""
-        nn_out = net(z)
-        return nn_out + self._baseline_B(z)
+        the decomposition is transparent to the rest of the solver.
+
+        Row-chunked under `no_grad` (gate-5 finding): `_decision_at` scores the FULL
+        action grid (levels^n_h — 1331 at 3 axes × 11 levels; live-masking zeros dead
+        columns but K stays 1331), so `z` is `(N·K, deep_dim)`. With an audit-grown
+        bank (N~7k) that is ~10M rows → the MLP forward alone needs ~9 GiB and OOMs at
+        production batch. Chunking the forward bounds it to `_upper_chunk_rows` (the same
+        MLP-eval budget the U DP / penalty envelope use). In a grad-enabled context (the
+        bootstrap-label / FD-gate paths) `z` is only `(N, deep_dim)` (the single realized
+        next state, no action axis) — small — so we keep the single fused call there to
+        leave the autograd graph through `C_{t+1}` intact."""
+        M = z.shape[0]
+        chunk = self._upper_chunk_rows
+        if torch.is_grad_enabled() or M <= chunk:
+            return net(z) + self._baseline_B(z)
+        out = torch.empty(M, dtype=z.dtype, device=z.device)
+        for i in range(0, M, chunk):
+            sl = slice(i, i + chunk)
+            out[sl] = net(z[sl]) + self._baseline_B(z[sl])
+        return out
 
     # ------------------------------------------------------------------ seam
     def sample_exogenous(self, n=None, seed=None):
@@ -2182,25 +2242,29 @@ class DifferentialSolver:
             positions=q_flat, g=wealth_flat, a=zero_b, futures=tradables_b,
             market=market_b, static=static_T, time_to_t=time_to_T)
 
-        # Terminal utility — symlog of wealth (w_T already
-        # carries cash + (q_total - 1)·S + K → fully realized terminal wealth).
-        c_util = max(float(self.bundle.get("utility_scale", 100.0)), 1.0)
+        # Terminal utility — the configured shape (symlog / huber / cara) of wealth (w_T
+        # already carries cash + (q_total - 1)·S + K → fully realized terminal wealth).
         wealth_idx = self.statepack.n_hedge
         if self._advantage_decomp:
             # Under advantage decomp the NN fits the RESIDUAL A_T = C_T − B_T(z).
-            # At terminal (`time_to_T = 0`), `B_T(z) = symlog(wealth)` exactly
-            # (drift_factor = e^0 − 1 = 0), so A_T = symlog(W_T) − symlog(z.wealth)
-            # = 0 identically. Both value and gradient targets collapse to 0; the
-            # NN trains to ~zero output and the full continuation is recovered as
-            # `B_T(z) + A_T(z) ≈ symlog(z.wealth) + 0`.
+            # At terminal (`time_to_T = 0`), `B_T(z) = u(wealth)` exactly (drift_factor =
+            # e^0 − 1 = 0 ⇒ E_wealth_T = wealth), so A_T = u(W_T) − u(z.wealth) = 0
+            # identically. Both value and gradient targets collapse to 0; the NN trains to
+            # ~zero output and the full continuation is recovered as `B_T(z) + A_T(z) ≈
+            # u(z.wealth) + 0` — shape-agnostic (B_T routes through `_utility_wrap_signed`).
             y_target = torch.zeros_like(wealth_flat)
             dy_dz = torch.zeros_like(z_T)
         else:
-            y_target = torch.sign(wealth_flat) * torch.log1p(wealth_flat.abs() / c_util)
-            # Gradient label: ∂U/∂wealth = 1/(c + |w|); zero on other coords. The
-            # wealth column is at StatePack offset n_hedge (after positions block).
+            # No-baseline path: C_T = u(W_T) directly. Value + pathwise gradient label from
+            # the configured utility (autograd → shape-correct ∂u/∂wealth for symlog/huber/cara,
+            # zero on other coords). Wealth column at StatePack offset n_hedge.
+            with torch.enable_grad():
+                w_leaf = wealth_flat.detach().clone().requires_grad_(True)
+                u_T = _utility_wrap_signed(w_leaf, self.runtime)
+                (gw,) = torch.autograd.grad(u_T.sum(), w_leaf)
+            y_target = u_T.detach()
             dy_dz = torch.zeros_like(z_T)
-            dy_dz[:, wealth_idx] = 1.0 / (c_util + wealth_flat.abs())
+            dy_dz[:, wealth_idx] = gw.detach()
 
         # Build and fit the twin network.
         net = construct_twin_network(
@@ -3029,12 +3093,18 @@ class DifferentialSolver:
 
     # --------------------------------- M2: audit rollout + correction loop
     def _rollout_no_grad_to_T(self, t_start, outer_indices, q_post_t, wealth_post_t,
-                              traj, *, return_raw_wealth=False):
+                              traj, *, return_raw_wealth=False, decide_fn=None):
         """Frozen-policy no-grad rollout from post-decision state at `t_start` to
         terminal `T_dec`. By default returns `Y_eval = symlog(W_T)` per row (the
         audit's utility-units residual). Pass `return_raw_wealth=True` to get the
         raw realised terminal wealth in dollars — used by `_compute_dollar_floor`
         (spec §6 step 2: lower bound L = realised $/oz).
+
+        `decide_fn=None` (default) ⇒ the learned argmax `C[u+1]` policy (the floor /
+        audit path — unchanged, byte-identical). Pass a callable
+        `decide_fn(u+1, market, F, q_carry, wealth_pre, static, time_to_T) -> q_target
+        (N, n_h)` to roll a NON-learned frozen policy (unhedged / static) through the
+        IDENTICAL wealth-MTM recursion — the apples-to-apples benchmark verdict (§7).
 
         At each future step u ∈ [t_start, t_outer−2]:
           • read realized (market_{u+1}, F_{u+1}) from `traj[u+1]` at the audit row's
@@ -3086,17 +3156,20 @@ class DifferentialSolver:
                     N, self._static_sim.shape[-1])
                 time_to_T_u1 = torch.full((N,), float(self.t_outer - 1 - (u + 1)),
                                            device=device)
-                q_star_u1, _, _ = self._decision_at(
-                    self.C[u + 1], market_u1, F_u1, q_carry,
-                    wealth_pre_u1, time_to_T_u1, static_u1, u + 1)
+                if decide_fn is None:
+                    q_star_u1, _, _ = self._decision_at(
+                        self.C[u + 1], market_u1, F_u1, q_carry,
+                        wealth_pre_u1, time_to_T_u1, static_u1, u + 1)
+                else:
+                    q_star_u1 = decide_fn(u + 1, market_u1, F_u1, q_carry,
+                                          wealth_pre_u1, static_u1, time_to_T_u1)
                 cost_u1 = self._turnover(q_star_u1, q_carry, F_u1)
                 wealth = wealth_pre_u1 - cost_u1
                 q_carry = q_star_u1
             if return_raw_wealth:
                 return wealth                                       # (N,) raw $
-            # Terminal utility under symlog at the framework's c.
-            c_util = self.utility_c
-            Y_eval = torch.sign(wealth) * torch.log1p(wealth.abs() / c_util)
+            # Terminal utility — the configured shape (symlog / huber / cara).
+            Y_eval = _utility_wrap_signed(wealth, self.runtime)
         return Y_eval
 
     def _compute_dollar_floor(self, traj):
@@ -3162,7 +3235,116 @@ class DifferentialSolver:
             "L_mean_per_oz_usd": mean_wealth / volume_oz,
             "L_cost_per_oz_usd": L_cost_per_oz,
             "L_p95_cost_per_oz_usd": L_p95_cost,
+            # Per-path learned terminal wealth (B,) — reused by the §7 benchmark verdict so
+            # learned/unhedged/static are scored on the IDENTICAL batch. Underscore-prefixed:
+            # the caller pops it before merging into the (JSON-scalar) diagnostics.
+            "_terminal_wealth": terminal_wealth,
         }
+
+    def _frozen_policy_terminal_wealth(self, traj, decide_fn):
+        """Per-path terminal wealth (B,) in $ for a NON-learned frozen policy whose
+        post-decision target inventory at each step is `decide_fn(t, market, F, q_carry,
+        wealth_pre, static, time_to_T)`. Mirrors `_compute_dollar_floor`'s t_min setup
+        (decide from flat, charge entry turnover) then reuses `_rollout_no_grad_to_T` with
+        the SAME `decide_fn` — so the wealth-MTM recursion (hedge Σq·cs·dF minus liability
+        dL=R·dS, plus per-expiry forced-unwind turnover) is IDENTICAL to the learned floor.
+        Apples-to-apples with `_compute_dollar_floor`'s learned terminal wealth."""
+        device = self.device
+        n_h = len(self.hedges)
+        B = self._B()
+        outer_idx = torch.arange(B, device=device)
+        t0 = self.t_min
+        market_0 = traj[t0]["market"]
+        F_0 = traj[t0]["tradables"]
+        static_0 = self._static_sim[t0].to(device).expand(B, self._static_sim.shape[-1])
+        time_to_T_0 = torch.full((B,), float(self.t_outer - 1 - t0), device=device,
+                                  dtype=self.dtype)
+        q_prev = torch.zeros(B, n_h, device=device, dtype=self.dtype)
+        wealth_pre = torch.zeros(B, device=device, dtype=self.dtype)
+        with torch.no_grad():
+            q_star_0 = decide_fn(t0, market_0, F_0, q_prev, wealth_pre, static_0, time_to_T_0)
+            wealth_post_0 = wealth_pre - self._turnover(q_star_0, q_prev, F_0)
+        return self._rollout_no_grad_to_T(
+            t_start=t0, outer_indices=outer_idx, q_post_t=q_star_0,
+            wealth_post_t=wealth_post_0, traj=traj, return_raw_wealth=True,
+            decide_fn=decide_fn)                                       # (B,) raw $
+
+    def _compute_benchmark_comparison(self, traj, learned_wealth):
+        """Piece §7 — the downside-protection VERDICT (port of `diffml_hedge_huber.py`'s
+        final block). On the SAME outer batch (shared shocks) as the floor L, roll three
+        policies and report mean / downside_sd / 5%-worst / 95%-best per path, in $ and $/oz:
+          • learned   — the fitted argmax policy (terminal wealth reused from the floor).
+          • unhedged  — q≡0 (bare liability; the do-nothing baseline).
+          • static    — the single best constant hold (`run_textbook_benchmark`'s n*), held
+                        live-masked (dead axes forced flat at expiry; the rollout charges the
+                        unwind). n* is selected under the textbook objective; the realised
+                        comparison here re-rolls it through the floor's recursion so all three
+                        policies share one wealth convention.
+
+        'Solved' (toy-parity criterion): learned `downside_sd` ≤ unhedged AND ≤ static — the
+        policy cuts the realised downside vs both naïve baselines. `downside_sd` = RMS of the
+        LOSS side only (`sqrt(mean(relu(-W)²))`) — the asymmetric-utility metric that matters;
+        plain std counts upside dispersion as 'risk'."""
+        device = self.device
+        n_h = len(self.hedges)
+        is_live = self.is_live
+
+        def _unhedged(t, market, F, q_carry, wealth_pre, static, time_to_T):
+            return torch.zeros_like(q_carry)
+
+        tb = run_textbook_benchmark(self.bundle, self.runtime)
+        n_star = torch.tensor(tb["n_star"], dtype=self.dtype, device=device)   # (n_h,)
+
+        def _static(t, market, F, q_carry, wealth_pre, static, time_to_T):
+            live = is_live[t].to(self.dtype)                                   # (n_h,)
+            return (n_star * live).expand(q_carry.shape[0], n_h)
+
+        unhedged_wealth = self._frozen_policy_terminal_wealth(traj, _unhedged)
+        static_wealth = self._frozen_policy_terminal_wealth(traj, _static)
+        volume_oz = float(self.bundle.get("total_leg_volume", 0.0)) or 1.0
+
+        def _metrics(W):
+            loss = torch.clamp(-W, min=0.0)
+            return {
+                "mean_usd": float(W.mean().item()),
+                "downside_sd_usd": float((loss ** 2).mean().sqrt().item()),
+                "p5_usd": float(W.quantile(0.05).item()),     # 5%-worst
+                "p95_usd": float(W.quantile(0.95).item()),    # 95%-best
+            }
+
+        out = {}
+        for name, W in (("learned", learned_wealth), ("unhedged", unhedged_wealth),
+                        ("static", static_wealth)):
+            m = _metrics(W)
+            for k, v in m.items():
+                out[f"bench_{name}_{k}"] = v
+            out[f"bench_{name}_mean_per_oz_usd"] = m["mean_usd"] / volume_oz
+            out[f"bench_{name}_downside_sd_per_oz_usd"] = m["downside_sd_usd"] / volume_oz
+        out["bench_volume_oz"] = volume_oz
+        out["bench_n_star_static"] = tb["n_star"]
+        out["bench_learned_beats_unhedged_downside"] = bool(
+            out["bench_learned_downside_sd_usd"] <= out["bench_unhedged_downside_sd_usd"])
+        out["bench_learned_beats_static_downside"] = bool(
+            out["bench_learned_downside_sd_usd"] <= out["bench_static_downside_sd_usd"])
+        logging.info(
+            "DifferentialSolver §7 VERDICT (downside protection, $/oz, B=%d paths):\n"
+            "  %-9s  mean=%+9.4f  down_sd=%9.4f  5%%worst=%+9.4f  95%%best=%+9.4f\n"
+            "  %-9s  mean=%+9.4f  down_sd=%9.4f  5%%worst=%+9.4f  95%%best=%+9.4f\n"
+            "  %-9s  mean=%+9.4f  down_sd=%9.4f  5%%worst=%+9.4f  95%%best=%+9.4f\n"
+            "  learned cuts downside vs unhedged=%s, vs static=%s  (n*_static=%s)",
+            self._B(),
+            "unhedged", out["bench_unhedged_mean_usd"] / volume_oz,
+            out["bench_unhedged_downside_sd_usd"] / volume_oz,
+            out["bench_unhedged_p5_usd"] / volume_oz, out["bench_unhedged_p95_usd"] / volume_oz,
+            "static", out["bench_static_mean_usd"] / volume_oz,
+            out["bench_static_downside_sd_usd"] / volume_oz,
+            out["bench_static_p5_usd"] / volume_oz, out["bench_static_p95_usd"] / volume_oz,
+            "learned", out["bench_learned_mean_usd"] / volume_oz,
+            out["bench_learned_downside_sd_usd"] / volume_oz,
+            out["bench_learned_p5_usd"] / volume_oz, out["bench_learned_p95_usd"] / volume_oz,
+            out["bench_learned_beats_unhedged_downside"],
+            out["bench_learned_beats_static_downside"], tb["n_star"])
+        return out
 
     def _spot_col(self, market):
         """Observable spot price from a market block `(…, market_dim)` → `(…)`.
@@ -3314,12 +3496,22 @@ class DifferentialSolver:
                 pnl_inner = (q_carry.unsqueeze(1) * cs * dF_inner).sum(dim=-1)
                 wealth_pre_t1_inner = wealth.unsqueeze(1) + pnl_inner - R_t * dS_inner
                 BI = B * B_inner
-                v_inner, _ = self._continuation_value(
-                    C_next,
-                    m_t1.reshape(BI, -1),
-                    F_t1_inner.reshape(BI, n_h),
-                    q_carry.unsqueeze(1).expand(B, B_inner, n_h).reshape(BI, n_h),
-                    wealth_pre_t1_inner.reshape(BI), t1)
+                # Chunk the inner continuation over BI: `_continuation_value` → `_decision_at`
+                # expands each row by the action grid K, so the un-chunked (B·B_inner·K) envelope
+                # OOMs on GPU at large B (e.g. B=2048, B_inner=128, K=121 → ~15 GiB). Bound it to
+                # ~`upper_bound_chunk_rows` post-expansion, same as the U DP's `_env`.
+                mk_in = m_t1.reshape(BI, -1)
+                Ff_in = F_t1_inner.reshape(BI, n_h)
+                qf_in = q_carry.unsqueeze(1).expand(B, B_inner, n_h).reshape(BI, n_h)
+                wf_in = wealth_pre_t1_inner.reshape(BI)
+                v_inner = torch.empty(BI, device=device, dtype=self.dtype)
+                K_act = self.action_grid.shape[0]
+                step_bi = max(1, self._upper_chunk_rows // max(1, K_act))
+                for i0 in range(0, BI, step_bi):
+                    sl = slice(i0, i0 + step_bi)
+                    vv, _ = self._continuation_value(
+                        C_next, mk_in[sl], Ff_in[sl], qf_in[sl], wf_in[sl], t1)
+                    v_inner[sl] = vv
                 E_hat = v_inner.reshape(B, B_inner).mean(dim=1)        # (B,)
 
                 delta_t = v_real - E_hat                               # (B,)
@@ -3407,6 +3599,439 @@ class DifferentialSolver:
             "penalty_n_steps": n_steps,
             "penalty_t_start": t0,
             "penalty_delta_per_t_mean": per_t_mean,
+        }
+
+    def _compute_penalized_upper_bound(self, traj, penalty):
+        """BSS sandwich step 3 — the penalized clairvoyant UPPER bound `U` (validation_
+        sandwich_spec §3; brief §3). Port of `diffml_hedge_huber.penalized_upper`:
+
+            U = E[ max_{q-path} ( u(W_T) − Σ_t π_t(s_t, q_t) ) ],
+            π_t(s_t, q) = C_{t+1}(s_{t+1})  −  Ê[ C_{t+1}(s'_{t+1}) | s_t, q ].
+
+        The clairvoyant sees the whole realised price path; the martingale penalty `π`
+        charges it for that foresight, so the bound tightens toward `V*` as `C → V*`.
+        Solved by a per-path BACKWARD DP on a discretised WEALTH grid:
+
+            J_T(N)  = u(N)                              (the configured terminal utility)
+            J_t(N)  = max_q [ J_{t+1}(N')  −  π_t(N, q) ],  N' interpolated on the grid.
+
+        Exactly the operator `_compute_martingale_penalty_check` already builds, but swept
+        over (wealth grid × action grid) instead of along the single policy trajectory —
+        `C_real`/`Ê` reuse the SAME continuation envelope (`_continuation_value`), so `U`'s
+        `π` is the identical martingale difference the zero-mean gate certified.
+
+        Per the standing directives:
+          • `π ≡ 0` on the DATA-DRIVEN boundary block (`penalty['penalty_boundary_t_steps']`)
+            — zero is itself dual-feasible, keeping `U` a VALID (safe-loose) bound there.
+          • `U = min(U_naive, U_pen)` — the tightest valid bound. `U_naive` is the same DP
+            with `π ≡ 0` everywhere (pure clairvoyant: free foresight, no penalty).
+          • A WIDE gap `U − L` is AMBIGUOUS (perfect-foresight slack + the turnover/grid
+            relaxations below), NOT necessarily policy suboptimality.
+
+        Relaxations that keep `U` valid but LOOSE (each only RAISES the bound): the wealth-
+        grid DP picks `q` per step with no inventory axis, so the step-`t` ENTRY turnover
+        (`q_t` vs `q_{t-1}`) is not charged (the t+1 re-trade still is, inside the envelope);
+        and the bound is read at the policy's `t_min` start wealth (0), matching `L`. Both
+        are documented looseness, not bias — `HindsightDpSolver` is a separate, tighter
+        naive clairvoyant reference (max-plus on cash with the inventory axis + turnover).
+
+        Discretised-DP GUARDS (memory rules, mandatory and permanent): the OFF-GRID clamp
+        fraction (silent clamping biases `U` upward / can invert the policy) and the
+        wealth-move RESOLUTION vs grid step (`vol/Δgrid`, `|drift|/Δgrid` — too coarse and
+        the kernel masks the dynamics). Both are logged and returned; a high clamp fraction
+        means the grid is too narrow and `U` is suspect.
+
+        Offline diagnostic only — never a solver dependency, never shipped."""
+        device = self.device
+        dtype = self.dtype
+        n_h = len(self.hedges)
+        cs = self.contract_size                                  # (n_h,)
+        t0 = self.t_min
+        runtime = self.runtime
+
+        if penalty.get("penalty_zero_mean_skipped"):
+            logging.warning(
+                "DifferentialSolver U: penalty check was skipped (no inner_mc_fn) — Ê[C] is "
+                "unavailable, cannot build the penalized bound. Skipping U.")
+            return {"U_skipped": True, "U_skip_reason": "penalty_skipped"}
+        if "inner_mc_fn" not in self.bundle:
+            logging.warning("DifferentialSolver U: bundle has no 'inner_mc_fn' — skipping U.")
+            return {"U_skipped": True, "U_skip_reason": "no_inner_mc_fn"}
+        if penalty.get("penalty_boundary_hit_cap"):
+            # Interior π is NOT zero-mean even after the boundary block — π is infeasible, so
+            # the certificate is void. Per the spec: stop, do not certify U.
+            logging.error(
+                "DifferentialSolver U: penalty boundary HIT CAP (interior ΣΔ_t still not "
+                "zero-mean, z=%.2f ≥ %.2f) — π is INFEASIBLE, U would NOT be a valid upper "
+                "bound. Skipping U (certificate void).",
+                penalty.get("penalty_zero_mean_z", float("nan")), self._penalty_zero_mean_z)
+            return {"U_skipped": True, "U_skip_reason": "penalty_infeasible"}
+
+        boundary_set = set(penalty.get("penalty_boundary_t_steps", []))
+        B = self._B()
+        P = min(B, self._upper_max_paths)
+        G = self._upper_n_grid
+        outer_idx = torch.arange(P, device=device)
+        K = self.action_grid.shape[0]
+        steps = list(range(t0, self.t_outer - 1))               # decision steps t0 … t_outer-2
+        if not steps:
+            logging.warning(
+                "DifferentialSolver U: no decision steps in [t_min=%d, t_outer-1=%d) — "
+                "degenerate horizon, skipping U.", t0, self.t_outer - 1)
+            return {"U_skipped": True, "U_skip_reason": "degenerate_horizon"}
+
+        # ---- Lower bound L (utility units) on the SAME P paths, for the gap + U≥L check ----
+        # Mirror _compute_dollar_floor's t0 decision, then a frozen-policy rollout. Y_eval is
+        # already the configured terminal utility u(W_T); L_util = mean. (The $/oz floor stays
+        # separate — different unit system, different consumer.)
+        market_0 = traj[t0]["market"][:P]
+        F_0 = traj[t0]["tradables"][:P]
+        static_0 = self._static_sim[t0].to(device).expand(P, self._static_sim.shape[-1])
+        time_to_T_0 = torch.full((P,), float(self.t_outer - 1 - t0), device=device, dtype=dtype)
+        q_prev0 = torch.zeros(P, n_h, device=device, dtype=dtype)
+        wealth_pre0 = torch.zeros(P, device=device, dtype=dtype)
+        with torch.no_grad():
+            q_star_0, _, _ = self._decision_at(
+                self.C[t0], market_0, F_0, q_prev0, wealth_pre0, time_to_T_0, static_0, t0)
+            wealth_post_0 = wealth_pre0 - self._turnover(q_star_0, q_prev0, F_0)
+        W_T_greedy = self._rollout_no_grad_to_T(
+            t_start=t0, outer_indices=outer_idx, q_post_t=q_star_0,
+            wealth_post_t=wealth_post_0, traj=traj, return_raw_wealth=True)   # (P,) raw $
+        L_util_path = _utility_wrap_signed(W_T_greedy, runtime)               # (P,) utility units
+        L_util = float(L_util_path.mean().item())
+
+        # ---- Wealth grid: bracket the realised greedy terminal wealth, padded each side.
+        # Off-grid fraction (below) is the quality gate; widen `upper_bound_grid_pad` if it bites.
+        w_lo = float(W_T_greedy.min().item())
+        w_hi = float(W_T_greedy.max().item())
+        span = max(w_hi - w_lo, 2.0 * self.utility_c)
+        pad = self._upper_grid_pad * span
+        xs = torch.linspace(w_lo - pad, w_hi + pad, G, device=device, dtype=dtype)  # (G,)
+        grid_step = float((xs[-1] - xs[0]).item()) / (G - 1)
+
+        # Live-masked action grid (dead axes → 0, exactly as _decision_at): the DP's own max_q.
+        q_grid = self.action_grid.clone()                        # (K, n_h)
+        live_any = self.is_live[t0]
+        if (~live_any).any():
+            # Use per-step liveness inside the loop; here just note the grid shape.
+            pass
+
+        est_evals = len(steps) * P * G * K * K * (1 + self._upper_n_inner)
+        logging.info(
+            "DifferentialSolver U: building penalized clairvoyant bound. P=%d (of B=%d), "
+            "wealth_grid=%d, action_grid K=%d, n_inner=%d, steps=%d (t %d→%d). "
+            "Boundary block (π≡0) = %s. ~%.2gM continuation evals (chunk=%d rows). "
+            "Grid=[%.4g, %.4g], Δgrid=%.4g $. Utilities normalised by c=%.4g.",
+            P, B, G, K, self._upper_n_inner, len(steps), steps[-1], t0,
+            sorted(boundary_set) or "[]", est_evals / 1e6, self._upper_chunk_rows,
+            float(xs[0]), float(xs[-1]), grid_step, self.utility_c)
+
+        # ---- chunked continuation envelope over a flattened (market,F,q,wealth) batch ----
+        def _env(C_next, market_f, F_f, q_f, w_f, t1):
+            M = market_f.shape[0]
+            out = torch.empty(M, device=device, dtype=dtype)
+            step = max(1, self._upper_chunk_rows // max(1, K))   # envelope expands by K interior
+            for i in range(0, M, step):
+                sl = slice(i, i + step)
+                v, _ = self._continuation_value(
+                    C_next, market_f[sl], F_f[sl], q_f[sl], w_f[sl], t1)
+                out[sl] = v
+            return out
+
+        # ---- backward DP: two J's (penalized + naive) sharing the realised paths ----
+        J_pen = _utility_wrap_signed(xs, runtime).unsqueeze(0).expand(P, G).clone()   # J_T = u(N)
+        J_naive = J_pen.clone()
+        off_grid_n = 0
+        off_grid_tot = 0
+        vol_over_step = []
+        drift_over_step = []
+        with torch.no_grad():
+            for t in reversed(steps):
+                t1 = t + 1
+                C_next = self.C[t1]
+                if C_next is None:
+                    logging.warning("DifferentialSolver U: C[%d] is None — stopping DP early.", t1)
+                    break
+                live_t = self.is_live[t]
+                qg = q_grid.clone()
+                if (~live_t).any():
+                    qg[:, ~live_t] = 0.0
+                qg_cs = qg * cs                                  # (K, n_h)
+
+                market_t = traj[t]["market"][:P]
+                F_t = traj[t]["tradables"][:P]
+                market_t1 = traj[t1]["market"][:P]
+                F_t1 = traj[t1]["tradables"][:P]
+                dim = market_t1.shape[-1]
+                spot_t = self._spot_col(market_t)
+                dF_real = F_t1 - F_t                             # (P, n_h)
+                dS_real = (self._spot_col(market_t1) - spot_t
+                           if spot_t is not None else dF_real[:, 0])         # (P,)
+                R_t = self._liability_R[t]
+                dL_real = R_t * dS_real                          # (P,)
+                pnl_real = (qg_cs.unsqueeze(0) * dF_real.unsqueeze(1)).sum(-1)   # (P, K)
+                dN_real = pnl_real - dL_real.unsqueeze(1)        # (P, K) per-step wealth move
+                Nreal = (xs.view(1, G, 1) + pnl_real.unsqueeze(1)
+                         - dL_real.view(P, 1, 1))                # (P, G, K)
+
+                # off-grid + resolution diagnostics (mandatory discretised-DP guards)
+                off_grid_n += int(((Nreal < xs[0]) | (Nreal > xs[-1])).sum().item())
+                off_grid_tot += Nreal.numel()
+                vol_over_step.append(float(dN_real.std().item()) / grid_step)
+                drift_over_step.append(abs(float(dN_real.mean().item())) / grid_step)
+
+                is_boundary = t in boundary_set
+                if is_boundary:
+                    pi = torch.zeros(P, G, K, device=device, dtype=dtype)
+                else:
+                    # C_real = continuation envelope at the REALISED next state (P,G,K)
+                    mk = market_t1.view(P, 1, 1, dim).expand(P, G, K, dim).reshape(-1, dim)
+                    Ff = F_t1.view(P, 1, 1, n_h).expand(P, G, K, n_h).reshape(-1, n_h)
+                    qf = qg.view(1, 1, K, n_h).expand(P, G, K, n_h).reshape(-1, n_h)
+                    C_real = _env(C_next, mk, Ff, qf, Nreal.reshape(-1), t1).reshape(P, G, K)
+
+                    # Ê[C|s_t,q] via INDEPENDENT inner draws (no winner's curse), mean over forks
+                    inner = self.bundle["inner_mc_fn"](t)
+                    m_t1_in = inner.get("market_t1")
+                    if m_t1_in is None:
+                        logging.warning(
+                            "DifferentialSolver U: inner fork has no market_t1 at t=%d — "
+                            "treating as boundary (π≡0) for this step.", t)
+                        pi = torch.zeros(P, G, K, device=device, dtype=dtype)
+                    else:
+                        I = min(m_t1_in.shape[1], self._upper_n_inner)
+                        m_t1_in = m_t1_in[:P, :I]                          # (P, I, dim)
+                        F_t1_in = torch.stack(
+                            [inner["F_t1"][h] for h in self.hedges], dim=-1)[:P, :I]  # (P,I,n_h)
+                        dF_in = F_t1_in - F_t.unsqueeze(1)                 # (P, I, n_h)
+                        dS_in = (self._spot_col(m_t1_in) - spot_t.unsqueeze(1)
+                                 if spot_t is not None else dF_in[..., 0])  # (P, I)
+                        dL_in = R_t * dS_in                                # (P, I)
+                        pnl_in = (qg_cs.view(1, 1, K, n_h)
+                                  * dF_in.view(P, I, 1, n_h)).sum(-1)      # (P, I, K)
+                        Nin = (xs.view(1, G, 1, 1)
+                               + pnl_in.permute(0, 2, 1).unsqueeze(1)      # (P,1,K,I)
+                               - dL_in.view(P, 1, 1, I))                   # (P, G, K, I)
+                        off_grid_n += int(((Nin < xs[0]) | (Nin > xs[-1])).sum().item())
+                        off_grid_tot += Nin.numel()
+                        mk = m_t1_in.view(P, 1, 1, I, dim).expand(
+                            P, G, K, I, dim).reshape(-1, dim)
+                        Ff = F_t1_in.view(P, 1, 1, I, n_h).expand(
+                            P, G, K, I, n_h).reshape(-1, n_h)
+                        qf = qg.view(1, 1, K, 1, n_h).expand(
+                            P, G, K, I, n_h).reshape(-1, n_h)
+                        C_e = _env(C_next, mk, Ff, qf, Nin.reshape(-1), t1
+                                   ).reshape(P, G, K, I).mean(-1)          # (P, G, K)
+                        pi = C_real - C_e                                  # (P,G,K) mean-zero in q
+
+                Jnext_pen = _interp_wealth_grid(xs, J_pen, Nreal)          # (P, G, K)
+                Jnext_naive = _interp_wealth_grid(xs, J_naive, Nreal)
+                J_pen = (Jnext_pen - pi).max(-1).values                    # (P, G)
+                J_naive = Jnext_naive.max(-1).values                       # (P, G)
+
+                if (not is_boundary) and m_t1_in is not None:
+                    logging.info(
+                        "DifferentialSolver U  t=%d: π mean=%+.4g abs_max=%.4g | "
+                        "J_pen∈[%+.3g,%+.3g] J_naive∈[%+.3g,%+.3g] | dN_real σ/Δgrid=%.2f",
+                        t, float(pi.mean()), float(pi.abs().max()),
+                        float(J_pen.min()), float(J_pen.max()),
+                        float(J_naive.min()), float(J_naive.max()), vol_over_step[-1])
+                else:
+                    logging.info(
+                        "DifferentialSolver U  t=%d: BOUNDARY π≡0 | J_pen∈[%+.3g,%+.3g] | "
+                        "dN_real σ/Δgrid=%.2f",
+                        t, float(J_pen.min()), float(J_pen.max()), vol_over_step[-1])
+
+            zero_q = torch.zeros(P, 1, device=device, dtype=dtype)
+            U_pen_path = _interp_wealth_grid(xs, J_pen, zero_q).squeeze(1)     # (P,)
+            U_naive_path = _interp_wealth_grid(xs, J_naive, zero_q).squeeze(1)
+        U_pen = float(U_pen_path.mean().item())
+        U_naive = float(U_naive_path.mean().item())
+        # U = min of the two PATH-AVERAGED bounds (the toy's `min(U_naive, U_pen)`). Each is an
+        # upper bound on V* IN EXPECTATION (E[dual] ≥ V*); the per-path min would NOT be — min and
+        # E don't commute, so mean_p min(·,·) ≤ min(mean,mean) can fall below V*. Min of the means.
+        U = min(U_naive, U_pen)
+        gap = U - L_util
+
+        # ---- U ≥ L verification. The pathwise check uses U_NAIVE (the pure clairvoyant must
+        # dominate the deployed policy on EVERY path); U_pen ≥ L holds in MEAN only (π can
+        # depress single paths). Mean U ≥ mean L is the headline certificate. ----
+        tol = 1e-3 * max(1.0, abs(L_util))
+        viol_path = int((U_naive_path < L_util_path - tol).sum().item())
+        mean_ok = U >= L_util - tol
+        off_grid_frac = off_grid_n / off_grid_tot if off_grid_tot else 0.0
+        vol_res = sum(vol_over_step) / len(vol_over_step) if vol_over_step else 0.0
+        drift_res = sum(drift_over_step) / len(drift_over_step) if drift_over_step else 0.0
+
+        if off_grid_frac > self._upper_clamp_warn:
+            logging.warning(
+                "DifferentialSolver U: OFF-GRID clamp fraction = %.2f%% > %.2f%% — the wealth "
+                "grid is too narrow; U is biased (clamping caps the bound). Widen "
+                "`upper_bound_grid_pad`/`upper_bound_wealth_grid`. (memory: discretised-DP-"
+                "boundary-clamp.)", 100 * off_grid_frac, 100 * self._upper_clamp_warn)
+        if vol_res < 0.3:
+            logging.warning(
+                "DifferentialSolver U: wealth-move σ/Δgrid = %.2f < 0.3 — the grid is too "
+                "COARSE relative to per-step wealth moves; the discrete kernel may mask the "
+                "dynamics (memory: discretised-DP-drift-resolution). Increase "
+                "`upper_bound_wealth_grid`.", vol_res)
+        if viol_path > 0:
+            logging.warning(
+                "DifferentialSolver U: %d/%d paths have U_naive < L (pathwise clairvoyant "
+                "below policy) — expected only if off-grid clamping bites (off-grid=%.2f%%).",
+                viol_path, P, 100 * off_grid_frac)
+
+        logging.info(
+            "DifferentialSolver BSS UPPER bound (§3): L=%+.4f ≤ U=%+.4f  →  gap U−L = %.4f "
+            "(utility units). Components: U_naive=%+.4f, U_pen=%+.4f (U=min). "
+            "MEAN U≥L: %s. Off-grid clamp=%.2f%%, σ/Δgrid=%.2f, |drift|/Δgrid=%.3f, "
+            "boundary steps zeroed=%d. NOTE: a wide gap is AMBIGUOUS — perfect-foresight + "
+            "turnover/grid relaxation slack, NOT necessarily policy suboptimality.",
+            L_util, U, gap, U_naive, U_pen, "OK" if mean_ok else "VIOLATED (U<L!)",
+            100 * off_grid_frac, vol_res, drift_res, len(boundary_set))
+
+        return {
+            "U_skipped": False,
+            "U_upper_bound": U,
+            "U_naive": U_naive,
+            "U_penalized": U_pen,
+            "U_lower_bound_L_util": L_util,
+            "U_gap": gap,
+            "U_mean_ge_L": bool(mean_ok),
+            "U_pathwise_naive_violations": viol_path,
+            "U_n_paths": P,
+            "U_wealth_grid": G,
+            "U_n_inner": self._upper_n_inner,
+            "U_grid_lo": float(xs[0].item()),
+            "U_grid_hi": float(xs[-1].item()),
+            "U_grid_step": grid_step,
+            "U_off_grid_frac": off_grid_frac,
+            "U_vol_over_gridstep": vol_res,
+            "U_drift_over_gridstep": drift_res,
+            "U_boundary_steps_zeroed": sorted(boundary_set),
+        }
+
+    def _compute_oracle_action_match(self, traj):
+        """OFFLINE gate-4 verdict: per-DEPTH action-match of the fitted policy vs the exact-DP
+        oracle (`gate2_exact_dp.npz`). For each decision t, at canonical oracle grid states,
+        compare `argmax_a C[t](post(a))` to the oracle's optimal action; the regression slope of
+        mean |Δq| vs backward depth is the 'does the policy ranking survive depth' gate (flat =
+        depth-robust; growing-backward = max-of-noisy compounding). Gated behind
+        `Oracle_Action_Match_Path`, toy-only, NEVER shipped — same offline status as the BSS / LSM
+        / hindsight yardsticks.
+
+        Alignments (verified on the gate4 toy): riskflow t == oracle t (is_live A-expiry == T_A and
+        B-expiry == T_dec, so no offset); wealth = the oracle MTM `w` (same convention that made the
+        historical V_0 comparison valid); true regime r → ONE-HOT belief (privileged — matches the
+        oracle's true-regime conditioning); forward == spot (toy has no carry/basis) so F_A=F_B=s;
+        basis/carry/static come from a real `traj` template row (zero-vol on the toy → any row)."""
+        import numpy as np
+        path = self._oracle_action_match_path
+        if not os.path.exists(path):
+            logging.warning("Oracle action-match: npz '%s' not found — skipping.", path)
+            return {"oracle_match_skipped": True, "oracle_match_reason": "npz_missing"}
+        d = np.load(path, allow_pickle=True)
+        q_grid = d["q_grid"]; s_grid = d["s_grid"]; w_grid = d["w_grid"]
+        T_A = int(d["T_A"]); T_dec = int(d["T_dec"])
+        pol_preA_qA = d["pol_pre_A_qA"]; pol_preA_qB = d["pol_pre_A_qB"]
+        pol_postA_qB = d["pol_post_A_qB"]
+        device, dtype = self.device, self.dtype
+        n_h = len(self.hedges)
+        qcen = int(np.argmin(np.abs(q_grid)))            # index of q=0 in q_grid
+        # Hedge A = expires first (is_live drops earliest), B = last.
+        first_dead = [next((t for t in range(self.t_outer) if not bool(self.is_live[t, j])),
+                            self.t_outer) for j in range(n_h)]
+        A = int(np.argmin(first_dead)); B = int(np.argmax(first_dead))
+        rlo, rhi = self._regime_cols_in_market
+        n_states = rhi - rlo
+        spot_col = (self._spot_cols_in_market[0]
+                    if self._spot_cols_in_market is not None else None)
+        # In-domain wealth subsample (C trained on |w| ≤ bank_wealth_halfwidth) + canonical w≈100.
+        w_targets = [w for w in (100.0, 0.0, -400.0, 600.0)
+                     if abs(w) <= self.bank_wealth_halfwidth]
+        w_idx = [int(np.argmin(np.abs(w_grid - w))) for w in w_targets]
+        s_idx = list(range(len(s_grid)))
+        logging.info(
+            "Oracle action-match: A=%s(hedge %d, dies t=%d) B=%s(hedge %d, dies t=%d); "
+            "T_A=%d T_dec=%d; regime_cols=%s spot_col=%s; grading t=0..%d at q_prev=0, "
+            "%d spots × %d wealth × %d regimes.",
+            self.hedges[A], A, first_dead[A], self.hedges[B], B, first_dead[B],
+            T_A, T_dec, (rlo, rhi), spot_col, min(T_dec, self.t_outer - 1) - 1,
+            len(s_idx), len(w_idx), n_states)
+
+        per_t_err = {}; per_t_match = {}
+        with torch.no_grad():
+            for t in range(0, min(T_dec, self.t_outer - 1)):
+                Ct = self.C[t]
+                if Ct is None:
+                    continue
+                postA = t >= T_A
+                m_tmpl = traj[t]["market"][0].to(device)               # (market_dim,)
+                static = self._static_sim[t].to(device)
+                rows = [(r, si, wi) for r in range(n_states)
+                        for si in s_idx for wi in w_idx]
+                R = len(rows)
+                market = m_tmpl.unsqueeze(0).expand(R, -1).clone()
+                belief = torch.zeros(R, n_states, device=device, dtype=dtype)
+                spot = torch.empty(R, device=device, dtype=dtype)
+                wealth = torch.empty(R, device=device, dtype=dtype)
+                for i, (r, si, wi) in enumerate(rows):
+                    belief[i, r] = 1.0
+                    spot[i] = float(s_grid[si])
+                    wealth[i] = float(w_grid[wi])
+                market[:, rlo:rhi] = belief
+                if spot_col is not None:
+                    market[:, spot_col] = spot
+                F = spot.unsqueeze(1).expand(R, n_h).clone()            # forward = spot
+                q_prev = torch.zeros(R, n_h, device=device, dtype=dtype)  # canonical flat start
+                ttT = torch.full((R,), float(self.t_outer - 1 - t), device=device, dtype=dtype)
+                static_b = static.expand(R, static.shape[-1])
+                q_star, _, _ = self._decision_at(
+                    Ct, market, F, q_prev, wealth, ttT, static_b, t)    # (R, n_h)
+                qsA = q_star[:, A].cpu().numpy(); qsB = q_star[:, B].cpu().numpy()
+                errs = []; matches = []
+                for i, (r, si, wi) in enumerate(rows):
+                    if postA:
+                        o_qB = float(q_grid[pol_postA_qB[t - T_A, r, qcen, si, wi]])
+                        e = abs(qsB[i] - o_qB)              # A is dead (forced 0 by is_live)
+                        m = (round(qsB[i]) == round(o_qB))
+                    else:
+                        o_qA = float(q_grid[pol_preA_qA[t, r, qcen, qcen, si, wi]])
+                        o_qB = float(q_grid[pol_preA_qB[t, r, qcen, qcen, si, wi]])
+                        e = 0.5 * (abs(qsA[i] - o_qA) + abs(qsB[i] - o_qB))
+                        m = (round(qsA[i]) == round(o_qA) and round(qsB[i]) == round(o_qB))
+                    errs.append(e); matches.append(1.0 if m else 0.0)
+                per_t_err[t] = float(np.mean(errs))
+                per_t_match[t] = float(np.mean(matches))
+
+        ts = sorted(per_t_err)
+        if not ts:
+            return {"oracle_match_skipped": True, "oracle_match_reason": "no_C"}
+        depth = np.array([T_dec - 1 - t for t in ts], dtype=np.float64)   # 0 = nearest terminal
+        err = np.array([per_t_err[t] for t in ts])
+        match = np.array([per_t_match[t] for t in ts])
+        # slope of mean|Δq| vs backward depth: >0 ⇒ error grows backward (compounding).
+        slope = float(np.polyfit(depth, err, 1)[0]) if len(ts) > 1 else 0.0
+        mean_err = float(err.mean()); mean_match = float(match.mean())
+        # split match by region for the headline
+        pre_match = float(np.mean([per_t_match[t] for t in ts if t < T_A])) if any(t < T_A for t in ts) else float("nan")
+        post_match = float(np.mean([per_t_match[t] for t in ts if t >= T_A])) if any(t >= T_A for t in ts) else float("nan")
+        logging.info(
+            "Oracle action-match VERDICT: mean|Δq|=%.3f contracts, exact-match=%.1f%% "
+            "(pre-A=%.1f%%, post-A=%.1f%%); error-vs-depth slope=%+.4f /step "
+            "(>0 ⇒ compounding backward, ≈0 ⇒ depth-robust). Oracle V_0=%.4f.",
+            mean_err, 100 * mean_match, 100 * pre_match, 100 * post_match, slope,
+            float(d["V_0"]))
+        return {
+            "oracle_match_skipped": False,
+            "oracle_match_mean_abs_dq": mean_err,
+            "oracle_match_exact_frac": mean_match,
+            "oracle_match_exact_frac_preA": pre_match,
+            "oracle_match_exact_frac_postA": post_match,
+            "oracle_match_err_vs_depth_slope": slope,
+            "oracle_match_per_t_err": per_t_err,
+            "oracle_match_per_t_match": per_t_match,
+            "oracle_V0": float(d["V_0"]),
         }
 
     def _audit_at(self, t, net, traj, audit_outer_indices, round_num):
@@ -3585,11 +4210,80 @@ class DifferentialSolver:
             "q_star_detach_ok": True,
         }
 
+    # ----------------------------------------------- C-stack persistence (OOS)
+    def _save_value_fn(self, path):
+        """Serialise the fitted C-stack for out-of-sample reuse: per-t `TwinNetwork`
+        `state_dict`s (weights AND the standardization buffers z_mean/z_std/y_mean/y_std,
+        which are registered buffers) plus a header for load-time compatibility checks.
+
+        Only the nets are persisted — everything else the sandwich needs (is_live, action
+        grid, liability R/τ tables, baseline drift tables, StatePack layout) is rebuilt
+        deterministically from the same deal JSON when the eval run constructs its solver.
+        So an OOS run = the SAME config with a fresh `Random_Seed` + `Load_Value_Fn_Path`."""
+        payload = {
+            "header": {
+                "format": 1,
+                "deep_dim": int(self.statepack.deep_dim),
+                "t_outer": int(self.t_outer),
+                "t_min": int(self.t_min),
+                "n_hedge": len(self.hedges),
+                "hidden_sizes": list(self.hidden_sizes),
+                "advantage_decomp": bool(self._advantage_decomp),
+            },
+            "C_state": [None if c is None
+                        else {k: v.detach().cpu() for k, v in c.state_dict().items()}
+                        for c in self.C],
+        }
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        torch.save(payload, path)
+        n_saved = sum(1 for c in self.C if c is not None)
+        logging.info(
+            "DifferentialSolver: SAVED C-stack (%d/%d nets, deep_dim=%d) → %s",
+            n_saved, self.t_outer, self.statepack.deep_dim, path)
+
+    def _load_value_fn(self, path):
+        """Load a C-stack saved by `_save_value_fn` into `self.C` and SKIP all training.
+        Fails LOUD if the artifact is from a different deal/config (deep_dim, t_outer,
+        n_hedge, or advantage_decomp mismatch) — a stale artifact would silently corrupt the
+        baseline (the net is only the residual `A`; `_C_full` adds the config's `B`)."""
+        payload = torch.load(path, map_location=self.device)
+        h = payload["header"]
+        dd = int(self.statepack.deep_dim)
+        mism = [f"{k}: artifact={h.get(k)} vs solver={v}" for k, v in
+                (("deep_dim", dd), ("t_outer", self.t_outer), ("n_hedge", len(self.hedges)),
+                 ("advantage_decomp", bool(self._advantage_decomp))) if h.get(k) != v]
+        if mism:
+            raise ValueError(
+                f"value-fn artifact {path} is incompatible with this deal/config "
+                f"({'; '.join(mism)}). Re-train the C-stack for this configuration.")
+        n_loaded = 0
+        for t, sd in enumerate(payload["C_state"]):
+            if sd is None:
+                self.C[t] = None
+                continue
+            net = construct_twin_network(dd, self.runtime, self.device)
+            net.load_state_dict({k: v.to(self.device) for k, v in sd.items()})
+            net.eval()
+            self.C[t] = net
+            n_loaded += 1
+        logging.info(
+            "DifferentialSolver: LOADED C-stack (%d/%d nets) ← %s — OOS eval (no training; "
+            "sandwich runs on this run's fresh-seeded outer batch).",
+            n_loaded, self.t_outer, path)
+        return {"loaded_value_fn": True, "loaded_value_fn_path": path,
+                "C_loaded_count": n_loaded, "seam_milestone": "oos_eval"}
+
     # --------------------------------------------------------------- solve
     def solve(self):
         """**Milestone 0**: cold-train C_T (= `C[t_outer-1]`) and exit. Validates the
         seam (`sample_exogenous` reads from the canonical buffer) and the StatePack
         layout before any backward-step / bootstrap / audit machinery lands.
+
+        OOS-eval mode (`Load_Value_Fn_Path` set): load a pretrained C-stack, SKIP the
+        terminal train + backward sweep, and run the V_0 read + L/π/U sandwich on this
+        run's (fresh-seeded) outer batch. Training mode optionally `Save_Value_Fn_Path`s
+        the fitted stack after the sweep.
         """
         logging.info(
             "DifferentialSolver Milestone 0: t_outer=%d, B=%d, b_endo=%d, "
@@ -3612,63 +4306,117 @@ class DifferentialSolver:
             "(spec π_0 = (0.5, 0.5); spot enters via tradable_prices, not market).",
             ["%.3f" % v for v in regime_t0_freq])
 
-        diag = self._train_C_terminal(traj)
-        diag["t0_regime_occupancy"] = regime_t0_freq
-        diag["seam_milestone"] = 0
         n_h = len(self.hedges)
-
-        # --- Backward sweep: fit C_{t} for t = T_outer-2 down to t_min with M2's
-        # audit-correct loop. At sweep entry we partition the B_outer paths into one
-        # training subset and MAX_ROUNDS mutually-disjoint audit slices. Per the
-        # user's correction: a single reserved holdout reused across rounds leaks
-        # info into the correction-row placement and drifts optimistic; disjoint
-        # per-round slices preserve the §7 re-audit-fresh invariant within one
-        # outer sweep (no per-round re-sim cost).
-        max_rounds = int(self.runtime["solver"].get("audit_max_rounds", 3))
-        B = self._B()
-        # Reserve ~25% for audit (split into MAX_ROUNDS slices); the rest is training.
-        n_audit_total = max(max_rounds * 8, int(B * 0.25))
-        n_audit_total = min(n_audit_total, B // 2)        # cap at 50%
-        n_train = B - n_audit_total
-        perm = torch.randperm(B, device=self.device)
-        training_outer_idx = perm[:n_train]
-        audit_slice_size = n_audit_total // max_rounds
-        audit_slices_global = [
-            perm[n_train + r * audit_slice_size : n_train + (r + 1) * audit_slice_size]
-            for r in range(max_rounds)
-        ]
-        logging.info(
-            "DifferentialSolver M2 setup: B=%d  training=%d  audit=%d ÷ %d rounds × %d/slice  "
-            "(disjoint per spec §7 re-audit-fresh invariant)",
-            B, n_train, n_audit_total, max_rounds, audit_slice_size)
         per_t_diag = {}
-        logging.info(
-            "DifferentialSolver backward sweep: t = %d → %d (T_A live transition "
-            "expected at the step where live_axes drops from 2 → 1)",
-            self.t_outer - 2, self.t_min)
-        for t_step in range(self.t_outer - 2, self.t_min - 1, -1):
-            t_diag = self._train_C_at_step(
-                t_step, self.C[t_step + 1], traj,
-                training_outer_idx=training_outer_idx,
-                audit_slices=audit_slices_global)
-            per_t_diag[t_step] = t_diag
-            logging.info(
-                "DifferentialSolver C[%d] fitted: live_axes=%d  rounds=%d  "
-                "twin val=%.5f diff=%.5f  bank=%d%s",
-                t_step, t_diag["live_axes_at_t"], t_diag.get("rounds_taken", 1),
-                t_diag["twin_value_loss"], t_diag["twin_diff_loss"],
-                t_diag["bank_rows"],
-                " ESCALATED" if t_diag.get("escalation_flag") else "")
-
-        # Grad sanity at three representative t values: end-of-sweep (t_min),
-        # mid-sweep, and just-past-the-T_A-transition. Catches grad propagation
-        # bugs that any single-t smoke misses.
-        t_sample = sorted({self.t_min, self.t_outer - 2,
-                            (self.t_outer - 2 + self.t_min) // 2})
         grad_sanity = {}
-        for t_s in t_sample:
-            if self.C[t_s] is not None:
-                grad_sanity[t_s] = self._grad_sanity_check(t_s)
+        conv_summary = {}          # convergence assumption-check (training branch only)
+        v0_over_bound = False      # V_0 utility-bound assumption-check
+
+        if self._load_value_fn_path:
+            # OOS-EVAL: load the pretrained C-stack, skip training entirely, and evaluate the
+            # sandwich on THIS run's fresh-seeded outer batch (`traj` above). The deal machinery
+            # (is_live, action grid, liability/baseline tables, StatePack) was already rebuilt
+            # in __init__ from the same config, so the loaded residual nets compose correctly.
+            diag = self._load_value_fn(self._load_value_fn_path)
+            diag["t0_regime_occupancy"] = regime_t0_freq
+        else:
+            diag = self._train_C_terminal(traj)
+            diag["t0_regime_occupancy"] = regime_t0_freq
+            diag["seam_milestone"] = 0
+
+            # --- Backward sweep: fit C_{t} for t = T_outer-2 down to t_min with M2's
+            # audit-correct loop. At sweep entry we partition the B_outer paths into one
+            # training subset and MAX_ROUNDS mutually-disjoint audit slices. Per the
+            # user's correction: a single reserved holdout reused across rounds leaks
+            # info into the correction-row placement and drifts optimistic; disjoint
+            # per-round slices preserve the §7 re-audit-fresh invariant within one
+            # outer sweep (no per-round re-sim cost).
+            max_rounds = int(self.runtime["solver"].get("audit_max_rounds", 3))
+            B = self._B()
+            # Reserve ~25% for audit (split into MAX_ROUNDS slices); the rest is training.
+            n_audit_total = max(max_rounds * 8, int(B * 0.25))
+            n_audit_total = min(n_audit_total, B // 2)        # cap at 50%
+            n_train = B - n_audit_total
+            perm = torch.randperm(B, device=self.device)
+            training_outer_idx = perm[:n_train]
+            audit_slice_size = n_audit_total // max_rounds
+            audit_slices_global = [
+                perm[n_train + r * audit_slice_size : n_train + (r + 1) * audit_slice_size]
+                for r in range(max_rounds)
+            ]
+            logging.info(
+                "DifferentialSolver M2 setup: B=%d  training=%d  audit=%d ÷ %d rounds × %d/slice  "
+                "(disjoint per spec §7 re-audit-fresh invariant)",
+                B, n_train, n_audit_total, max_rounds, audit_slice_size)
+            logging.info(
+                "DifferentialSolver backward sweep: t = %d → %d (T_A live transition "
+                "expected at the step where live_axes drops from 2 → 1)",
+                self.t_outer - 2, self.t_min)
+            for t_step in range(self.t_outer - 2, self.t_min - 1, -1):
+                t_diag = self._train_C_at_step(
+                    t_step, self.C[t_step + 1], traj,
+                    training_outer_idx=training_outer_idx,
+                    audit_slices=audit_slices_global)
+                per_t_diag[t_step] = t_diag
+                logging.info(
+                    "DifferentialSolver C[%d] fitted: live_axes=%d  rounds=%d  "
+                    "twin val=%.5f diff=%.5f  bank=%d%s",
+                    t_step, t_diag["live_axes_at_t"], t_diag.get("rounds_taken", 1),
+                    t_diag["twin_value_loss"], t_diag["twin_diff_loss"],
+                    t_diag["bank_rows"],
+                    " ESCALATED" if t_diag.get("escalation_flag") else "")
+
+            # --- CONVERGENCE assumption-check: did every C_t actually fit? The verdict-quality
+            # gate. Flags (a) UNDER-FIT outliers — value loss ≫ the sweep median (an under-trained
+            # step whose value/action estimate is unreliable), (b) ESCALATED steps (label-bias,
+            # §14), and (c) budget-exhausted steps when a loss tol is set (ran out of SGD steps
+            # before reaching tol). Threshold-free where possible (outlier vs the sweep itself). ---
+            vls = {t: float(d["twin_value_loss"]) for t, d in per_t_diag.items()}
+            if vls:
+                vals = sorted(vls.values())
+                med = vals[len(vals) // 2]
+                vmax_t = max(vls, key=vls.get)
+                budget_hit = (sorted(t for t, d in per_t_diag.items()
+                                     if not d.get("train_stopped_early")
+                                     and d.get("train_steps_used", 0) >= d.get("train_max_steps", 1))
+                              if self.train_loss_tol > 0 else [])
+                escalated = sorted(t for t, d in per_t_diag.items() if d.get("escalation_flag"))
+                # UNDER-FIT = twin value loss above an absolute floor (0.1). All utility families
+                # are O(1)-normalised by c, so the value target is O(1) and a converged residual
+                # fit sits «0.1 (RMS «0.3 utility units); a t above the floor is unreliable. This
+                # catches BOTH outlier steps and a UNIFORMLY under-fit sweep (where a "× median"
+                # rule sees no outlier because everything is equally bad).
+                FLOOR = 0.1
+                underfit = sorted(t for t, v in vls.items() if v > FLOOR)
+                conv_summary = {
+                    "conv_val_loss_median": float(med),
+                    "conv_val_loss_max": float(vls[vmax_t]), "conv_val_loss_max_t": int(vmax_t),
+                    "conv_budget_exhausted_t": budget_hit, "conv_escalated_t": escalated,
+                    "conv_underfit_t": underfit, "conv_n_fitted": len(vls),
+                }
+                (logging.warning if (underfit or escalated) else logging.info)(
+                    "DifferentialSolver CONVERGENCE check: %d C_t fitted; val_loss median=%.4f, "
+                    "max=%.4f @t=%d. Budget-exhausted t=%s; escalated (label-bias) t=%s; "
+                    "UNDER-FIT (val>%.2f) t=%s. %s",
+                    len(vls), med, vls[vmax_t], vmax_t, budget_hit or "[]", escalated or "[]",
+                    FLOOR, ("%d steps" % len(underfit)) if len(underfit) > 8 else (underfit or "[]"),
+                    "⚠ some C_t did NOT converge — value/action estimates at those t are unreliable "
+                    "(the depth-compounding signature); raise B_exo / train steps, or check §14."
+                    if (underfit or escalated) else "all C_t fits healthy (no outliers).")
+
+            # Persist the fitted stack for out-of-sample reuse (before the sandwich, so the
+            # nets are saved even if the optional U DP is heavy).
+            if self._save_value_fn_path:
+                self._save_value_fn(self._save_value_fn_path)
+
+            # Grad sanity at three representative t values: end-of-sweep (t_min),
+            # mid-sweep, and just-past-the-T_A-transition. Catches grad propagation
+            # bugs that any single-t smoke misses.
+            t_sample = sorted({self.t_min, self.t_outer - 2,
+                                (self.t_outer - 2 + self.t_min) // 2})
+            for t_s in t_sample:
+                if self.C[t_s] is not None:
+                    grad_sanity[t_s] = self._grad_sanity_check(t_s)
 
         # V_0 estimate via the decision operator at t_min: q*_t_min = argmax_q
         # C[t_min](post_state_t_min(q)). For the M1.5 path (t_min = T_A - 1) this is
@@ -3698,6 +4446,22 @@ class DifferentialSolver:
                 v0_decision = float("nan")
                 q_opt_mean = None
 
+        # --- V_0 BOUND assumption-check: a symlog/CARA value-to-go is bounded by the utility of
+        # reachable wealth. C is only TRAINED on |w| ≤ bank_wealth_halfwidth, so a |V_0| beyond
+        # |u(±halfwidth)| means C extrapolates ABOVE achievable utility — over-optimism / depth
+        # compounding (the verdict's V_0=3.63 > symlog bound ~2.77 was exactly this). nan compares
+        # False, so a missing C_t never trips it. ---
+        util_bound = float(_utility_wrap_signed(
+            torch.tensor([self.bank_wealth_halfwidth], device=self.device, dtype=self.dtype),
+            self.runtime).abs().item())
+        v0_over_bound = bool(abs(v0_decision) > util_bound + 1.0e-6)
+        if v0_over_bound:
+            logging.warning(
+                "DifferentialSolver V_0 BOUND check: |V_0|=%.4f EXCEEDS the utility bound %.4f "
+                "(=|u(±%.3g)| at the bank wealth span) — the value function is EXTRAPOLATING above "
+                "achievable utility (over-optimism / depth compounding); V_0 unreliable.",
+                v0_decision, util_bound, self.bank_wealth_halfwidth)
+
         # Aggregate sweep diagnostics.
         sweep_summary = {
             "t_min": self.t_min,
@@ -3724,12 +4488,60 @@ class DifferentialSolver:
         # Production validation: BSS sandwich lower bound L (realised $/oz of the
         # policy on a fresh MC set). Runs unconditionally; computes mean, p5/p95,
         # and the cost-per-oz that the dealer-margin ship criterion reads.
-        sweep_summary.update(self._compute_dollar_floor(traj))
+        floor = self._compute_dollar_floor(traj)
+        learned_wealth = floor.pop("_terminal_wealth")     # (B,) — reused by the §7 verdict
+        sweep_summary.update(floor)
+        # §7 downside-protection VERDICT: learned vs unhedged vs best-static on the SAME
+        # batch (mean / downside_sd / 5%-worst / 95%-best). The practical "did it hedge"
+        # check — for the platinum deal there is no exact-DP oracle, so this IS the verdict.
+        # Cheap (two extra no-grad rollouts + the static grid search); runs unconditionally.
+        sweep_summary.update(self._compute_benchmark_comparison(traj, learned_wealth))
         # BSS sandwich step 1+2: penalty π's martingale-difference terms + the
         # dual-feasibility (zero-mean) HARD GATE (§4.1). Must be green before U is a
         # valid upper bound. Surfaces as M1_penalty_*; the per-t mean Δ_t is the §5
         # localisation hook. Offline yardstick — diagnostic only, never shipped.
-        sweep_summary.update(self._compute_martingale_penalty_check(traj))
+        penalty = self._compute_martingale_penalty_check(traj)
+        sweep_summary.update(penalty)
+        # BSS sandwich step 3: penalized clairvoyant UPPER bound U + the gap U−L (utility
+        # units). Reuses the SAME penalty machinery (so U's π is the gate-certified
+        # martingale difference); π≡0 on the data-driven boundary block; U=min(naive,pen);
+        # U≥L verified. Surfaces as M1_U_*. Skips itself (loud) if π is infeasible/unavailable.
+        # OPT-IN (Run_Upper_Bound): the wealth-grid DP is O(P·G·K²·I), too costly to run on
+        # every solve — the cheap penalty gate above always runs as the dual-feasibility check.
+        if self._run_upper_bound:
+            sweep_summary.update(self._compute_penalized_upper_bound(traj, penalty))
+        else:
+            logging.info(
+                "DifferentialSolver U: Run_Upper_Bound=False — skipping the penalized "
+                "clairvoyant upper bound (penalty zero-mean gate ran; enable for gap=U−L).")
+        # Offline gate-4 verdict (opt-in): per-depth action-match vs the exact-DP oracle.
+        if self._oracle_action_match_path:
+            sweep_summary.update(self._compute_oracle_action_match(traj))
+        sweep_summary.update(conv_summary)
+        sweep_summary["v0_over_utility_bound"] = v0_over_bound
+
+        # --- CONSOLIDATED ASSUMPTIONS readout: one line confirming the run is trustworthy. Every
+        # check the downstream V_0 / sandwich / action-match rely on. A FAIL here means estimates
+        # below it are suspect (see the specific warning above). ---
+        _pz = sweep_summary.get("penalty_zero_mean_z")
+        _pen_ok = (_pz is not None and _pz < self._penalty_zero_mean_z
+                   and not sweep_summary.get("penalty_boundary_hit_cap", False))
+        _conv_ok = not (conv_summary.get("conv_underfit_t") or conv_summary.get("conv_escalated_t"))
+        _u_ok = sweep_summary.get("U_mean_ge_L")
+        _all_ok = (_conv_ok if conv_summary else True) and (_pen_ok if _pz is not None else True) \
+            and not v0_over_bound and (_u_ok if "U_mean_ge_L" in sweep_summary else True)
+        (logging.info if _all_ok else logging.warning)(
+            "DifferentialSolver ASSUMPTIONS CHECK: C_t-converged=%s (underfit t=%s, escalated=%s) | "
+            "penalty dual-feasible=%s (z=%s, thr=%.1f) | V_0 within utility bound=%s | U≥L=%s. %s",
+            ("OK" if _conv_ok else "FAIL") if conv_summary else "n/a (loaded)",
+            conv_summary.get("conv_underfit_t", []), conv_summary.get("conv_escalated_t", []),
+            ("OK" if _pen_ok else "FAIL") if _pz is not None else "n/a",
+            None if _pz is None else round(_pz, 2), self._penalty_zero_mean_z,
+            "OK" if not v0_over_bound else "FAIL",
+            ("OK" if _u_ok else "FAIL") if "U_mean_ge_L" in sweep_summary else "n/a (Run_Upper_Bound off)",
+            "✓ all key assumptions hold." if _all_ok
+            else "⚠ ASSUMPTION(S) FAILED — downstream V_0 / action-match estimates may be unreliable.")
+
         logging.info(
             "DifferentialSolver sweep complete: %d C_t functions fitted "
             "(t ∈ [%d, %d]); V_0_decision @ t=%d = %.4f; n*_t_min mean = %s",
