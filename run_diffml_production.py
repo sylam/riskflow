@@ -122,6 +122,7 @@ def main():
         'Bank_Sampling': {'B_Endo': int(args.bank_b_endo)},
         'Training_Action_Grid_Levels_Per_Axis': int(args.action_grid_levels),
         'Decision_Action_Grid_Levels_Per_Axis': int(args.action_grid_levels),
+        'Bootstrap_Inner_Samples': int(args.inner_sub_batch),
         'Audit_Max_Rounds': int(args.audit_max_rounds),
         'Value_Fn': {
             'MLP_Hidden': [128, 128, 128],

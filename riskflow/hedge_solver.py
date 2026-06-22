@@ -1669,6 +1669,16 @@ class DifferentialSolver:
         # Bank construction knobs (spec §6).
         bank_cfg = solver_cfg.get("bank_sampling", {})
         self.b_endo = int(bank_cfg.get("b_endo", 2))
+        # Bootstrap value-label fanout. The realised-path branch below still supplies the
+        # pathwise differential label, but the VALUE target can average the Bellman envelope
+        # over the retained one-step inner fork instead of training on one realised next state.
+        # This directly attacks the high-variance single-sample target that compounds backward.
+        self._bootstrap_inner_samples = max(1, int(solver_cfg.get("bootstrap_inner_samples", 1)))
+        if self._bootstrap_inner_samples > 1:
+            logging.info(
+                "DifferentialSolver bootstrap value labels: inner expectation ACTIVE "
+                "with up to %d one-step samples per bank row.",
+                self._bootstrap_inner_samples)
         # Backward sweep depth — t_min = 0 is the full sweep (Milestone 3); M1.5
         # uses t_min = T_A − 1 to validate the multi-contract path across the T_A
         # transition without committing to the full 30-step sweep. Configurable via
@@ -2491,21 +2501,113 @@ class DifferentialSolver:
         action_gap = torch.cat(gap_parts, dim=0)                        # (N,)
         return q_star, v_star, action_gap
 
+    def _inner_bootstrap_value_and_endogenous_grads(self, t, bank, q_post_t,
+                                                    wealth_post_t, C_next):
+        """Inner-MC Bellman label plus endogenous differential labels.
+
+        This is the production analogue of the toy's `E[max_q C_{t+1}]` target:
+        select the next-step action on the inner expectation under `no_grad`, then
+        recompute that same expectation at the fixed selected actions with the
+        post-decision endogenous coordinates as leaves. The returned gradients are
+        therefore derivatives of the same MC estimator used for the scalar value label,
+        for the columns where no simulator AAD tape is needed: live positions, wealth,
+        and current tradable prices. Market spot/belief gradients are still supplied by
+        the realised-path AAD branch below until the one-step grad fork is chunked for
+        full production batch sizes.
+        """
+        if self._bootstrap_inner_samples <= 1 or "inner_mc_fn" not in self.bundle:
+            return None
+        t1 = min(t + 1, self.t_outer - 1)
+        inner = self.bundle["inner_mc_fn"](t)
+        market_t1 = inner.get("market_t1")
+        if market_t1 is None:
+            return None
+
+        device = self.device
+        n_h = len(self.hedges)
+        oi = bank["outer_index"]
+        I = min(int(self._bootstrap_inner_samples), int(market_t1.shape[1]))
+        if I <= 0:
+            return None
+
+        market_i = market_t1[oi, :I].to(device).detach()                    # (N,I,market_dim)
+        F_t1_i = torch.stack(
+            [inner["F_t1"][h].to(device)[oi, :I] for h in self.hedges],
+            dim=-1).detach()                                                # (N,I,n_h)
+        spot_t = self._spot_col(bank["market"])
+        spot_t1 = self._spot_col(market_i)
+        if spot_t is not None and spot_t1 is not None:
+            dS = spot_t1 - spot_t.detach().unsqueeze(1)
+        else:
+            dS = F_t1_i[..., 0] - bank["F_at_t"].detach()[:, :1]
+        dL = (self._liability_R[t] * dS).detach()
+
+        N = q_post_t.shape[0]
+        static = bank["static"].unsqueeze(1).expand(
+            N, I, bank["static"].shape[-1]).reshape(N * I, -1)
+        time_to_T = (bank["time_to_T"] - 1.0).unsqueeze(1).expand(N, I).reshape(-1)
+
+        # Action selection: no gradient through the Bellman argmax/envelope.
+        with torch.no_grad():
+            dF_sel = F_t1_i - bank["F_at_t"].detach().unsqueeze(1)
+            pnl_sel = (q_post_t.unsqueeze(1) * self.contract_size * dF_sel).sum(-1)
+            wealth_pre_sel = wealth_post_t.unsqueeze(1) + pnl_sel - dL
+            q_prev_sel = q_post_t.unsqueeze(1).expand(N, I, n_h).reshape(N * I, n_h)
+            q_star, _, gap = self._decision_at(
+                C_next,
+                market_i.reshape(N * I, -1),
+                F_t1_i.reshape(N * I, n_h),
+                q_prev_sel,
+                wealth_pre_sel.reshape(-1),
+                time_to_T,
+                static,
+                t1)
+            q_star = q_star.detach().reshape(N, I, n_h)
+            action_gap = gap.reshape(N, I).mean(dim=1).detach()
+
+        with torch.enable_grad():
+            q_leaf = q_post_t.detach().clone().requires_grad_(True)
+            wealth_leaf = wealth_post_t.detach().clone().requires_grad_(True)
+            F_leaf = bank["F_at_t"].detach().clone().requires_grad_(True)
+            dF = F_t1_i - F_leaf.unsqueeze(1)
+            pnl = (q_leaf.unsqueeze(1) * self.contract_size * dF).sum(-1)
+            wealth_pre_t1 = wealth_leaf.unsqueeze(1) + pnl - dL
+            cost_t1 = self._turnover(q_star, q_leaf.unsqueeze(1), F_t1_i)
+            wealth_post_t1 = wealth_pre_t1 - cost_t1
+            z_t1 = self._assemble_z(
+                market=market_i.reshape(N * I, -1),
+                q=q_star.reshape(N * I, n_h),
+                wealth=wealth_post_t1.reshape(-1),
+                F=F_t1_i.reshape(N * I, n_h),
+                time_to_T=time_to_T,
+                static=static)
+            y_inner = self._C_full(C_next, z_t1).reshape(N, I).mean(dim=1)
+            q_grad, wealth_grad, F_grad = torch.autograd.grad(
+                y_inner.sum(), [q_leaf, wealth_leaf, F_leaf],
+                retain_graph=False, allow_unused=True)
+        return {
+            "value": y_inner.detach(),
+            "q_grad": (torch.zeros_like(q_post_t) if q_grad is None else q_grad.detach()),
+            "wealth_grad": (torch.zeros_like(wealth_post_t) if wealth_grad is None
+                             else wealth_grad.detach()),
+            "F_grad": (torch.zeros_like(bank["F_at_t"]) if F_grad is None else F_grad.detach()),
+            "action_gap": action_gap,
+        }
+
     def _compute_labels_for_bank(self, t, bank, C_next, traj=None):
         """Generate `(z_t, y_target, dy_dz, action_gap)` for a bank of pre-decision
         rows via the spec §4/§12 one-step-bootstrap pipeline:
           • sample q_t spanned across the action grid (per-row anchor)
           • assemble `z_t` post-decision after applying q_t
-          • re-price t+1 on the REALIZED outer path (NO inner-MC fork): spot[t] the sole
+          • re-price t+1 on the REALIZED outer path for AAD labels: spot[t] the sole
             pricing leaf, spot[t+1] its analytic re-seed, F/L from the persisted Jacobians,
             belief[t+1] from a one-step filter on the realized move (belief[t] a leaf)
           • decision at t+1 via `argmax_q C_next(post_{t+1}(q))` (q* detached)
-          • `Y_boot = C_next(post_{t+1}(q*))`
+          • value target = inner-averaged `E[max_q C_next(post_{t+1}(q))]` when configured,
+            otherwise the realised-path `C_next(post_{t+1}(q*))` fallback
           • `dy_dz` via `autograd.grad(Y_boot, leaves)` + closed-form wealth chain
         Used both by initial training-bank label gen and by per-round correction-row
-        label gen (M2); re-invoked per round on a grown bank by M2's audit-correct loop.
-        Fork-free: makes ZERO `inner_mc_grad_fn_one_step` calls (that machinery remains for
-        the offline LSM yardstick only)."""
+        label gen (M2); re-invoked per round on a grown bank by M2's audit-correct loop."""
         N = bank["wealth_pre"].shape[0]
         n_h = len(self.hedges)
         device = self.device
@@ -2609,6 +2711,7 @@ class DifferentialSolver:
             # of z_{t+1}), so ∂Y_boot/∂f_delta_j = ∂C_t/∂F_j(t) is the PURE hedge-book partial
             # (spot held fixed) — the liability is a function of spot, not F_j, so it lives on
             # ∂C/∂spot (once, total), NEVER on the F-columns. Per-contract via the position q_j.
+            q_leaf = q_t_sampled.detach().clone().requires_grad_(True)       # post-decision q coord
             f_delta = torch.zeros_like(bank["F_at_t"]).requires_grad_(True)  # (N, n_h)
             spot_col = (self._spot_cols_in_market[0]
                         if self._spot_cols_in_market is not None else None)
@@ -2631,9 +2734,9 @@ class DifferentialSolver:
                 F_t1 = F_t1_real + JF_t1 * d_t1                             # (N,n_h) forward channel
                 L_t = L_t_real + JL_t * d_t.squeeze(-1)                      # (N,) liability marks to spot
                 L_t1 = L_t1_real + JL_t1 * d_t1.squeeze(-1)                  # (N,)
-                pnl_hedges = (q_t_sampled * self.contract_size * (F_t1 - F_t)).sum(dim=-1)
+                pnl_hedges = (q_leaf * self.contract_size * (F_t1 - F_t)).sum(dim=-1)
                 wealth_pre_t1 = wealth_post_t + pnl_hedges - (L_t1 - L_t)    # (N,)
-                cost_t1 = self._turnover(q_star, q_t_sampled, F_t1)
+                cost_t1 = self._turnover(q_star, q_leaf, F_t1)
                 wealth_post_t1 = wealth_pre_t1 - cost_t1
                 # z_{t+1}'s spot coordinate = the re-seeded spot[t+1] (grad-connected), so the
                 # predictive channel ∂C_{t+1}/∂spot_{t+1}·∂spot_{t+1}/∂spot_t flows into the
@@ -2668,42 +2771,67 @@ class DifferentialSolver:
             # at the realized point (d_t=0), so Y_boot is correct for y_target regardless.
             spot_t_leaf = spot_t_real.detach().clone().requires_grad_(True)  # (N,)
             Y_boot = _y_boot_of_spot(spot_t_leaf, q_star_t1, move_entry_F=False)   # (N,)
-            grad_leaves = ([f_delta, spot_t_leaf]
+            grad_leaves = ([q_leaf, f_delta, spot_t_leaf]
                            + ([belief_leaf] if belief_leaf is not None else []))
             all_grads = torch.autograd.grad(
                 Y_boot.sum(), grad_leaves, retain_graph=False, allow_unused=True)
-            f_delta_grad = all_grads[0]                                      # (N,n_h) = ∂C/∂F_j(t)
-            g_spot = all_grads[1]                                           # (N,) = ∂C/∂spot|_F (partial)
-            belief_grad = all_grads[2] if belief_leaf is not None else None
+            q_grad = all_grads[0]
+            f_delta_grad = all_grads[1]                                      # (N,n_h) = ∂C/∂F_j(t)
+            g_spot = all_grads[2]                                           # (N,) = ∂C/∂spot|_F (partial)
+            belief_grad = all_grads[3] if belief_leaf is not None else None
+            if q_grad is None:
+                q_grad = torch.zeros_like(q_leaf)
+            if f_delta_grad is None:
+                f_delta_grad = torch.zeros_like(f_delta)
+            if g_spot is None:
+                g_spot = torch.zeros_like(spot_t_leaf)
+
+        inner_label = self._inner_bootstrap_value_and_endogenous_grads(
+            t, bank, q_t_sampled.detach(), wealth_post_t.detach(), C_next)
+        dY_dw_inner = None
+        if inner_label is not None:
+            Y_value_boot = inner_label["value"]
+            q_grad = inner_label["q_grad"]
+            f_delta_grad = inner_label["F_grad"]
+            dY_dw_inner = inner_label["wealth_grad"]
+            action_gap = inner_label["action_gap"]
+        else:
+            Y_value_boot = Y_boot.detach()
 
         # Assemble the differential label dy_dz on its three supervised column groups:
         #   • tradable_prices F_j  ← the f_delta hedge-book probe (∂C_t/∂F_j, per-contract)
         #   • wealth (cash slot)   ← the closed-form ∂C/∂wealth pass below
+        #   • positions q_j        ← post-decision inventory leaf, holding wealth fixed
         #   • belief (market block)← the inner-belief seed-leaf gradient
         # Every other column is an uncomputed zero (masked out of the diff loss).
         dy_dz = torch.zeros_like(z_t)
+        for j in range(n_h):
+            if live_t[j]:
+                dy_dz[:, j] = q_grad[:, j]
         F_col_start = self.statepack.n_hedge + 2          # tradable_prices block start
-        # Wealth gradient: ∂Y_boot/∂wealth_post_t = ∂Y_boot/∂wealth_post_t+1 (chain
-        # is wealth_post_t → wealth_pre_t+1 → wealth_post_t+1 → C_next; all linear).
-        # Compute via a separate small autograd pass on a leaf-wealth construction.
-        with torch.enable_grad():
-            w_leaf = wealth_post_t.detach().clone().requires_grad_(True)
-            wealth_pre_t1_l = w_leaf + pnl_real - dL_real            # realized-point, detached
-            wealth_post_t1_l = wealth_pre_t1_l - cost_t1_real
-            # Same z_{t+1} as the main bootstrap: override the spot column with the realized
-            # re-seed spot[t+1] (the fork's market carries an inner-draw price there). Without
-            # this the wealth pass evaluates C_next at a different spot than `Y_boot`, breaking
-            # the machine-tight hedge-book identity f_delta_grad == -dY_dw·q·cs.
-            market_w = market_t1_per_row.detach()
-            if spot_col is not None:
-                market_w = market_w.clone()
-                market_w[:, spot_col] = spot_t1_real
-            z_t1_l = self._assemble_z(
-                market=market_w, q=q_star_t1,
-                wealth=wealth_post_t1_l, F=F_t1_real.detach(),
-                time_to_T=time_to_T_t1, static=bank["static"])
-            Y_for_w = self._C_full(C_next, z_t1_l)
-            dY_dw = torch.autograd.grad(Y_for_w.sum(), w_leaf)[0]    # (N,)
+        # Wealth gradient: when the inner-expected label is active, this is the derivative
+        # of that SAME MC estimator. Otherwise fall back to the realised-path AAD branch.
+        if dY_dw_inner is not None:
+            dY_dw = dY_dw_inner
+        else:
+            with torch.enable_grad():
+                w_leaf = wealth_post_t.detach().clone().requires_grad_(True)
+                wealth_pre_t1_l = w_leaf + pnl_real - dL_real            # realized-point, detached
+                wealth_post_t1_l = wealth_pre_t1_l - cost_t1_real
+                # Same z_{t+1} as the main bootstrap: override the spot column with the realized
+                # re-seed spot[t+1] (the fork's market carries an inner-draw price there). Without
+                # this the wealth pass evaluates C_next at a different spot than `Y_boot`, breaking
+                # the machine-tight hedge-book identity f_delta_grad == -dY_dw·q·cs.
+                market_w = market_t1_per_row.detach()
+                if spot_col is not None:
+                    market_w = market_w.clone()
+                    market_w[:, spot_col] = spot_t1_real
+                z_t1_l = self._assemble_z(
+                    market=market_w, q=q_star_t1,
+                    wealth=wealth_post_t1_l, F=F_t1_real.detach(),
+                    time_to_T=time_to_T_t1, static=bank["static"])
+                Y_for_w = self._C_full(C_next, z_t1_l)
+                dY_dw = torch.autograd.grad(Y_for_w.sum(), w_leaf)[0]    # (N,)
         wealth_col = self.statepack.n_hedge                          # cash slot
         dy_dz[:, wealth_col] = dY_dw
 
@@ -2859,9 +2987,9 @@ class DifferentialSolver:
         # NN fits the residual A_t = C_t − B_t, and convert the gradient label to
         # the residual's slope on the columns where a slope was actually computed:
         #     ∂A_t/∂z = ∂Y_boot/∂z − ∂B_t/∂z        (∂B_t/∂z exact, closed form)
-        # `dy_dz` carries a genuine pathwise ∂C_t/∂z on exactly two column groups
-        # — wealth (closed-form chain above) and the live tradable_prices columns
-        # (spot-leaf projection). Every other column is an UNCOMPUTED zero, not a
+        # `dy_dz` carries a genuine pathwise ∂C_t/∂z on exactly the supervised column
+        # groups below: live positions, wealth, live tradable_prices, belief when the
+        # filter is differentiable, and observable spot. Every other column is an UNCOMPUTED zero, not a
         # measured slope. The earlier attempt subtracted ∂B/∂z across ALL columns,
         # which wrote `0 − ∂B/∂q` onto the positions block: a large slope target
         # of the WRONG SIGN (B carries the dominant first-order q-dependence by
@@ -2872,14 +3000,14 @@ class DifferentialSolver:
         # backward depth — the measured horizon-scaling V_0 gap. Fix: subtract
         # ∂B/∂z where ∂C/∂z exists and MASK the unlabeled columns out of the diff
         # loss entirely (no target, no constraint) via `diff_col_mask`.
-        # λ-mix (when active): blend Y_boot with a no-grad rollout Y_rollout to
+        # λ-mix (when active): blend the value label with a no-grad rollout Y_rollout to
         # break max-of-noisy compounding on the value labels. Rollout starts at
         # the bank's post-decision state (q_t_sampled applied, wealth_post_t)
         # and uses frozen C-stack for downstream decisions. Gradient label is
         # untouched — only the value path gets mixed.
         if self._advantage_decomp:
             B_at_z_t = self._baseline_B(z_t).detach()
-            Y_value = Y_boot.detach()
+            Y_value = Y_value_boot.detach()
             if self._lambda_mix > 0.0:
                 with torch.no_grad():
                     Y_rollout = self._rollout_no_grad_to_T(
@@ -2891,6 +3019,9 @@ class DifferentialSolver:
             y_target = Y_value - B_at_z_t
             diff_col_mask = torch.zeros(
                 z_t.shape[-1], device=z_t.device, dtype=self.dtype)
+            for j in range(n_h):
+                if live_t[j]:
+                    diff_col_mask[j] = 1.0
             diff_col_mask[wealth_col] = 1.0
             for j in range(n_h):
                 if live_t[j]:
@@ -2910,25 +3041,40 @@ class DifferentialSolver:
                 sup = [i for i in range(diff_col_mask.shape[0]) if float(diff_col_mask[i]) > 0]
                 logging.info(
                     "DifferentialSolver diff-label supervised cols (StatePack idx)=%s "
-                    "[wealth=%d, live F=%s, belief=%s, spot=%s]; belief differential %s",
-                    sup, wealth_col, [F_col_start + j for j in range(n_h) if live_t[j]],
+                    "[live positions=%s, wealth=%d, live F=%s, belief=%s, spot=%s]; "
+                    "belief differential %s",
+                    sup, [j for j in range(n_h) if live_t[j]], wealth_col,
+                    [F_col_start + j for j in range(n_h) if live_t[j]],
                     list(belief_cols) if belief_cols else None, spot_market_col,
                     "ACTIVE (filtered)" if belief_cols else "masked (one-hot/off)")
             dy_dz = (dy_dz - self._dB_dz(z_t)) * diff_col_mask
         else:
-            y_target = Y_boot.detach()
-            diff_col_mask = None
+            y_target = Y_value_boot.detach()
+            diff_col_mask = torch.zeros(
+                z_t.shape[-1], device=z_t.device, dtype=self.dtype)
+            for j in range(n_h):
+                if live_t[j]:
+                    diff_col_mask[j] = 1.0
+                    diff_col_mask[F_col_start + j] = 1.0
+            diff_col_mask[wealth_col] = 1.0
+            if belief_cols is not None:
+                diff_col_mask[belief_cols[0]:belief_cols[1]] = 1.0
+            if spot_market_col is not None:
+                diff_col_mask[spot_market_col] = 1.0
 
         # --- Label audit (opt-in, first round per t wins — the initial training bank): snapshot
-        # the actual labels the net regresses to. Y_boot = bootstrap value; baseline_B = analytic
-        # B_t; residual = y_target = Y_boot − B_t (what the NN fits — should be SMALL/O(1) under
+        # the actual labels the net regresses to. Y_value_label = bootstrap value target;
+        # Y_boot_realized = the realised-path AAD branch; baseline_B = analytic B_t;
+        # residual = y_target = Y_value_label − B_t (what the NN fits — should be SMALL/O(1) under
         # advantage decomp). A residual that is LARGE and grows with the bank IS the label-bias
         # signature; |residual| ≫ |B| means the baseline is not capturing the bulk. Surfaces as
         # M1_label_audit_at_t. ---
         if t in self._label_audit_t_steps and t not in self._label_audit:
             with torch.no_grad():
                 B_audit = self._baseline_B(z_t).detach()
-                yt, yb = y_target.detach(), Y_boot.detach()
+                yt = y_target.detach()
+                y_value = Y_value_boot.detach()
+                y_realized = Y_boot.detach()
                 sup_cols = [i for i in range(dy_dz.shape[-1])
                             if diff_col_mask is None or float(diff_col_mask[i]) > 0]
                 grad_norm = (dy_dz[:, sup_cols].norm(dim=-1) if sup_cols
@@ -2949,12 +3095,17 @@ class DifferentialSolver:
                 k = min(3, N)
                 self._label_audit[t] = {
                     "n_rows": int(N), "live_axes": int(live_t.sum()),
-                    "Y_boot": _stats(yb), "baseline_B": _stats(B_audit),
+                    "Y_value_label": _stats(y_value),
+                    "Y_boot_realized": _stats(y_realized),
+                    # Backward-compatible key for the harness readout: now means the actual
+                    # scalar value target, not necessarily the realised one-sample branch.
+                    "Y_boot": _stats(y_value), "baseline_B": _stats(B_audit),
                     "residual_y_target": _stats(yt),
                     "grad_label_norm": {"median": float(grad_norm.median()),
                                         "max": float(grad_norm.max())},
                     "examples": [
-                        {"Y_boot": float(yb[i]), "B": float(B_audit[i]),
+                        {"Y_value_label": float(y_value[i]),
+                         "Y_boot_realized": float(y_realized[i]), "B": float(B_audit[i]),
                          "residual": float(yt[i]),
                          "q_t": [float(v) for v in q_t_sampled[i]],
                          "wealth_post_t": float(wealth_post_t[i])}
@@ -2963,7 +3114,7 @@ class DifferentialSolver:
             a = self._label_audit[t]
             logging.info(
                 "DifferentialSolver LABEL AUDIT t=%d (live_axes=%d, N=%d): "
-                "Y_boot[med=%.4g |mean|=%.4g max=%.4g] baseline_B[med=%.4g |mean|=%.4g] "
+                "Y_value[med=%.4g |mean|=%.4g max=%.4g] baseline_B[med=%.4g |mean|=%.4g] "
                 "RESIDUAL_target[med=%.4g |mean|=%.4g max=%.4g] (the NN's target — should be SMALL) "
                 "grad_norm[med=%.4g max=%.4g] nonfinite=%.3g",
                 t, a["live_axes"], a["n_rows"],

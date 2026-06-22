@@ -177,6 +177,9 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # decomposition. Default 0 = pure bootstrap (banked behavior).
         "lambda_mix": float(solver_config.get("Lambda_Mix", 0.0)),
         "use_advantage_decomp": bool(solver_config.get("Use_Advantage_Decomp", True)),
+        # DifferentialSolver value-label fanout: average the Bellman envelope over the
+        # retained one-step inner fork instead of fitting a one-realisation max target.
+        "bootstrap_inner_samples": int(solver_config.get("Bootstrap_Inner_Samples", 1)),
         # Backward-sweep depth: fit C_t for t in [t_outer-2 .. t_min]. 0 = full sweep
         # to the initial decision; t_min near t_outer-1 = a shallow (bounded) sweep.
         "t_min": int(solver_config.get("T_Min", 0)),
