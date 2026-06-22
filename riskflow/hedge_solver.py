@@ -2526,6 +2526,7 @@ class DifferentialSolver:
         device = self.device
         n_h = len(self.hedges)
         oi = bank["outer_index"]
+        N = q_post_t.shape[0]
         I = min(int(self._bootstrap_inner_samples), int(market_t1.shape[1]))
         if I <= 0:
             return None
@@ -2534,63 +2535,115 @@ class DifferentialSolver:
         F_t1_i = torch.stack(
             [inner["F_t1"][h].to(device)[oi, :I] for h in self.hedges],
             dim=-1).detach()                                                # (N,I,n_h)
-        spot_t = self._spot_col(bank["market"])
-        spot_t1 = self._spot_col(market_i)
-        if spot_t is not None and spot_t1 is not None:
-            dS = spot_t1 - spot_t.detach().unsqueeze(1)
-        else:
-            dS = F_t1_i[..., 0] - bank["F_at_t"].detach()[:, :1]
-        dL = (self._liability_R[t] * dS).detach()
 
-        N = q_post_t.shape[0]
+        # spot[t] and belief[t] enter as PER-ROW leaves; each inner draw's z_{t+1} spot/belief
+        # column is reconstructed FROM them through the process's OWN one-step transitions
+        # (`reseed_one_step` / `forward_belief_onestep` — the same dynamics the realized-path
+        # bootstrap uses), so ∂value/∂spot and ∂value/∂belief fall out of the SAME autograd pass
+        # as q/wealth/F. The differential is a side effect of the state, not a backfilled label.
+        # The spot reseed lands EXACTLY on the fork's inner draw (value-coherent on price); a
+        # coherence check guards the belief filter. Liability marks to the spot LEVEL
+        # (dL = R_{t+1}·s_{t+1} − R_t·s_t) so the spot leaf also flows through the wealth channel
+        # (the liability theta), matching the realized path's g_spot.
+        spot_proc = self._calc.stoch_factors.get(self._spot_key)
+        spot_col = (self._spot_cols_in_market[0]
+                    if self._spot_cols_in_market is not None else None)
+        regime_cols = self._regime_cols_in_market
+        belief_buf = self._outer_buf.get((self._spot_key, 'regime_belief'))
+        spot_t_real = self._spot_col(bank["market"])                        # (N,) or None
+        spot_t1_inner = market_i[..., spot_col] if spot_col is not None else None  # (N,I)
+        R_t = float(self._liability_R[t].item())
+        R_t1 = float(self._liability_R[t1].item())
+
         static = bank["static"].unsqueeze(1).expand(
             N, I, bank["static"].shape[-1]).reshape(N * I, -1)
         time_to_T = (bank["time_to_T"] - 1.0).unsqueeze(1).expand(N, I).reshape(-1)
+        if spot_t1_inner is not None:
+            dL_det = R_t1 * spot_t1_inner - R_t * spot_t_real.unsqueeze(1)   # (N,I) detached
+        else:
+            dL_det = R_t * (F_t1_i[..., 0] - bank["F_at_t"][:, :1])
 
-        # Action selection: no gradient through the Bellman argmax/envelope.
+        # Action selection: NO gradient through the Bellman argmax/envelope.
         with torch.no_grad():
-            dF_sel = F_t1_i - bank["F_at_t"].detach().unsqueeze(1)
+            dF_sel = F_t1_i - bank["F_at_t"].unsqueeze(1)
             pnl_sel = (q_post_t.unsqueeze(1) * self.contract_size * dF_sel).sum(-1)
-            wealth_pre_sel = wealth_post_t.unsqueeze(1) + pnl_sel - dL
+            wealth_pre_sel = wealth_post_t.unsqueeze(1) + pnl_sel - dL_det
             q_prev_sel = q_post_t.unsqueeze(1).expand(N, I, n_h).reshape(N * I, n_h)
             q_star, _, gap = self._decision_at(
-                C_next,
-                market_i.reshape(N * I, -1),
-                F_t1_i.reshape(N * I, n_h),
-                q_prev_sel,
-                wealth_pre_sel.reshape(-1),
-                time_to_T,
-                static,
-                t1)
+                C_next, market_i.reshape(N * I, -1), F_t1_i.reshape(N * I, n_h),
+                q_prev_sel, wealth_pre_sel.reshape(-1), time_to_T, static, t1)
             q_star = q_star.detach().reshape(N, I, n_h)
             action_gap = gap.reshape(N, I).mean(dim=1).detach()
 
+        belief_coherence = float('nan')
         with torch.enable_grad():
             q_leaf = q_post_t.detach().clone().requires_grad_(True)
             wealth_leaf = wealth_post_t.detach().clone().requires_grad_(True)
             F_leaf = bank["F_at_t"].detach().clone().requires_grad_(True)
+            leaves = [q_leaf, wealth_leaf, F_leaf]
+            market_recon = market_i.clone()                                 # (N,I,market_dim)
+
+            # spot leaf → predictive channel (reseed → z_{t+1} spot col) + liability (dL).
+            spot_leaf = None
+            dL = dL_det
+            if spot_col is not None and spot_t1_inner is not None and spot_proc is not None:
+                spot_leaf = spot_t_real.detach().clone().requires_grad_(True)   # (N,)
+                spot_t1_recon = spot_proc.reseed_one_step(
+                    spot_leaf.unsqueeze(1), spot_t_real.unsqueeze(1), spot_t1_inner)  # (N,I)
+                market_recon[..., spot_col] = spot_t1_recon
+                dL = R_t1 * spot_t1_recon - R_t * spot_leaf.unsqueeze(1)
+                leaves.append(spot_leaf)
+
+            # belief leaf → one outer-grid filter step per inner draw → z_{t+1} belief cols.
+            belief_leaf = None
+            if (regime_cols is not None and belief_buf is not None
+                    and spot_t1_inner is not None
+                    and hasattr(spot_proc, 'forward_belief_onestep')):
+                r_lo, r_hi = regime_cols
+                belief_leaf = belief_buf[t][:, oi].detach().clone().requires_grad_(True)  # (ns,N)
+                ns = belief_leaf.shape[0]
+                bl_exp = belief_leaf.unsqueeze(-1).expand(ns, N, I).reshape(ns, N * I)
+                sp_prev = spot_t_real.unsqueeze(1).expand(N, I).reshape(-1)
+                belief_t1 = spot_proc.forward_belief_onestep(
+                    bl_exp, sp_prev, spot_t1_inner.reshape(-1), t1)         # (ns, N*I)
+                belief_recon = belief_t1.movedim(0, -1).reshape(N, I, ns)   # (N,I,ns)
+                belief_coherence = float(
+                    (belief_recon.detach() - market_i[..., r_lo:r_hi]).abs().max())
+                market_recon[..., r_lo:r_hi] = belief_recon
+                leaves.append(belief_leaf)
+
             dF = F_t1_i - F_leaf.unsqueeze(1)
             pnl = (q_leaf.unsqueeze(1) * self.contract_size * dF).sum(-1)
             wealth_pre_t1 = wealth_leaf.unsqueeze(1) + pnl - dL
             cost_t1 = self._turnover(q_star, q_leaf.unsqueeze(1), F_t1_i)
             wealth_post_t1 = wealth_pre_t1 - cost_t1
             z_t1 = self._assemble_z(
-                market=market_i.reshape(N * I, -1),
+                market=market_recon.reshape(N * I, -1),
                 q=q_star.reshape(N * I, n_h),
                 wealth=wealth_post_t1.reshape(-1),
                 F=F_t1_i.reshape(N * I, n_h),
-                time_to_T=time_to_T,
-                static=static)
+                time_to_T=time_to_T, static=static)
             y_inner = self._C_full(C_next, z_t1).reshape(N, I).mean(dim=1)
-            q_grad, wealth_grad, F_grad = torch.autograd.grad(
-                y_inner.sum(), [q_leaf, wealth_leaf, F_leaf],
-                retain_graph=False, allow_unused=True)
+            grads = torch.autograd.grad(
+                y_inner.sum(), leaves, retain_graph=False, allow_unused=True)
+
+        # Unpack by build order [q, wealth, F, (spot), (belief)].
+        q_grad, wealth_grad, F_grad = grads[0], grads[1], grads[2]
+        gi = 3
+        spot_grad = belief_grad = None
+        if spot_leaf is not None:
+            spot_grad = grads[gi]; gi += 1
+        if belief_leaf is not None:
+            belief_grad = grads[gi]; gi += 1
         return {
             "value": y_inner.detach(),
             "q_grad": (torch.zeros_like(q_post_t) if q_grad is None else q_grad.detach()),
             "wealth_grad": (torch.zeros_like(wealth_post_t) if wealth_grad is None
                              else wealth_grad.detach()),
             "F_grad": (torch.zeros_like(bank["F_at_t"]) if F_grad is None else F_grad.detach()),
+            "spot_grad": (None if spot_grad is None else spot_grad.detach()),   # (N,) per-row
+            "belief_grad": (None if belief_grad is None else belief_grad.detach()),  # (ns,N) per-row
+            "belief_coherence": belief_coherence,
             "action_gap": action_gap,
         }
 
@@ -2789,12 +2842,31 @@ class DifferentialSolver:
         inner_label = self._inner_bootstrap_value_and_endogenous_grads(
             t, bank, q_t_sampled.detach(), wealth_post_t.detach(), C_next)
         dY_dw_inner = None
+        inner_spot_grad = inner_belief_grad = None        # inner-estimator differentials (per-row)
         if inner_label is not None:
             Y_value_boot = inner_label["value"]
             q_grad = inner_label["q_grad"]
             f_delta_grad = inner_label["F_grad"]
             dY_dw_inner = inner_label["wealth_grad"]
             action_gap = inner_label["action_gap"]
+            # Spot/belief differentials from the inner estimator (a side effect of the spot[t]/
+            # belief[t] state leaves), consistent with the inner-averaged value. Kept SEPARATE
+            # from the realised g_spot / belief_grad, which the spot FD gate + coherence checks
+            # below still validate against the realised reconstruction. spot_grad is (N,);
+            # belief_grad is (ns,N) per-bank-row (realised is (ns,B_outer), indexed by oi).
+            inner_spot_grad = inner_label.get("spot_grad")
+            inner_belief_grad = inner_label.get("belief_grad")
+            # Coherence guard: forward_belief_onestep (outer-grid step) must reproduce the fork's
+            # filtered belief, else overriding z_{t+1}'s belief changes the value (the P-index /
+            # convention concern). Log once + warn if it drifts.
+            _bc = inner_label.get("belief_coherence")
+            if _bc is not None and _bc == _bc and not getattr(self, "_logged_inner_belief_coh", False):
+                self._logged_inner_belief_coh = True
+                (logging.warning if _bc > 1.0e-2 else logging.info)(
+                    "DifferentialSolver inner-MC belief reconstruction coherence "
+                    "max|forward_belief_onestep − fork belief| = %.3g (t=%d) — %s", _bc, t,
+                    "OK (value-coherent)" if _bc <= 1.0e-2 else
+                    "DRIFT: belief override changes the value; check P-index convention")
         else:
             Y_value_boot = Y_boot.detach()
 
@@ -2849,13 +2921,16 @@ class DifferentialSolver:
         # only when the inner belief filter populated a grad leaf, so it gates the unmask
         # below (one-hot fallback leaves the regime block detached → no slope → stay masked).
         belief_cols = None
-        if belief_leaf is not None and belief_grad is not None:
-            # belief_grad is (n_states, B_outer): ∂Y_boot/∂belief_t (flows through the inner
-            # filter's predict step into z_{t+1}). Project per-row via outer_index onto the
-            # belief slice of the market block.
+        belief_label = inner_belief_grad if inner_belief_grad is not None else belief_grad
+        if belief_label is not None and self._regime_cols_in_market is not None:
+            # ∂C_t/∂belief_t (flows through the filter's predict step into z_{t+1}), projected
+            # onto the belief slice of the market block. The inner-estimator grad is already
+            # per-bank-row (ns,N); the realised single-path grad is per-outer-path (ns,B_outer)
+            # and indexed by `oi`.
             ms = 2 * self.statepack.n_hedge + 2
             r_lo, r_hi = self._regime_cols_in_market
-            dy_dz[:, ms + r_lo : ms + r_hi] = belief_grad[:, oi].T
+            dy_dz[:, ms + r_lo : ms + r_hi] = (
+                belief_label.T if inner_belief_grad is not None else belief_label[:, oi].T)
             belief_cols = (ms + r_lo, ms + r_hi)
 
         # Spot column ← the PARTIAL ∂C/∂spot|_F (holds the current F fixed; the F-columns carry
@@ -2863,9 +2938,10 @@ class DifferentialSolver:
         # them). This is the off-manifold (basis-direction) sensitivity collinear value data
         # cannot identify — exactly what the differential label supplies.
         spot_market_col = None
-        if self._spot_cols_in_market is not None and g_spot is not None:
+        spot_label = inner_spot_grad if inner_spot_grad is not None else g_spot
+        if self._spot_cols_in_market is not None and spot_label is not None:
             spot_market_col = 2 * self.statepack.n_hedge + 2 + self._spot_cols_in_market[0]
-            dy_dz[:, spot_market_col] = g_spot
+            dy_dz[:, spot_market_col] = spot_label
 
         # Price-differential gate (diagnostic): snapshot the RAW pathwise ∂Y_boot/∂F_h on the
         # live tradable_prices columns BEFORE the advantage-decomp baseline subtraction, so the
