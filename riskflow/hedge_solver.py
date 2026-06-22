@@ -663,7 +663,18 @@ class TwinNetwork(torch.nn.Module):
             layers.append(torch.nn.Linear(prev, h))
             layers.append(torch.nn.Softplus())
             prev = h
-        layers.append(torch.nn.Linear(prev, 1))
+        final = torch.nn.Linear(prev, 1)
+        # Zero-init the OUTPUT layer so the residual A_t ≡ 0 at init (in standardized
+        # space): C_t = B_t(z) + A_t starts at exactly the analytic baseline rather than
+        # baseline + random high-frequency structure. This is the toy's design (it zeros
+        # its final Linear so A starts at 0) and the natural start under advantage decomp,
+        # where A is the SMALL residual to learn — a strictly easier optimization start
+        # than default Kaiming init. A fresh net is built per backward step, so every C_t
+        # benefits. The standardized output is then `0·y_std + y_mean = y_mean` (the bank's
+        # mean residual), and the differential label starts from a zero slope.
+        torch.nn.init.zeros_(final.weight)
+        torch.nn.init.zeros_(final.bias)
+        layers.append(final)
         self.mlp = torch.nn.Sequential(*layers).to(device)
         # Normalization buffers — refreshed per backward step from the bank; survive
         # state_dict() saves so warm-start carries the standardization forward.
@@ -1697,6 +1708,12 @@ class DifferentialSolver:
         self._save_value_fn_path = solver_cfg.get("save_value_fn_path") or None
         self._load_value_fn_path = solver_cfg.get("load_value_fn_path") or None
         self._oracle_action_match_path = solver_cfg.get("oracle_action_match_path") or None
+        # Label audit (opt-in, diagnostic): timesteps at which to snapshot the actual bootstrap
+        # labels the net is asked to fit — Y_boot, the analytic baseline B_t, and the RESIDUAL
+        # y_target = Y_boot − B_t (what the NN regresses to; should be SMALL under advantage
+        # decomp). Confirms the labels are sane vs exploding (label-bias ⇒ |residual| blows up).
+        self._label_audit_t_steps = set(int(x) for x in solver_cfg.get("label_audit_t_steps", []))
+        self._label_audit = {}
 
         self.hedges = list(runtime["names"]["hedges"])
         # T_outer-1 decision points: t=0..T-2 (DP convention). C[T_outer-1] is the
@@ -2417,52 +2434,61 @@ class DifferentialSolver:
           v_star : (N,)        — `C_next(post(q*))` at the chosen action
           action_gap : (N,)    — best minus second-best value (used for spec §9's
                                  derivative mask `w_diff = clamp(gap / threshold, 0, 1)`)
+
+        Row-chunked over N: each row's argmax is independent, so the `(N·K, deep_dim)`
+        scoring tensor is built + evaluated in blocks of `~_upper_chunk_rows` post-expansion
+        rows. Peak memory is then bounded by the chunk, INDEPENDENT of the outer batch — so
+        the outer batch can scale (the full action grid K=levels^n_h × an audit-grown bank
+        otherwise reaches ~10–80M rows and OOMs; gate-5). Bit-identical to the un-chunked
+        form (same per-row ops); guarded by the chunk-transparency test.
         """
         K, n_h = self.action_grid.shape
         N = market.shape[0]
         device = self.device
-        # Live-axis collapse on the action grid — broadcast and force dead axes to 0.
+        # Live-axis collapse — dead axes forced to 0. Grid is row-independent, so build the
+        # (K, n_h) masked grid ONCE and expand per block (was an N·K·n_h clone).
         live_t = self.is_live[t]                                      # (n_h,)
-        grid = self.action_grid.unsqueeze(0).expand(N, K, n_h).clone()      # (N, K, n_h)
+        grid_K = self.action_grid.clone()                            # (K, n_h)
         if (~live_t).any():
-            grid[..., ~live_t] = 0.0
+            grid_K[:, ~live_t] = 0.0
 
-        # Broadcast components to (N, K, ...).
-        market_K = market.unsqueeze(1).expand(N, K, -1)
-        F_K = F.unsqueeze(1).expand(N, K, n_h)
-        q_prev_K = q_prev.unsqueeze(1).expand(N, K, n_h)
-        wealth_pre_K = wealth_pre.unsqueeze(1).expand(N, K)
-        time_to_T_K = time_to_T.unsqueeze(1).expand(N, K)
-        static_K = static.unsqueeze(1).expand(N, K, -1)
-
-        # Turnover cost per (N, K) — spec §3's L1 model.
-        cost = self._turnover(grid, q_prev_K, F_K)                    # (N, K)
-        wealth_post_K = wealth_pre_K - cost                           # (N, K)
-
-        # Build post-decision states and score against frozen C_next. NO autograd —
-        # the decision operator's only output that flows into the differential label
-        # is `q*` (detached). Value is read for ranking + action_gap diagnostic.
+        chunk_n = max(1, self._upper_chunk_rows // max(1, K))         # N-rows per block
+        q_parts, v_parts, gap_parts = [], [], []
         with torch.no_grad():
-            z_post = self._assemble_z(
-                market=market_K.reshape(N * K, -1),
-                q=grid.reshape(N * K, n_h),
-                wealth=wealth_post_K.reshape(-1),
-                F=F_K.reshape(N * K, n_h),
-                time_to_T=time_to_T_K.reshape(-1),
-                static=static_K.reshape(N * K, -1))                   # (N*K, deep_dim)
-            # Advantage decomposition: argmax the SUM B_t + A_t, NOT A_t alone.
-            # The decomposition is transparent: legacy no-baseline path collapses
-            # `_C_full` to `C_next(z_post)` since `_baseline_B` returns zero.
-            values = self._C_full(C_next, z_post).reshape(N, K)       # (N, K)
-            argmax_idx = values.argmax(dim=-1)                        # (N,)
-            v_star = values.gather(-1, argmax_idx.unsqueeze(-1)).squeeze(-1)
-            # Action gap = top minus second-best. Robust to ties (sort then diff).
-            top2, _ = values.topk(min(2, K), dim=-1)
-            action_gap = (top2[..., 0] - top2[..., -1]).abs()         # (N,)
-
-        # Gather q*: shape (N, n_h).
-        q_star = grid.gather(
-            1, argmax_idx.view(N, 1, 1).expand(N, 1, n_h)).squeeze(1)
+            for i in range(0, N, chunk_n):
+                sl = slice(i, i + chunk_n)
+                n_b = market[sl].shape[0]
+                grid_b = grid_K.unsqueeze(0).expand(n_b, K, n_h)         # (n_b, K, n_h)
+                market_b = market[sl].unsqueeze(1).expand(n_b, K, -1)
+                F_b = F[sl].unsqueeze(1).expand(n_b, K, n_h)
+                q_prev_b = q_prev[sl].unsqueeze(1).expand(n_b, K, n_h)
+                wealth_pre_b = wealth_pre[sl].unsqueeze(1).expand(n_b, K)
+                time_to_T_b = time_to_T[sl].unsqueeze(1).expand(n_b, K)
+                static_b = static[sl].unsqueeze(1).expand(n_b, K, -1)
+                # Turnover cost per (n_b, K) — spec §3's L1 model.
+                wealth_post_b = wealth_pre_b - self._turnover(grid_b, q_prev_b, F_b)
+                # Build post-decision states + score the frozen C_next. NO autograd — the
+                # only decision output flowing into the differential label is q* (detached);
+                # value is read for ranking + the action_gap diagnostic. Advantage decomp:
+                # argmax the SUM B_t + A_t (legacy no-baseline path collapses _C_full to C_next).
+                z_post = self._assemble_z(
+                    market=market_b.reshape(n_b * K, -1),
+                    q=grid_b.reshape(n_b * K, n_h),
+                    wealth=wealth_post_b.reshape(-1),
+                    F=F_b.reshape(n_b * K, n_h),
+                    time_to_T=time_to_T_b.reshape(-1),
+                    static=static_b.reshape(n_b * K, -1))               # (n_b·K, deep_dim)
+                values = self._C_full(C_next, z_post).reshape(n_b, K)   # (n_b, K)
+                amax = values.argmax(dim=-1)                            # (n_b,)
+                v_parts.append(values.gather(-1, amax.unsqueeze(-1)).squeeze(-1))
+                # Action gap = top minus second-best (sort then diff; robust to ties).
+                top2, _ = values.topk(min(2, K), dim=-1)
+                gap_parts.append((top2[..., 0] - top2[..., -1]).abs())
+                q_parts.append(grid_b.gather(
+                    1, amax.view(n_b, 1, 1).expand(n_b, 1, n_h)).squeeze(1))
+        q_star = torch.cat(q_parts, dim=0)                              # (N, n_h)
+        v_star = torch.cat(v_parts, dim=0)                              # (N,)
+        action_gap = torch.cat(gap_parts, dim=0)                        # (N,)
         return q_star, v_star, action_gap
 
     def _compute_labels_for_bank(self, t, bank, C_next, traj=None):
@@ -2892,6 +2918,62 @@ class DifferentialSolver:
         else:
             y_target = Y_boot.detach()
             diff_col_mask = None
+
+        # --- Label audit (opt-in, first round per t wins — the initial training bank): snapshot
+        # the actual labels the net regresses to. Y_boot = bootstrap value; baseline_B = analytic
+        # B_t; residual = y_target = Y_boot − B_t (what the NN fits — should be SMALL/O(1) under
+        # advantage decomp). A residual that is LARGE and grows with the bank IS the label-bias
+        # signature; |residual| ≫ |B| means the baseline is not capturing the bulk. Surfaces as
+        # M1_label_audit_at_t. ---
+        if t in self._label_audit_t_steps and t not in self._label_audit:
+            with torch.no_grad():
+                B_audit = self._baseline_B(z_t).detach()
+                yt, yb = y_target.detach(), Y_boot.detach()
+                sup_cols = [i for i in range(dy_dz.shape[-1])
+                            if diff_col_mask is None or float(diff_col_mask[i]) > 0]
+                grad_norm = (dy_dz[:, sup_cols].norm(dim=-1) if sup_cols
+                             else torch.zeros(N, device=device))
+
+                def _stats(x):
+                    xf = x[torch.isfinite(x)]
+                    nonfin = float((~torch.isfinite(x)).float().mean())
+                    if xf.numel() == 0:
+                        return {"min": float('nan'), "max": float('nan'), "mean": float('nan'),
+                                "std": float('nan'), "median": float('nan'),
+                                "abs_mean": float('nan'), "frac_nonfinite": nonfin}
+                    return {"min": float(xf.min()), "max": float(xf.max()),
+                            "mean": float(xf.mean()), "std": float(xf.std()),
+                            "median": float(xf.median()), "abs_mean": float(xf.abs().mean()),
+                            "frac_nonfinite": nonfin}
+
+                k = min(3, N)
+                self._label_audit[t] = {
+                    "n_rows": int(N), "live_axes": int(live_t.sum()),
+                    "Y_boot": _stats(yb), "baseline_B": _stats(B_audit),
+                    "residual_y_target": _stats(yt),
+                    "grad_label_norm": {"median": float(grad_norm.median()),
+                                        "max": float(grad_norm.max())},
+                    "examples": [
+                        {"Y_boot": float(yb[i]), "B": float(B_audit[i]),
+                         "residual": float(yt[i]),
+                         "q_t": [float(v) for v in q_t_sampled[i]],
+                         "wealth_post_t": float(wealth_post_t[i])}
+                        for i in range(k)],
+                }
+            a = self._label_audit[t]
+            logging.info(
+                "DifferentialSolver LABEL AUDIT t=%d (live_axes=%d, N=%d): "
+                "Y_boot[med=%.4g |mean|=%.4g max=%.4g] baseline_B[med=%.4g |mean|=%.4g] "
+                "RESIDUAL_target[med=%.4g |mean|=%.4g max=%.4g] (the NN's target — should be SMALL) "
+                "grad_norm[med=%.4g max=%.4g] nonfinite=%.3g",
+                t, a["live_axes"], a["n_rows"],
+                a["Y_boot"]["median"], a["Y_boot"]["abs_mean"], a["Y_boot"]["max"],
+                a["baseline_B"]["median"], a["baseline_B"]["abs_mean"],
+                a["residual_y_target"]["median"], a["residual_y_target"]["abs_mean"],
+                a["residual_y_target"]["max"],
+                a["grad_label_norm"]["median"], a["grad_label_norm"]["max"],
+                a["Y_boot"]["frac_nonfinite"])
+
         return (z_t.detach(), y_target, dy_dz.detach(), action_gap.detach(),
                 diff_col_mask)
 
@@ -4484,6 +4566,10 @@ class DifferentialSolver:
             # Spot-gradient FD gate: per-t FD-vs-autograd rel-err on ∂Y_boot/∂spot + the
             # realized-dL vs R_t·dS sign cross-check. Surfaces as M1_spot_grad_fd_gate_at_t.
             "spot_grad_fd_gate_at_t": dict(getattr(self, "_spot_grad_fd_gate", {})),
+            # Label audit (opt-in): per-t snapshot of the bootstrap labels the net fits
+            # (Y_boot / baseline_B / residual_y_target distributions + examples). Surfaces
+            # as M1_label_audit_at_t. Empty unless Label_Audit_T_Steps is set.
+            "label_audit_at_t": dict(getattr(self, "_label_audit", {})),
         }
         # Production validation: BSS sandwich lower bound L (realised $/oz of the
         # policy on a fresh MC set). Runs unconditionally; computes mean, p5/p95,

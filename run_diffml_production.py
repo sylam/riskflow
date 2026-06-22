@@ -72,6 +72,11 @@ def main():
                     help='Path to an exact-DP oracle npz (e.g. artifacts/gate2_exact_dp.npz.toy_t30) '
                          'to score the fitted policy per-depth vs the optimal action. Only '
                          'meaningful on the matching toy deal (configs_gate2_toy.json).')
+    p.add_argument('--label-audit', type=str, default=None,
+                    help='Comma-separated timesteps (e.g. "0,6,12") at which to snapshot the '
+                         'bootstrap labels the net fits: Y_boot, baseline B_t, and the residual '
+                         'target (should be SMALL under advantage decomp). Confirms the labels '
+                         'are sane vs exploding (the label-bias signature).')
     p.add_argument('--margin-usd-per-oz', type=float, default=6.0,
                     help='Dealer margin to clear ($/oz). Spec §0: $6-8/oz; '
                          'default $6 per validation_sandwich_spec.md §7 ship criterion.')
@@ -143,6 +148,8 @@ def main():
         hp['Solver']['Load_Value_Fn_Path'] = args.load_value_fn
     if args.oracle_action_match:
         hp['Solver']['Oracle_Action_Match_Path'] = args.oracle_action_match
+    if args.label_audit:
+        hp['Solver']['Label_Audit_T_Steps'] = [int(x) for x in args.label_audit.split(',') if x.strip()]
     if args.random_seed is not None:
         calc['Random_Seed'] = int(args.random_seed)
 
@@ -201,6 +208,24 @@ def main():
             print(f"  penalty dual-feasible: {'OK' if (pz < 3.0 and not pen_cap) else 'FAIL'}  (z={pz:.2f})")
         if u_ge_l is not None:
             print(f"  U ≥ L: {'OK' if u_ge_l else 'FAIL'}")
+
+        # --- LABEL AUDIT: the actual bootstrap labels the net is asked to fit, per t.
+        # residual = Y_boot − B_t is what the NN regresses to; under advantage decomp it
+        # should be SMALL. A large/growing residual (esp. |residual| ≫ |B|) is label-bias. ---
+        la = _g('label_audit_at_t')
+        if isinstance(la, dict) and la:
+            print('  ── LABEL AUDIT (what the net fits, per t) ──')
+            print(f"  {'t':>3} {'live':>4} {'Y_boot|mean|':>13} {'B|mean|':>12} "
+                  f"{'residual|mean|':>14} {'residual_max':>13} {'gradN_med':>10}")
+            for t_key in sorted(la, key=lambda k: int(k)):
+                a = la[t_key]
+                print(f"  {int(t_key):>3} {a['live_axes']:>4} "
+                      f"{a['Y_boot']['abs_mean']:>13.4g} {a['baseline_B']['abs_mean']:>12.4g} "
+                      f"{a['residual_y_target']['abs_mean']:>14.4g} "
+                      f"{a['residual_y_target']['max']:>13.4g} "
+                      f"{a['grad_label_norm']['median']:>10.4g}")
+            print("  (residual should be SMALL/O(1); |residual| ≫ |B| or residual growing "
+                  "with bank ⇒ label-bias, not a net-size problem.)")
 
         # --- §7 DOWNSIDE-PROTECTION VERDICT: learned vs unhedged vs best-static on the
         # SAME shared-shock batch. The practical "did riskflow solve the hedge" check

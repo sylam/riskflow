@@ -207,6 +207,9 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # Offline gate4 diagnostic: per-depth action-match of the fitted policy vs an exact-DP
         # oracle (gate2_exact_dp.npz). Gated path; toy-only; never shipped.
         "oracle_action_match_path": solver_config.get("Oracle_Action_Match_Path") or None,
+        # Opt-in label audit: timesteps at which to snapshot the bootstrap labels the net fits
+        # (Y_boot / baseline_B / residual). Diagnostic; empty list = off.
+        "label_audit_t_steps": list(solver_config.get("Label_Audit_T_Steps", []) or []),
         # Endogenous-span bank knob (DifferentialSolver): inventory/wealth replicas
         # layered on each exogenous slice.
         "bank_sampling": {
