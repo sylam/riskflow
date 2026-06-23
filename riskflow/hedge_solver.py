@@ -2045,6 +2045,64 @@ class DifferentialSolver:
             float(R_t[0]), float(R_t[-1]),
             float(self._liability_tau_bar_years[0]),
             float(self._liability_tau_bar_years[-1]))
+        self._audit_liability_convention(R_t)
+
+    def _audit_liability_convention(self, R_t):
+        """Record the liability-mark gaps that justify using the framework MTM buffer.
+
+        Both the realised label path and the inner bootstrap mark the liability from the
+        framework's MTM buffer (`dL = liability_mtm[t+1] − liability_mtm[t]`, Jacobian-
+        reconstructed off the realised path). This logs how far the two closed-form shortcuts
+        fall from that ground truth, so nobody reverts to them: (a) `R_t·dS` is ~30–45% off
+        even where R is flat — the liability is FORWARD-driven, not spot-driven; (b) the level
+        form `R_{t+1}·s_{t+1} − R_t·s_t` additionally injects a spurious
+        `−(R_t − R_{t+1})·s_{t+1} = −w_fix·s` shock at every fixing (≈4× the typical |dL| in
+        the averaging window) that compounds the inner value off-band backward. Guards against
+        silent convention drift in the bootstrap's liability mark."""
+        liab_mtm = self.bundle.get("liability_mtm")
+        if liab_mtm is None or bool(torch.allclose(R_t, R_t[0])):
+            return                                                  # no MTM, or no fixings to exercise
+        T = self.t_outer
+        hist = int(self.bundle.get("initial_time_index", 0))
+        spot = self._outer_buf[self._spot_key]                      # (>=T, B_outer)
+        L = liab_mtm[hist:hist + T].to(self.dtype)                  # (T, B)
+        s = spot[:T].to(self.dtype)                                 # (T, B)
+        if L.shape != s.shape:
+            return                                                  # path dims misaligned — skip
+        Rt = R_t.unsqueeze(-1)                                      # (T, 1)
+        dL_true = L[1:] - L[:-1]                                    # framework MTM change
+        dL_design = Rt[:-1] * (s[1:] - s[:-1])                      # R_t·dS (closed form)
+        dL_level = Rt[1:] * s[1:] - Rt[:-1] * s[:-1]               # R_{t+1}s_{t+1} − R_t s_t
+        # The terminal settlement (last 1-2 steps) is a discontinuous MTM jump no spot-linear
+        # closed form captures; it masks the bulk, so report the max over the DECISION bulk
+        # (exclude the final 2 steps). The isolated `level − design` term is the spurious
+        # `−(R_t − R_{t+1})·s_{t+1}` fixing shock — present wherever R decays, ZERO where R flat.
+        bulk = slice(0, max(1, dL_true.shape[0] - 2))
+        err_design = (dL_true - dL_design).abs().mean(dim=-1)       # (T-1,)
+        err_level = (dL_true - dL_level).abs().mean(dim=-1)
+        spurious = (dL_level - dL_design).abs().mean(dim=-1)        # the level-form extra term
+        scale = dL_true[bulk].abs().mean().clamp_min(1e-12)
+        ed_b, el_b, sp_b = err_design[bulk], err_level[bulk], spurious[bulk]
+        logging.info(
+            "DifferentialSolver liability dL convention check (mean |Δ| over paths, decision "
+            "bulk t<%d): R_t·dS vs framework-MTM max=%.4g @t=%d; LEVEL vs framework-MTM max=%.4g "
+            "@t=%d; isolated LEVEL−design (spurious −w_fix·s) max=%.4g @t=%d; typical |dL_true|"
+            "=%.4g. (Inner bootstrap uses the framework MTM directly; these are the closed-form "
+            "gaps it avoids — R_t·dS is forward-vs-spot biased, LEVEL adds the fixing shock.)",
+            int(bulk.stop), float(ed_b.max()), int(ed_b.argmax()),
+            float(el_b.max()), int(el_b.argmax()),
+            float(sp_b.max()), int(sp_b.argmax()), float(scale))
+        if os.environ.get("RF_DL_AUDIT_TABLE"):
+            T1 = dL_true.shape[0]
+            ts = sorted({0, T1 // 8, T1 // 4, T1 * 3 // 8, T1 // 2, T1 * 5 // 8,
+                         T1 * 3 // 4, T1 - 5, T1 - 2, T1 - 1})
+            logging.info("  t  | R_t    | mean dL_true | mean dL_design | mean dL_level | |lvl-dsn|")
+            for ti in ts:
+                if 0 <= ti < T1:
+                    logging.info(
+                        "  %3d| %7.1f| %12.4g | %14.4g | %13.4g | %9.4g", ti, float(R_t[ti]),
+                        float(dL_true[ti].mean()), float(dL_design[ti].mean()),
+                        float(dL_level[ti].mean()), float(spurious[ti]))
 
     def _baseline_B(self, z):
         """Closed-form buy-and-hold baseline `B_t(z)` for advantage decomposition.
@@ -2542,9 +2600,17 @@ class DifferentialSolver:
         # bootstrap uses), so ∂value/∂spot and ∂value/∂belief fall out of the SAME autograd pass
         # as q/wealth/F. The differential is a side effect of the state, not a backfilled label.
         # The spot reseed lands EXACTLY on the fork's inner draw (value-coherent on price); a
-        # coherence check guards the belief filter. Liability marks to the spot LEVEL
-        # (dL = R_{t+1}·s_{t+1} − R_t·s_t) so the spot leaf also flows through the wealth channel
-        # (the liability theta), matching the realized path's g_spot.
+        # coherence check guards the belief filter. The liability is reconstructed the SAME way
+        # the realised/training label path does — first-order from the framework MTM buffer and
+        # the persisted spot Jacobian: L_t = liability_mtm[t] + JL_t·(s_t − s_t^real),
+        # L_{t+1} = liability_mtm[t+1] + JL_{t+1}·(s_{t+1} − s_{t+1}^real), dL = L_{t+1} − L_t.
+        # This makes the inner bootstrap's liability mark identical to the training labels by
+        # construction (value AND ∂dL/∂spot = JL_{t+1} − JL_t), so the inner expectation is a
+        # genuine variance reduction on the SAME quantity. The earlier closed forms were both
+        # wrong: the level form `R_{t+1}·s_{t+1} − R_t·s_t` injects a spurious `−w_fix·s` shock
+        # at every fixing (≈4× the typical |dL| in the averaging window — it compounds the value
+        # off-band backward), and even `R_t·dS` is ~30–45% off the forward-driven MTM. See the
+        # construction-time `_audit_liability_convention` for both gaps.
         spot_proc = self._calc.stoch_factors.get(self._spot_key)
         spot_col = (self._spot_cols_in_market[0]
                     if self._spot_cols_in_market is not None else None)
@@ -2553,13 +2619,31 @@ class DifferentialSolver:
         spot_t_real = self._spot_col(bank["market"])                        # (N,) or None
         spot_t1_inner = market_i[..., spot_col] if spot_col is not None else None  # (N,I)
         R_t = float(self._liability_R[t].item())
-        R_t1 = float(self._liability_R[t1].item())
+
+        # Framework liability (MTM buffer is history-prefixed → +hist; the spot Jacobian is
+        # sim-grid → no offset; mirrors the realised path in `_compute_labels_for_bank`).
+        liab_mtm = self.bundle.get("liability_mtm")
+        liab_jac = self.bundle.get("liability_jacobian", {})
+        have_liab = liab_mtm is not None and spot_t1_inner is not None
+        if have_liab:
+            hist = int(self.bundle.get("initial_time_index", 0))
+            spot_t1_real = self._outer_buf[self._spot_key][t1][oi]           # (N,) realised t+1 spot
+            L_t_real = liab_mtm[hist + t][oi]                                # (N,)
+            L_t1_real = liab_mtm[hist + t1][oi]                              # (N,)
+            jl = liab_jac.get(utils.check_tuple_name(self._spot_key)) if liab_jac else None
+            JL_t = jl[t][oi] if jl is not None else torch.zeros_like(spot_t1_real)    # (N,)
+            JL_t1 = jl[t1][oi] if jl is not None else torch.zeros_like(spot_t1_real)  # (N,)
 
         static = bank["static"].unsqueeze(1).expand(
             N, I, bank["static"].shape[-1]).reshape(N * I, -1)
         time_to_T = (bank["time_to_T"] - 1.0).unsqueeze(1).expand(N, I).reshape(-1)
-        if spot_t1_inner is not None:
-            dL_det = R_t1 * spot_t1_inner - R_t * spot_t_real.unsqueeze(1)   # (N,I) detached
+        if have_liab:
+            # d_t = 0 at the realised t spot ⇒ L_t = L_t_real; t+1 marks the inner draw.
+            dL_det = (L_t1_real.unsqueeze(1)
+                      + JL_t1.unsqueeze(1) * (spot_t1_inner - spot_t1_real.unsqueeze(1))
+                      - L_t_real.unsqueeze(1))                              # (N,I) framework MTM
+        elif spot_t1_inner is not None:
+            dL_det = R_t * (spot_t1_inner - spot_t_real.unsqueeze(1))        # fallback: R_t·dS
         else:
             dL_det = R_t * (F_t1_i[..., 0] - bank["F_at_t"][:, :1])
 
@@ -2591,7 +2675,15 @@ class DifferentialSolver:
                 spot_t1_recon = spot_proc.reseed_one_step(
                     spot_leaf.unsqueeze(1), spot_t_real.unsqueeze(1), spot_t1_inner)  # (N,I)
                 market_recon[..., spot_col] = spot_t1_recon
-                dL = R_t1 * spot_t1_recon - R_t * spot_leaf.unsqueeze(1)
+                if have_liab:
+                    # Framework MTM reconstruction with the spot leaf: ∂dL/∂spot = JL_{t+1} − JL_t.
+                    d_t = (spot_leaf - spot_t_real).unsqueeze(1)            # (N,1), 0 at value
+                    d_t1 = spot_t1_recon - spot_t1_real.unsqueeze(1)        # (N,I)
+                    L_t = L_t_real.unsqueeze(1) + JL_t.unsqueeze(1) * d_t   # (N,1)
+                    L_t1 = L_t1_real.unsqueeze(1) + JL_t1.unsqueeze(1) * d_t1  # (N,I)
+                    dL = L_t1 - L_t                                          # (N,I) matches training
+                else:
+                    dL = R_t * (spot_t1_recon - spot_leaf.unsqueeze(1))      # fallback: R_t·dS
                 leaves.append(spot_leaf)
 
             # belief leaf → one outer-grid filter step per inner draw → z_{t+1} belief cols.
