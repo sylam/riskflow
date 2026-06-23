@@ -221,6 +221,17 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         "include_dynamic_features_in_value_inputs":
             bool(solver_config.get("Include_Dynamic_Features_In_Value_Inputs", False)),
         "multi_seed_count": int(solver_config.get("Multi_Seed_Count", 1)),
+        # --- DiffSolverV2 (clean-room differential-ML solver) knobs ---
+        # Per-t residual-net Adam fit iterations / learning rate; bank q-exploration
+        # noise as a fraction of each instrument's [Min,Max] position range; and the
+        # subset of hedge instruments whose action axis VARIES in the grid (others
+        # pinned to 0 — the "[0,0,q]" single-future-of-three test). None = all vary.
+        "diffv2_fit_iters": int(solver_config.get("DiffV2_Fit_Iters", 150)),
+        "diffv2_lr": float(solver_config.get("DiffV2_LR", 2.0e-3)),
+        "diffv2_bank_noise_frac": float(solver_config.get("DiffV2_Bank_Noise_Frac", 0.15)),
+        "active_hedge_indices":
+            (list(solver_config["Active_Hedge_Indices"])
+             if solver_config.get("Active_Hedge_Indices") is not None else None),
         "run_hindsight_diagnostic": bool(solver_config.get("Run_Hindsight_Diagnostic", False)),
         "run_mpc_comparison": bool(solver_config.get("Run_Mpc_Comparison", False)),
         "run_textbook_benchmark": bool(solver_config.get("Run_Textbook_Benchmark", False)),
@@ -539,7 +550,7 @@ def construct_torchrl_runtime(
         if str(config.get("Inner_MC_Enabled", "No")) != "Yes":
             raise ValueError("Execution_Mode 'solve_hedge' requires Inner_MC_Enabled='Yes'")
         solver_object = str(solver_config.get("Object", "")).lower()
-        min_inner = 2 if solver_object == "differentialsolver" else 128
+        min_inner = 2 if solver_object in ("differentialsolver", "diffsolverv2") else 128
         if int(config.get("Inner_Sub_Batch", 0)) < min_inner:
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires Inner_Sub_Batch >= "

@@ -63,8 +63,9 @@ def _concat_inner_chunks(chunks, want_raw_samples):
     if want_raw_samples:
         first = chunks[0]
         out['t'], out['cutoff_idx'] = first['t'], first['cutoff_idx']
-        for key in ('L_T', 'market_t', 'market_t1'):
-            out[key] = torch.cat([c[key] for c in chunks], dim=0)
+        for key in ('L_T', 'market_t', 'market_t1', 'L_t', 'L_t1'):
+            if key in first and first[key] is not None:
+                out[key] = torch.cat([c[key] for c in chunks], dim=0)
         for key in ('F_t1', 'dF_T', 'dF_min'):
             out[key] = {ref: torch.cat([c[key][ref] for c in chunks], dim=0)
                         for ref in first[key]}
@@ -2639,8 +2640,18 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     market_t_parts.append(block)
                     market_t_widths.append((key, block.shape[0]))
                 market_t = torch.cat(market_t_parts, dim=0).permute(1, 0).contiguous()
+                # Exact liability MTM at the fork (outer-t) and outer-t+1, on the inner draws —
+                # the resolve_hedge_structure marks themselves (same time-indexing as F_t1:
+                # mtm[cutoff_idx:][0] is outer-t, [1] is outer-t+1). These replace the Jacobian
+                # linearization of the liability in the diff-ML one-step bootstrap, so the
+                # bootstrap value marks the liability EXACTLY at each inner draw.
+                mtm_fwd = inner_mtm[cutoff_idx:]                            # (T_inner, B_outer, B_inner)
+                L_t_inner = mtm_fwd[0].clone()                             # outer-t (shared across draws)
+                L_t1_inner = (mtm_fwd[1] if mtm_fwd.shape[0] >= 2
+                              else mtm_fwd[-1]).clone()                     # outer-t+1 per inner draw
                 result.update(
                     t=t, cutoff_idx=cutoff_idx, L_T=inner_mtm[-2].clone(),
+                    L_t=L_t_inner, L_t1=L_t1_inner,
                     F_t1=F_t1, dF_T=dF_T, dF_min=dF_min,
                     market_t=market_t, market_t1=market_t1)
                 if with_grad:

@@ -1616,7 +1616,7 @@ def _interp_wealth_grid(xs, ys, q):
     return (y0 + w * (y1 - y0)).reshape(q.shape)
 
 
-class DifferentialSolver:
+class DifferentialSolverOld:
     """Differential-ML dynamic-hedging solver. Casts each
     per-step value function as a smooth post-decision continuation `C_t : z_t → scalar`
     fit by supervised twin loss (value + AAD gradient labels) over a controlled bank,
@@ -1816,10 +1816,13 @@ class DifferentialSolver:
         # Bank-sampling ranges, derived from the runtime — no separate JSON knob.
         # `position_limits` is the same source `build_action_grid` reads (above), so
         # the sampling range is consistent with the decision search space at every t.
-        # Wealth half-width sized to the symlog scale: 15 × c covers ±2.78 in symlog
-        # units, the meaningful dynamic range of the activation; e.g.
-        # (`utility_scale=100`) this lands on the prior ±$1500, at the production
-        # deal (`vol_scaled_notional ≈ deal notional`) it scales with the deal.
+        # Wealth half-width = the OPERATING REGION the policy actually visits, NOT the full
+        # symlog dynamic range. The toy's `simulate_bank` keeps wealth in-band (rolls it through
+        # the replication hedge) so the residual A is only ever fit/queried on-support; a band
+        # far wider than the liability scale (R_0·spot ≈ c) leaves A sparsely constrained in the
+        # tails, where the one-step bootstrap query lands and the unbounded MLP extrapolates —
+        # the backward-compounding blow-up. Default 3·c (~3× the liability scale) covers the
+        # operating region without the off-support tails; `Bank_Wealth_Halfwidth_C` overrides.
         limits = runtime["accounting"].get("position_limits", {})
         if not limits:
             raise ValueError(
@@ -1829,13 +1832,14 @@ class DifferentialSolver:
         q_hi = [int(float(limits[h]["max_position"])) for h in self.hedges]
         self.bank_q_min = torch.tensor(q_lo, dtype=torch.long, device=self.device)
         self.bank_q_max = torch.tensor(q_hi, dtype=torch.long, device=self.device)
-        self.bank_wealth_halfwidth = 15.0 * self.utility_c
+        self._bank_wealth_halfwidth_c = float(solver_cfg.get("bank_wealth_halfwidth_c", 3.0))
+        self.bank_wealth_halfwidth = self._bank_wealth_halfwidth_c * self.utility_c
         logging.info(
             "DifferentialSolver bank ranges: q_min=%s, q_max=%s, "
-            "wealth_halfwidth=%.4g (= 15·utility_c, utility_c=%.4g), "
-            "contract_size=%s",
-            q_lo, q_hi, self.bank_wealth_halfwidth, self.utility_c,
-            self.contract_size.cpu().tolist())
+            "wealth_halfwidth=%.4g (= %.3g·utility_c, utility_c=%.4g; operating region, "
+            "NOT full symlog range), contract_size=%s",
+            q_lo, q_hi, self.bank_wealth_halfwidth, self._bank_wealth_halfwidth_c,
+            self.utility_c, self.contract_size.cpu().tolist())
 
         # Linear average-rate liability: `R_t` (remaining-fixing-weights sum, in
         # deal units) drives the AAD-aware wealth update `dL = R_t · dS`.
@@ -2430,6 +2434,60 @@ class DifferentialSolver:
         cs = self.contract_size                                       # (n_h,)
         return self.lambda_turn * (dq * F * cs).sum(dim=-1)
 
+    def _replication_hedge(self, tau):
+        """Operating-region centre for q at outer step `tau` (toy `q_rep`): SHORT the remaining
+        liability exposure `R_tau` (deal units), split evenly across the live futures, expressed
+        in contracts. Dead futures get 0. `(n_h,)`."""
+        live = self.is_live[tau]
+        q_rep = torch.zeros(len(self.hedges), device=self.device, dtype=self.dtype)
+        n_live = int(live.sum())
+        if n_live > 0:
+            per = -float(self._liability_R[tau].item()) / float(n_live)      # deal units / live future
+            q_rep[live] = per / self.contract_size[live]                     # → contracts
+        return q_rep
+
+    def _roll_operating_region(self, t, outer_indices, rows):
+        """Roll `(q_prev, wealth_pre)` forward 0→t along the realised outer paths — the toy's
+        `simulate_bank`. q_τ is explored AROUND the replication hedge; wealth accumulates the
+        realised hedged P&L `q·cs·dF − dL` (dL from the framework MTM buffer). The bank then
+        covers the OPERATING REGION the policy visits, so the residual A stays small/on-support
+        instead of being fit over a uniform ±halfwidth band whose tails the bootstrap query
+        extrapolates. Returns `q_prev (B*rows, n_h)`, `wealth_pre (B*rows,)`."""
+        device = self.device
+        n_h = len(self.hedges)
+        B = int(outer_indices.shape[0])
+        hist = int(self.bundle.get("initial_time_index", 0))
+        liab_mtm = self.bundle.get("liability_mtm")
+        q_min = self.bank_q_min.view(1, 1, n_h).to(self.dtype)
+        q_max = self.bank_q_max.view(1, 1, n_h).to(self.dtype)
+        # Exploration half-span around the hedge (contracts) — spans enough for the argmax signal
+        # while the centre keeps wealth in-band; the wealth half-width sets the operating scale.
+        span = max(1.0, 0.25 * float((self.bank_q_max - self.bank_q_min).max()))
+        with torch.no_grad():
+            q = torch.zeros(B, rows, n_h, device=device, dtype=self.dtype)
+            w = torch.zeros(B, rows, device=device, dtype=self.dtype)
+            for tau in range(int(t)):
+                q_rep = self._replication_hedge(tau).view(1, 1, n_h)
+                noise = (torch.rand(B, rows, n_h, device=device) - 0.5) * (2.0 * span)
+                q_tau = torch.minimum(torch.maximum((q_rep + noise).round(), q_min), q_max)
+                dead = ~self.is_live[tau]
+                if dead.any():
+                    q_tau[..., dead] = 0.0
+                tau1 = tau + 1
+                F_t = torch.stack([self._tradables_sim[h][tau].to(device)[outer_indices]
+                                   for h in self.hedges], dim=-1)            # (B, n_h)
+                F_t1 = torch.stack([self._tradables_sim[h][tau1].to(device)[outer_indices]
+                                    for h in self.hedges], dim=-1)
+                pnl = (q_tau * self.contract_size * (F_t1 - F_t).unsqueeze(1)).sum(dim=-1)  # (B,rows)
+                if liab_mtm is not None:
+                    dL = (liab_mtm[hist + tau1][outer_indices]
+                          - liab_mtm[hist + tau][outer_indices])             # (B,)
+                    w = w + pnl - dL.unsqueeze(1)
+                else:
+                    w = w + pnl
+                q = q_tau
+        return q.reshape(B * rows, n_h), w.reshape(B * rows)
+
     def _build_bank(self, t, traj, outer_indices=None, rows_per_outer=None):
         """Endogenous span on top of the realized exogenous slice at outer t.
 
@@ -2450,16 +2508,14 @@ class DifferentialSolver:
         n_h = len(self.hedges)
 
         rows = int(rows_per_outer if rows_per_outer is not None else self.b_endo)
-        # q per-hedge from position_limits, wealth band scaled to symlog c.
-        q_prev = torch.empty(B, rows, n_h, dtype=torch.long, device=device)
-        for j in range(n_h):
-            q_prev[..., j] = torch.randint(
-                int(self.bank_q_min[j]), int(self.bank_q_max[j]) + 1,
-                (B, rows), device=device)
-        q_prev = q_prev.to(self.dtype)
-        wealth_pre = (torch.rand(B, rows, device=device) - 0.5) \
-            * (2.0 * self.bank_wealth_halfwidth)
         live_t = self.is_live[t]
+        # Operating-region bank (toy `simulate_bank`): instead of sampling wealth over a uniform
+        # ±halfwidth band — which leaves the residual A sparsely fit in tails the bootstrap query
+        # then extrapolates off — ROLL (q, wealth) forward along each realized outer path from 0
+        # to t, with q EXPLORED AROUND THE REPLICATION HEDGE (short the remaining liability
+        # exposure R_τ, split across live futures). Wealth is then the realized hedged P&L, i.e.
+        # exactly the operating region the policy visits, so A stays small and on-support.
+        q_prev, wealth_pre = self._roll_operating_region(t, outer_indices, rows)
         if (~live_t).any():
             mask_dead = (~live_t).view(1, 1, n_h)
             q_prev = torch.where(mask_dead, torch.zeros_like(q_prev), q_prev)
@@ -2596,21 +2652,21 @@ class DifferentialSolver:
 
         # spot[t] and belief[t] enter as PER-ROW leaves; each inner draw's z_{t+1} spot/belief
         # column is reconstructed FROM them through the process's OWN one-step transitions
-        # (`reseed_one_step` / `forward_belief_onestep` — the same dynamics the realized-path
-        # bootstrap uses), so ∂value/∂spot and ∂value/∂belief fall out of the SAME autograd pass
-        # as q/wealth/F. The differential is a side effect of the state, not a backfilled label.
-        # The spot reseed lands EXACTLY on the fork's inner draw (value-coherent on price); a
-        # coherence check guards the belief filter. The liability is reconstructed the SAME way
-        # the realised/training label path does — first-order from the framework MTM buffer and
-        # the persisted spot Jacobian: L_t = liability_mtm[t] + JL_t·(s_t − s_t^real),
-        # L_{t+1} = liability_mtm[t+1] + JL_{t+1}·(s_{t+1} − s_{t+1}^real), dL = L_{t+1} − L_t.
-        # This makes the inner bootstrap's liability mark identical to the training labels by
-        # construction (value AND ∂dL/∂spot = JL_{t+1} − JL_t), so the inner expectation is a
-        # genuine variance reduction on the SAME quantity. The earlier closed forms were both
-        # wrong: the level form `R_{t+1}·s_{t+1} − R_t·s_t` injects a spurious `−w_fix·s` shock
-        # at every fixing (≈4× the typical |dL| in the averaging window — it compounds the value
-        # off-band backward), and even `R_t·dS` is ~30–45% off the forward-driven MTM. See the
-        # construction-time `_audit_liability_convention` for both gaps.
+        # (`reseed_one_step` / `forward_belief_onestep`), so ∂value/∂spot and ∂value/∂belief fall
+        # out of the SAME autograd pass as q/wealth/F. The differential is a side effect of the
+        # state, not a backfilled label. The spot reseed lands EXACTLY on the fork's inner draw.
+        #
+        # LIABILITY: marked EXACTLY by the inner MC's own `resolve_hedge_structure` pass — the
+        # marks `L_t`/`L_{t+1}` evaluated at each inner draw (calculation.py returns `inner['L_t']`
+        # / `inner['L_t1']`), NOT a Jacobian linearization around the realised path. The forward
+        # `F_t1` is likewise the exact `resolve_structure` tradable at the inner draw. So the
+        # bootstrap VALUE prices the t→t+1 wealth move exactly, on the same pricing the training
+        # labels use — the inner expectation is a genuine variance reduction on the SAME quantity.
+        # The spot GRADIENT of the liability uses the persisted spot Jacobian via the detached-
+        # slope pattern (∂dL/∂spot = JL_{t+1} − JL_t; same construction as `reseed_one_step`),
+        # so the value stays exact while the differential is supervised. Earlier closed forms
+        # were both wrong: the level form injects a spurious `−w_fix·s` fixing shock, and `R_t·dS`
+        # / the JL linearization are ~30–45% off the forward-driven MTM at inner draws.
         spot_proc = self._calc.stoch_factors.get(self._spot_key)
         spot_col = (self._spot_cols_in_market[0]
                     if self._spot_cols_in_market is not None else None)
@@ -2620,11 +2676,18 @@ class DifferentialSolver:
         spot_t1_inner = market_i[..., spot_col] if spot_col is not None else None  # (N,I)
         R_t = float(self._liability_R[t].item())
 
-        # Framework liability (MTM buffer is history-prefixed → +hist; the spot Jacobian is
-        # sim-grid → no offset; mirrors the realised path in `_compute_labels_for_bank`).
+        # Exact liability marks at outer-t / t+1 on the inner draws (resolve_hedge_structure).
+        L_t_exact = L_t1_exact = None
+        if inner.get("L_t1") is not None and inner.get("L_t") is not None:
+            L_t_exact = inner["L_t"].to(device)[oi, :I].detach()            # (N,I)
+            L_t1_exact = inner["L_t1"].to(device)[oi, :I].detach()          # (N,I)
+        have_exact_L = L_t1_exact is not None
+        # Persisted spot Jacobian — used ONLY as the detached spot-gradient slope (the value is
+        # the exact mark above), and as a fallback value when the exact marks are unavailable.
         liab_mtm = self.bundle.get("liability_mtm")
         liab_jac = self.bundle.get("liability_jacobian", {})
         have_liab = liab_mtm is not None and spot_t1_inner is not None
+        JL_t = JL_t1 = None
         if have_liab:
             hist = int(self.bundle.get("initial_time_index", 0))
             spot_t1_real = self._outer_buf[self._spot_key][t1][oi]           # (N,) realised t+1 spot
@@ -2637,11 +2700,12 @@ class DifferentialSolver:
         static = bank["static"].unsqueeze(1).expand(
             N, I, bank["static"].shape[-1]).reshape(N * I, -1)
         time_to_T = (bank["time_to_T"] - 1.0).unsqueeze(1).expand(N, I).reshape(-1)
-        if have_liab:
-            # d_t = 0 at the realised t spot ⇒ L_t = L_t_real; t+1 marks the inner draw.
+        if have_exact_L:
+            dL_det = L_t1_exact - L_t_exact                                 # (N,I) EXACT framework MTM
+        elif have_liab:
             dL_det = (L_t1_real.unsqueeze(1)
                       + JL_t1.unsqueeze(1) * (spot_t1_inner - spot_t1_real.unsqueeze(1))
-                      - L_t_real.unsqueeze(1))                              # (N,I) framework MTM
+                      - L_t_real.unsqueeze(1))                              # fallback: JL linearization
         elif spot_t1_inner is not None:
             dL_det = R_t * (spot_t1_inner - spot_t_real.unsqueeze(1))        # fallback: R_t·dS
         else:
@@ -2675,13 +2739,22 @@ class DifferentialSolver:
                 spot_t1_recon = spot_proc.reseed_one_step(
                     spot_leaf.unsqueeze(1), spot_t_real.unsqueeze(1), spot_t1_inner)  # (N,I)
                 market_recon[..., spot_col] = spot_t1_recon
-                if have_liab:
-                    # Framework MTM reconstruction with the spot leaf: ∂dL/∂spot = JL_{t+1} − JL_t.
+                if have_exact_L:
+                    # EXACT mark for the value; persisted Jacobian for the spot gradient via the
+                    # detached-slope pattern (value 0, ∂/∂spot = 1 — same as reseed_one_step), so
+                    # ∂dL/∂spot = JL_{t+1} − JL_t while dL itself stays the exact framework mark.
+                    jl_t1 = JL_t1.unsqueeze(1) if JL_t1 is not None else 0.0
+                    jl_t = JL_t.unsqueeze(1) if JL_t is not None else 0.0
+                    dL = (L_t1_exact - L_t_exact
+                          + jl_t1 * (spot_t1_recon - spot_t1_recon.detach())
+                          - jl_t * (spot_leaf - spot_leaf.detach()).unsqueeze(1))
+                elif have_liab:
+                    # Fallback: JL linearization of both value and gradient (no exact marks).
                     d_t = (spot_leaf - spot_t_real).unsqueeze(1)            # (N,1), 0 at value
                     d_t1 = spot_t1_recon - spot_t1_real.unsqueeze(1)        # (N,I)
                     L_t = L_t_real.unsqueeze(1) + JL_t.unsqueeze(1) * d_t   # (N,1)
                     L_t1 = L_t1_real.unsqueeze(1) + JL_t1.unsqueeze(1) * d_t1  # (N,I)
-                    dL = L_t1 - L_t                                          # (N,I) matches training
+                    dL = L_t1 - L_t                                          # (N,I)
                 else:
                     dL = R_t * (spot_t1_recon - spot_leaf.unsqueeze(1))      # fallback: R_t·dS
                 leaves.append(spot_leaf)
@@ -4992,11 +5065,369 @@ class DifferentialSolver:
         )
 
 
+class _DiffV2Residual(torch.nn.Module):
+    """Zero-init residual head A_t(market, q, W). The continuation is C = u(W) + A, so a
+    zero final layer makes C start exactly at the bounded utility anchor (A ≡ 0) and the
+    net only ever LEARNS the correction off that anchor — the toy's run-away guard."""
+
+    def __init__(self, in_dim, hidden=128):
+        super().__init__()
+        self.body = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, hidden), torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden), torch.nn.SiLU(),
+            torch.nn.Linear(hidden, 1),
+        )
+        for p in self.body[-1].parameters():
+            torch.nn.init.zeros_(p)
+
+    def forward(self, x):
+        return self.body(x).squeeze(-1)
+
+
+class DiffSolverV2:
+    """Clean-room differential-ML hedging solver — rebuilt from the toy (`diffml_hedge_huber.py`
+    via `diffsolver_v2.py`, validated BOUNDED at T=119) and wired to the OFFICIAL riskflow
+    framework. All dynamics come from the bundle's inner-MC closures
+    (`inner_mc_fn` / `inner_mc_grad_fn`), which fork the simulator and price via
+    `resolve_structure` (tradeables) + `resolve_hedge_structure` (liability) — no analytic
+    transition, no Jacobian reconstruction; the framework prices everything.
+
+    Spirit carried over verbatim from the toy:
+      * C_t(market, q, W) = u(W) + A_t(market, q, W).  u = the bounded utility anchor
+        (`_utility_wrap_signed`, the symlog/Huber/CARA transform normalised by c); A is a
+        zero-init residual net — the only learned part. The bounded anchor is what keeps the
+        backward recursion from running away (the old solver's 1e8 bug).
+      * External argmax — the Bellman max lives OUTSIDE the fitted value (a discrete grid
+        search over target positions, not inside the net).
+      * Advantage decomposition — fit A = C − u(W) (value AND the wealth-channel pathwise
+        gradient: a Huge–Savine twin loss), so the unbounded residual can't drift off u.
+      * Operating-region bank — roll the OUTER paths forward exploring q AROUND the per-t
+        replication (diagonal min-var) hedge, so wealth stays in-band and A stays on-support.
+      * Multi-instrument from the start — q ∈ R^{n_hedge} is in the state, so the net always
+        knows there are n_hedge instruments. The action grid spans all hedges; a
+        single-future-of-three test pins inactive axes to 0 via `Active_Hedge_Indices`
+        (e.g. [2] ⇒ [0,0,-50]…[0,0,0]).
+
+    Wealth convention (matches `MpcSolver`): net wealth W_t = cumulative hedge P&L + the
+    marked liability L_t; W_{t+1} = W_t + Σ_i q_i·cs_i·(F_{t+1,i} − F_{t,i}) + (L_{t+1} − L_t);
+    terminal utility u(W_{T_dec}) with W_{T_dec} = total hedge P&L + L_T.
+
+    INCREMENT 1 (this build): value bootstrap + the WEALTH-channel pathwise-gradient twin
+    loss. W is the solver's own autograd leaf, so ∂Y_boot/∂W is exact with pure torch (no
+    framework AAD needed). INCREMENT 2 adds the market-state (spot/belief) gradient via
+    `inner_mc_grad_fn`'s `state_t_leaves` (privileged-layout leaf projection; FD-checked by
+    `test_diffml_spot_grad_fd`). Turnover cost is ignored here (the toy has none) — a
+    documented next-increment slot.
+    """
+
+    def __init__(self, bundle, runtime):
+        self.bundle = bundle
+        self.runtime = runtime
+        self.cfg = runtime["solver"]
+        self.device = bundle["time_grid_days"].device
+        acc = runtime["accounting"]
+        self.hedges = list(runtime["names"]["hedges"])
+        self.n_hedge = len(self.hedges)
+        self.contract_size = torch.tensor(
+            [float(runtime["tradables"][ref]["contract_size"]) for ref in self.hedges],
+            device=self.device)                                       # (n_hedge,)
+        limits = acc["position_limits"]
+        self.q_lo = torch.tensor(
+            [float(limits.get(r, {}).get("min_position", 0.0)) for r in self.hedges],
+            device=self.device)
+        self.q_hi = torch.tensor(
+            [float(limits.get(r, {}).get("max_position", 0.0)) for r in self.hedges],
+            device=self.device)
+        self.total_abs_limit = float(acc["total_position_abs_limit"])
+        # Active hedge axes: which instruments the action grid varies (rest pinned to 0).
+        active = self.cfg.get("active_hedge_indices")
+        self.active = list(range(self.n_hedge)) if active is None else [int(i) for i in active]
+        self.n_active = len(self.active)
+        self.levels = int(self.cfg["training_action_grid_levels_per_axis"])
+        self.chunk = int(self.cfg["training_action_chunk_size"])
+        self.fit_iters = int(self.cfg.get("diffv2_fit_iters", 150))
+        self.lr = float(self.cfg.get("diffv2_lr", 2.0e-3))
+        self.noise_frac = float(self.cfg.get("diffv2_bank_noise_frac", 0.15))
+        self.t_min = int(self.cfg.get("t_min", 0))
+        self.use_adv = bool(self.cfg.get("use_advantage_decomp", True))
+        self.lambda_diff = float(self.cfg.get("lambda_diff", 0.0))    # market-grad gate (incr 2)
+        # History-stripped, sim-grid-indexed views of the outer-realised paths.
+        self.tradables_sim, _static, self.n_steps = _bundle_sim_views(bundle)
+        hist = int(bundle.get("initial_time_index", 0))
+        self.liability_sim = bundle["liability_mtm"][hist:]           # (n_steps, B_outer)
+        self.T_dec = self.n_steps - 1                                 # terminal index; decisions 0..T_dec-1
+        self.B_outer = int(self.liability_sim.shape[-1])
+
+    # ---- utility anchor ------------------------------------------------------
+    def _u(self, W):
+        """Bounded terminal-utility anchor u(W) — the framework's normalised utility."""
+        return _utility_wrap_signed(W, self.runtime)
+
+    # ---- action grid (subset-active; inactive axes pinned to 0) --------------
+    def _action_grid(self):
+        axes = []
+        for i in range(self.n_hedge):
+            if i in self.active:
+                axes.append(torch.linspace(float(self.q_lo[i]), float(self.q_hi[i]),
+                                            self.levels, device=self.device))
+            else:
+                axes.append(torch.zeros(1, device=self.device))
+        mesh = torch.meshgrid(*axes, indexing="ij")
+        grid = torch.stack([m.reshape(-1) for m in mesh], dim=-1)      # (K, n_hedge)
+        if self.total_abs_limit > 0.0:                                # drop infeasible rows
+            grid = grid[grid.abs().sum(-1) <= self.total_abs_limit + 1e-9]
+        return grid
+
+    # ---- input standardization ----------------------------------------------
+    def _standardize(self, market, q, W):
+        """Concatenate the standardized state (market | q | W) for the residual net.
+        Market/wealth use bank mean/std; positions use the grid half-range."""
+        m = (market - self.m_mean) / self.m_std
+        qn = q / self.q_scale
+        wn = ((W - self.w_mean) / self.w_std).unsqueeze(-1)
+        return torch.cat([m, qn, wn], dim=-1)
+
+    def _continuation(self, nets, market, q, W, t, chunk=400_000):
+        """C_t = u(W) + A_t(market, q, W); terminal C_{T_dec} = u(W). Row-chunked net eval."""
+        base = self._u(W)
+        if t >= self.T_dec:
+            return base
+        x = self._standardize(market, q, W)
+        if x.shape[0] <= chunk:
+            return base + nets[t](x)
+        out = torch.empty_like(base)
+        for i in range(0, x.shape[0], chunk):
+            out[i:i + chunk] = nets[t](x[i:i + chunk])
+        return base + out
+
+    # ---- one-step wealth move ------------------------------------------------
+    def _wealth_step(self, W, q, dF, dL):
+        """W_{t+1} = W + Σ_i q_i·cs_i·dF_i + dL. q (...,n_hedge); dF (...,n_hedge); dL (...)."""
+        return W + (q * self.contract_size * dF).sum(dim=-1) + dL
+
+    # ---- inner-MC one-step quantities at outer t -----------------------------
+    def _inner_step(self, t):
+        """Fork inner MC at t (resolve_structure / resolve_hedge_structure under the hood)
+        and return the one-step move tensors the bootstrap needs:
+          dF   (B_outer, B_inner, n_hedge)  per-instrument futures move t→t+1
+          dL   (B_outer, B_inner)           liability mark change t→t+1
+          m1   (B_outer, B_inner, market_dim) market state at t+1
+        plus the bank-state market at t (B_outer, market_dim)."""
+        inner = self.bundle["inner_mc_fn"](t)
+        F_t = torch.stack([self.tradables_sim[ref][t] for ref in self.hedges], dim=-1)   # (B_outer, n_hedge)
+        F_t1 = torch.stack([inner["F_t1"][ref] for ref in self.hedges], dim=-1)          # (B_outer, B_inner, n_hedge)
+        dF = F_t1 - F_t.unsqueeze(1)
+        dL = inner["L_t1"] - inner["L_t"]                                                # (B_outer, B_inner)
+        return dF, dL, inner["market_t1"], inner["market_t"]
+
+    # ---- external argmax (Bellman max outside the fitted value) --------------
+    def _decide(self, nets, market_t1, dF, dL, W, t, grid):
+        """Pick the grid action maximising E_inner[C_{t+1}] per outer path. No grad."""
+        with torch.no_grad():
+            B, Bi, md = market_t1.shape
+            best_val = None
+            best_q = None
+            for s in range(0, grid.shape[0], self.chunk):
+                acts = grid[s:s + self.chunk]                                            # (c, n_hedge)
+                c = acts.shape[0]
+                q = acts[None, :, None, :]                                               # (1,c,1,n_hedge)
+                W1 = self._wealth_step(W[:, None, None], q, dF[:, None], dL[:, None])     # (B,c,Bi)
+                C1 = self._continuation(
+                    nets,
+                    market_t1[:, None].expand(B, c, Bi, md).reshape(-1, md),
+                    q.expand(B, c, Bi, self.n_hedge).reshape(-1, self.n_hedge),
+                    W1.reshape(-1), t + 1).reshape(B, c, Bi).mean(-1)                     # (B,c)
+                cval, carg = C1.max(dim=1)
+                cact = acts[carg]                                                        # (B,n_hedge)
+                if best_val is None:
+                    best_val, best_q = cval, cact
+                else:
+                    upd = cval > best_val
+                    best_val = torch.where(upd, cval, best_val)
+                    best_q = torch.where(upd.unsqueeze(-1), cact, best_q)
+            return best_q, best_val
+
+    # ---- operating-region bank ----------------------------------------------
+    def _replication_hedge(self, t):
+        """Per-instrument diagonal min-var hedge from the OUTER one-step moves at t:
+        q_i = −Cov(dL, dF_i)/(cs_i·Var(dF_i)) / n_active, clamped to [lo,hi]. Inactive → 0."""
+        L = self.liability_sim
+        dL = (L[t + 1] - L[t])                                                            # (B_outer,)
+        q = torch.zeros(self.n_hedge, device=self.device)
+        for i in self.active:
+            ref = self.hedges[i]
+            dF = self.tradables_sim[ref][t + 1] - self.tradables_sim[ref][t]              # (B_outer,)
+            var = dF.var()
+            if float(var) <= 1e-12:
+                continue
+            beta = ((dL - dL.mean()) * (dF - dF.mean())).mean() / var
+            q[i] = (-beta / (self.contract_size[i] * max(self.n_active, 1)))
+        return torch.minimum(torch.maximum(q, self.q_lo), self.q_hi)
+
+    def _build_bank(self, gen):
+        """Operating-region bank — roll the OUTER paths forward (cheap; outer-realised
+        moves only, no inner MC): hold q = clamp(q_rep_t + noise) each step, accumulate
+        W = cum hedge P&L + L_t. Returns per-t lists W_t (B_outer,) and q_prev (B_outer,
+        n_hedge). The bank-state `market_t` is read lazily from the SAME inner-MC fork the
+        backward sweep makes at t (no extra inner-MC passes)."""
+        L = self.liability_sim
+        W = L[0].clone()                                                                 # (B_outer,) = cum_pnl(0)+L_0
+        q_prev = torch.zeros(self.B_outer, self.n_hedge, device=self.device)
+        W_list, q_list = [], []
+        rng = (self.q_hi - self.q_lo)
+        mask = torch.zeros(self.n_hedge, device=self.device)
+        mask[self.active] = 1.0
+        for t in range(self.T_dec):
+            W_list.append(W.clone())
+            q_list.append(q_prev.clone())
+            q_rep = self._replication_hedge(t)                                            # (n_hedge,)
+            noise = self.noise_frac * rng * torch.randn(
+                self.B_outer, self.n_hedge, generator=gen, device=self.device)
+            q = torch.minimum(torch.maximum(q_rep[None] + noise * mask, self.q_lo), self.q_hi)
+            dF = torch.stack(
+                [self.tradables_sim[ref][t + 1] - self.tradables_sim[ref][t] for ref in self.hedges],
+                dim=-1)                                                                  # (B_outer, n_hedge)
+            W = self._wealth_step(W, q, dF, L[t + 1] - L[t])
+            q_prev = q
+        return W_list, q_list
+
+    # ---- one backward step: bootstrap + advantage twin fit -------------------
+    def _fit_step(self, nets, W_bank, t, inner, grid):
+        dF, dL, m1, market0 = inner                                                      # cached framework inner MC
+        W0_bank = W_bank[t]
+        q_star, _ = self._decide(nets, m1, dF, dL, W0_bank, t, grid)                      # external argmax
+
+        # Bootstrap value + wealth-channel pathwise gradient (W0 is the solver's own leaf).
+        W0 = W0_bank.clone().requires_grad_(True)
+        q = q_star[:, None, :]                                                           # (B,1,n_hedge)
+        W1 = self._wealth_step(W0[:, None], q, dF, dL)                                    # (B,B_inner)
+        B, Bi, md = m1.shape
+        Y = self._continuation(
+            nets, m1.reshape(-1, md),
+            q.expand(B, Bi, self.n_hedge).reshape(-1, self.n_hedge),
+            W1.reshape(-1), t + 1).reshape(B, Bi).mean(1)                                # (B,)
+        (gW,) = torch.autograd.grad(Y.sum(), W0)
+        Y, gW = Y.detach(), gW.detach()
+
+        # Advantage decomposition: fit A = C − u(W0); subtract the anchor's wealth slope.
+        if self.use_adv:
+            Wb = W0_bank.clone().requires_grad_(True)
+            (dB_dW,) = torch.autograd.grad(self._u(Wb).sum(), Wb)
+            a_val = Y - self._u(W0_bank)
+            a_gW = gW - dB_dW.detach()
+        else:
+            a_val, a_gW = Y, gW
+
+        net = nets[t]
+        opt = torch.optim.Adam(net.parameters(), lr=self.lr)
+        for _ in range(self.fit_iters):
+            Wg = W0_bank.clone().requires_grad_(True)
+            x = self._standardize(market0, q_star, Wg)
+            a = net(x)
+            (daW,) = torch.autograd.grad(a.sum(), Wg, create_graph=True)
+            loss = ((a - a_val) ** 2).mean() + ((daW - a_gW) ** 2).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+
+        with torch.no_grad():
+            a_fit = net(self._standardize(market0, q_star, W0_bank))
+            val_loss = float(((a_fit - a_val) ** 2).mean())
+        return {
+            "t": t, "val_loss": val_loss,
+            "Y_absmean": float(Y.abs().mean()),
+            "A_absmean": float(a_fit.abs().mean()),
+            "q_star_mean": q_star.mean(0).detach().cpu().tolist(),
+            "Y_mean": float(Y.mean()),
+        }
+
+    # ---- driver --------------------------------------------------------------
+    def solve(self):
+        # Bank RNG is deterministic; multi-seed repeats (solve_hedge calls solve() N times)
+        # advance the framework's inner-MC Sobol stream, so V_0 spread reflects inner-MC noise.
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(0)
+        logging.info(
+            "DiffSolverV2 setup: n_hedge=%d active=%s T_dec=%d B_outer=%d levels=%d "
+            "fit_iters=%d lr=%.3g | contract_size=%s | q∈[%s, %s] total_abs_limit=%.3g",
+            self.n_hedge, self.active, self.T_dec, self.B_outer, self.levels,
+            self.fit_iters, self.lr, self.contract_size.tolist(),
+            self.q_lo.tolist(), self.q_hi.tolist(), self.total_abs_limit)
+
+        W_bank, _q_bank = self._build_bank(gen)
+        # Cache the framework inner-MC one-step quantities over the swept range — one
+        # inner-MC fork per swept t, reused for the argmax, the bootstrap, AND market_t.
+        sweep_ts = list(range(self.t_min, self.T_dec))
+        inner_cache = {t: self._inner_step(t) for t in sweep_ts}
+
+        # Standardization stats: market/wealth from the swept states, positions from the
+        # grid half-range. (market_t is inner_cache[t][3].)
+        M = torch.cat([inner_cache[t][3] for t in sweep_ts], 0)                           # (n_swept*B, md)
+        self.m_mean, self.m_std = M.mean(0), M.std(0).clamp_min(1e-6)
+        Wall = torch.stack([W_bank[t] for t in sweep_ts], 0).reshape(-1)
+        self.w_mean, self.w_std = Wall.mean(), Wall.std().clamp_min(1e-6)
+        self.q_scale = ((self.q_hi - self.q_lo) / 2.0).clamp_min(1.0)
+        md = M.shape[-1]
+        logging.info(
+            "DiffSolverV2 bank: market_dim=%d | swept W∈[%.4g, %.4g] mean=%.4g std=%.4g | "
+            "q_rep(t=0)=%s", md, float(Wall.min()), float(Wall.max()),
+            float(self.w_mean), float(self.w_std),
+            self._replication_hedge(0).detach().cpu().tolist())
+
+        grid = self._action_grid()
+        nets = [_DiffV2Residual(md + self.n_hedge + 1).to(self.device)
+                for _ in range(self.T_dec)]
+        logging.info("DiffSolverV2 action grid: K=%d actions (levels=%d ^ active=%d)",
+                     int(grid.shape[0]), self.levels, self.n_active)
+
+        rows = []
+        for t in reversed(sweep_ts):
+            r = self._fit_step(nets, W_bank, t, inner_cache[t], grid)
+            rows.append(r)
+            logging.info(
+                "DiffSolverV2 C[t=%d] fitted: val_loss=%.4g |Y_boot|=%.4g |A|=%.4g "
+                "Y_mean=%+.4g q*_mean=%s", r["t"], r["val_loss"], r["Y_absmean"],
+                r["A_absmean"], r["Y_mean"],
+                ["%.3f" % v for v in r["q_star_mean"]])
+
+        worst = max((r["Y_absmean"] for r in rows), default=0.0)
+        root = rows[-1] if rows else {"t": self.t_min, "Y_mean": 0.0, "q_star_mean":
+                                      [0.0] * self.n_hedge}
+        V_0 = float(root["Y_mean"])
+        n_star_0 = root["q_star_mean"]
+        bounded = worst < 1.0e4
+        logging.info(
+            "DiffSolverV2 sweep complete: t=%d→%d | max|Y_boot|=%.4g (%s) | "
+            "V_0=%+.6g | n_star@t=%d=%s", self.T_dec - 1, self.t_min, worst,
+            "BOUNDED" if bounded else "EXPLODED", V_0, root["t"], n_star_0)
+
+        return SolverResult(
+            solver_name="DiffSolverV2",
+            actions=torch.tensor(n_star_0),
+            values=V_0,
+            diagnostics={
+                "V_0": V_0,
+                "n_star_0": n_star_0,
+                "n_star": n_star_0,
+                "max_abs_Y_boot": worst,
+                "bounded": bool(bounded),
+                "root_t": int(root["t"]),
+                "per_t": rows,
+                "action_grid_size": int(grid.shape[0]),
+                "market_dim": int(M.shape[-1]),
+            },
+        )
+
+
 _SOLVERS: Dict[str, Callable] = {
     "mpcsolver": MpcSolver,
     "lsmdpsolver": LsmDpSolver,
     "hindsightdpsolver": HindsightDpSolver,
-    "differentialsolver": DifferentialSolver,
+    # `differentialsolver` still resolves to the legacy class (now renamed
+    # `DifferentialSolverOld`) so existing configs / tests keep running unchanged.
+    # `diffsolverv2` is the clean-room rebuild (DiffSolverV2) — framework-native
+    # (resolve_structure / resolve_hedge_structure via the inner-MC closures),
+    # built fresh from the toy. Flip `differentialsolver` to it once it reaches parity.
+    "differentialsolver": DifferentialSolverOld,
+    "diffsolverv2": DiffSolverV2,
 }
 
 
