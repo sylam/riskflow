@@ -5103,10 +5103,14 @@ class DiffSolverV2:
         gradient: a Huge–Savine twin loss), so the unbounded residual can't drift off u.
       * Operating-region bank — roll the OUTER paths forward exploring q AROUND the per-t
         replication (diagonal min-var) hedge, so wealth stays in-band and A stays on-support.
-      * Multi-instrument from the start — q ∈ R^{n_hedge} is in the state, so the net always
-        knows there are n_hedge instruments. The action grid spans all hedges; a
-        single-future-of-three test pins inactive axes to 0 via `Active_Hedge_Indices`
-        (e.g. [2] ⇒ [0,0,-50]…[0,0,0]).
+      * Position-free value (toy-faithful) — V(market, W) does NOT take the position as input;
+        with no turnover cost the held position is a freely-reset control, so it enters the
+        value only through next-step wealth W1 = W + Σ q_i·cs_i·dF_i + dL. The n_hedge
+        instruments live in the ACTION grid + the wealth step (the net learns there are 3 via
+        the routing of W1), not as a state coordinate. Adding q as a state is the right move
+        ONLY once turnover cost makes the incoming position a real state variable. The action
+        grid spans all hedges; a single-future-of-three test pins inactive axes to 0 via
+        `Active_Hedge_Indices` (e.g. [2] ⇒ [0,0,-50]…[0,0,0]).
 
     Wealth convention (matches `MpcSolver`): net wealth W_t = cumulative hedge P&L + the
     marked liability L_t; W_{t+1} = W_t + Σ_i q_i·cs_i·(F_{t+1,i} − F_{t,i}) + (L_{t+1} − L_t);
@@ -5155,8 +5159,19 @@ class DiffSolverV2:
         self.tradables_sim, _static, self.n_steps = _bundle_sim_views(bundle)
         hist = int(bundle.get("initial_time_index", 0))
         self.liability_sim = bundle["liability_mtm"][hist:]           # (n_steps, B_outer)
-        self.T_dec = self.n_steps - 1                                 # terminal index; decisions 0..T_dec-1
         self.B_outer = int(self.liability_sim.shape[-1])
+        # Effective terminal: the LAST sim index is a post-settlement drop when the liability
+        # mark there collapses to ~0 (the deal pays out — e.g. the platinum average-rate
+        # forward marks its realised payoff at T-1, then 0 at the payment date T). The
+        # framework's own `inner["L_T"] = inner_mtm[-2]` encodes exactly this. Telescoping
+        # wealth THROUGH that drop cancels the liability's settlement risk (no-hedge W_T≡0),
+        # so the meaningful terminal is the last LIVE mark. Decisions run 0..T_dec-1; the
+        # terminal continuation marks the liability at T_dec.
+        T_raw = self.n_steps - 1
+        last = float(self.liability_sim[T_raw].abs().mean())
+        prev = float(self.liability_sim[T_raw - 1].abs().mean()) if T_raw >= 1 else last
+        self._settled_terminal = last < 1.0e-3 * max(prev, 1.0)
+        self.T_dec = T_raw - 1 if self._settled_terminal else T_raw
 
     # ---- utility anchor ------------------------------------------------------
     def _u(self, W):
@@ -5179,20 +5194,20 @@ class DiffSolverV2:
         return grid
 
     # ---- input standardization ----------------------------------------------
-    def _standardize(self, market, q, W):
-        """Concatenate the standardized state (market | q | W) for the residual net.
-        Market/wealth use bank mean/std; positions use the grid half-range."""
+    def _standardize(self, market, W):
+        """Standardized state (market | W) for the residual net — POSITION-FREE (toy-faithful:
+        with no turnover cost the held position is a freely-reset control, not a state; it
+        enters the value only through next-step wealth W1). Market/wealth use bank mean/std."""
         m = (market - self.m_mean) / self.m_std
-        qn = q / self.q_scale
         wn = ((W - self.w_mean) / self.w_std).unsqueeze(-1)
-        return torch.cat([m, qn, wn], dim=-1)
+        return torch.cat([m, wn], dim=-1)
 
-    def _continuation(self, nets, market, q, W, t, chunk=400_000):
-        """C_t = u(W) + A_t(market, q, W); terminal C_{T_dec} = u(W). Row-chunked net eval."""
+    def _continuation(self, nets, market, W, t, chunk=400_000):
+        """C_t = u(W) + A_t(market, W); terminal C_{T_dec} = u(W). Row-chunked net eval."""
         base = self._u(W)
         if t >= self.T_dec:
             return base
-        x = self._standardize(market, q, W)
+        x = self._standardize(market, W)
         if x.shape[0] <= chunk:
             return base + nets[t](x)
         out = torch.empty_like(base)
@@ -5235,7 +5250,6 @@ class DiffSolverV2:
                 C1 = self._continuation(
                     nets,
                     market_t1[:, None].expand(B, c, Bi, md).reshape(-1, md),
-                    q.expand(B, c, Bi, self.n_hedge).reshape(-1, self.n_hedge),
                     W1.reshape(-1), t + 1).reshape(B, c, Bi).mean(-1)                     # (B,c)
                 cval, carg = C1.max(dim=1)
                 cact = acts[carg]                                                        # (B,n_hedge)
@@ -5295,17 +5309,25 @@ class DiffSolverV2:
     def _fit_step(self, nets, W_bank, t, inner, grid):
         dF, dL, m1, market0 = inner                                                      # cached framework inner MC
         W0_bank = W_bank[t]
-        q_star, _ = self._decide(nets, m1, dF, dL, W0_bank, t, grid)                      # external argmax
+        # CROSS-FIT to kill the winner's-curse max-bias: SELECT the action on one half of the
+        # inner draws, EVALUATE its bootstrap value on the disjoint other half. Selecting and
+        # evaluating on the SAME draws biases the value upward (the argmax picks the up-noised
+        # action and re-reads that same noise) — the documented value over-optimism. Disjoint
+        # draws make the selected action's value unbiased (the toy's sandwich does this).
+        Bi = dF.shape[1]
+        h = Bi // 2
+        sel, ev = slice(0, h), slice(h, Bi)
+        q_star, _ = self._decide(nets, m1[:, sel], dF[:, sel], dL[:, sel], W0_bank, t, grid)
 
         # Bootstrap value + wealth-channel pathwise gradient (W0 is the solver's own leaf).
         W0 = W0_bank.clone().requires_grad_(True)
         q = q_star[:, None, :]                                                           # (B,1,n_hedge)
-        W1 = self._wealth_step(W0[:, None], q, dF, dL)                                    # (B,B_inner)
-        B, Bi, md = m1.shape
+        dFe, dLe, m1e = dF[:, ev], dL[:, ev], m1[:, ev]
+        W1 = self._wealth_step(W0[:, None], q, dFe, dLe)                                  # (B,Bi_ev)
+        B, Bi_e, md = m1e.shape
         Y = self._continuation(
-            nets, m1.reshape(-1, md),
-            q.expand(B, Bi, self.n_hedge).reshape(-1, self.n_hedge),
-            W1.reshape(-1), t + 1).reshape(B, Bi).mean(1)                                # (B,)
+            nets, m1e.reshape(-1, md),
+            W1.reshape(-1), t + 1).reshape(B, Bi_e).mean(1)                              # (B,)
         (gW,) = torch.autograd.grad(Y.sum(), W0)
         Y, gW = Y.detach(), gW.detach()
 
@@ -5322,14 +5344,14 @@ class DiffSolverV2:
         opt = torch.optim.Adam(net.parameters(), lr=self.lr)
         for _ in range(self.fit_iters):
             Wg = W0_bank.clone().requires_grad_(True)
-            x = self._standardize(market0, q_star, Wg)
+            x = self._standardize(market0, Wg)
             a = net(x)
             (daW,) = torch.autograd.grad(a.sum(), Wg, create_graph=True)
             loss = ((a - a_val) ** 2).mean() + ((daW - a_gW) ** 2).mean()
             opt.zero_grad(); loss.backward(); opt.step()
 
         with torch.no_grad():
-            a_fit = net(self._standardize(market0, q_star, W0_bank))
+            a_fit = net(self._standardize(market0, W0_bank))
             val_loss = float(((a_fit - a_val) ** 2).mean())
         return {
             "t": t, "val_loss": val_loss,
@@ -5339,6 +5361,52 @@ class DiffSolverV2:
             "Y_mean": float(Y.mean()),
         }
 
+    # ---- greedy-rollout downside verdict -------------------------------------
+    def _verdict(self, nets, inner_cache, grid, sweep_ts):
+        """Roll the fitted argmax policy forward over [t_min, T_dec] on the OUTER paths
+        (wealth advanced by the outer-realised dF/dL), starting FLAT at t_min, and compare
+        terminal-wealth downside against a textbook diagonal-min-var delta hedge and no
+        hedge. The argmax uses the cached inner-MC E[C_{t+1}] estimate; the realised
+        outcome uses the outer path. In-sample w.r.t. the (cached) outer paths.
+
+        Returns per-policy {u_mean (the objective), wT_mean, wT_p5, wT_cvar5}. The verdict:
+        the greedy policy should DOMINATE no-hedge on downside and be competitive with
+        textbook — a SPECULATING policy (the old solver's failure) shows up as worse p5/CVaR
+        than textbook and a wide wT spread."""
+        L = self.liability_sim
+        t0 = self.t_min
+        W = {p: L[t0].clone() for p in ("greedy", "textbook", "nohedge")}
+        q_traj = {"greedy": [], "textbook": []}                                          # mean |q| per step
+        with torch.no_grad():
+            for t in sweep_ts:
+                dF_o = torch.stack(
+                    [self.tradables_sim[r][t + 1] - self.tradables_sim[r][t] for r in self.hedges],
+                    dim=-1)                                                              # (B_outer, n_hedge)
+                dL_o = L[t + 1] - L[t]
+                dF, dL, m1, _ = inner_cache[t]
+                q_g, _ = self._decide(nets, m1, dF, dL, W["greedy"], t, grid)
+                q_tb = self._replication_hedge(t)[None].expand(self.B_outer, self.n_hedge)
+                z = torch.zeros(self.B_outer, self.n_hedge, device=self.device)
+                W["greedy"] = self._wealth_step(W["greedy"], q_g, dF_o, dL_o)
+                W["textbook"] = self._wealth_step(W["textbook"], q_tb, dF_o, dL_o)
+                W["nohedge"] = self._wealth_step(W["nohedge"], z, dF_o, dL_o)
+                q_traj["greedy"].append(q_g.mean(0).tolist())
+                q_traj["textbook"].append(q_tb.mean(0).tolist())
+
+        def stats(wT):
+            p5 = torch.quantile(wT, 0.05)
+            cvar5 = wT[wT <= p5].mean() if (wT <= p5).any() else p5
+            return {"u_mean": float(self._u(wT).mean()), "wT_mean": float(wT.mean()),
+                    "wT_p5": float(p5), "wT_cvar5": float(cvar5)}
+        out = {p: stats(W[p]) for p in W}
+        # greedy position summary: mean over the rollout of |q| per instrument (is it hedging?)
+        gq = torch.tensor(q_traj["greedy"])                                              # (n_steps, n_hedge)
+        out["greedy_mean_abs_q"] = gq.abs().mean(0).tolist()
+        out["greedy_q_first"] = q_traj["greedy"][0] if q_traj["greedy"] else None
+        out["greedy_q_mid"] = (q_traj["greedy"][len(q_traj["greedy"]) // 2]
+                               if q_traj["greedy"] else None)
+        return out
+
     # ---- driver --------------------------------------------------------------
     def solve(self):
         # Bank RNG is deterministic; multi-seed repeats (solve_hedge calls solve() N times)
@@ -5346,10 +5414,11 @@ class DiffSolverV2:
         gen = torch.Generator(device=self.device)
         gen.manual_seed(0)
         logging.info(
-            "DiffSolverV2 setup: n_hedge=%d active=%s T_dec=%d B_outer=%d levels=%d "
-            "fit_iters=%d lr=%.3g | contract_size=%s | q∈[%s, %s] total_abs_limit=%.3g",
-            self.n_hedge, self.active, self.T_dec, self.B_outer, self.levels,
-            self.fit_iters, self.lr, self.contract_size.tolist(),
+            "DiffSolverV2 setup: n_hedge=%d active=%s T_dec=%d (of %d sim steps; "
+            "settled_terminal=%s) B_outer=%d levels=%d fit_iters=%d lr=%.3g | "
+            "contract_size=%s | q∈[%s, %s] total_abs_limit=%.3g",
+            self.n_hedge, self.active, self.T_dec, self.n_steps, self._settled_terminal,
+            self.B_outer, self.levels, self.fit_iters, self.lr, self.contract_size.tolist(),
             self.q_lo.tolist(), self.q_hi.tolist(), self.total_abs_limit)
 
         W_bank, _q_bank = self._build_bank(gen)
@@ -5364,7 +5433,6 @@ class DiffSolverV2:
         self.m_mean, self.m_std = M.mean(0), M.std(0).clamp_min(1e-6)
         Wall = torch.stack([W_bank[t] for t in sweep_ts], 0).reshape(-1)
         self.w_mean, self.w_std = Wall.mean(), Wall.std().clamp_min(1e-6)
-        self.q_scale = ((self.q_hi - self.q_lo) / 2.0).clamp_min(1.0)
         md = M.shape[-1]
         logging.info(
             "DiffSolverV2 bank: market_dim=%d | swept W∈[%.4g, %.4g] mean=%.4g std=%.4g | "
@@ -5373,7 +5441,7 @@ class DiffSolverV2:
             self._replication_hedge(0).detach().cpu().tolist())
 
         grid = self._action_grid()
-        nets = [_DiffV2Residual(md + self.n_hedge + 1).to(self.device)
+        nets = [_DiffV2Residual(md + 1).to(self.device)              # position-free: (market | W)
                 for _ in range(self.T_dec)]
         logging.info("DiffSolverV2 action grid: K=%d actions (levels=%d ^ active=%d)",
                      int(grid.shape[0]), self.levels, self.n_active)
@@ -5399,6 +5467,33 @@ class DiffSolverV2:
             "V_0=%+.6g | n_star@t=%d=%s", self.T_dec - 1, self.t_min, worst,
             "BOUNDED" if bounded else "EXPLODED", V_0, root["t"], n_star_0)
 
+        # Downside verdict: greedy policy vs textbook delta hedge vs no hedge.
+        verdict = self._verdict(nets, inner_cache, grid, sweep_ts)
+        g, tb, nh = verdict["greedy"], verdict["textbook"], verdict["nohedge"]
+        # PRIMARY metric = the optimization target E[u(W_T)] (already encodes downside aversion
+        # via the concave utility). CVaR5 is a secondary tail diagnostic (noisy at small B).
+        beats_nh = g["u_mean"] >= nh["u_mean"]
+        beats_tb = g["u_mean"] >= tb["u_mean"]
+        tail_vs_tb = g["wT_cvar5"] >= tb["wT_cvar5"] - abs(tb["wT_cvar5"]) * 0.05
+        logging.info(
+            "DiffSolverV2 VERDICT (rollout t=%d→T over %d outer paths, start flat):\n"
+            "  policy    u(W_T)mean    W_T mean       W_T p5         W_T CVaR5\n"
+            "  greedy    %+.5f    %+.4e   %+.4e   %+.4e\n"
+            "  textbook  %+.5f    %+.4e   %+.4e   %+.4e\n"
+            "  nohedge   %+.5f    %+.4e   %+.4e   %+.4e\n"
+            "  → on the OBJECTIVE E[u(W_T)]: beats no-hedge=%s, beats textbook=%s | "
+            "tail(CVaR5) competitive w/ textbook=%s",
+            self.t_min, self.B_outer,
+            g["u_mean"], g["wT_mean"], g["wT_p5"], g["wT_cvar5"],
+            tb["u_mean"], tb["wT_mean"], tb["wT_p5"], tb["wT_cvar5"],
+            nh["u_mean"], nh["wT_mean"], nh["wT_p5"], nh["wT_cvar5"],
+            beats_nh, beats_tb, tail_vs_tb)
+        logging.info(
+            "DiffSolverV2 greedy positions: mean|q| per instrument=%s | q@t0=%s | q@mid=%s "
+            "(textbook q@t0=%s)", ["%.2f" % v for v in verdict["greedy_mean_abs_q"]],
+            verdict.get("greedy_q_first"), verdict.get("greedy_q_mid"),
+            self._replication_hedge(self.t_min).detach().cpu().tolist())
+
         return SolverResult(
             solver_name="DiffSolverV2",
             actions=torch.tensor(n_star_0),
@@ -5413,6 +5508,10 @@ class DiffSolverV2:
                 "per_t": rows,
                 "action_grid_size": int(grid.shape[0]),
                 "market_dim": int(M.shape[-1]),
+                "verdict": verdict,
+                "verdict_beats_nohedge_on_utility": bool(beats_nh),
+                "verdict_beats_textbook_on_utility": bool(beats_tb),
+                "verdict_tail_competitive_vs_textbook": bool(tail_vs_tb),
             },
         )
 
