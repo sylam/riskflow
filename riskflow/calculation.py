@@ -1269,21 +1269,18 @@ class Credit_Monte_Carlo(Calculation):
                 riskfree = get_interest_factor(
                     utils.check_rate_name(params['Funding_Valuation_Adjustment']['Risk_Free_Curve']),
                     self.static_factors, self.stoch_factors, self.all_tenors)
-
-                deflation = utils.calc_time_grid_curve_rate(riskfree, np.zeros((1, 3)), shared_mem)
-                DF_rf = torch.squeeze(torch.exp(-deflation.gather_weighted_curve(
-                    shared_mem, mtm_grid.reshape(1, -1))), dim=0)
-
-                # tensors['mtm'] is in reporting currency - we need to convert back to base
-                pv_exposure = (tensors['mtm'] * fx_report * DF_rf) / fx_report[0]
-                Vk_plus_ti = torch.relu(pv_exposure)
-                Vk_minus_ti = torch.relu(-pv_exposure)
-                Vk_star_ti_p = (Vk_plus_ti[1:] + Vk_plus_ti[:-1]) / 2
-                Vk_star_ti_m = (Vk_minus_ti[1:] + Vk_minus_ti[:-1]) / 2
+                discount = get_interest_factor(
+                    utils.check_rate_name(params['Deflation_Interest_Rate']),
+                    self.static_factors, self.stoch_factors, self.all_tenors)
 
                 # note that for FVA, we already scale the exposure matrix by the survival probability
                 if params['Funding_Valuation_Adjustment'].get('Deflate_Stochastically', 'No') == 'Yes':
                     delta_scen_t = np.diff(mtm_grid).reshape(-1, 1)
+
+                    deflation = utils.calc_time_grid_curve_rate(
+                        discount, self.time_grid.time_grid[time_index], shared_mem)
+                    DF_base = torch.exp(-torch.squeeze(deflation.gather_weighted_curve(
+                        shared_mem, np.diff(np.append(0, mtm_grid)).reshape(-1, 1))).cumsum(dim=0))
 
                     discount_fund_cost = utils.calc_time_grid_curve_rate(
                         funding_cost, self.time_grid.time_grid[time_index[:-1]], shared_mem)
@@ -1300,6 +1297,10 @@ class Credit_Monte_Carlo(Calculation):
                         torch.exp(discount_fund_benefit.gather_weighted_curve(shared_mem, delta_scen_t)) -
                         torch.exp(discount_rf.gather_weighted_curve(shared_mem, delta_scen_t)), dim=1)
                 else:
+                    deflation = utils.calc_time_grid_curve_rate(discount, np.zeros((1, 3)), shared_mem)
+                    DF_base = torch.squeeze(torch.exp(-deflation.gather_weighted_curve(
+                        shared_mem, mtm_grid.reshape(1, -1))), dim=0)
+
                     zero_fund_cost = utils.calc_time_grid_curve_rate(funding_cost, np.zeros((1, 3)), shared_mem)
                     zero_fund_benefit = utils.calc_time_grid_curve_rate(funding_benefit, np.zeros((1, 3)), shared_mem)
                     zero_rf = utils.calc_time_grid_curve_rate(riskfree, np.zeros((1, 3)), shared_mem)
@@ -1315,6 +1316,13 @@ class Credit_Monte_Carlo(Calculation):
                         (Dt_T_fund_cost[:-1] / Dt_T_fund_cost[1:]) - (Dt_T_rf[:-1] / Dt_T_rf[1:]))
                     delta_fund_benefit_rf = (
                         (Dt_T_fund_benefit[:-1] / Dt_T_fund_benefit[1:]) - (Dt_T_rf[:-1] / Dt_T_rf[1:]))
+
+                # tensors['mtm'] is in reporting currency - we need to convert back to base
+                pv_exposure = (tensors['mtm'] * fx_report * DF_base) / fx_report[0]
+                Vk_plus_ti = torch.relu(pv_exposure)
+                Vk_minus_ti = torch.relu(-pv_exposure)
+                Vk_star_ti_p = (Vk_plus_ti[1:] + Vk_plus_ti[:-1]) / 2
+                Vk_star_ti_m = (Vk_minus_ti[1:] + Vk_minus_ti[:-1]) / 2
 
                 FCA_t = torch.sum(delta_fund_cost_rf * Vk_star_ti_p, dim=0)
                 FCA = torch.mean(FCA_t)
