@@ -1775,9 +1775,9 @@ def pv_discrete_asian_option(shared, time_grid, deal_data, nominal, spot, forwar
     samples = factor_dep['Samples'].reinitialize(shared.one)
     known_resets = samples.known_resets(shared.simulation_batch)
     start_idx = samples.get_start_index(deal_time)
-    sim_samples = samples.schedule[(samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
-                                   (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <=
-                                    deal_time[:, utils.TIME_GRID_MTM].max())]
+    sim_samples = samples.schedule[
+        (samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+        (samples.schedule[:, utils.RESET_INDEX_Reset_Day] <= deal_time[:, utils.TIME_GRID_MTM].max())]
 
     # check if the spot was simulated - if not, hold it flat
     if spot.shape != forward.shape:

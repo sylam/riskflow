@@ -27,7 +27,7 @@ from functools import reduce
 
 # import parsing libraries
 from typing import Dict, Any, Union
-from xml.etree.ElementTree import ElementTree, Element
+from xml.etree.ElementTree import ElementTree, SubElement, Element, tostring
 
 import numpy as np
 import pandas as pd
@@ -251,6 +251,36 @@ class Config(object):
             dates.add(next_date)
 
         return dates
+
+    def parse_output_results(self, data, ccy):
+        results = Element('Results')
+        header = SubElement(results, 'Header')
+        calc_type = SubElement(header, 'CalcType')
+        calc_type.text = 'Credit Monte Carlo'
+        series = SubElement(results, 'Series')
+
+        # Iterate over the data and create SeriesItem elements
+        for index, (column, items) in enumerate(data.T.iterrows()):
+            if 'PFE' in column:
+                name = 'Bank Exposure ({}%)'.format(column[4:])
+            elif column == 'EE':
+                name = 'Bank Expected Exposure'
+            else:
+                continue
+            value = items.max()
+            series_item = SubElement(
+                series, 'SeriesItem', Name=name, Index=str(index), InitialState='On',
+                SeriesType='XYPlot', LineStyle='Solid', Value='{:.0f}'.format(value),
+                Description='Maximum value {:,.3f}'.format(value))
+            x_values = [str((x - utils.excel_offset).days) for x in items.index]
+            y_values = ['{:.2f}'.format(x) for x in items.values]
+            x = SubElement(series_item, 'X')
+            x.text = ','.join(x_values)
+            y = SubElement(series_item, 'Y')
+            y.text = ','.join(y_values)
+
+        # Create the XML tree and return it
+        return tostring(results, encoding='utf-8').decode('utf-8')
 
     def parse_calendar_file(self, filename):
         """
