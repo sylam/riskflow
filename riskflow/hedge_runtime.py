@@ -229,6 +229,27 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         "diffv2_fit_iters": int(solver_config.get("DiffV2_Fit_Iters", 150)),
         "diffv2_lr": float(solver_config.get("DiffV2_LR", 2.0e-3)),
         "diffv2_bank_noise_frac": float(solver_config.get("DiffV2_Bank_Noise_Frac", 0.15)),
+        # Out-of-sample split: fraction of OUTER paths held out from the bank/fit and used
+        # ONLY for the verdict rollout (honest OOS policy eval; the in-sample verdict overfits
+        # to the fitted paths). 0 = no split (in-sample only).
+        "diffv2_oos_frac": float(solver_config.get("DiffV2_OOS_Frac", 0.5)),
+        # Residual-net regularization. The PRINCIPLED regularizer is the twin-loss pathwise-
+        # gradient match (diffv2_lambda_grad below), NOT weight decay — it does weight decay's
+        # job without the shrinkage BIAS, but it is DATA-HUNGRY (it constrains A along the
+        # sampled gradient directions, so it needs an adequate outer batch). At scale it stands
+        # alone: wd=0 + lambda_grad=1 + hidden=32 wins OOS on ALL 4 seeds of the platinum
+        # fixture at B_outer=4095 (greedy E[u]≈0.119 ±0.002, beats textbook ≈0.073 and tightens
+        # CVaR5 by ~$90k/seed) where small-batch wd=0 had been only 2/4. Weight decay remains
+        # an optional crutch for OUTER-PATH-STARVED problems (tiny batch, where DML lacks the
+        # data to regularize) — raise it there, trading DML's unbiasedness for shrinkage.
+        "diffv2_weight_decay": float(solver_config.get("DiffV2_Weight_Decay", 0.0)),
+        "diffv2_hidden": int(solver_config.get("DiffV2_Hidden", 32)),
+        # Twin-loss weight (Huge–Savine): the pathwise-gradient match. THIS is the principled
+        # regularizer of differential ML — it must be applied in STANDARDIZED space (the raw
+        # ∂A/∂W term is ~1e-12 in dollar units and inert). 0 = value-only (overfits, and with
+        # the default wd=0 there is then NO regularizer); 1 = equal weight (the toy's setting,
+        # and the default — with wd=0 this carries the regularization alone).
+        "diffv2_lambda_grad": float(solver_config.get("DiffV2_Lambda_Grad", 1.0)),
         "active_hedge_indices":
             (list(solver_config["Active_Hedge_Indices"])
              if solver_config.get("Active_Hedge_Indices") is not None else None),

@@ -5231,9 +5231,16 @@ class DiffSolverV2:
         inner = self.bundle["inner_mc_fn"](t)
         F_t = torch.stack([self.tradables_sim[ref][t] for ref in self.hedges], dim=-1)   # (B_outer, n_hedge)
         F_t1 = torch.stack([inner["F_t1"][ref] for ref in self.hedges], dim=-1)          # (B_outer, B_inner, n_hedge)
-        dF = F_t1 - F_t.unsqueeze(1)
+        # EXPIRED-CONTRACT GUARD: the framework returns inner F_t1=0 for a tradable that has
+        # expired before the fork's t+1, while the OUTER tradables_sim FREEZES at the last
+        # traded price. So a naive F_t1−F_t mints a spurious ~−F_t "move" on a dead contract
+        # — shorting it would mine fake P&L, which is exactly what drove the corner-saturation
+        # and value inflation. A dead contract can't be traded ⇒ its one-step move is 0
+        # (matching the outer's frozen convention). `live_i` = the contract still prices at t+1.
+        live = (F_t1.abs().amax(dim=(0, 1)) > 0).to(F_t1.dtype)                          # (n_hedge,)
+        dF = (F_t1 - F_t.unsqueeze(1)) * live
         dL = inner["L_t1"] - inner["L_t"]                                                # (B_outer, B_inner)
-        return dF, dL, inner["market_t1"], inner["market_t"]
+        return dF, dL, inner["market_t1"], inner["market_t"], live
 
     # ---- external argmax (Bellman max outside the fitted value) --------------
     def _decide(self, nets, market_t1, dF, dL, W, t, grid):
@@ -5305,31 +5312,88 @@ class DiffSolverV2:
             q_prev = q
         return W_list, q_list
 
-    # ---- one backward step: bootstrap + advantage twin fit -------------------
-    def _fit_step(self, nets, W_bank, t, inner, grid):
-        dF, dL, m1, market0 = inner                                                      # cached framework inner MC
-        W0_bank = W_bank[t]
-        # CROSS-FIT to kill the winner's-curse max-bias: SELECT the action on one half of the
-        # inner draws, EVALUATE its bootstrap value on the disjoint other half. Selecting and
-        # evaluating on the SAME draws biases the value upward (the argmax picks the up-noised
-        # action and re-reads that same noise) — the documented value over-optimism. Disjoint
-        # draws make the selected action's value unbiased (the toy's sandwich does this).
-        Bi = dF.shape[1]
-        h = Bi // 2
-        sel, ev = slice(0, h), slice(h, Bi)
-        q_star, _ = self._decide(nets, m1[:, sel], dF[:, sel], dL[:, sel], W0_bank, t, grid)
+    # ---- project per-process state-at-t leaf grads → market_t columns --------
+    def _project_leaf_grads(self, leaf_grads, widths, rows, n, md):
+        """Map ∂Y/∂(state_t leaf) for each simulated factor into the `(n, md)` gradient w.r.t.
+        the privileged market_t columns the value net consumes. `widths` is in market-column
+        order (factor iteration order); a regime-switching spot occupies [belief(width-1),
+        price(1)] (calc `_extract_outer_state_at` privileged layout: belief-first, price-last),
+        its belief columns supervised by the `(key,'regime_belief')` belief leaf and its price
+        column by the raw price leaf. Other factors map 1:1 (raw == privileged). Unmeasured /
+        unconnected leaves leave their columns at 0 (masked — only the value supervises them)."""
+        g = torch.zeros(n, md, device=self.device)
+        col = 0
+        for key, width in widths:
+            if width <= 0:                                      # privileged-empty factor (not in market_t)
+                continue
+            gb = leaf_grads.get((key, 'regime_belief'))
+            gr = leaf_grads.get(key)
+            if gb is not None and gb[..., rows].numel() == (width - 1) * n:   # spot: belief + price
+                nb = width - 1
+                g[:, col:col + nb] = gb[..., rows].reshape(nb, n).transpose(0, 1)
+                if gr is not None and gr[..., rows].numel() == n:
+                    g[:, col + nb] = gr[..., rows].reshape(-1)
+            elif gr is not None and gr[..., rows].numel() == width * n:        # 1:1 raw → privileged
+                g[:, col:col + width] = gr[..., rows].reshape(width, n).transpose(0, 1)
+            # else: leaf shape doesn't match the privileged block → leave 0 (masked, value-only)
+            col += width
+        return g
 
-        # Bootstrap value + wealth-channel pathwise gradient (W0 is the solver's own leaf).
+    # ---- one backward step: bootstrap + advantage twin fit -------------------
+    def _fit_step(self, nets, W_bank, t, inner, grid, rows=slice(None)):
+        dF_ng, dL_ng, m1_ng, market0, live = inner                                       # no-grad cache
+        market0 = market0[rows]
+        W0_bank = W_bank[t][rows]
+        # SELECT the action on the NO-GRAD inner draws; EVALUATE its value + pathwise gradients
+        # on a fresh GRAD inner (independent draws → cross-fit, no winner's-curse max-bias).
+        q_star, _ = self._decide(nets, m1_ng[rows], dF_ng[rows], dL_ng[rows], W0_bank, t, grid)
+        q_star = q_star * live          # expired contracts: dF=0 ⇒ wealth-neutral; report 0, not the tie
+
+        # GRAD inner-MC fork: AAD-live one-step F_t1/L_t1/market_t1 + per-process state-at-t
+        # LEAVES. Bootstrap value Y AND its pathwise gradients w.r.t. W0 (wealth) and the
+        # market state (spot/belief) come from the SAME forward — the full Huge–Savine twin
+        # loss. ∂Y/∂market_t is the differential constraint that regularizes the market
+        # dimension (where a value-only / W-only fit overfits the few outer paths).
+        ig = self.bundle["inner_mc_grad_fn"](t)
+        leaves, widths = ig["state_t_leaves"], ig["state_t_leaf_widths"]
+        if not getattr(self, "_proj_checked", False):
+            self._proj_checked = True                  # one-time self-check of the label projection
+            mt, col, errs = ig["market_t"].detach(), 0, []      # detach: numeric self-check only
+            for key, width in widths:
+                if width <= 0:
+                    continue
+                bl, pl = leaves.get((key, "regime_belief")), leaves.get(key)
+                bl = bl.detach() if bl is not None else None
+                pl = pl.detach() if pl is not None else None
+                if bl is not None:
+                    nb = width - 1
+                    be = float((mt[:, col:col + nb] - bl.reshape(nb, -1).transpose(0, 1)).abs().max())
+                    pe = float((mt[:, col + nb] - pl.reshape(-1)).abs().max()) if pl is not None else -1.0
+                    errs.append(f"{utils.check_tuple_name(key)}[belief={be:.1g},price={pe:.1g}]")
+                elif pl is not None:
+                    e = float((mt[:, col:col + width] - pl.reshape(width, -1).transpose(0, 1)).abs().max())
+                    errs.append(f"{utils.check_tuple_name(key)}[1:1={e:.1g}]")
+                col += width
+            logging.info("DiffSolverV2 differential-label projection check (privileged market_t "
+                         "cols vs state_t leaves; ≈0 ⇒ ∂Y/∂market_col == ∂Y/∂leaf): %s",
+                         " ".join(errs))
+        F_t = torch.stack([self.tradables_sim[r][t] for r in self.hedges], dim=-1)        # (B_outer,n_hedge)
+        F_t1 = torch.stack([ig["F_t1"][r] for r in self.hedges], dim=-1) * live           # AAD-live
+        dF_g = (F_t1 - F_t.unsqueeze(1))[rows]
+        dL_g = (ig["L_t1"] - ig["L_t"])[rows]
+        m1_g = ig["market_t1"][rows]
         W0 = W0_bank.clone().requires_grad_(True)
         q = q_star[:, None, :]                                                           # (B,1,n_hedge)
-        dFe, dLe, m1e = dF[:, ev], dL[:, ev], m1[:, ev]
-        W1 = self._wealth_step(W0[:, None], q, dFe, dLe)                                  # (B,Bi_ev)
-        B, Bi_e, md = m1e.shape
+        W1 = self._wealth_step(W0[:, None], q, dF_g, dL_g)                                # (B,Bi)
+        B, Bi_e, md = m1_g.shape
         Y = self._continuation(
-            nets, m1e.reshape(-1, md),
-            W1.reshape(-1), t + 1).reshape(B, Bi_e).mean(1)                              # (B,)
-        (gW,) = torch.autograd.grad(Y.sum(), W0)
-        Y, gW = Y.detach(), gW.detach()
+            nets, m1_g.reshape(-1, md), W1.reshape(-1), t + 1).reshape(B, Bi_e).mean(1)   # (B,)
+        grads = torch.autograd.grad(Y.sum(), [W0] + list(leaves.values()), allow_unused=True)
+        gW = grads[0].detach()
+        leaf_grads = {k: (g.detach() if g is not None else None)
+                      for k, g in zip(leaves.keys(), grads[1:])}
+        g_market = self._project_leaf_grads(leaf_grads, widths, rows, B, md)             # ∂Y/∂market_t (B,md)
+        Y = Y.detach()
 
         # Advantage decomposition: fit A = C − u(W0); subtract the anchor's wealth slope.
         if self.use_adv:
@@ -5341,13 +5405,30 @@ class DiffSolverV2:
             a_val, a_gW = Y, gW
 
         net = nets[t]
-        opt = torch.optim.Adam(net.parameters(), lr=self.lr)
+        # Twin loss in STANDARDIZED space (g_zn = std·g_raw). Raw-space matching is mis-scaled:
+        # ∂A/∂W ~ 1e-6 in dollars, ∂A/∂spot ~ 1e-4 — both inert against the O(0.1) value term.
+        # Standardized, ∂A/∂wn and ∂A/∂mn are O(1) and the gradient match actually regularizes
+        # — the principled regularizer of differential ML (NOT weight decay).
+        lam_g = float(self.cfg.get("diffv2_lambda_grad", 1.0))
+        g_zn_W = self.w_std * a_gW                                                       # (B,)
+        g_zn_m = self.m_std * g_market                                                   # (B,md); u indep of market
+        # Huge–Savine term BALANCING: with W~$1e6 and utility~O(1) the standardized W-gradient
+        # label is ~600× the value label, so an unnormalized sum lets the W-gradient drown the
+        # value fit AND the market gradient. Normalize each term by its label variance so all
+        # are O(1) and lam_g balances value-vs-gradient as intended.
+        nrm_v = a_val.var() + 1e-8
+        nrm_w = g_zn_W.var() + 1e-8
+        nrm_m = g_zn_m.var() + 1e-8
+        opt = torch.optim.Adam(net.parameters(), lr=self.lr,
+                               weight_decay=float(self.cfg.get("diffv2_weight_decay", 0.0)))
         for _ in range(self.fit_iters):
-            Wg = W0_bank.clone().requires_grad_(True)
-            x = self._standardize(market0, Wg)
-            a = net(x)
-            (daW,) = torch.autograd.grad(a.sum(), Wg, create_graph=True)
-            loss = ((a - a_val) ** 2).mean() + ((daW - a_gW) ** 2).mean()
+            mn = ((market0 - self.m_mean) / self.m_std).detach().requires_grad_(True)
+            wn = ((W0_bank - self.w_mean) / self.w_std).detach().requires_grad_(True)
+            a = net(torch.cat([mn, wn.unsqueeze(-1)], dim=-1))
+            da_m, da_w = torch.autograd.grad(a.sum(), [mn, wn], create_graph=True)
+            loss = (((a - a_val) ** 2).mean() / nrm_v
+                    + lam_g * ((da_w - g_zn_W) ** 2).mean() / nrm_w
+                    + lam_g * ((da_m - g_zn_m) ** 2).mean() / nrm_m)
             opt.zero_grad(); loss.backward(); opt.step()
 
         with torch.no_grad():
@@ -5362,12 +5443,12 @@ class DiffSolverV2:
         }
 
     # ---- greedy-rollout downside verdict -------------------------------------
-    def _verdict(self, nets, inner_cache, grid, sweep_ts):
-        """Roll the fitted argmax policy forward over [t_min, T_dec] on the OUTER paths
-        (wealth advanced by the outer-realised dF/dL), starting FLAT at t_min, and compare
-        terminal-wealth downside against a textbook diagonal-min-var delta hedge and no
-        hedge. The argmax uses the cached inner-MC E[C_{t+1}] estimate; the realised
-        outcome uses the outer path. In-sample w.r.t. the (cached) outer paths.
+    def _verdict(self, nets, inner_cache, grid, sweep_ts, rows=slice(None)):
+        """Roll the fitted argmax policy forward over [t_min, T_dec] on the OUTER paths in
+        `rows` (wealth advanced by the outer-realised dF/dL), starting FLAT at t_min, and
+        compare terminal-wealth downside against a textbook diagonal-min-var delta hedge and
+        no hedge. The argmax uses the cached inner-MC E[C_{t+1}] estimate; the realised
+        outcome uses the outer path. Pass held-out `rows` for an honest OUT-OF-SAMPLE verdict.
 
         Returns per-policy {u_mean (the objective), wT_mean, wT_p5, wT_cvar5}. The verdict:
         the greedy policy should DOMINATE no-hedge on downside and be competitive with
@@ -5375,18 +5456,20 @@ class DiffSolverV2:
         than textbook and a wide wT spread."""
         L = self.liability_sim
         t0 = self.t_min
-        W = {p: L[t0].clone() for p in ("greedy", "textbook", "nohedge")}
+        n = L[t0][rows].shape[0]
+        W = {p: L[t0][rows].clone() for p in ("greedy", "textbook", "nohedge")}
         q_traj = {"greedy": [], "textbook": []}                                          # mean |q| per step
         with torch.no_grad():
             for t in sweep_ts:
                 dF_o = torch.stack(
-                    [self.tradables_sim[r][t + 1] - self.tradables_sim[r][t] for r in self.hedges],
-                    dim=-1)                                                              # (B_outer, n_hedge)
-                dL_o = L[t + 1] - L[t]
-                dF, dL, m1, _ = inner_cache[t]
-                q_g, _ = self._decide(nets, m1, dF, dL, W["greedy"], t, grid)
-                q_tb = self._replication_hedge(t)[None].expand(self.B_outer, self.n_hedge)
-                z = torch.zeros(self.B_outer, self.n_hedge, device=self.device)
+                    [self.tradables_sim[r][t + 1][rows] - self.tradables_sim[r][t][rows]
+                     for r in self.hedges], dim=-1)                                       # (n, n_hedge)
+                dL_o = (L[t + 1] - L[t])[rows]
+                dF, dL, m1, _, live = inner_cache[t]
+                q_g, _ = self._decide(nets, m1[rows], dF[rows], dL[rows], W["greedy"], t, grid)
+                q_g = q_g * live          # zero positions on expired contracts (wealth-neutral)
+                q_tb = self._replication_hedge(t)[None].expand(n, self.n_hedge)
+                z = torch.zeros(n, self.n_hedge, device=self.device)
                 W["greedy"] = self._wealth_step(W["greedy"], q_g, dF_o, dL_o)
                 W["textbook"] = self._wealth_step(W["textbook"], q_tb, dF_o, dL_o)
                 W["nohedge"] = self._wealth_step(W["nohedge"], z, dF_o, dL_o)
@@ -5427,11 +5510,18 @@ class DiffSolverV2:
         sweep_ts = list(range(self.t_min, self.T_dec))
         inner_cache = {t: self._inner_step(t) for t in sweep_ts}
 
-        # Standardization stats: market/wealth from the swept states, positions from the
-        # grid half-range. (market_t is inner_cache[t][3].)
-        M = torch.cat([inner_cache[t][3] for t in sweep_ts], 0)                           # (n_swept*B, md)
+        # OUT-OF-SAMPLE split: hold out a fraction of outer paths from the bank/fit; the
+        # verdict's headline rolls the policy on the HELD-OUT paths so a +EV that's just
+        # overfitting to the fitted paths is exposed (in-sample is reported alongside).
+        oos_frac = float(self.cfg.get("diffv2_oos_frac", 0.5))
+        n_tr = self.B_outer if oos_frac <= 0 else max(1, int(self.B_outer * (1.0 - oos_frac)))
+        train, test = slice(0, n_tr), slice(n_tr, self.B_outer)
+        has_oos = n_tr < self.B_outer
+
+        # Standardization stats: market/wealth from the TRAIN swept states (no test peeking).
+        M = torch.cat([inner_cache[t][3][train] for t in sweep_ts], 0)                    # (n_swept*n_tr, md)
         self.m_mean, self.m_std = M.mean(0), M.std(0).clamp_min(1e-6)
-        Wall = torch.stack([W_bank[t] for t in sweep_ts], 0).reshape(-1)
+        Wall = torch.stack([W_bank[t][train] for t in sweep_ts], 0).reshape(-1)
         self.w_mean, self.w_std = Wall.mean(), Wall.std().clamp_min(1e-6)
         md = M.shape[-1]
         logging.info(
@@ -5441,14 +5531,15 @@ class DiffSolverV2:
             self._replication_hedge(0).detach().cpu().tolist())
 
         grid = self._action_grid()
-        nets = [_DiffV2Residual(md + 1).to(self.device)              # position-free: (market | W)
+        hidden = int(self.cfg.get("diffv2_hidden", 128))
+        nets = [_DiffV2Residual(md + 1, hidden=hidden).to(self.device)  # position-free: (market | W)
                 for _ in range(self.T_dec)]
         logging.info("DiffSolverV2 action grid: K=%d actions (levels=%d ^ active=%d)",
                      int(grid.shape[0]), self.levels, self.n_active)
 
         rows = []
         for t in reversed(sweep_ts):
-            r = self._fit_step(nets, W_bank, t, inner_cache[t], grid)
+            r = self._fit_step(nets, W_bank, t, inner_cache[t], grid, rows=train)
             rows.append(r)
             logging.info(
                 "DiffSolverV2 C[t=%d] fitted: val_loss=%.4g |Y_boot|=%.4g |A|=%.4g "
@@ -5467,8 +5558,17 @@ class DiffSolverV2:
             "V_0=%+.6g | n_star@t=%d=%s", self.T_dec - 1, self.t_min, worst,
             "BOUNDED" if bounded else "EXPLODED", V_0, root["t"], n_star_0)
 
-        # Downside verdict: greedy policy vs textbook delta hedge vs no hedge.
-        verdict = self._verdict(nets, inner_cache, grid, sweep_ts)
+        # Downside verdict: greedy policy vs textbook delta hedge vs no hedge. HEADLINE is the
+        # OUT-OF-SAMPLE rollout (held-out paths the nets never saw); in-sample reported too.
+        verdict = self._verdict(nets, inner_cache, grid, sweep_ts, rows=(test if has_oos else train))
+        verdict_is = self._verdict(nets, inner_cache, grid, sweep_ts, rows=train) if has_oos else verdict
+        if has_oos:
+            logging.info(
+                "DiffSolverV2 IN-SAMPLE vs OOS u(W_T): greedy IS=%+.5f OOS=%+.5f | "
+                "textbook IS=%+.5f OOS=%+.5f (gap IS−OOS greedy=%+.5f → overfit if large)",
+                verdict_is["greedy"]["u_mean"], verdict["greedy"]["u_mean"],
+                verdict_is["textbook"]["u_mean"], verdict["textbook"]["u_mean"],
+                verdict_is["greedy"]["u_mean"] - verdict["greedy"]["u_mean"])
         g, tb, nh = verdict["greedy"], verdict["textbook"], verdict["nohedge"]
         # PRIMARY metric = the optimization target E[u(W_T)] (already encodes downside aversion
         # via the concave utility). CVaR5 is a secondary tail diagnostic (noisy at small B).
@@ -5476,14 +5576,15 @@ class DiffSolverV2:
         beats_tb = g["u_mean"] >= tb["u_mean"]
         tail_vs_tb = g["wT_cvar5"] >= tb["wT_cvar5"] - abs(tb["wT_cvar5"]) * 0.05
         logging.info(
-            "DiffSolverV2 VERDICT (rollout t=%d→T over %d outer paths, start flat):\n"
+            "DiffSolverV2 VERDICT (%s rollout t=%d→T over %d outer paths, start flat):\n"
             "  policy    u(W_T)mean    W_T mean       W_T p5         W_T CVaR5\n"
             "  greedy    %+.5f    %+.4e   %+.4e   %+.4e\n"
             "  textbook  %+.5f    %+.4e   %+.4e   %+.4e\n"
             "  nohedge   %+.5f    %+.4e   %+.4e   %+.4e\n"
             "  → on the OBJECTIVE E[u(W_T)]: beats no-hedge=%s, beats textbook=%s | "
             "tail(CVaR5) competitive w/ textbook=%s",
-            self.t_min, self.B_outer,
+            "OUT-OF-SAMPLE" if has_oos else "in-sample", self.t_min,
+            self.B_outer - n_tr if has_oos else self.B_outer,
             g["u_mean"], g["wT_mean"], g["wT_p5"], g["wT_cvar5"],
             tb["u_mean"], tb["wT_mean"], tb["wT_p5"], tb["wT_cvar5"],
             nh["u_mean"], nh["wT_mean"], nh["wT_p5"], nh["wT_cvar5"],
@@ -5508,7 +5609,9 @@ class DiffSolverV2:
                 "per_t": rows,
                 "action_grid_size": int(grid.shape[0]),
                 "market_dim": int(M.shape[-1]),
-                "verdict": verdict,
+                "verdict": verdict,                       # OUT-OF-SAMPLE (held-out paths)
+                "verdict_in_sample": verdict_is,
+                "verdict_is_oos": bool(has_oos),
                 "verdict_beats_nohedge_on_utility": bool(beats_nh),
                 "verdict_beats_textbook_on_utility": bool(beats_tb),
                 "verdict_tail_competitive_vs_textbook": bool(tail_vs_tb),
