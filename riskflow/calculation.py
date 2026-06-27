@@ -42,9 +42,9 @@ from .instruments import (get_fxrate_factor, get_recovery_rate, get_interest_fac
 from .pricing import SensitivitiesEstimator
 # import the documentation and utils modules
 from . import utils, pricing, construct_instrument
-from .hedge_runtime import construct_torchrl_runtime
-from .torchrl_hedge import (
-    run_torchrl_execution, HedgeRuntimeExecutionResult, build_torchrl_bundle,
+from .hedge_runtime import construct_hedge_runtime
+from .hedge_bundle import (
+    run_hedge_execution, HedgeRuntimeExecutionResult, build_hedge_bundle,
 )
 
 # Inner-MC memory cap (M2g): generation and pricing both scale with B_outer*B_inner —
@@ -1687,42 +1687,38 @@ class Base_Revaluation(Calculation):
 class HedgeMonteCarlo(Credit_Monte_Carlo):
     documentation = ('Calculations', [
         'A specialisation of `Credit_Monte_Carlo` that wires the same simulated scenario',
-        'engine into a TorchRL training loop. Instead of producing exposure profiles, the',
-        'calculation rolls a structured policy through every simulated path, learning to',
-        'hedge a portfolio of liabilities by trading a configured set of futures (or other',
-        'instruments) over time. The Monte Carlo engine is unchanged — the additions are:',
+        'engine into a dynamic-hedging solver. Instead of producing exposure profiles, the',
+        'calculation solves for a hedge of a portfolio of liabilities, trading a configured',
+        'set of futures (or other instruments) over time. The Monte Carlo engine is unchanged',
+        '— the additions are:',
         '',
-        '- A **bundle** built per simulation batch containing the trajectories the policy',
-        '  needs at decision time (tradable prices, liability MtM, factor history, leg',
-        '  metadata, AAD-derived hedge ratios, privileged regime indicators for the critic).',
-        '- A **runtime** dict normalised from the JSON `Hedging_Problem` block (action',
-        '  space, position limits, cash accounts, objective, policy and optimiser configs).',
-        '- A **policy** (default: structured entity transformer with optional 1D-conv',
-        '  temporal encoder) that consumes the entity-tokenised bundle slice at each',
-        '  decision step and emits a discrete trade per instrument.',
-        '- A **PPO optimiser** that updates the policy from the rollouts. Supports',
-        '  asymmetric utility rewards, dense tracking shaping, per-step penalties,',
-        '  CVaR-α path-level advantage weighting, asymmetric Huber on the value head, and',
-        '  an entropy floor — all gated behind config flags.',
+        '- A **bundle** built per simulation batch containing the trajectories the solver',
+        '  needs (tradable prices, liability MtM, factor history, leg metadata, AAD-derived',
+        '  hedge ratios) plus an on-demand inner-MC fork (`bundle["inner_mc_fn"]`).',
+        '- A **runtime** dict normalised from the JSON `Hedging_Problem` block (tradables,',
+        '  position limits, cash accounts, objective, solver config).',
+        '- A **differential-ML solver** (`DiffSolverV2`): a backward-DP value function fit by',
+        '  the Huge–Savine twin loss (value + AAD pathwise gradient) under an asymmetric',
+        '  utility objective, with `HindsightDpSolver` (clairvoyant upper bound) and the',
+        '  textbook averaging hedge (lower bound) as benchmark tracks.',
         '',
         'The configuration contract is documented in the',
         '[Hedging_Problem](../json/index.md#calculation) section of the JSON reference.',
         '',
         '### Execution modes',
         '',
-        '- `Execution_Mode = "optimize_policy"` — train the policy in-process. Returns the',
-        '  trained policy artifact alongside diagnostic metrics (per-epoch losses,',
-        '  reward / |trade| / entropy, advantage stats).',
-        '- `Execution_Mode = "simulate_only"` — build the bundle and run a deterministic',
-        '  argmax eval against a saved policy artifact (or an untrained policy if no',
-        '  artifact is set). Useful for offline analysis and post-training reporting.',
+        '- `Execution_Mode = "solve_hedge"` — run the configured `Solver.Object` (DiffSolverV2).',
+        '  Returns the fitted value-function artifact, the greedy-policy verdict, and the',
+        '  benchmark comparison table + acceptance ladder.',
+        '- `Execution_Mode = "simulate_only"` — build the bundle and run the no-trade baseline.',
+        '  The result exposes `create_stepper()` to drive the simulator day-by-day with any',
+        '  explicit policy (e.g. the textbook hedge). Useful for offline analysis and reporting.',
         '',
         '### Output',
         '',
-        '`out[\'Results\']` contains the trained policy artifact (when `optimize_policy`),',
-        'the simulated bundle, the normalized runtime, and an evaluation summary with',
-        'terminal P&L statistics and a position-limit audit. Wallclock and device',
-        'statistics are in `out[\'Stats\']`.',
+        '`out[\'Results\']` contains the solver artifact, the simulated bundle, the normalized',
+        'runtime, and an evaluation summary with terminal P&L statistics and a position-limit',
+        'audit. Wallclock and device statistics are in `out[\'Stats\']`.',
         '',
         '### Reusing the inherited Credit Monte Carlo simulator',
         '',
@@ -1857,7 +1853,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         execution_label = 'Tensor_Execution_Time ({})'.format(self.device.type)
         self.calc_stats[execution_label] = time.monotonic()
 
-        normalized_runtime = construct_torchrl_runtime(
+        normalized_runtime = construct_hedge_runtime(
             params, stoch_factors=self.stoch_factors,
         )
 
@@ -1967,9 +1963,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 # declared spot — the carry curve gathered at distinct expiries is what gives
                 # J its rank (n_contracts ⇐ spot + carry-ladder + basis). So in the solve_hedge
                 # path we leaf all stochastic factors and `extract_spot_deltas` returns the full
-                # per-factor Jacobian. Downstream hedge_ratios consumers (hedge_features) look up
-                # only their known (tradable, factor) pairs, so the extra factor columns are never
-                # read — the textbook/RL path is untouched.
+                # per-factor Jacobian. Downstream hedge_ratios consumers look up only their known
+                # (tradable, factor) pairs, so the extra factor columns are never read.
                 if solve_hedge_mode or utils.check_tuple_name(key) in declared_underlyings:
                     simulated = simulated.detach().requires_grad_(True)
                 shared_mem.t_Scenario_Buffer[key] = simulated
@@ -2094,7 +2089,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 key: torch.cat(blocks, dim=-1) for key, blocks in outer_state_blocks.items()
             }
 
-        torchrl_bundle = None if normalized_runtime is None else build_torchrl_bundle(
+        torchrl_bundle = None if normalized_runtime is None else build_hedge_bundle(
             base_date,
             bus_day,
             shared_mem.one.new_tensor(t_days_arr),
@@ -2139,7 +2134,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             torchrl_bundle['inner_mc_grad_fn_one_step'] = lambda t: self._run_inner_mc_at_t(
                 t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
                 with_grad=True, max_inner_steps=1, return_market_only=True)
-            # Calc handle for DifferentialSolver's `sample_exogenous` seam: the
+            # Calc handle for the differential-ML solver's `sample_exogenous` seam: the
             # solver reads `_outer_scenario_buffer` + uses `_extract_outer_state_at`
             # directly; no monkey-patching of framework primitives. **TODO refactor (A):** promote `sample_exogenous` to a
             # `HedgeMonteCarlo` bundle source (i.e., emit per-t exogenous slices into
@@ -2155,7 +2150,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         runtime_diagnostics = {}
         optimization_result = None
         if torchrl_bundle is not None and normalized_runtime is not None:
-            optimization_result = run_torchrl_execution(torchrl_bundle, normalized_runtime)
+            optimization_result = run_hedge_execution(torchrl_bundle, normalized_runtime)
         if optimization_result is not None:
             evaluation_summary = optimization_result['evaluation_output']
             optimizer_diagnostics = optimization_result['optimizer_diagnostics']
@@ -2163,13 +2158,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             runtime_present = True
             runtime_diagnostics = {
                 'num_episodes': int(evaluation_summary.get('diagnostics', {}).get('num_episodes', 0)),
-                'trainer_type': evaluation_summary.get('diagnostics', {}).get('trainer_type'),
                 'riskflow_simulation_pricing_time_seconds': float(self.calc_stats.get(execution_label, 0.0)),
-                'torchrl_rollout_time_seconds': float((optimizer_diagnostics or {}).get('torchrl_rollout_time_seconds', 0.0)),
-                'replay_storage_time_seconds': float(evaluation_summary.get('timing', {}).get('replay_storage_time_seconds', 0.0)),
-                'gradient_update_time_seconds': float(evaluation_summary.get('timing', {}).get('gradient_update_time_seconds', 0.0)),
-                'final_evaluation_time_seconds': float(evaluation_summary.get('timing', {}).get('evaluation_time_seconds', 0.0)),
-                'total_fit_time_seconds': float(evaluation_summary.get('timing', {}).get('total_fit_time_seconds', 0.0)),
                 'accounting_mode': normalized_runtime.get('accounting_mode'),
                 'tradable_names': tuple(normalized_runtime.get('names', {}).get('tradables', ())),
                 'cash_account_names': tuple(normalized_runtime.get('names', {}).get('cash_accounts', ())),
@@ -2351,8 +2340,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         This is the per-`t` body of the former `_run_inner_mc_pass`, lifted so the DP/MPC
         backward sweep can call it on demand outside the outer loop (via the closure
-        `bundle['inner_mc_fn']`). The RL `optimize_policy` path still sweeps every `t`
-        through the `_run_inner_mc_pass` wrapper below.
+        `bundle['inner_mc_fn']`). The non-solve_hedge conditional-features pass sweeps every
+        `t` through the `_run_inner_mc_pass` wrapper below.
 
         `want_raw_samples=False` returns just `{'features': (B_outer, 3+2*n_tradables)}`.
         `want_raw_samples=True` additionally returns the raw inner samples the solvers need:
@@ -2451,7 +2440,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         `with_grad=True` lifts the no_grad wrapper and reattaches `requires_grad_(True)`
         on each process's per-path initial state. Used by the differential-label
-        computation in LsmDpSolver — autograd flows from state-at-t through inner sim
+        computation in the differential-ML solver — autograd flows from state-at-t through inner sim
         + deal pricing to terminal utility, giving `∂y_target/∂state_t` for the
         twin-loss (value + gradient) OLS fit. Default False preserves the value-only path."""
         spot_key = self._find_spot_key()
@@ -2664,7 +2653,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     market_t=market_t, market_t1=market_t1)
                 if with_grad:
                     # Pair each leaf with the privileged-column width it occupies in
-                    # market_t — the differential-label projection in LsmDpSolver needs
+                    # market_t — the differential-label projection in the differential-ML solver needs
                     # this to write per-leaf gradients into the right deep-state columns
                     # without re-deriving factor-type widths (which would silently drift
                     # if the privileged extractor's per-type packing changes).
@@ -2683,8 +2672,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         return result
 
     def _run_inner_mc_pass(self, run, shared_mem, base_date, params, tradable_refs):
-        """Thin wrapper over `_run_inner_mc_at_t` for the RL `optimize_policy` path:
-        sweep every outer `t`, collect the per-`t` feature row, stack to
+        """Thin wrapper over `_run_inner_mc_at_t` for the non-solve_hedge conditional-features
+        pass: sweep every outer `t`, collect the per-`t` feature row, stack to
         `(T_outer, B_outer, 3 + 2*len(tradable_refs))`. The solver path instead calls
         `_run_inner_mc_at_t` on demand via `bundle['inner_mc_fn']`."""
         outer_scenario_buffer = dict(shared_mem.t_Scenario_Buffer)

@@ -1,11 +1,12 @@
-"""Normalized TorchRL hedging runtime construction.
+"""Normalized hedging-runtime construction.
 
-This module owns the canonical TorchRL runtime contracts:
+This module owns the canonical hedging runtime contract:
 
-- runtime dict normalization from JSON/job spec
-- canonical state flattening layout
+- runtime dict normalization from JSON/job spec (Evaluator, Objective, Solver, tradables)
+- canonical state/entity layout
 
-Execution, rollout, and optimization live in torchrl_hedge.py.
+The bundle builder, env simulator, and Execution_Mode dispatch live in hedge_bundle.py;
+the differential-ML solver lives in hedge_solver.py.
 """
 
 from __future__ import annotations
@@ -13,8 +14,42 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional
 
+import torch
+
 from . import utils
-from .hedge_features import build_entity_layout, derive_privileged_layout
+
+
+def _privileged_name(factor_name, attr_name, multi):
+    """Multi-commodity runs prefix factor attribute names with `<factor>_` to disambiguate."""
+    return f'{factor_name.lower()}_{attr_name}' if multi else attr_name
+
+
+def _privileged_multi(stoch_factors):
+    """True iff there are multiple distinct primary factor names — drives the prefix decision."""
+    return len({f.name[0] for f in (stoch_factors or {})}) > 1
+
+
+def derive_privileged_layout(stoch_factors):
+    """Build the {name: dim} schema by asking each live stoch-factor process what it emits.
+    Polymorphic via `type(process).privileged_layout(process.param)` — adding a new
+    StochasticProcess subclass with its own privileged surface flows through automatically."""
+    multi = _privileged_multi(stoch_factors)
+    layout = {}
+    for factor, process in (stoch_factors or {}).items():
+        for attr_name, dim in type(process).privileged_layout(process.param).items():
+            layout[_privileged_name(factor.name[0], attr_name, multi)] = int(dim)
+    return layout
+
+
+def assemble_privileged_factors(privileged_factor_blocks, stoch_factors):
+    """Concatenate per-batch privileged-factor tensors collected during the simulation loop into
+    a single dict ready for the bundle. Input keyed by (factor_name, attr_name); output keys match
+    the schema produced by `derive_privileged_layout`."""
+    multi = _privileged_multi(stoch_factors)
+    return {
+        _privileged_name(factor_name, attr_name, multi): torch.cat(blocks, dim=1)
+        for (factor_name, attr_name), blocks in privileged_factor_blocks.items()
+    }
 
 
 def _unwrap_calc_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -74,208 +109,55 @@ def _normalize_liabilities(hedging_problem: Mapping[str, Any]) -> Dict[str, Dict
     return {}
 
 
-def _normalize_policy_config(policy_config: Mapping[str, Any]) -> Dict[str, Any]:
-    action_space = _normalize_action_space(policy_config)
-    model_config = dict(policy_config.get("Model", {}))
-    artifact_path = policy_config.get("Artifact_Path")
-    return {
-        "object": str(policy_config["Object"]),
-        "action_space": action_space,
-        "model": {
-            "object": str(model_config.get("Object", "EntityTransformer")),
-            "token_dim": int(model_config.get("Token_Dim", 64)),
-            "emb_dim": int(model_config.get("Emb_Dim", 8)),
-            "n_heads": int(model_config.get("N_Heads", 4)),
-            "n_layers": int(model_config.get("N_Layers", 2)),
-        },
-        "artifact_path": str(artifact_path) if artifact_path else None,
-    }
-
-
-def _normalize_optimizer_config(optimizer_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
-    if optimizer_config is None:
-        return None
-    decision_interval_curriculum = []
-    for stage in optimizer_config.get("Decision_Interval_Curriculum", ()):
-        decision_interval_curriculum.append({
-            "start_epoch": int(stage.get("Start_Epoch", 1)),
-            "end_epoch": None if stage.get("End_Epoch") is None else int(stage.get("End_Epoch")),
-            "interval_business_days": int(stage.get("Interval_Business_Days", 1)),
-        })
-    return {
-        "object": str(optimizer_config["Object"]),
-        "epochs": int(optimizer_config.get("Epochs", 20)),
-        "ppo_epochs": int(optimizer_config.get("PPO_Epochs", 4)),
-        "minibatch_size": int(optimizer_config.get("Minibatch_Size", 4096)),
-        # Per-business-day discounts; effective per-decision values are gamma**interval, lam**interval
-        "gamma": float(optimizer_config.get("Gamma", 1.0)),
-        "gae_lambda": float(optimizer_config.get("GAE_Lambda", 0.995)),
-        "learning_rate": float(optimizer_config.get("Learning_Rate", 3.0e-4)),
-        "lr_schedule": str(optimizer_config.get("LR_Schedule", "constant")).lower(),
-        "lr_min": float(optimizer_config.get("LR_Min", 0.0)),
-        "lr_warmup_epochs": int(optimizer_config.get("LR_Warmup_Epochs", 0)),
-        "clip_eps": float(optimizer_config.get("Clip_Eps", 0.2)),
-        "value_coef": float(optimizer_config.get("Value_Coef", 0.5)),
-        "entropy_coef": float(optimizer_config.get("Entropy_Coef", 0.01)),
-        "entropy_schedule": str(optimizer_config.get("Entropy_Schedule", "constant")).lower(),
-        "entropy_coef_min": float(optimizer_config.get("Entropy_Coef_Min", 0.0)),
-        "max_grad_norm": float(optimizer_config.get("Max_Grad_Norm", 0.5)),
-        "reward_scale": float(optimizer_config.get("Reward_Scale", 1.0)),
-        "debug_strict_bins": bool(optimizer_config.get("Debug_Strict_Bins", False)),
-        "dense_tracking_reward_scale": float(optimizer_config.get("Dense_Tracking_Reward_Scale", 0.0)),
-        "dense_tracking_reward_clip": float(optimizer_config.get("Dense_Tracking_Reward_Clip", 0.0)),
-        "dense_reward_mode": str(optimizer_config.get("Dense_Reward_Mode", "asymmetric")).lower(),
-        "validation_fraction": float(optimizer_config.get("Validation_Fraction", 0.25)),
-        "validation_min_batch": int(optimizer_config.get("Validation_Min_Batch", 256)),
-        "decision_interval_curriculum": tuple(decision_interval_curriculum),
-        "cvar_alpha": float(optimizer_config.get("CVaR_Alpha", 0.0)),
-        "cvar_lambda": float(optimizer_config.get("CVaR_Lambda", 0.0)),
-        "value_loss_asym_weight": float(optimizer_config.get("Value_Loss_Asym_Weight", 1.0)),
-        "entropy_floor_h_min": float(optimizer_config.get("Entropy_Floor_H_Min", 0.0)),
-        "entropy_floor_coef": float(optimizer_config.get("Entropy_Floor_Coef", 0.0)),
-        "seed": optimizer_config.get("Seed"),
-        # Optional path for atomic per-epoch diag dump. None disables. Reader (a separate
-        # script) can tail this file for live progress without parsing buffered stdout.
-        "live_diag_path": optimizer_config.get("Live_Diag_Path"),
-    }
-
-
 def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Normalize the `Solver` config block (Execution_Mode='solve_hedge'). Mirrors
-    `_normalize_optimizer_config`: accepts None (non-solve modes), requires `Object`."""
+    """Normalize the `Solver` config block (Execution_Mode='solve_hedge'). Accepts None
+    (non-solve modes); requires `Object` — one of 'diffsolverv2' | 'hindsightdpsolver'."""
     if solver_config is None:
         return None
     if "Object" not in solver_config:
         raise ValueError("Hedging_Problem['Solver'] requires an 'Object' field")
-    value_fn = dict(solver_config.get("Value_Fn", {}))
     return {
         "object": str(solver_config["Object"]).lower(),
+        "multi_seed_count": int(solver_config.get("Multi_Seed_Count", 1)),
+        # Backward-sweep depth: fit C_t for t in [t_outer-2 .. t_min]. 0 = full sweep to the
+        # initial decision; t_min near t_outer-1 = a shallow (bounded) sweep.
+        "t_min": int(solver_config.get("T_Min", 0)),
+        # Greedy-decision action grid (levels per hedge axis) + batched-argmax chunk size.
         "training_action_grid_levels_per_axis":
             int(solver_config.get("Training_Action_Grid_Levels_Per_Axis", 11)),
         "training_action_chunk_size": int(solver_config.get("Training_Action_Chunk_Size", 64)),
-        "decision_action_search": str(solver_config.get("Decision_Action_Search", "fine_grid")).lower(),
-        "decision_action_grid_levels_per_axis":
-            int(solver_config.get("Decision_Action_Grid_Levels_Per_Axis", 51)),
-        "turnover_cost_padding_multiplier":
-            float(solver_config.get("Turnover_Cost_Padding_Multiplier", 1.0)),
-        "range_projection_alpha":
-            float(solver_config.get("Range_Projection_Alpha", 1.0e-3)),
-        # λ-return blend between one-step bootstrap (λ=0, the legacy LSM-DP target)
-        # and a buy-and-hold value-only rollout to T_dec (λ=1, removes V̂ from the
-        # target entirely). See differential_ml_redesign_v14.md §2.2.
-        "lambda_return": float(solver_config.get("Lambda_Return", 0.0)),
-        # Differential-ML twin-loss weight (Huge–Savine): stacked least-squares
-        # `‖v - X·β‖² + λ_diff · ‖v_grad - X_grad·β‖²` in V̂.fit, with X_grad the
-        # Jacobian of the OLS basis w.r.t. the differentiable deep-state columns and
-        # v_grad the pathwise gradient of the cross-fit target through the AAD inner-MC.
-        # 0 disables the differential branch (bit-exact baseline). See
-        # differential_ml_redesign_v14.md §2.3.
-        "lambda_diff": float(solver_config.get("Lambda_Diff", 0.0)),
-        # λ-mix (DifferentialSolver advantage decomp): blend
-        # `(1-λ)·Y_boot + λ·Y_rollout` for the value label. Spec §14 deferred lever,
-        # indicated when a horizon-stable bounded residual V_0 gap survives advantage
-        # decomposition. Default 0 = pure bootstrap (banked behavior).
-        "lambda_mix": float(solver_config.get("Lambda_Mix", 0.0)),
+        # Advantage decomposition: fit A = C - u(W) (NN residual over the bounded-utility anchor).
         "use_advantage_decomp": bool(solver_config.get("Use_Advantage_Decomp", True)),
-        # DifferentialSolver value-label fanout: average the Bellman envelope over the
-        # retained one-step inner fork instead of fitting a one-realisation max target.
-        "bootstrap_inner_samples": int(solver_config.get("Bootstrap_Inner_Samples", 1)),
-        # Backward-sweep depth: fit C_t for t in [t_outer-2 .. t_min]. 0 = full sweep
-        # to the initial decision; t_min near t_outer-1 = a shallow (bounded) sweep.
-        "t_min": int(solver_config.get("T_Min", 0)),
-        "audit_max_rounds": int(solver_config.get("Audit_Max_Rounds", 3)),
-        # --- BSS validation sandwich (DifferentialSolver offline diagnostics) ---
-        # Penalty π zero-mean GATE (step 1+2): interior |mean ΣΔ|/stderr threshold for
-        # dual feasibility, and the cap on the data-driven terminal boundary block U zeros π on.
-        "penalty_zero_mean_z": float(solver_config.get("Penalty_ZeroMean_Z", 3.0)),
-        "penalty_max_boundary": int(solver_config.get("Penalty_Max_Boundary", 4)),
-        # Penalized clairvoyant UPPER bound U (step 3) — the wealth-grid backward DP. Cost
-        # ∝ P·G·K²·I per step, so it is OPT-IN (like Run_Hindsight_Diagnostic): off by default,
-        # enable for the validation readout. The cheap single-trajectory penalty gate above
-        # always runs. The caps below scope it (shallow/few-live first; raise for tightness).
-        "run_upper_bound": bool(solver_config.get("Run_Upper_Bound", False)),
-        "upper_bound_max_paths": int(solver_config.get("Upper_Bound_Max_Paths", 128)),
-        "upper_bound_wealth_grid": int(solver_config.get("Upper_Bound_Wealth_Grid", 41)),
-        "upper_bound_n_inner": int(solver_config.get("Upper_Bound_N_Inner", 4)),
-        "upper_bound_grid_pad": float(solver_config.get("Upper_Bound_Grid_Pad", 1.0)),
-        "upper_bound_chunk_rows": int(solver_config.get("Upper_Bound_Chunk_Rows", 200_000)),
-        "upper_bound_clamp_warn_frac":
-            float(solver_config.get("Upper_Bound_Clamp_Warn_Frac", 0.02)),
-        # C-stack persistence for OUT-OF-SAMPLE validation (DifferentialSolver). Save_* writes
-        # the fitted twin-net stack after the sweep; Load_* loads it, skips training, and runs
-        # the L/π/U sandwich on a fresh-seeded batch. Two config variants (train→save, eval→load
-        # + new Random_Seed), never both in one run.
-        "save_value_fn_path": solver_config.get("Save_Value_Fn_Path") or None,
-        "load_value_fn_path": solver_config.get("Load_Value_Fn_Path") or None,
-        # Offline gate4 diagnostic: per-depth action-match of the fitted policy vs an exact-DP
-        # oracle (gate2_exact_dp.npz). Gated path; toy-only; never shipped.
-        "oracle_action_match_path": solver_config.get("Oracle_Action_Match_Path") or None,
-        # Opt-in label audit: timesteps at which to snapshot the bootstrap labels the net fits
-        # (Y_boot / baseline_B / residual). Diagnostic; empty list = off.
-        "label_audit_t_steps": list(solver_config.get("Label_Audit_T_Steps", []) or []),
-        # Endogenous-span bank knob (DifferentialSolver): inventory/wealth replicas
-        # layered on each exogenous slice.
-        "bank_sampling": {
-            "b_endo": int((solver_config.get("Bank_Sampling") or {}).get("B_Endo", 2)),
-        },
-        "include_dynamic_features_in_value_inputs":
-            bool(solver_config.get("Include_Dynamic_Features_In_Value_Inputs", False)),
-        "multi_seed_count": int(solver_config.get("Multi_Seed_Count", 1)),
+        # Differential-ML twin-loss weight (stored; the active twin weight is diffv2_lambda_grad).
+        "lambda_diff": float(solver_config.get("Lambda_Diff", 0.0)),
         # --- DiffSolverV2 (clean-room differential-ML solver) knobs ---
-        # Per-t residual-net Adam fit iterations / learning rate; bank q-exploration
-        # noise as a fraction of each instrument's [Min,Max] position range; and the
-        # subset of hedge instruments whose action axis VARIES in the grid (others
-        # pinned to 0 — the "[0,0,q]" single-future-of-three test). None = all vary.
+        # Per-t residual-net Adam iters / lr; bank q-exploration noise as a fraction of each
+        # instrument's [Min,Max] range; the subset of hedge instruments whose action axis VARIES
+        # in the grid (others pinned to 0). None = all vary.
         "diffv2_fit_iters": int(solver_config.get("DiffV2_Fit_Iters", 150)),
         "diffv2_lr": float(solver_config.get("DiffV2_LR", 2.0e-3)),
         "diffv2_bank_noise_frac": float(solver_config.get("DiffV2_Bank_Noise_Frac", 0.15)),
-        # Out-of-sample split: fraction of OUTER paths held out from the bank/fit and used
-        # ONLY for the verdict rollout (honest OOS policy eval; the in-sample verdict overfits
-        # to the fitted paths). 0 = no split (in-sample only).
+        # Out-of-sample split: fraction of OUTER paths held out from the bank/fit, used ONLY for
+        # the verdict rollout (honest OOS policy eval). 0 = in-sample only.
         "diffv2_oos_frac": float(solver_config.get("DiffV2_OOS_Frac", 0.5)),
         # Residual-net regularization. The PRINCIPLED regularizer is the twin-loss pathwise-
-        # gradient match (diffv2_lambda_grad below), NOT weight decay — it does weight decay's
-        # job without the shrinkage BIAS, but it is DATA-HUNGRY (it constrains A along the
-        # sampled gradient directions, so it needs an adequate outer batch). At scale it stands
-        # alone: wd=0 + lambda_grad=1 + hidden=32 wins OOS on ALL 4 seeds of the platinum
-        # fixture at B_outer=4095 (greedy E[u]≈0.119 ±0.002, beats textbook ≈0.073 and tightens
-        # CVaR5 by ~$90k/seed) where small-batch wd=0 had been only 2/4. Weight decay remains
-        # an optional crutch for OUTER-PATH-STARVED problems (tiny batch, where DML lacks the
-        # data to regularize) — raise it there, trading DML's unbiasedness for shrinkage.
+        # gradient match (diffv2_lambda_grad), applied in STANDARDIZED space; weight decay is an
+        # optional crutch for outer-path-starved (tiny-batch) problems.
         "diffv2_weight_decay": float(solver_config.get("DiffV2_Weight_Decay", 0.0)),
         "diffv2_hidden": int(solver_config.get("DiffV2_Hidden", 32)),
-        # Twin-loss weight (Huge–Savine): the pathwise-gradient match. THIS is the principled
-        # regularizer of differential ML — it must be applied in STANDARDIZED space (the raw
-        # ∂A/∂W term is ~1e-12 in dollar units and inert). 0 = value-only (overfits, and with
-        # the default wd=0 there is then NO regularizer); 1 = equal weight (the toy's setting,
-        # and the default — with wd=0 this carries the regularization alone).
         "diffv2_lambda_grad": float(solver_config.get("DiffV2_Lambda_Grad", 1.0)),
+        # Downside-aware action SELECTION: at the argmax, score each action by
+        # mean(C) - DiffV2_Risk_Kappa * downside-semidev(C) over the inner-MC, de-risking ONLY the
+        # bad-tail actions (keeps upside). 0 = off (plain E[C] argmax, bit-identical). Tune ~0.5;
+        # scale with regime-drift magnitude. (Toy: RISK_KAPPA beat the uniform min-var blend.)
+        "diffv2_risk_kappa": float(solver_config.get("DiffV2_Risk_Kappa", 0.0)),
         "active_hedge_indices":
             (list(solver_config["Active_Hedge_Indices"])
              if solver_config.get("Active_Hedge_Indices") is not None else None),
+        # Benchmark tracks assembled alongside the DiffSolverV2 deliverable (hindsight upper
+        # bound / textbook lower bound).
         "run_hindsight_diagnostic": bool(solver_config.get("Run_Hindsight_Diagnostic", False)),
-        "run_mpc_comparison": bool(solver_config.get("Run_Mpc_Comparison", False)),
         "run_textbook_benchmark": bool(solver_config.get("Run_Textbook_Benchmark", False)),
-        "textbook_allocation": str(solver_config.get("Textbook_Allocation", "maturity_matched")).lower(),
-        "value_fn": {
-            "ols_refit_cadence_daily_solves": int(value_fn.get("OLS_Refit_Cadence_Daily_Solves", 5)),
-            "buffer_max_age_daily_solves": int(value_fn.get("Buffer_Max_Age_Daily_Solves", 60)),
-            "mlp_hidden": list(value_fn.get("MLP_Hidden", [64, 64, 64])),
-            "mlp_activation": str(value_fn.get("MLP_Activation", "gelu")).lower(),
-            "mlp_train_steps_per_solve": int(value_fn.get("MLP_Train_Steps_Per_Solve", 200)),
-            "mlp_loss_tol": float(value_fn.get("MLP_Loss_Tol", 0.0)),
-            "mlp_adam_lr": float(value_fn.get("MLP_Adam_LR", 1.0e-3)),
-            "mlp_final_init_scale": float(value_fn.get("MLP_Final_Init_Scale", 0.0)),
-            # Tail-saturating columns: deep-state indices to push through tanh after
-            # standardization, before the OLS basis. Bounds the V̂ input on load-bearing
-            # breach columns (outer-MC training covers ~σ, inner-MC queries explore tails
-            # to many σ where the linear basis has no support). Empty = off.
-            "tail_saturating_columns": [int(c) for c in value_fn.get("Tail_Saturating_Columns", [])],
-            # Steepness multiplier on the standardized input before tanh. scale > 1
-            # tightens the saturation knee inward in raw units; scale = 1 keeps the knee
-            # at the 1σ point of the training distribution.
-            "tail_saturation_scale": float(value_fn.get("Tail_Saturation_Scale", 1.0)),
-        },
     }
 
 
@@ -296,92 +178,28 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
         "post_deal_trade_penalty": float(objective_config.get("Post_Deal_Trade_Penalty", 0.0)),
         # NOTE: despite the name, `Position_Bounds_Penalty` controls ONLY the
         # portfolio-total Σ|pos_i| ramp (against `Evaluator.Total_Position_Abs_Limit`).
-        # Per-instrument [Min_Position, Max_Position] bounds are HARD-enforced upstream
-        # by `StructuredRebalancePolicy._feasible_mask` (logit -∞ on out-of-range bins),
-        # so a per-instrument soft term would always be zero. The naming pre-dates that
-        # clarification; behavior is portfolio-only. Rename to `Total_Position_Abs_Penalty`
-        # if it becomes worth the JSON / CSV / docs churn.
+        # Per-instrument [Min_Position, Max_Position] bounds are handled separately by the
+        # soft, reward-side `Per_Instrument_Bounds_Penalty` below, so this term is
+        # portfolio-only. The naming pre-dates that split; rename to
+        # `Total_Position_Abs_Penalty` if it becomes worth the JSON / CSV / docs churn.
         "position_bounds_penalty": float(objective_config.get("Position_Bounds_Penalty", 0.0)),
         "position_bounds_threshold": float(objective_config.get("Position_Bounds_Threshold", 5.0)),
         # Per-instrument [Min_Position, Max_Position] enforcement (soft, reward-side).
-        # Replaces the prior hard mask in `StructuredRebalancePolicy._feasible_mask`.
         "per_instrument_bounds_penalty": float(objective_config.get("Per_Instrument_Bounds_Penalty", 0.0)),
         "per_instrument_bounds_threshold": float(objective_config.get("Per_Instrument_Bounds_Threshold", 5.0)),
         # Utility-transform scale. Consumed by any utility Object (Symlog / Huber / CARA);
         # legacy "TerminalFloorThenSurplusUtility" path ignores it. `utility_scale` is mirrored
-        # from `bundle["utility_scale"]` at rollout start (see _collect_ppo_rollout).
+        # from `bundle["utility_scale"]` (see hedge_bundle._mirror_utility_scale_to_runtime).
         "utility_scale_mode": str(objective_config.get("Utility_Scale_Mode", "vol_scaled_notional")).lower(),
         "utility_scale_explicit": None if explicit is None else float(explicit),
         # Utility SHAPE params (DIMENSIONLESS, in units of the scale c — applied to x = W/c).
         # Huber (AsymmetricUtility_Huber): linear gains, quadratic small losses with curvature
         # `huber_aversion`, linear deep tail beyond the knee `huber_delta`. CARA
         # (AsymmetricUtility_CARA): u = (1−e^{−γx})/γ with risk aversion `cara_gamma`. Symlog
-        # ignores all three. See torchrl_hedge._utility_wrap_signed for the exact forms.
+        # ignores all three. See hedge_bundle._utility_wrap_signed for the exact forms.
         "huber_aversion": float(objective_config.get("Huber_Aversion", 2.5)),
         "huber_delta": float(objective_config.get("Huber_Delta", 1.0)),
         "cara_gamma": float(objective_config.get("CARA_Gamma", 1.0)),
-    }
-
-
-def _normalize_action_space(policy_config: Mapping[str, Any]) -> Dict[str, Any]:
-    """Normalize the JSON action-space config into a runtime dict. Accepts either:
-
-      - `Trade_Deltas`: list-of-list of allowed integer deltas per instrument (preferred).
-        Allows non-uniform spacings (e.g. fine bins near 0 + coarse bins at extremes).
-      - `Min_Trade_Delta` + `Max_Trade_Delta`: legacy unit-step integer ranges; expanded
-        to range(min, max+1) for each instrument.
-
-    The runtime dict carries both `trade_deltas` (per-instrument tuple of ints) and the
-    derived `min_trade_delta` / `max_trade_delta` (per-instrument int) for backward compat
-    with downstream consumers that only need the bounds.
-    """
-    action_space = dict(policy_config.get("Action_Space", {}))
-    instrument_order = tuple(str(name) for name in action_space.get("Instrument_Order", ()))
-    explicit_deltas = action_space.get("Trade_Deltas")
-
-    if explicit_deltas is not None:
-        per_instrument = tuple(
-            tuple(sorted(set(int(d) for d in deltas)))
-            for deltas in explicit_deltas
-        )
-        if instrument_order and len(instrument_order) != len(per_instrument):
-            raise ValueError(
-                "Trade_Deltas length must match Instrument_Order length; "
-                f"got {len(per_instrument)} delta-lists for {len(instrument_order)} instruments")
-    else:
-        import warnings
-        warnings.warn(
-            "Action_Space.Min_Trade_Delta/Max_Trade_Delta is deprecated; use "
-            "Action_Space.Trade_Deltas (per-instrument list of allowed integer deltas). "
-            "The min/max form expands to a uniform unit-step range and is scheduled for "
-            "removal — non-uniform spacings (e.g. fine bins near 0, coarse at extremes) "
-            "are now standard.",
-            DeprecationWarning, stacklevel=2,
-        )
-        min_trade_delta = tuple(int(value) for value in action_space.get("Min_Trade_Delta", ()))
-        max_trade_delta = tuple(int(value) for value in action_space.get("Max_Trade_Delta", ()))
-        if instrument_order and not (
-            len(instrument_order) == len(min_trade_delta) == len(max_trade_delta)
-        ):
-            raise ValueError("Structured action space entries must have matching lengths")
-        per_instrument = tuple(
-            tuple(range(int(lo), int(hi) + 1))
-            for lo, hi in zip(min_trade_delta, max_trade_delta))
-
-    return {
-        "instrument_order": instrument_order,
-        "trade_deltas": {
-            instrument_name: deltas
-            for instrument_name, deltas in zip(instrument_order, per_instrument)
-        },
-        "min_trade_delta": {
-            instrument_name: min(deltas)
-            for instrument_name, deltas in zip(instrument_order, per_instrument)
-        },
-        "max_trade_delta": {
-            instrument_name: max(deltas)
-            for instrument_name, deltas in zip(instrument_order, per_instrument)
-        },
     }
 
 
@@ -521,7 +339,7 @@ def _normalize_instrument_metadata(
     }
 
 
-def construct_torchrl_runtime(
+def construct_hedge_runtime(
     config: Mapping[str, Any],
     stoch_factors: Optional[Mapping[Any, Any]] = None,
 ) -> Dict[str, Any]:
@@ -530,8 +348,6 @@ def construct_torchrl_runtime(
     evaluator_config = hedging_problem["Evaluator"]
     liabilities = _normalize_liabilities(hedging_problem)
     objective_config = hedging_problem.get("Objective")
-    policy_config = hedging_problem.get("Policy")
-    optimizer_config = hedging_problem.get("Optimizer")
     solver_config = hedging_problem.get("Solver")
     tradables = _flatten_tradable_entries(hedging_problem["Tradable_Instruments"])
     execution_mode = _normalize_execution_mode(config)
@@ -563,15 +379,13 @@ def construct_torchrl_runtime(
         )
         for instrument_name, tradable_entry in tradables.items()
     }
-    if execution_mode == "optimize_policy" and optimizer_config is None:
-        raise ValueError("Execution_Mode 'optimize_policy' requires Hedging_Problem['Optimizer']")
     if execution_mode == "solve_hedge":
         if solver_config is None:
             raise ValueError("Execution_Mode 'solve_hedge' requires Hedging_Problem['Solver']")
         if str(config.get("Inner_MC_Enabled", "No")) != "Yes":
             raise ValueError("Execution_Mode 'solve_hedge' requires Inner_MC_Enabled='Yes'")
         solver_object = str(solver_config.get("Object", "")).lower()
-        min_inner = 2 if solver_object in ("differentialsolver", "diffsolverv2") else 128
+        min_inner = 2 if solver_object == "diffsolverv2" else 128
         if int(config.get("Inner_Sub_Batch", 0)) < min_inner:
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires Inner_Sub_Batch >= "
@@ -584,14 +398,13 @@ def construct_torchrl_runtime(
                 "'AsymmetricUtility_Symlog' | 'AsymmetricUtility_Huber' | 'AsymmetricUtility_CARA'. "
                 "The DP recursion lives in utility space: an identity (legacy) objective leaves "
                 "V-hat unbounded in dollars and the backward sweep blows up multiplicatively.")
-    # Policy is optional under solve_hedge — the DP/MPC solver replaces the RL policy track.
-    policy = _normalize_policy_config(policy_config) if policy_config is not None else None
     names = {
         "tradables": tuple(normalized_tradables.keys()),
         "hedges": hedge_names,
         "cash_accounts": cash_account_names,
-        "action_instruments": (tuple(policy["action_space"]["instrument_order"])
-                               if policy is not None else hedge_names),
+        # The tradable hedge instruments (cash accounts excluded) are the action set; the
+        # differential-ML solver builds its own action grid over them.
+        "action_instruments": hedge_names,
         "liabilities": tuple(liabilities.keys()),
     }
     history_lookback = int(hedging_problem.get("History_Lookback_Business_Days", 30))
@@ -606,8 +419,8 @@ def construct_torchrl_runtime(
         "tradables": normalized_tradables,
         "liabilities": liabilities,
         "objective": _normalize_objective_config(objective_config),
-        "policy": policy,
-        "optimizer": _normalize_optimizer_config(optimizer_config),
+        "policy": None,
+        "optimizer": None,
         "solver": _normalize_solver_config(solver_config),
         "history_lookback_business_days": history_lookback,
         "portfolio_state": _normalize_portfolio_state(
@@ -652,10 +465,10 @@ def construct_torchrl_runtime(
             "to be set on at least one instrument — otherwise the per-instrument penalty is "
             "silently disabled."
         )
-    runtime["entity_layout"] = build_entity_layout(runtime)
+    # Slim instrument metadata for the expiry-holding penalty: {name, last_trade_date} per hedge.
+    runtime["instrument_meta"] = tuple(
+        {"name": str(name), "last_trade_date": runtime["tradables"][name]["last_trade_date"]}
+        for name in runtime["names"]["hedges"]
+    )
     runtime["privileged_layout"] = derive_privileged_layout(stoch_factors)
     return runtime
-
-
-def construct_hedging_runtime(config: Mapping[str, Any]) -> Dict[str, Any]:
-    return construct_torchrl_runtime(config)

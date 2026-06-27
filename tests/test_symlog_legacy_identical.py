@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from riskflow import torchrl_hedge as th
+from riskflow import hedge_bundle as th
 
 
 def make_legacy_runtime(*, fp=50.0, sr=1.0, p=1.0, mode="asymmetric", rs=2.0, rc=0.0, gamma=1.0):
@@ -173,7 +173,7 @@ def test_mirror_bundle_no_utility_scale():
 def test_resolve_utility_scale_fails_loud_on_symlog_degeneracies():
     """Each silent-degrade path in resolve_utility_scale must raise under symlog (a $1k
     floor silently breaks tail compression). Same paths return $1k harmlessly under legacy."""
-    from riskflow.torchrl_hedge import resolve_utility_scale
+    from riskflow.hedge_bundle import resolve_utility_scale
 
     def runtime_with_object(obj_name, **objective_extras):
         rt = {'objective': {'object': obj_name, **objective_extras},
@@ -224,7 +224,7 @@ def test_resolve_utility_scale_fails_loud_on_symlog_degeneracies():
 def test_unknown_utility_scale_mode_fails_loud():
     """Typo in Utility_Scale_Mode silently resolved to 1e3 floor before; now raises with
     a clear message identifying the typo'd value."""
-    from riskflow.torchrl_hedge import resolve_utility_scale
+    from riskflow.hedge_bundle import resolve_utility_scale
     bundle = {'last_settlement_index': 200, 'total_leg_volume': 2500.0,
               'spot_price_history': {}, 'spot_realized_vol': {}}
     runtime = {'objective': {'utility_scale_mode': 'vol_scled_notional'},  # typo

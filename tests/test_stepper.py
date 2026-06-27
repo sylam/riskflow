@@ -154,37 +154,8 @@ def test_counterfactual_branching_via_deepcopy():
           f"(branch_a mean pnl=${float(pnl_a.mean()):+,.0f}, branch_b=${float(pnl_b.mean()):+,.0f})")
 
 
-def test_write_diagnostic_csvs_with_unmirrored_symlog_runtime():
-    """Regression: `result.write_diagnostic_csvs` invokes `_diag_rollout_policy`, which
-    must mirror utility_scale onto runtime BEFORE calling reward_and_terminal_payoff.
-    Earlier, that call site relied on training to have already mutated the runtime;
-    in any pipeline that constructs a fresh runtime + bundle and goes straight to
-    write_diagnostic_csvs (offline analysis, deserialized result, post-hoc CSV regen),
-    `_require_utility_scale` would raise. Simulate that scenario by clearing
-    `runtime['objective']['utility_scale']` and confirm the diagnostic path still works.
-    """
-    cfg = jsonlib.load(open(FIXTURE))
-    obj = cfg['Calc']['Calculation']['Hedging_Problem']['Objective']
-    obj.update({'Object': 'AsymmetricUtility_Symlog', 'Floor_Penalty': 10.0,
-                'Surplus_Reward': 1.0, 'Power': 1.0})
-    cx = rf.Context()
-    cx.load_json((jsonlib.dumps(cfg), 'unmirrored.json'))
-    _, result = cx.run_job()
-
-    # Simulate the unmirrored path: clear utility_scale from runtime; the bundle still
-    # has it (set at bundle build), but the runtime is fresh as far as reward computation
-    # is concerned.
-    result.runtime['objective'].pop('utility_scale', None)
-    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_stepper_out_unmirrored')
-    result.write_diagnostic_csvs(out_dir)
-    assert os.path.exists(os.path.join(out_dir, 'ml_paths.csv'))
-    assert os.path.exists(os.path.join(out_dir, 'summary.csv'))
-    print("test_write_diagnostic_csvs_with_unmirrored_symlog_runtime: PASS")
-
-
 if __name__ == '__main__':
     test_no_trade_stepper_matches_framework_baseline()
     test_textbook_hedge_as_stepper_loop()
     test_counterfactual_branching_via_deepcopy()
-    test_write_diagnostic_csvs_with_unmirrored_symlog_runtime()
     print("\nAll stepper tests passed.")

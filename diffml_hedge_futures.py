@@ -25,10 +25,16 @@ the index carry forward  S_t * exp(c_t(tau_u) tau_u)  (same NS curve, no basis).
             differently, the three futures are genuinely non-collinear: >=2 of them are
             needed to match the liability's spot AND carry exposure (not redundant).
    * BASIS is in the future only -> UNHEDGEABLE (pure tracking error).
-With zero-mean carry the mark sits at the spot mean (STRIKE=MU, L_0=0) so there is NO drift
-premium -- the problem is purely risk-driven.  The value baseline U(N) is only approximate
-(it ignores future hedging value and the carry/basis risk structure); the NN residual absorbs
-the rest.  (Nonzero carry means would re-introduce a premium -- see the carry-means comment.)
+DEAL SPREAD (the realistic bit): the deal is NOT struck at the money -- it is struck ~$5-8/oz
+ABOVE fair, so the desk books a margin.  The strike level cancels in the mark-to-market wealth
+dynamics, so the spread enters as a day-1 wealth CUSHION  N_INIT = NU*MARGIN  (see MARGIN).  That
+turns the objective from "minimise variance" into "do not lose MORE than the spread, keep upside":
+the spread is a downside BUDGET.  Consequences (shown in the downside table): the best STATIC hedge
+UNDER-hedges (alpha~0.6, not 1.0); full min-var OVER-hedges (it spends upside to buy tail safety
+the cushion already gives); the dynamic learned policy spends the budget on reversion-timing and
+keeps far more upside at a comparable spread-loss probability.  AVERSION/DELTA set how much of the
+spread to put at risk.  (Carry is still zero-mean -> no carry premium; the spread is structural.)
+The value baseline U(N) is only approximate; the NN residual absorbs the rest.
 
 Two new stochastic blocks supply B and c:
   * BASIS  : mean-reverting OU      dB = -alpha B dt + sigma_B dZ   (here AR(1) to 0).
@@ -103,7 +109,13 @@ PHI    = 1.0 - KAPPA # AR(1) persistence
 SIGMA  = 4.0         # spot per-step shock std (price level)
 NU     = 3.0         # liability notional
 S_INIT = MU
-# STRIKE is set below, once the carry curve is known, so that E_0[avg] = STRIKE => L_0 = 0.
+MARGIN = 6.5         # USD/oz the deal is struck ABOVE fair (the desk's spread; real deals are NOT
+#   at-the-money -- we lock in $5-8/oz).  The strike level CANCELS in the mark-to-market wealth
+#   dynamics (we track dL), so the spread enters as a day-1 wealth CUSHION N_INIT = NU*MARGIN.
+#   Economically it is a downside BUDGET: the job is to not lose MORE than the spread, not to avoid
+#   any loss -- so the policy can under-hedge and keep upside, spending the spread on tail risk.
+N_INIT = NU * MARGIN
+# STRIKE is set below to fair (E_0[avg]); the spread lives in N_INIT, not in STRIKE (which cancels).
 
 # --- BASIS: cross-exchange spread (CME future index - LME averaging index), OU to 0 --- #
 ALPHA   = 0.30       # basis mean-reversion speed
@@ -185,6 +197,11 @@ def init_market(n):
     return M
 
 
+def init_wealth(n):
+    """Day-1 wealth = the booked spread cushion N_INIT = NU*MARGIN (deal struck above fair)."""
+    return torch.full((n,), N_INIT)
+
+
 def market_step(M, eps):
     """One-step joint evolution of M=[S,B,L0,L1,L2].  eps has matching trailing dim 5.
     Spot AR(1) to MU; basis OU to 0; each carry factor AR(1) to its mean."""
@@ -264,7 +281,7 @@ class Residual(nn.Module):
         S, B, L0, L1, L2 = M.unbind(-1)
         x = torch.stack([(S - MU) / 10.0, B / 2.0,
                          (L0 - L0_BAR) / 0.01, (L1 - L1_BAR) / 0.01, (L2 - L2_BAR) / 0.01,
-                         N / 10.0], dim=-1)
+                         (N - N_INIT) / 10.0], dim=-1)            # centre on the cushion
         return self.body(x).squeeze(-1)
 
 
@@ -342,7 +359,7 @@ def greedy_rollout(nets, M, N, pe, t_start, gen, n_inner=N_INNER):
 # --------------------------------------------------------------------------- #
 def simulate_bank(n_paths, gen):
     M  = init_market(n_paths)
-    N  = torch.zeros(n_paths)
+    N  = init_wealth(n_paths)
     pe = torch.zeros(n_paths)
     bank = {"M": [], "N": [], "pe": []}
     for t in range(T):
@@ -509,12 +526,12 @@ def mean_path():
 def sandwich(nets, n_paths, gen):
     # lower bound = deployed greedy policy value -- MUST use the same argmax quality the policy
     # is deployed with (N_INNER), else L understates the policy and looks artificially loose.
-    L = float(greedy_rollout(nets, init_market(n_paths), torch.zeros(n_paths),
+    L = float(greedy_rollout(nets, init_market(n_paths), init_wealth(n_paths),
                              torch.zeros(n_paths), 0, gen, n_inner=N_INNER).mean())
 
     # naive clairvoyant upper bound: utility is monotone in wealth, so perfect-foresight
     # maximises terminal N by picking, each step, the gridded action best aligned with dF.
-    M = init_market(n_paths); pe = torch.zeros(n_paths); N = torch.zeros(n_paths)
+    M = init_market(n_paths); pe = torch.zeros(n_paths); N = init_wealth(n_paths)
     for t in range(T):
         eps = torch.randn(n_paths, DIM_M, generator=gen)
         M1  = market_step(M, eps)
@@ -529,7 +546,7 @@ def sandwich(nets, n_paths, gen):
     # martingale-penalty zero-mean guard (independent selection vs estimate draws).
     # This is the meaningful dual-feasibility check: if the fitted C is a good value, the
     # one-step penalty pi_t = C_{t+1}(realised) - E[C_{t+1}|s_t,q*] is mean-zero.
-    M = init_market(n_paths); N = torch.zeros(n_paths); pe = torch.zeros(n_paths)
+    M = init_market(n_paths); N = init_wealth(n_paths); pe = torch.zeros(n_paths)
     pis = []
     with torch.no_grad():
         for t in range(T):
@@ -575,7 +592,7 @@ def policy_response(nets, gen):
     for t in (1, 4, 6):
         M0 = Ms[t][None, :].repeat(Sgrid.numel(), 1); M0[:, 0] = Sgrid
         pe = torch.full((Sgrid.numel(),), float(pes[t]))
-        q  = decide(nets, M0, torch.zeros(Sgrid.numel()), pe, t, gen=gen)
+        q  = decide(nets, M0, init_wealth(Sgrid.numel()), pe, t, gen=gen)
         S, B, L0, L1, L2 = M0.unbind(-1); taus = T_EXP - t
         dFdS = torch.exp(carry_curve(taus, L0[:, None], L1[:, None], L2[:, None]) * taus)
         sd = (q * dFdS).sum(-1)                                     # portfolio spot-delta-equivalent
@@ -598,6 +615,8 @@ def main():
     log("=" * 78)
     log("CONFIG  T=%d  NU=%.1f  STRIKE=%.3f (MU=%.1f)  AVERSION=%.2f  DELTA=%.1f" %
         (T, NU, STRIKE, MU, AVERSION, DELTA))
+    log("  deal spread: $%.1f/oz above fair -> day-1 cushion N_INIT=%.2f (downside budget)" %
+        (MARGIN, N_INIT))
     log("  spot   : KAPPA=%.2f  SIGMA=%.2f  (per-step sd; AR(1) to MU)" % (KAPPA, SIGMA))
     log("  basis  : ALPHA=%.2f  SIGMA_B=%.2f  (OU to 0; UNHEDGEABLE -- not in the deal)" % (ALPHA, SIGMA_B))
     log("  carry  : means=(%.3f,%.3f,%.3f) rho=(%.2f,%.2f,%.2f) sig=(%.4f,%.4f,%.4f) LAM=%.1f" %
@@ -645,7 +664,7 @@ def main():
     print("  (basis is unhedgeable, so var-reduction is capped well below 1; the three futures")
     print("   share S+B -> Sigma_F is near-singular, hence the ridge and the modest gross hedge)")
     Ms, pes = mean_path()
-    M = init_market(256); N = torch.zeros(256); pe = torch.zeros(256)
+    M = init_market(256); N = init_wealth(256); pe = torch.zeros(256)
     with torch.no_grad():
         for t in range(T):
             q = decide(nets, M, N, pe, t, gen=gen).float().mean(0)
@@ -678,7 +697,7 @@ def main():
     hstar = [minvar_hedge(Ms[t], pes[t], t, 100_000, g2)[0] for t in range(T)]
 
     def run_policy(policy):
-        M = init_market(P); N = torch.zeros(P); pe = torch.zeros(P)
+        M = init_market(P); N = init_wealth(P); pe = torch.zeros(P)
         with torch.no_grad():
             for t in range(T):
                 q  = policy(t, M, N, pe) * alive(t)             # cannot hold expired contracts
@@ -706,17 +725,17 @@ def main():
         ("min-var (1.0x h*, downside bench)",     lambda t, M, N, pe: hstar[t][None, :].expand(M.shape[0], NF)),
         ("learned policy",                        lambda t, M, N, pe: decide(nets, M, N, pe, t, gen=g2)),
     ]
-    print(f"  {'policy':28s}  {'mean':>6s} {'down_sd':>8s} {'5%worst':>8s} {'95%best':>8s} {'E[util]':>8s}")
+    print(f"  terminal wealth W_T = spread cushion ({N_INIT:+.1f} = NU*${MARGIN:.1f}/oz) + hedge P&L - deal P&L")
+    print(f"  {'policy':30s}  {'mean':>6s} {'5%worst':>8s} {'95%best':>8s} {'P(lose$)':>8s} {'E[util]':>8s}")
     for name, pol in pols:
         N = run_policy(pol)
-        dn = torch.clamp(-N, min=0.0)
-        print(f"  {name:28s}  {float(N.mean()):+6.2f} {float((dn**2).mean().sqrt()):8.2f} "
-              f"{float(torch.quantile(N,0.05)):+8.2f} {float(torch.quantile(N,0.95)):+8.2f} "
-              f"{float(utility(N).mean()):+8.2f}")
-    print("  (min-var = analytic variance-minimiser: symmetric, so it gives up the upside (95%);")
-    print("   basis-capped on the downside too.  learned = dynamic utility policy (objective=E[util]):")
-    print("   it TIMES the mean-reversion -- net-longer when spot is low, shorter when high -- giving")
-    print("   a tighter tail AND far more upside than the static hedge.  Read E[util], the objective.)")
+        ploss = float((N < 0.0).double().mean()) * 100.0          # ate through the WHOLE spread
+        print(f"  {name:30s}  {float(N.mean()):+6.2f} "
+              f"{float(torch.quantile(N, 0.05)):+8.2f} {float(torch.quantile(N, 0.95)):+8.2f} "
+              f"{ploss:7.1f}% {float(utility(N).mean()):+8.2f}")
+    print(f"  (W_T<0 = we lost the ENTIRE spread and more.  The spread is a downside BUDGET: with it,")
+    print(f"   min-var over-hedges -- it spends upside to buy tail safety the cushion already gives.  The")
+    print(f"   learned policy under-hedges, keeps the upside, and still rarely loses the spread.)")
 
 
 if __name__ == "__main__":

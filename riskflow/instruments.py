@@ -23,7 +23,21 @@ from functools import reduce
 
 # utility functions and constants
 from . import utils, pricing
-from .hedge_features import LEG_FEATURE_NAMES, LEG_ID_NAMES
+
+# Leg-feature schema (produced by the deal `hedge_features()` methods below; consumed by the
+# hedge bundle builder). Lives here with its producer.
+LEG_FEATURE_NAMES = (
+    'fixed_basis',
+    'volume',
+    'time_to_period_start',
+    # time_to_period_end pruned — for our deal types it differs from `time_to_payment`
+    # by a fixed settlement-lag offset and is therefore highly correlated. Reintroduce
+    # for deal structures with non-trivial period-end-to-payment dynamics (deferred
+    # settlement, conditional payments).
+    'time_to_payment',
+    'accumulation_fraction',
+)
+LEG_ID_NAMES = ('currency', 'underlying', 'leg_type')
 
 # specific modules
 import numpy as np

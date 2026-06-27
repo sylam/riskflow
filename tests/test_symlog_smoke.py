@@ -66,6 +66,29 @@ def test_symlog_objective_runs():
     print(f"test_symlog_objective_runs: PASS  (mean=${metrics['average_net_pnl']:+,.0f})")
 
 
+def test_huber_objective_runs():
+    """AsymmetricUtility_Huber flows through run_job (bundle resolves c, objective dispatches
+    the Huber terminal utility) and produces a finite headline."""
+    data = _load(Object='AsymmetricUtility_Huber', Huber_Aversion=2.5, Huber_Delta=1.0)
+    result = _run(data)
+    assert float(result.torchrl_bundle.get('utility_scale', 0.0)) > 1e3, "huber needs a real c"
+    metrics = result.evaluation_summary['metrics']
+    assert metrics['average_net_pnl'] is not None and \
+        metrics['average_net_pnl'] == metrics['average_net_pnl'], f"huber NaN headline: {metrics}"
+    print(f"test_huber_objective_runs: PASS  (mean=${metrics['average_net_pnl']:+,.0f})")
+
+
+def test_cara_objective_runs():
+    """AsymmetricUtility_CARA flows through run_job and produces a finite headline."""
+    data = _load(Object='AsymmetricUtility_CARA', CARA_Gamma=1.0)
+    result = _run(data)
+    assert float(result.torchrl_bundle.get('utility_scale', 0.0)) > 1e3, "cara needs a real c"
+    metrics = result.evaluation_summary['metrics']
+    assert metrics['average_net_pnl'] is not None and \
+        metrics['average_net_pnl'] == metrics['average_net_pnl'], f"cara NaN headline: {metrics}"
+    print(f"test_cara_objective_runs: PASS  (mean=${metrics['average_net_pnl']:+,.0f})")
+
+
 def test_unknown_utility_scale_mode_fails_loud():
     """Typo in Utility_Scale_Mode raises at bundle build, not silently."""
     data = _load(Object='AsymmetricUtility_Symlog', Floor_Penalty=10.0,
