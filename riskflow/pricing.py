@@ -1155,6 +1155,270 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
 
     return value * discount_rates
 
+
+def _tarf_fd_option(deal_data, name, default):
+    options = getattr(deal_data.Instrument, 'options', {}) or {}
+    for key in (f'TARF_FD_{name}', f'FD_Tarf_{name}', name):
+        if key in options:
+            return options[key]
+    return default
+
+
+def _apply_tarf_fd_jump(value_after, spot_grid, accrued_grid, strike, target_value,
+                        notional_itm, notional_otm, call_or_put, inverted_target,
+                        barrier, coupon_discount, interp_accrued):
+    """Apply one TARF fixing jump to value_after [batch, accrued, spot]."""
+    dtype = value_after.dtype
+    device = value_after.device
+    batch_size = value_after.shape[0]
+    accrued = accrued_grid.reshape(1, -1, 1)
+    spot_nodes = spot_grid.reshape(1, 1, -1)
+    strike_t = torch.as_tensor(strike, dtype=dtype, device=device).reshape(1, 1, 1)
+    target_t = torch.as_tensor(target_value, dtype=dtype, device=device).reshape(1, 1, 1)
+    notional_itm_t = torch.as_tensor(notional_itm, dtype=dtype, device=device).reshape(1, 1, 1)
+    notional_otm_t = torch.as_tensor(notional_otm, dtype=dtype, device=device).reshape(1, 1, 1)
+    call_or_put_t = torch.as_tensor(call_or_put, dtype=dtype, device=device).reshape(1, 1, 1)
+    coupon_df = coupon_discount.reshape(batch_size, 1, 1)
+
+    if inverted_target:
+        intrinsic = (1.0 / spot_nodes - 1.0 / strike_t) * (-call_or_put_t)
+    else:
+        intrinsic = (spot_nodes - strike_t) * call_or_put_t
+
+    remaining = (target_t - accrued).clamp_min(0.0)
+    positive_accrual = torch.minimum(intrinsic.clamp_min(0.0), remaining)
+    negative_accrual = (-intrinsic).clamp_min(0.0)
+    if barrier > 0.0:
+        barrier_hit = (((barrier - spot_nodes) * call_or_put_t) >= 0.0).to(dtype)
+    else:
+        barrier_hit = torch.ones_like(intrinsic)
+
+    coupon = notional_itm_t * positive_accrual - notional_otm_t * negative_accrual * barrier_hit
+    accrued_after = accrued + positive_accrual
+    continuation = interp_accrued(
+        value_after, accrued_grid, accrued_after.expand(batch_size, -1, -1))
+    alive = (accrued_after < target_t).to(dtype)
+    return coupon_df * coupon + alive * continuation
+
+
+def _fd_step_implicit_logspot_batched(value_later, spot_grid, domestic_rate, carry_rate,
+                                      volatility, year_step):
+    """Implicit Euler log-spot step for value_later [batch, accrued, spot]."""
+    if year_step <= 0.0:
+        return value_later
+    dtype = value_later.dtype
+    device = value_later.device
+    batch_size, accrued_count, num_spot = value_later.shape
+    inner_count = num_spot - 2
+    if inner_count < 1:
+        raise ValueError('Need at least 3 spot grid nodes for TARF finite-difference pricing')
+
+    log_grid = torch.log(spot_grid)
+    log_step = log_grid[1] - log_grid[0]
+    sigma2 = volatility * volatility
+    drift = carry_rate - 0.5 * sigma2
+    lower_coeff = -year_step * (0.5 * sigma2 / (log_step * log_step) - drift / (2.0 * log_step))
+    diag_coeff = 1.0 + year_step * (sigma2 / (log_step * log_step) + domestic_rate)
+    upper_coeff = -year_step * (0.5 * sigma2 / (log_step * log_step) + drift / (2.0 * log_step))
+
+    lower_diag = lower_coeff.reshape(batch_size, 1).expand(batch_size, inner_count).clone()
+    main_diag = diag_coeff.reshape(batch_size, 1).expand(batch_size, inner_count).clone()
+    upper_diag = upper_coeff.reshape(batch_size, 1).expand(batch_size, inner_count).clone()
+    lower_diag[:, 0] = 0.0
+    upper_diag[:, -1] = 0.0
+
+    boundary_discount = torch.exp(-domestic_rate * year_step).reshape(batch_size, 1)
+    left_boundary = value_later[:, :, 0] * boundary_discount
+    right_boundary = value_later[:, :, -1] * boundary_discount
+    rhs = value_later[:, :, 1:-1].clone()
+    rhs[:, :, 0] = rhs[:, :, 0] - lower_coeff.reshape(batch_size, 1) * left_boundary
+    rhs[:, :, -1] = rhs[:, :, -1] - upper_coeff.reshape(batch_size, 1) * right_boundary
+
+    solve_rows = batch_size * accrued_count
+    repeated_lower = lower_diag[:, None, :].expand(batch_size, accrued_count, inner_count).reshape(solve_rows, inner_count)
+    repeated_main = main_diag[:, None, :].expand(batch_size, accrued_count, inner_count).reshape(solve_rows, inner_count)
+    repeated_upper = upper_diag[:, None, :].expand(batch_size, accrued_count, inner_count).reshape(solve_rows, inner_count)
+    inner_value = utils.solve_tridiagonal_batched(
+        repeated_lower, repeated_main, repeated_upper, rhs.reshape(solve_rows, inner_count))
+    inner_value = inner_value.reshape(batch_size, accrued_count, inner_count)
+    return torch.cat([left_boundary[:, :, None], inner_value, right_boundary[:, :, None]], dim=2)
+
+
+def pv_FD_Tarf(shared, time_grid, deal_data, spot):
+    """Finite-difference TARF pricer using the same block/fixing scaffolding as pv_MC_Tarf."""
+    mtm_list = []
+    factor_dep = deal_data.Factor_dep
+    deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
+    discount = utils.calc_time_grid_curve_rate(factor_dep['Discount'], deal_time, shared)
+    daycount_fn = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount]
+    dtype = shared.one.dtype
+    device = shared.one.device
+    eps = torch.finfo(dtype).eps
+
+    samples = factor_dep['Fixings'].reinitialize(shared.one)
+    start_idx = samples.get_start_index(deal_time)
+    start_index, counts = np.unique(start_idx, return_counts=True)
+
+    fx_samples = factor_dep['Price_Fixings'].reinitialize(shared.one)
+    known_resets = fx_samples.known_resets(shared.simulation_batch)
+    sim_samples = fx_samples.schedule[
+        (fx_samples.schedule[:, utils.RESET_INDEX_Scenario] > -1) &
+        (fx_samples.schedule[:, utils.RESET_INDEX_Reset_Day] <= deal_time[:, utils.TIME_GRID_MTM].max())]
+    next_samples = utils.calc_fx_cross(
+        factor_dep['Underlying_Currency'][0], factor_dep['Currency'][0],
+        sim_samples[:, :utils.RESET_INDEX_Scenario + 1], shared)
+
+    target_value = torch.as_tensor(deal_data.Instrument.field['TargetLevel'], dtype=dtype, device=device)
+    barrier = deal_data.Instrument.field.get('Barrier', 0.0)
+    notional_itm = factor_dep['Notional1'] * shared.one
+    notional_otm = factor_dep['Notional2'] * shared.one
+    strike = torch.as_tensor(factor_dep['Strike_Price'], dtype=dtype, device=device)
+    inverted_target = deal_data.Instrument.field['InvertedTarget']
+    call_or_put = factor_dep['Option_Type']
+
+    def interp_accrued(value_grid, accrued_grid, accrued_query):
+        batch_size, _, num_spot = value_grid.shape
+        flat_query = accrued_query.reshape(-1).clamp(accrued_grid[0], accrued_grid[-1])
+        upper_index = torch.searchsorted(accrued_grid, flat_query, right=False)
+        upper_index = upper_index.clamp(1, accrued_grid.numel() - 1)
+        lower_index = upper_index - 1
+        lower_value = accrued_grid[lower_index]
+        upper_value = accrued_grid[upper_index]
+        weight = (flat_query - lower_value) / (upper_value - lower_value).clamp_min(
+            torch.finfo(value_grid.dtype).eps)
+
+        queries_per_batch = accrued_query[0].numel()
+        spot_index = torch.arange(num_spot, device=value_grid.device).repeat(accrued_query.numel() // num_spot)
+        batch_index = torch.arange(batch_size, device=value_grid.device).repeat_interleave(queries_per_batch)
+        value_lower = value_grid[batch_index, lower_index, spot_index]
+        value_upper = value_grid[batch_index, upper_index, spot_index]
+        return ((1.0 - weight) * value_lower + weight * value_upper).reshape_as(accrued_query)
+
+    def interp_spot(values_on_spot, spot_grid, spot_query):
+        query = spot_query.clamp(spot_grid[0], spot_grid[-1])
+        upper_index = torch.searchsorted(spot_grid, query, right=False)
+        upper_index = upper_index.clamp(1, spot_grid.numel() - 1)
+        lower_index = upper_index - 1
+        weight = (query - spot_grid[lower_index]) / (spot_grid[upper_index] - spot_grid[lower_index]).clamp_min(
+            torch.finfo(values_on_spot.dtype).eps)
+        batch_index = torch.arange(values_on_spot.shape[0], device=values_on_spot.device)
+        return ((1.0 - weight) * values_on_spot[batch_index, lower_index] +
+                weight * values_on_spot[batch_index, upper_index])
+
+    def calc_accum_value(accumulated, spot_value):
+        if inverted_target:
+            intrinsic_value = (1.0 / spot_value - 1.0 / strike) * call_or_put * (-1.0)
+        else:
+            intrinsic_value = (spot_value - strike) * call_or_put
+        return (accumulated + F.relu(intrinsic_value).reshape(-1, 1)).clamp(max=target_value)
+
+    accumulated = shared.one * 0.0
+    for sample_value in fx_samples.schedule[:, utils.RESET_INDEX_Value]:
+        if sample_value:
+            accumulated = calc_accum_value(accumulated, sample_value * shared.one)
+
+    accumulation = [accumulated]
+    for sample_value in next_samples:
+        accumulation.append(calc_accum_value(accumulation[-1], sample_value))
+
+    settle_idx = np.searchsorted(factor_dep['Settlement'], deal_time[:, utils.TIME_GRID_MTM]).astype(np.int64)
+    fixing_indices = counts.cumsum() - 1
+    settle_index = settle_idx[fixing_indices]
+
+    num_spot = int(_tarf_fd_option(deal_data, 'Num_Spot', 201))
+    num_accrued = int(_tarf_fd_option(deal_data, 'Num_Accrued', 61))
+    pde_steps_per_month = float(_tarf_fd_option(deal_data, 'Steps_Per_Month', 4.0))
+    log_width = float(_tarf_fd_option(deal_data, 'Log_Width', 0.35))
+    num_spot = max(3, num_spot + (1 - num_spot % 2))
+    num_accrued = max(2, num_accrued)
+
+    for block_index, (discount_block, spot_block) in enumerate(
+            utils.split_counts([discount, spot], counts, shared)):
+        t_block = discount_block.time_grid
+        settle_index_local = settle_index[block_index]
+        fixing_days = (fx_samples[np.newaxis, settle_index_local:, utils.RESET_INDEX_End_Day] -
+                       t_block[:, utils.TIME_GRID_MTM, np.newaxis]).clip(min=0)
+        settlement_days = (factor_dep['Settlement'][np.newaxis, settle_index_local:] -
+                           t_block[:, utils.TIME_GRID_MTM, np.newaxis])
+        carry = utils.calc_fx_drift(
+            factor_dep['Underlying_Currency'], factor_dep['Currency'],
+            fixing_days, t_block, shared, multiply_by_time=False)
+        fixing_years = daycount_fn(fixing_days)
+        discount_to_settlement = utils.calc_discount_rate(discount_block, settlement_days, shared)
+        discount_to_fixing = utils.calc_discount_rate(discount_block, fixing_days, shared).clamp_min(eps)
+        coupon_discount = discount_to_settlement / discount_to_fixing
+
+        block_values = []
+        for row_index, spot_row in enumerate(spot_block):
+            active_fixing_years = carry.new(fixing_years[row_index])
+            active_fixings = int((active_fixing_years >= 0.0).sum())
+            if active_fixings == 0 or target_value <= 0.0:
+                block_values.append(spot_row.new_zeros(spot_row.shape))
+                continue
+
+            log_center = torch.log(spot_row.detach().clamp_min(eps)).mean()
+            log_grid = torch.linspace(
+                log_center - log_width, log_center + log_width, num_spot,
+                dtype=dtype, device=device)
+            spot_grid = torch.exp(log_grid)
+            accrued_grid = torch.linspace(
+                0.0, float(target_value.detach()), num_accrued, dtype=dtype, device=device)
+            value_grid = spot_row.new_zeros((spot_row.numel(), num_accrued, num_spot))
+
+            forward = spot_row.unsqueeze(0) * torch.exp(carry[row_index] * active_fixing_years.reshape(-1, 1))
+            moneyness = strike / forward if factor_dep['Invert_Moneyness'] else forward / strike
+            vols = torch.stack([
+                utils.calc_time_grid_vol_rate(
+                    factor_dep['Volatility'], mon, fixing_tau.reshape(1, 1), shared).reshape(-1)
+                for mon, fixing_tau in zip(moneyness, active_fixing_years)
+            ])
+
+            for fixing_index in range(active_fixings - 1, -1, -1):
+                value_grid = _apply_tarf_fd_jump(
+                    value_grid, spot_grid, accrued_grid, strike, target_value,
+                    notional_itm, notional_otm, call_or_put, inverted_target,
+                    barrier, coupon_discount[row_index, fixing_index].reshape(-1), interp_accrued)
+
+                later_time = active_fixing_years[fixing_index]
+                earlier_time = (active_fixing_years[fixing_index - 1]
+                                if fixing_index > 0 else later_time.new_tensor(0.0))
+                total_year_step = float((later_time - earlier_time).clamp_min(0.0).detach())
+                if total_year_step <= 0.0:
+                    continue
+                previous_discount = (discount_to_fixing[row_index, fixing_index - 1]
+                                     if fixing_index > 0 else torch.ones_like(discount_to_fixing[row_index, fixing_index]))
+                interval_discount = (discount_to_fixing[row_index, fixing_index] / previous_discount).clamp_min(eps)
+                domestic_rate = -torch.log(interval_discount) / total_year_step
+                if fixing_index > 0:
+                    carry_rate = ((carry[row_index, fixing_index] * active_fixing_years[fixing_index] -
+                                   carry[row_index, fixing_index - 1] * active_fixing_years[fixing_index - 1]) /
+                                  total_year_step)
+                    variance = (active_fixing_years[fixing_index] * vols[fixing_index] * vols[fixing_index] -
+                                active_fixing_years[fixing_index - 1] * vols[fixing_index - 1] *
+                                vols[fixing_index - 1]).clamp_min(eps)
+                    volatility = torch.sqrt(variance / total_year_step)
+                else:
+                    carry_rate = carry[row_index, fixing_index]
+                    volatility = vols[fixing_index].clamp_min(eps)
+
+                num_steps = max(1, int(round(pde_steps_per_month * total_year_step * 12.0)))
+                year_step = total_year_step / num_steps
+                for _ in range(num_steps):
+                    value_grid = _fd_step_implicit_logspot_batched(
+                        value_grid, spot_grid, domestic_rate, carry_rate, volatility, year_step)
+
+            initial_accrued = accumulation[settle_index_local].reshape(-1).to(dtype=dtype, device=device)
+            if initial_accrued.numel() == 1:
+                initial_accrued = initial_accrued.expand_as(spot_row)
+            value_at_accrued = interp_accrued(
+                value_grid, accrued_grid, initial_accrued.reshape(-1, 1).expand(-1, num_spot))
+            block_values.append(interp_spot(value_at_accrued, spot_grid, spot_row))
+
+        theo_price = factor_dep['Buy_Sell'] * torch.stack(block_values, dim=0)
+        mtm_list.append(theo_price)
+
+    return torch.cat(mtm_list, dim=0)
+
 def pv_MC_Tarf(shared, time_grid, deal_data, spot):
     """
     One-step survival Monte Carlo for TARF (autograd-friendly).

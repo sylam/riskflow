@@ -1618,6 +1618,40 @@ def interpolate_tensor(t, tenor, rate_tensor):
     return rate_tensor[index] * (1 - alpha) + rate_tensor[index_next] * alpha
 
 
+def solve_tridiagonal_batched(lower_diag, main_diag, upper_diag, rhs):
+    """Batched Thomas solve for tridiagonal systems.
+
+    Diagonals are either [rows, n] or [n]; rhs is [rows, n]. Returns [rows, n].
+    """
+    num_nodes = rhs.shape[-1]
+    if lower_diag.dim() == 1:
+        lower_diag = lower_diag.unsqueeze(0).expand_as(rhs)
+        main_diag = main_diag.unsqueeze(0).expand_as(rhs)
+        upper_diag = upper_diag.unsqueeze(0).expand_as(rhs)
+    if num_nodes == 1:
+        return rhs / main_diag[:, :1]
+
+    c_prime = []
+    d_prime = []
+    denom = main_diag[:, 0]
+    c_prime.append(upper_diag[:, 0] / denom)
+    d_prime.append(rhs[:, 0] / denom)
+
+    for node in range(1, num_nodes):
+        denom = main_diag[:, node] - lower_diag[:, node] * c_prime[node - 1]
+        if node < num_nodes - 1:
+            c_prime.append(upper_diag[:, node] / denom)
+        else:
+            c_prime.append(torch.zeros_like(denom))
+        d_prime.append((rhs[:, node] - lower_diag[:, node] * d_prime[node - 1]) / denom)
+
+    solution = [None] * num_nodes
+    solution[-1] = d_prime[-1]
+    for node in range(num_nodes - 2, -1, -1):
+        solution[node] = d_prime[node] - c_prime[node] * solution[node + 1]
+    return torch.stack(solution, dim=1)
+
+
 # indexing ops manipulating large tensors
 def gather_interp_matrix(mtm, deal_time_dep, shared):
     if deal_time_dep.alpha.any():
