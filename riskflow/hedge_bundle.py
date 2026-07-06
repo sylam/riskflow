@@ -20,10 +20,10 @@ import pandas as pd
 import torch
 
 from .hedge_runtime import assemble_privileged_factors
-from .instruments import LEG_FEATURE_NAMES
 
 
-# --- spot/basis statistic features (relocated from the deleted hedge_features.py) ---------- #
+# --- spot realized-vol + timeline (relocated from the deleted hedge_features.py); feed the
+#     symlog utility scale c in resolve_utility_scale ------------------------------------------ #
 PRICE_ZSCORE_WINDOW = 20
 
 
@@ -67,91 +67,6 @@ def compute_spot_realized_vol(bundle, window=PRICE_ZSCORE_WINDOW, min_periods=5,
         rv = (252.0 * sum_w / count[1:]).clamp_min(0.0).sqrt()
         rv[:min_periods] = 0.0
         out[commodity] = rv
-    return out
-
-
-def compute_spot_trend(bundle, *, window):
-    """Annualised log-return over `window` business days, per commodity:
-    trend_W(t) = log(S(t) / S(t-W)) * (252 / W). Signed direction-and-magnitude trend signal,
-    magnitude comparable across windows; zero for t < window (no full lookback yet)."""
-    spot_history = bundle.get('spot_price_history') or {}
-    if not spot_history:
-        return {}
-    out = {}
-    for commodity in spot_history.keys():
-        S = _full_spot_timeline(bundle, commodity)
-        if S is None:
-            continue
-        log_S = S.clamp_min(1e-9).log()
-        T = log_S.shape[0]
-        trend = torch.zeros_like(log_S)
-        if T > window:
-            trend[window:] = (log_S[window:] - log_S[:-window]) * (252.0 / float(window))
-        out[commodity] = trend
-    return out
-
-
-def compute_spot_stretch(bundle, *, window):
-    """Vol-normalised stretch from the rolling moving average:
-    stretch_W(t) = (S(t) - MA_W(t)) / (RV_W(t) * S(t)). Reuses `bundle['spot_realized_vol']` if
-    available (same default 20d window); otherwise falls back to price-std normalisation."""
-    spot_history = bundle.get('spot_price_history') or {}
-    if not spot_history:
-        return {}
-    rv_dict = bundle.get('spot_realized_vol') or {}
-    out = {}
-    for commodity in spot_history.keys():
-        S = _full_spot_timeline(bundle, commodity)
-        if S is None:
-            continue
-        T = S.shape[0]
-        # Vectorised rolling mean via cumulative sum.
-        cum = torch.cat([torch.zeros_like(S[:1]), S.cumsum(dim=0)], dim=0)  # (T+1, B)
-        idx = torch.arange(T, device=S.device)
-        lo = (idx - window + 1).clamp_min(0)
-        count = (idx - lo + 1).to(dtype=torch.float32).clamp_min(1.0).unsqueeze(-1)
-        ma = (cum[idx + 1] - cum[lo]) / count
-        rv = rv_dict.get(commodity)
-        if rv is None:
-            sq = (S - ma).pow(2)
-            cum_sq = torch.cat([torch.zeros_like(sq[:1]), sq.cumsum(dim=0)], dim=0)
-            window_sq = cum_sq[idx + 1] - cum_sq[lo]
-            std = (window_sq / count).clamp_min(1e-12).sqrt()
-            denom = std
-        else:
-            denom = (rv * S).clamp_min(1e-9)
-        out[commodity] = (S - ma) / denom
-    return out
-
-
-def compute_basis_zscore(bundle, *, window=20, eps=1e-9):
-    """Per-future basis z-score over a rolling window: basis_i(t) = F_i(t) - S(t),
-    zscore_i(t) = (basis_i - MA_W) / std_W. Returns {instrument_name → (T, B)}. Single-commodity
-    assumption: all instruments track the first spot factor in `bundle['spot_price_history']`."""
-    spot_history = bundle.get('spot_price_history') or {}
-    tradables = bundle.get('tradables') or {}
-    if not spot_history or not tradables:
-        return {}
-    commodity = next(iter(spot_history))
-    S = _full_spot_timeline(bundle, commodity)
-    if S is None:
-        return {}
-    out = {}
-    for name, F_i in tradables.items():
-        F = F_i.to(dtype=torch.float32)
-        S_t = S.to(dtype=torch.float32, device=F.device)
-        basis = F - S_t                                                 # (T, B)
-        T = basis.shape[0]
-        cum = torch.cat([torch.zeros_like(basis[:1]), basis.cumsum(dim=0)], dim=0)
-        idx = torch.arange(T, device=basis.device)
-        lo = (idx - window + 1).clamp_min(0)
-        count = (idx - lo + 1).to(dtype=torch.float32).clamp_min(1.0).unsqueeze(-1)
-        ma = (cum[idx + 1] - cum[lo]) / count
-        sq = (basis - ma).pow(2)
-        cum_sq = torch.cat([torch.zeros_like(sq[:1]), sq.cumsum(dim=0)], dim=0)
-        window_sq = cum_sq[idx + 1] - cum_sq[lo]
-        std = (window_sq / count).clamp_min(eps).sqrt()
-        out[name] = (basis - ma) / std
     return out
 
 
@@ -1353,7 +1268,7 @@ def _prepend_history_prefix(bundle, runtime, base_date):
 
     Adds bundle['spot_price_history'][commodity] of shape (H, B) — broadcast historical spot.
     Adjusts bundle['time_grid_days'], bundle['tradables'][name], bundle['liability_mtm'],
-    bundle['realized_cashflows'][currency], bundle['legs']['features'], bundle['factors'][name].
+    bundle['realized_cashflows'][currency], bundle['factors'][name].
     """
     H = int(runtime.get('history_lookback_business_days', 0))
     spot_history = (runtime.get('portfolio_state') or {}).get('spot_price_history') or {}
@@ -1387,24 +1302,12 @@ def _prepend_history_prefix(bundle, runtime, base_date):
         mtm = bundle['liability_mtm']
         mtm_prefix = mtm[:1].expand(H, -1).contiguous()
         bundle['liability_mtm'] = torch.cat([mtm_prefix, mtm], dim=0)
-    if bundle.get('hedge_ratios'):
-        new_ratios = {}
-        for tradable_name, by_factor in bundle['hedge_ratios'].items():
-            new_ratios[tradable_name] = {}
-            for factor_name, tensor in by_factor.items():
-                r_prefix = tensor[:1].expand((H,) + tuple(tensor.shape[1:])).contiguous()
-                new_ratios[tradable_name][factor_name] = torch.cat([r_prefix, tensor], dim=0)
-        bundle['hedge_ratios'] = new_ratios
     if bundle.get('realized_cashflows'):
         new_cf = {}
         for currency, tensor in bundle['realized_cashflows'].items():
             cf_prefix = torch.zeros((H,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
             new_cf[currency] = torch.cat([cf_prefix, tensor], dim=0)
         bundle['realized_cashflows'] = new_cf
-    if bundle.get('legs') is not None and bundle['legs'].get('features') is not None:
-        feats = bundle['legs']['features']
-        feats_prefix = feats[:1].expand((H,) + tuple(feats.shape[1:])).contiguous()
-        bundle['legs']['features'] = torch.cat([feats_prefix, feats], dim=0)
     if bundle.get('factors'):
         new_factors = {}
         for factor_name, tensor in bundle['factors'].items():
@@ -1413,44 +1316,10 @@ def _prepend_history_prefix(bundle, runtime, base_date):
         bundle['factors'] = new_factors
 
 
-def _static_portfolio_descriptors(legs_features, feat_names, ref_price):
-    """Deterministic per-outer-t portfolio descriptors from the leg-feature tensor —
-    identical for every batch element (book composition is deterministic). Returns
-    `(T, 7)`: aggregate_notional, weighted_avg_strike, weighted_avg_tte,
-    weighted_moneyness, expiry_dispersion, strike_dispersion, fraction_in_window.
-
-    `|fixed_basis|` is used as the strike level — the energy-Asian payoff references
-    `Fixed_Basis`, and LEG_FEATURE_NAMES carries no separate strike field. Volume is the
-    notional weight. For a single-leg book the dispersions are identically zero."""
-    names = tuple(feat_names)
-    lf = legs_features
-    while lf.ndim > 3:                      # (T, B, L, F) -> (T, L, F)
-        lf = lf[:, 0]
-    fixed_basis = lf[..., names.index('fixed_basis')]              # (T, L)
-    volume = lf[..., names.index('volume')]
-    ttps = lf[..., names.index('time_to_period_start')]
-    ttp = lf[..., names.index('time_to_payment')]
-    w = volume.abs()                                                # (T, L)
-    w_sum = w.sum(dim=-1).clamp_min(1.0e-8)                          # (T,)
-    strike = fixed_basis.abs()
-    aggregate_notional = w.sum(dim=-1)
-    weighted_avg_strike = (w * strike).sum(-1) / w_sum
-    weighted_avg_tte = (w * ttp).sum(-1) / w_sum
-    weighted_moneyness = weighted_avg_strike / max(float(ref_price), 1.0e-8)
-    expiry_dispersion = torch.sqrt(
-        ((w * (ttp - weighted_avg_tte.unsqueeze(-1)) ** 2).sum(-1) / w_sum).clamp_min(0.0))
-    strike_dispersion = torch.sqrt(
-        ((w * (strike - weighted_avg_strike.unsqueeze(-1)) ** 2).sum(-1) / w_sum).clamp_min(0.0))
-    in_window = ((ttps <= 0.0) & (ttp > 0.0)).to(w.dtype)           # period started, unpaid
-    fraction_in_window = (w * in_window).sum(-1) / w_sum
-    return torch.stack([
-        aggregate_notional, weighted_avg_strike, weighted_avg_tte, weighted_moneyness,
-        expiry_dispersion, strike_dispersion, fraction_in_window], dim=-1)               # (T, 7)
-
-
 def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
                           factor_tensor_blocks, hedge_profile_blocks, num_batches,
-                          stoch_factors, runtime=None, privileged_factor_blocks=None):
+                          stoch_factors, runtime=None, privileged_factor_blocks=None,
+                          total_leg_volume=None, last_payment_day=None):
     """Assemble the per-batch tensor blocks (produced by the HedgeMonteCarlo simulator) into
     a single hedge bundle: concatenates blocks along the batch axis, prepends
     history-prefix rows, derives feature surfaces (realized vol, trend, stretch, privileged
@@ -1472,47 +1341,15 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
 
     tradables = {n: torch.cat(blocks, dim=1) for n, blocks in tradable_blocks.items()}
     factors = {n: torch.cat(blocks, dim=-1) for n, blocks in factor_tensor_blocks.items()}
-    legs_bundle = None
-    if hedge_profile_blocks and hedge_profile_blocks.get('legs_features'):
-        legs_bundle = {
-            'features': torch.cat(hedge_profile_blocks['legs_features'], dim=1),
-            'ids': list(hedge_profile_blocks['legs_ids'] or ()),
-            'feature_names': tuple(hedge_profile_blocks.get('legs_feature_names') or ()),
-            'id_names': tuple(hedge_profile_blocks.get('legs_id_names') or ()),
-        }
     liability_mtm = torch.cat(hedge_profile_blocks['mtm'], dim=1) if hedge_profile_blocks.get('mtm') else None
-    hedge_ratio_blocks = hedge_profile_blocks.get('hedge_ratios') or {}
-    hedge_ratios_pre_pad = {}
-    for tradable_name, blocks in hedge_ratio_blocks.items():
-        if not blocks:
-            continue
-        factor_names = list(blocks[0].keys())
-        hedge_ratios_pre_pad[tradable_name] = {
-            name: torch.cat([block[name] for block in blocks], dim=1) for name in factor_names
-        }
-    fwd_jac_blocks = hedge_profile_blocks.get('forward_jacobian') or {}
-    fwd_jac_pre_pad = {}
-    for tradable_name, blocks in fwd_jac_blocks.items():
-        if not blocks:
-            continue
-        factor_names = list(blocks[0].keys())
-        fwd_jac_pre_pad[tradable_name] = {
-            # Batch is the trailing axis for both scalar (T, B) and curve (T, n_tenors, B) deltas.
-            name: torch.cat([block[name] for block in blocks], dim=-1) for name in factor_names
-        }
-    # Liability Jacobian ∂L/∂factor — a single {factor: (T,[n_tenors,]B)} dict per batch
-    # (not per-tradable, since the liability is one deal). Batch trailing, like fwd_jac.
-    liab_jac_blocks = hedge_profile_blocks.get('liability_jacobian') or []
-    liab_jac_pre_pad = {}
-    if liab_jac_blocks:
-        for name in list(liab_jac_blocks[0].keys()):
-            liab_jac_pre_pad[name] = torch.cat([blk[name] for blk in liab_jac_blocks], dim=-1)
     realized_cashflows = {
         currency: torch.cat(blocks, dim=1)
         for currency, blocks in (hedge_profile_blocks.get('realized_cashflows') or {}).items()
     }
-    if legs_bundle is not None:
-        aligned_time_steps = int(legs_bundle['features'].shape[0])
+    if liability_mtm is not None:
+        # The liability MTM sets the mtm/hedge time axis (its native length is the mtm grid —
+        # the same axis the old leg-feature tensor defined); everything else pads/truncates to it.
+        aligned_time_steps = int(liability_mtm.shape[0])
     else:
         candidate_lengths = [int(time_grid_days.shape[0])]
         candidate_lengths.extend(int(tensor.shape[0]) for tensor in tradables.values())
@@ -1525,56 +1362,8 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
     }
     if factors:
         bundle['factors'] = {n: pad_time_axis(t, aligned_time_steps) for n, t in factors.items()}
-    if legs_bundle is not None:
-        bundle['legs'] = {
-            'features': pad_time_axis(legs_bundle['features'], aligned_time_steps),
-            'ids': legs_bundle['ids'],
-            'feature_names': legs_bundle['feature_names'],
-            'id_names': legs_bundle['id_names'],
-        }
     if liability_mtm is not None:
         bundle['liability_mtm'] = pad_time_axis(liability_mtm, aligned_time_steps)
-    # Per-(tradable, factor) hedge ratios — zero-pad post-expiry rows; don't repeat last row.
-    if hedge_ratios_pre_pad:
-        hedge_ratios = {}
-        for tradable_name, by_factor in hedge_ratios_pre_pad.items():
-            hedge_ratios[tradable_name] = {}
-            for factor_name, tensor in by_factor.items():
-                cur_T = int(tensor.shape[0])
-                if cur_T >= aligned_time_steps:
-                    padded = tensor[:aligned_time_steps]
-                else:
-                    zeros = tensor.new_zeros((aligned_time_steps - cur_T,) + tuple(tensor.shape[1:]))
-                    padded = torch.cat([tensor, zeros], dim=0)
-                hedge_ratios[tradable_name][factor_name] = padded
-        bundle['hedge_ratios'] = hedge_ratios
-    # Per-(tradable, factor) forward Jacobian ∂F_h/∂θ — same zero-pad-post-expiry as ratios;
-    # shape[1:] preserves the trailing curve dims for multi-tenor factors.
-    if fwd_jac_pre_pad:
-        forward_jacobian = {}
-        for tradable_name, by_factor in fwd_jac_pre_pad.items():
-            forward_jacobian[tradable_name] = {}
-            for factor_name, tensor in by_factor.items():
-                cur_T = int(tensor.shape[0])
-                if cur_T >= aligned_time_steps:
-                    padded = tensor[:aligned_time_steps]
-                else:
-                    zeros = tensor.new_zeros((aligned_time_steps - cur_T,) + tuple(tensor.shape[1:]))
-                    padded = torch.cat([tensor, zeros], dim=0)
-                forward_jacobian[tradable_name][factor_name] = padded
-        bundle['forward_jacobian'] = forward_jacobian
-    # Liability Jacobian — same zero-pad-post-expiry; single {factor: (T,[n_tenors,]B)} dict.
-    if liab_jac_pre_pad:
-        liability_jacobian = {}
-        for factor_name, tensor in liab_jac_pre_pad.items():
-            cur_T = int(tensor.shape[0])
-            if cur_T >= aligned_time_steps:
-                padded = tensor[:aligned_time_steps]
-            else:
-                zeros = tensor.new_zeros((aligned_time_steps - cur_T,) + tuple(tensor.shape[1:]))
-                padded = torch.cat([tensor, zeros], dim=0)
-            liability_jacobian[factor_name] = padded
-        bundle['liability_jacobian'] = liability_jacobian
     if realized_cashflows:
         bundle['realized_cashflows'] = {
             currency: pad_time_axis(tensor, aligned_time_steps)
@@ -1600,36 +1389,22 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
     bundle['business_indices'] = tuple(
         i for i in range(min(last, len(bd_mask))) if bd_mask[i] and i >= initial_time_index
     )
-    if bundle.get('legs') is not None and bundle['legs'].get('features') is not None:
-        feat_names = tuple(bundle['legs'].get('feature_names', LEG_FEATURE_NAMES))
-        feats = bundle['legs']['features']
-        if 'volume' in feat_names:
-            leg_vol = feats[..., feat_names.index('volume')]
-            while leg_vol.ndim > 1:
-                leg_vol = leg_vol[0]
-            bundle['total_leg_volume'] = float(leg_vol.abs().sum().item())
-        if 'time_to_payment' in feat_names:
-            ttp = feats[..., feat_names.index('time_to_payment')]
-            while ttp.ndim > 2:
-                ttp = ttp[:, 0]
-            active = (ttp > 0).any(dim=-1) if ttp.ndim == 2 else (ttp > 0)
-            if bool(active.any()):
-                bundle['last_settlement_index'] = int(active.nonzero(as_tuple=False).max().item())
-        # Static (batch-independent) portfolio descriptors for the solver state vector.
-        ref_price = 1.0
-        if bundle.get('tradables'):
-            first_trad = next(iter(bundle['tradables'].values()))
-            ref_price = float(first_trad[min(initial_time_index, first_trad.shape[0] - 1)].mean())
-        bundle['static_portfolio_descriptors'] = _static_portfolio_descriptors(
-            feats, feat_names, ref_price)
+    # Liability descriptors the symlog utility-scale needs, from the cashflow schedule (no leg
+    # tensor). `total_leg_volume` = Σ|notional|; `last_settlement_index` = last (history-prefixed)
+    # grid step still strictly before the final payment — the same value the old leg-feature
+    # `time_to_payment > 0` reduction produced (time_to_payment>0 ⟺ grid_day < payment_day).
+    if total_leg_volume:
+        bundle['total_leg_volume'] = float(total_leg_volume)
+    if last_payment_day is not None:
+        pending = [i for i, d in enumerate(days_cpu) if d < last_payment_day]
+        if pending:
+            bundle['last_settlement_index'] = pending[-1]
+    logging.info('liability scalars: total_leg_volume=%s last_settlement_index=%s',
+                 bundle.get('total_leg_volume'), bundle.get('last_settlement_index'))
     bundle['spot_realized_vol'] = compute_spot_realized_vol(bundle)
     bundle['utility_scale'] = resolve_utility_scale(bundle, runtime or {})
     logging.info('utility_scale (symlog c) resolved to {0:.2f}'.format(bundle['utility_scale']))
     log_symlog_penalty_calibration(bundle, runtime or {})
-    bundle['spot_trend_20'] = compute_spot_trend(bundle, window=20)
-    bundle['spot_trend_60'] = compute_spot_trend(bundle, window=60)
-    bundle['spot_stretch_20'] = compute_spot_stretch(bundle, window=20)
-    bundle['basis_zscore_20'] = compute_basis_zscore(bundle, window=20)
     bundle['privileged_factors'] = assemble_privileged_factors(privileged_factor_blocks or {}, stoch_factors)
     H = int(runtime.get('history_lookback_business_days', 0)) if runtime else 0
     if H > 0 and bundle['privileged_factors']:

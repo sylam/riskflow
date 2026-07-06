@@ -222,23 +222,12 @@ class DealStructure(object):
         return accum
 
     def resolve_hedge_structure(self, shared, time_grid):
-        """
-        Resolves the Structure
-        """
+        """Accumulate the liability MTM across the structure and return `{'mtm': tensor}`.
+        Unlike `resolve_structure` this skips `post_process`/`save_results` — i.e. no per-batch
+        GPU->CPU copy of the mark — which is why the hedge sim loop and the inner MC use it for
+        the liability. (Deal feature tensors were removed; the symlog utility-scale's two static
+        descriptors now come from the cashflow schedule via `_liability_schedule_scalars`.)"""
         def merge_features(cumulative, new_features):
-            new_legs = new_features.get('legs')
-            if new_legs is not None:
-                if 'legs' in cumulative:
-                    cumulative['legs']['features'] = torch.cat(
-                        [cumulative['legs']['features'], new_legs['features']], dim=2)
-                    cumulative['legs']['ids'] = cumulative['legs']['ids'] + new_legs['ids']
-                else:
-                    cumulative['legs'] = {
-                        'features': new_legs['features'],
-                        'ids': list(new_legs['ids']),
-                        'feature_names': new_legs['feature_names'],
-                        'id_names': new_legs['id_names'],
-                    }
             new_mtm = new_features.get('mtm')
             if new_mtm is not None:
                 cumulative['mtm'] = new_mtm if cumulative.get('mtm') is None else cumulative['mtm'] + new_mtm
@@ -1770,6 +1759,31 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         return self._build_factor_state(
             dependent_factors, stochastic_factors, additional_factors, params, base_date, job_id, num_jobs)
 
+    def _liability_schedule_scalars(self):
+        """Static (batch-independent) liability descriptors the symlog utility-scale needs, read
+        straight from the cashflow schedules — no per-batch leg pass. Returns
+        `(total_leg_volume, last_payment_day)`: the summed |notional| across all liability legs
+        and the latest payment day (offset in days from base_date). `build_hedge_bundle` maps the
+        payment day onto the (history-prefixed) bundle time grid to recover `last_settlement_index`."""
+        total_volume = 0.0
+        last_payment_day = None
+
+        def walk(struct):
+            nonlocal total_volume, last_payment_day
+            for deal_data in struct.dependencies:
+                cashflows = deal_data.Factor_dep.get('Cashflows')
+                if cashflows is None:
+                    continue
+                schedule = cashflows.schedule
+                total_volume += float(np.abs(schedule[:, utils.CASHFLOW_INDEX_Nominal]).sum())
+                pay = float(schedule[:, utils.CASHFLOW_INDEX_Pay_Day].max())
+                last_payment_day = pay if last_payment_day is None else max(last_payment_day, pay)
+            for sub in struct.sub_structures:
+                walk(sub)
+
+        walk(self.liabilities)
+        return total_volume, last_payment_day
+
     def execute(self, params, job_id=0, num_jobs=1):
         """Run hedging simulation batches and package the result for TorchRL.
 
@@ -1876,26 +1890,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         }
         tradable_blocks = defaultdict(list)
         hedge_profile_blocks = {
-            'legs_features': [],
-            'legs_ids': None,
-            'legs_feature_names': None,
-            'legs_id_names': None,
             'mtm': [],
-            # Per-(tradable, factor) hedge ratios (in *contract* units), computed per-batch in
-            # the sim loop directly from liability and tradable AAD deltas — no separate
-            # spot_deltas accumulator needed since the ratio is the only thing the policy reads.
-            'hedge_ratios': defaultdict(list),
-            # Per-tradable forward Jacobian J = ∂F_h/∂θ — the RAW per-factor spot-deltas from
-            # extract_spot_deltas (before the hedge-ratio division), keyed by factor name. The
-            # diff-ML solver projects the value's factor-gradient onto the tradables through J
-            # to get the per-contract price differential ∂C/∂F_h.
-            'forward_jacobian': defaultdict(list),
-            # Liability Jacobian ∂L/∂factor — the per-factor spot-deltas of the deal MtM from
-            # extract_spot_deltas (already computed for hedge_ratios, previously discarded).
-            # The diff-ML bootstrap reconstructs the differentiable t±1 liability MtM from this
-            # + the spot leaf / re-seed, so ∂C/∂spot carries the REAL ∂L/∂spot (any deal),
-            # with no R_t hand-form. Keyed by factor name; one dict per batch.
-            'liability_jacobian': [],
             'realized_cashflows': defaultdict(list),
         }
         # Per-batch privileged-factor accumulator. Keyed by (factor_name, factor_attr) where
@@ -1958,14 +1953,11 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
             for key, proc in self.stoch_factors.items():
                 simulated = proc.generate(shared_mem)
-                # Diff-ML forward Jacobian (∂F_h/∂θ): the per-contract price differential is
-                # well-posed only if EVERY tradable risk factor is an AAD leaf, not just the
-                # declared spot — the carry curve gathered at distinct expiries is what gives
-                # J its rank (n_contracts ⇐ spot + carry-ladder + basis). So in the solve_hedge
-                # path we leaf all stochastic factors and `extract_spot_deltas` returns the full
-                # per-factor Jacobian. Downstream hedge_ratios consumers look up only their known
-                # (tradable, factor) pairs, so the extra factor columns are never read.
-                if solve_hedge_mode or utils.check_tuple_name(key) in declared_underlyings:
+                # Leaf the declared underlying(s) so the base-delta / conditional-feature pass can
+                # read ∂value/∂spot via AAD. The diff-ML solver differentiates the continuation
+                # inside the inner MC off its own fresh state-at-t leaves (see inner_mc_grad_fn),
+                # so it needs no outer leaf.
+                if utils.check_tuple_name(key) in declared_underlyings:
                     simulated = simulated.detach().requires_grad_(True)
                 shared_mem.t_Scenario_Buffer[key] = simulated
                 # Each process owns its privileged-factor surface; ask it what to expose. Default
@@ -1985,24 +1977,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             _ = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
             # clear hedge cashflows so t_Cashflows after the next call holds only liability cashflows
             shared_mem.reset_cashflows(self.time_grid)
-            # grab the liability features
-            features = self.liabilities.resolve_hedge_structure(shared_mem, self.time_grid)
-            legs = features.get('legs')
-            if legs is not None:
-                hedge_profile_blocks['legs_features'].append(legs['features'].detach().clone())
-                if hedge_profile_blocks['legs_ids'] is None:
-                    hedge_profile_blocks['legs_ids'] = list(legs['ids'])
-                    hedge_profile_blocks['legs_feature_names'] = legs['feature_names']
-                    hedge_profile_blocks['legs_id_names'] = legs['id_names']
-            mtm = features.get('mtm')
-            liability_spot_deltas = None
+            # grab the liability mark — post-process-free (no per-batch GPU->CPU save_results copy).
+            # The feature tensor is gone; the symlog scale's two static descriptors come from the
+            # cashflow schedule (`_liability_schedule_scalars`), not a per-batch leg pass.
+            mtm = self.liabilities.resolve_hedge_structure(shared_mem, self.time_grid).get('mtm')
             if mtm is not None:
-                liability_spot_deltas = pricing.extract_spot_deltas(mtm, shared_mem.t_Scenario_Buffer)
                 hedge_profile_blocks['mtm'].append(mtm.detach().clone())
-                # Persist ∂L/∂factor (per-factor, full grid) for the diff-ML bootstrap's
-                # differentiable liability reconstruction — same source as hedge_ratios.
-                hedge_profile_blocks['liability_jacobian'].append(
-                    {fn: d.detach().clone() for fn, d in liability_spot_deltas.items()})
 
             mtm_grid_size = self.time_grid.mtm_time_grid.size
             for currency, by_time in (shared_mem.t_Cashflows or {}).items():
@@ -2026,50 +2006,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
             if tradable_blocks is not None:
                 for instrument_name, instrument_tensor in trade_tensors.items():
-                    # Hedge ratio per (tradable, factor) in *contract* units:
-                    #     ratio_contracts = (dL/dS) / (dF_i/dS) / contract_size_i
-                    # i.e. "how many contracts of this tradable to short to delta-flatten the
-                    # liability against this factor at this (t, b)". AAD-extracted before the
-                    # .detach() below. Cash accounts and other constant-tensor instruments have
-                    # no backward graph — skipped (their hedge_ratio is undefined anyway).
-                    if instrument_tensor.requires_grad:
-                        td_deltas = pricing.extract_spot_deltas(instrument_tensor, shared_mem.t_Scenario_Buffer)
-                        # Raw forward Jacobian ∂F_h/∂θ (per factor) for the diff-ML projection —
-                        # stored independent of the liability (which only the ratios below need).
-                        hedge_profile_blocks['forward_jacobian'][instrument_name].append(
-                            {fn: d.detach().clone() for fn, d in td_deltas.items()})
-                        if not getattr(self, '_logged_fwd_jac', False) and len(td_deltas) > 1:
-                            self._logged_fwd_jac = True
-                            logging.info(
-                                "diff-ML forward Jacobian: tradable %s ∂F/∂θ over factors %s",
-                                instrument_name, list(td_deltas.keys()))
-                        if liability_spot_deltas:
-                            contract_size = float(
-                                normalized_runtime['tradables'][instrument_name].get('contract_size', 1.0)
-                            ) or 1.0
-                            ratios = {}
-                            T_td = instrument_tensor.shape[0]
-                            for factor_name, td_delta in td_deltas.items():
-                                liab_delta = liability_spot_deltas.get(factor_name)
-                                if liab_delta is None:
-                                    continue
-                                # Hedge ratios are scalar-spot-factor only (the policy's
-                                # hedge_ratio_pairs never reference curve factors). Curve
-                                # factors (e.g. the carry ladder) carry shape (T, n_tenors, B)
-                                # and are handled by the diff-ML forward_jacobian block, not here.
-                                if td_delta.dim() != 2:
-                                    continue
-                                # Liability MtM lives over the full deal period; tradable lives until
-                                # its expiry (T_td <= T_liab). Crop liability to the tradable's grid.
-                                liab_aligned = liab_delta[:T_td]
-                                nonzero = td_delta.abs() > 1e-6
-                                safe_td = torch.where(nonzero, td_delta, torch.ones_like(td_delta))
-                                ratios[factor_name] = torch.where(
-                                    nonzero,
-                                    liab_aligned / (safe_td * contract_size),
-                                    torch.zeros_like(liab_aligned),
-                                )
-                            hedge_profile_blocks['hedge_ratios'][instrument_name].append(ratios)
                     tradable_blocks[instrument_name].append(instrument_tensor.detach().clone())
 
             # RL path only: precompute conditional features during the outer loop.
@@ -2089,6 +2025,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 key: torch.cat(blocks, dim=-1) for key, blocks in outer_state_blocks.items()
             }
 
+        total_leg_volume, last_payment_day = self._liability_schedule_scalars()
         torchrl_bundle = None if normalized_runtime is None else build_hedge_bundle(
             base_date,
             bus_day,
@@ -2100,6 +2037,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             self.stoch_factors,
             runtime=normalized_runtime,
             privileged_factor_blocks=privileged_factor_blocks,
+            total_leg_volume=total_leg_volume,
+            last_payment_day=last_payment_day,
         )
         if torchrl_bundle is not None and conditional_features_blocks:
             torchrl_bundle['conditional_features'] = torch.cat(

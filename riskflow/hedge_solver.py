@@ -80,14 +80,13 @@ def _per_contract_kappa(tradables_sim, runtime, hedges, t_index, device):
 
 def _bundle_sim_views(bundle):
     """History-stripped views of the bundle's time-indexed tensors. `build_hedge_bundle`
-    prepends a `History_Lookback_Business_Days` prefix to `tradables` /
-    `static_portfolio_descriptors`, but `inner_mc_fn` works in simulation-grid coords.
-    Stripping the prefix lets the solver index every time tensor by the same sim-grid `t`.
-    Returns `(tradables_sim, static_sim, n_outer_steps)`."""
+    prepends a `History_Lookback_Business_Days` prefix to `tradables` / `liability_mtm`, but
+    `inner_mc_fn` works in simulation-grid coords. Stripping the prefix lets the solver index
+    every time tensor by the same sim-grid `t`. Returns `(tradables_sim, n_outer_steps)`."""
     hist = int(bundle.get("initial_time_index", 0))
     tradables = {k: v[hist:] for k, v in bundle["tradables"].items()}
-    static = bundle["static_portfolio_descriptors"][hist:]
-    return tradables, static, int(static.shape[0])
+    n_outer_steps = int(bundle["liability_mtm"][hist:].shape[0])
+    return tradables, n_outer_steps
 
 
 def _realized_paths(bundle, runtime):
@@ -95,7 +94,7 @@ def _realized_paths(bundle, runtime):
     `F` `(n_hedge, t_outer, B_outer)` hedge prices, `L_T` `(B_outer,)` the liability
     terminal MTM, and `t_outer`. The liability terminal mirrors the DP's `inner_mtm[-2]`
     convention — the pre-settlement terminal (index -1 is the appended clean-exit zero)."""
-    tradables_sim, _, t_outer = _bundle_sim_views(bundle)
+    tradables_sim, t_outer = _bundle_sim_views(bundle)
     hedges = list(runtime["names"]["hedges"])
     F = torch.stack([tradables_sim[h] for h in hedges], dim=0)        # (n_h, t_outer, B)
     hist = int(bundle.get("initial_time_index", 0))
@@ -140,7 +139,7 @@ def run_textbook_benchmark(bundle, runtime):
     device = F.device
     acc = runtime["accounting"]
     solver_cfg = runtime["solver"]
-    tradables_sim, _, _ = _bundle_sim_views(bundle)
+    tradables_sim, _ = _bundle_sim_views(bundle)
     kappa0, contract_size = _per_contract_kappa(tradables_sim, runtime, hedges, 0, device)
     kappa_T, _ = _per_contract_kappa(tradables_sim, runtime, hedges, t_outer - 1, device)
     grid = build_action_grid(
@@ -190,7 +189,7 @@ class HindsightDpSolver:
         F, L_T, t_outer = _realized_paths(bundle, runtime)             # F (n_h,t_outer,B)
         device = F.device
         b_outer = F.shape[-1]
-        tradables_sim, _, _ = _bundle_sim_views(bundle)
+        tradables_sim, _ = _bundle_sim_views(bundle)
         levels = solver_cfg["training_action_grid_levels_per_axis"]
         grid = build_action_grid(runtime, levels, device)              # (n_actions, n_h)
         n_actions = grid.shape[0]
@@ -349,7 +348,7 @@ class DiffSolverV2:
         # Downside-aware action selection (toy: RISK_KAPPA). 0 = plain E[C] argmax (bit-identical).
         self.risk_kappa = float(self.cfg.get("diffv2_risk_kappa", 0.0))
         # History-stripped, sim-grid-indexed views of the outer-realised paths.
-        self.tradables_sim, _static, self.n_steps = _bundle_sim_views(bundle)
+        self.tradables_sim, self.n_steps = _bundle_sim_views(bundle)
         hist = int(bundle.get("initial_time_index", 0))
         self.liability_sim = bundle["liability_mtm"][hist:]           # (n_steps, B_outer)
         self.B_outer = int(self.liability_sim.shape[-1])
