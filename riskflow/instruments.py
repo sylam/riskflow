@@ -2036,13 +2036,6 @@ class CFFloatingInterestListDeal(Deal):
             # (groupsize -1 means group resets per cashflow - not 1 cashflow 1 reset)
             field_index['Cashflows'] = utils.compress_no_compounding(
                 float_cashflows, groupsize=-1, check_resets=False)
-            if field_index['AveragingMethod']=='Post_Aggregation':
-                bus_day_offset = calendars.get(
-                    self.field.get('Calendar'), {'businessday': pd.offsets.BDay(1)})['businessday']
-                end_dates = base_date + pd.to_timedelta(
-                    field_index['Cashflows'].schedule[:, utils.CASHFLOW_INDEX_End_Day], unit='D')
-                field_index['Cashflows'].schedule[:, utils.CASHFLOW_INDEX_End_Adj] = (
-                    end_dates - bus_day_offset - base_date).days
         else:
             field_index['Cashflows'] = float_cashflows
 

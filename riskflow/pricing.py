@@ -2406,9 +2406,10 @@ def pricer_float_cashflows(all_resets, t_cash, shared):
     return all_int, margin
 
 
-def _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, call_or_put, shared):
+def _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, call_or_put, shared, vol_expiries):
     strike = t_cash[:, utils.CASHFLOW_INDEX_Strike].reshape(1, -1, 1)
     expiry = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount](expiries)
+    vol_expiry = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount](vol_expiries)
     digital_payoff = factor_dep['Digital_Payoff_Rate'] if 'Digital_Payoff_Rate' in factor_dep else 0.0
     dist, shf = factor_dep['VolSurface'][0][utils.FACTOR_INDEX_SubType]
     pricing_fn = utils.black_european_option if dist=='Lognormal' else utils.bachelier_european_option
@@ -2422,9 +2423,9 @@ def _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, call_or_p
         mn_lo = -100.0 * (all_resets - strike_lo)
         mn_hi = -100.0 * (all_resets - strike_hi)
         vols_lo = utils.calc_tenor_cap_time_grid_vol_rate(
-            factor_dep['VolSurface'], mn_lo, expiry, tenor, shared)
+            factor_dep['VolSurface'], mn_lo, vol_expiry, tenor, shared)
         vols_hi = utils.calc_tenor_cap_time_grid_vol_rate(
-            factor_dep['VolSurface'], mn_hi, expiry, tenor, shared)
+            factor_dep['VolSurface'], mn_hi, vol_expiry, tenor, shared)
         payoff = digital_payoff * (
             pricing_fn(all_resets, strike_lo, vols_lo, expiry, 1.0, call_or_put, shared, shift=shf.amount) -
             pricing_fn(all_resets, strike_hi, vols_hi, expiry, 1.0, call_or_put, shared, shift=shf.amount)
@@ -2432,7 +2433,7 @@ def _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, call_or_p
     else:
         mn_option = -100.0 * (all_resets - strike)
         vols = utils.calc_tenor_cap_time_grid_vol_rate(
-            factor_dep['VolSurface'], mn_option, expiry, tenor, shared)
+            factor_dep['VolSurface'], mn_option, vol_expiry, tenor, shared)
         payoff = pricing_fn(
             all_resets, strike, vols, expiry, 1.0, call_or_put, shared, 
             cash_payoff=digital_payoff, shift=shf.amount)
@@ -2443,12 +2444,12 @@ def _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, call_or_p
     return all_int, margin
 
 
-def pricer_cap(all_resets, t_cash, factor_dep, expiries, tenor, shared):
-    return _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, 1.0, shared)
+def pricer_cap(all_resets, t_cash, factor_dep, expiries, tenor, shared, vol_expiries):
+    return _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, 1.0, shared, vol_expiries)
 
 
-def pricer_floor(all_resets, t_cash, factor_dep, expiries, tenor, shared):
-    return _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, -1.0, shared)
+def pricer_floor(all_resets, t_cash, factor_dep, expiries, tenor, shared, vol_expiries):
+    return _pricer_cap_floor(all_resets, t_cash, factor_dep, expiries, tenor, -1.0, shared, vol_expiries)
 
 
 def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.TimeGrid, deal_data: utils.DealDataType,
@@ -2572,19 +2573,20 @@ def pv_float_cashflow_list(shared: utils.Calculation_State, time_grid: utils.Tim
 
             # check if we need extra information to price caps or floors
             if cashflow_pricer in [pricer_cap, pricer_floor]:
-                # adjust the expiry date to adjust the vol
+                expiries = cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day] - time_slice
                 if factor_dep['AveragingMethod']=='Post_Aggregation':
+                    # adjust the expiry date to adjust the vol
                     t_k = cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day] - time_slice
-                    t_kp1 = cashflows.np[:, utils.CASHFLOW_INDEX_End_Adj] - time_slice
-                    expiries = t_kp1 - (2/3)*(t_kp1 - t_k)
+                    t_kp1 = cashflows.np[:, utils.CASHFLOW_INDEX_End_Day] - time_slice
+                    eff_expiries = t_kp1 - (2/3)*(t_kp1 - t_k)
                 else:
-                    expiries = cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day] - time_slice
+                    eff_expiries = expiries
                 # note that the tenor (Year Frac) is averaged
                 # all the cashflows are supposed to have the same year frac
                 # (but practically not - should be ok to do this)
                 tenor = cashflows.np[:, utils.CASHFLOW_INDEX_Year_Frac].mean()
                 all_int, all_margin = cashflow_pricer(
-                    all_resets, reset_cashflows.tn, factor_dep, expiries, tenor, shared)
+                    all_resets, reset_cashflows.tn, factor_dep, eff_expiries, tenor, shared, expiries)
             else:
                 all_int, all_margin = cashflow_pricer(all_resets, reset_cashflows.tn, shared)
 
