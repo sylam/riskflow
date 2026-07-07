@@ -498,8 +498,9 @@ class CMC_State_Inner(CMC_State):
     state object is transparent. `reset_inner()` swaps in the inner-shape random
     numbers: `(num_factors, T, simulation_batch, simulation_sub_batch)` instead of
     the base `(num_factors, T, simulation_batch)`. Stochastic processes dispatch on
-    `Z.ndim` to pick between outer and inner code paths. Antithetic sampling is not
-    supported in inner mode. quasi_rng is inherited — callers handle any reshape."""
+    `Z.ndim` to pick between outer and inner code paths. `use_antithetic=True`
+    (`Inner_Antithetic='Yes'`) mirrors the Sobol draws as (z, -z) pairs on the inner
+    axis. quasi_rng is inherited — callers handle any reshape."""
 
     def __init__(self, cholesky, static_buffer, batch_size, one, mcmc_sims, report_currency,
                  seed, job_id, num_jobs, simulation_sub_batch=0,
@@ -515,18 +516,32 @@ class CMC_State_Inner(CMC_State):
             raise ValueError(
                 f'reset_inner requires simulation_sub_batch > 1; got {self.simulation_sub_batch}. '
                 f'Pass a positive Inner_Sub_Batch in params to enable nested simulation.')
-        if use_antithetic:
-            raise ValueError('CMC_State_Inner.reset_inner does not support antithetic sampling.')
         T = time_grid.scen_time_grid.size
         B = self.simulation_batch
         B2 = self.simulation_sub_batch
         # Sobol-based correlated Gaussian: draw T*B*B2 quasi-normal vectors of dim num_factors,
         # transpose to (num_factors, T*B*B2), correlate via cholesky, reshape.
-        Z_normal, _ = self.quasi_rng(num_factors, T * B * B2)                        # (T*B*B2, num_factors)
-        correlated_sample = torch.matmul(
-            self.t_cholesky, Z_normal.transpose(0, 1)
-        ).reshape(num_factors, T, B, B2)
-        self.t_random_numbers = correlated_sample
+        if use_antithetic:
+            # Antithetic on the inner Gaussian emissions (Inner_Antithetic='Yes'): draw B2/2
+            # Sobol quasi-normals per (t, outer-path) and mirror them (z, -z) on the inner
+            # axis. Halves the label/argmax variance of the inner-MC E[C] estimate — the
+            # diff-ML winner's-curse lever validated in the HMM toy. Regime-transition
+            # uniforms come from a separate quasi_rng stream and stay iid (only the
+            # symmetric emissions are folded, matching the toy). Folding a Sobol sequence
+            # with its mirror preserves unbiasedness (emissions are symmetric in z).
+            if B2 % 2:
+                raise ValueError(
+                    f'Inner_Antithetic requires an even Inner_Sub_Batch; got {B2}.')
+            Z_normal, _ = self.quasi_rng(num_factors, T * B * (B2 // 2))
+            half = torch.matmul(
+                self.t_cholesky, Z_normal.transpose(0, 1)
+            ).reshape(num_factors, T, B, B2 // 2)
+            self.t_random_numbers = torch.cat([half, -half], dim=-1)
+        else:
+            Z_normal, _ = self.quasi_rng(num_factors, T * B * B2)                    # (T*B*B2, num_factors)
+            self.t_random_numbers = torch.matmul(
+                self.t_cholesky, Z_normal.transpose(0, 1)
+            ).reshape(num_factors, T, B, B2)
 
         self.reset_cashflows(time_grid)
         self.t_Buffer.clear()
@@ -2395,7 +2410,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         state_t_leaves = {} if with_grad else None
         with grad_ctx:
             shared_mem.simulation_batch = B_outer
-            shared_mem.reset_inner(self.num_factors, inner_time_grid)
+            shared_mem.reset_inner(self.num_factors, inner_time_grid,
+                                   use_antithetic=self.params.get('Inner_Antithetic', 'No') == 'Yes')
             # Per-outer-path initial regime — read by the inner HMM generate.
             shared_mem.t_Scenario_Buffer[(spot_key, 'regime0_inner')] = outer_regimes[t]
 

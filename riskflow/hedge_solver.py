@@ -728,37 +728,91 @@ class DiffSolverV2:
 
         grid = self._action_grid()
         hidden = int(self.cfg.get("diffv2_hidden", 128))
+        load_path = str(self.cfg.get("diffv2_load_value_fn", "") or "")
+        loaded = None
+        if load_path:
+            # Frozen-policy eval: restore the fitted nets AND the function's frame — the
+            # train-time standardization stats and utility scale are part of the value
+            # function; recomputing them from the (possibly stressed) eval world would
+            # silently change what the nets compute. EVERY eval path is unseen by the nets,
+            # so the verdict rolls over all paths.
+            loaded = torch.load(load_path, map_location=self.device)
+            for key, want in (("t_min", self.t_min), ("T_dec", self.T_dec),
+                              ("md", md), ("hedges", list(self.hedges))):
+                if loaded[key] != want:
+                    raise ValueError(
+                        f"DiffV2_Load_Value_Fn checkpoint mismatch on {key!r}: "
+                        f"saved {loaded[key]!r} vs this run {want!r}")
+            # OOD drift diagnostic: how far the eval world's market states sit from the
+            # train-world standardization frame (in train-σ units, per-dim max).
+            drift = ((M.mean(0) - loaded["m_mean"]).abs() / loaded["m_std"]).max()
+            logging.info(
+                "DiffSolverV2 LOADED value fn from %s (train V_0=%+.6g) | eval-world market "
+                "drift vs train frame: max %.3g σ | utility_scale restored to %.6g",
+                load_path, loaded["V_0"], float(drift), loaded["utility_scale"])
+            self.m_mean, self.m_std = loaded["m_mean"], loaded["m_std"]
+            self.w_mean, self.w_std = loaded["w_mean"], loaded["w_std"]
+            self.runtime["objective"]["utility_scale"] = float(loaded["utility_scale"])
+            hidden = int(loaded["hidden"])
         nets = [_DiffV2Residual(md + 1, hidden=hidden).to(self.device)  # position-free: (market | W)
                 for _ in range(self.T_dec)]
         logging.info("DiffSolverV2 action grid: K=%d actions (levels=%d ^ active=%d)",
                      int(grid.shape[0]), self.levels, self.n_active)
 
         rows = []
-        for t in reversed(sweep_ts):
-            r = self._fit_step(nets, W_bank, t, inner_cache[t], grid, rows=train)
-            rows.append(r)
-            logging.info(
-                "DiffSolverV2 C[t=%d] fitted: val_loss=%.4g |Y_boot|=%.4g |A|=%.4g "
-                "Y_mean=%+.4g q*_mean=%s", r["t"], r["val_loss"], r["Y_absmean"],
-                r["A_absmean"], r["Y_mean"],
-                ["%.3f" % v for v in r["q_star_mean"]])
-
-        worst = max((r["Y_absmean"] for r in rows), default=0.0)
-        root = rows[-1] if rows else {"t": self.t_min, "Y_mean": 0.0, "q_star_mean":
-                                      [0.0] * self.n_hedge}
+        if loaded is not None:
+            for net, sd in zip(nets, loaded["state_dicts"]):
+                net.load_state_dict(sd)
+                net.eval()
+            worst = float(loaded["max_abs_Y_boot"])
+            root = {"t": self.t_min, "Y_mean": float(loaded["V_0"]),
+                    "q_star_mean": list(loaded["n_star_0"])}
+        else:
+            for t in reversed(sweep_ts):
+                r = self._fit_step(nets, W_bank, t, inner_cache[t], grid, rows=train)
+                rows.append(r)
+                logging.info(
+                    "DiffSolverV2 C[t=%d] fitted: val_loss=%.4g |Y_boot|=%.4g |A|=%.4g "
+                    "Y_mean=%+.4g q*_mean=%s", r["t"], r["val_loss"], r["Y_absmean"],
+                    r["A_absmean"], r["Y_mean"],
+                    ["%.3f" % v for v in r["q_star_mean"]])
+            worst = max((r["Y_absmean"] for r in rows), default=0.0)
+            root = rows[-1] if rows else {"t": self.t_min, "Y_mean": 0.0, "q_star_mean":
+                                          [0.0] * self.n_hedge}
         V_0 = float(root["Y_mean"])
         n_star_0 = root["q_star_mean"]
         bounded = worst < 1.0e4
-        logging.info(
-            "DiffSolverV2 sweep complete: t=%d→%d | max|Y_boot|=%.4g (%s) | "
-            "V_0=%+.6g | n_star@t=%d=%s", self.T_dec - 1, self.t_min, worst,
-            "BOUNDED" if bounded else "EXPLODED", V_0, root["t"], n_star_0)
+        if loaded is None:
+            logging.info(
+                "DiffSolverV2 sweep complete: t=%d→%d | max|Y_boot|=%.4g (%s) | "
+                "V_0=%+.6g | n_star@t=%d=%s", self.T_dec - 1, self.t_min, worst,
+                "BOUNDED" if bounded else "EXPLODED", V_0, root["t"], n_star_0)
+        save_path = str(self.cfg.get("diffv2_save_value_fn", "") or "")
+        if save_path and loaded is None:
+            torch.save({
+                "state_dicts": [net.state_dict() for net in nets],
+                "m_mean": self.m_mean, "m_std": self.m_std,
+                "w_mean": self.w_mean, "w_std": self.w_std,
+                "utility_scale": float(self.runtime["objective"]["utility_scale"]),
+                "t_min": self.t_min, "T_dec": self.T_dec, "md": md, "hidden": hidden,
+                "hedges": list(self.hedges),
+                "V_0": V_0, "n_star_0": list(n_star_0), "max_abs_Y_boot": worst,
+            }, save_path)
+            logging.info("DiffSolverV2 SAVED value fn to %s (V_0=%+.6g)", save_path, V_0)
 
         # Downside verdict: greedy policy vs textbook delta hedge vs no hedge. HEADLINE is the
         # OUT-OF-SAMPLE rollout (held-out paths the nets never saw); in-sample reported too.
-        verdict = self._verdict(nets, inner_cache, grid, sweep_ts, rows=(test if has_oos else train))
-        verdict_is = self._verdict(nets, inner_cache, grid, sweep_ts, rows=train) if has_oos else verdict
-        if has_oos:
+        if loaded is not None:
+            # Frozen nets never saw ANY of this run's paths — the whole batch is out-of-sample.
+            verdict = verdict_is = self._verdict(nets, inner_cache, grid, sweep_ts,
+                                                 rows=slice(None))
+            has_oos = True
+        else:
+            verdict = self._verdict(nets, inner_cache, grid, sweep_ts,
+                                    rows=(test if has_oos else train))
+            verdict_is = (self._verdict(nets, inner_cache, grid, sweep_ts, rows=train)
+                          if has_oos else verdict)
+        if has_oos and loaded is None:
             logging.info(
                 "DiffSolverV2 IN-SAMPLE vs OOS u(W_T): greedy IS=%+.5f OOS=%+.5f | "
                 "textbook IS=%+.5f OOS=%+.5f (gap IS−OOS greedy=%+.5f → overfit if large)",
@@ -780,7 +834,8 @@ class DiffSolverV2:
             "  → on the OBJECTIVE E[u(W_T)]: beats no-hedge=%s, beats textbook=%s | "
             "tail(CVaR5) competitive w/ textbook=%s",
             "OUT-OF-SAMPLE" if has_oos else "in-sample", self.t_min,
-            self.B_outer - n_tr if has_oos else self.B_outer,
+            self.B_outer if loaded is not None else (
+                self.B_outer - n_tr if has_oos else self.B_outer),
             g["u_mean"], g["wT_mean"], g["wT_p5"], g["wT_cvar5"],
             tb["u_mean"], tb["wT_mean"], tb["wT_p5"], tb["wT_cvar5"],
             nh["u_mean"], nh["wT_mean"], nh["wT_p5"], nh["wT_cvar5"],

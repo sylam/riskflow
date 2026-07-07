@@ -151,6 +151,12 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # bad-tail actions (keeps upside). 0 = off (plain E[C] argmax, bit-identical). Tune ~0.5;
         # scale with regime-drift magnitude. (Toy: RISK_KAPPA beat the uniform min-var blend.)
         "diffv2_risk_kappa": float(solver_config.get("DiffV2_Risk_Kappa", 0.0)),
+        # Value-function persistence: save the fitted nets (+ standardization stats + utility
+        # scale) after the backward sweep, or load them and SKIP training — a frozen-policy
+        # eval, e.g. OOD stress gates (train under the calibrated world, evaluate the frozen
+        # policy under a stressed one).
+        "diffv2_save_value_fn": str(solver_config.get("DiffV2_Save_Value_Fn", "") or ""),
+        "diffv2_load_value_fn": str(solver_config.get("DiffV2_Load_Value_Fn", "") or ""),
         "active_hedge_indices":
             (list(solver_config["Active_Hedge_Indices"])
              if solver_config.get("Active_Hedge_Indices") is not None else None),
