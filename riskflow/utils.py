@@ -1506,7 +1506,7 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_p
     # make sure the forward is always >1e-5
     forward = torch.clamp(F, min=1e-5)
 
-    if isinstance(strike, float) and strike == 0:
+    if isinstance(strike, float) and strike == 0 and not shift:
         # need to check if this is a put option (value is 0)
         # or a call option (value is just the forward)
         adjustment = 1.0 if callorput == 1.0 else 0.0
@@ -1515,7 +1515,7 @@ def black_european_option(F, X, vol, tenor, buyorsell, callorput, shared, cash_p
     else:
         # handle shifted vol surfaces
         if shift:
-            forward = forward + shift
+            forward = torch.clamp(F, min=1e-5-shift) + shift
             strike = strike + shift
         d1 = torch.log(forward / strike) / stddev + 0.5 * stddev
         d2 = d1 - stddev
