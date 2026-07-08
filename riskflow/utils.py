@@ -657,6 +657,18 @@ class DealTimeDependencies(object):
             return None
         return type(self)(self.mtm_time_grid, self.deal_time_grid[keep])
 
+    def copy_window(self, from_mtm_index, to_mtm_index):
+        """Fresh DealTimeDependencies covering only deal events at mtm positions in
+        [from_mtm_index, to_mtm_index] — the one-step inner-MC fork prices at exactly
+        {t, t+1}, so the AAD tape and the scenario buffer stop at t+1 (interp is rebuilt
+        up to the last kept event; nothing downstream indexes past it). Assumes
+        hedge-mode deals reval on every mtm date (dense event grids). Returns None if
+        no event falls inside the window (deal expired before the fork)."""
+        keep = (self.deal_time_grid >= from_mtm_index) & (self.deal_time_grid <= to_mtm_index)
+        if not keep.any():
+            return None
+        return type(self)(self.mtm_time_grid, self.deal_time_grid[keep])
+
     def update_indices(self):
         self.index = np.searchsorted(self.deal_time_grid, np.arange(self.interp.size), side='right') - 1
         self.index_next = (self.index + 1).clip(0, self.deal_time_grid.size - 1)
@@ -1084,6 +1096,38 @@ class TensorBlock(object):
         # we need the index just prior - note this needs to be checked in the calling code
         indices = self.time_grid[:, TIME_GRID_MTM].searchsorted(time_points) - 1
         return {t: DtT[index] for t, index in zip(time_points, indices)}
+
+
+class DerivedForwardCurve(object):
+    '''
+    A forward curve reconstructed from simulated components - F(t,T) = S(t) exp(c(T)(T-t) + r(t,T)(T-t))
+    where S is a spot price tensor (time, batch), c is a carry TensorBlock quoted at absolute (excel date)
+    tenors and r is a repo/funding TensorBlock quoted at relative year tenors. t_excel maps each time row
+    to its excel date offset so gathers take the same absolute-date end_points as a ForwardPrice factor.
+    Duck-types the TensorBlock surface used by curve pricing (gather_weighted_curve, split_counts, time_grid).
+    Note that F(t,t) = S(t) exactly.
+    '''
+
+    def __init__(self, spot, carry, repo, t_excel, time_grid):
+        self.spot = spot
+        self.carry = carry
+        self.repo = repo
+        self.t_excel = t_excel
+        self.time_grid = time_grid
+
+    def split_counts(self, counts, shared):
+        cum_counts = counts.cumsum()
+        return [DerivedForwardCurve(*sub_block) for sub_block in zip(
+            torch.split(self.spot, tuple(counts)),
+            self.carry.split_counts(counts, shared), self.repo.split_counts(counts, shared),
+            np.split(self.t_excel, cum_counts), np.split(self.time_grid, cum_counts))]
+
+    def gather_weighted_curve(self, shared, end_points, start_points=None, multiply_by_time=False):
+        tenor_in_days = end_points - self.t_excel.reshape(-1, 1)
+        cost_of_carry = self.carry.gather_weighted_curve(
+            shared, end_points, multiply_by_time=False) * self.spot.new_tensor(
+            tenor_in_days / DAYS_IN_YEAR).unsqueeze(-1) + self.repo.gather_weighted_curve(shared, tenor_in_days)
+        return self.spot.unsqueeze(1) * torch.exp(cost_of_carry)
 
 
 # date generation utils

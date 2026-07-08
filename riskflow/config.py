@@ -107,7 +107,13 @@ class ModelParams(object):
             self.modelfilters.setdefault(price_factor, []).append((price_filter, stoch_proc))
 
     def update(self, modelparams):
-        self.set_state(modelparams.modeldefaults, modelparams.modelfilters)
+        # Explicit-update semantics: incoming defaults/filters OVERRIDE existing entries.
+        # (`append`/`setdefault` stays first-wins for file parsing; an ExplicitMarketData
+        # merge is deliberately last-wins — otherwise a Model Configuration override that
+        # remaps an already-mapped factor type is a silent no-op.)
+        self.modeldefaults.update(modelparams.modeldefaults)
+        for factor, mappings in modelparams.modelfilters.items():
+            self.modelfilters[factor] = list(mappings)
 
     def additional_factors(self, model, factor):
         add_factor = self.implied_models.get(model)
@@ -622,7 +628,8 @@ class Config(object):
                             'ReferenceVol': [('ForwardPriceVol', 'ForwardPriceVol'),
                                              ('ReferencePrice', 'ReferencePrice')],
                             'InflationRate': [('Price_Index', 'PriceIndex')],
-                            'CommodityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')],
+                            'CommodityPrice': [('Interest_Rate', 'InterestRate'),
+                                               ('Forward_Rate', 'ForwardRate'), ('Currency', 'FxRate')],
                             'EquityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')],
                             'CommodityBasis': [('Observed_Commodity', 'CommodityPrice')]}
 

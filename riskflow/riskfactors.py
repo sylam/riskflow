@@ -703,7 +703,7 @@ class EquityPrice(Factor0D):
 
     def get_repo_curve_name(self):
         return utils.check_rate_name(
-            self.param['Interest_Rate'] if self.param['Interest_Rate'] else self.param['Currency'])
+            self.param['Interest_Rate'] if self.param.get('Interest_Rate') else self.param['Currency'])
 
     def get_currency(self):
         return utils.check_rate_name(self.param['Currency'])
@@ -722,6 +722,10 @@ class CommodityPrice(EquityPrice):
 
     def __init__(self, param):
         super(CommodityPrice, self).__init__(param)
+
+    def get_carry_curve_name(self):
+        return utils.check_rate_name(
+            self.param['Forward_Rate'] if self.param.get('Forward_Rate') else self.param['Currency'])
 
 
 class CommodityBasis(Factor0D):

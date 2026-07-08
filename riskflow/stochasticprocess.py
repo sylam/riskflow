@@ -2094,9 +2094,13 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
 
         if Z.ndim == 2:
             T, B = Z.shape
-            # quasi_rng(dim, sample_size) returns sobol.draw(sample_size) of shape (sample_size, dim).
-            # We want (T+1, B) — one initial draw plus one per transition — so pass dim=B, sample_size=T+1.
-            u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, T + 1)[1].contiguous()
+            # Canonical Sobol orientation: dimension = per-path coordinates (T+1 uniforms — one
+            # initial draw plus one per transition), samples = paths. draw(B) -> (B, T+1),
+            # transposed to (T+1, B). The TRANSPOSED form (dim=B, samples=T+1) is a defect at
+            # large B: a B-dimensional Sobol sequence with only ~T points has badly-distributed
+            # cross-dimension (= cross-PATH) projections, correlating regime transitions across
+            # outer paths — measured as the B=512 policy collapse (worse even in-sample).
+            u_regime = shared_mem.quasi_rng(T + 1, B)[1].transpose(0, 1).contiguous()
             # Per-outer-path regime0 override (diff-ML t=0 randomization): honour the
             # `(factor_key, 'regime0_outer')` the burn-in publishes, mirroring the inner
             # `regime0_inner` path. Absent it, draw t=0 from the calibrated π_0.
@@ -2281,9 +2285,11 @@ class MarkovHMMSpotModel(StochasticProcess):
         nu = self.nu_per_state
 
         if Z.ndim == 2:
-            # Outer mode: (T, B). Bit-exact preserves of legacy behavior.
+            # Outer mode: (T, B). Canonical Sobol orientation (dimension = T+1 per-path
+            # uniforms, samples = paths) — see MarkovSwitchingLogOUSpotModel.generate for the
+            # transposed-form defect this replaces (cross-path regime correlation at large B).
             T, B = Z.shape
-            u_regime = shared_mem.quasi_rng(shared_mem.simulation_batch, T + 1)[1].contiguous()
+            u_regime = shared_mem.quasi_rng(T + 1, B)[1].transpose(0, 1).contiguous()
             # Per-path regime0 override (diff-ML t=0 randomization): if the buffer
             # carries `(self.factor_key, 'regime0_outer')`, use it as the t=0
             # regime sample instead of the calibrated π_0 draw. Mirrors the

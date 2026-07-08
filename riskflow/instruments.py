@@ -199,14 +199,18 @@ def get_forwardprice_sampling(fieldname, all_factors):
 
 
 def get_forwardprice_factor(cashflow_currency, static_offsets, stochastic_offsets,
-                            all_tenors, all_factors, reference_factor, forward_factor, base_date):
+                            all_tenors, all_factors, reference_factor, forward_factor,
+                            base_date):
     """Read the Forward price factor of a reference Factor - adjusts the all_tenors lookup to
     include the excel_date version of the base_date"""
+    if reference_factor is not None:
+        forward_price = reference_factor.get_forwardprice()
+        # note that in future we could stack forward prices together
+        forward_offset = [calc_factor_index(
+            utils.Factor('ForwardPrice', forward_price), static_offsets, stochastic_offsets, all_tenors)]
+    else:
+        forward_offset = None
 
-    forward_price = reference_factor.get_forwardprice()
-    # note that in future we could stack forward prices together
-    forward_offset = [calc_factor_index(
-        utils.Factor('ForwardPrice', forward_price), static_offsets, stochastic_offsets, all_tenors)]
     forward_fx_ofs = get_fx_and_zero_rate_factor(
         forward_factor.get_currency(), static_offsets, stochastic_offsets, all_tenors, all_factors)
 
@@ -218,10 +222,21 @@ def get_forwardprice_factor(cashflow_currency, static_offsets, stochastic_offset
         return [forward_offset, forward_fx_ofs, forward_fx_ofs]
 
 
-def get_reference_factor_objects(fieldname, all_factors):
+def get_reference_factor(fieldname, all_factors):
     """Read the Reference and Forward price factors"""
     reference = all_factors.get(utils.Factor('ReferencePrice', fieldname))
-    reference_factor = (reference.factor if hasattr(reference, 'factor') else reference)
+    return reference.factor if hasattr(reference, 'factor') else reference
+
+
+def get_factor_component(componentname, all_factors):
+    underlying = all_factors.get(componentname)
+    under_factor = underlying.factor if hasattr(underlying, "factor") else underlying
+    return under_factor
+
+
+def get_reference_factor_objects(fieldname, all_factors):
+    """Read the Reference and Forward price factors"""
+    reference_factor = get_reference_factor(fieldname, all_factors)
     forward_price_name = reference_factor.get_forwardprice()
     forward = all_factors.get(utils.Factor('ForwardPrice', forward_price_name))
     forward_factor = (forward.factor if hasattr(forward, 'factor') else forward)
@@ -246,6 +261,10 @@ def get_impliedbasis_factor(fieldname, static_offsets, stochastic_offsets):
     """Read the index of the CommodityBasis scalar price factor"""
     return [calc_factor_index(utils.Factor('CommodityBasis', fieldname),
                               static_offsets, stochastic_offsets)]
+
+
+def get_forward_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors):
+    return [calc_factor_index(utils.Factor('ForwardRate', fieldname), static_offsets, stochastic_offsets, all_tenors)]
 
 
 def get_observed_commodity_name(fieldname, all_factors):
@@ -3653,8 +3672,8 @@ class CommodityFutureDeal(Deal):
                            field['Implied_Basis'], static_offsets, stochastic_offsets),
                        'Repo': get_interest_factor(
                            field['Repo_Rate'], static_offsets, stochastic_offsets, all_tenors),
-                       'Carry': [calc_factor_index(utils.Factor('ForwardRate', field['Carry']),
-                                                   static_offsets, stochastic_offsets, all_tenors)],
+                       'Carry': get_forward_rate_factor(
+                           field['Carry'], static_offsets, stochastic_offsets, all_tenors),
                        'base_index': (base_date - utils.excel_offset).days,
                        'Expiry': (self.field['Maturity_Date'] - base_date).days}
 
@@ -4767,23 +4786,39 @@ class FloatingEnergyDeal(Deal):
             'Reference_Type': utils.check_rate_name(self.field['Reference_Type'])
         }
 
-        if 'Commodity' in self.field:
-            field['Commodity'] = utils.check_rate_name(self.field['Commodity'])
-
         payoff_currency = self.field['Payoff_Currency' if 'Payoff_Currency' in self.field else 'Currency']
         field['Discount_Rate'] = utils.check_rate_name(
             self.field['Discount_Rate']) if self.field['Discount_Rate'] else field['Currency']
         field['Payoff_Currency'] = utils.check_rate_name(payoff_currency)
 
-        field_index = {}
-        reference_factor, forward_factor = get_reference_factor_objects(field['Reference_Type'], all_factors)
-        forward_sample = get_forwardprice_sampling(field['Sampling_Type'], all_factors)
-        fx_sample = get_forwardprice_sampling(field['FX_Sampling_Type'], all_factors) if field[
-            'FX_Sampling_Type'] else None
+        field_index = {}        
 
-        field_index['ForwardPrice'], field_index['ForwardFX'], field_index['CashFX'] = get_forwardprice_factor(
-            field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors,
-            all_factors, reference_factor, forward_factor, base_date)
+        if self.options.get('ForwardCurve', 'Full') == 'Components':
+            # need to construct the forwardcurve from the components already simulated
+            field["Commodity"] = utils.check_rate_name(self.field["Commodity"])
+            reference_factor = get_reference_factor(field["Reference_Type"], all_factors)
+            commodity_factor = get_factor_component(
+                utils.Factor('CommodityPrice', field["Commodity"]), all_factors)
+            field_index['Commodity'] = get_commodity_rate_factor(
+                field['Commodity'], static_offsets, stochastic_offsets)
+            field_index["ForwardPrice"], field_index["ForwardFX"], field_index["CashFX"] = get_forwardprice_factor(
+                field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors,
+                all_factors, None, commodity_factor, base_date)
+            field_index["Repo_Rate"] = get_interest_factor(
+                commodity_factor.get_repo_curve_name(), static_offsets, stochastic_offsets, all_tenors)
+            field_index["Carry_Rate"] = get_forward_rate_factor(
+                commodity_factor.get_carry_curve_name(), static_offsets, stochastic_offsets, all_tenors)
+            field_index['ForwardStart'] = np.array(
+                sorted([(x - reference_factor.start_date).days for x in time_grid.mtm_dates]))
+        else:
+            reference_factor, forward_factor = get_reference_factor_objects(field['Reference_Type'], all_factors)
+            field_index['ForwardPrice'], field_index['ForwardFX'], field_index['CashFX'] = get_forwardprice_factor(
+                field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors,
+                all_factors, reference_factor, forward_factor, base_date)
+
+        fx_sample = get_forwardprice_sampling(
+            field["FX_Sampling_Type"], all_factors) if field["FX_Sampling_Type"] else None
+        forward_sample = get_forwardprice_sampling(field["Sampling_Type"], all_factors)
         field_index['Discount'] = get_discount_factor(
             field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors)
         field_index['Cashflows'] = utils.make_energy_cashflows(
@@ -4792,12 +4827,6 @@ class FloatingEnergyDeal(Deal):
         field_index['Currency'] = get_fx_and_zero_rate_factor(
             field['Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors)
         field_index['SettleCurrency'] = payoff_currency
-
-        if 'Commodity' in field:
-            field_index['Commodity'] = get_commodity_rate_factor(
-                field['Commodity'], static_offsets, stochastic_offsets)
-            field_index['ForwardStart'] = np.array(
-                sorted([(x - reference_factor.start_date).days for x in time_grid.mtm_dates]))
 
         return field_index
 

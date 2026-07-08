@@ -127,9 +127,7 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
             int(solver_config.get("Training_Action_Grid_Levels_Per_Axis", 11)),
         "training_action_chunk_size": int(solver_config.get("Training_Action_Chunk_Size", 64)),
         # Advantage decomposition: fit A = C - u(W) (NN residual over the bounded-utility anchor).
-        "use_advantage_decomp": bool(solver_config.get("Use_Advantage_Decomp", True)),
-        # Differential-ML twin-loss weight (stored; the active twin weight is diffv2_lambda_grad).
-        "lambda_diff": float(solver_config.get("Lambda_Diff", 0.0)),
+        "use_advantage_decomp": solver_config.get("Use_Advantage_Decomp", "Yes") == "Yes",
         # --- DiffSolverV2 (clean-room differential-ML solver) knobs ---
         # Per-t residual-net Adam iters / lr; bank q-exploration noise as a fraction of each
         # instrument's [Min,Max] range; the subset of hedge instruments whose action axis VARIES
@@ -151,19 +149,35 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # bad-tail actions (keeps upside). 0 = off (plain E[C] argmax, bit-identical). Tune ~0.5;
         # scale with regime-drift magnitude. (Toy: RISK_KAPPA beat the uniform min-var blend.)
         "diffv2_risk_kappa": float(solver_config.get("DiffV2_Risk_Kappa", 0.0)),
+        # Cost-aware EXECUTION: the verdict rollout charges the L1 repositioning cost
+        # (Transaction_Cost_Per_Unit + half Bid_Offer_Spread_Bps) at the argmax, trading
+        # expected value against the cost of getting there. Training stays cost-free.
+        "diffv2_cost_aware_argmax":
+            solver_config.get("DiffV2_Cost_Aware_Argmax", "No") == "Yes",
+        # One-step inner forks: window fork generation AND pricing to {t, t+1} — the
+        # bootstrap/argmax only read t/t+1 fields (F_t1, L_t, L_t1, market_t1), so the
+        # AAD tape and per-fork pricing stop scaling with the remaining horizon.
+        # 'No' = legacy full-horizon forks (statistically equivalent labels, ~rows/2 x cost).
+        "diffv2_one_step_fork":
+            solver_config.get("DiffV2_One_Step_Fork", "Yes") == "Yes",
         # Value-function persistence: save the fitted nets (+ standardization stats + utility
         # scale) after the backward sweep, or load them and SKIP training — a frozen-policy
         # eval, e.g. OOD stress gates (train under the calibrated world, evaluate the frozen
-        # policy under a stressed one).
+        # policy under a stressed one). Load accepts a LIST of checkpoint paths for an
+        # ENSEMBLE-argmax eval: each member evaluated in its own standardization frame, the
+        # continuations averaged before the argmax (cross-fit winner's-curse reduction).
         "diffv2_save_value_fn": str(solver_config.get("DiffV2_Save_Value_Fn", "") or ""),
-        "diffv2_load_value_fn": str(solver_config.get("DiffV2_Load_Value_Fn", "") or ""),
+        "diffv2_load_value_fn":
+            ([str(p) for p in solver_config["DiffV2_Load_Value_Fn"]]
+             if isinstance(solver_config.get("DiffV2_Load_Value_Fn"), (list, tuple))
+             else str(solver_config.get("DiffV2_Load_Value_Fn", "") or "")),
         "active_hedge_indices":
             (list(solver_config["Active_Hedge_Indices"])
              if solver_config.get("Active_Hedge_Indices") is not None else None),
         # Benchmark tracks assembled alongside the DiffSolverV2 deliverable (hindsight upper
         # bound / textbook lower bound).
-        "run_hindsight_diagnostic": bool(solver_config.get("Run_Hindsight_Diagnostic", False)),
-        "run_textbook_benchmark": bool(solver_config.get("Run_Textbook_Benchmark", False)),
+        "run_hindsight_diagnostic": solver_config.get("Run_Hindsight_Diagnostic", "No") == "Yes",
+        "run_textbook_benchmark": solver_config.get("Run_Textbook_Benchmark", "No") == "Yes",
     }
 
 
@@ -338,8 +352,8 @@ def _normalize_instrument_metadata(
         "expiry_date": expiry_date,
         "first_notice_date": params.get("First_Notice_Date"),
         "auto_close_days_before_last_trade": int(params.get("Auto_Close_Days_Before_Last_Trade", 0)),
-        "allow_new_positions_until_last_trade": bool(params.get("Allow_New_Positions_Until_Last_Trade", True)),
-        "allow_holding_past_last_trade": bool(params.get("Allow_Holding_Past_Last_Trade", False)),
+        "allow_new_positions_until_last_trade": params.get("Allow_New_Positions_Until_Last_Trade", "Yes") == "Yes",
+        "allow_holding_past_last_trade": params.get("Allow_Holding_Past_Last_Trade", "No") == "Yes",
         "contract_size": float(params.get("Contract_Size", 1.0)),
         "params": deepcopy(dict(params)),
     }
@@ -448,7 +462,7 @@ def construct_hedge_runtime(
                 normalized_tradables, cash_account_names),
             "transaction_cost_per_unit": float(evaluator_config.get("Transaction_Cost_Per_Unit", 0.0)),
             "bid_offer_spread_bps": float(evaluator_config.get("Bid_Offer_Spread_Bps", 0.0)),
-            "force_flat_at_end": bool(evaluator_config.get("Force_Flat_At_End", True)),
+            "force_flat_at_end": evaluator_config.get("Force_Flat_At_End", "Yes") == "Yes",
             "total_position_abs_limit": float(evaluator_config.get("Total_Position_Abs_Limit", 0.0)),
         },
     }

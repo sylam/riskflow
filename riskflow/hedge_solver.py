@@ -344,9 +344,14 @@ class DiffSolverV2:
         self.noise_frac = float(self.cfg.get("diffv2_bank_noise_frac", 0.15))
         self.t_min = int(self.cfg.get("t_min", 0))
         self.use_adv = bool(self.cfg.get("use_advantage_decomp", True))
-        self.lambda_diff = float(self.cfg.get("lambda_diff", 0.0))    # market-grad gate (incr 2)
         # Downside-aware action selection (toy: RISK_KAPPA). 0 = plain E[C] argmax (bit-identical).
         self.risk_kappa = float(self.cfg.get("diffv2_risk_kappa", 0.0))
+        # Cost-aware EXECUTION: the verdict rollout charges κ·|q − q_prev| at the argmax
+        # (hysteresis); training/selection stay cost-free. Default off = bit-identical.
+        self.cost_aware = bool(self.cfg.get("diffv2_cost_aware_argmax", False))
+        # One-step forks: window inner generation+pricing to {t, t+1} (the bootstrap only
+        # reads t/t+1 fields) — fork cost stops scaling with the remaining horizon.
+        self.one_step = bool(self.cfg.get("diffv2_one_step_fork", True))
         # History-stripped, sim-grid-indexed views of the outer-realised paths.
         self.tradables_sim, self.n_steps = _bundle_sim_views(bundle)
         hist = int(bundle.get("initial_time_index", 0))
@@ -395,10 +400,20 @@ class DiffSolverV2:
         return torch.cat([m, wn], dim=-1)
 
     def _continuation(self, nets, market, W, t, chunk=400_000):
-        """C_t = u(W) + A_t(market, W); terminal C_{T_dec} = u(W). Row-chunked net eval."""
+        """C_t = u(W) + A_t(market, W); terminal C_{T_dec} = u(W). Row-chunked net eval.
+        Ensemble mode (list-of-checkpoints load): A = mean over members, each evaluated in
+        its OWN standardization frame — the frame is part of the function."""
         base = self._u(W)
         if t >= self.T_dec:
             return base
+        if getattr(self, "_ensemble", None):
+            acc = torch.zeros_like(base)
+            for m_nets, m_mean, m_std, w_mean, w_std in self._ensemble:
+                x = torch.cat([(market - m_mean) / m_std,
+                               ((W - w_mean) / w_std).unsqueeze(-1)], dim=-1)
+                for i in range(0, x.shape[0], chunk):
+                    acc[i:i + chunk] += m_nets[t](x[i:i + chunk])
+            return base + acc / len(self._ensemble)
         x = self._standardize(market, W)
         if x.shape[0] <= chunk:
             return base + nets[t](x)
@@ -420,7 +435,7 @@ class DiffSolverV2:
           dL   (B_outer, B_inner)           liability mark change t→t+1
           m1   (B_outer, B_inner, market_dim) market state at t+1
         plus the bank-state market at t (B_outer, market_dim)."""
-        inner = self.bundle["inner_mc_fn"](t)
+        inner = self.bundle["inner_mc_fn"](t, one_step=self.one_step)
         F_t = torch.stack([self.tradables_sim[ref][t] for ref in self.hedges], dim=-1)   # (B_outer, n_hedge)
         F_t1 = torch.stack([inner["F_t1"][ref] for ref in self.hedges], dim=-1)          # (B_outer, B_inner, n_hedge)
         # EXPIRED-CONTRACT GUARD: the framework returns inner F_t1=0 for a tradable that has
@@ -435,8 +450,12 @@ class DiffSolverV2:
         return dF, dL, inner["market_t1"], inner["market_t"], live
 
     # ---- external argmax (Bellman max outside the fitted value) --------------
-    def _decide(self, nets, market_t1, dF, dL, W, t, grid):
-        """Pick the grid action maximising E_inner[C_{t+1}] per outer path. No grad."""
+    def _decide(self, nets, market_t1, dF, dL, W, t, grid, q_prev=None, kappa=None):
+        """Pick the grid action maximising E_inner[C_{t+1}] per outer path. No grad.
+        `q_prev`+`kappa` (cost-aware execution): charge the L1 repositioning cost
+        κ·|q − q_prev| against the wealth entering the continuation, so the argmax trades
+        off expected value against the cost of getting there (hysteresis instead of churn).
+        The value function itself stays cost-free; this is a decision-time correction."""
         with torch.no_grad():
             B, Bi, md = market_t1.shape
             best_val = None
@@ -446,6 +465,9 @@ class DiffSolverV2:
                 c = acts.shape[0]
                 q = acts[None, :, None, :]                                               # (1,c,1,n_hedge)
                 W1 = self._wealth_step(W[:, None, None], q, dF[:, None], dL[:, None])     # (B,c,Bi)
+                if q_prev is not None:
+                    tc = ((acts[None, :, :] - q_prev[:, None, :]).abs() * kappa).sum(-1)  # (B,c) $
+                    W1 = W1 - tc[:, :, None]
                 C1f = self._continuation(
                     nets,
                     market_t1[:, None].expand(B, c, Bi, md).reshape(-1, md),
@@ -550,7 +572,49 @@ class DiffSolverV2:
         # market state (spot/belief) come from the SAME forward — the full Huge–Savine twin
         # loss. ∂Y/∂market_t is the differential constraint that regularizes the market
         # dimension (where a value-only / W-only fit overfits the few outer paths).
-        ig = self.bundle["inner_mc_grad_fn"](t)
+        # Row-aware grad-slice width: the grad fork's tape scales with remaining rows × flat —
+        # except one-step forks, whose tape is 2 rows regardless of t (the 64 floor then just
+        # reproduces the flat cap, giving constant-width slices across the whole sweep).
+        rows_t = max(64, 2 if self.one_step else (self.n_steps + 1 - t))
+        cell_budget = int(self.bundle.get("inner_mc_cell_budget", 1 << 62))
+        inner_sub = int(self.bundle.get("inner_sub_batch", 1))
+        grad_chunk = max(1, cell_budget // (inner_sub * rows_t))
+        if self.B_outer > grad_chunk:
+            # Large-B mode: the grad fork's AAD tape only fits `grad_chunk` outer paths at a
+            # time, so fork the TRAIN rows in contiguous sub-slices (labels are per-outer-path
+            # — slices are independent; each fork call is single-chunk under the hood).
+            r0, r1, _ = rows.indices(self.B_outer)
+            Y_parts, gW_parts, gm_parts = [], [], []
+            for a in range(r0, r1, grad_chunk):
+                b = min(a + grad_chunk, r1)
+                ig = self.bundle["inner_mc_grad_fn"](t, outer_rows=(a, b), one_step=self.one_step)
+                leaves, widths = ig["state_t_leaves"], ig["state_t_leaf_widths"]
+                F_t_c = torch.stack(
+                    [self.tradables_sim[r][t][a:b] for r in self.hedges], dim=-1)
+                F_t1_c = torch.stack([ig["F_t1"][r] for r in self.hedges], dim=-1) * live
+                dF_c = F_t1_c - F_t_c.unsqueeze(1)
+                dL_c = ig["L_t1"] - ig["L_t"]
+                m1_c = ig["market_t1"]
+                W0_c = W0_bank[a - r0:b - r0].clone().requires_grad_(True)
+                q_c = q_star[a - r0:b - r0][:, None, :]
+                W1_c = self._wealth_step(W0_c[:, None], q_c, dF_c, dL_c)
+                n_c, Bi_c, md = m1_c.shape
+                Y_c = self._continuation(
+                    nets, m1_c.reshape(-1, md), W1_c.reshape(-1), t + 1
+                ).reshape(n_c, Bi_c).mean(1)
+                grads_c = torch.autograd.grad(
+                    Y_c.sum(), [W0_c] + list(leaves.values()), allow_unused=True)
+                leaf_grads_c = {k: (g.detach() if g is not None else None)
+                                for k, g in zip(leaves.keys(), grads_c[1:])}
+                Y_parts.append(Y_c.detach())
+                gW_parts.append(grads_c[0].detach())
+                gm_parts.append(self._project_leaf_grads(
+                    leaf_grads_c, widths, slice(None), n_c, md))
+            Y = torch.cat(Y_parts)
+            gW = torch.cat(gW_parts)
+            g_market = torch.cat(gm_parts)
+            return self._fit_from_labels(nets, W0_bank, market0, Y, gW, g_market, t, q_star)
+        ig = self.bundle["inner_mc_grad_fn"](t, one_step=self.one_step)
         leaves, widths = ig["state_t_leaves"], ig["state_t_leaf_widths"]
         if not getattr(self, "_proj_checked", False):
             self._proj_checked = True                  # one-time self-check of the label projection
@@ -590,7 +654,12 @@ class DiffSolverV2:
                       for k, g in zip(leaves.keys(), grads[1:])}
         g_market = self._project_leaf_grads(leaf_grads, widths, rows, B, md)             # ∂Y/∂market_t (B,md)
         Y = Y.detach()
+        return self._fit_from_labels(nets, W0_bank, market0, Y, gW, g_market, t, q_star)
 
+    def _fit_from_labels(self, nets, W0_bank, market0, Y, gW, g_market, t, q_star):
+        """Shared fit tail: advantage decomposition + standardized twin loss on the
+        (value, wealth-grad, market-grad) labels. Called by both the single-fork and the
+        sub-sliced large-B label paths of `_fit_step`."""
         # Advantage decomposition: fit A = C − u(W0); subtract the anchor's wealth slope.
         if self.use_adv:
             Wb = W0_bank.clone().requires_grad_(True)
@@ -655,6 +724,13 @@ class DiffSolverV2:
         n = L[t0][rows].shape[0]
         W = {p: L[t0][rows].clone() for p in ("greedy", "textbook", "nohedge")}
         q_traj = {"greedy": [], "textbook": []}                                          # mean |q| per step
+        # Parallel turnover-cost accounting (Transaction_Cost_Per_Unit + half the
+        # Bid_Offer_Spread_Bps on |Δq| each rebalance, from flat at t_min). The wealth
+        # recursion itself stays cost-free (the position-free value design assumes free
+        # repositioning) — these are DIAGNOSTICS quantifying that approximation per policy.
+        cost = {p: torch.zeros(n, device=self.device) for p in ("greedy", "textbook")}
+        q_prev = {p: torch.zeros(n, self.n_hedge, device=self.device)
+                  for p in ("greedy", "textbook")}
         with torch.no_grad():
             for t in sweep_ts:
                 dF_o = torch.stack(
@@ -662,10 +738,18 @@ class DiffSolverV2:
                      for r in self.hedges], dim=-1)                                       # (n, n_hedge)
                 dL_o = (L[t + 1] - L[t])[rows]
                 dF, dL, m1, _, live = inner_cache[t]
-                q_g, _ = self._decide(nets, m1[rows], dF[rows], dL[rows], W["greedy"], t, grid)
+                kappa_t, _ = _per_contract_kappa(
+                    self.tradables_sim, self.runtime, self.hedges, t, self.device)
+                q_g, _ = self._decide(
+                    nets, m1[rows], dF[rows], dL[rows], W["greedy"], t, grid,
+                    q_prev=q_prev["greedy"] if self.cost_aware else None,
+                    kappa=kappa_t if self.cost_aware else None)
                 q_g = q_g * live          # zero positions on expired contracts (wealth-neutral)
                 q_tb = self._replication_hedge(t)[None].expand(n, self.n_hedge)
                 z = torch.zeros(n, self.n_hedge, device=self.device)
+                for p, q_now in (("greedy", q_g), ("textbook", q_tb)):
+                    cost[p] = cost[p] + _turnover_cost(q_now - q_prev[p], kappa_t)
+                    q_prev[p] = q_now
                 W["greedy"] = self._wealth_step(W["greedy"], q_g, dF_o, dL_o)
                 W["textbook"] = self._wealth_step(W["textbook"], q_tb, dF_o, dL_o)
                 W["nohedge"] = self._wealth_step(W["nohedge"], z, dF_o, dL_o)
@@ -678,6 +762,10 @@ class DiffSolverV2:
             return {"u_mean": float(self._u(wT).mean()), "wT_mean": float(wT.mean()),
                     "wT_p5": float(p5), "wT_cvar5": float(cvar5)}
         out = {p: stats(W[p]) for p in W}
+        for p in ("greedy", "textbook"):
+            net_stats = stats(W[p] - cost[p])
+            out[p]["turnover_cost_mean"] = float(cost[p].mean())
+            out[p].update({f"{k}_net": v for k, v in net_stats.items()})
         # greedy position summary: mean over the rollout of |q| per instrument (is it hedging?)
         gq = torch.tensor(q_traj["greedy"])                                              # (n_steps, n_hedge)
         out["greedy_mean_abs_q"] = gq.abs().mean(0).tolist()
@@ -699,6 +787,10 @@ class DiffSolverV2:
             self.n_hedge, self.active, self.T_dec, self.n_steps, self._settled_terminal,
             self.B_outer, self.levels, self.fit_iters, self.lr, self.contract_size.tolist(),
             self.q_lo.tolist(), self.q_hi.tolist(), self.total_abs_limit)
+        logging.info("DiffSolverV2 inner forks: one_step=%s (window {t, t+1} generation+pricing)"
+                     if self.one_step else
+                     "DiffSolverV2 inner forks: one_step=%s (full remaining-horizon forks)",
+                     self.one_step)
 
         W_bank, _q_bank = self._build_bank(gen)
         # Cache the framework inner-MC one-step quantities over the swept range — one
@@ -728,31 +820,43 @@ class DiffSolverV2:
 
         grid = self._action_grid()
         hidden = int(self.cfg.get("diffv2_hidden", 128))
-        load_path = str(self.cfg.get("diffv2_load_value_fn", "") or "")
+        load_cfg = self.cfg.get("diffv2_load_value_fn", "") or ""
+        load_paths = ([str(p) for p in load_cfg] if isinstance(load_cfg, (list, tuple))
+                      else ([str(load_cfg)] if load_cfg else []))
         loaded = None
-        if load_path:
-            # Frozen-policy eval: restore the fitted nets AND the function's frame — the
+        if load_paths:
+            # Frozen-policy eval: restore the fitted nets AND each function's frame — the
             # train-time standardization stats and utility scale are part of the value
             # function; recomputing them from the (possibly stressed) eval world would
             # silently change what the nets compute. EVERY eval path is unseen by the nets,
-            # so the verdict rolls over all paths.
-            loaded = torch.load(load_path, map_location=self.device)
-            for key, want in (("t_min", self.t_min), ("T_dec", self.T_dec),
-                              ("md", md), ("hedges", list(self.hedges))):
-                if loaded[key] != want:
-                    raise ValueError(
-                        f"DiffV2_Load_Value_Fn checkpoint mismatch on {key!r}: "
-                        f"saved {loaded[key]!r} vs this run {want!r}")
-            # OOD drift diagnostic: how far the eval world's market states sit from the
-            # train-world standardization frame (in train-σ units, per-dim max).
-            drift = ((M.mean(0) - loaded["m_mean"]).abs() / loaded["m_std"]).max()
-            logging.info(
-                "DiffSolverV2 LOADED value fn from %s (train V_0=%+.6g) | eval-world market "
-                "drift vs train frame: max %.3g σ | utility_scale restored to %.6g",
-                load_path, loaded["V_0"], float(drift), loaded["utility_scale"])
+            # so the verdict rolls over all paths. A LIST of checkpoints = ensemble argmax:
+            # each member evaluated in its own frame, continuations averaged (cross-fit
+            # winner's-curse reduction on top of antithetic).
+            members = []
+            for path in load_paths:
+                ck = torch.load(path, map_location=self.device)
+                for key, want in (("t_min", self.t_min), ("T_dec", self.T_dec),
+                                  ("md", md), ("hedges", list(self.hedges))):
+                    if ck[key] != want:
+                        raise ValueError(
+                            f"DiffV2_Load_Value_Fn checkpoint mismatch on {key!r}: "
+                            f"{path} saved {ck[key]!r} vs this run {want!r}")
+                drift = ((M.mean(0) - ck["m_mean"]).abs() / ck["m_std"]).max()
+                logging.info(
+                    "DiffSolverV2 LOADED value fn from %s (train V_0=%+.6g) | eval-world "
+                    "market drift vs train frame: max %.3g σ | utility_scale %.6g",
+                    path, ck["V_0"], float(drift), ck["utility_scale"])
+                members.append(ck)
+            loaded = members[0]
+            scales = [float(ck["utility_scale"]) for ck in members]
+            if max(scales) - min(scales) > 0.01 * max(scales):
+                logging.warning(
+                    "DiffSolverV2 ensemble utility_scale spread %.3g%% — members trained "
+                    "against different anchors; averaging is approximate",
+                    100.0 * (max(scales) - min(scales)) / max(scales))
             self.m_mean, self.m_std = loaded["m_mean"], loaded["m_std"]
             self.w_mean, self.w_std = loaded["w_mean"], loaded["w_std"]
-            self.runtime["objective"]["utility_scale"] = float(loaded["utility_scale"])
+            self.runtime["objective"]["utility_scale"] = float(sum(scales) / len(scales))
             hidden = int(loaded["hidden"])
         nets = [_DiffV2Residual(md + 1, hidden=hidden).to(self.device)  # position-free: (market | W)
                 for _ in range(self.T_dec)]
@@ -764,6 +868,18 @@ class DiffSolverV2:
             for net, sd in zip(nets, loaded["state_dicts"]):
                 net.load_state_dict(sd)
                 net.eval()
+            if len(members) > 1:
+                # Ensemble: per-member net stacks + frames; _continuation averages members.
+                self._ensemble = []
+                for ck in members:
+                    m_nets = [_DiffV2Residual(md + 1, hidden=int(ck["hidden"])).to(self.device)
+                              for _ in range(self.T_dec)]
+                    for net, sd in zip(m_nets, ck["state_dicts"]):
+                        net.load_state_dict(sd)
+                        net.eval()
+                    self._ensemble.append(
+                        (m_nets, ck["m_mean"], ck["m_std"], ck["w_mean"], ck["w_std"]))
+                logging.info("DiffSolverV2 ENSEMBLE argmax over %d value fns", len(members))
             worst = float(loaded["max_abs_Y_boot"])
             root = {"t": self.t_min, "Y_mean": float(loaded["V_0"]),
                     "q_star_mean": list(loaded["n_star_0"])}
