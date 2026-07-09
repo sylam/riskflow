@@ -376,7 +376,7 @@
         ]
        }
       },
-      "ForwardPrice": "PLATINUM",
+      "ForwardPrice": null,
       "Property_Aliases": ""
      },
      "ForwardPrice.PLATINUM": {

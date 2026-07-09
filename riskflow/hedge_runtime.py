@@ -160,6 +160,12 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # 'No' = legacy full-horizon forks (statistically equivalent labels, ~rows/2 x cost).
         "diffv2_one_step_fork":
             solver_config.get("DiffV2_One_Step_Fork", "Yes") == "Yes",
+        # Twin-loss differential normalization: Huge-Savine's official implementation
+        # normalizes greeks PER INPUT COLUMN (lambda_j vector) — validated +0.01-0.017 u
+        # on every 8k seed vs the pooled scalar. 'No' = legacy pooled variance (one
+        # fat-tailed column deflates the constraint for all columns).
+        "diffv2_per_column_grad_norm":
+            solver_config.get("DiffV2_Per_Column_Grad_Norm", "Yes") == "Yes",
         # Value-function persistence: save the fitted nets (+ standardization stats + utility
         # scale) after the backward sweep, or load them and SKIP training — a frozen-policy
         # eval, e.g. OOD stress gates (train under the calibrated world, evaluate the frozen

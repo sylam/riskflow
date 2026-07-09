@@ -2887,7 +2887,12 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
         # round-trip check (the recovery is approximate by construction). When the ladder
         # is well-conditioned, keep the exact solve + round-trip guard (it catches genuine
         # searchsorted/clip bracketing bugs).
-        if float(torch.linalg.cond(M_t)) < 1.0e8:
+        # Dtype-aware conditioning gate: the exact-solve round-trip residual scales like
+        # cond(M)·eps·‖curve‖, so the float32 gate must sit ~eps ratio below the float64
+        # one (measured: cond ~1e6 at float32 passes 1e8 but leaves a 0.13 residual on a
+        # late-horizon degenerate ladder — an expected geometry, not a bracketing bug).
+        cond_gate = 1.0e8 if M_t.dtype == torch.float64 else 1.0e4
+        if float(torch.linalg.cond(M_t)) < cond_gate:
             X0 = torch.linalg.solve(M_t, curve0)                                       # (3,) or (3, B)
             roundtrip_err_t = (M_t @ X0 - curve0).abs().max()
             rt_tol = 1.0e-10 if M_t.dtype == torch.float64 else 1.0e-5

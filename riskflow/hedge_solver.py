@@ -402,24 +402,35 @@ class DiffSolverV2:
     def _continuation(self, nets, market, W, t, chunk=400_000):
         """C_t = u(W) + A_t(market, W); terminal C_{T_dec} = u(W). Row-chunked net eval.
         Ensemble mode (list-of-checkpoints load): A = mean over members, each evaluated in
-        its OWN standardization frame — the frame is part of the function."""
+        its OWN standardization frame — the frame is part of the function.
+        A_t is CLAMPED to its fitted-target trust region (one range-width of headroom):
+        off-support the zero-init MLP extrapolates freely — measured printing −5 where its
+        targets spanned ±0.5 — and the argmax then chases the phantom direction, poisoning
+        the t−1 bootstrap labels (the dead-net and corner-over-leverage basins at large B).
+        Outside the clamp the gradient is zero, so the differential labels ignore phantom
+        directions too."""
         base = self._u(W)
         if t >= self.T_dec:
             return base
         if getattr(self, "_ensemble", None):
             acc = torch.zeros_like(base)
-            for m_nets, m_mean, m_std, w_mean, w_std in self._ensemble:
+            for m_nets, m_mean, m_std, w_mean, w_std, m_bounds in self._ensemble:
                 x = torch.cat([(market - m_mean) / m_std,
                                ((W - w_mean) / w_std).unsqueeze(-1)], dim=-1)
+                b = m_bounds[t] if m_bounds is not None else None
                 for i in range(0, x.shape[0], chunk):
-                    acc[i:i + chunk] += m_nets[t](x[i:i + chunk])
+                    a = m_nets[t](x[i:i + chunk])
+                    acc[i:i + chunk] += a if b is None else torch.clamp(a, b[0], b[1])
             return base + acc / len(self._ensemble)
         x = self._standardize(market, W)
+        b = self.a_bounds[t]
         if x.shape[0] <= chunk:
-            return base + nets[t](x)
+            a = nets[t](x)
+            return base + (a if b is None else torch.clamp(a, b[0], b[1]))
         out = torch.empty_like(base)
         for i in range(0, x.shape[0], chunk):
-            out[i:i + chunk] = nets[t](x[i:i + chunk])
+            a = nets[t](x[i:i + chunk])
+            out[i:i + chunk] = a if b is None else torch.clamp(a, b[0], b[1])
         return base + out
 
     # ---- one-step wealth move ------------------------------------------------
@@ -683,7 +694,12 @@ class DiffSolverV2:
         # are O(1) and lam_g balances value-vs-gradient as intended.
         nrm_v = a_val.var() + 1e-8
         nrm_w = g_zn_W.var() + 1e-8
-        nrm_m = g_zn_m.var() + 1e-8
+        # Per-column lambda_j (Huge-Savine official): each market column normalized by its
+        # own label variance, so one fat-tailed column can't deflate the differential
+        # constraint for the rest. 'No' = legacy pooled scalar.
+        nrm_m = (g_zn_m.var(dim=0, keepdim=True) + 1e-8
+                 if bool(self.cfg.get("diffv2_per_column_grad_norm", False))
+                 else g_zn_m.var() + 1e-8)
         opt = torch.optim.Adam(net.parameters(), lr=self.lr,
                                weight_decay=float(self.cfg.get("diffv2_weight_decay", 0.0)))
         for _ in range(self.fit_iters):
@@ -693,12 +709,17 @@ class DiffSolverV2:
             da_m, da_w = torch.autograd.grad(a.sum(), [mn, wn], create_graph=True)
             loss = (((a - a_val) ** 2).mean() / nrm_v
                     + lam_g * ((da_w - g_zn_W) ** 2).mean() / nrm_w
-                    + lam_g * ((da_m - g_zn_m) ** 2).mean() / nrm_m)
+                    + lam_g * (((da_m - g_zn_m) ** 2) / nrm_m).mean())
             opt.zero_grad(); loss.backward(); opt.step()
 
         with torch.no_grad():
             a_fit = net(self._standardize(market0, W0_bank))
             val_loss = float(((a_fit - a_val) ** 2).mean())
+            # Trust region for all future EVALUATIONS of this net (argmax, bootstrap labels,
+            # verdict): its fitted-target range plus one range-width of headroom each side.
+            lo, hi = float(a_val.min()), float(a_val.max())
+            pad = max(hi - lo, 1e-3)
+            self.a_bounds[t] = (lo - pad, hi + pad)
         return {
             "t": t, "val_loss": val_loss,
             "Y_absmean": float(Y.abs().mean()),
@@ -860,6 +881,10 @@ class DiffSolverV2:
             hidden = int(loaded["hidden"])
         nets = [_DiffV2Residual(md + 1, hidden=hidden).to(self.device)  # position-free: (market | W)
                 for _ in range(self.T_dec)]
+        # Per-t trust region for A_t evaluation (set at fit time / restored from checkpoint;
+        # None = unclamped, e.g. pre-trust-region checkpoints).
+        self.a_bounds = (list(loaded["a_bounds"]) if loaded is not None and loaded.get("a_bounds")
+                         else [None] * self.T_dec)
         logging.info("DiffSolverV2 action grid: K=%d actions (levels=%d ^ active=%d)",
                      int(grid.shape[0]), self.levels, self.n_active)
 
@@ -878,7 +903,8 @@ class DiffSolverV2:
                         net.load_state_dict(sd)
                         net.eval()
                     self._ensemble.append(
-                        (m_nets, ck["m_mean"], ck["m_std"], ck["w_mean"], ck["w_std"]))
+                        (m_nets, ck["m_mean"], ck["m_std"], ck["w_mean"], ck["w_std"],
+                         ck.get("a_bounds")))
                 logging.info("DiffSolverV2 ENSEMBLE argmax over %d value fns", len(members))
             worst = float(loaded["max_abs_Y_boot"])
             root = {"t": self.t_min, "Y_mean": float(loaded["V_0"]),
@@ -913,6 +939,7 @@ class DiffSolverV2:
                 "t_min": self.t_min, "T_dec": self.T_dec, "md": md, "hidden": hidden,
                 "hedges": list(self.hedges),
                 "V_0": V_0, "n_star_0": list(n_star_0), "max_abs_Y_boot": worst,
+                "a_bounds": self.a_bounds,
             }, save_path)
             logging.info("DiffSolverV2 SAVED value fn to %s (V_0=%+.6g)", save_path, V_0)
 

@@ -1,12 +1,24 @@
 """Minimal debug harness for the platinum hedge — load the canonical fixture, run one
 solve_hedge job, print the verdict. Tweak the constants below and step through.
 
+PRODUCTION RECIPE (validated 2026-07-09, Components world):
+  TRAIN: BATCH=8192, INNER=64, T_MIN=0, LEVELS=9, FIT_ITERS=60, COST_AWARE='Yes',
+  one-step forks + trust-region clamp + per-column grad norm (all default 'Yes').
+  Single-seed is now RELIABLE: u=0.380-0.392 across seeds (the clamp killed the
+  phantom-extrapolation bimodality; per-column lambda_j added +0.01-0.017/seed).
+  ENSEMBLE (optional upside + winner's-curse reduction): DiffV2_Load_Value_Fn=[ckpts];
+  deploys at Inner_Sub_Batch=16-32 with no quality loss (fresh-world u≈0.38,
+  E[W_T]≈$1.14M, p5≈−116k vs textbook 0.064/$191k/−879k; OOD gate passed).
+  Notes: single-net selection floor is inner=64 (twin July legs); peak ≈ 8.1 GB at
+  8192x64. Backtest: backtest_walk_forward.py (Historical_Replay realized-path mode).
+
 Useful breakpoints:
   riskflow/hedge_solver.py   DiffSolverV2.solve        (driver: bank -> forks -> fit -> verdict)
   riskflow/hedge_solver.py   DiffSolverV2._fit_step    (per-t bootstrap + twin-loss fit)
   riskflow/hedge_solver.py   DiffSolverV2._decide      (argmax; cost-aware branch)
   riskflow/hedge_solver.py   DiffSolverV2._verdict     (OOS rollout vs textbook/no-hedge)
-  riskflow/calculation.py    _run_inner_mc_at_t        (the inner-MC fork)
+  riskflow/calculation.py    _run_inner_mc_at_t        (the inner-MC fork; one-step window)
+  riskflow/pricing.py        pv_energy_cashflows       (ForwardCurve=Components liability)
 """
 import json
 import logging
@@ -19,16 +31,19 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        'tests', 'fixtures', 'policy_test_simulate_only.json')
 
-# ---- knobs (defaults = small & fast for debugging; shipping values in comments) ----
-BATCH = 48                # shipping: 256
-INNER = 8                 # shipping: 64   (even if INNER_ANTITHETIC)
-T_MIN = 100               # shipping: 60   (sweep covers t in [T_MIN, ~116])
-LEVELS = 5                # shipping: 9
-FIT_ITERS = 30            # shipping: 60
+# ---- knobs (defaults = small & fast for debugging; production values in comments) ----
+BATCH = 256                # production: 8192
+INNER = 8                 # production: 64  (selection floor on the dual strip)
+T_MIN = 100               # production: 0   (full ~116-step window)
+LEVELS = 5                # production: 9
+FIT_ITERS = 30            # production: 60
 SEED = 1234
 INNER_ANTITHETIC = 'Yes'
 INNER_DRAWS = 'sobol'     # 'sobol' | 'random'  (iid randn inner draws)
-COST_AWARE = 'No'         # shipping: 'Yes'  (charge k|dq| at the argmax in the verdict)
+COST_AWARE = 'No'         # production: 'Yes' (charge k|dq| at the argmax)
+ONE_STEP = 'Yes'          # production: 'Yes' ({t,t+1} fork window; 'No' = legacy full forks)
+SAVE_CKPT = ''            # production: per-seed path, then ensemble via LOAD_CKPTS
+LOAD_CKPTS = []           # eval-only: list of pruned member checkpoints (ensemble argmax)
 
 
 def main():
@@ -51,7 +66,12 @@ def main():
         'DiffV2_Fit_Iters': FIT_ITERS,
         'DiffV2_OOS_Frac': 0.5,
         'DiffV2_Cost_Aware_Argmax': COST_AWARE,
+        'DiffV2_One_Step_Fork': ONE_STEP,
     }
+    if SAVE_CKPT:
+        hp['Solver']['DiffV2_Save_Value_Fn'] = SAVE_CKPT
+    if LOAD_CKPTS:
+        hp['Solver']['DiffV2_Load_Value_Fn'] = LOAD_CKPTS
 
     cx = rf.Context()
     cx.load_json((json.dumps(cfg), 'harness.json'))

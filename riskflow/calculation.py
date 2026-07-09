@@ -1939,6 +1939,16 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # then re-precalculate with that snapshot as the new t=0. The designer
         # distribution is the process's own T-step pushforward — no separate sampler.
         randomize_t0 = hedging_problem.get('Randomize_Initial_State', 'No') == 'Yes'
+        # Historical replay (walk-forward backtest): the OUTER paths are the realized
+        # archive series instead of simulated draws — deal pricing, the bundle, forks
+        # (which still SIMULATE from the realized state) and the frozen-policy verdict
+        # then all run on the path that actually happened. Every path replica carries
+        # the same prices; the regime aux keys are re-derived from the realized path
+        # (filtered belief + per-replica regime draws), so replicas differ only in
+        # latent-regime samples. Replay configs pair with Randomize_Initial_State='No'
+        # and a DiffV2_Load_Value_Fn frozen policy.
+        replay_paths = self._build_replay_paths(shared_mem) \
+            if params.get('Historical_Replay') else None
 
         for run in range(params['Simulation_Batches']):
             shared_mem.reset(
@@ -1983,6 +1993,19 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
             for key, proc in self.stoch_factors.items():
                 simulated = proc.generate(shared_mem)
+                if replay_paths is not None and key in replay_paths:
+                    # Realized path (broadcast across replicas), replacing the draw.
+                    # Assign BEFORE the next factor generates — linked factors (basis)
+                    # read their underlying from the buffer, so they see the replay.
+                    simulated = replay_paths[key].expand(*simulated.shape).contiguous()
+                    if hasattr(proc, '_forward_belief'):
+                        with torch.no_grad():
+                            belief = proc._forward_belief(simulated.detach(), simulated.device)
+                        shared_mem.t_Scenario_Buffer[(key, 'regime_belief')] = \
+                            belief.permute(0, 2, 1).contiguous()          # (T, n_states, B)
+                        T_b, B_b, n_s = belief.shape
+                        shared_mem.t_Scenario_Buffer[(key, 'regimes')] = torch.multinomial(
+                            belief.reshape(-1, n_s), 1).reshape(T_b, B_b)  # per-replica draws
                 # Leaf the declared underlying(s) so the base-delta / conditional-feature pass can
                 # read ∂value/∂spot via AAD. The diff-ML solver differentiates the continuation
                 # inside the inner MC off its own fresh state-at-t leaves (see inner_mc_grad_fn),
@@ -2284,6 +2307,58 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         return torch.stack(
             [prob_loss, expected_loss_given_loss, variance_loss_given_loss] + per_contract,
             dim=-1)
+
+    def _build_replay_paths(self, shared_mem):
+        """Historical replay: realized archive series mapped onto the sim grid, one entry
+        per stochastic factor found in the archive. `Historical_Replay` = path to a
+        business-day CSV (dates x 'FactorType.NAME[,subkey]' columns — the calibration
+        archive format). Calendar sim-grid rows between business days forward-fill.
+        Per factor type:
+          Factor0D (CommodityPrice/CommodityBasis): the level column -> (T, 1).
+          ForwardRate: the archive quotes a ROLLING-tenor curve ('...,'PLATINUM_TAUi'
+            columns + 'Tenor.PLATINUM_TAUi' year-fracs per row); the sim factor holds
+            FIXED absolute-date knots, so each day's knot value interpolates the rolling
+            curve at the knot's shrinking tenor (clamped to the quoted range).
+          InterestRate: fixed year-tenor columns interpolated to the factor's tenor
+            grid -> (T, n_tenor, 1).
+        Factors without archive columns (e.g. the synthetic identity basis) keep their
+        simulated paths."""
+        archive = pd.read_csv(self.params['Historical_Replay'], index_col=0, parse_dates=True)
+        dates = pd.DatetimeIndex([self.base_date + pd.Timedelta(days=int(d))
+                                  for d in self.time_grid.scen_time_grid])
+        rows = archive.reindex(archive.index.union(dates)).ffill().loc[dates]
+        by_factor = {}
+        for col in archive.columns:
+            by_factor.setdefault(col.split(',')[0], []).append(col)
+
+        out = {}
+        for key in self.stoch_factors:
+            name = utils.check_tuple_name(key)
+            cols = by_factor.get(name)
+            if not cols:
+                continue
+            if key.type == 'ForwardRate':
+                taus = rows[[f'Tenor.{c.split(",")[1]}' for c in cols]].to_numpy()   # (T, k)
+                vals = rows[cols].to_numpy()                                          # (T, k)
+                knot_excel = self.all_factors[key].factor.get_tenor()                 # absolute dates
+                day_excel = (self.base_date - utils.excel_offset).days + \
+                    self.time_grid.scen_time_grid                                     # (T,)
+                knot_tau = (knot_excel[None, :] - day_excel[:, None]) / utils.DAYS_IN_YEAR
+                path = np.stack([
+                    np.interp(knot_tau[t], taus[t], vals[t]) for t in range(len(dates))])
+            elif key.type == 'InterestRate':
+                col_tenors = np.array([float(c.split(',')[1]) for c in cols])
+                order = np.argsort(col_tenors)
+                vals = rows[cols].to_numpy()[:, order]                                # (T, k)
+                grid = self.all_factors[key].factor.get_tenor()                       # year fracs
+                path = np.stack([
+                    np.interp(grid, col_tenors[order], vals[t]) for t in range(len(dates))])
+            else:
+                path = rows[cols[0]].to_numpy()                                       # (T,)
+            out[key] = shared_mem.one.new_tensor(path).unsqueeze(-1)                  # batch-last
+            logging.info('Historical replay: %s <- %d archive column(s), %d sim rows',
+                         name, len(cols), len(dates))
+        return out
 
     def _restricted_struct(self, outer_struct, cutoff_mtm_idx, window_end_idx=None):
         """Build a fresh DealStructure mirroring outer_struct but with each deal's
