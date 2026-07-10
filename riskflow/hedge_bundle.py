@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .hedge_runtime import assemble_privileged_factors
+from .hedge_runtime import assemble_privileged_factors, per_contract_kappa
 
 
 # --- spot realized-vol + timeline (relocated from the deleted hedge_features.py); feed the
@@ -261,6 +261,28 @@ def _tracking_error_value(state, runtime):
     return pnl_excess + liability_mtm + cumulative_liability
 
 
+def wealth_step(W, q, contract_size, dF, dL):
+    """The ONE analytic hedged-wealth transition — frictionless telescoping core.
+
+        W_{t+1} = W_t + Σ_i q_i·cs_i·dF_i + dL,   W_t = cumulative hedge P&L + marked liability L_t
+
+    `q` (…,n_hedge) is the per-instrument position, `dF` (…,n_hedge) the per-instrument price
+    move F_{t+1}−F_t, `dL` (…) the marked-liability change L_{t+1}−L_t. This is the frictionless
+    law DiffSolverV2 rolls (bank/verdict) and, crucially, the one the twin loss DIFFERENTIATES:
+    u(W_{t+1}) is taped back to a wealth leaf + the state-at-t market leaves, so this MUST stay a
+    pure tensor op — no .item()/.detach()/.cpu()/.to(); callers own the grad context.
+
+    `futures_account_step` is the DEPLOYMENT discretization of this same law: it books the same
+    Σ q·cs·dF as per-instrument variation margin `pos·(price−settlement)·cs`, then layers the
+    deployment extras this frictionless form deliberately omits — overnight financing (growth on
+    cash/margin), transaction cost, per-instrument settlement/expiry, and terminal forced-flat.
+    `_tracking_error_value` is its state-based read. That gap is an intentional fidelity
+    difference (the value is position-free / freely-repositioning), not a bug — the faithful
+    walk-forward path is hedge_solver `_rollout_on_stepper`, which rolls the real stepper.
+    """
+    return W + (q * contract_size * dF).sum(dim=-1) + dL
+
+
 # The terminal-utility SHAPES (all map dollars→O(1) utility via the deal scale c: x = W/c).
 # symlog is odd/symmetric; huber and cara are asymmetric (downside-averse). Selected by
 # `Objective.Object`; the legacy `TerminalFloorThenSurplusUtility` is the identity path.
@@ -370,7 +392,7 @@ def resolve_utility_scale(bundle, runtime):
         which defeats the whole point. Fail-loud is consistent with `_require_utility_scale`.
       - Legacy objective (doesn't consume c): returns $1k harmlessly.
 
-    Multi-commodity TODO: use the deal's reference commodity; current scope is single-commodity.
+    Single-commodity scope: uses the unique declared underlying.
     """
     objective = (runtime.get('objective') or {})
     needs_scale = _is_utility_objective(runtime)   # symlog / huber / cara all consume c
@@ -500,7 +522,7 @@ def log_symlog_penalty_calibration(bundle, runtime):
     rc = float((runtime.get('optimizer') or {}).get('dense_tracking_reward_clip', 0.0))
     if rc > 0.0:
         # `rc` clips `shaping = prev_down - next_down` BEFORE the rs·fp multiplication in
-        # asymmetric mode (the spec §8 default), so the relevant scale is the pre-scale
+        # asymmetric mode (the asymmetric-mode default), so the relevant scale is the pre-scale
         # log1p-saturation bound (~5) — NOT the post-rs·fp number. A clip much larger than
         # ~5 is a no-op (the shaping never reaches it).
         dense_pre_scale_bound = 5.0
@@ -681,13 +703,8 @@ def _realized_structured_action(action, current_positions, runtime, *, batch_siz
 
 
 def _transaction_costs(trade_delta, price, runtime, name):
-    unit_cost = float(runtime.get("accounting", {}).get("transaction_cost_per_unit", 0.0))
-    spread_bps = float(runtime.get("accounting", {}).get("bid_offer_spread_bps", 0.0))
-    contract_size = float(_runtime_tradable(runtime, name).get("contract_size", 1.0))
-    cost = trade_delta.abs() * unit_cost
-    if spread_bps > 0.0:
-        cost = cost + trade_delta.abs() * price.abs() * contract_size * 0.5 * spread_bps * 1.0e-4
-    return cost
+    # Realized debit on |Δq| contracts at the turnover-cost rule (hedge_runtime.per_contract_kappa).
+    return trade_delta.abs() * per_contract_kappa(runtime, price.abs(), name)
 
 
 def _apply_cash_trade(cash_accounts, account_name, trade_delta, price, transaction_cost, contract_size):
@@ -775,7 +792,7 @@ def build_shared_state(bundle, runtime):
     # Start simulation state at sim-day-0 (= bundle row H) so the prefix-injected historical rows
     # are only used by features (z-score, cross-delta, momentum) — never visited by the simulator
     # itself. JSON-supplied positions are "today's overnight book", not "30 days ago".
-    initial_time_index = int(runtime.get("history_lookback_business_days", 0) or 0)
+    initial_time_index = int(bundle["initial_time_index"])
     seeded_settlement = portfolio_state.get("settlement_prices", {})
     fallback = _current_tradable_values(bundle, runtime, initial_time_index)
     settlement_prices = {
@@ -1385,6 +1402,11 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
     # Index where the history prefix ends and the simulation grid begins. Solvers strip
     # this offset so they can index time tensors by simulation-grid t (inner_mc_fn coords).
     bundle['initial_time_index'] = int(initial_time_index)
+    # Pre-settlement terminal on the (history-stripped) sim grid: the time grid appends one
+    # clean-exit row where the liability settles to zero, so the last LIVE mtm row is
+    # `aligned_time_steps - 2` (the structural `[-2]`). Single source for the DP terminal
+    # depth (DiffSolverV2.T_dec) and the realized-path L_T read — no magnitude heuristic.
+    bundle['last_live_mtm_index'] = int(aligned_time_steps - 2)
     last = max(len(scenario_dates) - 1, 0)
     bundle['business_indices'] = tuple(
         i for i in range(min(last, len(bd_mask))) if bd_mask[i] and i >= initial_time_index
@@ -1424,17 +1446,16 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
 def _diag_expand_per_day(rollout, bundle, runtime):
     """Build per-instrument (T, B) per-day cashflow tensors plus portfolio totals."""
     factors = bundle['factors']
-    spot_keys = [k for k in factors if k.startswith('CommodityPrice.')]
+    spot_keys = [k for k in factors if k in runtime['referenced_commodities']]
     if len(spot_keys) != 1:
         raise ValueError(
-            f"Diagnostic CSV writer expects exactly one CommodityPrice factor in the bundle; "
+            f"Diagnostic CSV writer expects exactly one commodity-spot factor in the bundle; "
             f"got {spot_keys}. Multi-commodity diagnostic output is not yet implemented."
         )
     spot = factors[spot_keys[0]].detach().cpu().float()
     mtm_running = bundle['liability_mtm'].detach().cpu().float()
     instrument_order = tuple(runtime['names']['action_instruments'])
     spread_bps = float((runtime.get('accounting') or {}).get('bid_offer_spread_bps', 0.0))
-    unit_cost = float((runtime.get('accounting') or {}).get('transaction_cost_per_unit', 0.0))
     T, B = mtm_running.shape
 
     nonzero = (mtm_running != 0)
@@ -1460,7 +1481,7 @@ def _diag_expand_per_day(rollout, bundle, runtime):
                 j += 1
             pos[t] = cur
         trade_cash = -trd * fut * cs
-        trade_cost = trd.abs() * (unit_cost + fut * cs * 0.5 * spread_bps * 1.0e-4)
+        trade_cost = trd.abs() * per_contract_kappa(runtime, fut, name)
         position_mtm = pos * fut * cs
         cum_cash = trade_cash.cumsum(0)
         cum_cost = trade_cost.cumsum(0)
@@ -1484,7 +1505,7 @@ def _diag_expand_per_day(rollout, bundle, runtime):
     }
 
 
-def _diag_write_paths_csv(fields, day_strs, label, runtime, csv_path):
+def _diag_write_paths_csv(fields, day_strs, label, bundle, runtime, csv_path):
     """Per-day per-instrument breakdown for 5 representative cases (worst/p5/mean/p95/best),
     selected by terminal `total_ex_funding_discount`."""
     total = fields['total_ex_funding_discount']
@@ -1496,7 +1517,7 @@ def _diag_write_paths_csv(fields, day_strs, label, runtime, csv_path):
         'p95':   int(sidx[round(0.95 * (B - 1))]),
         'best':  int(sidx[-1]),
     }
-    sim_start = int(runtime.get('history_lookback_business_days', 0) or 0)
+    sim_start = int(bundle['initial_time_index'])
     instrument_order = tuple(runtime['names']['action_instruments'])
     rows = []
 
@@ -1661,7 +1682,7 @@ class BundleStepper:
         fields = _diag_expand_per_day(rollout, self.bundle, self.runtime)
         day_strs = [pd.Timestamp(d).strftime('%Y-%m-%d')
                     for d in _bundle_scenario_dates(self.bundle)]
-        _diag_write_paths_csv(fields, day_strs, label, self.runtime,
+        _diag_write_paths_csv(fields, day_strs, label, self.bundle, self.runtime,
                               os.path.join(output_dir, f'{label}_paths.csv'))
         pd.DataFrame(_diag_summary_rows(label, rollout, fields)).to_csv(
             os.path.join(output_dir, f'{label}_summary.csv'), index=False, float_format='%.2f',
@@ -1691,9 +1712,9 @@ class HedgeRuntimeExecutionResult:
     work without touching framework internals. `create_stepper()` spawns a `BundleStepper`
     to drive the simulator day-by-day with any explicit policy (e.g. the textbook hedge).
     """
-    def __init__(self, *, torchrl_bundle=None, runtime=None, evaluation_summary=None,
+    def __init__(self, *, bundle=None, runtime=None, evaluation_summary=None,
                  optimizer_diagnostics=None, policy_artifact=None, metadata=None):
-        self.torchrl_bundle = torchrl_bundle
+        self.bundle = bundle
         self.runtime = runtime
         self.evaluation_summary = evaluation_summary
         self.optimizer_diagnostics = optimizer_diagnostics
@@ -1705,9 +1726,9 @@ class HedgeRuntimeExecutionResult:
         the simulator one step at a time with arbitrary actions — useful for textbook
         hedges, custom policies, debugging, counterfactual what-ifs (deep-copy the
         stepper to fork branches)."""
-        if self.torchrl_bundle is None or self.runtime is None:
-            raise ValueError("create_stepper needs torchrl_bundle and runtime on the result.")
-        return BundleStepper(self.torchrl_bundle, self.runtime)
+        if self.bundle is None or self.runtime is None:
+            raise ValueError("create_stepper needs bundle and runtime on the result.")
+        return BundleStepper(self.bundle, self.runtime)
 
 
 if __name__ == '__main__':

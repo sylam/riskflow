@@ -1,5 +1,5 @@
 """Pre-flight calibration check: drives the framework with a JSON fixture, retrieves the
-resolved utility_scale `c` from result.torchrl_bundle, then verifies the symlog terminal
+resolved utility_scale `c` from result.bundle, then verifies the symlog terminal
 utility band is in the [10, 50] range the spec calls "fittable by a linear value head"
 across a panel of representative terminal net_pnl dollar values.
 
@@ -37,7 +37,7 @@ def main():
     cx.load_json((jsonlib.dumps(cfg), 'calib_range.json'))
     _, result = cx.run_job()
 
-    c = float(result.torchrl_bundle['utility_scale'])
+    c = float(result.bundle['utility_scale'])
     print(f"Resolved utility_scale c = ${c:,.0f}")
 
     pnl_panel = torch.tensor([

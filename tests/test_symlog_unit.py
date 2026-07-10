@@ -1,6 +1,6 @@
 """Unit tests for the symlog utility transform — pure math, no bundle/runtime needed.
 
-Covers spec §9 items 1 (inverse round-trip) and 2 (PBRS telescoping).
+Covers the inverse round-trip and PBRS telescoping identities.
 """
 import os
 import sys

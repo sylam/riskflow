@@ -503,3 +503,16 @@ def construct_hedge_runtime(
     )
     runtime["privileged_layout"] = derive_privileged_layout(stoch_factors)
     return runtime
+
+
+def per_contract_kappa(runtime, price, name):
+    """Per-contract turnover cost for tradable `name` at mark `price`: a flat
+    Transaction_Cost_Per_Unit plus a half-spread charge on notional
+    (`0.5 · Bid_Offer_Spread_Bps · 1e-4 · price · contract_size`). `price` is a scalar or
+    tensor mark. Single source for the solver's decision-time kappa, the env's realized
+    debit, and the diagnostic CSV writer — any change (asymmetric bid/offer, tiered spread)
+    lives here alone."""
+    acc = runtime["accounting"]
+    contract_size = float(runtime["tradables"][name]["contract_size"])
+    return (acc["transaction_cost_per_unit"]
+            + 0.5 * acc["bid_offer_spread_bps"] * 1.0e-4 * price * contract_size)

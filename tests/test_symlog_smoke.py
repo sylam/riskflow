@@ -27,7 +27,7 @@ def _run(data, *, expect_eval=True):
     cx = rf.Context()
     cx.load_json((jsonlib.dumps(data), 'smoke.json'))
     _, result = cx.run_job()
-    assert result.torchrl_bundle is not None, "bundle missing from result"
+    assert result.bundle is not None, "bundle missing from result"
     if expect_eval:
         assert result.evaluation_summary is not None, "evaluation_summary missing"
     return result
@@ -36,7 +36,7 @@ def _run(data, *, expect_eval=True):
 def test_bundle_resolves_utility_scale():
     """Bundle build always sets utility_scale (consumed by symlog, harmless for legacy)."""
     result = _run(_load())
-    c = float(result.torchrl_bundle.get('utility_scale', 0.0))
+    c = float(result.bundle.get('utility_scale', 0.0))
     assert c > 1e3, f"utility_scale should be > $1k floor; got ${c:,.0f}"
     print(f"test_bundle_resolves_utility_scale: PASS  (c = ${c:,.0f})")
 
@@ -71,7 +71,7 @@ def test_huber_objective_runs():
     the Huber terminal utility) and produces a finite headline."""
     data = _load(Object='AsymmetricUtility_Huber', Huber_Aversion=2.5, Huber_Delta=1.0)
     result = _run(data)
-    assert float(result.torchrl_bundle.get('utility_scale', 0.0)) > 1e3, "huber needs a real c"
+    assert float(result.bundle.get('utility_scale', 0.0)) > 1e3, "huber needs a real c"
     metrics = result.evaluation_summary['metrics']
     assert metrics['average_net_pnl'] is not None and \
         metrics['average_net_pnl'] == metrics['average_net_pnl'], f"huber NaN headline: {metrics}"
@@ -82,7 +82,7 @@ def test_cara_objective_runs():
     """AsymmetricUtility_CARA flows through run_job and produces a finite headline."""
     data = _load(Object='AsymmetricUtility_CARA', CARA_Gamma=1.0)
     result = _run(data)
-    assert float(result.torchrl_bundle.get('utility_scale', 0.0)) > 1e3, "cara needs a real c"
+    assert float(result.bundle.get('utility_scale', 0.0)) > 1e3, "cara needs a real c"
     metrics = result.evaluation_summary['metrics']
     assert metrics['average_net_pnl'] is not None and \
         metrics['average_net_pnl'] == metrics['average_net_pnl'], f"cara NaN headline: {metrics}"
@@ -107,7 +107,7 @@ def test_explicit_utility_scale_override():
     data = _load(Object='AsymmetricUtility_Symlog', Floor_Penalty=10.0,
                  Utility_Scale_Explicit=5_000_000.0)
     result = _run(data)
-    c = float(result.torchrl_bundle['utility_scale'])
+    c = float(result.bundle['utility_scale'])
     assert abs(c - 5_000_000.0) < 1.0, f"explicit override not honored: c=${c:,.0f}"
     print(f"test_explicit_utility_scale_override: PASS  (c = ${c:,.0f})")
 

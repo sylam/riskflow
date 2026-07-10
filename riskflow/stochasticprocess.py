@@ -2337,7 +2337,7 @@ class MarkovHMMSpotModel(StochasticProcess):
             # Detach from autograd: belief is consumed as a state coordinate, not a
             # quantity we differentiate through; the simulator's price-path autograd
             # graph is preserved separately for the deal pricer.
-            # Phase 3c: published to BOTH `privileged_factors()` (B-axis dim=1 → ok concat)
+            # Published to BOTH `privileged_factors()` (B-axis dim=1 → ok concat)
             # AND `t_Scenario_Buffer` with B-LAST shape (T, n_states, B) so the buffer's
             # dim=-1 concat works, enabling `_extract_outer_state_at(privileged=True)` to
             # route belief into the V̂ deep-state market block.

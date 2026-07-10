@@ -19,8 +19,9 @@ import torch
 
 from . import utils
 from .hedge_bundle import (
-    _utility_wrap_signed, _mirror_utility_scale_to_runtime,
+    _utility_wrap_signed, _mirror_utility_scale_to_runtime, wealth_step,
 )
+from .hedge_runtime import per_contract_kappa
 
 
 @dataclass
@@ -63,18 +64,14 @@ def _turnover_cost(delta_contracts, kappa):
 
 
 def _per_contract_kappa(tradables_sim, runtime, hedges, t_index, device):
-    """Per-contract trading cost per hedge instrument: a flat `Transaction_Cost_Per_Unit`
-    plus a half-spread charge `0.5 · Bid_Offer_Spread_Bps · 1e-4 · F_i(t) · contract_size_i`.
-    `tradables_sim` is the history-stripped tradables view; `t_index` is simulation-grid."""
-    acc = runtime["accounting"]
+    """Per-hedge (kappa, contract_size) vectors at sim-grid `t_index`. kappa off
+    `hedge_runtime.per_contract_kappa` at each instrument's mean mark — one source for the
+    turnover-cost rule. `tradables_sim` is the history-stripped tradables view."""
     contract_size = torch.tensor(
         [float(runtime["tradables"][ref]["contract_size"]) for ref in hedges],
         device=device)
-    f_t = torch.tensor(
-        [float(tradables_sim[ref][t_index].mean()) for ref in hedges],
-        device=device)
-    kappa = (acc["transaction_cost_per_unit"]
-             + 0.5 * acc["bid_offer_spread_bps"] * 1.0e-4 * f_t * contract_size)
+    kappa = torch.stack(
+        [per_contract_kappa(runtime, tradables_sim[ref][t_index].mean(), ref) for ref in hedges])
     return kappa, contract_size
 
 
@@ -92,14 +89,14 @@ def _bundle_sim_views(bundle):
 def _realized_paths(bundle, runtime):
     """Realized outer-path data the no-inner-MC tracks (hindsight, textbook) consume:
     `F` `(n_hedge, t_outer, B_outer)` hedge prices, `L_T` `(B_outer,)` the liability
-    terminal MTM, and `t_outer`. The liability terminal mirrors the DP's `inner_mtm[-2]`
-    convention — the pre-settlement terminal (index -1 is the appended clean-exit zero)."""
+    terminal MTM, and `t_outer`. The liability terminal is the bundle's pre-settlement
+    `last_live_mtm_index` (index -1 is the appended clean-exit zero)."""
     tradables_sim, t_outer = _bundle_sim_views(bundle)
     hedges = list(runtime["names"]["hedges"])
     F = torch.stack([tradables_sim[h] for h in hedges], dim=0)        # (n_h, t_outer, B)
     hist = int(bundle.get("initial_time_index", 0))
     liab = bundle["liability_mtm"][hist:]                             # (>=t_outer, B)
-    L_T = liab[min(t_outer - 2, liab.shape[0] - 1)]                   # (B,)
+    L_T = liab[bundle["last_live_mtm_index"]]                         # (B,)
     return F, L_T, t_outer
 
 
@@ -357,18 +354,13 @@ class DiffSolverV2:
         hist = int(bundle.get("initial_time_index", 0))
         self.liability_sim = bundle["liability_mtm"][hist:]           # (n_steps, B_outer)
         self.B_outer = int(self.liability_sim.shape[-1])
-        # Effective terminal: the LAST sim index is a post-settlement drop when the liability
-        # mark there collapses to ~0 (the deal pays out — e.g. the platinum average-rate
-        # forward marks its realised payoff at T-1, then 0 at the payment date T). The
-        # framework's own `inner["L_T"] = inner_mtm[-2]` encodes exactly this. Telescoping
-        # wealth THROUGH that drop cancels the liability's settlement risk (no-hedge W_T≡0),
-        # so the meaningful terminal is the last LIVE mark. Decisions run 0..T_dec-1; the
-        # terminal continuation marks the liability at T_dec.
-        T_raw = self.n_steps - 1
-        last = float(self.liability_sim[T_raw].abs().mean())
-        prev = float(self.liability_sim[T_raw - 1].abs().mean()) if T_raw >= 1 else last
-        self._settled_terminal = last < 1.0e-3 * max(prev, 1.0)
-        self.T_dec = T_raw - 1 if self._settled_terminal else T_raw
+        # Effective terminal = the last LIVE liability mark. The time grid appends one
+        # post-settlement clean-exit row (the deal pays out — the platinum average-rate forward
+        # marks its realised payoff at T-1, then 0 at the payment date T), so the meaningful
+        # terminal is the bundle's `last_live_mtm_index` (the structural pre-settlement `[-2]`).
+        # Telescoping wealth THROUGH the settlement drop cancels the liability's settlement risk
+        # (no-hedge W_T≡0). Decisions run 0..T_dec-1; the terminal continuation marks at T_dec.
+        self.T_dec = int(bundle["last_live_mtm_index"])
 
     # ---- utility anchor ------------------------------------------------------
     def _u(self, W):
@@ -435,8 +427,11 @@ class DiffSolverV2:
 
     # ---- one-step wealth move ------------------------------------------------
     def _wealth_step(self, W, q, dF, dL):
-        """W_{t+1} = W + Σ_i q_i·cs_i·dF_i + dL. q (...,n_hedge); dF (...,n_hedge); dL (...)."""
-        return W + (q * self.contract_size * dF).sum(dim=-1) + dL
+        """W_{t+1} = W + Σ_i q_i·cs_i·dF_i + dL — the frictionless analytic wealth law, owned by
+        `hedge_bundle.wealth_step` (the single source `futures_account_step` discretizes; the
+        solver's bank/verdict/inner-labels all funnel through here). q (...,n_hedge); dF
+        (...,n_hedge); dL (...). Expiry is composed by callers via the `live` mask on dF."""
+        return wealth_step(W, q, self.contract_size, dF, dL)
 
     # ---- inner-MC one-step quantities at outer t -----------------------------
     def _inner_step(self, t):
@@ -872,10 +867,10 @@ class DiffSolverV2:
         gen = torch.Generator(device=self.device)
         gen.manual_seed(0)
         logging.info(
-            "DiffSolverV2 setup: n_hedge=%d active=%s T_dec=%d (of %d sim steps; "
-            "settled_terminal=%s) B_outer=%d levels=%d fit_iters=%d lr=%.3g | "
+            "DiffSolverV2 setup: n_hedge=%d active=%s T_dec=%d (of %d sim steps; last-live "
+            "mtm=[-2]) B_outer=%d levels=%d fit_iters=%d lr=%.3g | "
             "contract_size=%s | q∈[%s, %s] total_abs_limit=%.3g",
-            self.n_hedge, self.active, self.T_dec, self.n_steps, self._settled_terminal,
+            self.n_hedge, self.active, self.T_dec, self.n_steps,
             self.B_outer, self.levels, self.fit_iters, self.lr, self.contract_size.tolist(),
             self.q_lo.tolist(), self.q_hi.tolist(), self.total_abs_limit)
         logging.info("DiffSolverV2 inner forks: one_step=%s (window {t, t+1} generation+pricing)"

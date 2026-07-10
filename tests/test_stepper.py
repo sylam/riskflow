@@ -60,7 +60,7 @@ def test_textbook_hedge_as_stepper_loop():
     short Volume/cs from t=0, ramp linearly to 0 across the averaging window."""
     result = _run_fixture()
     runtime = result.runtime
-    bundle = result.torchrl_bundle
+    bundle = result.bundle
 
     # Pull deal volume + averaging window from runtime/liabilities (problem-specific data
     # but read via public surface — the runtime dict is part of the public contract).

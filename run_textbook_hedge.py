@@ -124,7 +124,7 @@ def runtime_instrument_order(result) -> list[str]:
 
 
 def build_schedule_rows(result, instruments: Optional[list[str]] = None) -> list[dict[str, Any]]:
-    bundle = result.torchrl_bundle
+    bundle = result.bundle
     dates = bundle['scenario_dates']
     business_day = bundle['meta']['business_day']
     decision_indices = set(bundle.get('business_indices', ()))
@@ -167,7 +167,7 @@ def run_position_target_schedule(result, target_positions_by_date: dict[str, dic
             last = stepper.step(None)
             continue
         observed = stepper.observe()
-        date_key = pd.Timestamp(result.torchrl_bundle['scenario_dates'][stepper.time_index]).strftime('%Y-%m-%d')
+        date_key = pd.Timestamp(result.bundle['scenario_dates'][stepper.time_index]).strftime('%Y-%m-%d')
         targets = target_positions_by_date.get(date_key)
         if not targets:
             last = stepper.step(None)
@@ -228,7 +228,7 @@ def _textbook_targets(result, hedge_instrument):
         business days; linearly ramps from -short_at_start back to 0.
     """
     runtime = result.runtime
-    bundle = result.torchrl_bundle
+    bundle = result.bundle
     liab = next(iter(runtime['liabilities'].values()))
     items = liab['params']['Payments']['Items']
     deal_volume = float(items[0]['Volume'])

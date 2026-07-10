@@ -1770,8 +1770,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         dependent_factors, stochastic_factors, _, reset_dates, settlement_currencies = self.config.calculate_dependencies(
             params, base_date, self.input_time_grid)
 
-        # Size the time grid from Futures_Expiries (or a 2-year fallback). If a
-        # liability-end cap was set upstream, clip max_expiry there — hedge maturities
+        # Size the time grid from the max tradable reset date, capped at liability end.
+        # If a liability-end cap was set upstream, clip max_expiry there — hedge maturities
         # past liability end are dropped from the simulation horizon; the hedges
         # themselves will be priced through liability end and any residual position
         # closes out at fair value there.
@@ -1815,24 +1815,10 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         return total_volume, last_payment_day
 
     def execute(self, params, job_id=0, num_jobs=1):
-        """Run hedging simulation batches and package the result for TorchRL.
-
-        The calculation lifecycle is intentionally split into three phases:
-
-        - setup before the simulation loop
-        - tensor accumulation inside the simulation loop
-        - bundle finalization after the loop
-
-        RiskFlow remains responsible for:
-
-        - simulation
-        - tradable pricing
-        - time grid construction
-
-        The output handoff is a minimal dictionary-driven tensor bundle for the
-        TorchRL path. Learning and policy execution are intentionally not run
-        here.
-        """
+        """Simulate the scenario engine over batches, accumulate the tensor bundle
+        (tradable prices, liability MtM, factor paths), then hand it to the configured
+        hedge solver (solve_hedge) or expose it for stepping (simulate_only). Returns a
+        HedgeRuntimeExecutionResult."""
         def read_instruments(instruments_dict):
             instruments = []
             for obj_type, obj_data in instruments_dict.items():
@@ -1858,10 +1844,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         execution_mode = params.get('Execution_Mode', 'simulate_only')
         hedging_problem = params.get('Hedging_Problem', {})
-        # Diff-ML inner-MC belief coherence (validation_sandwich_spec §1/§4.2): when True,
-        # the bootstrap's z_{t+1} regime block is a one-step HMM filter posterior seeded
-        # from the outer belief, not the privileged true-regime one-hot. Default True;
-        # set False to reproduce the legacy one-hot bootstrap for A/B verdicts.
+        # Diff-ML inner-MC belief coherence: when True, the bootstrap's z_{t+1} regime
+        # block is a one-step HMM filter posterior seeded from the outer belief, not the
+        # privileged true-regime one-hot. Default True; set False for the one-hot bootstrap.
         self._inner_belief_filter = hedging_problem.get('Inner_Belief_Filter', 'Yes') == 'Yes'
 
         instruments = read_instruments(hedging_problem.get('Tradable_Instruments', {}))
@@ -1900,18 +1885,22 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         normalized_runtime = construct_hedge_runtime(
             params, stoch_factors=self.stoch_factors,
         )
+        # Canonical underlying (commodity-spot) factor-name set, derived once by the runtime
+        # from the live CommodityPrice factors. Read by the spot-leaf pass and `_find_spot_key`
+        # (mapping back to the live key object via stoch_factors) — no divergent re-derivation.
+        self._underlying_names = set(normalized_runtime['referenced_commodities'])
 
         # Inner-MC setup. Copies are forked after outer setup precalc has populated
         # `factor_key`/`spot0`/etc., so inner-mode precalc on the copies doesn't clobber
         # outer-instance attrs read by outer generate each batch. `shared_mem` is a
         # CMC_State_Inner — outer batches use inherited `reset()`, inner uses `reset_inner()`.
-        conditional_features_blocks = [] if params.get('Inner_MC_Enabled', 'No')=='Yes' else None
-        tradable_refs = sorted(normalized_runtime['names']['hedges']) if conditional_features_blocks is not None else ()
+        inner_mc_enabled = params.get('Inner_MC_Enabled', 'No') == 'Yes'
+        tradable_refs = sorted(normalized_runtime['names']['hedges']) if inner_mc_enabled else ()
 
         # solve_hedge: inner MC runs in the backward DP/MPC sweep, not the outer loop.
         # Cache the per-batch outer scenario buffer so inner MC can fork on demand later.
         solve_hedge_mode = str(execution_mode).lower() == 'solve_hedge'
-        if conditional_features_blocks is not None:
+        if inner_mc_enabled:
             self.stoch_factors_inner = {k: proc.copy() for k, proc in self.stoch_factors.items()}
         outer_state_blocks = defaultdict(list) if solve_hedge_mode else None
 
@@ -1930,9 +1919,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # get the calendar for business day
         bus_day = self.config.holidays.get(
             self.params['Calendar'], {'businessday': pd.offsets.BDay(1)})['businessday']
-        # Identify which factors correspond to user-declared underlyings.
-        # Spot_Price_History is keyed by commodity name; the matching factor key is
-        declared_underlyings = self.params['Hedging_Problem']['Portfolio_State'].get('Spot_Price_History',{}).keys()
         # Huge-Savine diff-ML needs variance in z_0 for the differential label at the
         # boundary to be well-posed. We obtain it via a per-batch burn-in: run each
         # process once from the calibrated t=0, snapshot the terminal state per path,
@@ -2007,7 +1993,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 # read ∂value/∂spot via AAD. The diff-ML solver differentiates the continuation
                 # inside the inner MC off its own fresh state-at-t leaves (see inner_mc_grad_fn),
                 # so it needs no outer leaf.
-                if utils.check_tuple_name(key) in declared_underlyings:
+                if utils.check_tuple_name(key) in self._underlying_names:
                     simulated = simulated.detach().requires_grad_(True)
                 shared_mem.t_Scenario_Buffer[key] = simulated
                 # Each process owns its privileged-factor surface; ask it what to expose. Default
@@ -2058,12 +2044,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 for instrument_name, instrument_tensor in trade_tensors.items():
                     tradable_blocks[instrument_name].append(instrument_tensor.detach().clone())
 
-            # RL path only: precompute conditional features during the outer loop.
-            # solve_hedge defers inner MC to the backward sweep (see inner_mc_fn below).
-            if conditional_features_blocks is not None and not solve_hedge_mode:
-                conditional_features_blocks.append(self._run_inner_mc_pass(
-                    run, shared_mem, base_date, params, tradable_refs).cpu())
-
             shared_mem.t_Buffer.clear()
 
         self.calc_stats[execution_label] = time.monotonic() - self.calc_stats[execution_label]
@@ -2076,7 +2056,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             }
 
         total_leg_volume, last_payment_day = self._liability_schedule_scalars()
-        torchrl_bundle = None if normalized_runtime is None else build_hedge_bundle(
+        bundle = None if normalized_runtime is None else build_hedge_bundle(
             base_date,
             bus_day,
             shared_mem.one.new_tensor(t_days_arr),
@@ -2090,37 +2070,24 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             total_leg_volume=total_leg_volume,
             last_payment_day=last_payment_day,
         )
-        if torchrl_bundle is not None and conditional_features_blocks:
-            torchrl_bundle['conditional_features'] = torch.cat(
-                conditional_features_blocks, dim=1)
-            torchrl_bundle['conditional_feature_names'] = [
-                'prob_loss',
-                'expected_loss_given_loss',
-                'variance_loss_given_loss',
-            ] + [
-                f'{stat}_{ref}'
-                for ref in tradable_refs
-                for stat in ('expected_terminal_move_given_loss', 'expected_min_move_given_loss')
-            ]
-
-        if torchrl_bundle is not None and solve_hedge_mode:
+        if bundle is not None and solve_hedge_mode:
             # Closure lets the solver fork inner MC on demand without a calc handle —
             # captures `self` (the inner-MC machinery), the cached outer state, shared_mem.
             # `one_step=True` windows the fork to {t, t+1}: 2-row generation AND a real
             # 2-row pricing pass (exact per-tradable F_t1, exact L_t/L_t1) — the only
             # fields the diff-ML bootstrap reads. Horizon fields (L_T, dF_T, dF_min,
             # features) are only produced on full forks.
-            torchrl_bundle['inner_mc_fn'] = lambda t, one_step=False: self._run_inner_mc_at_t(
+            bundle['inner_mc_fn'] = lambda t, one_step=False: self._run_inner_mc_at_t(
                 t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
                 max_inner_steps=1 if one_step else None)
             # Grad-enabled twin: per-process state-at-t leaves attached so the solver can
             # `.backward()` from any function of inner outputs back to state-at-t and read
-            # gradient labels (Phase 3b deep, differential ML twin-loss). `outer_rows`
+            # gradient labels (differential ML twin-loss). `outer_rows`
             # lets the solver run the grad fork in outer-path sub-slices at large B_outer
             # (per-slice tapes; the single-chunk grad constraint applies per slice —
             # with `one_step=True` the tape covers 2 rows, so the flat cap binds instead
             # of the cells cap and slices get wide).
-            torchrl_bundle['inner_mc_grad_fn'] = lambda t, outer_rows=None, one_step=False: \
+            bundle['inner_mc_grad_fn'] = lambda t, outer_rows=None, one_step=False: \
                 self._run_inner_mc_at_t(
                     t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
                     with_grad=True, outer_rows=outer_rows,
@@ -2128,16 +2095,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             # Grad-slice sizing inputs: cell budget (flat limit at its 64-row calibration
             # reference, halved — the AAD tape roughly doubles per-cell memory vs no-grad)
             # + the inner sub-batch. The solver divides by the per-t remaining rows.
-            torchrl_bundle['inner_mc_cell_budget'] = (_INNER_MC_FLAT_LIMIT * 64) // 2
-            torchrl_bundle['inner_sub_batch'] = int(shared_mem.simulation_sub_batch)
-            # Calc handle for the differential-ML solver's `sample_exogenous` seam: the
-            # solver reads `_outer_scenario_buffer` + uses `_extract_outer_state_at`
-            # directly; no monkey-patching of framework primitives. **TODO refactor (A):** promote `sample_exogenous` to a
-            # `HedgeMonteCarlo` bundle source (i.e., emit per-t exogenous slices into
-            # `torchrl_bundle` so the solver doesn't reach back into the calc) — until
-            # then this attribute lets the solver read what's already there without
-            # owning the buffer.
-            torchrl_bundle['_calc_handle'] = self
+            bundle['inner_mc_cell_budget'] = (_INNER_MC_FLAT_LIMIT * 64) // 2
+            bundle['inner_sub_batch'] = int(shared_mem.simulation_sub_batch)
 
         evaluation_summary = None
         optimizer_diagnostics = None
@@ -2145,8 +2104,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         runtime_present = False
         runtime_diagnostics = {}
         optimization_result = None
-        if torchrl_bundle is not None and normalized_runtime is not None:
-            optimization_result = run_hedge_execution(torchrl_bundle, normalized_runtime)
+        if bundle is not None and normalized_runtime is not None:
+            optimization_result = run_hedge_execution(bundle, normalized_runtime)
         if optimization_result is not None:
             evaluation_summary = optimization_result['evaluation_output']
             optimizer_diagnostics = optimization_result['optimizer_diagnostics']
@@ -2161,14 +2120,14 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             }
 
         return HedgeRuntimeExecutionResult(
-            torchrl_bundle=torchrl_bundle,
+            bundle=bundle,
             runtime=normalized_runtime,
             evaluation_summary=evaluation_summary,
             optimizer_diagnostics=optimizer_diagnostics,
             policy_artifact=policy_artifact,
             metadata={
                 'execution_mode': execution_mode,
-                'torchrl_bundle_present': torchrl_bundle is not None,
+                'bundle_present': bundle is not None,
                 'num_batches': params['Simulation_Batches'],
                 'num_paths': self.numscenarios,
                 'optimizer_diagnostics_present': optimizer_diagnostics is not None,
@@ -2189,21 +2148,16 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
     # ------------------------------------------------------------------
 
     def _find_spot_key(self):
-        """Return the unique CommodityPrice factor key from self.stoch_factors. Raises
-        if zero or multiple — v1 inner-MC is specified for a single-spot regime."""
-        spot_keys = [k for k in self.stoch_factors if k.type == 'CommodityPrice']
+        """Return the unique underlying (commodity-spot) factor key. Its name comes from the
+        runtime-owned underlying set (`self._underlying_names`); map back to the live key
+        object via stoch_factors. Raises unless exactly one — v1 inner-MC is single-spot."""
+        spot_keys = [k for k in self.stoch_factors
+                     if utils.check_tuple_name(k) in self._underlying_names]
         if len(spot_keys) != 1:
             raise ValueError(
-                f'Inner MC expects exactly one CommodityPrice factor; found {len(spot_keys)}: {spot_keys}'
+                f'Inner MC expects exactly one underlying spot factor; found {len(spot_keys)}: {spot_keys}'
             )
         return spot_keys[0]
-
-    def _get_implied_for(self, key):
-        """Mirror of the outer `_build_factor_state` implied-tensor derivation. Returns
-        None if the factor has no implied variables."""
-        if key in self.implied_var:
-            return {k.name[-1]: v for k, v in self.implied_var[key].items()}
-        return None
 
     def _extract_outer_state_at(self, t, key, scenario_buffer, privileged=False):
         """Per-factor state for `key` at time index `t`, sliced from `scenario_buffer`
@@ -2222,7 +2176,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             regimes = scenario_buffer.get((key, 'regimes'))
             proc = self.stoch_factors_inner.get(key)
             if privileged and regimes is not None and getattr(proc, 'n_states', None):
-                # Phase 3c: prefer the filtered belief `P(regime_t | prices_{0..t})` when
+                # Prefer the filtered belief `P(regime_t | prices_{0..t})` when
                 # available AND the buffer's shape matches the current mode. Outer mode:
                 # regimes (T, B), belief (T, n_states, B) → belief.dim() == regimes.dim() + 1.
                 # Inner mode: regimes (T, B, B2), belief still outer-shape (no inner filter)
@@ -2341,10 +2295,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         solver uses to run GRAD forks in sub-slices at large B_outer (per-slice AAD tapes;
         labels are per-outer-path so slices are independent).
 
-        This is the per-`t` body of the former `_run_inner_mc_pass`, lifted so the DP/MPC
-        backward sweep can call it on demand outside the outer loop (via the closure
-        `bundle['inner_mc_fn']`). The non-solve_hedge conditional-features pass sweeps every
-        `t` through the `_run_inner_mc_pass` wrapper below.
+        The DP/MPC backward sweep calls this on demand outside the outer loop (via the
+        closure `bundle['inner_mc_fn']`), forking inner MC at the requested `t`.
 
         `want_raw_samples=False` returns just `{'features': (B_outer, 3+2*n_tradables)}`.
         `want_raw_samples=True` additionally returns the raw inner samples the solvers need:
@@ -2378,7 +2330,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         # Terminal / past-end — no inner horizon. Emit zero features; `prob_loss == 0`
         # flags this downstream. The DP sweep does not call here at terminal (it uses the
-        # closed-form V_T); the RL wrapper does, hence the guard.
+        # closed-form V_T); a caller querying `inner_mc_fn` at or past terminal does, hence the guard.
         if inner_time_grid.scen_time_grid.size < 2:
             result = {'features': shared_mem.one.new_zeros(B_outer, n_features)}
             if want_raw_samples:
@@ -2397,7 +2349,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # liability L_t/L_t1 (the only fields the diff-ML bootstrap reads), correct on
         # mixed strips (each future prices its own basis+carry; the old market-only
         # short-circuit broadcast SPOT as every F_t1). Restricting the AAD tape to a
-        # single forward step is what keeps the twin-loss architecture on a 3090 — a
+        # single forward step is what keeps its memory bounded — a
         # full t→T_dec horizon multiplies tape and pricing by the remaining rows for no
         # use. The scenario buffer only reaches row t+1, and the windowed Time_dep
         # rebuilds `interp` up to its last kept event, so nothing indexes past it.
@@ -2496,11 +2448,11 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     inner_base_date, inner_time_grid,
                     init_state,
                     shared_mem, self.process_ofs[key],
-                    implied_tensor=self._get_implied_for(key),
+                    implied_tensor=self._factor_precalc_args[key][1],
                 )
                 simulated = proc_inner.generate(shared_mem)
                 shared_mem.t_Scenario_Buffer[key] = simulated
-                # Diff-ML belief coherence (validation_sandwich_spec §1/§4.2): for a
+                # Diff-ML belief coherence: for a
                 # regime-switching spot, publish a one-step filtered belief so the
                 # privileged extractor below returns the participant's posterior instead
                 # of the true-regime one-hot fallback. Seeded from the outer entry belief
@@ -2655,20 +2607,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             shared_mem.t_quasi_rng.clear()
 
         return result
-
-    def _run_inner_mc_pass(self, run, shared_mem, base_date, params, tradable_refs):
-        """Thin wrapper over `_run_inner_mc_at_t` for the non-solve_hedge conditional-features
-        pass: sweep every outer `t`, collect the per-`t` feature row, stack to
-        `(T_outer, B_outer, 3 + 2*len(tradable_refs))`. The solver path instead calls
-        `_run_inner_mc_at_t` on demand via `bundle['inner_mc_fn']`."""
-        outer_scenario_buffer = dict(shared_mem.t_Scenario_Buffer)
-        per_t = [
-            self._run_inner_mc_at_t(
-                t, outer_scenario_buffer, shared_mem, base_date,
-                tradable_refs, want_raw_samples=False)['features']
-            for t in range(self.time_grid.scen_time_grid.size)
-        ]
-        return torch.stack(per_t, dim=0)
 
 
 def construct_calculation(calc_type, config, **kwargs):
