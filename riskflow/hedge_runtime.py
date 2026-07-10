@@ -154,6 +154,11 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
         # expected value against the cost of getting there. Training stays cost-free.
         "diffv2_cost_aware_argmax":
             solver_config.get("DiffV2_Cost_Aware_Argmax", "No") == "Yes",
+        # Deployment-faithful backtest: with a frozen policy loaded, roll it day-by-day on the
+        # observed path via BundleStepper (real futures accounting; decisions off the stepper's
+        # own wealth). Exposes diagnostics['stepper_verdict']. 'No' = only the fast _verdict.
+        "diffv2_stepper_rollout":
+            solver_config.get("DiffV2_Stepper_Rollout", "No") == "Yes",
         # One-step inner forks: window fork generation AND pricing to {t, t+1} — the
         # bootstrap/argmax only read t/t+1 fields (F_t1, L_t, L_t1, market_t1), so the
         # AAD tape and per-fork pricing stop scaling with the remaining horizon.

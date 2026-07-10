@@ -508,7 +508,9 @@ class DiffSolverV2:
             ref = self.hedges[i]
             dF = self.tradables_sim[ref][t + 1] - self.tradables_sim[ref][t]              # (B_outer,)
             var = dF.var()
-            if float(var) <= 1e-12:
+            # Skip degenerate OR non-finite instruments (an expired-contract row can carry a
+            # NaN mark; without this guard clamp(NaN)=NaN poisons the whole textbook book).
+            if not float(var) > 1e-12 or not torch.isfinite(dF).all():
                 continue
             beta = ((dL - dL.mean()) * (dF - dF.mean())).mean() / var
             q[i] = (-beta / (self.contract_size[i] * max(self.n_active, 1)))
@@ -790,9 +792,77 @@ class DiffSolverV2:
         # greedy position summary: mean over the rollout of |q| per instrument (is it hedging?)
         gq = torch.tensor(q_traj["greedy"])                                              # (n_steps, n_hedge)
         out["greedy_mean_abs_q"] = gq.abs().mean(0).tolist()
+        out["greedy_q_traj"] = q_traj["greedy"]          # full per-t mean book (audit trail)
         out["greedy_q_first"] = q_traj["greedy"][0] if q_traj["greedy"] else None
         out["greedy_q_mid"] = (q_traj["greedy"][len(q_traj["greedy"]) // 2]
                                if q_traj["greedy"] else None)
+        return out
+
+    # ---- frozen-policy daily rollout on a realized path via the stepper -------
+    def _rollout_on_stepper(self, nets, inner_cache, grid, sweep_ts):
+        """Deployment-faithful backtest: roll the frozen policy day-by-day along the
+        bundle's (observed) path through `BundleStepper`, which owns the real futures
+        accounting (variation margin, financing, per-instrument expiry, forced-flat).
+        Each day the book is chosen by `_decide` from the CAUSAL one-step fork forecast
+        (`inner_cache[t]`) and the STEPPER'S OWN net wealth — never a verdict wealth
+        recursion, so the decision can't be contaminated by mis-accrued P&L. This is
+        the JSON-contract interface for running the precomputed diff-ML nets daily.
+        Returns {greedy, textbook, nohedge} terminal-P&L stats in the verdict shape."""
+        from .hedge_bundle import BundleStepper, _tracking_error_value
+        hist = int(self.bundle.get("initial_time_index", 0))
+        sweep_set = set(int(t) for t in sweep_ts)
+
+        q_log = {"greedy": [], "t": []}
+
+        def roll(policy):
+            stepper = BundleStepper(self.bundle, self.runtime)
+            q_prev = None
+            last = None
+            while not stepper.done:
+                t = stepper.time_index - hist
+                if stepper.is_decision_step and t in sweep_set:
+                    state = stepper._state
+                    W = _tracking_error_value(state, self.runtime).to(self.device)     # (B,) net wealth
+                    B = W.shape[0]
+                    if policy == "nohedge":
+                        q = torch.zeros(B, self.n_hedge, device=self.device)
+                    elif policy == "textbook":
+                        qt = self._replication_hedge(t)     # (n_hedge,) per-instrument clamped
+                        # Also honour the TOTAL position cap (replication clamps per-instrument
+                        # only; unscaled it can hold n_hedge x the cap and blow up the stepper's
+                        # margin accounting). Scale the book down proportionally if over-limit.
+                        tot = float(qt.abs().sum())
+                        if self.total_abs_limit > 0.0 and tot > self.total_abs_limit:
+                            qt = qt * (self.total_abs_limit / tot)
+                        q = qt[None].expand(B, self.n_hedge)
+                    else:
+                        dF, dL, m1, _, live = inner_cache[t]
+                        kappa_t, _ = _per_contract_kappa(
+                            self.tradables_sim, self.runtime, self.hedges, t, self.device)
+                        q, _ = self._decide(nets, m1, dF, dL, W, t, grid,
+                                            q_prev=q_prev if self.cost_aware else None,
+                                            kappa=kappa_t if self.cost_aware else None)
+                        q = q * live
+                        q_log["greedy"].append(q.mean(0).detach().cpu().tolist())
+                        q_log["t"].append(int(t))
+                    q_prev = q
+                    cur = state["positions"]
+                    delta = {n: q[:, j] - cur[n].to(dtype=q.dtype, device=q.device)
+                             for j, n in enumerate(self.hedges)}
+                    last = stepper.step(delta)
+                else:
+                    last = stepper.step(None)
+            return (last["transition_pnl_excess"]
+                    + last["transition_liability_value"]).to(torch.float64)
+
+        def stats(wT):
+            p5 = torch.quantile(wT, 0.05)
+            cvar5 = wT[wT <= p5].mean() if (wT <= p5).any() else p5
+            return {"u_mean": float(self._u(wT.to(torch.float32)).mean()),
+                    "wT_mean": float(wT.mean()), "wT_p5": float(p5), "wT_cvar5": float(cvar5)}
+        out = {p: stats(roll(p)) for p in ("greedy", "textbook", "nohedge")}
+        out["greedy_q_traj"] = q_log["greedy"]        # per-decision mean book (audit)
+        out["greedy_q_t"] = q_log["t"]
         return out
 
     # ---- driver --------------------------------------------------------------
@@ -962,6 +1032,23 @@ class DiffSolverV2:
                 verdict_is["greedy"]["u_mean"], verdict["greedy"]["u_mean"],
                 verdict_is["textbook"]["u_mean"], verdict["textbook"]["u_mean"],
                 verdict_is["greedy"]["u_mean"] - verdict["greedy"]["u_mean"])
+        # Deployment-faithful backtest: when a frozen policy is loaded and stepper rollout is
+        # requested, roll it day-by-day on the (observed) path via BundleStepper — real futures
+        # accounting + decisions off the stepper's own wealth. This is the trustworthy P&L for a
+        # walk-forward backtest (the simplified _verdict wealth recursion mis-accrues expiry).
+        stepper_verdict = None
+        if loaded is not None and bool(self.cfg.get("diffv2_stepper_rollout", False)):
+            stepper_verdict = self._rollout_on_stepper(nets, inner_cache, grid, sweep_ts)
+            sg, stb, snh = (stepper_verdict[k] for k in ("greedy", "textbook", "nohedge"))
+            logging.info(
+                "DiffSolverV2 STEPPER ROLLOUT (frozen policy, realized path, real accounting):\n"
+                "  greedy   wT=%+.4e p5=%+.4e cvar5=%+.4e\n"
+                "  textbook wT=%+.4e p5=%+.4e cvar5=%+.4e\n"
+                "  nohedge  wT=%+.4e p5=%+.4e cvar5=%+.4e",
+                sg["wT_mean"], sg["wT_p5"], sg["wT_cvar5"],
+                stb["wT_mean"], stb["wT_p5"], stb["wT_cvar5"],
+                snh["wT_mean"], snh["wT_p5"], snh["wT_cvar5"])
+
         g, tb, nh = verdict["greedy"], verdict["textbook"], verdict["nohedge"]
         # PRIMARY metric = the optimization target E[u(W_T)] (already encodes downside aversion
         # via the concave utility). CVaR5 is a secondary tail diagnostic (noisy at small B).
@@ -1004,6 +1091,7 @@ class DiffSolverV2:
                 "action_grid_size": int(grid.shape[0]),
                 "market_dim": int(M.shape[-1]),
                 "verdict": verdict,                       # OUT-OF-SAMPLE (held-out paths)
+                "stepper_verdict": stepper_verdict,       # frozen-policy realized-path rollout (real accounting)
                 "verdict_in_sample": verdict_is,
                 "verdict_is_oos": bool(has_oos),
                 "verdict_beats_nohedge_on_utility": bool(beats_nh),
