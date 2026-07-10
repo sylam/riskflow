@@ -1947,7 +1947,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 # generate loop below. Each process's `simulated[-1]` is the
                 # per-path shape its precalculate accepts as `tensor`; the
                 # inner-MC fork at `_run_inner_mc_at_t` uses exactly this
-                # contract (terminal slice via `_extract_outer_state_at`,
+                # contract (terminal slice `outer_buf[key][t]`,
                 # re-precalc with it as init_state), so a curve process gets a
                 # (n_tenors, B) snapshot, a spot a (B,) snapshot, and so on.
                 initial_t0 = {}
@@ -2159,58 +2159,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             )
         return spot_keys[0]
 
-    def _extract_outer_state_at(self, t, key, scenario_buffer, privileged=False):
-        """Per-factor state for `key` at time index `t`, sliced from `scenario_buffer`
-        with the batch axis trailing.
-
-        `privileged=False` (default): the raw factor state — the shape each process's
-        `precalculate` expects as its per-path initial state.
-        `privileged=True`: the informative market-state representation the value function
-        consumes — the regime posterior (one-hot of the regime path the regime-switching
-        process publishes under `(key, 'regimes')`) for a regime-switching spot, since
-        the raw price is redundant with the tradable futures; the carry curve as-is for
-        a rate factor. Extend the per-type dispatch here to support a new factor type —
-        the DP / MPC solvers stay factor-agnostic."""
-        outer = scenario_buffer[key]
-        if key.type in ('CommodityPrice', 'CommodityBasis'):
-            regimes = scenario_buffer.get((key, 'regimes'))
-            proc = self.stoch_factors_inner.get(key)
-            if privileged and regimes is not None and getattr(proc, 'n_states', None):
-                # Prefer the filtered belief `P(regime_t | prices_{0..t})` when
-                # available AND the buffer's shape matches the current mode. Outer mode:
-                # regimes (T, B), belief (T, n_states, B) → belief.dim() == regimes.dim() + 1.
-                # Inner mode: regimes (T, B, B2), belief still outer-shape (no inner filter)
-                # → dim mismatch ⇒ fall back to the inner-regime one-hot (degenerate point-
-                # mass belief at the sampled regime; the V̂ was trained on belief vectors
-                # but a one-hot is at the boundary of belief space, so the query is well-
-                # defined though not statistically pure).
-                #
-                # The observable spot PRICE is appended as the LAST sub-coordinate of the
-                # block: the liability marks to it and it is deployable (the quoted LME spot),
-                # so it belongs in the value function's state. The regime stays LATENT — we
-                # expose the belief posterior (participant-inferable from prices), never the
-                # true regime. Belief-first / price-last keeps the regime-column offsets
-                # downstream unchanged; consumers split the block by `n_states`.
-                price = outer[t].unsqueeze(0)              # (1, ...batch) — raw spot level
-                belief = scenario_buffer.get((key, 'regime_belief'))
-                if belief is not None and belief.dim() == regimes.dim() + 1:
-                    return torch.cat([belief[t], price], dim=0)   # (n_states+1, ...batch)
-                onehot = torch.nn.functional.one_hot(
-                    regimes[t].long(), num_classes=proc.n_states).to(dtype=outer.dtype)
-                return torch.cat([onehot.movedim(-1, 0), price], dim=0)  # (n_states+1, ...)
-            return outer[t, :]
-        if key.type == 'ForwardRate':
-            return outer[t, :, :]                          # carry-factor curve (compact)
-        if key.type in ('ForwardPrice', 'InterestRate'):
-            # In privileged mode these curves are excluded from the V̂ market state —
-            # their hedging-relevant content is already carried by the tradable futures
-            # prices in the deep state, and dumping every tenor bloats the V̂ basis past
-            # the training-row count. Raw mode (the precalculate fork state) is unchanged.
-            return outer[t, :0, :] if privileged else outer[t, :, :]
-        raise NotImplementedError(
-            f'Inner MC has no per-path initial-state extractor for factor type {key.type!r}'
-        )
-
     def _calc_inner_features(self, inner_mtm, inner_trade_tensors, tradable_refs, cutoff_idx):
         """Per-outer-path features from inner-MC outputs: P(L_T<0), E[L_T|loss],
         Var[L_T|loss], and per-tradable E[F_T-F_t|loss] / E[min_s F_s-F_t|loss].
@@ -2307,8 +2255,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             market_t1     (B_outer, B_inner, market_dim)  inner market state at outer t+1
             market_t      (B_outer, market_dim)           outer-realised market state at t
             t, cutoff_idx
-        `market_t`/`market_t1` are every simulated factor's state concatenated — the
-        column block is generic (factor-type dispatch lives in `_extract_outer_state_at`),
+        `market_t`/`market_t1` are every simulated factor's revealed segments concatenated —
+        the column block is generic (each process owns its packing via `reveal_state_at`),
         so the DP/MPC solvers consume it without knowing what the factors are.
 
         M2g: this is a dispatcher — the whole inner MC (generation + pricing) runs in
@@ -2439,7 +2387,10 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             for key, proc_inner in self.stoch_factors_inner.items():
                 if key.type in utils.DimensionLessFactors:
                     continue
-                init_state = self._extract_outer_state_at(t, key, outer_buf)
+                # Raw per-path init state for this factor's inner-MC precalculate fork. Never was
+                # type-specific: raw CommodityPrice `outer[t,:]`, raw ForwardRate/ForwardPrice/
+                # InterestRate `outer[t,:,:]` all equal `outer[key][t]`.
+                init_state = outer_buf[key][t]
                 if with_grad:
                     # Leaf with grad: differentiates inner-sim + pricing back to state_t.
                     init_state = init_state.detach().clone().requires_grad_(True)
@@ -2453,8 +2404,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 simulated = proc_inner.generate(shared_mem)
                 shared_mem.t_Scenario_Buffer[key] = simulated
                 # Diff-ML belief coherence: for a
-                # regime-switching spot, publish a one-step filtered belief so the
-                # privileged extractor below returns the participant's posterior instead
+                # regime-switching spot, publish a one-step filtered belief so the process's
+                # `reveal_state_at` below returns the participant's posterior instead
                 # of the true-regime one-hot fallback. Seeded from the outer entry belief
                 # (detached) and updated on the inner price move — differentiable in the
                 # inner price, so the belief-column slope is available to the twin loss.
@@ -2484,12 +2435,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                             inner_belief.shape[1],
                             bool(torch.allclose(sums, torch.ones_like(sums), atol=1.0e-4)))
                 if want_raw_samples:
-                    # Market state at outer t+1 (inner-time index 1) — generic privileged
-                    # extractor; reads the live buffer (factor path + any regime aux its
-                    # generate() just published). (factor_flat, B, SB).
-                    s = self._extract_outer_state_at(
-                        1, key, shared_mem.t_Scenario_Buffer, privileged=True)
-                    market_t1_parts.append(s.reshape(-1, B_outer, B_inner))
+                    # Market state at outer t+1 (inner-time index 1): each factor reveals its
+                    # informative segments (regime belief/one-hot, spot, carry curve) from the live
+                    # buffer (factor path + any regime aux its generate() just published). The calc
+                    # owns the (factor_flat, B, SB) reshape and concatenates in reveal order.
+                    for block, _kind in proc_inner.reveal_state_at(1, shared_mem.t_Scenario_Buffer):
+                        market_t1_parts.append(block.reshape(-1, B_outer, B_inner))
 
             # Stuff the outer-realized past into each factor buffer + flatten (B,SB)→B*SB.
             for key in self.stoch_factors_inner:
@@ -2567,10 +2518,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 for key in self.stoch_factors_inner:
                     if key.type in utils.DimensionLessFactors:
                         continue
-                    block = self._extract_outer_state_at(
-                        t, key, outer_buf, privileged=True).reshape(-1, B_outer)
-                    market_t_parts.append(block)
-                    market_t_widths.append((key, block.shape[0]))
+                    width = 0
+                    for block, _kind in self.stoch_factors_inner[key].reveal_state_at(t, outer_buf):
+                        b = block.reshape(-1, B_outer)
+                        market_t_parts.append(b)
+                        width += b.shape[0]
+                    market_t_widths.append((key, width))
                 market_t = torch.cat(market_t_parts, dim=0).permute(1, 0).contiguous()
                 # Exact liability MTM at the fork (outer-t) and outer-t+1, on the inner draws —
                 # the resolve_hedge_structure marks themselves (same time-indexing as F_t1:
@@ -2589,11 +2542,11 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     dF_min={} if one_step else dF_min,
                     market_t=market_t, market_t1=market_t1)
                 if with_grad:
-                    # Pair each leaf with the privileged-column width it occupies in
-                    # market_t — the differential-label projection in the differential-ML solver needs
+                    # Pair each leaf with the market_t column width it occupies — the
+                    # differential-label projection in the differential-ML solver needs
                     # this to write per-leaf gradients into the right deep-state columns
-                    # without re-deriving factor-type widths (which would silently drift
-                    # if the privileged extractor's per-type packing changes).
+                    # without re-deriving factor widths (which would silently drift
+                    # if a process's `reveal_state_at` packing changes).
                     result['state_t_leaves'] = state_t_leaves
                     result['state_t_leaf_widths'] = market_t_widths
 

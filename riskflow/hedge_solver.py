@@ -543,7 +543,7 @@ class DiffSolverV2:
         """Map ∂Y/∂(state_t leaf) for each simulated factor into the `(n, md)` gradient w.r.t.
         the privileged market_t columns the value net consumes. `widths` is in market-column
         order (factor iteration order); a regime-switching spot occupies [belief(width-1),
-        price(1)] (calc `_extract_outer_state_at` privileged layout: belief-first, price-last),
+        price(1)] (`MarkovHMMSpotModel.reveal_state_at` layout: belief-first, price-last),
         its belief columns supervised by the `(key,'regime_belief')` belief leaf and its price
         column by the raw price leaf. Other factors map 1:1 (raw == privileged). Unmeasured /
         unconnected leaves leave their columns at 0 (masked — only the value supervises them)."""

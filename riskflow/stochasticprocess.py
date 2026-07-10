@@ -136,6 +136,14 @@ def hmm_forward_backward(log_pi, log_P, log_emit):
     return gamma, xi, log_lik
 
 
+# State-reveal tags for `reveal_state_at` (see [[project-diffpca-reveal-design]]): a CONTINUOUS
+# segment is a first-order-differentiable risk factor (the diff-PCA pool of migration step 2); a
+# SUFFICIENT segment is a minimal sufficient statistic (regime belief) revealed verbatim, bypassing
+# PCA. Migration step 1 concatenates every segment regardless of tag (IDENTITY treatment).
+REVEAL_CONTINUOUS = 'continuous'
+REVEAL_SUFFICIENT = 'sufficient'
+
+
 class StochasticProcess(object):
     """Base class for all stochastic processes"""
 
@@ -170,6 +178,18 @@ class StochasticProcess(object):
         """Privileged factors the asymmetric critic sees but the actor does not — dict of
         (T, B, dim) tensors keyed by name. `simulated` is this process's (T, B) path."""
         return {}
+
+    def reveal_state_at(self, t, buffer):
+        """Ordered market-state segments `[(block, reveal_kind), ...]` this factor exposes to
+        the value function at scenario-time index `t` — the informative deep-state the DP/MPC
+        solvers consume. `block` is factor-dims-leading with the batch axis TRAILING; the CALC
+        owns the batch reshape (it knows outer `(*, B)` vs inner `(*, B, B2)` mode), so no batch
+        rank leaks into this signature. Default: the whole factor state at `t` as ONE continuous
+        segment — `buffer[self.factor_key][t]` covers a scalar spot, a compact carry curve, and a
+        full tenor curve alike (a curve declares every tenor; the reducer decides what survives).
+        `self.factor_key` is set for every stochastic factor by the calc before reveal is ever
+        called (calculation.py, `value.factor_key = key`)."""
+        return [(buffer[self.factor_key][t], REVEAL_CONTINUOUS)]
 
     def forward_curve(self, tensor, time_grid_years, shared, mul_time=True):
         """`utils.calc_curve_forwards` lifted to a per-path BATCH of curves. `tensor` is
@@ -1338,6 +1358,13 @@ class PCAInterestRateModel(StochasticProcess):
         # — broadcasts a calibrated curve across the batch, a per-path curve element-wise.
         return self.align_rank(self.fwd_component, stoch.ndim) * torch.exp(stoch)
 
+    def reveal_state_at(self, t, buffer):
+        # MIGRATION STEP 1 (temporary): this InterestRate curve is EXCLUDED from the V̂ market
+        # state — its hedging content is already carried by the tradable futures, and revealing
+        # every tenor bloats the basis past the training-row count. Step 2 (diff-PCA) deletes this
+        # override; the base default then declares every tenor and the reducer derives k_curve≈0.
+        return []
+
 
 class PCAInterestRateCalibration(object):
     def __init__(self, model, param):
@@ -2339,8 +2366,8 @@ class MarkovHMMSpotModel(StochasticProcess):
             # graph is preserved separately for the deal pricer.
             # Published to BOTH `privileged_factors()` (B-axis dim=1 → ok concat)
             # AND `t_Scenario_Buffer` with B-LAST shape (T, n_states, B) so the buffer's
-            # dim=-1 concat works, enabling `_extract_outer_state_at(privileged=True)` to
-            # route belief into the V̂ deep-state market block.
+            # dim=-1 concat works, enabling `reveal_state_at` to route belief into the V̂
+            # deep-state market block.
             with torch.no_grad():
                 belief_path = self._forward_belief(spot_path.detach(), device)
             self.last_regime_belief = belief_path
@@ -2416,6 +2443,26 @@ class MarkovHMMSpotModel(StochasticProcess):
             # Shape (T, B, n_states); accumulator concatenates along batch dim (last but one).
             out['regime_belief'] = belief.to(dtype=torch.float32)
         return out
+
+    def reveal_state_at(self, t, buffer):
+        """Regime-switching spot: belief-first / price-last (the calc concatenates the segments in
+        this order). The regime stays LATENT — reveal the participant-inferable posterior
+        `P(regime_t | prices_{0..t})` (SUFFICIENT statistic; step 2 keeps it out of diff-PCA) when
+        the buffer carries a filtered belief whose rank matches the current mode (outer belief
+        `(T,n,B)` vs regimes `(T,B)`; inner belief `(T,n,B,B2)` vs regimes `(T,B,B2)` ⇒
+        `belief.dim() == regimes.dim() + 1`), else the degenerate true-regime one-hot fallback.
+        The observable spot level — the deployable LME quote the liability marks to — is the last
+        (CONTINUOUS) coordinate. Reproduces the pre-migration privileged packing byte-for-byte."""
+        key = self.factor_key
+        price = buffer[key][t].unsqueeze(0)                                   # (1, ...batch)
+        regimes = buffer[(key, 'regimes')]
+        belief = buffer.get((key, 'regime_belief'))
+        if belief is not None and belief.dim() == regimes.dim() + 1:
+            block = belief[t]                                                 # (n_states, ...batch)
+        else:
+            block = F.one_hot(regimes[t].long(), num_classes=self.n_states)\
+                .to(dtype=buffer[key].dtype).movedim(-1, 0)                   # (n_states, ...batch)
+        return [(block, REVEAL_SUFFICIENT), (price, REVEAL_CONTINUOUS)]
 
     def reseed_one_step(self, spot_t_leaf, spot_t_realized, spot_t1_realized):
         """Analytic one-step transition re-seed for the diff-ML bootstrap.
@@ -2511,7 +2558,7 @@ class MarkovHMMSpotModel(StochasticProcess):
         index 0 = outer t, index 1 = outer t+1). `belief0`: `(n_states, B)` outer posterior
         at the fork step (B-last, as published to the buffer), broadcast across the B2
         fan-out. Returns belief `(T, n_states, B, B2)` — the buffer's B-last convention, so
-        `_extract_outer_state_at(privileged=True)` returns `belief[τ] = (n_states, B, B2)`.
+        `reveal_state_at` returns `belief[τ] = (n_states, B, B2)`.
 
         Predict uses the transition over the FULL step `P_per_step[τ] = expm(Q·dt[τ])` (the
         real interval), not the dt=0 anchor `P_per_step[τ-1]=I`: the participant filters
