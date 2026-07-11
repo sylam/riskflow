@@ -201,23 +201,6 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
         # literal (e.g. "asymmetricutility_symlog"), so normalize once at the boundary
         # rather than re-lowercasing on every reward call.
         "object": str(objective_config["Object"]).lower(),
-        "floor_penalty": float(objective_config.get("Floor_Penalty", 1.0)),
-        "surplus_reward": float(objective_config.get("Surplus_Reward", 1.0)),
-        "power": float(objective_config.get("Power", 1.0)),
-        "expiry_penalty": float(objective_config.get("Expiry_Penalty", 0.0)),
-        "expiry_threshold_days": float(objective_config.get("Expiry_Threshold_Days", 4.0)),
-        "post_deal_trade_penalty": float(objective_config.get("Post_Deal_Trade_Penalty", 0.0)),
-        # NOTE: despite the name, `Position_Bounds_Penalty` controls ONLY the
-        # portfolio-total Σ|pos_i| ramp (against `Evaluator.Total_Position_Abs_Limit`).
-        # Per-instrument [Min_Position, Max_Position] bounds are handled separately by the
-        # soft, reward-side `Per_Instrument_Bounds_Penalty` below, so this term is
-        # portfolio-only. The naming pre-dates that split; rename to
-        # `Total_Position_Abs_Penalty` if it becomes worth the JSON / CSV / docs churn.
-        "position_bounds_penalty": float(objective_config.get("Position_Bounds_Penalty", 0.0)),
-        "position_bounds_threshold": float(objective_config.get("Position_Bounds_Threshold", 5.0)),
-        # Per-instrument [Min_Position, Max_Position] enforcement (soft, reward-side).
-        "per_instrument_bounds_penalty": float(objective_config.get("Per_Instrument_Bounds_Penalty", 0.0)),
-        "per_instrument_bounds_threshold": float(objective_config.get("Per_Instrument_Bounds_Threshold", 5.0)),
         # Utility-transform scale. Consumed by any utility Object (Symlog / Huber / CARA);
         # legacy "TerminalFloorThenSurplusUtility" path ignores it. `utility_scale` is mirrored
         # from `bundle["utility_scale"]` (see hedge_bundle._mirror_utility_scale_to_runtime).
@@ -477,30 +460,6 @@ def construct_hedge_runtime(
             "total_position_abs_limit": float(evaluator_config.get("Total_Position_Abs_Limit", 0.0)),
         },
     }
-    # Sanity check: Position_Bounds_Penalty is silently no-op'd when Total_Position_Abs_Limit
-    # is unset, since the penalty's only active branch is the portfolio-total ramp. (Per-instrument
-    # enforcement is a separate coefficient: Per_Instrument_Bounds_Penalty.)
-    if (runtime["objective"]["position_bounds_penalty"] > 0.0
-            and runtime["accounting"]["total_position_abs_limit"] <= 0.0):
-        raise ValueError(
-            "Objective.Position_Bounds_Penalty > 0 requires "
-            "Evaluator.Total_Position_Abs_Limit > 0 — otherwise the penalty is silently disabled."
-        )
-    # Sanity check: Per_Instrument_Bounds_Penalty needs per-instrument Position_Limits; without
-    # them the per-instrument penalty is silently no-op'd (every instrument has [-∞, +∞] bounds
-    # so violations are never registered).
-    if (runtime["objective"]["per_instrument_bounds_penalty"] > 0.0
-            and not runtime["accounting"]["position_limits"]):
-        raise ValueError(
-            "Objective.Per_Instrument_Bounds_Penalty > 0 requires Evaluator.Position_Limits "
-            "to be set on at least one instrument — otherwise the per-instrument penalty is "
-            "silently disabled."
-        )
-    # Slim instrument metadata for the expiry-holding penalty: {name, last_trade_date} per hedge.
-    runtime["instrument_meta"] = tuple(
-        {"name": str(name), "last_trade_date": runtime["tradables"][name]["last_trade_date"]}
-        for name in runtime["names"]["hedges"]
-    )
     runtime["privileged_layout"] = derive_privileged_layout(stoch_factors)
     return runtime
 

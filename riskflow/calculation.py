@@ -2170,7 +2170,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         reusable as a standalone diagnostic.
 
         Sign convention: `liability` MTM follows the deal's natural Payer/Receiver sign
-        (see `_evaluate_objective`: net_pnl = pnl_excess + liability). For a Receiver,
+        (net_pnl = pnl_excess + liability). For a Receiver,
         L > 0 = money flows in = profit; L < 0 = loss. The hedger conditions on the
         loss tail, so the mask is `L_T < 0`.
 

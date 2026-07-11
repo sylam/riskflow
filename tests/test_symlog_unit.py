@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
 from riskflow.hedge_bundle import (
-    _utility_wrap, _utility_wrap_signed, _is_symlog_objective, _is_utility_objective)
+    _utility_wrap_signed, _is_symlog_objective, _is_utility_objective)
 
 
 @pytest.fixture(autouse=True)
@@ -122,15 +122,6 @@ def test_utility_signed_legacy_identity():
     print("test_utility_signed_legacy_identity: PASS")
 
 
-def test_utility_wrap_passes_through_for_legacy():
-    """For non-symlog objectives, _utility_wrap returns input unchanged."""
-    runtime = make_runtime(symlog=False)
-    x = torch.tensor([0.0, 1.0e3, 1.0e6, 1.0e9])
-    out = _utility_wrap(x, runtime)
-    assert torch.equal(out, x), "legacy path must not modify the dollar value"
-    print("test_utility_wrap_passes_through_for_legacy: PASS")
-
-
 def test_pbrs_telescoping():
     """On a 5-step synthetic rollout with known err_t, kept-transition shaping sum
     must equal Φ(s_0) − Φ(s_{T-1}) for Φ(s) = −fp · log1p(max(−err(s), 0) / c).
@@ -177,7 +168,6 @@ if __name__ == "__main__":
     test_utility_shapes_match_reference()
     test_utility_shapes_differentiable()
     test_utility_signed_legacy_identity()
-    test_utility_wrap_passes_through_for_legacy()
     test_pbrs_telescoping()
     test_magnitude_sanity()
     print("\nAll symlog unit tests passed.")

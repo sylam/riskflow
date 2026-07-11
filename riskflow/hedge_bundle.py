@@ -335,16 +335,6 @@ def _require_utility_scale(runtime):
     return float(c)
 
 
-def _utility_wrap(x_dollars, runtime):
-    """log1p magnitude-COMPRESSION for reward shaping (PBRS potential, penalty magnitudes) —
-    a fixed compression primitive, independent of the terminal-utility SHAPE (which may be
-    symlog/huber/cara via `_utility_wrap_signed`). Active under any utility objective,
-    identity for the legacy objective. Caller ensures x_dollars >= 0 (log1p needs it)."""
-    if not _is_utility_objective(runtime):
-        return x_dollars
-    return torch.log1p(x_dollars / _require_utility_scale(runtime))
-
-
 def _utility_wrap_signed(x_dollars, runtime):
     """The terminal UTILITY u(W) applied to signed wealth — the single source of truth for
     the objective, the DP recursion, and the solver's value labels. Dispatches on the
@@ -470,200 +460,6 @@ def resolve_utility_scale(bundle, runtime):
             f"(volume={total_volume}, spot={initial_spot:.2f}, σ={sigma:.4f}, √τ={tau_years**0.5:.3f})"
         )
     return c
-
-
-def log_symlog_penalty_calibration(bundle, runtime):
-    """Under symlog, the dollar notional factor in every per-step penalty is compressed
-    through log1p(notional / c) — a coefficient previously tuned against dollar-scale
-    notional ($M) now multiplies a value of order 1, i.e. ~6 orders of magnitude weaker.
-    Print the per-step magnitude for each active penalty at notional = c (the natural
-    scale, where log1p(1) ≈ 0.693) so users migrating from a legacy config can see at a
-    glance whether their penalties still bite vs the dense-tracking effective floor.
-
-    No-op for legacy objectives. Reports active (coef > 0) penalties only.
-    """
-    objective = runtime.get('objective') or {}
-    if objective.get('object') != 'asymmetricutility_symlog':
-        return
-    # Direct lookup, no default — `resolve_utility_scale` is called immediately before this
-    # in `build_hedge_bundle` and either succeeds (c ≥ $1k) or raises. If the key is
-    # missing here, that's a refactor regression worth surfacing as KeyError, not a silent
-    # divide-by-zero in the bite math below.
-    c = float(bundle['utility_scale'])
-    fp = float(objective.get('floor_penalty', 1.0))
-    rs = float((runtime.get('optimizer') or {}).get('dense_tracking_reward_scale', 0.0))
-    log1p_at_c = float(np.log1p(1.0))  # ≈ 0.693
-    expiry_coef = float(objective.get('expiry_penalty', 0.0))
-    expiry_thr = float(objective.get('expiry_threshold_days', 4.0))
-    post_deal_coef = float(objective.get('post_deal_trade_penalty', 0.0))
-    bounds_coef = float(objective.get('position_bounds_penalty', 0.0))
-    bounds_thr = float(objective.get('position_bounds_threshold', 5.0))
-    per_inst_coef = float(objective.get('per_instrument_bounds_penalty', 0.0))
-    per_inst_thr = float(objective.get('per_instrument_bounds_threshold', 5.0))
-    dense_step = rs * fp * log1p_at_c
-    lines = [f'symlog penalty bite-check (notional = c = ${c:,.0f}, log1p(1) = {log1p_at_c:.3f}):']
-    lines.append(f'  reference: dense_tracking ≈ rs·fp·log1p ≈ {dense_step:.2f} utility/step (per-step asymmetric shaping)')
-    if expiry_coef > 0.0:
-        m = float(np.exp(expiry_thr))
-        bite = expiry_coef * m * log1p_at_c
-        lines.append(f'  expiry      = {expiry_coef:g} × exp({expiry_thr:g})={m:.1f} × {log1p_at_c:.2f} = {bite:.2f} utility/step at expiry')
-    if post_deal_coef > 0.0:
-        m = 2.0
-        bite = post_deal_coef * m * log1p_at_c
-        lines.append(f'  post_deal   = {post_deal_coef:g} × {m:.0f} (1 day past) × {log1p_at_c:.2f} = {bite:.2f} utility/step')
-    if bounds_coef > 0.0:
-        # Both bounds penalties are pure-count: bite = coef × ramp(violation, threshold) — no
-        # dollar wrap. Reported bite at violation=threshold is the unitful answer (utility/step).
-        m = float(np.exp(bounds_thr) - 1.0)
-        lines.append(f'  bounds      = {bounds_coef:g} × (exp({bounds_thr:g})-1)={m:.1f} = {bounds_coef * m:.2f} utility/step at violation=threshold (portfolio Σ|pos| past limit)')
-    if per_inst_coef > 0.0:
-        m = float(np.exp(per_inst_thr) - 1.0)
-        lines.append(f'  per_instr   = {per_inst_coef:g} × (exp({per_inst_thr:g})-1)={m:.1f} = {per_inst_coef * m:.2f} utility/step at violation=threshold (per-instrument [Min, Max])')
-    rc = float((runtime.get('optimizer') or {}).get('dense_tracking_reward_clip', 0.0))
-    if rc > 0.0:
-        # `rc` clips `shaping = prev_down - next_down` BEFORE the rs·fp multiplication in
-        # asymmetric mode (the asymmetric-mode default), so the relevant scale is the pre-scale
-        # log1p-saturation bound (~5) — NOT the post-rs·fp number. A clip much larger than
-        # ~5 is a no-op (the shaping never reaches it).
-        dense_pre_scale_bound = 5.0
-        flag = ' (no-op: clip > pre-scale shaping bound — likely a stale dollar value)' if rc > 10.0 * dense_pre_scale_bound else ''
-        lines.append(f'  dense_clip  = {rc:g} pre-scale utility (post rs·fp max ≈ {rs * fp * dense_pre_scale_bound:.0f}){flag}')
-    # Reward_Scale × symlog footgun: legacy configs used Reward_Scale ≪ 1 to compress
-    # dollar rewards into a tractable range; under symlog rewards are already in utility
-    # space (≈ [-100, 100]) so a small Reward_Scale crushes the gradient signal flat.
-    reward_scale = float((runtime.get('optimizer') or {}).get('reward_scale', 1.0))
-    if reward_scale != 1.0:
-        lines.append(f'  reward_scale = {reward_scale:g} (canonical for symlog is 1.0)')
-    lines.append('  if any bite << dense_tracking, that penalty is unlikely to influence the policy — coef may need 10-1000x scaling vs the legacy dollar-tuned value')
-    logging.info('\n'.join(lines))
-
-    # Standalone warnings (logging.WARNING level so they're visible in noisy training logs)
-    # for two symlog footguns that survive from legacy dollar-tuned configs:
-    #
-    #   1. Reward_Scale ≪ 1: was needed under legacy ($1M-$100M reward range); under
-    #      symlog (utility units ~[-100, +100]) it just crushes the gradient signal.
-    #
-    #   2. Value_Loss_Asym_Weight > 1: justified under legacy heavy-tailed downside
-    #      (8-order-of-magnitude V-target span); under symlog the target distribution
-    #      has bounded tails, so asymmetric V-loss is unmotivated.
-    if reward_scale < 0.1 or reward_scale > 10.0:
-        logging.warning(
-            f"Reward_Scale={reward_scale:g} under AsymmetricUtility_Symlog: canonical "
-            f"value is 1.0. Symlog rewards are utility-units (~[-100, +100]); a small "
-            f"Reward_Scale crushes the gradient signal flat. If this is a stale legacy "
-            f"dollar-tuned config, set Optimizer.Reward_Scale=1.0."
-        )
-    asym_weight = float((runtime.get('optimizer') or {}).get('value_loss_asym_weight', 1.0))
-    if asym_weight != 1.0:
-        logging.warning(
-            f"Value_Loss_Asym_Weight={asym_weight:g} under AsymmetricUtility_Symlog: "
-            f"canonical is 1.0 (symmetric V-loss). The asymmetric V-loss countered "
-            f"median-bias on heavy-tailed dollar targets; symlog bounds the tails so "
-            f"the motivation evaporates. Consider Optimizer.Value_Loss_Asym_Weight=1.0."
-        )
-    power = float(objective.get('power', 1.0))
-    if power != 1.0:
-        logging.warning(
-            f"Power={power:g} under AsymmetricUtility_Symlog: surplus/shortfall = "
-            f"sr·log1p(net_pnl/c)^p — a *compound* concave-then-power compression "
-            f"that differs in shape from legacy sr·net_pnl^p (dollar-domain "
-            f"convexification). Legacy `Power>1` amplified large wins/losses; under "
-            f"symlog the same `Power>1` double-compresses tails. Coefficients tuned "
-            f"for legacy Power!=1 may not transfer meaningfully. Canonical for symlog is 1.0."
-        )
-
-
-def _dense_tracking_reward(prev_state, next_state, runtime):
-    """Per-step shaping reward on the downside part of the tracking error. Two modes:
-
-    `Dense_Reward_Mode = "asymmetric"` (default, current behavior):
-        shaping_t = rs · fp · (max(−err_t, 0) − max(−err_{t+1}, 0))   for non-terminal t
-        Terminal transition's shaping is FORCIBLY ZEROED in `reward_and_terminal_payoff`
-        (to avoid penalizing the unavoidable force-flat close cost as fresh downside),
-        so the telescoping sum is rs·fp·(|downside_0| − |downside_{T-1}|), NOT
-        |downside_T|. Combined with the terminal asymmetric utility (−fp·|downside_T|
-        on losses), the EFFECTIVE floor penalty is approximately (1 + rs)·fp — exact
-        only when |downside_{T-1}| ≈ |downside_T|, i.e. when the close-cost segment
-        (bid-offer × position × contract_size) is small relative to total downside.
-        For non-trivial close costs the actual coefficient sits between fp and (1+rs)·fp.
-        With rs=2, fp=10, sr=1 the agent is optimized as if effective fp ≈ 30 vs sr=1.
-        Use rs=1 for terminal-parity (effective fp ≈ 2·fp), rs=0 to disable shaping.
-
-    `Dense_Reward_Mode = "potential_based"` (Ng et al. 1999 PBRS-shaped):
-        Φ(s) = −fp · max(−err(s), 0); shaping_t = γ·Φ(s_{t+1}) − Φ(s_t).
-        Same terminal-zero applies. **Note**: strict PBRS invariance requires Φ at
-        boundaries to be policy-independent (Φ(terminal) = 0 by convention OR boundary
-        states reached deterministically). Our terminal-zero implementation effectively
-        sets Φ(terminal) = Φ(s_{T-1}), which IS policy-dependent (tracking error at
-        T−1 depends on action history). The kept-transitions sum is therefore
-        γ^{T-1}·Φ(s_{T-1}) − Φ(s_0), with a small policy-dependent residual
-        γ^{T-1}·(−fp·log1p(down_{T-1}/c)) on top of the terminal asymmetric utility.
-        Practically the two modes are scalar-multiples of each other modulo rs:
-        asymmetric at rs=1 equals fp·(prev_down − next_down) which is exactly PBRS
-        shaping with Φ = −fp·down. So the *behavior* is roughly equivalent; the
-        "invariance" claim is approximate, not strict. `Dense_Tracking_Reward_Scale`
-        is ignored in this mode (scaling Φ would multiply the residual too)."""
-    settings = dict(runtime.get("optimizer") or {})
-    fp = float((runtime.get("objective") or {}).get("floor_penalty", 1.0))
-    prev_err = _tracking_error_value(prev_state, runtime)
-    next_err = _tracking_error_value(next_state, runtime)
-    rc = float(settings.get("dense_tracking_reward_clip", 0.0))
-    mode = str(settings.get("dense_reward_mode", "asymmetric")).lower()
-    # Symlog: replace dollar-valued downside `clamp(-err, 0)` with `log1p(clamp(-err, 0)/c)`.
-    # The PBRS theorem (Ng-Harada-Russell 1999) requires only that Φ be a state function — it is
-    # silent on Φ's shape — so utility-wrapping doesn't change the invariance status (which is
-    # already approximate, not strict, per the docstring above).
-    prev_down = torch.clamp(-prev_err, min=0.0)
-    next_down = torch.clamp(-next_err, min=0.0)
-    prev_down = _utility_wrap(prev_down, runtime)
-    next_down = _utility_wrap(next_down, runtime)
-    if mode == "potential_based":
-        gamma = float(settings.get("gamma", 1.0))
-        prev_pot = -fp * prev_down
-        next_pot = -fp * next_down
-        shaping = gamma * next_pot - prev_pot
-        if rc > 0.0:
-            # Match asymmetric mode's documented semantics: `rc` is the pre-fp-scale
-            # clip on the down-change (`prev_down - next_down`, or its PBRS-discounted
-            # analog `prev_down - gamma·next_down`). Asymmetric mode clips
-            # `prev_down - next_down` at ±rc BEFORE multiplying by `rs · fp` → effective
-            # post-scale clip = `rs · fp · rc`. The PBRS shaping expands to
-            # `fp · (prev_down - gamma · next_down)` — its `fp` factor is baked in
-            # before the clamp, so to apply the same pre-scale clip we multiply the
-            # clamp bound by `fp` (the PBRS analog of asymmetric's rs=1 post-scale clip).
-            clip_bound = rc * fp
-            shaping = torch.clamp(shaping, min=-clip_bound, max=clip_bound)
-        return shaping
-    # Asymmetric mode preserves original clip-before-scale semantics: rc is in (utility or dollar)
-    # units of downside change depending on objective; `rs · fp` scales the clipped shaping.
-    rs = float(settings.get("dense_tracking_reward_scale", 0.0))
-    shaping = prev_down - next_down
-    if rc > 0.0:
-        shaping = torch.clamp(shaping, min=-rc, max=rc)
-    return rs * fp * shaping
-
-
-def _evaluate_objective(pnl_excess, liability, runtime):
-    objective = runtime.get("objective")
-    # net_pnl = hedge gain since inception + leg cashflows received. Perfect hedge → pnl_excess
-    # offsets liability → net_pnl ≈ 0, sitting exactly at the floor where Floor_Penalty kicks in.
-    # Using ABSOLUTE portfolio_value here (cash baseline included) would silently bias every
-    # scenario into the surplus regime and the floor penalty would never fire.
-    net_pnl = pnl_excess + liability
-    if objective is None:
-        return net_pnl
-    fp = float(objective.get("floor_penalty", 1.0))
-    sr = float(objective.get("surplus_reward", 1.0))
-    p = float(objective.get("power", 1.0))
-    # `_utility_wrap_signed` returns sign(x)·log1p(|x|/c) for symlog, identity for legacy.
-    # The clamps below are sign-disjoint (one is zero where the other isn't), so adding
-    # surplus + shortfall is exact — no `torch.where` needed. Clamps are still load-bearing:
-    # `torch.pow` of a negative base with non-integer p produces NaN, so we clamp the base
-    # to non-negative before pow.
-    u_pnl = _utility_wrap_signed(net_pnl, runtime)
-    surplus = sr * torch.pow(torch.clamp(u_pnl, min=0.0), p)
-    shortfall = -fp * torch.pow(torch.clamp(-u_pnl, min=0.0), p)
-    return surplus + shortfall
 
 
 def _cash_account_for_instrument(name, runtime):
@@ -963,208 +759,20 @@ def step_runtime_state(state, action, bundle, runtime):
     return futures_account_step(state, action, bundle, runtime)
 
 
-def _expiry_holding_penalty(state, bundle, runtime):
-    """Per-step penalty for non-zero positions near or past contract expiry.
-    Pre-expiry: smooth exp ramp inside the warning window. Post-expiry: large
-    linear-in-days-past hammer. Plateauing past expiry leaves the policy with
-    no marginal incentive to *exit* an already-expired contract — so the
-    multiplier must keep growing once we cross zero.
-
-    Gated on `bundle["last_settlement_index"]`: penalty only fires AFTER the deal
-    has fully settled. During the deal's active life, holding contracts close to
-    their own expiry is legitimate hedging (e.g. an averaging deal whose window
-    ends ~contract expiry — the textbook hedge holds JUL contracts up to JUL's
-    last trade date, and the framework must not punish that). Once the deal is
-    over (`current > last_settle`), any remaining position is non-hedge exposure
-    and contract-expiry physical-delivery risk applies; the penalty fires then.
-
-    Coef from `Expiry_Penalty`; threshold from `Expiry_Threshold_Days` (default 4).
-    Disabled when objective.expiry_penalty <= 0 or `last_settlement_index` missing.
-    """
-    objective = runtime.get("objective") or {}
-    coef = float(objective.get("expiry_penalty", 0.0))
-    if coef <= 0.0:
-        return None
-    last_settle = bundle.get("last_settlement_index")
-    if last_settle is None or int(state["time_index"]) <= int(last_settle):
-        return None
-    threshold = float(objective.get("expiry_threshold_days", 4.0))
-    layout_instruments = runtime.get("instrument_meta", ())
-    if not layout_instruments:
-        return None
-
-    base_date = pd.Timestamp(bundle["meta"]["base_date"])
-    # Use the CPU-cached day grid (Python list) — avoids a per-step GPU→CPU sync
-    # that fires on every reward computation across the rollout.
-    current_day_offset = int(bundle["time_grid_days_cpu"][int(state["time_index"])])
-
-    device = bundle["time_grid_days"].device
-    batch_size = _batch_size_from_bundle(bundle)
-    penalty = torch.zeros(batch_size, dtype=torch.float32, device=device)
-    any_active = False
-    for entry in layout_instruments:
-        name = entry["name"]
-        if name not in state["positions"]:
-            continue
-        last_trade_day = (entry["last_trade_date"] - base_date).days
-        days_to_expiry = last_trade_day - current_day_offset
-        # Outside the warning window (still plenty of time) → no penalty.
-        if days_to_expiry > threshold:
-            continue
-        if days_to_expiry >= 0:
-            mult = np.exp(threshold - days_to_expiry)
-        else:
-            # Past expiry: continuous with the at-expiry value, then grows
-            # linearly with days-past so each extra day of holding hurts more
-            # than the last. Linear (not exp) avoids float32 overflow over a
-            # multi-week post-expiry tail.
-            mult = np.exp(threshold) * (1.0 + abs(days_to_expiry))
-        position = state["positions"][name]
-        price = state["tradable_values"][name]
-        cs = float(_runtime_tradable(runtime, name).get("contract_size", 1.0))
-        notional = position.abs() * price * cs
-        penalty = penalty - coef * mult * _utility_wrap(notional, runtime)
-        any_active = True
-    return penalty if any_active else None
-
-
-def _post_deal_trade_penalty(prev_state, state, bundle, runtime):
-    """Per-step holding penalty on ANY non-zero position past the original
-    liability's last settlement. Mirrors the expiry penalty's post-expiry form
-    (linear-in-days-past × |position notional|) but applied at portfolio level
-    rather than per-contract: once the deal is gone, no instrument should be
-    held, regardless of which contract it is.
-
-    Coefficient `Post_Deal_Trade_Penalty` × `(1 + days_past_settlement)` × Σ_i
-    |position_i| × price_i × contract_size_i. Disabled when coef <= 0 or
-    `last_settlement_index` missing.
-    """
-    objective = runtime.get("objective") or {}
-    coef = float(objective.get("post_deal_trade_penalty", 0.0))
-    if coef <= 0.0:
-        return None
-    last_settle = bundle.get("last_settlement_index")
-    if last_settle is None:
-        return None
-    current_idx = int(state["time_index"])
-    if current_idx <= int(last_settle):
-        return None
-    days_past = float(current_idx - int(last_settle))
-    device = bundle["time_grid_days"].device
-    batch_size = _batch_size_from_bundle(bundle)
-    penalty = torch.zeros(batch_size, dtype=torch.float32, device=device)
-    any_active = False
-    for name, pos in state["positions"].items():
-        price = state["tradable_values"][name]
-        cs = float(_runtime_tradable(runtime, name).get("contract_size", 1.0))
-        notional = pos.abs() * price * cs
-        penalty = penalty - coef * (1.0 + days_past) * _utility_wrap(notional, runtime)
-        any_active = True
-    return penalty if any_active else None
-
-
-def _exp_linear_ramp(violation, threshold):
-    """f(0)=0; exp(v)−1 for 0≤v<T; exp(T)−1 + exp(T)·(v−T) for v≥T. C¹ at v=T."""
-    v = violation.clamp_min(0.0)
-    eT = np.exp(threshold)
-    return torch.exp(v.clamp_max(threshold)) - 1.0 + eT * (v - threshold).clamp_min(0.0)
-
-
-def _per_instrument_bounds_penalty(state, bundle, runtime):
-    """exp→linear penalty on each instrument's [Min_Position, Max_Position] constraint:
-      v_i = relu(pos_i − max_position_i) + relu(min_position_i − pos_i)
-      penalty_i = coef × ramp(v_i, threshold)
-    Pure count-based: violation is dimensionless (integer contracts past the bound), and
-    `ramp` is dimensionless, so `coef` carries the utility-unit conversion directly. No
-    dollar wrap — that would only add a constant scaling factor for a single-commodity
-    hedger anyway, while making the design appear inconsistent with the portfolio-total
-    penalty (which has the same structure). Symmetric in long/short violations of equal
-    count."""
-    objective = runtime.get("objective") or {}
-    coef = float(objective.get("per_instrument_bounds_penalty", 0.0))
-    threshold = float(objective.get("per_instrument_bounds_threshold", 5.0))
-    position_limits = (runtime.get("accounting") or {}).get("position_limits") or {}
-    if coef <= 0.0 or not position_limits:
-        return None
-    device = bundle["time_grid_days"].device
-    batch_size = _batch_size_from_bundle(bundle)
-    penalty = torch.zeros(batch_size, dtype=torch.float32, device=device)
-    for name in _runtime_names(runtime, "action_instruments"):
-        if name not in state["positions"] or name not in position_limits:
-            continue
-        limits = position_limits[name]
-        min_pos = float(limits["min_position"])
-        max_pos = float(limits["max_position"])
-        pos = state["positions"][name]
-        violation = (pos - max_pos).clamp_min(0.0) + (min_pos - pos).clamp_min(0.0)
-        # `_exp_linear_ramp(0, threshold) == 0`, so summing inactive instruments adds
-        # only zeros. Skipping was a `.any()` sync per (instrument, step) — 3·250=750
-        # CUDA-CPU syncs per epoch — for negligible compute savings.
-        penalty = penalty - coef * _exp_linear_ramp(violation, threshold)
-    return penalty
-
-
-def _position_bounds_penalty(state, bundle, runtime):
-    """exp→linear penalty on the portfolio Σ_i|pos_i| total-position constraint:
-      v = max(0, Σ_i|pos_i| − total_position_abs_limit)
-      penalty = coef × ramp(v, threshold)
-    Same pure count-based formulation as `_per_instrument_bounds_penalty` — see that
-    function's docstring for rationale. Identical math, just fed a different violation."""
-    objective = runtime.get("objective") or {}
-    coef = float(objective.get("position_bounds_penalty", 0.0))
-    threshold = float(objective.get("position_bounds_threshold", 5.0))
-    total_limit = float((runtime.get("accounting") or {}).get("total_position_abs_limit", 0.0))
-    if coef <= 0.0 or total_limit <= 0.0:
-        return None
-    device = bundle["time_grid_days"].device
-    batch_size = _batch_size_from_bundle(bundle)
-    abs_count = torch.zeros(batch_size, dtype=torch.float32, device=device)
-    for name in _runtime_names(runtime, "action_instruments"):
-        if name not in state["positions"]:
-            continue
-        abs_count = abs_count + state["positions"][name].abs()
-    return -coef * _exp_linear_ramp(abs_count - total_limit, threshold)
-
-
 def reward_and_terminal_payoff(prev_state, state, bundle, runtime):
     batch_size = _batch_size_from_bundle(bundle)
     device = bundle["time_grid_days"].device
     is_terminal = int(state["time_index"]) >= _last_time_index(bundle)
-    # Skip dense shaping on the terminal transition: Force_Flat_At_End closes positions inside
-    # this step's env update, debiting transaction cost from margin → tracking error drops by
-    # the close cost → dense shaping reads it as fresh downside and penalizes the agent for an
-    # unavoidable cost. Sacrifices one step of legitimate price-move signal (out of ~250) to
-    # keep per-step gradients clean. Terminal asymmetric utility captures the closing P&L anyway.
-    if is_terminal:
-        reward = torch.zeros(batch_size, dtype=torch.float32, device=device)
-    else:
-        reward = _dense_tracking_reward(prev_state, state, runtime).to(device=device, dtype=torch.float32)
-    expiry = _expiry_holding_penalty(state, bundle, runtime)
-    if expiry is not None:
-        reward = reward + expiry.to(device=device, dtype=torch.float32)
-    post_deal = _post_deal_trade_penalty(prev_state, state, bundle, runtime)
-    if post_deal is not None:
-        reward = reward + post_deal.to(device=device, dtype=torch.float32)
-    bounds = _position_bounds_penalty(state, bundle, runtime)
-    if bounds is not None:
-        reward = reward + bounds.to(device=device, dtype=torch.float32)
-    per_instrument_bounds = _per_instrument_bounds_penalty(state, bundle, runtime)
-    if per_instrument_bounds is not None:
-        reward = reward + per_instrument_bounds.to(device=device, dtype=torch.float32)
-    terminal_payoff = torch.zeros(batch_size, dtype=torch.float32, device=device)
     pnl_excess = torch.zeros(batch_size, dtype=torch.float32, device=device)
     liability_value = state.get("cumulative_liability_value", torch.zeros(batch_size, dtype=torch.float32, device=device)).to(device=device, dtype=torch.float32)
     # Sync-free terminality check: done becomes True iff time_index hits last_idx, and is uniform
     # across the batch (the simulator advances all scenarios together). Avoids a `.item()` sync on
     # every rollout step.
     if is_terminal:
-        # pnl_excess = portfolio change since inception; the asymmetric utility evaluates against
-        # this (NOT absolute portfolio value) so the seed cash baseline doesn't bias the floor.
+        # pnl_excess = portfolio change since inception (NOT absolute portfolio value, so the seed
+        # cash baseline doesn't bias the terminal P&L read the solver/stepper consume).
         pnl_excess = _pnl_excess(state, runtime).to(device=device, dtype=torch.float32)
-        terminal_reward = _evaluate_objective(pnl_excess, liability_value, runtime).to(device=device, dtype=torch.float32)
-        reward = reward + terminal_reward
-        terminal_payoff = liability_value
-    return {"reward": reward, "terminal_payoff": terminal_payoff, "pnl_excess": pnl_excess, "liability_value": liability_value}
+    return {"pnl_excess": pnl_excess, "liability_value": liability_value}
 
 
 def _bundle_scenario_dates(bundle):
@@ -1426,7 +1034,6 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
     bundle['spot_realized_vol'] = compute_spot_realized_vol(bundle)
     bundle['utility_scale'] = resolve_utility_scale(bundle, runtime or {})
     logging.info('utility_scale (symlog c) resolved to {0:.2f}'.format(bundle['utility_scale']))
-    log_symlog_penalty_calibration(bundle, runtime or {})
     bundle['privileged_factors'] = assemble_privileged_factors(privileged_factor_blocks or {}, stoch_factors)
     H = int(runtime.get('history_lookback_business_days', 0)) if runtime else 0
     if H > 0 and bundle['privileged_factors']:
@@ -1628,7 +1235,7 @@ class BundleStepper:
         """Advance one time step. `action` is `{instrument_name: scalar_or_(B,)_tensor}`
         applied as trade deltas (only meaningful at decision steps; ignored otherwise).
         Pass `None` for zero trades. Returns a dict combining the post-step observation
-        with the per-path reward + pnl_excess + liability_value for this transition.
+        with the per-path pnl_excess + liability_value for this transition.
         """
         was_decision_step = self.is_decision_step
         t_pre = self.time_index
@@ -1650,7 +1257,6 @@ class BundleStepper:
         self._terminal_transition = transition
         return {
             **self.observe(),
-            'reward': transition['reward'],
             'transition_pnl_excess': transition['pnl_excess'],
             'transition_liability_value': transition['liability_value'],
         }
