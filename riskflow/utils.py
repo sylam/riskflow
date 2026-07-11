@@ -868,6 +868,14 @@ class TensorCashFlows(TensorSchedule):
     def get_resets(self, unit):
         return self.Resets.reinitialize(unit)
 
+    def total_abs_nominal(self):
+        """Summed |notional| across the schedule."""
+        return float(np.abs(self.schedule[:, CASHFLOW_INDEX_Nominal]).sum())
+
+    def last_pay_day(self):
+        """Latest payment day (offset in days from base_date)."""
+        return float(self.schedule[:, CASHFLOW_INDEX_Pay_Day].max())
+
     def known_fx_resets(self, num_scenarios, index=CASHFLOW_INDEX_FXResetValue,
                         filter_index=CASHFLOW_INDEX_FXResetDate):
 

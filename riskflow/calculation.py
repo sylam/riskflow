@@ -41,7 +41,7 @@ from .instruments import (get_fxrate_factor, get_recovery_rate, get_interest_fac
 # import the hessian function
 from .pricing import SensitivitiesEstimator
 # import the documentation and utils modules
-from . import utils, pricing, construct_instrument
+from . import utils, pricing
 from .hedge_runtime import construct_hedge_runtime
 from .hedge_bundle import (
     run_hedge_execution, HedgeRuntimeExecutionResult, build_hedge_bundle,
@@ -254,6 +254,44 @@ class DealStructure(object):
             merge_features(accum, deal_features)
 
         return accum
+
+    def aggregate_leg_descriptors(self):
+        """Reduce the per-deal cashflow descriptors over this structure (recursing
+        sub_structures the way `resolve_hedge_structure` does): summed |notional| across
+        all legs and the latest pay-day. Legs with no schedule contribute (0.0, None),
+        so non-cashflow deals never poison the max."""
+        total_volume, last_payment_day = 0.0, None
+        for vol, pay in ([dd.Instrument.leg_descriptors(dd) for dd in self.dependencies] +
+                         [sub.aggregate_leg_descriptors() for sub in self.sub_structures]):
+            total_volume += vol
+            if pay is not None:
+                last_payment_day = pay if last_payment_day is None else max(last_payment_day, pay)
+        return total_volume, last_payment_day
+
+    def tensor_marks(self):
+        """Stored per-deal price series keyed by deal Reference, recursing sub_structures
+        (mirrors `resolve_structure`'s walk). Only deals whose `Calc_res` holds a kept
+        'tensor' (set by `pricing.interpolate` when `shared.keep_tensor`) are included."""
+        marks = {}
+        for sub in self.sub_structures:
+            marks.update(sub.tensor_marks())
+        for deal_data in self.dependencies:
+            tensor = (deal_data.Calc_res or {}).get('tensor')
+            if tensor is not None:
+                marks[deal_data.Instrument.field['Reference']] = tensor
+        return marks
+
+    @staticmethod
+    def max_settlement_date(deals, calendars):
+        """Latest clipped reval/settlement date across a set of (un-built) deal nodes — the
+        liability-terminal horizon that caps the sim time grid. Resets each instrument from
+        its `field` first (idempotent; `set_deal_structures` resets again downstream), since
+        the structure isn't built yet when the horizon is needed."""
+        dates = set()
+        for node in deals:
+            node['Instrument'].reset(calendars)
+            dates |= node['Instrument'].get_reval_dates(clip_expiry=True)
+        return max(dates)
 
 
 class ScenarioTimeGrid(object):
@@ -1795,39 +1833,13 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         `(total_leg_volume, last_payment_day)`: the summed |notional| across all liability legs
         and the latest payment day (offset in days from base_date). `build_hedge_bundle` maps the
         payment day onto the (history-prefixed) bundle time grid to recover `last_settlement_index`."""
-        total_volume = 0.0
-        last_payment_day = None
-
-        def walk(struct):
-            nonlocal total_volume, last_payment_day
-            for deal_data in struct.dependencies:
-                cashflows = deal_data.Factor_dep.get('Cashflows')
-                if cashflows is None:
-                    continue
-                schedule = cashflows.schedule
-                total_volume += float(np.abs(schedule[:, utils.CASHFLOW_INDEX_Nominal]).sum())
-                pay = float(schedule[:, utils.CASHFLOW_INDEX_Pay_Day].max())
-                last_payment_day = pay if last_payment_day is None else max(last_payment_day, pay)
-            for sub in struct.sub_structures:
-                walk(sub)
-
-        walk(self.liabilities)
-        return total_volume, last_payment_day
+        return self.liabilities.aggregate_leg_descriptors()
 
     def execute(self, params, job_id=0, num_jobs=1):
         """Simulate the scenario engine over batches, accumulate the tensor bundle
         (tradable prices, liability MtM, factor paths), then hand it to the configured
         hedge solver (solve_hedge) or expose it for stepping (simulate_only). Returns a
         HedgeRuntimeExecutionResult."""
-        def read_instruments(instruments_dict):
-            instruments = []
-            for obj_type, obj_data in instruments_dict.items():
-                for ref, obj_field in obj_data.items():
-                    ins_obj = {'Object': obj_type, 'Reference': ref}
-                    ins_obj.update(obj_field)
-                    instruments.append({'Instrument':construct_instrument(ins_obj, self.config.params['Valuation Configuration'])})
-            return instruments
-
         base_date = pd.Timestamp(params['Run_Date'])
         self.input_time_grid = params['Time_Grid']
         params['Simulation_Batches'] = params['Simulation_Batches'] // num_jobs
@@ -1849,25 +1861,20 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # privileged true-regime one-hot. Default True; set False for the one-hot bootstrap.
         self._inner_belief_filter = hedging_problem.get('Inner_Belief_Filter', 'Yes') == 'Yes'
 
-        instruments = read_instruments(hedging_problem.get('Tradable_Instruments', {}))
-        liabilities = read_instruments(hedging_problem.get('Liabilities', {}))
+        instruments = self.config.deals_from_object_map(hedging_problem.get('Tradable_Instruments', {}))
+        liabilities = self.config.deals_from_object_map(hedging_problem.get('Liabilities', {}))
         # store it away for deal resolution
-        self.config.deals['Deals']['Children'] = instruments + liabilities
+        self.config.set_calculation_children(instruments + liabilities)
         # Liability-driven time-grid cap. Design choice (not a bug): historically the
         # simulator priced every hedge instrument to its own maturity, which extended
         # the time grid to the latest hedge expiry. For hedge-MC that's wasteful —
         # past the liability terminal there is nothing to hedge, and any residual
         # hedge position is closed out at fair value at that point. Cap the global
         # time grid at the liability's last cashflow / reval date so outer and inner
-        # sim both stop there. Picked up by update_factors below.
-        # `reset(holidays)` populates each liability's reval_dates / settlement_currencies
-        # from its `field` — this is the same call walk_groups makes a moment later, so
-        # the double-reset is idempotent. Without it the attrs don't exist yet.
-        liability_dates = set()
-        for liab in liabilities:
-            liab['Instrument'].reset(self.config.holidays)
-            liability_dates |= liab['Instrument'].get_reval_dates(clip_expiry=True)
-        shared_mem = self.update_factors(params, base_date, job_id, num_jobs, end_date=max(liability_dates))
+        # sim both stop there (`max_settlement_date` resets each liability from its
+        # `field` first — idempotent with the reset `set_deal_structures` does below).
+        end_date = DealStructure.max_settlement_date(liabilities, self.config.holidays)
+        shared_mem = self.update_factors(params, base_date, job_id, num_jobs, end_date=end_date)
         # Build the valuation structure first; the hedging runtime will consume
         # the live factor and instrument tensors produced by this same loop.
         self.netting_sets = DealStructure(Aggregation('root'), store_results=True)
@@ -2034,11 +2041,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     )
 
             # grab the simulated instruments and collect them into a generic bundle
-            trade_tensors = {
-                x.Instrument.field['Reference']: x.Calc_res['tensor']
-                for x in self.netting_sets.dependencies
-                if x.Calc_res.get('tensor') is not None
-            }
+            trade_tensors = self.netting_sets.tensor_marks()
 
             if tradable_blocks is not None:
                 for instrument_name, instrument_tensor in trade_tensors.items():
@@ -2479,10 +2482,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     f'was skipped inside the fork; see the CRITICAL log above for the cause.')
             inner_mtm = mtm_flat.reshape(*mtm_flat.shape[:-1], B_outer, B_inner)
             inner_trade_tensors = {
-                x.Instrument.field['Reference']: x.Calc_res['tensor'].reshape(
-                    *x.Calc_res['tensor'].shape[:-1], B_outer, B_inner)
-                for x in inner_netting_sets.dependencies
-                if x.Calc_res.get('tensor') is not None
+                ref: t.reshape(*t.shape[:-1], B_outer, B_inner)
+                for ref, t in inner_netting_sets.tensor_marks().items()
             }
             # One-step window: the feature builder and the horizon stats (L_T, dF_T,
             # dF_min) read terminal rows that a 2-row window doesn't price — emit the

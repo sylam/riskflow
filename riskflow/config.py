@@ -221,6 +221,21 @@ class Config(object):
         self.calibration_process_map = {}
         self.gridparser, self.periodparser = get_grid_grammar()
 
+    def deals_from_object_map(self, object_map):
+        """Convert a {Object: {Reference: field}} map (e.g. a Hedging_Problem's
+        Tradable_Instruments / Liabilities block) into constructed instrument nodes
+        [{'Instrument': Deal}, ...] using the Valuation Configuration — the same adapter
+        `parse_json` uses for `.Deal` nodes."""
+        return [{'Instrument': construct_instrument(
+            {'Object': obj_type, 'Reference': ref, **obj_field},
+            self.params['Valuation Configuration'])}
+            for obj_type, obj_data in object_map.items()
+            for ref, obj_field in obj_data.items()]
+
+    def set_calculation_children(self, nodes):
+        """Install constructed instrument nodes as the canonical deal-tree children."""
+        self.deals['Deals']['Children'] = nodes
+
     def parse_grid(self, run_date, max_date, grid, past_max_date=False):
         """
         Construct a set of dates (NOT adjusted to the next business day) as specified in the grid.

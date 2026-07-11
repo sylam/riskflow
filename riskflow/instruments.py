@@ -472,6 +472,13 @@ class Deal(object):
     def get_settlement_currencies(self):
         return self.settlement_currencies
 
+    def leg_descriptors(self, deal_data):
+        """Static (batch-independent) cashflow descriptors: (summed |notional|, latest pay
+        day offset). Reads this deal's own `Factor_dep['Cashflows']`; defaults to
+        (0.0, None) for deals with no cashflow schedule."""
+        cf = deal_data.Factor_dep.get('Cashflows')
+        return (cf.total_abs_nominal(), cf.last_pay_day()) if cf is not None else (0.0, None)
+
     def refresh_dependencies(self, base_date, time_grid, deal_data):
         """Inner-MC hook: rebase any date-anchored entries in `deal_data.Factor_dep` /
         `deal_data.Time_dep` to a new (base_date, time_grid). Default is a no-op for
