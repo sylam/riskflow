@@ -627,20 +627,23 @@ class DiffSolverV2:
         if not getattr(self, "_proj_checked", False):
             self._proj_checked = True                  # one-time self-check of the label projection
             mt, col, errs = ig["market_t"].detach(), 0, []      # detach: numeric self-check only
+            n = mt.shape[0]
             for key, width in widths:
                 if width <= 0:
                     continue
                 bl, pl = leaves.get((key, "regime_belief")), leaves.get(key)
                 bl = bl.detach() if bl is not None else None
                 pl = pl.detach() if pl is not None else None
-                if bl is not None:
+                if bl is not None and bl.numel() == (width - 1) * n:            # spot: belief + price
                     nb = width - 1
                     be = float((mt[:, col:col + nb] - bl.reshape(nb, -1).transpose(0, 1)).abs().max())
-                    pe = float((mt[:, col + nb] - pl.reshape(-1)).abs().max()) if pl is not None else -1.0
+                    pe = float((mt[:, col + nb] - pl.reshape(-1)).abs().max()) if pl is not None and pl.numel() == n else -1.0
                     errs.append(f"{utils.check_tuple_name(key)}[belief={be:.1g},price={pe:.1g}]")
-                elif pl is not None:
+                elif pl is not None and pl.numel() == width * n:               # 1:1 raw → privileged
                     e = float((mt[:, col:col + width] - pl.reshape(width, -1).transpose(0, 1)).abs().max())
                     errs.append(f"{utils.check_tuple_name(key)}[1:1={e:.1g}]")
+                else:                                                          # belief leaf absent → masked
+                    errs.append(f"{utils.check_tuple_name(key)}[unmeasured]")
                 col += width
             logging.info("DiffSolverV2 differential-label projection check (privileged market_t "
                          "cols vs state_t leaves; ≈0 ⇒ ∂Y/∂market_col == ∂Y/∂leaf): %s",
