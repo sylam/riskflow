@@ -4763,7 +4763,6 @@ class FloatingEnergyDeal(Deal):
                      'FX_Sampling_Type': ['ForwardPriceSample'],
                      'Reference_Type': ['ReferencePrice'],
                      'Commodity': ['CommodityPrice'],
-                     'Implied_Basis': ['CommodityBasis'],
                      'Payoff_Currency': ['FxRate']}
 
     documentation = ('Energy', [
@@ -4772,10 +4771,7 @@ class FloatingEnergyDeal(Deal):
         '',
         '$$V (A S^R(t,t_s^s,t_e^s,\\mathcal S)+b)D(t,T)$$',
         '',
-        'where $A$ is the **Price Multiplier** and $b$ is the **Fixed Basis**. With',
-        '`ForwardCurve=Components`, an optional **Implied_Basis** (a `CommodityBasis` factor)',
-        'shifts the reference spot additively — the same synthetic-spot convention as',
-        '`CommodityFutureDeal` — so fixings sample $S(t)+b_{implied}(t)$.'
+        'where $A$ is the **Price Multiplier** and $b$ is the **Fixed Basis**.'
     ])
 
     def __init__(self, params, valuation_options):
@@ -4821,10 +4817,6 @@ class FloatingEnergyDeal(Deal):
                 commodity_factor.get_carry_curve_name(), static_offsets, stochastic_offsets, all_tenors)
             field_index['ForwardStart'] = np.array(
                 sorted([(x - reference_factor.start_date).days for x in time_grid.mtm_dates]))
-            if self.field.get('Implied_Basis'):
-                field['Implied_Basis'] = utils.check_rate_name(self.field['Implied_Basis'])
-                field_index['Implied_Basis'] = get_impliedbasis_factor(
-                    field['Implied_Basis'], static_offsets, stochastic_offsets)
         else:
             reference_factor, forward_factor = get_reference_factor_objects(field['Reference_Type'], all_factors)
             field_index['ForwardPrice'], field_index['ForwardFX'], field_index['CashFX'] = get_forwardprice_factor(
