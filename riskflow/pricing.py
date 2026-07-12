@@ -2876,14 +2876,23 @@ def pv_energy_cashflows(shared, time_grid, deal_data):
 
     if factor_dep['ForwardPrice'] is None:
         # reconstruct the forward curve from the simulated components - spot x exp((carry + repo) tau);
-        # past resets sample F(reset_day, fixing_day) off the same curve (F(t,t) = spot)
+        # past resets sample F(reset_day, fixing_day) off the same curve (F(t,t) = spot).
+        # An optional Implied_Basis (CommodityBasis) shifts the spot additively — the same
+        # synthetic_spot = observed + basis convention as CommodityFutureDeal — so fixings
+        # sample S(t)+b(t) exactly (growth = 1 at the fixing).
+        spot_fwd = utils.calc_time_grid_spot_rate(factor_dep['Commodity'], deal_time, shared)
+        spot_reset = utils.calc_time_grid_spot_rate(factor_dep['Commodity'], sim_resets, shared)
+        basis = factor_dep.get('Implied_Basis')
+        if basis is not None:
+            spot_fwd = spot_fwd + utils.calc_time_grid_spot_rate(basis, deal_time, shared)
+            spot_reset = spot_reset + utils.calc_time_grid_spot_rate(basis, sim_resets, shared)
         forwards = utils.DerivedForwardCurve(
-            utils.calc_time_grid_spot_rate(factor_dep['Commodity'], deal_time, shared),
+            spot_fwd,
             utils.calc_time_grid_curve_rate(factor_dep['Carry_Rate'], deal_time, shared),
             utils.calc_time_grid_curve_rate(factor_dep['Repo_Rate'], deal_time, shared),
             factor_dep['ForwardStart'][deal_data.Time_dep.deal_time_grid], deal_time)
         all_resets = utils.DerivedForwardCurve(
-            utils.calc_time_grid_spot_rate(factor_dep['Commodity'], sim_resets, shared),
+            spot_reset,
             utils.calc_time_grid_curve_rate(factor_dep['Carry_Rate'], sim_resets, shared),
             utils.calc_time_grid_curve_rate(factor_dep['Repo_Rate'], sim_resets, shared),
             sim_resets[:, utils.RESET_INDEX_Start_Day], sim_resets)
