@@ -30,6 +30,15 @@ Usage:
 in the Components forward-curve world) + Hedging_Problem (the deal + tradables + evaluator).
 The best solver/calc knobs below are applied on top, so the JSON need not carry a Solver block.
 
+This solver is config-agnostic — it applies the same best block to whatever world the JSON
+describes. The shipping deliverable (artifacts/platinum_hedge_shipping.json) is the corrected
+composed-spot platinum world: CommodityPrice.PLATINUM_CME = P is the martingale primary,
+CommodityBasis.LME_CME (Linked_Commodity=PLATINUM_CME) carries the published basis b = P - S,
+and CommodityPrice.PLATINUM_LME = P - b is the composed LBMA fixing (BasisComposedSpotModel,
+routed by modelfilters, never calibrated). The world's invariant is E[dF|b] ≈ 0 — every tradeable
+future references P (martingale), so its expected one-step change conditional on the basis is ~0
+(no unexecutable reversion for the solver to harvest); enforce it at calibration.
+
 JSON-is-the-contract: import riskflow, load_json, run_job. No internal imports, no monkey-patching.
 """
 import argparse
