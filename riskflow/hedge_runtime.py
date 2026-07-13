@@ -475,3 +475,20 @@ def per_contract_kappa(runtime, price, name):
     contract_size = float(runtime["tradables"][name]["contract_size"])
     return (acc["transaction_cost_per_unit"]
             + 0.5 * acc["bid_offer_spread_bps"] * 1.0e-4 * price * contract_size)
+
+
+def initial_q_from_runtime(runtime, batch, device):
+    """Per-hedge initial contract book `q0` `(batch, n_hedge)` from the normalized
+    `Portfolio_State` positions, in `runtime['names']['hedges']` order (hedge legs only,
+    cash accounts excluded). The seed the stepper already applies to its opening positions —
+    exposed here so the solver's frictionless bank/verdict/benchmark tracks measure their
+    FIRST-step turnover from the real opening book rather than from flat.
+
+    The differential-ML value function is POSITION-FREE: `q0` affects only first-step
+    turnover diagnostics + the rolled P&L, never the fitted value. If turnover cost ever
+    becomes material to the objective, the incoming position becomes a genuine state
+    variable and `q_prev` must move into the value-function state (V(market, W, q))."""
+    positions = (runtime.get("portfolio_state") or {}).get("positions") or {}
+    hedges = runtime["names"]["hedges"]
+    q0 = torch.tensor([float(positions.get(str(h), 0.0)) for h in hedges], device=device)
+    return q0.unsqueeze(0).expand(batch, len(hedges)).contiguous()

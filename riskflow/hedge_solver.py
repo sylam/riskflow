@@ -11,6 +11,8 @@ comparison table + acceptance ladder.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
@@ -21,7 +23,11 @@ from . import utils
 from .hedge_bundle import (
     _utility_wrap_signed, _mirror_utility_scale_to_runtime, wealth_step,
 )
-from .hedge_runtime import per_contract_kappa
+from .hedge_runtime import per_contract_kappa, initial_q_from_runtime
+
+# Bumped whenever the fitted-value-function on-disk/artifact contract changes shape. Stamped
+# into every artifact so a loader can tell which solver produced a checkpoint.
+SOLVER_VERSION = "diffsolverv2/2026-07"
 
 
 @dataclass
@@ -38,24 +44,6 @@ class SolverResult:
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
-def build_action_grid(runtime, levels_per_axis, device):
-    """Discrete action grid in raw contract units — one axis per hedge instrument. Each
-    axis spans `[Min_Position_i, Max_Position_i]` (from
-    `runtime['accounting']['position_limits']`) with `levels_per_axis` evenly-spaced
-    levels, endpoints included. The action is the target inventory `(n_1, …, n_hedge)`,
-    not a trade delta. Returns `(n_actions, n_hedge)`."""
-    hedges = runtime["names"]["hedges"]
-    limits = runtime["accounting"]["position_limits"]
-    axes = []
-    for name in hedges:
-        lim = limits.get(name, {})
-        lo = float(lim.get("min_position", 0.0))
-        hi = float(lim.get("max_position", 0.0))
-        axes.append(torch.linspace(lo, hi, levels_per_axis, device=device))
-    grid = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
-    return grid.reshape(-1, len(hedges))
-
-
 def _turnover_cost(delta_contracts, kappa):
     """L1 turnover cost: Σ_i |Δcontracts_i| · kappa_i. `delta_contracts` is
     `(..., n_hedge)`, `kappa` is `(n_hedge,)` per-contract cost. Hard (no smoothing) —
@@ -63,16 +51,83 @@ def _turnover_cost(delta_contracts, kappa):
     return (delta_contracts.abs() * kappa).sum(dim=-1)
 
 
-def _per_contract_kappa(tradables_sim, runtime, hedges, t_index, device):
-    """Per-hedge (kappa, contract_size) vectors at sim-grid `t_index`. kappa off
-    `hedge_runtime.per_contract_kappa` at each instrument's mean mark — one source for the
-    turnover-cost rule. `tradables_sim` is the history-stripped tradables view."""
-    contract_size = torch.tensor(
-        [float(runtime["tradables"][ref]["contract_size"]) for ref in hedges],
-        device=device)
-    kappa = torch.stack(
-        [per_contract_kappa(runtime, tradables_sim[ref][t_index].mean(), ref) for ref in hedges])
-    return kappa, contract_size
+def _config_hash(solver_cfg):
+    """sha1 of the stable-JSON normalized solver cfg — a stamp identifying the TRAINING
+    RECIPE. The persistence paths (save/load) are excluded so the same recipe hashes
+    identically regardless of where its checkpoint lives."""
+    stable = {k: v for k, v in solver_cfg.items()
+              if k not in ("diffv2_save_value_fn", "diffv2_load_value_fn")}
+    return hashlib.sha1(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
+
+
+class HedgeActionSpace:
+    """The solver-owned ACTION UNIVERSE + friction access, built ONCE from (runtime, device)
+    and shared by every track (DiffSolverV2, HindsightDpSolver, run_textbook_benchmark, and
+    the stepper rollout) so they optimize over exactly the same positions and price the same
+    frictions. One object replaces the old scattered `build_action_grid` (varied ALL hedges,
+    letting the benchmarks trade axes an `Active_Hedge_Indices` run had pinned off) + the
+    private `DiffSolverV2._action_grid` + the free `_per_contract_kappa`/`_axis_levels`.
+
+    Surface:
+      * `axis_levels()` / `grid()` — the MASK-AWARE target-position grid: the active hedge
+        axes span `[min, max]` at `levels` points, inactive axes are pinned to a single 0,
+        and rows over the total-position cap are dropped (identical to the old private grid).
+      * `kappa(tradables_sim, t)` — the per-hedge turnover kappa at sim-grid `t` (each
+        instrument's mean mark), off the single `hedge_runtime.per_contract_kappa` rule.
+      * `initial_q(batch, device)` — the opening book `q0` (see `initial_q_from_runtime`)."""
+
+    def __init__(self, runtime, device):
+        self.runtime = runtime
+        self.device = device
+        self.hedges = list(runtime["names"]["hedges"])
+        self.n_hedge = len(self.hedges)
+        acc = runtime["accounting"]
+        limits = acc["position_limits"]
+        self.q_lo = torch.tensor(
+            [float(limits.get(r, {}).get("min_position", 0.0)) for r in self.hedges],
+            device=device)
+        self.q_hi = torch.tensor(
+            [float(limits.get(r, {}).get("max_position", 0.0)) for r in self.hedges],
+            device=device)
+        self.contract_size = torch.tensor(
+            [float(runtime["tradables"][r]["contract_size"]) for r in self.hedges],
+            device=device)
+        self.total_abs_limit = float(acc["total_position_abs_limit"])
+        solver_cfg = runtime["solver"]
+        self.levels = int(solver_cfg["training_action_grid_levels_per_axis"])
+        active = solver_cfg.get("active_hedge_indices")
+        self.active = (list(range(self.n_hedge)) if active is None
+                       else [int(i) for i in active])
+        self.n_active = len(self.active)
+
+    def axis_levels(self):
+        """Per-hedge 1-D level values: `linspace(lo, hi, levels)` on ACTIVE axes, a single 0
+        on inactive axes (pinned). The product of these is the action grid."""
+        return [torch.linspace(float(self.q_lo[i]), float(self.q_hi[i]), self.levels,
+                               device=self.device)
+                if i in self.active else torch.zeros(1, device=self.device)
+                for i in range(self.n_hedge)]
+
+    def grid(self):
+        """Mask-aware target-position grid `(n_actions, n_hedge)`: inactive axes pinned to 0,
+        rows over the total-position cap dropped."""
+        mesh = torch.meshgrid(*self.axis_levels(), indexing="ij")
+        grid = torch.stack([m.reshape(-1) for m in mesh], dim=-1)
+        if self.total_abs_limit > 0.0:
+            grid = grid[grid.abs().sum(-1) <= self.total_abs_limit + 1e-9]
+        return grid
+
+    def kappa(self, tradables_sim, t_index):
+        """Per-hedge kappa `(n_hedge,)` at sim-grid `t_index` — each instrument's mean mark
+        through `hedge_runtime.per_contract_kappa` (the single turnover-cost rule)."""
+        return torch.stack(
+            [per_contract_kappa(self.runtime, tradables_sim[r][t_index].mean(), r)
+             for r in self.hedges])
+
+    def initial_q(self, batch, device):
+        """The opening book `q0` `(batch, n_hedge)` (hedge legs only, `names['hedges']`
+        order) from the normalized `Portfolio_State` positions."""
+        return initial_q_from_runtime(self.runtime, batch, device)
 
 
 def _bundle_sim_views(bundle):
@@ -100,137 +155,111 @@ def _realized_paths(bundle, runtime):
     return F, L_T, t_outer
 
 
-def _axis_levels(runtime, levels, device):
-    """Per-hedge-axis 1-D level values — the `linspace(min, max, levels)` that
-    `build_action_grid` takes the meshgrid of. Returned as a list of `(levels,)` tensors."""
-    limits = runtime["accounting"]["position_limits"]
-    return [torch.linspace(float(limits.get(h, {}).get("min_position", 0.0)),
-                           float(limits.get(h, {}).get("max_position", 0.0)),
-                           levels, device=device)
-            for h in runtime["names"]["hedges"]]
-
-
-def _maxplus_grid(A, kappa, axis_vals, levels, n_hedge):
-    """`J[n_prev, b] = max_n [ A[n, b] - Σ_i kappa_i·|val_i(n) - val_i(n_prev)| ]` over the
-    discrete grid. The L1 turnover cost is separable across hedges, so the max-plus
-    factorizes into `n_hedge` sequential 1-D transforms — `O(levels^(n_hedge+1)·B)` rather
-    than the `O(n_actions²·B)` full action-pair table. `-inf` entries of `A` (grid points
-    masked out by a total-position limit) propagate harmlessly."""
-    g = A.reshape(*([levels] * n_hedge), A.shape[-1])
-    for i in range(n_hedge):
-        v = axis_vals[i]
-        cost_i = float(kappa[i]) * (v.unsqueeze(1) - v.unsqueeze(0)).abs()   # (L_p, L_q)
-        g = g.movedim(i, 0)                                                 # (L_p, rest…, B)
-        cand = g.unsqueeze(1) - cost_i.view(levels, levels, *([1] * (g.dim() - 1)))
-        g = cand.amax(dim=0).movedim(0, i)                                  # (L_q, rest…, B)
-    return g.reshape(levels ** n_hedge, A.shape[-1])
-
-
 def run_textbook_benchmark(bundle, runtime):
-    """Static-hedge reference: the single best constant position, held over the whole
-    horizon with no rebalancing, evaluated on the realized outer paths. A valid lower
-    bound for the dynamic DP — dynamic rebalancing can only add value. No inner MC, no
-    V̂. Static hold telescopes the per-step P&L to `position · (F_T − F_0)`."""
+    """Static-hedge reference: the single best CONSTANT position, held over the whole horizon
+    with no rebalancing, evaluated FRICTIONLESS on the realized outer paths (the shared DP
+    objective — greedy/hindsight are frictionless too). A valid lower bound for the dynamic
+    DP: dynamic rebalancing can only add value. No inner MC, no V̂. Static hold telescopes
+    the per-step P&L to `position · (F_T − F_0)`. Uses the shared `HedgeActionSpace` so it
+    respects `Active_Hedge_Indices` (inactive axes pinned to 0) exactly like the greedy grid.
+
+    The turnover a real execution of this constant hold would pay — entry from the OPENING
+    book `q0` (not from flat) + terminal unwind — is a shared-kappa net-of-cost DIAGNOSTIC
+    (`turnover_cost_mean` / `v0_mean_net`), never charged against the V_0 track."""
     F, L_T, t_outer = _realized_paths(bundle, runtime)
-    hedges = list(runtime["names"]["hedges"])
     device = F.device
     acc = runtime["accounting"]
-    solver_cfg = runtime["solver"]
+    aspace = HedgeActionSpace(runtime, device)
     tradables_sim, _ = _bundle_sim_views(bundle)
-    kappa0, contract_size = _per_contract_kappa(tradables_sim, runtime, hedges, 0, device)
-    kappa_T, _ = _per_contract_kappa(tradables_sim, runtime, hedges, t_outer - 1, device)
-    grid = build_action_grid(
-        runtime, solver_cfg["training_action_grid_levels_per_axis"], device)
+    grid = aspace.grid()                                               # (n_actions, n_hedge)
+    b_outer = F.shape[-1]
+    q0 = aspace.initial_q(b_outer, device)                            # (B, n_hedge) opening book
 
     total_move = F[:, -1, :] - F[:, 0, :]                              # (n_h, B) telescoped
-    g_t = torch.einsum("ai,ib->ab", grid * contract_size, total_move)  # (n_actions, B)
-    cost = _turnover_cost(grid, kappa0)                                # entry turnover
-    if acc["force_flat_at_end"]:
-        cost = cost + _turnover_cost(grid, kappa_T)                    # terminal unwind
-    u = _utility_wrap_signed(L_T.unsqueeze(0) + g_t - cost.unsqueeze(-1), runtime)
+    g_t = torch.einsum("ai,ib->ab", grid * aspace.contract_size, total_move)  # (n_actions, B)
+    u = _utility_wrap_signed(L_T.unsqueeze(0) + g_t, runtime)         # FRICTIONLESS objective
     obj = u.mean(dim=-1)                                               # (n_actions,)
-    if acc["total_position_abs_limit"] > 0.0:
-        violators = grid.abs().sum(dim=-1) > acc["total_position_abs_limit"]
-        obj = obj.masked_fill(violators, float("-inf"))
     best = int(obj.argmax())
+    n_star = grid[best]                                                # (n_hedge,)
+    # Net-of-cost diagnostic (shared kappa): entry |n_star − q0| + terminal unwind |0 − n_star|.
+    kappa0 = aspace.kappa(tradables_sim, 0)
+    cost = _turnover_cost(n_star.unsqueeze(0) - q0, kappa0)            # (B,) entry from q0
+    if acc["force_flat_at_end"]:
+        kappa_T = aspace.kappa(tradables_sim, t_outer - 1)
+        cost = cost + _turnover_cost(n_star, kappa_T)                  # unwind to flat (scalar)
+    u_net = _utility_wrap_signed(L_T + g_t[best] - cost, runtime)
     return {"v0_mean": float(obj[best]), "v0_std": 0.0,
-            "n_star": grid[best].detach().cpu().tolist(),
+            "v0_mean_net": float(u_net.mean()),
+            "turnover_cost_mean": float(cost.mean()),
+            "n_star": n_star.detach().cpu().tolist(),
             "terminal_utility": u[best].detach().cpu()}
 
 
 class HindsightDpSolver:
-    """Clairvoyant upper-bound diagnostic. For each outer path it solves the deterministic
-    optimal position trajectory GIVEN the realized future — a backward max-plus DP over
-    the discrete action grid with L1 turnover cost. No inner MC, no V̂: the realized path
-    is its own one-sample future.
+    """Clairvoyant upper-bound diagnostic, FRICTIONLESS (the shared DP objective). For each
+    realized outer path it picks, at EVERY step independently, the grid position maximizing
+    that step's realized P&L `q·cs·(F_{t+1}−F_t)` — perfect foresight + free repositioning.
+    No inner MC, no V̂: the realized path is its own one-sample future.
 
-    `u_signed` is monotone and the liability terminal `L_T(b)` is path-fixed, so
-    maximizing `u_signed(W_T)` ≡ maximizing the additive cash `G_T` — hence a pure
-    max-plus DP, then `u_signed` applied once at `t=0`. `mean_b V_0(b)` is an upper bound
-    on any deployable (non-clairvoyant) policy's value — the reference the DP is measured
-    against."""
+    `u_signed` is monotone and the liability terminal `L_T(b)` is path-fixed, so maximizing
+    `u_signed(W_T)` ≡ maximizing the additive cash `G_T`; with no turnover cost the per-step
+    choices decouple, so the max-plus DP collapses to a per-step argmax. `mean_b V_0(b)` is
+    an upper bound on any deployable (non-clairvoyant) policy's value — the reference the DP
+    is measured against. The turnover a real execution of this bang-bang trajectory would pay
+    (entry from the OPENING book, per-step repositioning, terminal unwind) is a shared-kappa
+    net-of-cost DIAGNOSTIC, never charged against the V_0 track. Uses the shared
+    `HedgeActionSpace`, so it respects `Active_Hedge_Indices` exactly like the greedy grid."""
 
     def __init__(self, bundle, runtime):
         self.bundle = bundle
         self.runtime = runtime
+        self.aspace = HedgeActionSpace(runtime, bundle["time_grid_days"].device)
 
     def solve(self):
-        bundle, runtime = self.bundle, self.runtime
-        hedges = list(runtime["names"]["hedges"])
-        n_h = len(hedges)
+        bundle, runtime, aspace = self.bundle, self.runtime, self.aspace
         acc = runtime["accounting"]
-        solver_cfg = runtime["solver"]
-        force_flat = acc["force_flat_at_end"]
-        total_abs_limit = acc["total_position_abs_limit"]
 
         F, L_T, t_outer = _realized_paths(bundle, runtime)             # F (n_h,t_outer,B)
         device = F.device
         b_outer = F.shape[-1]
         tradables_sim, _ = _bundle_sim_views(bundle)
-        levels = solver_cfg["training_action_grid_levels_per_axis"]
-        grid = build_action_grid(runtime, levels, device)              # (n_actions, n_h)
-        n_actions = grid.shape[0]
-        axis_vals = _axis_levels(runtime, levels, device)
-        valid = (grid.abs().sum(dim=-1) <= total_abs_limit
-                 if total_abs_limit > 0.0 else None)
+        grid = aspace.grid()                                           # (n_actions, n_h) mask-aware
+        cs = aspace.contract_size
 
-        # Terminal: J_{T}(n_prev) = -[force_flat] · cost(0, n_prev) — the unwind charge.
-        kappa_T, contract_size = _per_contract_kappa(
-            tradables_sim, runtime, hedges, t_outer - 1, device)
-        J = (-_turnover_cost(grid, kappa_T).unsqueeze(-1).expand(n_actions, b_outer)
-             if force_flat else torch.zeros(n_actions, b_outer, device=device))
-
-        def _step_pnl(t):
+        # Frictionless clairvoyant: independent per-step argmax over the realized move. The
+        # net-of-cost trajectory (from the opening book q0) is accumulated for the diagnostic.
+        q_prev = aspace.initial_q(b_outer, device)                     # (B, n_h) opening book
+        n_star_0 = None
+        G = torch.zeros(b_outer, device=device)
+        cost = torch.zeros(b_outer, device=device)
+        for t in range(t_outer - 1):
             dF = F[:, t + 1, :] - F[:, t, :]                           # (n_h, B)
-            return torch.einsum("ai,ib->ab", grid * contract_size, dF)  # (n_actions, B)
-
-        # Backward DP, t = t_outer-2 … 1: J_t(n_prev) = max_n[pnl_t(n) - cost + J_{t+1}(n)].
-        for t in range(t_outer - 2, 0, -1):
-            kappa_t, _ = _per_contract_kappa(tradables_sim, runtime, hedges, t, device)
-            A = _step_pnl(t) + J
-            if valid is not None:
-                A = A.masked_fill(~valid.unsqueeze(-1), float("-inf"))
-            J = _maxplus_grid(A, kappa_t, axis_vals, levels, n_h)
-        # t=0 decision from the flat start (n_{-1}=0): max over n_0 directly.
-        kappa0, _ = _per_contract_kappa(tradables_sim, runtime, hedges, 0, device)
-        A0 = _step_pnl(0) + J
-        if valid is not None:
-            A0 = A0.masked_fill(~valid.unsqueeze(-1), float("-inf"))
-        A0 = A0 - _turnover_cost(grid, kappa0).unsqueeze(-1)           # cost(n_0, 0)
-        g0, n0_idx = A0.max(dim=0)                                     # (B,), (B,)
-        v0 = _utility_wrap_signed(L_T + g0, runtime)                   # (B,)
+            step_pnl = torch.einsum("ai,ib->ab", grid * cs, dF)        # (n_actions, B)
+            best_pnl, best_idx = step_pnl.max(dim=0)                   # (B,), (B,)
+            q_now = grid[best_idx]                                     # (B, n_h)
+            cost = cost + _turnover_cost(q_now - q_prev, aspace.kappa(tradables_sim, t))
+            G = G + best_pnl
+            q_prev = q_now
+            if t == 0:
+                n_star_0 = q_now
+        if acc["force_flat_at_end"]:
+            cost = cost + _turnover_cost(q_prev, aspace.kappa(tradables_sim, t_outer - 1))
+        v0 = _utility_wrap_signed(L_T + G, runtime)                    # (B,) FRICTIONLESS
+        v0_net = _utility_wrap_signed(L_T + G - cost, runtime)         # (B,) net-of-cost diagnostic
 
         return SolverResult(
             solver_name="HindsightDpSolver",
-            actions=grid[n0_idx].detach().cpu(),
+            actions=n_star_0.detach().cpu(),
             values=v0.detach().cpu(),
-            terminal_pnl=(L_T + g0).detach().cpu(),
+            terminal_pnl=(L_T + G).detach().cpu(),
             terminal_utility=v0.detach().cpu(),
             diagnostics={
                 "V_0": float(v0.mean()),
-                "n_star_0": grid[n0_idx].float().mean(dim=0).detach().cpu().tolist(),
+                "V_0_net": float(v0_net.mean()),
+                "turnover_cost_mean": float(cost.mean()),
+                "n_star_0": n_star_0.float().mean(dim=0).detach().cpu().tolist(),
                 "v0_abs_max": float(v0.abs().max()),
-                "action_grid_size": n_actions,
+                "action_grid_size": int(grid.shape[0]),
             },
         )
 
@@ -316,25 +345,20 @@ class DiffSolverV2:
         self.runtime = runtime
         self.cfg = runtime["solver"]
         self.device = bundle["time_grid_days"].device
-        acc = runtime["accounting"]
-        self.hedges = list(runtime["names"]["hedges"])
-        self.n_hedge = len(self.hedges)
-        self.contract_size = torch.tensor(
-            [float(runtime["tradables"][ref]["contract_size"]) for ref in self.hedges],
-            device=self.device)                                       # (n_hedge,)
-        limits = acc["position_limits"]
-        self.q_lo = torch.tensor(
-            [float(limits.get(r, {}).get("min_position", 0.0)) for r in self.hedges],
-            device=self.device)
-        self.q_hi = torch.tensor(
-            [float(limits.get(r, {}).get("max_position", 0.0)) for r in self.hedges],
-            device=self.device)
-        self.total_abs_limit = float(acc["total_position_abs_limit"])
+        # The shared action universe (mask-aware grid + per-contract kappa + opening book) —
+        # the SAME object the benchmark tracks and the stepper rollout consume, so every track
+        # optimizes over identical positions and prices identical frictions.
+        self.aspace = HedgeActionSpace(runtime, self.device)
+        self.hedges = self.aspace.hedges
+        self.n_hedge = self.aspace.n_hedge
+        self.contract_size = self.aspace.contract_size                # (n_hedge,)
+        self.q_lo = self.aspace.q_lo
+        self.q_hi = self.aspace.q_hi
+        self.total_abs_limit = self.aspace.total_abs_limit
         # Active hedge axes: which instruments the action grid varies (rest pinned to 0).
-        active = self.cfg.get("active_hedge_indices")
-        self.active = list(range(self.n_hedge)) if active is None else [int(i) for i in active]
-        self.n_active = len(self.active)
-        self.levels = int(self.cfg["training_action_grid_levels_per_axis"])
+        self.active = self.aspace.active
+        self.n_active = self.aspace.n_active
+        self.levels = self.aspace.levels
         self.chunk = int(self.cfg["training_action_chunk_size"])
         self.fit_iters = int(self.cfg.get("diffv2_fit_iters", 150))
         self.lr = float(self.cfg.get("diffv2_lr", 2.0e-3))
@@ -367,20 +391,9 @@ class DiffSolverV2:
         """Bounded terminal-utility anchor u(W) — the framework's normalised utility."""
         return _utility_wrap_signed(W, self.runtime)
 
-    # ---- action grid (subset-active; inactive axes pinned to 0) --------------
+    # ---- action grid (shared, mask-aware; inactive axes pinned to 0) ---------
     def _action_grid(self):
-        axes = []
-        for i in range(self.n_hedge):
-            if i in self.active:
-                axes.append(torch.linspace(float(self.q_lo[i]), float(self.q_hi[i]),
-                                            self.levels, device=self.device))
-            else:
-                axes.append(torch.zeros(1, device=self.device))
-        mesh = torch.meshgrid(*axes, indexing="ij")
-        grid = torch.stack([m.reshape(-1) for m in mesh], dim=-1)      # (K, n_hedge)
-        if self.total_abs_limit > 0.0:                                # drop infeasible rows
-            grid = grid[grid.abs().sum(-1) <= self.total_abs_limit + 1e-9]
-        return grid
+        return self.aspace.grid()
 
     # ---- input standardization ----------------------------------------------
     def _standardize(self, market, W):
@@ -519,7 +532,10 @@ class DiffSolverV2:
         backward sweep makes at t (no extra inner-MC passes)."""
         L = self.liability_sim
         W = L[0].clone()                                                                 # (B_outer,) = cum_pnl(0)+L_0
-        q_prev = torch.zeros(self.B_outer, self.n_hedge, device=self.device)
+        # Seed q_prev from the OPENING book (position-free value: the bank wealth W below
+        # never reads q_prev, so this only labels q_list[0]; q_prev would carry real weight
+        # here only if turnover cost entered the value — see initial_q_from_runtime).
+        q_prev = self.aspace.initial_q(self.B_outer, self.device)
         W_list, q_list = [], []
         rng = (self.q_hi - self.q_lo)
         mask = torch.zeros(self.n_hedge, device=self.device)
@@ -746,12 +762,13 @@ class DiffSolverV2:
         W = {p: L[t0][rows].clone() for p in ("greedy", "textbook", "nohedge")}
         q_traj = {"greedy": [], "textbook": []}                                          # mean |q| per step
         # Parallel turnover-cost accounting (Transaction_Cost_Per_Unit + half the
-        # Bid_Offer_Spread_Bps on |Δq| each rebalance, from flat at t_min). The wealth
-        # recursion itself stays cost-free (the position-free value design assumes free
-        # repositioning) — these are DIAGNOSTICS quantifying that approximation per policy.
+        # Bid_Offer_Spread_Bps on |Δq| each rebalance, entry measured from the OPENING book
+        # q0 — not from flat). The wealth recursion itself stays cost-free (the position-free
+        # value design assumes free repositioning) — these are DIAGNOSTICS quantifying that
+        # approximation per policy.
         cost = {p: torch.zeros(n, device=self.device) for p in ("greedy", "textbook")}
-        q_prev = {p: torch.zeros(n, self.n_hedge, device=self.device)
-                  for p in ("greedy", "textbook")}
+        q0 = self.aspace.initial_q(n, self.device)
+        q_prev = {p: q0.clone() for p in ("greedy", "textbook")}
         with torch.no_grad():
             for t in sweep_ts:
                 dF_o = torch.stack(
@@ -759,8 +776,7 @@ class DiffSolverV2:
                      for r in self.hedges], dim=-1)                                       # (n, n_hedge)
                 dL_o = (L[t + 1] - L[t])[rows]
                 dF, dL, m1, _, live = inner_cache[t]
-                kappa_t, _ = _per_contract_kappa(
-                    self.tradables_sim, self.runtime, self.hedges, t, self.device)
+                kappa_t = self.aspace.kappa(self.tradables_sim, t)
                 q_g, _ = self._decide(
                     nets, m1[rows], dF[rows], dL[rows], W["greedy"], t, grid,
                     q_prev=q_prev["greedy"] if self.cost_aware else None,
@@ -814,7 +830,10 @@ class DiffSolverV2:
 
         def roll(policy):
             stepper = BundleStepper(self.bundle, self.runtime)
-            q_prev = None
+            # Seed the cost-aware decision q_prev from the OPENING book (the stepper's own
+            # positions already open here too, so its realized first-step turnover is measured
+            # from q0). The frozen value is position-free — q0 only shifts first-step cost/P&L.
+            q_prev = self.aspace.initial_q(self.B_outer, self.device)
             last = None
             while not stepper.done:
                 t = stepper.time_index - hist
@@ -835,8 +854,7 @@ class DiffSolverV2:
                         q = qt[None].expand(B, self.n_hedge)
                     else:
                         dF, dL, m1, _, live = inner_cache[t]
-                        kappa_t, _ = _per_contract_kappa(
-                            self.tradables_sim, self.runtime, self.hedges, t, self.device)
+                        kappa_t = self.aspace.kappa(self.tradables_sim, t)
                         q, _ = self._decide(nets, m1, dF, dL, W, t, grid,
                                             q_prev=q_prev if self.cost_aware else None,
                                             kappa=kappa_t if self.cost_aware else None)
@@ -910,10 +928,15 @@ class DiffSolverV2:
         grid = self._action_grid()
         hidden = int(self.cfg.get("diffv2_hidden", 128))
         load_cfg = self.cfg.get("diffv2_load_value_fn", "") or ""
-        load_paths = ([str(p) for p in load_cfg] if isinstance(load_cfg, (list, tuple))
-                      else ([str(load_cfg)] if load_cfg else []))
+        # A load member is either a checkpoint PATH (JSON contract) or an already-materialised
+        # artifact DICT (the same dict solve() returns via value_fn_artifacts / torch.saves) —
+        # the eval-from-artifact path treats an in-memory artifact exactly like a loaded file.
+        load_members = ([(p if isinstance(p, dict) else str(p)) for p in load_cfg]
+                        if isinstance(load_cfg, (list, tuple))
+                        else ([load_cfg] if isinstance(load_cfg, dict)
+                              else ([str(load_cfg)] if load_cfg else [])))
         loaded = None
-        if load_paths:
+        if load_members:
             # Frozen-policy eval: restore the fitted nets AND each function's frame — the
             # train-time standardization stats and utility scale are part of the value
             # function; recomputing them from the (possibly stressed) eval world would
@@ -922,19 +945,22 @@ class DiffSolverV2:
             # each member evaluated in its own frame, continuations averaged (cross-fit
             # winner's-curse reduction on top of antithetic).
             members = []
-            for path in load_paths:
-                ck = torch.load(path, map_location=self.device)
+            for member in load_members:
+                # Pre-contract checkpoints predate active_hedge_indices / solver_version /
+                # config_hash — they still load: only the frame + net keys below are read.
+                ck = member if isinstance(member, dict) else torch.load(member, map_location=self.device)
+                src = "<in-memory artifact>" if isinstance(member, dict) else member
                 for key, want in (("t_min", self.t_min), ("T_dec", self.T_dec),
                                   ("md", md), ("hedges", list(self.hedges))):
                     if ck[key] != want:
                         raise ValueError(
                             f"DiffV2_Load_Value_Fn checkpoint mismatch on {key!r}: "
-                            f"{path} saved {ck[key]!r} vs this run {want!r}")
+                            f"{src} saved {ck[key]!r} vs this run {want!r}")
                 drift = ((M.mean(0) - ck["m_mean"]).abs() / ck["m_std"]).max()
                 logging.info(
                     "DiffSolverV2 LOADED value fn from %s (train V_0=%+.6g) | eval-world "
                     "market drift vs train frame: max %.3g σ | utility_scale %.6g",
-                    path, ck["V_0"], float(drift), ck["utility_scale"])
+                    src, ck["V_0"], float(drift), ck["utility_scale"])
                 members.append(ck)
             loaded = members[0]
             scales = [float(ck["utility_scale"]) for ck in members]
@@ -997,19 +1023,31 @@ class DiffSolverV2:
                 "DiffSolverV2 sweep complete: t=%d→%d | max|Y_boot|=%.4g (%s) | "
                 "V_0=%+.6g | n_star@t=%d=%s", self.T_dec - 1, self.t_min, worst,
                 "BOUNDED" if bounded else "EXPLODED", V_0, root["t"], n_star_0)
+        # POLICY ARTIFACT (built ONCE, here): the fitted value function + its frame + the
+        # provenance stamps. This is the single source returned via SolverResult (→
+        # HedgeRuntimeExecutionResult.policy_artifact) AND torch.saved to DiffV2_Save_Value_Fn
+        # — the file and the in-memory dict are byte-for-byte the same object, so the
+        # eval-from-artifact path (load member = this dict) is identical to loading the file.
+        artifact = None
         save_path = str(self.cfg.get("diffv2_save_value_fn", "") or "")
-        if save_path and loaded is None:
-            torch.save({
+        if loaded is None:
+            artifact = {
                 "state_dicts": [net.state_dict() for net in nets],
                 "m_mean": self.m_mean, "m_std": self.m_std,
                 "w_mean": self.w_mean, "w_std": self.w_std,
                 "utility_scale": float(self.runtime["objective"]["utility_scale"]),
-                "t_min": self.t_min, "T_dec": self.T_dec, "md": md, "hidden": hidden,
-                "hedges": list(self.hedges),
-                "V_0": V_0, "n_star_0": list(n_star_0), "max_abs_Y_boot": worst,
                 "a_bounds": self.a_bounds,
-            }, save_path)
-            logging.info("DiffSolverV2 SAVED value fn to %s (V_0=%+.6g)", save_path, V_0)
+                "hedges": list(self.hedges),
+                "active_hedge_indices": list(self.active),
+                "T_dec": self.T_dec, "t_min": self.t_min, "md": md, "hidden": hidden,
+                "solver_version": SOLVER_VERSION,
+                "config_hash": _config_hash(self.cfg),
+                # Headline echoed so a loaded eval reads it back rather than recomputing.
+                "V_0": V_0, "n_star_0": list(n_star_0), "max_abs_Y_boot": worst,
+            }
+            if save_path:
+                torch.save(artifact, save_path)
+                logging.info("DiffSolverV2 SAVED value fn to %s (V_0=%+.6g)", save_path, V_0)
 
         # Downside verdict: greedy policy vs textbook delta hedge vs no hedge. HEADLINE is the
         # OUT-OF-SAMPLE rollout (held-out paths the nets never saw); in-sample reported too.
@@ -1078,6 +1116,7 @@ class DiffSolverV2:
             solver_name="DiffSolverV2",
             actions=torch.tensor(n_star_0),
             values=V_0,
+            value_fn_artifacts=artifact,              # the fitted policy (None in eval-from-load runs)
             diagnostics={
                 "V_0": V_0,
                 "n_star_0": n_star_0,
@@ -1088,6 +1127,7 @@ class DiffSolverV2:
                 "per_t": rows,
                 "action_grid_size": int(grid.shape[0]),
                 "market_dim": int(M.shape[-1]),
+                "value_fn_path": save_path or None,       # where the artifact was persisted (if any)
                 "verdict": verdict,                       # OUT-OF-SAMPLE (held-out paths)
                 "stepper_verdict": stepper_verdict,       # frozen-policy realized-path rollout (real accounting)
                 "verdict_in_sample": verdict_is,
