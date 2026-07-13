@@ -173,6 +173,7 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume)
     hp = calc['Hedging_Problem']
 
     calc['Base_Date'] = _ts(trade_date)
+    calc['Scenario_Factors'] = ['CommodityBasis.LME_CME']  # reached only via the composed LME spot
     mm['MarketDataFile'] = calibrated_md
     hp['Objective'] = dict(OBJECTIVE)
 

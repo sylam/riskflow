@@ -477,7 +477,10 @@
    },
    "Inner_Sub_Batch": 64,
    "Inner_MC_Enabled": "Yes",
-   "Inner_Antithetic": "Yes"
+   "Inner_Antithetic": "Yes",
+   "Scenario_Factors": [
+    "CommodityBasis.LME_CME"
+   ]
   },
   "MergeMarketData": {
    "MarketDataFile": "./artifacts/MarketDataRF_platinum_calibrated_cme.json",

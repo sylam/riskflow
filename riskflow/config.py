@@ -644,8 +644,7 @@ class Config(object):
                                              ('ReferencePrice', 'ReferencePrice')],
                             'InflationRate': [('Price_Index', 'PriceIndex')],
                             'CommodityPrice': [('Interest_Rate', 'InterestRate'),
-                                               ('Forward_Rate', 'ForwardRate'), ('Currency', 'FxRate'),
-                                               ('Implied_Basis', 'CommodityBasis')],
+                                               ('Forward_Rate', 'ForwardRate'), ('Currency', 'FxRate')],
                             'EquityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')],
                             'CommodityBasis': [('Observed_Commodity', 'CommodityPrice')]}
 

@@ -1804,9 +1804,14 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             keep_tensor=self.params.get('Keep_Tensor', 'No') == 'Yes')
 
     def update_factors(self, params, base_date, job_id, num_jobs, end_date):
-        """Override: build dependent_factors from the generic Scenario_Factors JSON dict."""
+        """Override: deal-driven dependencies plus the calc's explicit Scenario_Factors list —
+        factors no deal reaches directly (e.g. a basis consumed only by a composed spot)
+        are declared in the JSON, not discovered through schema edges."""
         dependent_factors, stochastic_factors, _, reset_dates, settlement_currencies = self.config.calculate_dependencies(
             params, base_date, self.input_time_grid)
+        for name in params.get('Scenario_Factors', []):
+            factor_type, factor_name = name.split('.', 1)
+            dependent_factors.setdefault(utils.Factor(factor_type, utils.check_rate_name(factor_name)), [])
 
         # Size the time grid from the max tradable reset date, capped at liability end.
         # If a liability-end cap was set upstream, clip max_expiry there — hedge maturities
@@ -1824,8 +1829,13 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         dependent_factors = {k: last_scen_date for k in dependent_factors}
         stochastic_factors, additional_factors = self.config.find_models(dependent_factors)
 
-        return self._build_factor_state(
+        shared_mem = self._build_factor_state(
             dependent_factors, stochastic_factors, additional_factors, params, base_date, job_id, num_jobs)
+        # Derived factors (zero-random processes, e.g. BasisComposedSpotModel) generate after
+        # the stochastic factors they compose — ordering by process kind, no dependency edges.
+        self.stoch_factors = ({k: p for k, p in self.stoch_factors.items() if p.num_factors() != 0}
+                              | {k: p for k, p in self.stoch_factors.items() if p.num_factors() == 0})
+        return shared_mem
 
     def _liability_schedule_scalars(self):
         """Static (batch-independent) liability descriptors the symlog utility-scale needs, read
