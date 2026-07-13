@@ -250,6 +250,12 @@ def _normalize_spot_price_history(
 ) -> Dict[str, Dict[str, Any]]:
     state = hedging_problem.get("Portfolio_State") or {}
     raw_history = state.get("Spot_Price_History") or {}
+    # Spot_Price_History is OPTIONAL. Absent it, the utility scale falls back to the calibrated
+    # market data (hedge_bundle.resolve_utility_scale) and the history prefix no-ops, so return
+    # empty rather than demanding entries for every referenced commodity. A PARTIAL history (some
+    # but not all commodities) is still an error — that check stays below.
+    if not raw_history:
+        return {}
     normalized: Dict[str, Dict[str, Any]] = {}
     for commodity, payload in raw_history.items():
         commodity_name = str(commodity)

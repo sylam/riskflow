@@ -179,6 +179,14 @@ class StochasticProcess(object):
         (T, B, dim) tensors keyed by name. `simulated` is this process's (T, B) path."""
         return {}
 
+    def calibrated_annual_vol(self):
+        """Annualized FRACTIONAL vol implied by this process's calibrated params, or None if
+        the process does not characterize a single scalar spot vol. Consumed by the utility-
+        scale fallback (hedge_bundle.resolve_utility_scale) when Spot_Price_History is absent —
+        the calibrated substitute for the realized-vol read off the history window. Default None
+        (no vol characterization); spot models that own a calibrated vol override it."""
+        return None
+
     def reveal_state_at(self, t, buffer):
         """Ordered market-state segments `[(block, reveal_kind), ...]` this factor exposes to
         the value function at scenario-time index `t` — the informative deep-state the DP/MPC
@@ -2463,6 +2471,23 @@ class MarkovHMMSpotModel(StochasticProcess):
             block = F.one_hot(regimes[t].long(), num_classes=self.n_states)\
                 .to(dtype=buffer[key].dtype).movedim(-1, 0)                   # (n_states, ...batch)
         return [(block, REVEAL_SUFFICIENT), (price, REVEAL_CONTINUOUS)]
+
+    def calibrated_annual_vol(self):
+        """Stationary regime-weighted annualized vol: σ = √(Σ_i π_i σ_i²), with π the stationary
+        distribution of the calibration-DT transition matrix P (left eigenvector for eigenvalue 1).
+        Log_Price=True → the state σ_i are already fractional log-vols and σ is returned as-is;
+        raw-diff (Log_Price=False) → σ_i are absolute ($/√yr), divided by the initial spot to a
+        fraction so the utility-scale formula c = volume·spot·σ·√τ recovers volume·σ_abs·√τ."""
+        sig = np.array([float(s['Sigma']) for s in self.param['States']], dtype=np.float64)
+        P = np.array(self.param['Transition_Matrix'], dtype=np.float64)
+        evals, evecs = np.linalg.eig(P.T)
+        pi = np.real(evecs[:, int(np.argmin(np.abs(evals - 1.0)))])
+        pi = pi / pi.sum()
+        sigma = float(np.sqrt(float((pi * sig * sig).sum())))
+        if not bool(self.param.get('Log_Price', False)):
+            spot = float(self.spot0.reshape(-1).median().item())
+            sigma = sigma / spot if spot > 0.0 else 0.0
+        return sigma
 
     def reseed_one_step(self, spot_t_leaf, spot_t_realized, spot_t1_realized):
         """Analytic one-step transition re-seed for the diff-ML bootstrap.

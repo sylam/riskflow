@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from . import utils
 from .hedge_runtime import assemble_privileged_factors, per_contract_kappa
 
 
@@ -366,6 +367,34 @@ def _utility_wrap_signed(x_dollars, runtime):
     return (1.0 - torch.exp(-g * x)) / g
 
 
+def _calibrated_utility_inputs(bundle, runtime, stoch_factors):
+    """Utility-scale (commodity, spot, σ) sourced from CALIBRATED market data — the
+    Spot_Price_History-absent fallback for `resolve_utility_scale`. Spot is the sim-day-0
+    CommodityPrice level (bundle factor row 0 = the price-factor Spot); σ is the underlying
+    process's calibrated annualized vol (`StochasticProcess.calibrated_annual_vol`). When
+    several CommodityPrice factors exist (cross-market strips), the regime/belief-owning
+    primary is preferred — the martingale the tradeable futures reference. Returns
+    (commodity, spot, sigma) or None when no referenced underlying reports a calibrated vol."""
+    factors = bundle.get('factors') or {}
+    referenced = set(runtime.get('referenced_commodities') or ())
+    candidates = []
+    for key, proc in (stoch_factors or {}).items():
+        name = utils.check_tuple_name(key)
+        if name not in referenced or name not in factors:
+            continue
+        sigma = proc.calibrated_annual_vol()
+        if sigma is None or sigma <= 0.0:
+            continue
+        # belief-owning (regime) spots sort first — the martingale primary of a cross-market strip.
+        candidates.append((not hasattr(proc, '_forward_belief'), name, float(sigma)))
+    if not candidates:
+        return None
+    candidates.sort()
+    _, commodity, sigma = candidates[0]
+    spot = float(factors[commodity][0].median().item())
+    return (commodity, spot, sigma)
+
+
 def resolve_utility_scale(bundle, runtime):
     """Compute the dollar scale `c` used by `AsymmetricUtility_Symlog` to map dollars to
     log-utility: u(x; c) = sign(x) · log1p(|x| / c). Single source of truth — every reward
@@ -420,7 +449,12 @@ def resolve_utility_scale(bundle, runtime):
                 'utility_scale Explicit override: c=%.4g (below the $1k '
                 'production floor — test mode; trust mode active)', c_explicit)
         return c_explicit
-    H = int(runtime.get('history_lookback_business_days', 0))
+    # `initial_time_index` is the history-prefix length — equal to History_Lookback_Business_Days
+    # when Spot_Price_History is present, 0 when it is absent. It is the sim-grid origin, and τ
+    # measures the SIM horizon, so anchor τ there (bit-identical on the history path, where
+    # initial_time_index == H). Fall back to the raw lookback for the unit-test bundles that
+    # carry no simulated grid.
+    H = int(bundle.get('initial_time_index', runtime.get('history_lookback_business_days', 0)))
     last_idx = bundle.get('last_settlement_index')
     if last_idx is None:
         return _degenerate("last_settlement_index missing from bundle")
@@ -428,26 +462,37 @@ def resolve_utility_scale(bundle, runtime):
     total_volume = float(bundle.get('total_leg_volume', 0.0))
     spot_history = bundle.get('spot_price_history') or {}
     rv_by_commodity = bundle.get('spot_realized_vol') or {}
-    if not spot_history:
-        return _degenerate("bundle['spot_price_history'] is empty")
+    # Spot_Price_History is OPTIONAL: absent it, source (spot, σ) from the CALIBRATED market data
+    # (`bundle['calibrated_utility_inputs']`, assembled in build_hedge_bundle). Fail loud only
+    # when NEITHER a history window NOR a calibrated underlying vol is available.
+    calibrated = bundle.get('calibrated_utility_inputs')
+    if not spot_history and calibrated is None:
+        return _degenerate(
+            "bundle['spot_price_history'] is empty and no calibrated underlying vol is available "
+            "(no referenced CommodityPrice process reports calibrated_annual_vol)")
     if not total_volume:
         return _degenerate("bundle['total_leg_volume'] is zero")
-    commodity = next(iter(spot_history))
-    full = _full_spot_timeline(bundle, commodity)
-    if full is None or H >= int(full.shape[0]):
-        return _degenerate(
-            f"spot timeline for {commodity!r} has length "
-            f"{0 if full is None else int(full.shape[0])} ≤ history_lookback H={H}"
-        )
-    # Take batch-median at index H (history/sim boundary) rather than slot [H, 0]. The
-    # rolling-vol window at H spans broadcast history rows, so all batch entries are equal
-    # in well-behaved cases — but `full[H]` is the FIRST sim step, and any process emitting
-    # a stochastic initial draw (some HMM variants, jump-diffusion with state-sampling)
-    # would silently make c path-dependent off slot 0. Median is defensive: deterministic
-    # when batch is uniform, robust when it's not. Negligible cost (one (B,) reduce).
-    initial_spot = float(full[H].median().item())
-    rv = rv_by_commodity.get(commodity)
-    sigma = float(rv[H].median().item()) if rv is not None and H < int(rv.shape[0]) else 0.0
+    if spot_history:
+        # History path (bit-anchored): spot + realized σ read at the history/sim boundary H.
+        commodity = next(iter(spot_history))
+        full = _full_spot_timeline(bundle, commodity)
+        if full is None or H >= int(full.shape[0]):
+            return _degenerate(
+                f"spot timeline for {commodity!r} has length "
+                f"{0 if full is None else int(full.shape[0])} ≤ history_lookback H={H}"
+            )
+        # Take batch-median at index H (history/sim boundary) rather than slot [H, 0]. The
+        # rolling-vol window at H spans broadcast history rows, so all batch entries are equal
+        # in well-behaved cases — but `full[H]` is the FIRST sim step, and any process emitting
+        # a stochastic initial draw (some HMM variants, jump-diffusion with state-sampling)
+        # would silently make c path-dependent off slot 0. Median is defensive: deterministic
+        # when batch is uniform, robust when it's not. Negligible cost (one (B,) reduce).
+        initial_spot = float(full[H].median().item())
+        rv = rv_by_commodity.get(commodity)
+        sigma = float(rv[H].median().item()) if rv is not None and H < int(rv.shape[0]) else 0.0
+    else:
+        # Calibrated fallback: sim-day-0 spot + the underlying process's stationary annual vol.
+        commodity, initial_spot, sigma = calibrated
     if sigma <= 0.0:
         return _degenerate(
             f"realized vol for {commodity!r} is non-positive (σ={sigma}) — "
@@ -1032,6 +1077,11 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
     logging.info('liability scalars: total_leg_volume=%s last_settlement_index=%s',
                  bundle.get('total_leg_volume'), bundle.get('last_settlement_index'))
     bundle['spot_realized_vol'] = compute_spot_realized_vol(bundle)
+    # Spot_Price_History absent → assemble the calibrated utility-scale fallback (spot from the
+    # CommodityPrice factor, σ from the underlying process). Only when history is absent, so the
+    # history-present path (bit anchors) gains no new bundle key.
+    if not bundle.get('spot_price_history'):
+        bundle['calibrated_utility_inputs'] = _calibrated_utility_inputs(bundle, runtime or {}, stoch_factors)
     bundle['utility_scale'] = resolve_utility_scale(bundle, runtime or {})
     logging.info('utility_scale (symlog c) resolved to {0:.2f}'.format(bundle['utility_scale']))
     bundle['privileged_factors'] = assemble_privileged_factors(privileged_factor_blocks or {}, stoch_factors)
