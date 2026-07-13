@@ -2153,9 +2153,13 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
     def _find_spot_key(self):
         """Return the unique underlying (commodity-spot) factor key. Its name comes from the
         runtime-owned underlying set (`self._underlying_names`); map back to the live key
-        object via stoch_factors. Raises unless exactly one — v1 inner-MC is single-spot."""
-        spot_keys = [k for k in self.stoch_factors
-                     if utils.check_tuple_name(k) in self._underlying_names]
+        object via stoch_factors. The regime chain lives on the belief-owning (HMM) spot —
+        prefer that when derived spots (BasisComposedSpotModel) add further CommodityPrice
+        factors. Raises unless exactly one — v1 inner-MC is single-regime-chain."""
+        spots = [k for k in self.stoch_factors
+                 if utils.check_tuple_name(k) in self._underlying_names]
+        beliefs = [k for k in spots if hasattr(self.stoch_factors[k], '_forward_belief')]
+        spot_keys = beliefs or spots
         if len(spot_keys) != 1:
             raise ValueError(
                 f'Inner MC expects exactly one underlying spot factor; found {len(spot_keys)}: {spot_keys}'
