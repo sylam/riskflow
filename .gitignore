@@ -8,3 +8,6 @@
 /interface.py
 /LegacyFVA.py
 /conf.py
+__pycache__/
+*.pyc
+tests/_stepper_out*/
