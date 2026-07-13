@@ -61,6 +61,11 @@ import sys
 import numpy as np
 import pandas as pd
 
+# Must precede the first torch/riskflow import (pulled in via production_solver below):
+# PYTORCH_CUDA_ALLOC_CONF is parsed once at first allocator use. expandable_segments frees
+# ~20GB of reserved allocator slack, bit-identical results.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 from production_solver import apply_config, run
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message)s')
@@ -260,6 +265,10 @@ def observed_scenario_npz(arch, base_date, path):
     S = P + b internally. Keys are the full factor names the seam matches on."""
     base = pd.Timestamp(base_date)
     dates = pd.DatetimeIndex([base + pd.Timedelta(days=i) for i in range(220)])
+    if dates.max() > arch.index[-1]:
+        raise ValueError(
+            f'Observed window {base.date()}+220d ends {dates.max().date()} past archive end '
+            f'{arch.index[-1].date()}: the realized roll would run on fabricated flat prices')
     rows = arch.reindex(arch.index.union(dates)).ffill().loc[dates]
     np.savez(path, **{CME_COL: rows[CME_COL].to_numpy(),
                       'CommodityBasis.LME_CME': rows[BASIS_COL].to_numpy()})
@@ -270,6 +279,10 @@ def pf_bound(arch, trade_date, mats, pay):
     forward strip ($/oz). A hedge can only lose (vs no-hedge) by the sum over days of the worst
     adverse forward move it could be caught in; greedy P&L must stay ≤ nohedge + this bound."""
     bdays = pd.bdate_range(trade_date, pay)
+    if bdays.max() > arch.index[-1]:
+        raise ValueError(
+            f'Bound window {pd.Timestamp(trade_date).date()}..{pd.Timestamp(pay).date()} ends past '
+            f'archive end {arch.index[-1].date()}: the causal bound would use fabricated flat prices')
     sub = arch.reindex(arch.index.union(bdays)).ffill().loc[bdays]
     sofr = sorted((float(c.split(',')[1]), c) for c in arch.columns if c.startswith(SOFR_PREFIX))
     F_legs = []
@@ -286,6 +299,19 @@ def pf_bound(arch, trade_date, mats, pay):
     dF = np.diff(np.array(F_legs), axis=1)
     dg = np.nanmax(np.where(np.isnan(dF), -np.inf, np.maximum(0.0, -dF)), axis=0)
     return float(np.where(np.isfinite(dg), dg, 0.0).sum())
+
+
+def _atomic_write_csv(path, rows):
+    """Atomic CSV write: temp file in the same dir + os.replace (POSIX-atomic) so a SIGTERM/OOM
+    mid-flush can't truncate trades.csv. Fieldnames = the ordered union across rows (a FAILED
+    row carries an extra 'error' column the success rows lack)."""
+    fieldnames = list({k: None for r in rows for k in r})
+    tmp = path + '.tmp'
+    with open(tmp, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+    os.replace(tmp, path)
 
 
 def calibrate(marketdata, cal_config, cal_end, out_md):
@@ -380,33 +406,39 @@ def main():
         trade_date = (pd.Timestamp(args.start + '-01') + pd.offsets.MonthBegin(m) + pd.offsets.BDay(0)).normalize()
         tag = trade_date.strftime('%Y%m')
 
-        if m % args.recal_months == 0:
-            calibrated_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}.json'))
-            cal_end = trade_date.strftime('%Y-%m-%d')
-            calibrate(md_cal, cal_cfg, cal_end, calibrated_md)
-            g = guard_e_df_b(arch, cal_end)
-            logging.info('GUARD %s: dP~b slope=%+.4f t=%+.2f (martingale) | dS~b slope=%+.4f t=%+.2f (catch-up)',
-                         cal_end, g['dP~b'][0], g['dP~b'][1], g['dS~b'][0], g['dS~b'][1])
-
+        # One month's failure (OOM / archive gap / corrupt-checkpoint UnpicklingError / a
+        # calibrate() that raises) must degrade to a single FAILED row, not discard every
+        # remaining month. The broad guard logs the FULL traceback (logging.exception) so the
+        # cause survives; the inner ValueError guard keeps the stale-md fresh-calibration retry.
         try:
-            rec = one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag)
-        except ValueError as e:
-            # Stale quarterly calibration: a VAR carry front slot can expire between cal-date and
-            # trade-date (tau -> 0), tripping the float32 X_0 round-trip. Still no lookahead:
-            # recalibrate AT the trade date and retry.
-            logging.warning('TRADE %s: stale-md failure (%s); FALLBACK fresh calibration', tag, e)
-            fresh_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}_fresh.json'))
-            calibrate(md_cal, cal_cfg, trade_date.strftime('%Y-%m-%d'), fresh_md)
-            rec = one_trade(template, arch, trade_date, fresh_md, args, run_dir, tag)
-            rec['fresh_md'] = True
+            if m % args.recal_months == 0:
+                calibrated_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}.json'))
+                cal_end = trade_date.strftime('%Y-%m-%d')
+                calibrate(md_cal, cal_cfg, cal_end, calibrated_md)
+                g = guard_e_df_b(arch, cal_end)
+                logging.info('GUARD %s: dP~b slope=%+.4f t=%+.2f (martingale) | dS~b slope=%+.4f t=%+.2f (catch-up)',
+                             cal_end, g['dP~b'][0], g['dP~b'][1], g['dS~b'][0], g['dS~b'][1])
+            try:
+                rec = one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag)
+            except ValueError as e:
+                # Stale quarterly calibration: a VAR carry front slot can expire between cal-date and
+                # trade-date (tau -> 0), tripping the float32 X_0 round-trip. Still no lookahead:
+                # recalibrate AT the trade date and retry.
+                logging.warning('TRADE %s: stale-md failure (%s); FALLBACK fresh calibration', tag, e)
+                fresh_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}_fresh.json'))
+                calibrate(md_cal, cal_cfg, trade_date.strftime('%Y-%m-%d'), fresh_md)
+                rec = one_trade(template, arch, trade_date, fresh_md, args, run_dir, tag)
+                rec['fresh_md'] = True
+            logging.info('TRADE %s: greedy=%s nohedge=%s $/oz  bound=%s PASS=%s  churn=%s',
+                         tag, rec['greedy_usd_oz'], rec['nohedge_usd_oz'], rec['pf_bound'], rec['bound_pass'], rec['churn'])
+        except Exception as e:
+            logging.exception('TRADE %s FAILED', tag)
+            rec = {'trade': tag, 'fair': None, 'strike': None, 'train_u': None, 'V_0': None,
+                   'greedy_usd_oz': None, 'nohedge_usd_oz': None, 'pf_bound': None,
+                   'bound_pass': None, 'churn': None, 'error': str(e)}
 
         rows.append(rec)
-        logging.info('TRADE %s: greedy=%s nohedge=%s $/oz  bound=%s PASS=%s  churn=%s',
-                     tag, rec['greedy_usd_oz'], rec['nohedge_usd_oz'], rec['pf_bound'], rec['bound_pass'], rec['churn'])
-        with open(os.path.join(run_dir, 'trades.csv'), 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            w.writeheader()
-            w.writerows(rows)
+        _atomic_write_csv(os.path.join(run_dir, 'trades.csv'), rows)
 
     df = pd.DataFrame(rows)
     g = df['greedy_usd_oz']

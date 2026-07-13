@@ -14,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
@@ -115,6 +117,9 @@ class HedgeActionSpace:
         grid = torch.stack([m.reshape(-1) for m in mesh], dim=-1)
         if self.total_abs_limit > 0.0:
             grid = grid[grid.abs().sum(-1) <= self.total_abs_limit + 1e-9]
+        if grid.shape[0] == 0:
+            raise ValueError(
+                "action grid empty — Position_Limits infeasible under Total_Position_Abs_Limit")
         return grid
 
     def kappa(self, tradables_sim, t_index):
@@ -385,6 +390,9 @@ class DiffSolverV2:
         # Telescoping wealth THROUGH the settlement drop cancels the liability's settlement risk
         # (no-hedge W_T≡0). Decisions run 0..T_dec-1; the terminal continuation marks at T_dec.
         self.T_dec = int(bundle["last_live_mtm_index"])
+        if self.t_min >= self.T_dec:
+            raise ValueError(
+                f"Solver.T_Min={self.t_min} must be < decision horizon T_dec={self.T_dec}")
 
     # ---- utility anchor ------------------------------------------------------
     def _u(self, W):
@@ -1012,12 +1020,13 @@ class DiffSolverV2:
                     "Y_mean=%+.4g q*_mean=%s", r["t"], r["val_loss"], r["Y_absmean"],
                     r["A_absmean"], r["Y_mean"],
                     ["%.3f" % v for v in r["q_star_mean"]])
-            worst = max((r["Y_absmean"] for r in rows), default=0.0)
+            worst = max((r["Y_absmean"] for r in rows if math.isfinite(r["Y_absmean"])),
+                        default=0.0)
             root = rows[-1] if rows else {"t": self.t_min, "Y_mean": 0.0, "q_star_mean":
                                           [0.0] * self.n_hedge}
         V_0 = float(root["Y_mean"])
         n_star_0 = root["q_star_mean"]
-        bounded = worst < 1.0e4
+        bounded = math.isfinite(V_0) and worst < 1.0e4
         if loaded is None:
             logging.info(
                 "DiffSolverV2 sweep complete: t=%d→%d | max|Y_boot|=%.4g (%s) | "
@@ -1046,7 +1055,12 @@ class DiffSolverV2:
                 "V_0": V_0, "n_star_0": list(n_star_0), "max_abs_Y_boot": worst,
             }
             if save_path:
-                torch.save(artifact, save_path)
+                if not math.isfinite(V_0):
+                    raise ValueError(
+                        f"refusing to save non-finite value fn to {save_path}: V_0={V_0}")
+                tmp = save_path + ".tmp"
+                torch.save(artifact, tmp)
+                os.replace(tmp, save_path)                       # atomic on POSIX
                 logging.info("DiffSolverV2 SAVED value fn to %s (V_0=%+.6g)", save_path, V_0)
 
         # Downside verdict: greedy policy vs textbook delta hedge vs no hedge. HEADLINE is the

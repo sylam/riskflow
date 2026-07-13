@@ -376,6 +376,8 @@ def construct_hedge_runtime(
         for instrument_name in tradables.keys()
         if instrument_name not in cash_account_names
     )
+    if not hedge_names:
+        raise ValueError("no hedge instruments: Tradable_Instruments has only cash accounts")
     liability_expiry = None
     for liability in liabilities.values():
         expiry_date = liability.get("expiry_date")

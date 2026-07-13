@@ -49,6 +49,11 @@ import json
 import logging
 import os
 
+# expandable_segments frees ~20GB of allocator slack (measured 24.7GB->4.6GB reserved,
+# bit-identical V_0). Parsed once at first allocator use, so it MUST be set before torch is
+# imported (riskflow pulls torch below) — a later setdefault would be too late to take effect.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 import riskflow as rf
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message)s')

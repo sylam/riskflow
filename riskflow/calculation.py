@@ -1953,6 +1953,13 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             by_name = {utils.check_tuple_name(k): k for k in self.stoch_factors}
             observed = {by_name[n]: shared_mem.one.new_tensor(npz[n]).unsqueeze(-1)
                         for n in npz.files if n in by_name}
+            unmatched = [n for n in npz.files if n not in by_name]
+            if unmatched:
+                raise ValueError(
+                    f'Observed_Scenario keys matched no simulated factor: {unmatched}; '
+                    f'available={sorted(by_name)}')
+            logging.info('Observed_Scenario substituted %d factor(s): %s', len(observed),
+                         [utils.check_tuple_name(k) for k in observed])
 
         for run in range(params['Simulation_Batches']):
             shared_mem.reset(
