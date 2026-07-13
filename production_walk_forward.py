@@ -16,12 +16,14 @@ Aggregate across all trades and print the table (mean/min/max, positives, bound-
 
 CORRECTED (composed-spot) architecture, all validated:
   * CommodityPrice.PLATINUM_CME = P is the martingale primary (MarkovHMMSpotModel).
-  * CommodityBasis.LME_CME (BasisLinkedSpotModel, Linked_Commodity=PLATINUM_CME) carries the
-    published basis b = P - S — the LBMA catch-up.
-  * CommodityPrice.PLATINUM_LME = P - b is the observable LBMA fixing (BasisComposedSpotModel;
+  * CommodityBasis.LME_CME (BasisLinkedSpotModel, Observed_Commodity=PLATINUM_CME) carries the
+    published basis b = S - P (LME - CME) — the LBMA catch-up.
+  * CommodityPrice.PLATINUM_LME = P + b is the observable LBMA fixing (BasisComposedSpotModel;
     routed via the source MarketDataRF modelfilters, never calibrated — it carries no params).
-  * The swap references pure PLATINUM_LME; the CME futures reference PLATINUM_LME +
-    Implied_Basis=LME_CME (= P, martingale) so E[dF|b] ≈ 0 (unexecutable reversion not harvested).
+  * The swap references pure PLATINUM_LME; the CME futures reference the primary through the
+    identity basis CME_FLAT (Observed_Commodity=PLATINUM_CME, zero dynamics) so synthetic = P + 0
+    = P (martingale) and E[dF|b] ≈ 0 (unexecutable reversion not harvested). The dependency graph
+    is acyclic: CME -> {CME_FLAT, LME_CME} -> LME (no cycle, so no cycle-breaking needed).
 
 The raw futures file (--archive, default data/pl_exp.csv) is decomposed internally into the
 corrected series by build_corrected_archive() (CME-implied continuous spot P, published basis,
@@ -71,12 +73,12 @@ CARRY_TENORS = ('PLATINUM_TAU1', 'PLATINUM_TAU2', 'PLATINUM_TAU3')
 # --- corrected archive column names ---
 CME_COL = 'CommodityPrice.PLATINUM_CME'          # martingale primary P
 LME_COL = 'CommodityPrice.PLATINUM_LME'          # LBMA fixing S = P - b
-BASIS_COL = 'CommodityBasis.LME_CME,PLATINUM_CME'  # published basis b = P - S (CME - LBMA)
+BASIS_COL = 'CommodityBasis.LME_CME,PLATINUM_CME'  # published basis b = S - P (LME - CME)
 CARRY_COL = 'ForwardRate.PLATINUM_CARRY'          # + ',<tenor>'
 SOFR_PREFIX = 'InterestRate.USD-SOFR'
 
 # validated objective (matches artifacts/platinum_hedge_shipping.json)
-OBJECTIVE = {'Object': 'AsymmetricUtility_Huber', 'Huber_Aversion': 2.5, 'Huber_Delta': 1.0,
+OBJECTIVE = {'Object': 'AsymmetricUtility_Huber', 'Huber_Aversion': 6.0, 'Huber_Delta': 1.0,
              'Floor_Penalty': 10.0, 'Surplus_Reward': 1.0, 'Power': 1.0,
              'Expiry_Penalty': 1.0, 'Expiry_Threshold_Days': 4.0,
              'Post_Deal_Trade_Penalty': 1.0, 'Position_Bounds_Penalty': 0.25,
@@ -90,9 +92,9 @@ def _ts(d):
 def build_corrected_archive(raw):
     """Decompose the raw futures file (PL1/PL2/PL3 + taus + repo + LBMA spot + SOFR) into the
     corrected series. Returns a DataFrame with the martingale primary P (CME-implied continuous
-    spot), the published basis b = P - S, clean calendar-spread carry knots, tenors, the SOFR
-    curve, and the LBMA fixing S. (The calibration CSV drops S — it is a composed factor with no
-    archive series; it routes to BasisComposedSpotModel and is never calibrated.)"""
+    spot), the published basis b = S - P (LME - CME), clean calendar-spread carry knots, tenors,
+    the SOFR curve, and the LBMA fixing S. (The calibration CSV drops S — it is a composed factor
+    with no archive series; it routes to BasisComposedSpotModel and is never calibrated.)"""
     F1, F2, F3 = raw['PL1'].astype(float), raw['PL2'].astype(float), raw['PL3'].astype(float)
     t1, t2, t3 = raw['PL1_tau'].astype(float), raw['PL2_tau'].astype(float), raw['PL3_tau'].astype(float)
     r1, r2, r3 = raw['PL1_rf'].astype(float), raw['PL2_rf'].astype(float), raw['PL3_rf'].astype(float)
@@ -107,7 +109,7 @@ def build_corrected_archive(raw):
     P = F1 * np.exp(-(r1 + c1) * t1)                       # CME-implied continuous spot (primary)
     out = pd.DataFrame(index=raw.index)
     out[CME_COL] = P
-    out[BASIS_COL] = P - S                                 # published sign (CME - LBMA)
+    out[BASIS_COL] = S - P                                 # published sign (LBMA - CME) = LME - CME
     for i, (c, t) in enumerate(zip((c1, c2, c3), (t1, t2, t3)), 1):
         out[f'{CARRY_COL},PLATINUM_TAU{i}'] = c
         out[f'Tenor.PLATINUM_TAU{i}'] = t
@@ -160,8 +162,8 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume)
 
     Deal: a 3-month average-price swap (Receiver) on the pure LBMA fixing, averaged over the full
     3rd calendar month after the trade date, paid +5 days, struck at fair - margin. Hedges: the
-    CME futures strip at the 3 carry tenors, each referencing PLATINUM_LME + Implied_Basis=LME_CME
-    (= P, the martingale primary).
+    CME futures strip at the 3 carry tenors, each referencing the primary through the identity
+    basis Implied_Basis=CME_FLAT (synthetic = P + 0 = P, the martingale primary).
     """
     row = arch.loc[:trade_date].iloc[-1]
     cfg = copy.deepcopy(template)
@@ -176,7 +178,7 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume)
 
     s0 = float(row[LME_COL])
     p0 = float(row[CME_COL])
-    b0 = float(row[BASIS_COL])            # published P - S
+    b0 = float(row[BASIS_COL])            # published S - P (LME - CME)
     taus = [float(row[f'Tenor.{t}']) for t in CARRY_TENORS]
     carry = [float(row[f'{CARRY_COL},{t}']) for t in CARRY_TENORS]
     mats = [trade_date + pd.Timedelta(days=round(t * 360)) for t in taus]
@@ -195,12 +197,12 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume)
         'FX_Period_Start': _ts(avg_start), 'FX_Period_End': _ts(avg_end), 'Volume': volume,
         'Realized_Average': 0.0, 'FX_Realized_Average': 0.0, 'Fixed_Basis': -(k_fair - margin)})
 
-    # --- tradables: CME strip at the tenor ladder (LBMA + LME_CME basis = P) -------------------
+    # --- tradables: CME strip at the tenor ladder (primary via CME_FLAT identity basis = P) -----
     futs, positions, setts, margins, limits = {}, {}, {}, {}, {}
     for i, (mat, c, tau) in enumerate(zip(mats, carry, taus), 1):
         name = f'PL_M{i}'
         futs[name] = {'Maturity_Date': _ts(mat), 'Currency': 'USD', 'Carry': 'PLATINUM_CARRY',
-                      'Repo_Rate': 'USD-SOFR', 'Implied_Basis': 'LME_CME', 'Contract_Size': CONTRACT_SIZE}
+                      'Repo_Rate': 'USD-SOFR', 'Implied_Basis': 'CME_FLAT', 'Contract_Size': CONTRACT_SIZE}
         positions[name] = 0
         setts[name] = round(p0 * float(np.exp(c * tau)), 4)
         margins[name] = {'Method': 'per_contract', 'Amount': round(0.085 * setts[name] * CONTRACT_SIZE, 0)}
@@ -226,8 +228,8 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume)
                   'Spot': s0, 'Implied_Basis': 'LME_CME', 'Property_Aliases': ''},
         CME_COL: {'Currency': 'USD', 'Interest_Rate': 'USD-SOFR', 'Forward_Rate': 'PLATINUM_CARRY',
                   'Spot': p0, 'Property_Aliases': ''},
-        'CommodityBasis.LME_CME': {'Spot': b0, 'Observed_Commodity': 'PLATINUM_LME',
-                                   'Linked_Commodity': 'PLATINUM_CME'},
+        'CommodityBasis.LME_CME': {'Spot': b0, 'Observed_Commodity': 'PLATINUM_CME'},
+        'CommodityBasis.CME_FLAT': {'Spot': 0.0, 'Observed_Commodity': 'PLATINUM_CME'},
         'ReferencePrice.PLATINUM': {'Fixing_Curve': {'.Curve': {'meta': [], 'data': [[40000, 40000], [50000, 50000]]}},
                                     'ForwardPrice': None, 'Property_Aliases': ''},
         'ForwardRate.PLATINUM_CARRY': {'Currency': 'USD', 'Curve': {'.Curve': {'meta': [], 'data': [
@@ -239,7 +241,12 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume)
         'ForwardPriceSample.USD': {'Offset': 0, 'Holiday_Calendar': 'New York',
                                    'Sampling_Convention': 'ForwardPriceSampleDaily'},
     }
-    emd.setdefault('Price Models', {})['BasisComposedSpotModel.PLATINUM_LME'] = {}
+    emd_pm = emd.setdefault('Price Models', {})
+    emd_pm['BasisComposedSpotModel.PLATINUM_LME'] = {}
+    # CME_FLAT is the zero-dynamics identity basis (not calibrated — carries no archive series);
+    # inject its params so the futures' synthetic = P + 0 = P references the martingale primary.
+    emd_pm['BasisLinkedSpotModel.CME_FLAT'] = {'A': 0.0, 'Phi': 0.0, 'Nu': 5.0, 'Mu': 0.0,
+                                               'Sigma_By_State': [0.0, 0.0, 0.0]}
     emd['Valuation Configuration'] = {'FloatingEnergyDeal': {'ForwardCurve': 'Components'}}
 
     info = {'k_fair': k_fair, 'mats': mats, 'pay': pay}
@@ -249,7 +256,7 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume)
 def observed_scenario_npz(arch, base_date, path):
     """Dense daily realized (CME primary, published basis) from the base date, forward-filled,
     written to an npz the calc's Observed_Scenario reads. The framework composes the LBMA fixing
-    S = P - b internally. Keys are the full factor names the seam matches on."""
+    S = P + b internally. Keys are the full factor names the seam matches on."""
     base = pd.Timestamp(base_date)
     dates = pd.DatetimeIndex([base + pd.Timedelta(days=i) for i in range(220)])
     rows = arch.reindex(arch.index.union(dates)).ffill().loc[dates]

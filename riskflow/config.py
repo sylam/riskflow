@@ -516,18 +516,10 @@ class Config(object):
             factor_name = utils.check_tuple_name(factor)
 
             if factor.type in dependant_fields:
-                fields = self.params['Price Factors'][factor_name]
-                dep_fields = dependant_fields[factor.type]
-                # A CommodityBasis simulated against a sibling other than its pricing
-                # observable (composed-spot decomposition) must order after its SIM driver;
-                # the pricing observable is then itself composed FROM this basis, so keeping
-                # the Observed_Commodity edge would create a cycle. The observable is
-                # discovered by whatever deal references it directly.
-                if factor.type == 'CommodityBasis' and fields.get('Linked_Commodity'):
-                    dep_fields = [('Linked_Commodity', 'CommodityPrice')]
-                linked_factors = [
-                    utils.Factor(dep_type, utils.check_rate_name(fields[dep_field]))
-                    for dep_field, dep_type in dep_fields if fields.get(dep_field)]
+                linked_factors = [utils.Factor(dep_field[1], utils.check_rate_name(
+                    self.params['Price Factors'][factor_name][dep_field[0]])) for dep_field in
+                                  dependant_fields[factor.type] if
+                                  self.params['Price Factors'][factor_name].get(dep_field[0])]
                 for linked_factor in linked_factors:
                     # add it assuming no dependencies
                     rates_to_add.setdefault(linked_factor, [])

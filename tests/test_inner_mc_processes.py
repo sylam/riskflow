@@ -397,17 +397,17 @@ def test_basis_inner_shape_init_and_independence():
 
 @pytest.mark.parametrize('inner_sub', [None, 8])
 def test_composed_spot_shape_and_composition(inner_sub):
-    """BasisComposedSpotModel: published path == primary − basis bitwise in outer (T,B)
-    and inner (T,B,B2) modes; parents resolved via calc_references, with the basis's
-    Linked_Commodity overriding Observed_Commodity as the primary."""
+    """BasisComposedSpotModel: published path == primary + basis bitwise in outer (T,B)
+    and inner (T,B,B2) modes; the primary is the basis's Observed_Commodity (sim driver
+    and pricing anchor unified), resolved via calc_references."""
     B, T = 4, 10
     shared = _build_shared(num_factors=1, batch_size=B, seed=42, simulation_sub_batch=inner_sub)
     _do_reset(shared, 1, _time_grid(T))
     primary_key = utils.Factor('CommodityPrice', ('CME',))
     basis_key = utils.Factor('CommodityBasis', ('LME_CME',))
-    # basis: pricing observable = the composed LME spot; sim driver = CME (Linked_Commodity)
-    basis_factor = types.SimpleNamespace(
-        param={'Observed_Commodity': 'CommodityPrice.LME', 'Linked_Commodity': 'CME'})
+    # basis: sim driver and pricing anchor are both CME (Observed_Commodity); the composed
+    # LME spot published here is derived FROM the basis, never drives it (acyclic).
+    basis_factor = types.SimpleNamespace(param={'Observed_Commodity': 'CME'})
     p = BasisComposedSpotModel(
         factor=types.SimpleNamespace(param={'Implied_Basis': 'LME_CME'}), param={})
     p.factor_key = utils.Factor('CommodityPrice', ('LME',))
@@ -422,7 +422,7 @@ def test_composed_spot_shape_and_composition(inner_sub):
     shared.t_Scenario_Buffer[basis_key] = basis
     out = p.generate(shared)
     assert out.shape == shape
-    assert torch.equal(out, primary - basis), 'composed path != primary - basis'
+    assert torch.equal(out, primary + basis), 'composed path != primary + basis'
     assert p.reveal_state_at(0, shared.t_Scenario_Buffer) == []
     assert BasisComposedSpotModel.num_factors() == 0
 

@@ -23,7 +23,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "LME_CME",
+       "Implied_Basis": "CME_FLAT",
        "Contract_Size": 50
       },
       "PL_M2": {
@@ -33,7 +33,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "LME_CME",
+       "Implied_Basis": "CME_FLAT",
        "Contract_Size": 50
       },
       "PL_M3": {
@@ -43,7 +43,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "LME_CME",
+       "Implied_Basis": "CME_FLAT",
        "Contract_Size": 50
       }
      },
@@ -385,7 +385,7 @@
     },
     "Objective": {
      "Object": "AsymmetricUtility_Huber",
-     "Huber_Aversion": 2.5,
+     "Huber_Aversion": 6.0,
      "Huber_Delta": 1.0,
      "Floor_Penalty": 10.0,
      "Surplus_Reward": 1.0,
@@ -507,9 +507,12 @@
       "Property_Aliases": ""
      },
      "CommodityBasis.LME_CME": {
-      "Spot": -15.516078760020719,
-      "Observed_Commodity": "PLATINUM_LME",
-      "Linked_Commodity": "PLATINUM_CME"
+      "Spot": 15.516078760020719,
+      "Observed_Commodity": "PLATINUM_CME"
+     },
+     "CommodityBasis.CME_FLAT": {
+      "Spot": 0.0,
+      "Observed_Commodity": "PLATINUM_CME"
      },
      "ReferencePrice.PLATINUM": {
       "Fixing_Curve": {
