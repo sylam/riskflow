@@ -36,7 +36,11 @@ Usage:
         --calibration-config artifacts/calibration_config.json \
         --marketdata data/MarketDataRF_platinum.json \
         --deal-template tests/fixtures/policy_test_simulate_only.json \
-        --start 2021-01 --months 24 --recal-months 3 --margin 8 --batch 8192 --seed 7
+        --start 2021-01 --months 24 --recal-months 3 --margin 8 --batch 8192 --seeds 7 42 314
+
+Pass several --seeds for a seed-ensemble deployment (per trade: train one checkpoint per seed,
+then ONE roll with DiffV2_Load_Value_Fn = [all checkpoints] = ensemble argmax). --run-dir <dir>
+resumes a killed lane in place (completed trades + already-trained seed checkpoints are skipped).
 
 CRITICAL correctness notes baked in:
   * Spot_Price_History is STRICTLY BEFORE the trade date — including the trade-date spot
@@ -52,6 +56,7 @@ import argparse
 import copy
 import csv
 import datetime
+import glob
 import json
 import logging
 import os
@@ -314,6 +319,15 @@ def _atomic_write_csv(path, rows):
     os.replace(tmp, path)
 
 
+def _atomic_write_json(path, obj):
+    """Atomic JSON write (tmp + os.replace) so a killed lane leaves either the old file or the
+    complete new one — never a truncated per-trade row sidecar the resume path would misread."""
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(obj, f, default=str)
+    os.replace(tmp, path)
+
+
 def calibrate(marketdata, cal_config, cal_end, out_md):
     """Calibrate the corrected models on the archive up to cal_end (no lookahead)."""
     logging.info('=== CALIBRATE through %s ===', cal_end)
@@ -323,22 +337,48 @@ def calibrate(marketdata, cal_config, cal_end, out_md):
 
 
 def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
-    """Train the day-1 policy and roll it on the realized path; return the recorded row."""
-    cfg, info = build_deal_config(template, arch, trade_date, calibrated_md, args.margin, args.volume)
-    ckpt = os.path.abspath(os.path.join(run_dir, f'value_fn_{tag}.pt'))
+    """Train the day-1 policy for EACH seed and roll the frozen seed-ensemble on the realized
+    path; return the recorded row. One checkpoint per seed (value_fn_<tag>_s<seed>.pt), then ONE
+    stepper roll with DiffV2_Load_Value_Fn = [all checkpoints] — the framework evaluates each
+    member in its own standardization frame and averages continuations before the argmax
+    (cross-fit winner's-curse reduction; logs 'ENSEMBLE argmax over N value fns'). With a single
+    seed the roll loads a 1-element list, bit-identical to the pre-ensemble behaviour.
 
-    train = apply_config(copy.deepcopy(cfg), batch=args.batch, seed=args.seed, save=ckpt)
-    if args.fit_iters is not None:
-        train['Calc']['Calculation']['Hedging_Problem']['Solver']['DiffV2_Fit_Iters'] = args.fit_iters
-    logging.info('=== TRAIN %s (fair=%.2f, strike=%.2f) ===', tag, info['k_fair'], info['k_fair'] - args.margin)
-    tdiag = run(train, f'train_{tag}')
+    Seed-level idempotency: a seed whose checkpoint already exists in the run dir is skipped, so a
+    killed lane re-pointed at the same run dir resumes mid-trade without retraining. Row diagnostics
+    train_u / V_0 report the primary member (seeds[0]); train_u_seeds carries the per-seed spread."""
+    cfg, info = build_deal_config(template, arch, trade_date, calibrated_md, args.margin, args.volume)
+
+    ckpts, train_us, v0s = [], [], []
+    for seed in args.seeds:
+        ckpt = os.path.abspath(os.path.join(run_dir, f'value_fn_{tag}_s{seed}.pt'))
+        ckpts.append(ckpt)
+        if os.path.exists(ckpt):
+            logging.info('=== TRAIN %s seed=%d SKIP (checkpoint exists) ===', tag, seed)
+            train_us.append(None)
+            v0s.append(None)
+            continue
+        train = apply_config(copy.deepcopy(cfg), batch=args.batch, seed=seed, save=ckpt)
+        if args.fit_iters is not None:
+            train['Calc']['Calculation']['Hedging_Problem']['Solver']['DiffV2_Fit_Iters'] = args.fit_iters
+        logging.info('=== TRAIN %s seed=%d (fair=%.2f, strike=%.2f) ===',
+                     tag, seed, info['k_fair'], info['k_fair'] - args.margin)
+        tdiag = run(train, f'train_{tag}_s{seed}')
+        tv = (tdiag.get('verdict') or {}).get('greedy') or {}
+        train_us.append(None if tv.get('u_mean') is None else round(tv['u_mean'], 4))
+        v0s.append(tdiag.get('V_0'))
 
     obs_npz = os.path.abspath(os.path.join(run_dir, f'obs_{tag}.npz'))
     observed_scenario_npz(arch, trade_date, obs_npz)
-    roll = apply_config(copy.deepcopy(cfg), batch=1, seed=args.seed, load=[ckpt],
+    roll = apply_config(copy.deepcopy(cfg), batch=1, seed=args.seeds[0], load=ckpts,
                         stepper_rollout=True, randomize_initial_state=False)
+    # The ROLL's inner draws are independent of training's (validated 64): at Batch_Size=1 a
+    # large inner sub-batch is nearly free and shrinks the causal one-step forecast noise
+    # (the argmax input is E_inner[C_{t+1}]) that dominates single-realized-path dispersion.
+    roll['Calc']['Calculation']['Inner_Sub_Batch'] = args.roll_inner
     roll['Calc']['Calculation']['Observed_Scenario'] = obs_npz
-    logging.info('=== ROLL %s (stepper, realized path) ===', tag)
+    logging.info('=== ROLL %s (stepper, realized path, %d-seed ensemble, inner=%d) ===',
+                 tag, len(ckpts), args.roll_inner)
     rdiag = run(roll, f'roll_{tag}')
     json.dump(rdiag, open(os.path.join(run_dir, f'diag_{tag}.json'), 'w'), indent=1, default=str)
 
@@ -346,12 +386,13 @@ def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
     gr = (sv.get('greedy') or {}).get('wT_mean')
     nh = (sv.get('nohedge') or {}).get('wT_mean')
     bound = pf_bound(arch, trade_date, info['mats'], info['pay'])
-    tv = (tdiag.get('verdict') or {}).get('greedy') or {}
     q = np.array(sv.get('greedy_q_traj') or [[0.0]])
     return {
         'trade': tag, 'fair': round(info['k_fair'], 2), 'strike': round(info['k_fair'] - args.margin, 2),
-        'train_u': None if tv.get('u_mean') is None else round(tv['u_mean'], 4),
-        'V_0': tdiag.get('V_0'),
+        'n_seeds': len(args.seeds),
+        'train_u': train_us[0],
+        'train_u_seeds': train_us,
+        'V_0': v0s[0],
         'greedy_usd_oz': None if gr is None else round(gr / args.volume, 2),
         'nohedge_usd_oz': None if nh is None else round(nh / args.volume, 2),
         'pf_bound': round(bound, 2),
@@ -374,17 +415,33 @@ def main():
     ap.add_argument('--margin', type=float, default=8.0, help='$/oz dealer margin (strike = fair - margin).')
     ap.add_argument('--volume', type=float, default=2500.0, help='Swap volume (oz).')
     ap.add_argument('--batch', type=int, default=8192, help='Training outer paths (scale up on a big GPU).')
-    ap.add_argument('--seed', type=int, default=7)
+    ap.add_argument('--seeds', type=int, nargs='+', default=[7],
+                    help='Training seed(s) / ensemble members. >1 trains one checkpoint per seed '
+                         'and rolls the seed-ensemble argmax (each member in its own frame, '
+                         'continuations averaged) on the realized path.')
+    ap.add_argument('--seed', type=int, default=None,
+                    help='Backward-compat alias for a single --seeds value (overrides --seeds if set).')
+    ap.add_argument('--run-dir', default=None,
+                    help='Reuse this run directory instead of a fresh timestamped one. Point a '
+                         'restarted lane at its prior dir to resume: completed trades (per-trade '
+                         'row sidecars) and already-trained seed checkpoints are skipped.')
+    ap.add_argument('--roll-inner', type=int, default=256,
+                    help='Inner_Sub_Batch for the realized-path ROLL only (training stays at the '
+                         'validated 64). The roll is Batch_Size=1, so a large inner sub-batch is '
+                         'nearly free and de-noises the causal one-step argmax forecast. '
+                         'Default 256; pass 64 to recover the pre-lever roll behavior.')
     ap.add_argument('--fit-iters', type=int, default=None, help='Override DiffV2_Fit_Iters (smoke tests).')
     args = ap.parse_args()
+    if args.seed is not None:      # fold the legacy single-seed alias into the seed list
+        args.seeds = [args.seed]
 
     raw = pd.read_csv(args.archive, index_col=0, parse_dates=True)
     arch = build_corrected_archive(raw)
     template = json.load(open(args.deal_template))
     stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = os.path.join('artifacts', 'walk_forward', f'{stamp}_{args.start}_{args.months}m')
+    run_dir = args.run_dir or os.path.join('artifacts', 'walk_forward', f'{stamp}_{args.start}_{args.months}m')
     os.makedirs(run_dir, exist_ok=True)
-    logging.info('run dir: %s', run_dir)
+    logging.info('run dir: %s  seeds: %s', run_dir, args.seeds)
 
     # corrected calibration inputs (written once): archive CSV (drop the composed LBMA fixing),
     # source MarketDataRF with the PLATINUM_LME -> BasisComposedSpotModel routing, calibration
@@ -401,6 +458,15 @@ def main():
     cal_cfg = os.path.abspath(os.path.join(run_dir, 'calibration_config.json'))
     json.dump(cal_src, open(cal_cfg, 'w'), indent=1)
 
+    # Resume: a killed lane re-pointed at its run dir (--run-dir) skips completed trades. Only
+    # SUCCESS rows are sidecar-persisted (row_<tag>.json, atomic), so a FAILED trade retries.
+    done = {}
+    for f in sorted(glob.glob(os.path.join(run_dir, 'row_*.json'))):
+        r = json.load(open(f))
+        done[r['trade']] = r
+    if done:
+        logging.info('RESUME: %d completed trade(s) found in run dir; will skip them', len(done))
+
     rows, calibrated_md = [], None
     for m in range(args.months):
         trade_date = (pd.Timestamp(args.start + '-01') + pd.offsets.MonthBegin(m) + pd.offsets.BDay(0)).normalize()
@@ -412,28 +478,37 @@ def main():
         # cause survives; the inner ValueError guard keeps the stale-md fresh-calibration retry.
         try:
             if m % args.recal_months == 0:
+                # Recalibrate every boundary even for a resumed/skipped trade: calibrated_md must
+                # be set for the later non-skipped months, and re-running (a subprocess) is cheap
+                # and can't trust a possibly-truncated md from a killed lane.
                 calibrated_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}.json'))
                 cal_end = trade_date.strftime('%Y-%m-%d')
                 calibrate(md_cal, cal_cfg, cal_end, calibrated_md)
                 g = guard_e_df_b(arch, cal_end)
                 logging.info('GUARD %s: dP~b slope=%+.4f t=%+.2f (martingale) | dS~b slope=%+.4f t=%+.2f (catch-up)',
                              cal_end, g['dP~b'][0], g['dP~b'][1], g['dS~b'][0], g['dS~b'][1])
-            try:
-                rec = one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag)
-            except ValueError as e:
-                # Stale quarterly calibration: a VAR carry front slot can expire between cal-date and
-                # trade-date (tau -> 0), tripping the float32 X_0 round-trip. Still no lookahead:
-                # recalibrate AT the trade date and retry.
-                logging.warning('TRADE %s: stale-md failure (%s); FALLBACK fresh calibration', tag, e)
-                fresh_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}_fresh.json'))
-                calibrate(md_cal, cal_cfg, trade_date.strftime('%Y-%m-%d'), fresh_md)
-                rec = one_trade(template, arch, trade_date, fresh_md, args, run_dir, tag)
-                rec['fresh_md'] = True
-            logging.info('TRADE %s: greedy=%s nohedge=%s $/oz  bound=%s PASS=%s  churn=%s',
-                         tag, rec['greedy_usd_oz'], rec['nohedge_usd_oz'], rec['pf_bound'], rec['bound_pass'], rec['churn'])
+            if tag in done:
+                logging.info('TRADE %s: SKIP (already completed, resuming)', tag)
+                rec = done[tag]
+            else:
+                try:
+                    rec = one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag)
+                except ValueError as e:
+                    # Stale quarterly calibration: a VAR carry front slot can expire between cal-date and
+                    # trade-date (tau -> 0), tripping the float32 X_0 round-trip. Still no lookahead:
+                    # recalibrate AT the trade date and retry.
+                    logging.warning('TRADE %s: stale-md failure (%s); FALLBACK fresh calibration', tag, e)
+                    fresh_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}_fresh.json'))
+                    calibrate(md_cal, cal_cfg, trade_date.strftime('%Y-%m-%d'), fresh_md)
+                    rec = one_trade(template, arch, trade_date, fresh_md, args, run_dir, tag)
+                    rec['fresh_md'] = True
+                logging.info('TRADE %s: greedy=%s nohedge=%s $/oz  bound=%s PASS=%s  churn=%s',
+                             tag, rec['greedy_usd_oz'], rec['nohedge_usd_oz'], rec['pf_bound'], rec['bound_pass'], rec['churn'])
+                _atomic_write_json(os.path.join(run_dir, f'row_{tag}.json'), rec)  # mark done for resume
         except Exception as e:
             logging.exception('TRADE %s FAILED', tag)
-            rec = {'trade': tag, 'fair': None, 'strike': None, 'train_u': None, 'V_0': None,
+            rec = {'trade': tag, 'fair': None, 'strike': None, 'n_seeds': len(args.seeds),
+                   'train_u': None, 'train_u_seeds': None, 'V_0': None,
                    'greedy_usd_oz': None, 'nohedge_usd_oz': None, 'pf_bound': None,
                    'bound_pass': None, 'churn': None, 'error': str(e)}
 
@@ -446,7 +521,8 @@ def main():
     print(df.to_string(index=False))
     print(f"\ngreedy  mean {g.mean():+.2f}  min {g.min():+.2f}  max {g.max():+.2f}  "
           f"positives {int((g > 0).sum())}/{len(df)}  |  nohedge mean {df['nohedge_usd_oz'].mean():+.2f}  "
-          f"|  bound-PASS {int(df['bound_pass'].sum())}/{len(df)}  |  margin {args.margin:+.2f} ($/oz)")
+          f"|  bound-PASS {int(df['bound_pass'].sum())}/{len(df)}  |  margin {args.margin:+.2f} ($/oz)  "
+          f"|  seeds {args.seeds}")
     print('run dir:', run_dir)
 
 
