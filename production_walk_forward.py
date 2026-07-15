@@ -165,7 +165,36 @@ def fair_strike(row, trade_date, fixings):
     return float((s0 * np.exp((c + r) * tau_f)).mean())
 
 
-def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume):
+def delta_corridor_schedule(trade_date, fixings, band):
+    """Deterministic causal delta-ramp corridor on the SIGNED total position Σq_i, keyed by
+    sim-grid step t (= calendar-day offset from the trade date; the deal runs on the daily
+    '0d 1d(1d)' grid). The remaining-average exposure is FULL (-50 contracts) before the first
+    fixing, declines LINEARLY to 0 across the averaging window as fixings crystallize, and is 0
+    after the last fixing — every date known at the trade date (causal). `band` (fraction of the
+    50-contract notional) is the half-width of slack around the ramp:
+        Min_Total = -(ramp + band·50) clamped to [-50, 0];  Max_Total = min(0, -(ramp − band·50)).
+    Returns a list of {Step, Min_Total, Max_Total} knots (one per calendar day over the window;
+    piecewise-constant between knots — grid_at(t) reads the rightmost knot with Step <= t)."""
+    first = pd.Timestamp(fixings[0]); last = pd.Timestamp(fixings[-1])
+    f0 = (first - pd.Timestamp(trade_date)).days
+    fN = (last - pd.Timestamp(trade_date)).days
+    span = max(fN - f0, 1)
+    half = band * 50.0
+
+    def knot(remaining):
+        ramp = 50.0 * remaining
+        lo = max(-50.0, min(0.0, -(ramp + half)))
+        hi = min(0.0, -(ramp - half))
+        return round(lo, 4), round(hi, 4)
+
+    knots = {0: knot(1.0)}                                    # full short before the first fixing
+    for off in range(f0, fN + 1):                            # linear decline across the fixings
+        knots[off] = knot(max(0.0, min(1.0, (fN - off) / span)))
+    return [{'Step': int(s), 'Min_Total': lo, 'Max_Total': hi}
+            for s, (lo, hi) in sorted(knots.items())]
+
+
+def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume, delta_corridor=None):
     """Reshape the deal template to the trade date in the corrected world, reading every market
     level off the corrected archive row. Returns (cfg, info) where info carries the strike and
     the dates the causal bound / observed path need. Adapt this for a different product.
@@ -224,6 +253,12 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume)
     ps['Settlement_Prices'] = setts
     ps['Initial_Margin'] = margins
     hp['Evaluator']['Position_Limits'] = limits
+    # Optional causal delta-ramp corridor on Σq_i (both TRAIN and ROLL configs carry it — the DP
+    # should learn within the corridor; for the roll-only validation phase re-rolls activate it on
+    # corridor-free checkpoints). The ramp is deterministic from THIS deal's fixing calendar.
+    if delta_corridor is not None:
+        hp['Evaluator']['Total_Position_Schedule'] = delta_corridor_schedule(
+            trade_date, fixings, delta_corridor)
     hp['Tradable_Instruments']['CashAccountDeal']['USD_CASH']['Investment_Horizon'] = _ts(pay)
 
     # --- realized spot history (both legs), STRICTLY before the trade date --------------------
@@ -347,7 +382,8 @@ def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
     Seed-level idempotency: a seed whose checkpoint already exists in the run dir is skipped, so a
     killed lane re-pointed at the same run dir resumes mid-trade without retraining. Row diagnostics
     train_u / V_0 report the primary member (seeds[0]); train_u_seeds carries the per-seed spread."""
-    cfg, info = build_deal_config(template, arch, trade_date, calibrated_md, args.margin, args.volume)
+    cfg, info = build_deal_config(template, arch, trade_date, calibrated_md, args.margin, args.volume,
+                                  delta_corridor=args.delta_corridor)
 
     ckpts, train_us, v0s = [], [], []
     for seed in args.seeds:
@@ -431,6 +467,10 @@ def main():
                          'nearly free and de-noises the causal one-step argmax forecast. '
                          'Default 256; pass 64 to recover the pre-lever roll behavior.')
     ap.add_argument('--fit-iters', type=int, default=None, help='Override DiffV2_Fit_Iters (smoke tests).')
+    ap.add_argument('--delta-corridor', type=float, default=None,
+                    help='Enforce a causal delta-ramp corridor on the SIGNED total position: '
+                         'BAND = half-width as a fraction of the 50-contract notional (e.g. 0.40). '
+                         'Off by default. Emits Evaluator.Total_Position_Schedule on train+roll.')
     args = ap.parse_args()
     if args.seed is not None:      # fold the legacy single-seed alias into the seed list
         args.seeds = [args.seed]

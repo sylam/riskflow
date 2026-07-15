@@ -243,6 +243,32 @@ def _normalize_position_limits(evaluator_config: Mapping[str, Any]) -> Dict[str,
     return position_limits
 
 
+def _normalize_total_position_schedule(evaluator_config: Mapping[str, Any]):
+    """Optional per-decision-step corridor on the SIGNED total position Σq_i. A list of
+    `{Step, Min_Total, Max_Total}` knots (piecewise-constant between knots): at sim-grid
+    decision step t the signed book total must lie within [Min_Total, Max_Total] of the
+    rightmost knot with `Step <= t`. Absent → None (no corridor; today's behaviour).
+    Returns a sorted tuple of `(step, min_total, max_total)` with strictly ascending,
+    non-negative steps and Min_Total <= Max_Total per knot."""
+    raw = evaluator_config.get("Total_Position_Schedule")
+    if not raw:
+        return None
+    knots = sorted(
+        (int(k["Step"]), float(k["Min_Total"]), float(k["Max_Total"])) for k in raw)
+    if knots[0][0] < 0:
+        raise ValueError(
+            f"Total_Position_Schedule Step must be >= 0; got {knots[0][0]}")
+    for (a, _, _), (b, _, _) in zip(knots, knots[1:]):
+        if b <= a:
+            raise ValueError(
+                f"Total_Position_Schedule Steps must be strictly ascending; got {a} >= {b}")
+    for step, lo, hi in knots:
+        if lo > hi:
+            raise ValueError(
+                f"Total_Position_Schedule knot at Step {step}: Min_Total {lo} > Max_Total {hi}")
+    return tuple(knots)
+
+
 def _normalize_spot_price_history(
     hedging_problem: Mapping[str, Any],
     lookback: int,
@@ -466,6 +492,7 @@ def construct_hedge_runtime(
             "bid_offer_spread_bps": float(evaluator_config.get("Bid_Offer_Spread_Bps", 0.0)),
             "force_flat_at_end": evaluator_config.get("Force_Flat_At_End", "Yes") == "Yes",
             "total_position_abs_limit": float(evaluator_config.get("Total_Position_Abs_Limit", 0.0)),
+            "total_position_schedule": _normalize_total_position_schedule(evaluator_config),
         },
     }
     runtime["privileged_layout"] = derive_privileged_layout(stoch_factors)

@@ -95,6 +95,10 @@ class HedgeActionSpace:
             [float(runtime["tradables"][r]["contract_size"]) for r in self.hedges],
             device=device)
         self.total_abs_limit = float(acc["total_position_abs_limit"])
+        # Optional per-decision-step corridor on the SIGNED total position Σq_i (sorted
+        # (step, min_total, max_total) knots or None). `grid_at(t)` filters the base grid to it.
+        self.schedule = acc.get("total_position_schedule")
+        self._grid_cache = None
         solver_cfg = runtime["solver"]
         self.levels = int(solver_cfg["training_action_grid_levels_per_axis"])
         active = solver_cfg.get("active_hedge_indices")
@@ -112,15 +116,53 @@ class HedgeActionSpace:
 
     def grid(self):
         """Mask-aware target-position grid `(n_actions, n_hedge)`: inactive axes pinned to 0,
-        rows over the total-position cap dropped."""
-        mesh = torch.meshgrid(*self.axis_levels(), indexing="ij")
-        grid = torch.stack([m.reshape(-1) for m in mesh], dim=-1)
-        if self.total_abs_limit > 0.0:
-            grid = grid[grid.abs().sum(-1) <= self.total_abs_limit + 1e-9]
-        if grid.shape[0] == 0:
+        rows over the total-position cap dropped. Cached (deterministic) — `grid_at(t)` reslices
+        this base grid per decision step without rebuilding the meshgrid."""
+        if self._grid_cache is None:
+            mesh = torch.meshgrid(*self.axis_levels(), indexing="ij")
+            grid = torch.stack([m.reshape(-1) for m in mesh], dim=-1)
+            if self.total_abs_limit > 0.0:
+                grid = grid[grid.abs().sum(-1) <= self.total_abs_limit + 1e-9]
+            if grid.shape[0] == 0:
+                raise ValueError(
+                    "action grid empty — Position_Limits infeasible under Total_Position_Abs_Limit")
+            self._grid_cache = grid
+        return self._grid_cache
+
+    def _corridor_at(self, t):
+        """`(min_total, max_total)` at decision step t — the rightmost `Total_Position_Schedule`
+        knot with `Step <= t` (piecewise-constant; clamps to the first knot for t before it)."""
+        lo, hi = self.schedule[0][1], self.schedule[0][2]
+        for step, mn, mx in self.schedule:
+            if step > t:
+                break
+            lo, hi = mn, mx
+        return lo, hi
+
+    def grid_at(self, t, live=None):
+        """Action grid at decision step t: the base `grid()` filtered to rows whose SIGNED total
+        position lies in the `Total_Position_Schedule` corridor at t. No schedule → the base grid
+        unchanged (bit-identical to today). The single per-t filter site every track shares
+        (DiffSolverV2 argmax, hindsight, textbook). Empty after filtering ⇒ infeasible corridor at
+        t, failed loud.
+
+        The corridor bounds the REALIZED signed total — the position that survives expiry masking
+        (the argmax callers apply `q = q * live` afterwards). Passing the step-t `live` leg mask
+        filters on Σ(q_i·live_i), so a corridor-satisfying short can't be parked on an expired leg
+        (a dF=0 wealth-neutral tie) only to be masked to 0 and silently under-hedge. Absent live ⇒
+        Σq_i over all legs (entry step / static diagnostics, where nothing has expired)."""
+        grid = self.grid()
+        if self.schedule is None:
+            return grid
+        lo, hi = self._corridor_at(t)
+        tot = (grid * live).sum(-1) if live is not None else grid.sum(-1)
+        grid_t = grid[(tot >= lo - 1e-9) & (tot <= hi + 1e-9)]
+        if grid_t.shape[0] == 0:
             raise ValueError(
-                "action grid empty — Position_Limits infeasible under Total_Position_Abs_Limit")
-        return grid
+                f"action grid empty at step {t} — Total_Position_Schedule corridor "
+                f"[{lo}, {hi}] infeasible on live legs (grid Σq·live spans "
+                f"[{float(tot.min())}, {float(tot.max())}])")
+        return grid_t
 
     def kappa(self, tradables_sim, t_index):
         """Per-hedge kappa `(n_hedge,)` at sim-grid `t_index` — each instrument's mean mark
@@ -176,7 +218,11 @@ def run_textbook_benchmark(bundle, runtime):
     acc = runtime["accounting"]
     aspace = HedgeActionSpace(runtime, device)
     tradables_sim, _ = _bundle_sim_views(bundle)
-    grid = aspace.grid()                                               # (n_actions, n_hedge)
+    # The static hold is chosen ONCE at entry and held; a per-t corridor is a dynamic constraint a
+    # constant hold can't track, so the single well-defined filter is the entry-step corridor
+    # grid_at(0) (no schedule ⇒ the base grid, unchanged). Keeps textbook a within-entry-mandate
+    # static lower bound and shares the one filter site.
+    grid = aspace.grid_at(0)                                           # (n_actions, n_hedge)
     b_outer = F.shape[-1]
     q0 = aspace.initial_q(b_outer, device)                            # (B, n_hedge) opening book
 
@@ -228,18 +274,19 @@ class HindsightDpSolver:
         device = F.device
         b_outer = F.shape[-1]
         tradables_sim, _ = _bundle_sim_views(bundle)
-        grid = aspace.grid()                                           # (n_actions, n_h) mask-aware
         cs = aspace.contract_size
 
-        # Frictionless clairvoyant: independent per-step argmax over the realized move. The
-        # net-of-cost trajectory (from the opening book q0) is accumulated for the diagnostic.
+        # Frictionless clairvoyant: independent per-step argmax over the realized move, within the
+        # per-t action universe `grid_at(t)` (base grid, corridor-filtered when a schedule is set).
+        # The net-of-cost trajectory (from the opening book q0) is accumulated for the diagnostic.
         q_prev = aspace.initial_q(b_outer, device)                     # (B, n_h) opening book
         n_star_0 = None
         G = torch.zeros(b_outer, device=device)
         cost = torch.zeros(b_outer, device=device)
         for t in range(t_outer - 1):
+            grid = aspace.grid_at(t)                                   # (n_actions_t, n_h) per-t
             dF = F[:, t + 1, :] - F[:, t, :]                           # (n_h, B)
-            step_pnl = torch.einsum("ai,ib->ab", grid * cs, dF)        # (n_actions, B)
+            step_pnl = torch.einsum("ai,ib->ab", grid * cs, dF)        # (n_actions_t, B)
             best_pnl, best_idx = step_pnl.max(dim=0)                   # (B,), (B,)
             q_now = grid[best_idx]                                     # (B, n_h)
             cost = cost + _turnover_cost(q_now - q_prev, aspace.kappa(tradables_sim, t))
@@ -264,7 +311,7 @@ class HindsightDpSolver:
                 "turnover_cost_mean": float(cost.mean()),
                 "n_star_0": n_star_0.float().mean(dim=0).detach().cpu().tolist(),
                 "v0_abs_max": float(v0.abs().max()),
-                "action_grid_size": int(grid.shape[0]),
+                "action_grid_size": int(aspace.grid().shape[0]),
             },
         )
 
@@ -477,12 +524,17 @@ class DiffSolverV2:
         return dF, dL, inner["market_t1"], inner["market_t"], live
 
     # ---- external argmax (Bellman max outside the fitted value) --------------
-    def _decide(self, nets, market_t1, dF, dL, W, t, grid, q_prev=None, kappa=None):
-        """Pick the grid action maximising E_inner[C_{t+1}] per outer path. No grad.
+    def _decide(self, nets, market_t1, dF, dL, W, t, q_prev=None, kappa=None, live=None):
+        """Pick the grid action maximising E_inner[C_{t+1}] per outer path. No grad. The action
+        universe is `aspace.grid_at(t, live)` — the base grid, further filtered to the
+        `Total_Position_Schedule` corridor at t when one is configured (else the base grid). The
+        `live` leg mask (the callers zero `q*live` after expiry) enters the filter so the corridor
+        bounds the REALIZED Σ(q_i·live_i), not a target the expiry mask then guts.
         `q_prev`+`kappa` (cost-aware execution): charge the L1 repositioning cost
         κ·|q − q_prev| against the wealth entering the continuation, so the argmax trades
         off expected value against the cost of getting there (hysteresis instead of churn).
         The value function itself stays cost-free; this is a decision-time correction."""
+        grid = self.aspace.grid_at(t, live)
         with torch.no_grad():
             B, Bi, md = market_t1.shape
             best_val = None
@@ -590,13 +642,13 @@ class DiffSolverV2:
         return g
 
     # ---- one backward step: bootstrap + advantage twin fit -------------------
-    def _fit_step(self, nets, W_bank, t, inner, grid, rows=slice(None)):
+    def _fit_step(self, nets, W_bank, t, inner, rows=slice(None)):
         dF_ng, dL_ng, m1_ng, market0, live = inner                                       # no-grad cache
         market0 = market0[rows]
         W0_bank = W_bank[t][rows]
         # SELECT the action on the NO-GRAD inner draws; EVALUATE its value + pathwise gradients
         # on a fresh GRAD inner (independent draws → cross-fit, no winner's-curse max-bias).
-        q_star, _ = self._decide(nets, m1_ng[rows], dF_ng[rows], dL_ng[rows], W0_bank, t, grid)
+        q_star, _ = self._decide(nets, m1_ng[rows], dF_ng[rows], dL_ng[rows], W0_bank, t, live=live)
         q_star = q_star * live          # expired contracts: dF=0 ⇒ wealth-neutral; report 0, not the tie
 
         # GRAD inner-MC fork: AAD-live one-step F_t1/L_t1/market_t1 + per-process state-at-t
@@ -753,7 +805,7 @@ class DiffSolverV2:
         }
 
     # ---- greedy-rollout downside verdict -------------------------------------
-    def _verdict(self, nets, inner_cache, grid, sweep_ts, rows=slice(None)):
+    def _verdict(self, nets, inner_cache, sweep_ts, rows=slice(None)):
         """Roll the fitted argmax policy forward over [t_min, T_dec] on the OUTER paths in
         `rows` (wealth advanced by the outer-realised dF/dL), starting FLAT at t_min, and
         compare terminal-wealth downside against a textbook diagonal-min-var delta hedge and
@@ -786,9 +838,9 @@ class DiffSolverV2:
                 dF, dL, m1, _, live = inner_cache[t]
                 kappa_t = self.aspace.kappa(self.tradables_sim, t)
                 q_g, _ = self._decide(
-                    nets, m1[rows], dF[rows], dL[rows], W["greedy"], t, grid,
+                    nets, m1[rows], dF[rows], dL[rows], W["greedy"], t,
                     q_prev=q_prev["greedy"] if self.cost_aware else None,
-                    kappa=kappa_t if self.cost_aware else None)
+                    kappa=kappa_t if self.cost_aware else None, live=live)
                 q_g = q_g * live          # zero positions on expired contracts (wealth-neutral)
                 q_tb = self._replication_hedge(t)[None].expand(n, self.n_hedge)
                 z = torch.zeros(n, self.n_hedge, device=self.device)
@@ -821,7 +873,7 @@ class DiffSolverV2:
         return out
 
     # ---- frozen-policy daily rollout on a realized path via the stepper -------
-    def _rollout_on_stepper(self, nets, inner_cache, grid, sweep_ts):
+    def _rollout_on_stepper(self, nets, inner_cache, sweep_ts):
         """Deployment-faithful backtest: roll the frozen policy day-by-day along the
         bundle's (observed) path through `BundleStepper`, which owns the real futures
         accounting (variation margin, financing, per-instrument expiry, forced-flat).
@@ -863,9 +915,9 @@ class DiffSolverV2:
                     else:
                         dF, dL, m1, _, live = inner_cache[t]
                         kappa_t = self.aspace.kappa(self.tradables_sim, t)
-                        q, _ = self._decide(nets, m1, dF, dL, W, t, grid,
+                        q, _ = self._decide(nets, m1, dF, dL, W, t,
                                             q_prev=q_prev if self.cost_aware else None,
-                                            kappa=kappa_t if self.cost_aware else None)
+                                            kappa=kappa_t if self.cost_aware else None, live=live)
                         q = q * live
                         q_log["greedy"].append(q.mean(0).detach().cpu().tolist())
                         q_log["t"].append(int(t))
@@ -1013,7 +1065,7 @@ class DiffSolverV2:
                     "q_star_mean": list(loaded["n_star_0"])}
         else:
             for t in reversed(sweep_ts):
-                r = self._fit_step(nets, W_bank, t, inner_cache[t], grid, rows=train)
+                r = self._fit_step(nets, W_bank, t, inner_cache[t], rows=train)
                 rows.append(r)
                 logging.info(
                     "DiffSolverV2 C[t=%d] fitted: val_loss=%.4g |Y_boot|=%.4g |A|=%.4g "
@@ -1067,13 +1119,13 @@ class DiffSolverV2:
         # OUT-OF-SAMPLE rollout (held-out paths the nets never saw); in-sample reported too.
         if loaded is not None:
             # Frozen nets never saw ANY of this run's paths — the whole batch is out-of-sample.
-            verdict = verdict_is = self._verdict(nets, inner_cache, grid, sweep_ts,
+            verdict = verdict_is = self._verdict(nets, inner_cache, sweep_ts,
                                                  rows=slice(None))
             has_oos = True
         else:
-            verdict = self._verdict(nets, inner_cache, grid, sweep_ts,
+            verdict = self._verdict(nets, inner_cache, sweep_ts,
                                     rows=(test if has_oos else train))
-            verdict_is = (self._verdict(nets, inner_cache, grid, sweep_ts, rows=train)
+            verdict_is = (self._verdict(nets, inner_cache, sweep_ts, rows=train)
                           if has_oos else verdict)
         if has_oos and loaded is None:
             logging.info(
@@ -1088,7 +1140,7 @@ class DiffSolverV2:
         # walk-forward backtest (the simplified _verdict wealth recursion mis-accrues expiry).
         stepper_verdict = None
         if loaded is not None and bool(self.cfg.get("diffv2_stepper_rollout", False)):
-            stepper_verdict = self._rollout_on_stepper(nets, inner_cache, grid, sweep_ts)
+            stepper_verdict = self._rollout_on_stepper(nets, inner_cache, sweep_ts)
             sg, stb, snh = (stepper_verdict[k] for k in ("greedy", "textbook", "nohedge"))
             logging.info(
                 "DiffSolverV2 STEPPER ROLLOUT (frozen policy, realized path, real accounting):\n"
