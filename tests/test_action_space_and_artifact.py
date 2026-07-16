@@ -20,6 +20,7 @@ import copy
 import json as jsonlib
 import os
 
+import pytest
 import torch
 
 import riskflow as rf
@@ -34,8 +35,8 @@ _HEDGES = ('PL_APR_2026', 'PL_JUL_2026', 'PL_OCT_2026')
 
 _LISTED_ARTIFACT_KEYS = {
     'state_dicts', 'm_mean', 'm_std', 'w_mean', 'w_std', 'utility_scale', 'a_bounds',
-    'hedges', 'active_hedge_indices', 'T_dec', 't_min', 'hidden', 'solver_version',
-    'config_hash',
+    'hedges', 'active_hedge_indices', 'total_position_schedule', 'T_dec', 't_min', 'hidden',
+    'solver_version', 'config_hash',
 }
 
 
@@ -199,6 +200,59 @@ def test_policy_artifact_contract_and_eval_from_memory(tmp_path):
     v_file = _eval(ckpt)                      # the loaded file
     assert v_art == v_file == artifact['V_0'], \
         f'in-memory {v_art} vs file {v_file} vs saved {artifact["V_0"]}'
+
+
+# --------------------------------------------------------------------------------------------
+# (iv) corridor provenance — a policy trained inside a Total_Position_Schedule is valid ONLY
+#      when rolled in the SAME corridor; a different (or absent) one fails loud.
+# --------------------------------------------------------------------------------------------
+def test_corridor_provenance_stamped_and_load_mismatch_fails_loud(tmp_path):
+    ckpt = str(tmp_path / 'value_fn_corr.pt')
+    cfg = _cfg(seed=7, save=ckpt)
+    S1 = [{'Step': 0, 'Min_Total': -50, 'Max_Total': -30},
+          {'Step': 50, 'Min_Total': -30, 'Max_Total': -10}]
+    cfg['Calc']['Calculation']['Hedging_Problem']['Evaluator']['Total_Position_Schedule'] = S1
+    train = _run(cfg)
+    art = train.policy_artifact
+    # the trained corridor is STAMPED into the artifact (provenance)
+    assert art['total_position_schedule'] is not None
+    assert len(art['total_position_schedule']) == 2
+
+    def _eval(load_member, sched):
+        rt = dict(train.runtime)
+        rt['solver'] = dict(train.runtime['solver'])
+        rt['accounting'] = dict(train.runtime['accounting'])
+        rt['accounting']['total_position_schedule'] = sched
+        rt['solver']['diffv2_load_value_fn'] = [load_member]
+        return DiffSolverV2(train.bundle, rt).solve().values
+
+    same = train.runtime['accounting']['total_position_schedule']   # normalized training corridor
+    assert _eval(ckpt, same) == art['V_0'], 'reload in the SAME corridor must echo the trained V_0'
+
+    # a DIFFERENT corridor is invalid — the frozen value fn learned other reachable wealth states
+    other = ((0, -40.0, -20.0),)
+    with pytest.raises(ValueError, match='corridor mismatch'):
+        _eval(ckpt, other)
+    # dropping the corridor entirely is also a mismatch (trained fenced, rolled unfenced)
+    with pytest.raises(ValueError, match='corridor mismatch'):
+        _eval(ckpt, None)
+
+
+def test_corridor_free_policy_rolls_in_any_corridor(tmp_path):
+    """A policy trained corridor-FREE has the widest wealth support, so rolling it INSIDE a
+    Total_Position_Schedule only restricts to a learned subset — allowed, not a mismatch. This is
+    the roll-only-on-corridor-free validation path the delta-corridor work was validated with."""
+    ckpt = str(tmp_path / 'value_fn_free.pt')
+    train = _run(_cfg(seed=7, save=ckpt))                          # no schedule → trained free
+    assert train.policy_artifact['total_position_schedule'] is None
+
+    rt = dict(train.runtime)
+    rt['solver'] = dict(train.runtime['solver'])
+    rt['accounting'] = dict(train.runtime['accounting'])
+    rt['accounting']['total_position_schedule'] = ((0, -50.0, -20.0),)   # roll inside a corridor
+    rt['solver']['diffv2_load_value_fn'] = [ckpt]
+    v = DiffSolverV2(train.bundle, rt).solve().values             # must NOT raise
+    assert v == train.policy_artifact['V_0']
 
 
 if __name__ == '__main__':

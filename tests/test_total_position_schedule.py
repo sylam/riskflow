@@ -18,17 +18,19 @@ from riskflow.hedge_runtime import _normalize_total_position_schedule as _norm
 from riskflow.hedge_solver import HedgeActionSpace
 
 
-def _aspace(schedule=None, levels=9):
-    """Minimal HedgeActionSpace: 3 hedges on [-50, 0], total |Σq| cap 50, `levels` per axis."""
+def _aspace(schedule=None, levels=9, lo=-50, hi=0, abs_limit=50.0, active=None):
+    """Minimal HedgeActionSpace: 3 hedges on `[lo, hi]`, total |Σq| cap `abs_limit`, `levels`
+    per axis. Defaults to the short-only platinum book ([-50, 0]); pass `lo`/`hi`/`abs_limit`
+    for long-side or symmetric (book-style) limits."""
     hedges = ["A", "B", "C"]
     runtime = {
         "names": {"hedges": hedges},
         "tradables": {r: {"contract_size": 1.0} for r in hedges},
         "solver": {"training_action_grid_levels_per_axis": levels,
-                   "active_hedge_indices": None},
+                   "active_hedge_indices": active},
         "accounting": {
-            "position_limits": {r: {"min_position": -50, "max_position": 0} for r in hedges},
-            "total_position_abs_limit": 50.0,
+            "position_limits": {r: {"min_position": lo, "max_position": hi} for r in hedges},
+            "total_position_abs_limit": abs_limit,
             "total_position_schedule": schedule,
         },
     }
@@ -151,6 +153,72 @@ def test_grid_at_live_mask_infeasible_fails_loud():
         assert False, "corridor unreachable on live legs must raise"
     except ValueError as e:
         assert "action grid empty at step 0" in str(e) and "on live legs" in str(e)
+
+
+# ---- (2c) BOOK-STYLE generalization: long-side + sign-crossing corridors ---------------------
+def test_grid_at_long_only_schedule():
+    """Positive-Max limits build LONG action rows and grid_at filters a positive corridor: a
+    long-only book ([0, 50] per leg) under a Σq∈[30, 50] corridor returns only long totals."""
+    a = _aspace(lo=0, hi=50, abs_limit=0.0, levels=5)          # abs cap off: pure signed corridor
+    assert (a.grid() >= -1e-9).all(), "long-only limits must not build short rows"
+    sched = _norm({"Total_Position_Schedule": [{"Step": 0, "Min_Total": 30, "Max_Total": 50}]})
+    a = _aspace(sched, lo=0, hi=50, abs_limit=0.0, levels=5)
+    gt = a.grid_at(0)
+    tot = gt.sum(-1)
+    assert gt.shape[0] > 0
+    assert (tot >= 30 - 1e-9).all() and (tot <= 50 + 1e-9).all()
+
+
+def test_grid_at_sign_crossing_schedule():
+    """A book that is SHORT early and LONG late: symmetric limits [-50, 50] under a schedule that
+    flips the corridor sign across t. grid_at returns short rows in the early phase and long rows
+    in the late phase — the same base grid, resliced per t."""
+    sched = _norm({"Total_Position_Schedule": [
+        {"Step": 0, "Min_Total": -50, "Max_Total": -25},       # short early
+        {"Step": 10, "Min_Total": 25, "Max_Total": 50}]})      # long late
+    a = _aspace(sched, lo=-50, hi=50, abs_limit=0.0, levels=5)
+    early = a.grid_at(3).sum(-1)                                # piecewise-constant: knot@0
+    late = a.grid_at(12).sum(-1)                                # knot@10
+    assert early.shape[0] > 0 and late.shape[0] > 0
+    assert (early >= -50 - 1e-9).all() and (early <= -25 + 1e-9).all(), "early phase must be short"
+    assert (late >= 25 - 1e-9).all() and (late <= 50 + 1e-9).all(), "late phase must be long"
+    # the two phases occupy disjoint signed-total half-lines
+    assert float(early.max()) < 0 < float(late.min())
+
+
+# ---- (2d) project_to_corridor: continuous in-corridor nudge (bank + textbook) ----------------
+def test_project_to_corridor_no_schedule_is_identity():
+    a = _aspace(None, lo=-50, hi=50)
+    q = torch.tensor([[-40.0, 10.0, 5.0], [3.0, 3.0, 3.0]])
+    assert torch.equal(a.project_to_corridor(q, 0), q)
+
+
+def test_project_to_corridor_lands_on_corridor_and_stays_feasible():
+    """Projecting an out-of-corridor position lands Σq exactly on the nearest corridor edge while
+    every leg stays inside [lo, hi] — for short, long, and sign-crossing corridors."""
+    for lo_c, hi_c, q_raw in (
+        (-50.0, -30.0, [[-5.0, -5.0, -5.0]]),     # too SHALLOW short (Σ=-15) → push to -30
+        (-50.0, -30.0, [[-40.0, -40.0, 0.0]]),    # too DEEP short (Σ=-80) → pull to -50
+        (30.0, 50.0, [[5.0, 5.0, 5.0]]),          # too small long (Σ=15) → push to 30
+        (30.0, 50.0, [[40.0, 40.0, 40.0]]),       # too big long (Σ=120) → pull to 50
+        (-10.0, 10.0, [[-40.0, 5.0, 5.0]]),       # sign-crossing corridor around 0 (Σ=-30) → -10
+    ):
+        sched = _norm({"Total_Position_Schedule": [
+            {"Step": 0, "Min_Total": lo_c, "Max_Total": hi_c}]})
+        a = _aspace(sched, lo=-50, hi=50, abs_limit=0.0)
+        q = torch.tensor(q_raw)
+        p = a.project_to_corridor(q, 0)
+        tot = float(p.sum(-1))
+        assert lo_c - 1e-4 <= tot <= hi_c + 1e-4, f"Σq {tot} not in [{lo_c}, {hi_c}]"
+        assert (p >= -50 - 1e-4).all() and (p <= 50 + 1e-4).all(), f"leg left its box: {p}"
+
+
+def test_project_to_corridor_in_corridor_is_untouched():
+    """An already-in-corridor position is returned unchanged (deficit d=0)."""
+    sched = _norm({"Total_Position_Schedule": [{"Step": 0, "Min_Total": -50, "Max_Total": -30}]})
+    a = _aspace(sched, lo=-50, hi=0)
+    q = torch.tensor([[-15.0, -15.0, -10.0]])                  # Σ=-40 ∈ [-50, -30]
+    assert torch.allclose(a.project_to_corridor(q, 0), q)
 
 
 # ---- (3) infeasible corridor fails loud ------------------------------------------------------

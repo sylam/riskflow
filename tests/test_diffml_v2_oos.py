@@ -87,3 +87,73 @@ def test_diffsolverv2_bounded_and_hedges_oos(inner_antithetic, one_step_fork):
     mean_abs_q = v['greedy_mean_abs_q']
     assert min(mean_abs_q) < 1e-6, \
         f'no expired contract zeroed — live-mask not applied? mean|q|={mean_abs_q}'
+
+
+def _corridor_at(sched, t):
+    lo, hi = sched[0]['Min_Total'], sched[0]['Max_Total']
+    for k in sched:
+        if k['Step'] > t:
+            break
+        lo, hi = k['Min_Total'], k['Max_Total']
+    return lo, hi
+
+
+def test_corridor_train_smoke_sign_crossing():
+    """BOOK-STYLE generalization end-to-end: train DiffSolverV2 INSIDE a SIGN-CROSSING
+    Total_Position_Schedule (short early, long late) on symmetric [-50, 50] limits, and assert
+    (a) the backward sweep stays bounded and (b) the greedy verdict rolls INSIDE the fence at
+    every step — the corridor flips the mandated total's sign mid-window and the argmax obeys it.
+    Exercises grid_at long rows + the bank/textbook corridor projection on a superposable book."""
+    cfg = jsonlib.load(open(FIXTURE))
+    calc = cfg['Calc']['Calculation']
+    calc['Execution_Mode'] = 'solve_hedge'
+    calc['Batch_Size'] = 48
+    calc['Inner_Sub_Batch'] = 8
+    calc['Inner_MC_Enabled'] = 'Yes'
+    calc['Inner_Antithetic'] = 'Yes'
+    calc['Random_Seed'] = 1234
+    hp = calc['Hedging_Problem']
+    hp['Randomize_Initial_State'] = 'Yes'
+    ev = hp['Evaluator']
+    # symmetric (book-style) limits + gross cap off so the signed corridor is the only total bound
+    for lim in ev['Position_Limits'].values():
+        lim['Min_Position'], lim['Max_Position'] = -50, 50
+    ev['Total_Position_Abs_Limit'] = 0.0
+    # short early, long late — the sign flips at Step 107, inside the T_Min=100 sweep window
+    sched = [{'Step': 0, 'Min_Total': -50, 'Max_Total': -25},
+             {'Step': 107, 'Min_Total': 25, 'Max_Total': 50}]
+    ev['Total_Position_Schedule'] = sched
+    hp['Solver'] = {
+        'Object': 'DiffSolverV2', 'Training_Action_Grid_Levels_Per_Axis': 5,
+        'Training_Action_Chunk_Size': 64, 'T_Min': 100, 'DiffV2_Fit_Iters': 15,
+        'DiffV2_OOS_Frac': 0.5}
+
+    cx = rf.Context()
+    cx.load_json((jsonlib.dumps(cfg), 'corridor_sign_crossing.json'))
+    _, result = cx.run_job()
+    diag = (result.evaluation_summary or {}).get('diagnostics') or {}
+
+    # (a) bounded backward sweep under the sign-crossing corridor
+    v0 = float(diag['V_0'])
+    assert math.isfinite(v0) and abs(v0) < 50.0, f'V_0 not bounded under corridor: {v0}'
+    assert diag.get('bounded') is True, 'sweep flagged not-bounded under corridor'
+
+    # (b) the greedy verdict rolls INSIDE the fence at every step (short early, long late)
+    v = diag['verdict']
+    traj = v['greedy_q_traj']
+    t0 = int(diag['root_t'])
+    saw_short = saw_long = False
+    for i, book in enumerate(traj):
+        t = t0 + i
+        lo, hi = _corridor_at(sched, t)
+        tot = float(sum(book))
+        assert lo - 1e-3 <= tot <= hi + 1e-3, \
+            f'greedy breached corridor at t={t}: Σq={tot:.3f} vs [{lo}, {hi}]'
+        saw_short = saw_short or hi < 0
+        saw_long = saw_long or lo > 0
+    assert saw_short and saw_long, 'sweep window did not cover both corridor signs'
+
+    # provenance: the trained artifact stamps the corridor it was trained inside
+    art = result.policy_artifact
+    assert art['total_position_schedule'] is not None, 'artifact must stamp the training corridor'
+    assert len(art['total_position_schedule']) == len(sched)

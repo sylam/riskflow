@@ -62,6 +62,14 @@ def _config_hash(solver_cfg):
     return hashlib.sha1(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def _schedule_key(schedule):
+    """Canonical, comparison-stable form of a `Total_Position_Schedule` (None or the sorted
+    `(step, min, max)` knot tuple) — flattens tuple-vs-list and int/float drift so a checkpoint's
+    stored corridor compares bitwise against the run's corridor regardless of round-trip form."""
+    return None if schedule is None else tuple(
+        (int(step), float(lo), float(hi)) for step, lo, hi in schedule)
+
+
 class HedgeActionSpace:
     """The solver-owned ACTION UNIVERSE + friction access, built ONCE from (runtime, device)
     and shared by every track (DiffSolverV2, HindsightDpSolver, run_textbook_benchmark, and
@@ -163,6 +171,32 @@ class HedgeActionSpace:
                 f"[{lo}, {hi}] infeasible on live legs (grid Σq·live spans "
                 f"[{float(tot.min())}, {float(tot.max())}])")
         return grid_t
+
+    def project_to_corridor(self, q, t):
+        """Project the SIGNED total of the ACTIVE legs of `q` `(B, n_hedge)` into the
+        `Total_Position_Schedule` corridor at decision step t, keeping every leg inside its own
+        `[Min,Max]` via headroom water-filling: shift the active legs by the corridor deficit
+        `d = clamp(Σq, lo, hi) − Σq`, distributed in proportion to each leg's remaining room in
+        d's direction, so `Σ_active` lands exactly on the nearest corridor edge and no leg leaves
+        its box. Feasible whenever the corridor is grid-feasible (headroom ≥ |d|, the same
+        feasibility `grid_at` fails loud on). No schedule → returns `q` unchanged (bit-identical).
+
+        Unlike `grid_at` (which FILTERS a discrete action universe to the corridor for the argmax),
+        this CONTINUOUSLY nudges an exploration/benchmark position — the exploration bank rolls
+        continuous q around the min-var hedge, so a filter has nothing to select from. Shared by
+        the bank (so the fitted value trains on IN-corridor wealth states, not unreachable ones)
+        and the verdict/stepper textbook (a fair in-corridor min-var comparison)."""
+        if self.schedule is None:
+            return q
+        lo, hi = self._corridor_at(t)
+        idx = self.active
+        qa = q[:, idx]                                                   # (B, n_active)
+        tot = qa.sum(-1, keepdim=True)                                   # (B,1) signed active total
+        d = tot.clamp(lo, hi) - tot                                     # (B,1) corridor deficit
+        head = torch.where(d >= 0, self.q_hi[idx] - qa, qa - self.q_lo[idx]).clamp_min(0.0)
+        out = q.clone()
+        out[:, idx] = qa + d * head / head.sum(-1, keepdim=True).clamp_min(1e-9)
+        return out
 
     def kappa(self, tradables_sim, t_index):
         """Per-hedge kappa `(n_hedge,)` at sim-grid `t_index` — each instrument's mean mark
@@ -600,6 +634,7 @@ class DiffSolverV2:
         rng = (self.q_hi - self.q_lo)
         mask = torch.zeros(self.n_hedge, device=self.device)
         mask[self.active] = 1.0
+        oob = []                                                                         # per-t bank corridor-breach diagnostic
         for t in range(self.T_dec):
             W_list.append(W.clone())
             q_list.append(q_prev.clone())
@@ -607,11 +642,30 @@ class DiffSolverV2:
             noise = self.noise_frac * rng * torch.randn(
                 self.B_outer, self.n_hedge, generator=gen, device=self.device)
             q = torch.minimum(torch.maximum(q_rep[None] + noise * mask, self.q_lo), self.q_hi)
+            if self.aspace.schedule is not None:
+                # Keep the exploration IN the corridor so the value fn trains on reachable wealth
+                # states only (un-projected, ~50% of bank paths breach — the nets would fit
+                # unreachable W). Diagnostic below then confirms ~0 residual breach.
+                q = self.aspace.project_to_corridor(q, t)
+                lo, hi = self.aspace._corridor_at(t)                                      # signed-total corridor at t
+                tot = q[:, self.active].sum(-1)                                           # bank signed total (active legs)
+                tol = 1e-3                     # float32 headroom-fill lands on the edge to ~1e-6
+                oob.append((t, lo, hi, float((tot < lo - tol).float().mean()
+                                             + (tot > hi + tol).float().mean()),
+                            float(tot.min()), float(tot.max())))
             dF = torch.stack(
                 [self.tradables_sim[ref][t + 1] - self.tradables_sim[ref][t] for ref in self.hedges],
                 dim=-1)                                                                  # (B_outer, n_hedge)
             W = self._wealth_step(W, q, dF, L[t + 1] - L[t])
             q_prev = q
+        if oob:
+            worst = max(oob, key=lambda r: r[3])
+            logging.info(
+                "DiffSolverV2 bank IN Total_Position_Schedule (post-projection): residual "
+                "frac(Σq outside corridor) min=%.3f mean=%.3f max=%.3f | worst t=%d "
+                "corridor=[%.4g, %.4g] bank Σq∈[%.4g, %.4g] frac_oob=%.3f (≈0 ⇒ projection clean)",
+                min(r[3] for r in oob), sum(r[3] for r in oob) / len(oob),
+                worst[3], worst[0], worst[1], worst[2], worst[4], worst[5], worst[3])
         return W_list, q_list
 
     # ---- project per-process state-at-t leaf grads → market_t columns --------
@@ -842,7 +896,10 @@ class DiffSolverV2:
                     q_prev=q_prev["greedy"] if self.cost_aware else None,
                     kappa=kappa_t if self.cost_aware else None, live=live)
                 q_g = q_g * live          # zero positions on expired contracts (wealth-neutral)
-                q_tb = self._replication_hedge(t)[None].expand(n, self.n_hedge)
+                # Textbook = diagonal min-var, PROJECTED into the corridor (no schedule ⇒ identity)
+                # so the benchmark obeys the same mandate as greedy — a fair in-corridor comparison.
+                q_tb = self.aspace.project_to_corridor(
+                    self._replication_hedge(t)[None].expand(n, self.n_hedge), t)
                 z = torch.zeros(n, self.n_hedge, device=self.device)
                 for p, q_now in (("greedy", q_g), ("textbook", q_tb)):
                     cost[p] = cost[p] + _turnover_cost(q_now - q_prev[p], kappa_t)
@@ -867,6 +924,7 @@ class DiffSolverV2:
         gq = torch.tensor(q_traj["greedy"])                                              # (n_steps, n_hedge)
         out["greedy_mean_abs_q"] = gq.abs().mean(0).tolist()
         out["greedy_q_traj"] = q_traj["greedy"]          # full per-t mean book (audit trail)
+        out["textbook_q_traj"] = q_traj["textbook"]      # corridor-projected benchmark book (audit)
         out["greedy_q_first"] = q_traj["greedy"][0] if q_traj["greedy"] else None
         out["greedy_q_mid"] = (q_traj["greedy"][len(q_traj["greedy"]) // 2]
                                if q_traj["greedy"] else None)
@@ -911,7 +969,9 @@ class DiffSolverV2:
                         tot = float(qt.abs().sum())
                         if self.total_abs_limit > 0.0 and tot > self.total_abs_limit:
                             qt = qt * (self.total_abs_limit / tot)
-                        q = qt[None].expand(B, self.n_hedge)
+                        # Obey the corridor mandate too (no schedule ⇒ identity), so the stepper
+                        # textbook is the same in-corridor min-var benchmark the verdict rolls.
+                        q = self.aspace.project_to_corridor(qt[None].expand(B, self.n_hedge), t)
                     else:
                         dF, dL, m1, _, live = inner_cache[t]
                         kappa_t = self.aspace.kappa(self.tradables_sim, t)
@@ -1016,6 +1076,35 @@ class DiffSolverV2:
                         raise ValueError(
                             f"DiffV2_Load_Value_Fn checkpoint mismatch on {key!r}: "
                             f"{src} saved {ck[key]!r} vs this run {want!r}")
+                # Corridor provenance: a value fn trained INSIDE a Total_Position_Schedule fit only
+                # the wealth states that corridor makes reachable. The wealth support is monotone in
+                # the corridor: training UNCONSTRAINED spans the widest support, so rolling that
+                # policy inside ANY corridor only restricts to a learned subset (valid — this is the
+                # roll-only-on-corridor-free validation path). But a policy trained in a specific
+                # corridor is queried off-support under a DIFFERENT or absent one → fail loud.
+                want_sched = _schedule_key(self.aspace.schedule)
+                if "total_position_schedule" in ck:
+                    saved_sched = _schedule_key(ck["total_position_schedule"])
+                    if saved_sched == want_sched:
+                        pass                                         # same corridor — exact match
+                    elif saved_sched is None:
+                        logging.info(
+                            "DiffV2_Load_Value_Fn: %s trained corridor-free (widest wealth "
+                            "support); rolling under a Total_Position_Schedule only restricts to a "
+                            "learned subset — valid.", src)
+                    else:
+                        raise ValueError(
+                            f"DiffV2_Load_Value_Fn corridor mismatch: {src} was trained under "
+                            f"Total_Position_Schedule {saved_sched} but this run rolls under "
+                            f"{want_sched}. A policy trained inside a corridor is queried off its "
+                            f"learned wealth support under a different (or absent) one — retrain, "
+                            f"or match the Evaluator.Total_Position_Schedule.")
+                elif want_sched is not None:
+                    logging.warning(
+                        "DiffV2_Load_Value_Fn: %s predates corridor provenance (no "
+                        "total_position_schedule stamp) but this run sets a Total_Position_Schedule "
+                        "— cannot verify the frozen policy was trained in it; roll validity "
+                        "unverified.", src)
                 drift = ((M.mean(0) - ck["m_mean"]).abs() / ck["m_std"]).max()
                 logging.info(
                     "DiffSolverV2 LOADED value fn from %s (train V_0=%+.6g) | eval-world "
@@ -1100,6 +1189,9 @@ class DiffSolverV2:
                 "a_bounds": self.a_bounds,
                 "hedges": list(self.hedges),
                 "active_hedge_indices": list(self.active),
+                # Corridor provenance: the Total_Position_Schedule this policy was trained inside
+                # (None = unconstrained). A load under a DIFFERENT corridor fails loud (above).
+                "total_position_schedule": _schedule_key(self.aspace.schedule),
                 "T_dec": self.T_dec, "t_min": self.t_min, "md": md, "hidden": hidden,
                 "solver_version": SOLVER_VERSION,
                 "config_hash": _config_hash(self.cfg),
