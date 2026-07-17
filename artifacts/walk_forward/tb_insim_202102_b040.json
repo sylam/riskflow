@@ -1,0 +1,37 @@
+{
+ "month": "202102",
+ "band": 0.4,
+ "bit_identity": {
+  "exact": true,
+  "l1": 0.0,
+  "shape": [
+   90,
+   3
+  ],
+  "steps_match": true,
+  "wT_clip": 326660.71875,
+  "wT_trained": 326660.71875,
+  "regen_greedy_usd_oz": 130.66,
+  "regen_churn": 112.5
+ },
+ "insim": {
+  "corridor-FREE": {
+   "u_mean": 0.1210499033331871,
+   "wT_mean": 131350.59375,
+   "wT_p5": -32238.6640625,
+   "wT_cvar5": -111608.2734375,
+   "verdict_is_oos": true,
+   "textbook_u": 0.09020696580410004,
+   "nohedge_u": -0.13847415149211884
+  },
+  "corridor-TRAINED": {
+   "u_mean": 0.12106502801179886,
+   "wT_mean": 131378.25,
+   "wT_p5": -32238.6640625,
+   "wT_cvar5": -111713.3203125,
+   "verdict_is_oos": true,
+   "textbook_u": 0.09020696580410004,
+   "nohedge_u": -0.13847415149211884
+  }
+ }
+}
