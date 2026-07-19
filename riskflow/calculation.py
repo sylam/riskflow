@@ -580,9 +580,9 @@ class CMC_State_Inner(CMC_State):
             # Antithetic on the inner Gaussian emissions (Inner_Antithetic='Yes'): draw B2/2
             # Sobol quasi-normals per (t, outer-path) and mirror them (z, -z) on the inner
             # axis. Halves the label/argmax variance of the inner-MC E[C] estimate — the
-            # diff-ML winner's-curse lever validated in the HMM toy. Regime-transition
-            # uniforms come from a separate quasi_rng stream and stay iid (only the
-            # symmetric emissions are folded, matching the toy). Folding a Sobol sequence
+            # diff-ML winner's-curse lever validated in the toy. Any auxiliary sampling
+            # streams (e.g. a discrete-state transition) come from a separate quasi_rng stream
+            # and stay iid — only the symmetric emissions are folded. Folding a Sobol sequence
             # with its mirror preserves unbiasedness (emissions are symmetric in z).
             Z_normal, _ = self.quasi_rng(num_factors, T * B * (B2 // 2))
             half = torch.matmul(
@@ -1866,10 +1866,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         execution_mode = params.get('Execution_Mode', 'simulate_only')
         hedging_problem = params.get('Hedging_Problem', {})
-        # Diff-ML inner-MC belief coherence: when True, the bootstrap's z_{t+1} regime
-        # block is a one-step HMM filter posterior seeded from the outer belief, not the
-        # privileged true-regime one-hot. Default True; set False for the one-hot bootstrap.
-        self._inner_belief_filter = hedging_problem.get('Inner_Belief_Filter', 'Yes') == 'Yes'
+        # The hedging-problem cfg is forwarded to each process's `reseed_inner_state` OPAQUELY —
+        # the calc never reads a model switch out of it; a process owns which keys mean what to it.
+        self._inner_state_opts = hedging_problem
 
         instruments = self.config.deals_from_object_map(hedging_problem.get('Tradable_Instruments', {}))
         liabilities = self.config.deals_from_object_map(hedging_problem.get('Liabilities', {}))
@@ -1945,8 +1944,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # Observed factor paths (walk-forward backtest): a driver prepares grid-aligned
         # realized paths (an .npz keyed by factor name) and the simulated draw is replaced
         # by the observed one — the deal pricers then produce the realized tradable/liability
-        # marks the stepper replays. All prep (archive read, interpolation, belief source)
-        # lives in the driver; here we only substitute + refilter the regime belief.
+        # marks the stepper replays. All prep (archive read, interpolation, state source)
+        # lives in the driver; here we only substitute + let each process reseed its own state.
         observed = None
         if params.get('Observed_Scenario'):
             npz = np.load(params['Observed_Scenario'])
@@ -1975,7 +1974,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 # re-precalc with it as init_state), so a curve process gets a
                 # (n_tenors, B) snapshot, a spot a (B,) snapshot, and so on.
                 initial_t0 = {}
-                regime0_t0 = {}
+                outer_reseeds = {}
                 for key, proc in self.stoch_factors.items():
                     simulated = proc.generate(shared_mem)
                     # Publish to the buffer as we go — linked factors (e.g.
@@ -1985,9 +1984,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     # before the linked factor runs (same as the main loop below).
                     shared_mem.t_Scenario_Buffer[key] = simulated
                     initial_t0[key] = simulated[-1].detach()
-                    regimes_aux = shared_mem.t_Scenario_Buffer.get((key, 'regimes'))
-                    if regimes_aux is not None:
-                        regime0_t0[key] = regimes_aux[-1].detach()
+                    # Each process owns its t=0 seed for the next run (regime / variance / none);
+                    # captured now (detached) so it survives the buffer-clearing reset below.
+                    outer_reseeds.update(proc.outer_reseed())
                 # Independent innovation stream for the main run (regenerates
                 # t_random_numbers via torch.randn; quasi-rng auto-advances).
                 shared_mem.reset(
@@ -1999,8 +1998,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                         self.base_date, scenario_grid, init_state,
                         shared_mem, self.process_ofs[key],
                         implied_tensor=implied_tensor)
-                for key, r0 in regime0_t0.items():
-                    shared_mem.t_Scenario_Buffer[(key, 'regime0_outer')] = r0
+                for seed_key, seed_val in outer_reseeds.items():
+                    shared_mem.t_Scenario_Buffer[seed_key] = seed_val
 
             for key, proc in self.stoch_factors.items():
                 simulated = proc.generate(shared_mem)
@@ -2009,10 +2008,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     # sim-grid-length prefix (Time_Grid is daily) and broadcast to the batch.
                     simulated = observed[key][:simulated.shape[0]].expand(
                         *simulated.shape).contiguous()
-                    if hasattr(proc, '_forward_belief'):     # refilter belief on the observed path
-                        belief = proc._forward_belief(simulated.detach(), simulated.device)
-                        shared_mem.t_Scenario_Buffer[(key, 'regime_belief')] = \
-                            belief.permute(0, 2, 1).contiguous()
+                    # The process re-derives & publishes its own path-dependent revealed state
+                    # along the replayed path (belief, log-variance, …); base processes no-op.
+                    proc.reseed_from_path(simulated, shared_mem)
                 # Leaf the declared underlying(s) so the base-delta / conditional-feature pass can
                 # read ∂value/∂spot via AAD. The diff-ML solver differentiates the continuation
                 # inside the inner MC off its own fresh state-at-t leaves (see inner_mc_grad_fn),
@@ -2028,8 +2026,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     for attr_name, tensor in priv.items():
                         privileged_factor_blocks[(factor_name, attr_name)].append(tensor.detach().clone())
 
-            # solve_hedge: snapshot this batch's outer scenario buffer (factor paths +
-            # the (spot_key,'regimes') aux key) for on-demand inner-MC forking later.
+            # solve_hedge: snapshot this batch's outer scenario buffer (factor paths + every
+            # per-process aux key each generate() published) for on-demand inner-MC forking later.
             if outer_state_blocks is not None:
                 for key, tensor in shared_mem.t_Scenario_Buffer.items():
                     outer_state_blocks[key].append(tensor.detach().clone())
@@ -2070,7 +2068,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         if outer_state_blocks is not None:
             # Concatenate per-batch outer scenario snapshots along the batch (last) dim:
-            # spot (T, B), curve (T, n_tenors, B), regimes (T, B) all carry B last.
+            # spot (T, B), curve (T, n_tenors, B), per-process aux (T, B) all carry B last.
             self._outer_scenario_buffer = {
                 key: torch.cat(blocks, dim=-1) for key, blocks in outer_state_blocks.items()
             }
@@ -2170,13 +2168,14 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
     def _find_spot_key(self):
         """Return the unique underlying (commodity-spot) factor key. Its name comes from the
         runtime-owned underlying set (`self._underlying_names`); map back to the live key
-        object via stoch_factors. The regime chain lives on the belief-owning (HMM) spot —
-        prefer that when derived spots (BasisComposedSpotModel) add further CommodityPrice
-        factors. Raises unless exactly one — v1 inner-MC is single-regime-chain."""
+        object via stoch_factors. The sufficient statistic (HMM regime/belief, GARCH log-
+        variance) lives on the martingale primary — prefer the spot exposing a revealed
+        sufficient statistic (non-empty `privileged_layout`) when derived spots
+        (BasisComposedSpotModel) add further CommodityPrice factors. Raises unless exactly one."""
         spots = [k for k in self.stoch_factors
                  if utils.check_tuple_name(k) in self._underlying_names]
-        beliefs = [k for k in spots if hasattr(self.stoch_factors[k], '_forward_belief')]
-        spot_keys = beliefs or spots
+        primaries = [k for k in spots if self.stoch_factors[k].privileged_layout(self.stoch_factors[k].param)]
+        spot_keys = primaries or spots
         if len(spot_keys) != 1:
             raise ValueError(
                 f'Inner MC expects exactly one underlying spot factor; found {len(spot_keys)}: {spot_keys}'
@@ -2260,8 +2259,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                            tradable_refs, want_raw_samples=True, with_grad=False,
                            max_inner_steps=None, outer_rows=None):
         """Run inner MC at a single outer timestep `t`, forking from `outer_scenario_buffer`
-        — a snapshot of the outer `t_Scenario_Buffer` (factor keys plus the
-        `(spot_key,'regimes')` aux key, batch dim B_outer).
+        — a snapshot of the outer `t_Scenario_Buffer` (factor keys plus every per-process aux
+        key, batch dim B_outer).
 
         `outer_rows=(lo, hi)` forks only that contiguous outer-path range — the seam the
         solver uses to run GRAD forks in sub-slices at large B_outer (per-slice AAD tapes;
@@ -2392,7 +2391,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         B_outer = outer_buf[spot_key].shape[-1]
         B_inner = shared_mem.simulation_sub_batch
         B_flat = B_outer * B_inner
-        outer_regimes = outer_buf[(spot_key, 'regimes')]               # (T_outer, B_outer) long
 
         grad_ctx = (torch.enable_grad() if with_grad else torch.no_grad())
         # Track per-process initial state leaves when with_grad — exposed via the result
@@ -2404,8 +2402,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             shared_mem.reset_inner(self.num_factors, inner_time_grid,
                                    use_antithetic=self.params.get('Inner_Antithetic', 'No') == 'Yes',
                                    use_random=str(self.params.get('Inner_Draws', 'sobol')).lower() == 'random')
-            # Per-outer-path initial regime — read by the inner HMM generate.
-            shared_mem.t_Scenario_Buffer[(spot_key, 'regime0_inner')] = outer_regimes[t]
 
             market_t1_parts = []
             for key, proc_inner in self.stoch_factors_inner.items():
@@ -2425,43 +2421,27 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     shared_mem, self.process_ofs[key],
                     implied_tensor=self._factor_precalc_args[key][1],
                 )
+                # Per-outer-path t=0 privileged-state seed read by this process's inner generate
+                # (regime for the HMM, conditional variance h0 for GARCH). Capability lives on the
+                # process — a no-op dict for factors without a revealed sufficient statistic — so
+                # the forker runs one uniform loop across model worlds (no isinstance branch).
+                for seed_key, seed_val in proc_inner.inner_fork_seed(key, outer_buf, t).items():
+                    shared_mem.t_Scenario_Buffer[seed_key] = seed_val
                 simulated = proc_inner.generate(shared_mem)
                 shared_mem.t_Scenario_Buffer[key] = simulated
-                # Diff-ML belief coherence: for a
-                # regime-switching spot, publish a one-step filtered belief so the process's
-                # `reveal_state_at` below returns the participant's posterior instead
-                # of the true-regime one-hot fallback. Seeded from the outer entry belief
-                # (detached) and updated on the inner price move — differentiable in the
-                # inner price, so the belief-column slope is available to the twin loss.
-                # Disabled (→ one-hot) when Inner_Belief_Filter=False or the process has no
-                # filter / no outer belief was published.
-                belief0 = outer_buf.get((key, 'regime_belief'))
-                if (self._inner_belief_filter and belief0 is not None
-                        and hasattr(proc_inner, 'inner_forward_belief')):
-                    seed = belief0[t]
-                    if with_grad:
-                        # Belief seed as a grad leaf so the twin loss can supervise the
-                        # belief COLUMN: ∂Y_boot/∂belief_t flows through the filter's
-                        # predict step (∂belief_{t+1}/∂belief_t) into z_{t+1}. Independent
-                        # of the spot leaf, so the price-column gradient is unchanged.
-                        seed = seed.detach().clone().requires_grad_(True)
-                        state_t_leaves[(key, 'regime_belief')] = seed
-                    inner_belief = proc_inner.inner_forward_belief(simulated, seed)
-                    shared_mem.t_Scenario_Buffer[(key, 'regime_belief')] = inner_belief
-                    if not getattr(self, '_logged_inner_belief', False):
-                        self._logged_inner_belief = True
-                        sums = inner_belief.sum(dim=1)
-                        logging.info(
-                            'inner belief filter ACTIVE for %s: shape=%s n_states=%d '
-                            'normalized=%s (replaces the privileged true-regime one-hot '
-                            'in the bootstrap z_{t+1})',
-                            utils.check_tuple_name(key), tuple(inner_belief.shape),
-                            inner_belief.shape[1],
-                            bool(torch.allclose(sums, torch.ones_like(sums), atol=1.0e-4)))
+                # Post-generate inner-fork state coherence: the process publishes any path-
+                # dependent revealed state its `reveal_state_at` needs at t+1 (e.g. a filtered
+                # belief) and returns differentiable leaves for the twin loss. Opts are forwarded
+                # opaquely; base/GARCH processes are no-ops (their revealed state is already
+                # published by generate, or detached by design).
+                inner_leaves = proc_inner.reseed_inner_state(
+                    key, simulated, outer_buf, t, shared_mem, self._inner_state_opts, with_grad)
+                if with_grad:
+                    state_t_leaves.update(inner_leaves)
                 if want_raw_samples:
                     # Market state at outer t+1 (inner-time index 1): each factor reveals its
-                    # informative segments (regime belief/one-hot, spot, carry curve) from the live
-                    # buffer (factor path + any regime aux its generate() just published). The calc
+                    # informative segments (its sufficient statistic + price/curve) from the live
+                    # buffer (factor path + any aux its generate()/reseed just published). The calc
                     # owns the (factor_flat, B, SB) reshape and concatenates in reveal order.
                     for block, _kind in proc_inner.reveal_state_at(1, shared_mem.t_Scenario_Buffer):
                         market_t1_parts.append(block.reshape(-1, B_outer, B_inner))
@@ -2531,8 +2511,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     F_t1[ref] = (td[1] if td.shape[0] >= 2 else td[-1]).clone()
                     dF_T[ref] = (td[-1] - td[0]).clone()
                     dF_min[ref] = (td.min(dim=0).values - td[0]).clone()
-                # Market state — every simulated factor's informative state (regime
-                # posterior, carry curve, …) concatenated; factor order is the
+                # Market state — every simulated factor's informative state (sufficient
+                # statistic + price, carry curve, …) concatenated; factor order is the
                 # `stoch_factors_inner` iteration order, identical for market_t/market_t1.
                 market_t1 = torch.cat(market_t1_parts, dim=0).permute(1, 2, 0).contiguous()
                 market_t_parts = []
@@ -2540,12 +2520,15 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 for key in self.stoch_factors_inner:
                     if key.type in utils.DimensionLessFactors:
                         continue
+                    proc_inner = self.stoch_factors_inner[key]
                     width = 0
-                    for block, _kind in self.stoch_factors_inner[key].reveal_state_at(t, outer_buf):
+                    for block, _kind in proc_inner.reveal_state_at(t, outer_buf):
                         b = block.reshape(-1, B_outer)
                         market_t_parts.append(b)
                         width += b.shape[0]
-                    market_t_widths.append((key, width))
+                    # Forward the process's differentiable-state-leaf suffixes to the solver's
+                    # label projection, so it maps leaf grads → market columns with no model concept.
+                    market_t_widths.append((key, width, tuple(proc_inner.diff_state_leaves())))
                 market_t = torch.cat(market_t_parts, dim=0).permute(1, 0).contiguous()
                 # Exact liability MTM at the fork (outer-t) and outer-t+1, on the inner draws —
                 # the resolve_hedge_structure marks themselves (same time-indexing as F_t1:

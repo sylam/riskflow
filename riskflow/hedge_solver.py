@@ -420,7 +420,7 @@ class DiffSolverV2:
 
     INCREMENT 1 (this build): value bootstrap + the WEALTH-channel pathwise-gradient twin
     loss. W is the solver's own autograd leaf, so ∂Y_boot/∂W is exact with pure torch (no
-    framework AAD needed). INCREMENT 2 adds the market-state (spot/belief) gradient via
+    framework AAD needed). INCREMENT 2 adds the market-state (spot/state) gradient via
     `inner_mc_grad_fn`'s `state_t_leaves` (privileged-layout leaf projection; FD-checked by
     `test_diffml_spot_grad_fd`). Turnover cost is ignored here (the toy has none) — a
     documented next-increment slot.
@@ -672,26 +672,32 @@ class DiffSolverV2:
     def _project_leaf_grads(self, leaf_grads, widths, rows, n, md):
         """Map ∂Y/∂(state_t leaf) for each simulated factor into the `(n, md)` gradient w.r.t.
         the privileged market_t columns the value net consumes. `widths` is in market-column
-        order (factor iteration order); a regime-switching spot occupies [belief(width-1),
-        price(1)] (`MarkovHMMSpotModel.reveal_state_at` layout: belief-first, price-last),
-        its belief columns supervised by the `(key,'regime_belief')` belief leaf and its price
-        column by the raw price leaf. Other factors map 1:1 (raw == privileged). Unmeasured /
-        unconnected leaves leave their columns at 0 (masked — only the value supervises them)."""
+        order (factor iteration order) as `(key, width, state_suffixes)`; the suffixes are the
+        process's DIFFERENTIABLE state coordinates (`diff_state_leaves()` — model-agnostic, no
+        regime/belief concept here). Layout convention: state columns first (from the state
+        leaves, in declared order), the trailing price columns last (from the raw factor leaf).
+        Factors with no state suffix map 1:1 raw→privileged (a curve) or leave the non-price
+        state masked (e.g. a detached-variance coordinate). Unmeasured / unconnected leaves
+        leave their columns at 0 (masked — only the value supervises them)."""
         g = torch.zeros(n, md, device=self.device)
         col = 0
-        for key, width in widths:
+        for key, width, suffixes in widths:
             if width <= 0:                                      # privileged-empty factor (not in market_t)
                 continue
-            gb = leaf_grads.get((key, 'regime_belief'))
             gr = leaf_grads.get(key)
-            if gb is not None and gb[..., rows].numel() == (width - 1) * n:   # spot: belief + price
-                nb = width - 1
-                g[:, col:col + nb] = gb[..., rows].reshape(nb, n).transpose(0, 1)
-                if gr is not None and gr[..., rows].numel() == n:
-                    g[:, col + nb] = gr[..., rows].reshape(-1)
-            elif gr is not None and gr[..., rows].numel() == width * n:        # 1:1 raw → privileged
+            kr = (gr[..., rows].numel() // n) if gr is not None else 0         # raw-leaf column count (price)
+            if suffixes:
+                gb = leaf_grads.get((key, suffixes[0]))                        # single state leaf today
+                if gb is not None and gb[..., rows].numel() == (width - kr) * n:
+                    nb = width - kr
+                    g[:, col:col + nb] = gb[..., rows].reshape(nb, n).transpose(0, 1)
+                    if gr is not None and kr >= 1:
+                        g[:, col + nb:col + width] = gr[..., rows].reshape(kr, n).transpose(0, 1)
+                # else: state leaf absent/mismatched → whole block masked (value-only)
+            elif kr == width:                                                 # 1:1 raw → privileged (curve)
                 g[:, col:col + width] = gr[..., rows].reshape(width, n).transpose(0, 1)
-            # else: leaf shape doesn't match the privileged block → leave 0 (masked, value-only)
+            elif gr is not None and kr >= 1:                                  # masked state + price (raw last)
+                g[:, col + width - kr:col + width] = gr[..., rows].reshape(kr, n).transpose(0, 1)
             col += width
         return g
 
@@ -707,7 +713,7 @@ class DiffSolverV2:
 
         # GRAD inner-MC fork: AAD-live one-step F_t1/L_t1/market_t1 + per-process state-at-t
         # LEAVES. Bootstrap value Y AND its pathwise gradients w.r.t. W0 (wealth) and the
-        # market state (spot/belief) come from the SAME forward — the full Huge–Savine twin
+        # market state (spot/state) come from the SAME forward — the full Huge–Savine twin
         # loss. ∂Y/∂market_t is the differential constraint that regularizes the market
         # dimension (where a value-only / W-only fit overfits the few outer paths).
         # Row-aware grad-slice width: the grad fork's tape scales with remaining rows × flat —
@@ -758,21 +764,27 @@ class DiffSolverV2:
             self._proj_checked = True                  # one-time self-check of the label projection
             mt, col, errs = ig["market_t"].detach(), 0, []      # detach: numeric self-check only
             n = mt.shape[0]
-            for key, width in widths:
+            for key, width, suffixes in widths:
                 if width <= 0:
                     continue
-                bl, pl = leaves.get((key, "regime_belief")), leaves.get(key)
-                bl = bl.detach() if bl is not None else None
+                pl = leaves.get(key)
                 pl = pl.detach() if pl is not None else None
-                if bl is not None and bl.numel() == (width - 1) * n:            # spot: belief + price
-                    nb = width - 1
+                kr = (pl.numel() // n) if pl is not None else 0
+                bl = leaves.get((key, suffixes[0])) if suffixes else None
+                bl = bl.detach() if bl is not None else None
+                if bl is not None and bl.numel() == (width - kr) * n:          # state + price
+                    nb = width - kr
                     be = float((mt[:, col:col + nb] - bl.reshape(nb, -1).transpose(0, 1)).abs().max())
-                    pe = float((mt[:, col + nb] - pl.reshape(-1)).abs().max()) if pl is not None and pl.numel() == n else -1.0
-                    errs.append(f"{utils.check_tuple_name(key)}[belief={be:.1g},price={pe:.1g}]")
-                elif pl is not None and pl.numel() == width * n:               # 1:1 raw → privileged
+                    pe = float((mt[:, col + nb:col + width] - pl.reshape(kr, -1).transpose(0, 1)).abs().max()) \
+                        if pl is not None and kr >= 1 else -1.0
+                    errs.append(f"{utils.check_tuple_name(key)}[state={be:.1g},price={pe:.1g}]")
+                elif not suffixes and pl is not None and kr == width:          # 1:1 raw → privileged
                     e = float((mt[:, col:col + width] - pl.reshape(width, -1).transpose(0, 1)).abs().max())
                     errs.append(f"{utils.check_tuple_name(key)}[1:1={e:.1g}]")
-                else:                                                          # belief leaf absent → masked
+                elif not suffixes and pl is not None and kr >= 1:              # masked state + price
+                    pe = float((mt[:, col + width - kr:col + width] - pl.reshape(kr, -1).transpose(0, 1)).abs().max())
+                    errs.append(f"{utils.check_tuple_name(key)}[maskedstate,price={pe:.1g}]")
+                else:                                                          # leaf absent → masked
                     errs.append(f"{utils.check_tuple_name(key)}[unmeasured]")
                 col += width
             logging.info("DiffSolverV2 differential-label projection check (privileged market_t "

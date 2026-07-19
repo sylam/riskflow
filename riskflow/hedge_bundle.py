@@ -372,7 +372,7 @@ def _calibrated_utility_inputs(bundle, runtime, stoch_factors):
     Spot_Price_History-absent fallback for `resolve_utility_scale`. Spot is the sim-day-0
     CommodityPrice level (bundle factor row 0 = the price-factor Spot); σ is the underlying
     process's calibrated annualized vol (`StochasticProcess.calibrated_annual_vol`). When
-    several CommodityPrice factors exist (cross-market strips), the regime/belief-owning
+    several CommodityPrice factors exist (cross-market strips), the sufficient-statistic-owning
     primary is preferred — the martingale the tradeable futures reference. Returns
     (commodity, spot, sigma) or None when no referenced underlying reports a calibrated vol."""
     factors = bundle.get('factors') or {}
@@ -385,8 +385,9 @@ def _calibrated_utility_inputs(bundle, runtime, stoch_factors):
         sigma = proc.calibrated_annual_vol()
         if sigma is None or sigma <= 0.0:
             continue
-        # belief-owning (regime) spots sort first — the martingale primary of a cross-market strip.
-        candidates.append((not hasattr(proc, '_forward_belief'), name, float(sigma)))
+        # Spots exposing a revealed sufficient statistic (HMM belief, GARCH log-variance) sort
+        # first — the martingale primary of a cross-market strip.
+        candidates.append((not bool(proc.privileged_layout(proc.param)), name, float(sigma)))
     if not candidates:
         return None
     candidates.sort()

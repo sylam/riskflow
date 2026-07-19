@@ -19,6 +19,7 @@
 # import standard libraries
 import copy
 import itertools
+import logging
 
 # 3rd party libraries
 import numpy as np
@@ -198,6 +199,46 @@ class StochasticProcess(object):
         `self.factor_key` is set for every stochastic factor by the calc before reveal is ever
         called (calculation.py, `value.factor_key = key`)."""
         return [(buffer[self.factor_key][t], REVEAL_CONTINUOUS)]
+
+    def inner_fork_seed(self, factor_key, outer_buf, t):
+        """Buffer entries seeding this process's inner-MC fork at outer time `t` from the
+        outer path — the per-outer-path t=0 privileged sufficient statistic the fork reprices
+        from (regime for the HMM, conditional variance for GARCH). Keyed by the buffer key the
+        process's `generate` consumes, so the forker runs one uniform loop across process types
+        instead of type-branching. Default: nothing to seed."""
+        return {}
+
+    # ---- Model-agnostic reseed protocol (the calc / solver speak only these verbs) ----------
+    # A process owns every model-specific buffer key and recursion; the calc loops uniformly and
+    # never mentions a regime, belief, or variance. Base implementations are inert no-ops.
+
+    def outer_reseed(self):
+        """Buffer entries seeding the NEXT outer run's t=0 state from THIS run's just-generated
+        terminal state — the diff-ML `Randomize_Initial_State` burn-in. Returned (not written)
+        so the calc can stash them across the reset that clears the buffer. Default: none."""
+        return {}
+
+    def reseed_from_path(self, simulated, shared_mem):
+        """Re-derive and publish this process's path-dependent revealed state ALONG a supplied
+        path `simulated` (the `Observed_Scenario` / stepper replay, where a driver path replaces
+        the generated one). Publishes to `shared_mem.t_Scenario_Buffer` under this process's own
+        keys. Default: nothing to replay."""
+        pass
+
+    def reseed_inner_state(self, factor_key, simulated, outer_buf, t, shared_mem, opts, with_grad):
+        """Post-generate inner-fork coherence: publish any path-dependent revealed state the
+        bootstrap's `reveal_state_at` consumes at t+1 (e.g. a filtered belief), keyed by this
+        process. `opts` forwards hedging-problem switches opaquely (the calc never interprets
+        them). Returns grad-leaf entries `{key: leaf}` to fold into the twin-loss `state_t_leaves`
+        when `with_grad`. Default: nothing to publish, no leaves."""
+        return {}
+
+    def diff_state_leaves(self):
+        """Ordered buffer-key suffixes of this process's DIFFERENTIABLE state coordinates — the
+        market columns (before the trailing price) the twin loss supervises via a state leaf
+        rather than the raw factor leaf. The solver reads this to project leaf grads into market
+        columns without knowing any model concept. Default: none (price-only / masked state)."""
+        return ()
 
     def forward_curve(self, tensor, time_grid_years, shared, mul_time=True):
         """`utils.calc_curve_forwards` lifted to a per-path BATCH of curves. `tensor` is
@@ -2472,6 +2513,53 @@ class MarkovHMMSpotModel(StochasticProcess):
                 .to(dtype=buffer[key].dtype).movedim(-1, 0)                   # (n_states, ...batch)
         return [(block, REVEAL_SUFFICIENT), (price, REVEAL_CONTINUOUS)]
 
+    def inner_fork_seed(self, factor_key, outer_buf, t):
+        """Per-outer-path t=0 regime seed: the regime at the fork step, read by generate()'s
+        `regime0_inner` hook so the inner fan-out continues the forked path's regime instead
+        of redrawing from π_0."""
+        return {(factor_key, 'regime0_inner'): outer_buf[(factor_key, 'regimes')][t]}
+
+    def outer_reseed(self):
+        """t=0 regime seed for the next outer run's burn-in: the terminal regime of this run."""
+        return {(self.factor_key, 'regime0_outer'): self.last_regime_path[-1].detach()}
+
+    def reseed_from_path(self, simulated, shared_mem):
+        """Observed-path replay: refilter the HMM belief along the supplied price path and
+        publish it (B-last, as generate does), so `reveal_state_at` returns the participant
+        posterior on the replayed path instead of the true-regime one-hot fallback."""
+        belief = self._forward_belief(simulated.detach(), simulated.device)
+        shared_mem.t_Scenario_Buffer[(self.factor_key, 'regime_belief')] = \
+            belief.permute(0, 2, 1).contiguous()
+
+    def reseed_inner_state(self, factor_key, simulated, outer_buf, t, shared_mem, opts, with_grad):
+        """Inner-fork belief coherence: publish a one-step filtered belief (seeded from the outer
+        entry posterior, updated on the inner price move) so the bootstrap's z_{t+1} regime block
+        is the participant posterior, not the privileged true-regime one-hot. Off (→ one-hot)
+        when `Inner_Belief_Filter` is not 'Yes' or no outer belief was published. With grad, the
+        belief seed is a leaf so the twin loss supervises the belief column."""
+        belief0 = outer_buf.get((factor_key, 'regime_belief'))
+        if not (opts.get('Inner_Belief_Filter', 'Yes') == 'Yes' and belief0 is not None):
+            return {}
+        seed = belief0[t]
+        leaves = {}
+        if with_grad:
+            seed = seed.detach().clone().requires_grad_(True)
+            leaves[(factor_key, 'regime_belief')] = seed
+        inner_belief = self.inner_forward_belief(simulated, seed)
+        shared_mem.t_Scenario_Buffer[(factor_key, 'regime_belief')] = inner_belief
+        if not getattr(self, '_logged_inner_belief', False):
+            self._logged_inner_belief = True
+            sums = inner_belief.sum(dim=1)
+            logging.info(
+                'inner belief filter ACTIVE for %s: shape=%s n_states=%d normalized=%s (replaces '
+                'the privileged true-regime one-hot in the bootstrap z_{t+1})',
+                utils.check_tuple_name(factor_key), tuple(inner_belief.shape), inner_belief.shape[1],
+                bool(torch.allclose(sums, torch.ones_like(sums), atol=1.0e-4)))
+        return leaves
+
+    def diff_state_leaves(self):
+        return ('regime_belief',)
+
     def calibrated_annual_vol(self):
         """Stationary regime-weighted annualized vol: σ = √(Σ_i π_i σ_i²), with π the stationary
         distribution of the calibration-DT transition matrix P (left eigenvector for eigenvalue 1).
@@ -2754,6 +2842,324 @@ class MarkovHMMSpotCalibration(object):
         delta = pd.DataFrame({data_frame.columns[0]: innov}, index=diffs.index)
 
         return utils.CalibrationInfo(param, [[1.0]], delta)
+
+
+class GARCHSpotModel(StochasticProcess):
+    """Zero-mean GARCH(1,1)-t spot-price model — martingale primary by construction:
+    E[Δlog S | filtration] = μ·dt with `Mu` defaulting to 0. The conditional variance
+    `h_t` is a deterministic recursion on realized returns (no belief filter), exactly
+    observable, and revealed to the value function as `log h_t`. Drop-in for the HMM: same
+    outer/inner generate contract, same buffer conventions, same privileged-state plumbing.
+
+        ε_k ~ standardized Student-t(ν) (unit variance);  r_k = √h_k · ε_k
+        Δlog S over step k = μ·dt_c + r_k;  h_{k+1} = ω + α·r_k² + β·h_k;  h_0 = H0
+
+    No-lookahead: `h_t` is the variance of the step t→t+1, a function of returns strictly
+    before t, so `log h_t` is known at decision time t.
+
+    JSON config:
+        Omega, H0: per-calibration-step variance of FRACTION log returns (ω>0, H0>0).
+        Alpha, Beta: GARCH weights (α≥0, β≥0, α+β≤0.999).
+        Nu: Student-t degrees of freedom (>2.05).
+        Mu: annualised drift (default 0 — 16y of daily data cannot identify it).
+        Log_Price: bool (default True; the model is defined in log-return units).
+        Calibration_DT_Years: step size of the recursion (default 1/252)."""
+
+    documentation = (
+        'Asset Pricing',
+        ['A zero-mean GARCH(1,1) spot-price model with standardised Student-t innovations on '
+         'the log return $r_t = \\Delta\\log S_t - \\mu\\delta$. The conditional variance follows',
+         '',
+         '$$ r_t = \\sqrt{h_t}\\,\\varepsilon_t,\\quad \\varepsilon_t\\sim t_\\nu\\ (\\text{unit var}),'
+         '\\quad h_{t+1} = \\omega + \\alpha r_t^2 + \\beta h_t $$',
+         '',
+         'The variance $h_t$ is an exactly observable deterministic recursion on realised '
+         'returns — no latent state, no belief filter — revealed to the value function as '
+         '$\\log h_t$. Long-memory volatility comes from persistence $\\alpha+\\beta\\to 1$, fat '
+         'tails from the Student-t emission.',
+         '',
+         'Parameters:',
+         '- **Omega, H0**: per-step variance of fraction log returns.',
+         '- **Alpha, Beta**: GARCH weights ($\\alpha+\\beta\\le 0.999$).',
+         '- **Nu**: Student-t degrees of freedom.',
+         '- **Mu**: annualised drift (default 0).',
+         '- **Calibration_DT_Years**: step size of the recursion (default 1/252).'])
+
+    def __init__(self, factor, param, implied_factor=None):
+        super().__init__(factor, param)
+        assert (param['Omega'] > 0.0 and param['Alpha'] >= 0.0 and param['Beta'] >= 0.0
+                and param['Alpha'] + param['Beta'] <= 0.999 and param['Nu'] > 2.05
+                and param['H0'] > 0.0), f'GARCHSpotModel invalid params: {param}'
+
+    @staticmethod
+    def num_factors():
+        return 1
+
+    @property
+    def correlation_name(self):
+        return 'GARCHSpotProcess', [()]
+
+    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
+        # Anchor at time_grid_years[0] so per-step dt is correct under both outer mode
+        # (scen_time_grid[0] = 0) and inner-MC kept-base mode (scen_time_grid[0] > 0).
+        tg_years = time_grid.time_grid_years
+        dt_arr = np.diff(np.hstack(([tg_years[0]], tg_years)))
+        dt_c = float(self.param['Calibration_DT_Years'])
+
+        def _t(arr):
+            return shared.one.new_tensor(arr)
+
+        self.omega = _t(float(self.param['Omega']))
+        self.alpha = _t(float(self.param['Alpha']))
+        self.beta = _t(float(self.param['Beta']))
+        self.nu = _t(float(self.param['Nu']))
+        self.h0_default = _t(float(self.param['H0']))
+        self.drift = _t(float(self.param.get('Mu', 0.0)) * dt_arr)               # (T,) μ·dt per step
+        # Fractional trading clock. The recursion is calibrated per business day (dt_c);
+        # the sim grid runs in CALENDAR time (Time_Grid "0d 1d(1d)" ⇒ dt=1/365.25, NOT
+        # business-day adjusted), so f_t = dt_t/dt_c is the trading-time length of a grid
+        # step (≈0.69 on the production grid). generate scales per-step variance by f_t so
+        # the annualized vol and the mean-reversion RATE are grid-invariant (see §1a of the
+        # spec). n_sub = round(f) ≥ 2 (grid ≥ ~1.5 bd/step) falls back to the integer
+        # aggregate-variance bridge; n_sub == 1 uses the exact fractional step.
+        self.f = _t(dt_arr / dt_c)                                               # (T,) trading-time step length
+        self.n_sub = np.maximum(1, np.round(dt_arr / dt_c)).astype(int)
+        if np.any(self.n_sub >= 2):
+            # Diagnostic (INFO, not WARN — precalculate reruns on every inner fork): only the
+            # coarse-grid aggregate-variance bridge is an approximation; the fractional step is
+            # exact for n_sub == 1 (incl. the calendar-daily production grid, f≈0.69).
+            logging.info('GARCHSpotModel coarse grid: n_sub up to %d — aggregate-variance bridge '
+                         'active (within-step vol-of-vol approximated).', int(self.n_sub.max()))
+        self._log_lr_var = float(np.log(self.param['Omega'] / (1.0 - self.param['Alpha'] - self.param['Beta'])))
+
+        # AAD: keep spot0 on the autograd graph. In log mode h depends only on generated
+        # innovations, never on spot0, so price-AAD w.r.t. spot0 is unaffected by the vol
+        # recursion. Outer mode passes a (1,) scalar; inner-MC mode a (B,) per-outer-path vector.
+        self.spot0 = tensor
+
+    def _simulate_returns(self, eps, h):
+        """Shared GARCH recursion (outer/inner) on the FRACTIONAL TRADING CLOCK. `eps` (T, ...)
+        unit-variance standardised-t innovations, `h` (...) the entry variance h_0 (per business
+        day). Returns (ds, log_h), each (T, ...): ds[t] is Δlog S landing at grid point t
+        (ds[0]=0 — the dt=0 anchor), log_h[t] is the revealed variance of the move t→t+1
+        (no-lookahead: a function of eps[1..t] only).
+
+        Per step with trading-time length f_t = dt_t/dt_c:
+            r_t = √(h_t·f_t)·ε_t,   h_{t+1} = h_t + f_t·(ω − (1−β)·h_t) + α·r_t².
+        This is the standard recursion at f=1, has E-fixed-point ω/(1−α−β) for any f, and a
+        per-step mean-reversion factor (1 − f(1−α−β)) so the decay RATE is grid-invariant in
+        real time. n_sub ≥ 2 (grid coarser than ~1.5 bd) uses the integer aggregate-variance
+        bridge instead (deterministic sub-step forward, single aggregate draw)."""
+        omega, alpha, beta = self.omega, self.alpha, self.beta
+        drift, n_sub, f = self.drift, self.n_sub, self.f
+        log_h = torch.empty_like(eps)
+        ds = torch.zeros_like(eps)
+        log_h[0] = h.log()
+        for t in range(1, eps.shape[0]):
+            if n_sub[t] <= 1:
+                ft = f[t]
+                r = (h * ft).sqrt() * eps[t]
+                h = h + ft * (omega - (1.0 - beta) * h) + alpha * r * r
+            else:
+                # n_sub≥2: only one Gaussian per grid step — forward h deterministically through
+                # the integer sub-steps via E[r²]=h and draw the aggregate return with the summed
+                # variance. Loses within-step vol-of-vol (documented approximation).
+                h_j, var = h, h
+                for _ in range(1, n_sub[t]):
+                    h_j = omega + (alpha + beta) * h_j
+                    var = var + h_j
+                r = var.sqrt() * eps[t]
+                h = omega + (alpha + beta) * h_j
+            ds[t] = drift[t] + r
+            log_h[t] = h.log()
+        return ds, log_h
+
+    def generate(self, shared_mem):
+        # Z is (T, B) outer, (T, B, B2) inner. One framework Gaussian per step; the
+        # standardised-t rescale draws its own Gamma (no regime sampling → no quasi_rng).
+        # ε is unit-variance and independent of h, so it precomputes fully vectorised.
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        nu = self.nu
+        W = torch.distributions.Gamma(nu / 2.0, 0.5).sample(Z.shape).clamp_min(1.0e-6)
+        eps = Z * torch.sqrt(nu / W) * torch.sqrt((nu - 2.0).clamp_min(1.0e-3) / nu)
+
+        if Z.ndim == 2:
+            T, B = Z.shape
+            # h0: the diff-ML t=0 randomization hook (mirrors regime0_outer); else H0 expanded.
+            h0 = shared_mem.t_Scenario_Buffer.get((self.factor_key, 'h0_outer'))
+            h = h0 if h0 is not None else torch.zeros_like(Z[0]) + self.h0_default
+            ds, log_h = self._simulate_returns(eps, h)
+            s0 = self.spot0.expand(B)                                            # (1,) -> (B,)
+            log_path = s0.log().unsqueeze(0) + ds.cumsum(dim=0)                  # (T, B)
+        else:
+            T, B, B2 = Z.shape
+            # h0: per-outer-path fork seed (mirrors regime0_inner), expanded across B2; else H0.
+            h0 = shared_mem.t_Scenario_Buffer.get((self.factor_key, 'h0_inner'))
+            h = h0.view(B, 1).expand(B, B2) if h0 is not None else torch.zeros_like(Z[0]) + self.h0_default
+            ds, log_h = self._simulate_returns(eps, h)
+            s0 = self.spot0                                                      # (B,)
+            log_path = s0.view(B, 1).log() + ds.cumsum(dim=0)                    # (T, B, B2)
+        # Floor the log-path before exp(): a fat-tailed Student-t innovation can drive it below
+        # the float underflow threshold, where exp() returns 0.0 and breaks the price invariant.
+        spot_path = log_path.clamp_min(-10.0).exp()
+
+        # Revealed state, detached (consumed as a state coordinate, not differentiated through —
+        # same rationale as the HMM belief detach). B-LAST shape so the buffer's dim=-1 concat
+        # works: (T, 1, B) outer / (T, 1, B, B2) inner. Stash the (T, B) form for privileged_factors.
+        shared_mem.t_Scenario_Buffer[(self.factor_key, 'garch_log_h')] = log_h.detach().unsqueeze(1)
+        self.last_log_h = log_h.detach()
+        return spot_path
+
+    @classmethod
+    def privileged_layout(cls, param):
+        return {'log_h': 1}
+
+    def privileged_factors(self, simulated):
+        # (T, B, 1) — matches the HMM's (T, B, n) accumulator convention. Called outer-mode only.
+        return {'log_h': self.last_log_h.to(torch.float32).unsqueeze(-1)}
+
+    def reveal_state_at(self, t, buffer):
+        """GARCH spot: log_h-first / price-last (the calc concatenates the segments in this
+        order — mirrors the HMM's belief-first/price-last packing). `log h_t` is the exactly
+        observable SUFFICIENT statistic; the observable spot level is the last CONTINUOUS
+        coordinate. Rank-check the buffered log-h against the current mode (outer (T,1,B) vs
+        price (T,B); inner (T,1,B,B2) vs (T,B,B2) ⇒ log_h.dim() == price.dim()+1), else the
+        defensive long-run-variance fallback when the buffer key is absent."""
+        key = self.factor_key
+        price = buffer[key][t].unsqueeze(0)                                      # (1, ...batch)
+        log_h = buffer.get((key, 'garch_log_h'))
+        if log_h is not None and log_h.dim() == buffer[key].dim() + 1:
+            block = log_h[t]                                                     # (1, ...batch)
+        else:
+            block = torch.full_like(price, self._log_lr_var)
+        return [(block, REVEAL_SUFFICIENT), (price, REVEAL_CONTINUOUS)]
+
+    def inner_fork_seed(self, factor_key, outer_buf, t):
+        """Per-outer-path t=0 conditional-variance seed: h0_inner = exp(outer log h_t), so the
+        inner fan-out reprices from the forked path's vol state, not the calibrated H0. Without
+        it the one-step bootstrap labels are wrong (repriced from the base-date variance)."""
+        return {(factor_key, 'h0_inner'): outer_buf[(factor_key, 'garch_log_h')][t].reshape(-1).exp()}
+
+    def outer_reseed(self):
+        """t=0 conditional-variance seed for the next outer run's burn-in: terminal h of this run."""
+        return {(self.factor_key, 'h0_outer'): self.last_log_h[-1].exp()}
+
+    def reseed_from_path(self, simulated, shared_mem):
+        """Observed-path replay: rerun the GARCH variance recursion (fractional clock) on the
+        REALIZED returns of the supplied price path, publishing `garch_log_h` (so reveal returns
+        the right log h along the replayed path) and `h0_outer` (the terminal h, for a continuing
+        replay). Closes the stepper-replay gap — replays used to reseed nothing in a GARCH world."""
+        obs = simulated.detach()
+        logret = obs.clamp_min(1.0e-30).log()
+        omega, alpha, beta = self.omega, self.alpha, self.beta
+        f, drift, n_sub = self.f, self.drift, self.n_sub
+        h = torch.zeros_like(obs[0]) + self.h0_default                       # (…B) = H0
+        log_h = torch.empty_like(obs)
+        log_h[0] = h.log()
+        for t in range(1, obs.shape[0]):
+            if n_sub[t] <= 1:
+                r = (logret[t] - logret[t - 1]) - drift[t]                   # realized innovation
+                h = h + f[t] * (omega - (1.0 - beta) * h) + alpha * r * r
+            else:
+                h_j = h                                                      # deterministic bridge (as generate)
+                for _ in range(1, n_sub[t]):
+                    h_j = omega + (alpha + beta) * h_j
+                h = omega + (alpha + beta) * h_j
+            log_h[t] = h.log()
+        shared_mem.t_Scenario_Buffer[(self.factor_key, 'garch_log_h')] = log_h.unsqueeze(1)
+        shared_mem.t_Scenario_Buffer[(self.factor_key, 'h0_outer')] = h
+
+    def calibrated_annual_vol(self):
+        """Long-run annualised (fractional) vol √(ω/(1−α−β) / dt_c) — the stationary GARCH vol.
+        Log_Price is always True here (a log-return model), so it is returned as a fraction,
+        consumed directly by the utility-scale fallback."""
+        p = self.param
+        return float(np.sqrt(p['Omega'] / (1.0 - p['Alpha'] - p['Beta']) / p['Calibration_DT_Years']))
+
+    @classmethod
+    def calibrate(cls, data_frame, vol_shift=0.0, num_business_days=252.0):
+        """Zero-mean GARCH(1,1)-t MLE on a business-daily close series (§5). The fit runs in
+        percent-return units (100·r) for conditioning, then converts ω, H0 back to fraction
+        (×1e-4). Uses `arch` if importable, else scipy L-BFGS-B on the identical standardised-t
+        log-likelihood. Returns the §2 param dict; H0 is the filtered conditional variance at
+        the final observation. `Mu` is fixed at 0 — 16y of daily data cannot identify the drift
+        (s.e. ≈ σ/√years ≈ 5.6% unconditional)."""
+        from scipy.special import gammaln
+
+        dt_c = 1.0 / float(num_business_days)
+        px = data_frame.iloc[:, 0].astype(np.float64).dropna()
+        r = np.log(px).diff().dropna()
+        r = r[r.abs() < 0.25].values                                            # outlier guard
+        x = 100.0 * r                                                           # percent units
+        var0 = float(np.var(x))
+
+        def negll(th):
+            omega, alpha, beta, nu = th
+            if omega <= 0.0 or nu <= 2.0 or alpha < 0.0 or beta < 0.0:
+                return 1.0e10
+            h = np.empty_like(x)
+            h[0] = var0
+            for i in range(1, len(x)):
+                h[i] = omega + alpha * x[i - 1] ** 2 + beta * h[i - 1]
+            ne = nu - 2.0
+            ll = (gammaln((nu + 1) / 2) - gammaln(nu / 2) - 0.5 * np.log(ne * np.pi)
+                  - 0.5 * np.log(h) - (nu + 1) / 2 * np.log1p(x ** 2 / (h * ne)))
+            return -ll.sum()
+
+        try:
+            from arch import arch_model
+            res = arch_model(x, mean='Zero', vol='GARCH', p=1, q=1, dist='t').fit(disp='off')
+            omega, alpha, beta, nu = (float(res.params[k]) for k in ('omega', 'alpha[1]', 'beta[1]', 'nu'))
+            se = {k: float(v) for k, v in zip(('omega', 'alpha', 'beta', 'nu'), res.std_err[
+                ['omega', 'alpha[1]', 'beta[1]', 'nu']].values)}
+            h_last = float((res.conditional_volatility ** 2)[-1])
+        except ImportError:
+            from scipy.optimize import minimize
+            opt = minimize(negll, np.array([0.01, 0.05, 0.90, 8.0]), method='L-BFGS-B',
+                           bounds=[(1e-8, None), (0.0, 0.999), (0.0, 0.999), (2.05, 200.0)],
+                           options={'maxiter': 1000, 'ftol': 1e-12, 'gtol': 1e-8})
+            omega, alpha, beta, nu = opt.x
+            # Numerical Hessian → asymptotic standard errors (central second differences,
+            # per-coordinate step since ω~1e-2 and ν~7.5 differ by orders of magnitude).
+            step = 1e-4 * (np.abs(opt.x) + 1e-3)
+            H = np.zeros((4, 4))
+            for i in range(4):
+                for j in range(i, 4):
+                    ei, ej = np.zeros(4), np.zeros(4)
+                    ei[i], ej[j] = step[i], step[j]
+                    H[i, j] = H[j, i] = (negll(opt.x + ei + ej) - negll(opt.x + ei - ej)
+                                         - negll(opt.x - ei + ej) + negll(opt.x - ei - ej)
+                                         ) / (4 * step[i] * step[j])
+            se = dict(zip(('omega', 'alpha', 'beta', 'nu'), np.sqrt(np.abs(np.diag(np.linalg.inv(H))))))
+            h = np.empty_like(x)
+            h[0] = var0
+            for i in range(1, len(x)):
+                h[i] = omega + alpha * x[i - 1] ** 2 + beta * h[i - 1]
+            h_last = float(h[-1])
+
+        if alpha + beta > 0.999:
+            logging.warning('GARCH persistence %.5f > 0.999 — scaling beta down.', alpha + beta)
+            beta = 0.999 - alpha
+        nu = max(float(nu), 2.05)
+
+        omega_f = float(omega) * 1.0e-4                                         # percent → fraction
+        H0 = h_last * 1.0e-4
+        persistence = alpha + beta
+        lr_vol_ann = float(np.sqrt(omega_f / (1.0 - persistence) / dt_c))
+        half_life = float(np.log(0.5) / np.log(persistence))
+        logging.info(
+            'GARCH(1,1)-t fit: omega=%.4e (se %.2e) alpha=%.4f (t=%.1f) beta=%.4f (t=%.1f) '
+            'nu=%.3f (t=%.1f) | persistence=%.5f half-life=%.0fbd LR-ann-vol=%.4f H0=%.4e (ann %.4f)',
+            omega_f, se['omega'] * 1e-4, alpha, alpha / se['alpha'], beta, beta / se['beta'],
+            nu, nu / se['nu'], persistence, half_life, lr_vol_ann, H0, float(np.sqrt(H0 / dt_c)))
+
+        return {
+            'Omega': omega_f, 'Alpha': float(alpha), 'Beta': float(beta), 'Nu': float(nu),
+            'Mu': 0.0, 'H0': H0, 'Log_Price': True, 'Calibration_DT_Years': dt_c,
+        }
 
 
 class VARMixedFactorInterestRateModel(StochasticProcess):
@@ -3182,7 +3588,16 @@ class BasisLinkedSpotModel(StochasticProcess):
         self.A = float(self.param['A'])
         self.Phi = float(self.param['Phi'])
         self.Nu = float(self.param['Nu'])
-        self.sigma_by_state = shared.one.new_tensor(np.array(self.param['Sigma_By_State'], dtype=np.float64))
+        # Two innovation forms, chosen by which key the JSON block carries (exactly one):
+        #   Sigma_By_State — regime-conditional σ_s, indexed by the primary's HMM regime path;
+        #   Sigma          — flat single-vol OU, no regime read (for a regime-free primary,
+        #                    e.g. the GARCH martingale primary).
+        has_flat, has_regime = ('Sigma' in self.param), ('Sigma_By_State' in self.param)
+        assert has_flat != has_regime, \
+            f"BasisLinkedSpotModel needs exactly one of 'Sigma' / 'Sigma_By_State': {self.param}"
+        self.sigma_by_state = (shared.one.new_tensor(np.array(self.param['Sigma_By_State'], dtype=np.float64))
+                               if has_regime else None)
+        self.sigma_flat = None if has_regime else shared.one.new_tensor(float(self.param['Sigma']))
         # AAD: keep b0 on the autograd graph so sensitivities of payoffs w.r.t. the
         # observed initial basis flow through. Stored as-is so inner-MC mode can pass
         # a `(B,)` vector of per-outer-path initial bases; outer mode is `(1,)`.
@@ -3201,10 +3616,19 @@ class BasisLinkedSpotModel(StochasticProcess):
         # process exp()s its log-cumsum before publishing. Path/regime shapes match
         # this process's Z, since both processes ran in the same inner/outer mode.
         linked_path = shared_mem.t_Scenario_Buffer[self.linked_key]
-        regimes = shared_mem.t_Scenario_Buffer[(self.linked_key, 'regimes')]
         assert (linked_path > 0).all(), 'linked_path expected to be all positive'
 
-        sigma_t = self.sigma_by_state[regimes]
+        if self.sigma_by_state is not None:
+            regimes = shared_mem.t_Scenario_Buffer.get((self.linked_key, 'regimes'))
+            if regimes is None:
+                raise KeyError(
+                    f"{utils.check_tuple_name(self.factor_key)} uses regime-conditional "
+                    f"Sigma_By_State but its primary {utils.check_tuple_name(self.linked_key)} "
+                    f"publishes no regimes — give this basis a flat 'Sigma' (single-vol OU) or "
+                    f"pair it with a regime-switching primary.")
+            sigma_t = self.sigma_by_state[regimes]
+        else:
+            sigma_t = self.sigma_flat
         # Student-t innovation: η_t = sigma_t · ε_t · √((ν-2)/ν), ε_t ~ t_ν.
         # Identity: ε_t = Z · √(ν/W) where W ~ Chi²(ν). Combine the rescaling so the
         # marginal variance of η_t is sigma_t² regardless of ν.

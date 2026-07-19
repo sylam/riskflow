@@ -798,7 +798,7 @@ from riskflow.stochasticprocess import (                                       #
     GBMAssetPriceModel, GBMPriceIndexModel, GBMAssetPriceTSModelImplied,
     SingleRegimeOU1FactorKalmanModel, HWHazardRateModel,
     HullWhite2FactorImpliedInterestRateModel, CSForwardPriceModel,
-    PCAInterestRateModel,
+    PCAInterestRateModel, GARCHSpotModel,
 )
 
 
@@ -846,6 +846,18 @@ def _setup_hw1f_inner(B, B2, T=10):
     bumps = torch.linspace(-0.004, 0.004, B, dtype=DTYPE, device=DEVICE).view(1, -1)
     curve = base + bumps                                                        # (n_tenors, B) distinct
     p.precalculate(REF_DATE, _time_grid(T), curve, sh, process_ofs=0)
+    return p, sh
+
+
+def _setup_garch_inner(B, B2, T=10):
+    sh = _inner_shared(1, B, B2)
+    p = GARCHSpotModel(factor=types.SimpleNamespace(param={}),
+                       param={'Omega': 8.028e-07, 'Alpha': 0.0328, 'Beta': 0.9639, 'Nu': 7.5,
+                              'Mu': 0.0, 'H0': 7.671e-04, 'Log_Price': True,
+                              'Calibration_DT_Years': 1.0 / 252.0})
+    p.factor_key = utils.Factor('CommodityPrice', ('GARCH',))
+    spot = torch.linspace(1800.0, 2200.0, B, dtype=DTYPE, device=DEVICE)        # distinct per outer
+    p.precalculate(REF_DATE, _time_grid(T), spot, sh, process_ofs=0)
     return p, sh
 
 
@@ -922,6 +934,7 @@ def _setup_hw2f_inner(B, B2, T=10):
     (_setup_gbm_inner, False),
     (_setup_gbmindex_inner, False),
     (_setup_singleregime_inner, False),
+    (_setup_garch_inner, False),
     (_setup_logou_inner, False),
     (_setup_mslogou_inner, False),
     (_setup_hw1f_inner, True),
