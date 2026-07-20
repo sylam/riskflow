@@ -1,0 +1,86 @@
+{
+  "_README": "Realistic transaction-cost calibration for the platinum hedger. Overlay one of the two 'Evaluator_Cost_Block_*' objects onto Calculation.Hedging_Problem.Evaluator in a walk-forward config (they contain ONLY the cost keys to merge; leave Object/Accounting_Mode/Position_Limits/etc. as-is). BASE = central estimate; HIGH = stress case for the free (assumption-driven) knobs. Every number's data basis and proxy caveats are in _calibration_notes below. PROXY WARNING: all spread/liquidity figures are derived from END-OF-DAY OPEN INTEREST and a GARCH/realized vol filter, NOT from quoted intraday bid/offer. They are placeholders pending forward 2pm-synced intraday capture.",
+
+  "Evaluator_Cost_Block_BASE": {
+    "Transaction_Cost_Per_Unit": 0.0,
+    "Bid_Offer_Spread_Bps": {
+      "Default_Bps": 10.0,
+      "Per_Instrument": {
+        "PL_M1": 6.0,
+        "PL_M2": 11.0,
+        "PL_M3": 34.0
+      },
+      "Vol_Scale": {
+        "Ref_Vol": 0.2475,
+        "Beta": 0.5
+      }
+    },
+    "Roll_As_Calendar_Spread": "Yes",
+    "Calendar_Spread_Bps": null,
+    "IM_Funding_Spread_Bps": 100.0,
+    "IM_Vol_Multiplier": 0.085,
+    "IM_Ref_Vol": 0.44
+  },
+
+  "Evaluator_Cost_Block_HIGH": {
+    "Transaction_Cost_Per_Unit": 0.0,
+    "Bid_Offer_Spread_Bps": {
+      "Default_Bps": 10.0,
+      "Per_Instrument": {
+        "PL_M1": 6.0,
+        "PL_M2": 11.0,
+        "PL_M3": 34.0
+      },
+      "Vol_Scale": {
+        "Ref_Vol": 0.2475,
+        "Beta": 1.0
+      }
+    },
+    "Roll_As_Calendar_Spread": "Yes",
+    "Calendar_Spread_Bps": null,
+    "IM_Funding_Spread_Bps": 200.0,
+    "IM_Vol_Multiplier": 0.085,
+    "IM_Ref_Vol": 0.44
+  },
+
+  "_calibration_notes": {
+    "base_date": "2025-12-01",
+    "data_inputs": {
+      "oi_source": "data/pl_exp.csv OPEN_INT_PL1/2/3 (CME end-of-day open interest, contracts)",
+      "im_source": "artifacts/platinum_hedge_shipping.json Portfolio_State.Initial_Margin (per_contract) + Settlement_Prices",
+      "vol_source": "GARCHSpotModel LR=0.2475, base-date filtered H0~0.44; realized-vol cross-check from CommodityPrice.PLATINUM spot log-returns in pl_exp.csv"
+    },
+    "task1_maturity_spread": {
+      "kind": "DATA-DERIVED (proxy: OI liquidity, not quoted spreads)",
+      "base_date_open_interest": {"PL_M1": 65338, "PL_M2": 19069, "PL_M3": 2030},
+      "window_median_open_interest_base_pm30bd": {"PL_M1": 64833, "PL_M2": 18356, "PL_M3": 2040},
+      "ordering": "PL_M1 (front active, Jan26) >> PL_M2 (Apr26) >> PL_M3 (Jul26): front most liquid -> tightest; deferreds wider",
+      "mapping": "half-spread ~ 1/sqrt(OI) (square-root/inventory-risk liquidity law). 1/sqrt(OI) relative to PL_M1 = {PL_M1 1.000, PL_M2 1.851, PL_M3 5.673}. Rejected 1/OI: it gives PL_M3 32x front (too steep for the OI dispersion observed).",
+      "anchor": "PL_M1 full bid-offer = 6.0 bps at NORMAL vol (Ref_Vol=0.2475). Then PL_M2=6*1.851=11.1~11.0, PL_M3=6*5.673=34.0. Consistency check: at the ELEVATED base-date vol (0.44) with Beta=0.5, effective PL_M1 spread = 6*(0.44/0.2475)^0.5 = 8.0 bps, bracketing the current flat 10 bps -> the legacy flat 10 is consistent with a ~6bps normal-vol front + squeeze scaling.",
+      "Default_Bps": "10.0 fallback = the current flat spread (used for any instrument absent from Per_Instrument).",
+      "caveat": "PROXY. OI is a liquidity PROXY, not a quoted spread. Also: at base date PL_M2 is mid-activation so the PL_M1:PL_M2 ratio (3.4:1 by OI) is steeper than the roll-cycle-average (~1.8:1); the 1/sqrt damps this. Replace with quoted 2pm bid/offer when intraday capture is live."
+    },
+    "task2_vol_scale": {
+      "kind": "Ref_Vol DATA-DERIVED; Beta MODELING CHOICE (proxy/assumption)",
+      "Ref_Vol": "0.2475 = GARCH long-run annual vol = 'normal' regime. Cross-checks: realized spot vol full-sample 0.224, 2024-2025 0.251. Base-date is ELEVATED (GARCH H0~0.44; trailing-60bd realized 0.31) so the vol factor (sigma_t/Ref)^Beta > 1 at base date -> spreads widen in the squeeze, as intended.",
+      "Beta_base": "0.5 (sub-linear spread-vol elasticity; typical microstructure range 0.5-0.7). Central estimate.",
+      "Beta_high": "1.0 (spread proportional to vol; Roll/inventory-risk theoretical upper). STRESS case = more cost in high vol.",
+      "sensitivity_note": "Beta is an ASSUMPTION pending intraday spread-vs-vol regression. Eval/retrain MUST report P&L sensitivity across Beta in [0.5, 1.0]. Same sigma_t drives both this and IM funding (documented coupling)."
+    },
+    "task3_im_funding": {
+      "kind": "Multiplier+Ref_Vol DATA-DERIVED (anchor); Funding_Spread MODELING CHOICE (free knob)",
+      "IM_Vol_Multiplier": "0.085 = IM_0/(F_0*cs), computed per leg: PL_M1 7084/(1666.7819*50)=0.085002, PL_M2 7118/(1674.7606*50)=0.085003, PL_M3 7111/(1673.2864*50)=0.084994. Constant to 4 sig figs (std 3.9e-6) -> single scalar 0.085.",
+      "IM_Ref_Vol": "0.44 = base-date filtered GARCH H0 = sigma_0. Setting IM_Ref_Vol=sigma_0 makes (sigma_0/IM_Ref_Vol)=1 at base date, so IM reproduces today's flat Initial_Margin exactly, then scales DOWN as vol mean-reverts toward 0.2475 (IM ~ 3980/ct at normal vol). Captures CME's 2025-squeeze margin hikes qualitatively. RE-ANCHOR if the GARCH is recalibrated (must equal the sim's t=0 revealed vol).",
+      "IM_Funding_Spread_Bps_base": "100.0 bps/yr OVER risk-free (the SOFR margin ledger already earns risk-free; this is the excess funding spread a desk pays). Full 50-ct M1 book funds ~$3,540/yr (~$9.70/day) at base vol -> a second-order cost.",
+      "IM_Funding_Spread_Bps_high": "200.0 bps/yr. STRESS = 2x.",
+      "sensitivity_note": "IM_Funding_Spread_Bps is a pure MODELING CHOICE (not in the data). Report eval/retrain sensitivity across [50, 200] bps."
+    },
+    "task4_calendar_spread": {
+      "kind": "DEFAULT KEPT",
+      "Roll_As_Calendar_Spread": "Yes -> a rebalance that offsets Dq across adjacent maturities pays a single calendar half-cost on the matched quantity instead of two outright half-spreads.",
+      "Calendar_Spread_Bps": "null -> framework default = 0.5*(outright_i+outright_j): the matched roll pays HALF the sum of the two legs' outright kappas (a 50% rebate on the matched leg). Kept: real exchange calendar markets are often cheaper still (20-40% of two outrights), so the 50% default is CONSERVATIVE (does not over-credit the hedger). OI gives no direct calendar-spread liquidity, so no data-driven override.",
+      "caveat": "Composes automatically with the Per_Instrument/Vol_Scale spread since the default rebate is defined off per_contract_kappa."
+    },
+    "proxy_summary": "ALL spread numbers are OI-and-vol PROXIES, not quoted spreads. DATA-DERIVED: Per_Instrument ordering/ratios (OI), Ref_Vol (GARCH LR), IM_Vol_Multiplier + IM_Ref_Vol (IM anchor). MODELING CHOICES (assumption, run sensitivity): Vol_Scale.Beta, IM_Funding_Spread_Bps, the PL_M1 anchor level (6 bps), and the calendar 50% default. Replace with 2pm-synced intraday bid/offer + calendar-spread quotes when available."
+  }
+}
