@@ -188,6 +188,14 @@ class StochasticProcess(object):
         (no vol characterization); spot models that own a calibrated vol override it."""
         return None
 
+    def revealed_annual_vol(self, log_h):
+        """Map this process's revealed log-conditional-variance surface `log_h` (T, B) to
+        annualized fractional vol (T, B), or None if the process exposes no log-variance
+        sufficient statistic. Consumed by the state-dependent bid/offer half-spread
+        (`hedge_runtime.per_contract_kappa` Vol_Scale) — the per-step, per-path vol driver.
+        Default None."""
+        return None
+
     def reveal_state_at(self, t, buffer):
         """Ordered market-state segments `[(block, reveal_kind), ...]` this factor exposes to
         the value function at scenario-time index `t` — the informative deep-state the DP/MPC
@@ -2863,7 +2871,12 @@ class GARCHSpotModel(StochasticProcess):
         Nu: Student-t degrees of freedom (>2.05).
         Mu: annualised drift (default 0 — 16y of daily data cannot identify it).
         Log_Price: bool (default True; the model is defined in log-return units).
-        Calibration_DT_Years: step size of the recursion (default 1/252)."""
+        Calibration_DT_Years: step size of the recursion (default 1/252).
+        Convexity_Correction: Yes/No (default No). No = today's log-space-zero-mean (E[Δlog S]=
+            Mu·dt), which leaves a spurious +½·Var Jensen drift in the PRICE (~½·annual-var, e.g.
+            ~3%/yr at LR vol 0.2475). Yes subtracts ½·Var(r_t) from the per-step log-drift so the
+            PRICE is the Mu-martingale: E[S_{t+1}/S_t]=exp(Mu·dt) (Gaussian-exact; the Student-t
+            tail leaves a small positive residual). h recursion / revealed log_h are UNCHANGED."""
 
     documentation = (
         'Asset Pricing',
@@ -2890,6 +2903,12 @@ class GARCHSpotModel(StochasticProcess):
         assert (param['Omega'] > 0.0 and param['Alpha'] >= 0.0 and param['Beta'] >= 0.0
                 and param['Alpha'] + param['Beta'] <= 0.999 and param['Nu'] > 2.05
                 and param['H0'] > 0.0), f'GARCHSpotModel invalid params: {param}'
+        # Convexity_Correction=Yes makes the PRICE the martingale (E[S_{t+1}/S_t]=exp(Mu·dt))
+        # by subtracting ½·Var(r_t) from the per-step log-drift; No (default) is today's
+        # log-space-zero-mean (E[Δlog S]=Mu·dt, so the price carries a +½·var Jensen drift).
+        cc = param.get('Convexity_Correction', 'No')
+        assert cc in ('Yes', 'No'), f'GARCHSpotModel Convexity_Correction must be Yes/No: {cc}'
+        self.convexity = cc == 'Yes'
 
     @staticmethod
     def num_factors():
@@ -2952,7 +2971,13 @@ class GARCHSpotModel(StochasticProcess):
         This is the standard recursion at f=1, has E-fixed-point ω/(1−α−β) for any f, and a
         per-step mean-reversion factor (1 − f(1−α−β)) so the decay RATE is grid-invariant in
         real time. n_sub ≥ 2 (grid coarser than ~1.5 bd) uses the integer aggregate-variance
-        bridge instead (deterministic sub-step forward, single aggregate draw)."""
+        bridge instead (deterministic sub-step forward, single aggregate draw).
+
+        With Convexity_Correction, the deterministic log-drift also carries −½·Var(r_t) so the
+        PRICE (not the log-price) is the Mu-martingale: E[exp(r_t − ½Var(r_t))] = 1 for Gaussian
+        r_t. The correction touches ONLY ds (the log-price shift); the innovation r_t and the h
+        recursion — hence revealed log_h — are untouched. (Student-t r has E[exp(r)]=∞, so −½Var
+        slightly under-corrects, leaving a small positive residual price drift on the fat tail.)"""
         omega, alpha, beta = self.omega, self.alpha, self.beta
         drift, n_sub, f = self.drift, self.n_sub, self.f
         log_h = torch.empty_like(eps)
@@ -2961,19 +2986,20 @@ class GARCHSpotModel(StochasticProcess):
         for t in range(1, eps.shape[0]):
             if n_sub[t] <= 1:
                 ft = f[t]
-                r = (h * ft).sqrt() * eps[t]
+                var_step = h * ft                                                # Var(r_t)
+                r = var_step.sqrt() * eps[t]
                 h = h + ft * (omega - (1.0 - beta) * h) + alpha * r * r
             else:
                 # n_sub≥2: only one Gaussian per grid step — forward h deterministically through
                 # the integer sub-steps via E[r²]=h and draw the aggregate return with the summed
                 # variance. Loses within-step vol-of-vol (documented approximation).
-                h_j, var = h, h
+                h_j, var_step = h, h
                 for _ in range(1, n_sub[t]):
                     h_j = omega + (alpha + beta) * h_j
-                    var = var + h_j
-                r = var.sqrt() * eps[t]
+                    var_step = var_step + h_j
+                r = var_step.sqrt() * eps[t]
                 h = omega + (alpha + beta) * h_j
-            ds[t] = drift[t] + r
+            ds[t] = drift[t] + (r - 0.5 * var_step if self.convexity else r)
             log_h[t] = h.log()
         return ds, log_h
 
@@ -3051,7 +3077,10 @@ class GARCHSpotModel(StochasticProcess):
         """Observed-path replay: rerun the GARCH variance recursion (fractional clock) on the
         REALIZED returns of the supplied price path, publishing `garch_log_h` (so reveal returns
         the right log h along the replayed path) and `h0_outer` (the terminal h, for a continuing
-        replay). Closes the stepper-replay gap — replays used to reseed nothing in a GARCH world."""
+        replay). Closes the stepper-replay gap — replays used to reseed nothing in a GARCH world.
+        Convexity coupling: the forward sim writes ds = drift − ½Var(r) + r, so the innovation is
+        recovered as r = realized_logret − drift + ½Var(r) with the SAME correction, keeping the
+        h recursion identical between forward sim and replay (Var(r)=h·f on the n_sub≤1 clock)."""
         obs = simulated.detach()
         logret = obs.clamp_min(1.0e-30).log()
         omega, alpha, beta = self.omega, self.alpha, self.beta
@@ -3062,6 +3091,8 @@ class GARCHSpotModel(StochasticProcess):
         for t in range(1, obs.shape[0]):
             if n_sub[t] <= 1:
                 r = (logret[t] - logret[t - 1]) - drift[t]                   # realized innovation
+                if self.convexity:
+                    r = r + 0.5 * (h * f[t])                                 # undo the −½Var(r) drift shift
                 h = h + f[t] * (omega - (1.0 - beta) * h) + alpha * r * r
             else:
                 h_j = h                                                      # deterministic bridge (as generate)
@@ -3078,6 +3109,11 @@ class GARCHSpotModel(StochasticProcess):
         consumed directly by the utility-scale fallback."""
         p = self.param
         return float(np.sqrt(p['Omega'] / (1.0 - p['Alpha'] - p['Beta']) / p['Calibration_DT_Years']))
+
+    def revealed_annual_vol(self, log_h):
+        """σ_t = √(exp(log h_t)/dt_c): the exactly-observed conditional vol annualized off the
+        calibration business-day clock (h_t is the per-business-day variance)."""
+        return (log_h.exp() / float(self.param['Calibration_DT_Years'])).sqrt()
 
     @classmethod
     def calibrate(cls, data_frame, vol_shift=0.0, num_business_days=252.0):

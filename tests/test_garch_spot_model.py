@@ -19,6 +19,7 @@ Plus registration (construct_process resolves the class by name) and the privile
 Deterministic: CMC_State is seeded, and torch.manual_seed fixes the standardised-t Gamma draw.
 CPU-fast sizes throughout.
 """
+import logging
 import os
 import types
 
@@ -403,3 +404,126 @@ def test_basis_both_sigma_forms_rejected():
                     'Sigma': 8.0, 'Sigma_By_State': [5.0, 8.0], 'Calibration_DT_Years': DT_C})
     with pytest.raises(AssertionError):
         basis.precalculate(REF_DATE, _time_grid(5), torch.tensor([0.0], dtype=DTYPE), sh, process_ofs=1)
+
+
+# ---------------------------------------------------------------------------
+# Convexity_Correction: PRICE-martingale switch (Δlog S = Mu·dt − ½Var(r) + r).
+# Default/absent/No is today's log-space-zero-mean (a spurious +½·var Jensen drift in the
+# PRICE); Yes makes the price the Mu-martingale. The correction shifts ONLY the log-drift —
+# the innovation r, the h recursion and the revealed log_h are untouched.
+# ---------------------------------------------------------------------------
+
+def _conv_gen(cc, T, B, mu=0.0, h0=None, seed=11, mseed=7):
+    """Generate under Convexity_Correction=cc (double-precision spot + log_h for the moments)."""
+    param = {**PARAM, 'Mu': mu, 'H0': h0 if h0 is not None else LR_VAR, 'Convexity_Correction': cc}
+    p, sh = _make(T, B, param=param, seed=seed)
+    torch.manual_seed(mseed)
+    spot = p.generate(sh).double()
+    return p, spot, p.last_log_h.double()
+
+
+def test_convexity_off_bit_identical_and_logh_invariant():
+    # (1) Absent key == explicit 'No' (byte). (2) The correction is a PURE deterministic log-drift
+    # shift: log_h is BYTE-IDENTICAL on/off (so the h recursion — hence revealed_annual_vol / the
+    # cost-model vol plumbing — is untouched), and the on/off log-price gap equals exactly
+    # ½·Σ_{k≤t} Var(r_k) = ½·Σ exp(log h_{k-1})·f_k.
+    T, B = 60, 300
+    pa, sa = _make(T, B, param={**PARAM}, seed=7)                       # Convexity_Correction ABSENT
+    torch.manual_seed(1); spot_abs = pa.generate(sa); logh_abs = pa.last_log_h.clone()
+    pn, sn = _make(T, B, param={**PARAM, 'Convexity_Correction': 'No'}, seed=7)
+    torch.manual_seed(1); spot_no = pn.generate(sn)
+    assert torch.equal(spot_abs, spot_no), 'absent Convexity_Correction != explicit No (bit)'
+    assert torch.equal(logh_abs, pn.last_log_h), 'absent vs No log_h differ (bit)'
+
+    po, so = _make(T, B, param={**PARAM, 'Convexity_Correction': 'Yes'}, seed=7)
+    torch.manual_seed(1); spot_on = po.generate(so); logh_on = po.last_log_h
+    assert torch.equal(logh_abs, logh_on), 'log_h changed under the correction — h recursion touched'
+    # Reconstruct the deterministic drift shift from the (shared) log_h and trading clock.
+    shift = torch.zeros_like(spot_on)
+    for t in range(1, T):
+        shift[t] = shift[t - 1] + 0.5 * logh_on[t - 1].exp() * po.f[t]
+    assert torch.allclose(spot_no.log() - spot_on.log(), shift, atol=1e-5), \
+        'on/off log-price gap != ½·Σ Var(r) — correction is not a pure drift shift'
+    assert (spot_no - spot_on).abs().max() > 1.0, 'prices should differ once the drift is corrected'
+
+
+def test_convexity_price_martingale_by_state():
+    # The PRICE-space analogue of test_martingale_by_state (which is exactly zero in LOG space and
+    # so blind to the Jensen drift). Bucket the per-step GROSS return S_{t+1}/S_t−1 by log h_t
+    # decile (log h_t ∈ F_t), pooled over the horizon for power: E[S_{t+1}/S_t−1 | bucket]=0 is the
+    # martingale. ON passes < 3·se; OFF (uncorrected) is detected many σ out — the test HAS power.
+    T, B = 140, 60000
+
+    def worst_ratio(spot, logh):
+        gross = (spot[1:] / spot[:-1]).reshape(-1) - 1.0
+        h = logh[:-1].reshape(-1)
+        edges = torch.quantile(h, torch.linspace(0.0, 1.0, 11).double())
+        w = 0.0
+        for i in range(10):
+            m = (h >= edges[i]) & (h <= edges[i + 1])
+            se = gross[m].std().item() / np.sqrt(int(m.sum()))
+            w = max(w, abs(gross[m].mean().item()) / se)
+        return w
+
+    _, spot_on, logh_on = _conv_gen('Yes', T, B)
+    _, spot_off, logh_off = _conv_gen('No', T, B)
+    w_on, w_off = worst_ratio(spot_on, logh_on), worst_ratio(spot_off, logh_off)
+    # Report the residual: annualized per-step gross drift (t under-correction) vs the ~3%/yr off.
+    ann_on = (spot_on[1:] / spot_on[:-1] - 1.0).mean().item() / DT_C
+    ann_off = (spot_off[1:] / spot_off[:-1] - 1.0).mean().item() / DT_C
+    logging.info('Convexity price-martingale: worst |E[gross-1|log h decile]|/se ON=%.2f OFF=%.2f; '
+                 'residual ann price-drift ON=%+.3f%%/yr vs OFF=%+.3f%%/yr (½·annual-var=%.3f%%/yr)',
+                 w_on, w_off, 100 * ann_on, 100 * ann_off, 100 * 0.5 * LR_VAR / DT_C)
+    assert w_on < 3.0, f'price-martingale violated under correction: worst ratio {w_on:.2f}'
+    assert w_off > 5.0, f'test lacks power — uncorrected drift not detected (worst {w_off:.2f})'
+    assert abs(ann_on) < 0.005, f'residual price-drift {ann_on*100:.3f}%/yr too large (t under-correction)'
+
+
+def test_convexity_price_drift_matches_mu():
+    # E[S_T/S_0]: OFF drifts at the Jensen exp(½·var·T); ON(Mu=0) is a martingale (≈1); ON(Mu≠0)
+    # drifts at exactly exp(Mu·T). All within a few MC-se at T=140, B=60000.
+    T, B = 140, 60000
+    T_years = T * DT_C
+
+    def e_ratio(cc, mu):
+        _, spot, _ = _conv_gen(cc, T, B, mu=mu)
+        ratio = spot[-1] / spot[0]
+        return ratio.mean().item(), ratio.std().item() / np.sqrt(B)
+
+    e_off, se_off = e_ratio('No', 0.0)
+    assert abs(e_off - np.exp(0.5 * LR_VAR / DT_C * T_years)) < 5 * se_off, \
+        f'uncorrected E[S_T/S_0]={e_off:.5f} != Jensen exp(½·var·T)'
+    assert e_off - 1.0 > 10 * se_off, 'uncorrected price should carry a clear positive drift'
+
+    e_on, se_on = e_ratio('Yes', 0.0)
+    assert abs(e_on - 1.0) < 5 * se_on, f'corrected Mu=0 E[S_T/S_0]={e_on:.5f} != 1 (not a martingale)'
+
+    mu = 0.05
+    e_mu, se_mu = e_ratio('Yes', mu)
+    assert abs(e_mu - np.exp(mu * T_years)) < 5 * se_mu, \
+        f'corrected Mu={mu} E[S_T/S_0]={e_mu:.5f} != exp(Mu·T)={np.exp(mu*T_years):.5f}'
+
+
+def test_convexity_reseed_consistency():
+    # Observed-path replay must reproduce the forward-sim h path WITH the correction on: the
+    # innovation extraction adds back the same ½·Var(r) the forward drift subtracted, so the h
+    # recursion stays in lock-step. Desync would corrupt reveal along a replayed (stepper) path.
+    T, B = 200, 800
+    pf, path, logh_fwd = _conv_gen('Yes', T, B, seed=5, mseed=3)
+    pr, shr = _make(T, B, param={**PARAM, 'H0': LR_VAR, 'Convexity_Correction': 'Yes'}, seed=99)
+    pr.reseed_from_path(path, shr)
+    logh_re = shr.t_Scenario_Buffer[(pr.factor_key, 'garch_log_h')].squeeze(1).double()
+    assert torch.allclose(logh_fwd, logh_re, atol=1e-3), \
+        f'reseed desync under correction: max|Δlog h|={ (logh_fwd - logh_re).abs().max().item():.2e}'
+    # Control: replaying WITHOUT the correction on a corrected path desyncs (coupling matters).
+    pr2, shr2 = _make(T, B, param={**PARAM, 'H0': LR_VAR, 'Convexity_Correction': 'No'}, seed=99)
+    pr2.reseed_from_path(path, shr2)
+    logh_re2 = shr2.t_Scenario_Buffer[(pr2.factor_key, 'garch_log_h')].squeeze(1).double()
+    assert (logh_fwd - logh_re2).abs().max() > 10 * (logh_fwd - logh_re).abs().max(), \
+        'wrong-correction replay should desync — the reseed coupling is not being exercised'
+
+
+def test_convexity_correction_validated_on_load():
+    with pytest.raises(AssertionError, match='Convexity_Correction'):
+        GARCHSpotModel(factor=types.SimpleNamespace(param={}),
+                       param={**PARAM, 'Convexity_Correction': 'true'})

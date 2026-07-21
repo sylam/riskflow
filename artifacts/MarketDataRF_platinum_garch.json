@@ -1094,7 +1094,8 @@
     "Mu": 0.0,
     "H0": 0.0007685387707479281,
     "Log_Price": true,
-    "Calibration_DT_Years": 0.003968253968253968
+    "Calibration_DT_Years": 0.003968253968253968,
+    "Convexity_Correction": "Yes"
    }
   },
   "Correlations": {
