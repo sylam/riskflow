@@ -194,7 +194,8 @@ def delta_corridor_schedule(trade_date, fixings, band):
             for s, (lo, hi) in sorted(knots.items())]
 
 
-def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume, delta_corridor=None):
+def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume, delta_corridor=None,
+                      spot_model='hmm'):
     """Reshape the deal template to the trade date in the corrected world, reading every market
     level off the corrected archive row. Returns (cfg, info) where info carries the strike and
     the dates the causal bound / observed path need. Adapt this for a different product.
@@ -291,8 +292,11 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
     emd_pm['BasisComposedSpotModel.PLATINUM_LME'] = {}
     # CME_FLAT is the zero-dynamics identity basis (not calibrated — carries no archive series);
     # inject its params so the futures' synthetic = P + 0 = P references the martingale primary.
-    emd_pm['BasisLinkedSpotModel.CME_FLAT'] = {'A': 0.0, 'Phi': 0.0, 'Nu': 5.0, 'Mu': 0.0,
-                                               'Sigma_By_State': [0.0, 0.0, 0.0]}
+    # Sigma form must match the primary: regime-conditional (HMM publishes 'regimes') vs flat
+    # (GARCH publishes no regimes — a Sigma_By_State basis would fail loud on the missing key).
+    flat = {'A': 0.0, 'Phi': 0.0, 'Nu': 5.0, 'Mu': 0.0}
+    emd_pm['BasisLinkedSpotModel.CME_FLAT'] = (
+        {**flat, 'Sigma': 0.0} if spot_model == 'garch' else {**flat, 'Sigma_By_State': [0.0, 0.0, 0.0]})
     emd['Valuation Configuration'] = {'FloatingEnergyDeal': {'ForwardCurve': 'Components'}}
 
     info = {'k_fair': k_fair, 'mats': mats, 'pay': pay}
@@ -371,6 +375,71 @@ def calibrate(marketdata, cal_config, cal_end, out_md):
                    check=True, cwd=ROOT, stdout=subprocess.DEVNULL)
 
 
+def garchify_md(hmm_md, arch, cal_end, out_md):
+    """Swap ONLY the model layer of a HMM-calibrated md into the GARCH world (causal, series ≤
+    cal_end); everything else (carry VAR, SOFR, composed-LME routing) is byte-for-byte untouched:
+      * GARCHSpotModel.PLATINUM_CME from GARCHSpotModel.calibrate on the primary P series (same
+        |r|<0.25 guard and H0 = filtered variance at the trade date — reuses the calibrator).
+      * BasisLinkedSpotModel.LME_CME → flat-Sigma OU: keep the HMM A/Phi/Nu (the OU structure);
+        σ = unconditional innovation std of b up to the trade date (NO regime conditioning, NO
+        shipping constant).
+      * modeldefaults.CommodityPrice → GARCHSpotModel; Correlations mirror the carry-spot entry
+        under GARCHSpotProcess.PLATINUM_CME.
+    Logs the calibrated params (ω, α, β, ν, H0, LR vol, basis σ/κ) + a martingale-by-state
+    diagnostic at INFO. Returns the GARCH primary param dict."""
+    from riskflow.stochasticprocess import GARCHSpotModel      # reuse the calibrator (library fn)
+    md = json.load(open(hmm_md))
+    m = md['MarketData']
+    pm = m['Price Models']
+
+    P = arch[CME_COL].loc[:cal_end].astype(float)
+    block = GARCHSpotModel.calibrate(pd.DataFrame({CME_COL: P}))
+    block['Convexity_Correction'] = 'Yes'        # price-martingale tradeable (no harvestable Jensen drift)
+    pm.pop('MarkovHMMSpotModel.PLATINUM_CME', None)
+    pm['GARCHSpotModel.PLATINUM_CME'] = block
+    m['Model Configuration']['.ModelParams']['modeldefaults']['CommodityPrice'] = 'GARCHSpotModel'
+
+    corr = m.setdefault('Correlations', {})
+    hmm_corr = corr.pop('MarkovHMMSpotProcess.PLATINUM_CME', None)
+    if hmm_corr is not None:
+        corr['GARCHSpotProcess.PLATINUM_CME'] = dict(hmm_corr)
+
+    lme = pm['BasisLinkedSpotModel.LME_CME']
+    A, Phi = float(lme['A']), float(lme['Phi'])
+    b = arch[BASIS_COL].loc[:cal_end].astype(float)            # published basis S - P
+    eta = (b - A * P.diff() - Phi * b.shift(1)).dropna()       # AR(1)-on-ΔP innovations, no regime split
+    basis_sigma = float(eta.std())
+    lme.pop('Sigma_By_State', None)
+    lme['Sigma'] = basis_sigma
+
+    _atomic_write_json(out_md, md)
+
+    persist = block['Alpha'] + block['Beta']
+    lr_vol = float(np.sqrt(block['Omega'] / (1.0 - persist) / block['Calibration_DT_Years']))
+    kappa = float(-np.log(Phi) / lme['Calibration_DT_Years']) if 0.0 < Phi < 1.0 else float('nan')
+    # martingale-by-state on realized data: filter h, bucket ΔlogP by log-h decile, E[r|bucket]≈μ=0
+    r = np.log(P).diff().dropna().values
+    r = r[np.abs(r) < 0.25]
+    h = np.empty_like(r)
+    h[0] = block['H0']
+    for i in range(1, len(r)):
+        h[i] = block['Omega'] + block['Alpha'] * r[i - 1] ** 2 + block['Beta'] * h[i - 1]
+    lh = np.log(h)
+    edges = np.quantile(lh, np.linspace(0.0, 1.0, 11))
+    worst = 0.0
+    for k in range(10):
+        msk = (lh >= edges[k]) & (lh <= edges[k + 1])
+        if msk.sum() < 20:
+            continue
+        se = r[msk].std() / np.sqrt(int(msk.sum()))
+        worst = max(worst, abs(r[msk].mean()) / se if se > 0 else 0.0)
+    logging.info('GARCH-CALIB %s: omega=%.4e alpha=%.4f beta=%.4f nu=%.2f H0=%.4e LR-vol=%.4f | '
+                 'basis sigma=%.3f phi=%.3f kappa=%.2f | martingale-by-state worst|E[r|h-decile]|/se=%.2f',
+                 cal_end, block['Omega'], block['Alpha'], block['Beta'], block['Nu'], block['H0'],
+                 lr_vol, basis_sigma, Phi, kappa, worst)
+    return block
+
+
 def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
     """Train the day-1 policy for EACH seed and roll the frozen seed-ensemble on the realized
     path; return the recorded row. One checkpoint per seed (value_fn_<tag>_s<seed>.pt), then ONE
@@ -383,11 +452,14 @@ def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
     killed lane re-pointed at the same run dir resumes mid-trade without retraining. Row diagnostics
     train_u / V_0 report the primary member (seeds[0]); train_u_seeds carries the per-seed spread."""
     cfg, info = build_deal_config(template, arch, trade_date, calibrated_md, args.margin, args.volume,
-                                  delta_corridor=args.delta_corridor)
+                                  delta_corridor=args.delta_corridor, spot_model=args.spot_model)
+    # Model tag stamped into every per-trade artifact name so a GARCH lane pointed at an HMM run
+    # dir (or vice-versa) never reuses the wrong checkpoint/md/obs; HMM names are unchanged.
+    sfx = '' if args.spot_model == 'hmm' else f'_{args.spot_model}'
 
-    ckpts, train_us, v0s = [], [], []
+    ckpts, train_us, v0s, market_dim = [], [], [], None
     for seed in args.seeds:
-        ckpt = os.path.abspath(os.path.join(run_dir, f'value_fn_{tag}_s{seed}.pt'))
+        ckpt = os.path.abspath(os.path.join(run_dir, f'value_fn_{tag}{sfx}_s{seed}.pt'))
         ckpts.append(ckpt)
         if os.path.exists(ckpt):
             logging.info('=== TRAIN %s seed=%d SKIP (checkpoint exists) ===', tag, seed)
@@ -403,8 +475,9 @@ def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
         tv = (tdiag.get('verdict') or {}).get('greedy') or {}
         train_us.append(None if tv.get('u_mean') is None else round(tv['u_mean'], 4))
         v0s.append(tdiag.get('V_0'))
+        market_dim = tdiag.get('market_dim')
 
-    obs_npz = os.path.abspath(os.path.join(run_dir, f'obs_{tag}.npz'))
+    obs_npz = os.path.abspath(os.path.join(run_dir, f'obs_{tag}{sfx}.npz'))
     observed_scenario_npz(arch, trade_date, obs_npz)
     roll = apply_config(copy.deepcopy(cfg), batch=1, seed=args.seeds[0], load=ckpts,
                         stepper_rollout=True, randomize_initial_state=False)
@@ -416,7 +489,7 @@ def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
     logging.info('=== ROLL %s (stepper, realized path, %d-seed ensemble, inner=%d) ===',
                  tag, len(ckpts), args.roll_inner)
     rdiag = run(roll, f'roll_{tag}')
-    json.dump(rdiag, open(os.path.join(run_dir, f'diag_{tag}.json'), 'w'), indent=1, default=str)
+    json.dump(rdiag, open(os.path.join(run_dir, f'diag_{tag}{sfx}.json'), 'w'), indent=1, default=str)
 
     sv = rdiag.get('stepper_verdict') or {}
     gr = (sv.get('greedy') or {}).get('wT_mean')
@@ -424,8 +497,9 @@ def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
     bound = pf_bound(arch, trade_date, info['mats'], info['pay'])
     q = np.array(sv.get('greedy_q_traj') or [[0.0]])
     return {
-        'trade': tag, 'fair': round(info['k_fair'], 2), 'strike': round(info['k_fair'] - args.margin, 2),
-        'n_seeds': len(args.seeds),
+        'trade': tag, 'spot_model': args.spot_model,
+        'fair': round(info['k_fair'], 2), 'strike': round(info['k_fair'] - args.margin, 2),
+        'n_seeds': len(args.seeds), 'market_dim': market_dim,
         'train_u': train_us[0],
         'train_u_seeds': train_us,
         'V_0': v0s[0],
@@ -445,6 +519,10 @@ def main():
     ap.add_argument('--marketdata', default='data/MarketDataRF_platinum.json', help='Source MarketDataRF (Model Configuration).')
     ap.add_argument('--deal-template', default='tests/fixtures/policy_test_simulate_only.json',
                     help='Deal/hedge template JSON (Components world).')
+    ap.add_argument('--spot-model', choices=['hmm', 'garch'], default='hmm',
+                    help='CommodityPrice model for the primary. hmm (default): MarkovHMMSpotModel, '
+                         'unchanged. garch: per-trade-date GARCHSpotModel (causal recalibration) + '
+                         'flat-Sigma basis; swaps ONLY the model layer of the calibrated md.')
     ap.add_argument('--start', default='2021-01', help='First trade month, YYYY-MM.')
     ap.add_argument('--months', type=int, default=12)
     ap.add_argument('--recal-months', type=int, default=3, help='Recalibrate every N months.')
@@ -479,9 +557,10 @@ def main():
     arch = build_corrected_archive(raw)
     template = json.load(open(args.deal_template))
     stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = args.run_dir or os.path.join('artifacts', 'walk_forward', f'{stamp}_{args.start}_{args.months}m')
+    run_dir = args.run_dir or os.path.join(
+        'artifacts', 'walk_forward', f'{stamp}_{args.start}_{args.months}m_{args.spot_model}')
     os.makedirs(run_dir, exist_ok=True)
-    logging.info('run dir: %s  seeds: %s', run_dir, args.seeds)
+    logging.info('run dir: %s  spot_model: %s  seeds: %s', run_dir, args.spot_model, args.seeds)
 
     # corrected calibration inputs (written once): archive CSV (drop the composed LBMA fixing),
     # source MarketDataRF with the PLATINUM_LME -> BasisComposedSpotModel routing, calibration
@@ -503,6 +582,13 @@ def main():
     done = {}
     for f in sorted(glob.glob(os.path.join(run_dir, 'row_*.json'))):
         r = json.load(open(f))
+        # Fail loud if this run dir was built with a DIFFERENT spot model — a GARCH lane pointed at
+        # an HMM run dir (or vice-versa) must never reuse/overwrite the wrong world's rows.
+        prior = r.get('spot_model', 'hmm')
+        if prior != args.spot_model:
+            raise RuntimeError(
+                f'run dir {run_dir} holds spot_model={prior!r} rows (e.g. {os.path.basename(f)}), '
+                f'but --spot-model={args.spot_model!r}. Use a fresh --run-dir.')
         done[r['trade']] = r
     if done:
         logging.info('RESUME: %d completed trade(s) found in run dir; will skip them', len(done))
@@ -521,9 +607,15 @@ def main():
                 # Recalibrate every boundary even for a resumed/skipped trade: calibrated_md must
                 # be set for the later non-skipped months, and re-running (a subprocess) is cheap
                 # and can't trust a possibly-truncated md from a killed lane.
-                calibrated_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}.json'))
+                hmm_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}.json'))
                 cal_end = trade_date.strftime('%Y-%m-%d')
-                calibrate(md_cal, cal_cfg, cal_end, calibrated_md)
+                calibrate(md_cal, cal_cfg, cal_end, hmm_md)
+                # GARCH world: swap only the model layer of the freshly-calibrated md (causal),
+                # writing a model-tagged md so the HMM cache is never overwritten.
+                calibrated_md = hmm_md if args.spot_model == 'hmm' else \
+                    os.path.abspath(os.path.join(run_dir, f'md_{tag}_garch.json'))
+                if args.spot_model == 'garch':
+                    garchify_md(hmm_md, arch, cal_end, calibrated_md)
                 g = guard_e_df_b(arch, cal_end)
                 logging.info('GUARD %s: dP~b slope=%+.4f t=%+.2f (martingale) | dS~b slope=%+.4f t=%+.2f (catch-up)',
                              cal_end, g['dP~b'][0], g['dP~b'][1], g['dS~b'][0], g['dS~b'][1])
@@ -538,8 +630,13 @@ def main():
                     # trade-date (tau -> 0), tripping the float32 X_0 round-trip. Still no lookahead:
                     # recalibrate AT the trade date and retry.
                     logging.warning('TRADE %s: stale-md failure (%s); FALLBACK fresh calibration', tag, e)
+                    fresh_end = trade_date.strftime('%Y-%m-%d')
                     fresh_md = os.path.abspath(os.path.join(run_dir, f'md_{tag}_fresh.json'))
-                    calibrate(md_cal, cal_cfg, trade_date.strftime('%Y-%m-%d'), fresh_md)
+                    calibrate(md_cal, cal_cfg, fresh_end, fresh_md)
+                    if args.spot_model == 'garch':
+                        garch_fresh = os.path.abspath(os.path.join(run_dir, f'md_{tag}_fresh_garch.json'))
+                        garchify_md(fresh_md, arch, fresh_end, garch_fresh)
+                        fresh_md = garch_fresh
                     rec = one_trade(template, arch, trade_date, fresh_md, args, run_dir, tag)
                     rec['fresh_md'] = True
                 logging.info('TRADE %s: greedy=%s nohedge=%s $/oz  bound=%s PASS=%s  churn=%s',
@@ -547,7 +644,8 @@ def main():
                 _atomic_write_json(os.path.join(run_dir, f'row_{tag}.json'), rec)  # mark done for resume
         except Exception as e:
             logging.exception('TRADE %s FAILED', tag)
-            rec = {'trade': tag, 'fair': None, 'strike': None, 'n_seeds': len(args.seeds),
+            rec = {'trade': tag, 'spot_model': args.spot_model, 'fair': None, 'strike': None,
+                   'n_seeds': len(args.seeds), 'market_dim': None,
                    'train_u': None, 'train_u_seeds': None, 'V_0': None,
                    'greedy_usd_oz': None, 'nohedge_usd_oz': None, 'pf_bound': None,
                    'bound_pass': None, 'churn': None, 'error': str(e)}
