@@ -1,0 +1,9 @@
+month,md,lr_vol,A_price_drift_pct_yr,B_price_drift_pct_yr,A_logdrift_pct_yr,B_logdrift_pct_yr
+202105,md_202104_garch_driftless.json,0.2336,4.169,-0.18,-0.203,-4.526
+202202,md_202201_garch_driftless.json,0.2377,3.776,-0.157,-0.169,-4.083
+202106,md_202104_garch_driftless.json,0.2336,4.169,-0.18,-0.203,-4.526
+202001,md_202001_garch_driftless.json,0.2077,2.171,-0.075,-0.086,-2.325
+202204,md_202204_garch_driftless.json,0.2439,4.672,-0.087,-0.11,-4.838
+202011,md_202010_garch_driftless.json,0.2282,5.846,-0.165,-0.2,-6.163
+202102,md_202101_garch_driftless.json,0.2269,3.376,-0.121,-0.142,-3.623
+202112,md_202110_garch_driftless.json,0.2395,5.067,-0.164,-0.185,-5.379
