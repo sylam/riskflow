@@ -18,7 +18,7 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import hn_garch as hg                                                   # noqa: E402
+from riskflow import hn_garch as hg                                     # noqa: E402
 
 DEV = 'cuda' if torch.cuda.is_available() else 'cpu'
 DT = torch.float64

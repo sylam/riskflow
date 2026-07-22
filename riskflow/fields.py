@@ -195,6 +195,8 @@ mapping = {
                 ["Surface_Type", "Surface", "Moneyness_Rule", "Delta_Surface", "Currency"],
             "CSForwardPriceModelParameters":
                 ["Sigma", "Alpha"],
+            "HestonNandiModelParameters":
+                ["Omega", "Alpha", "Beta", "Gamma_Star", "H0"],
             "ConvenienceYield":
                 ["Curve", "Currency"],
             "EquityPriceVol":
@@ -274,6 +276,10 @@ mapping = {
             'Distribution_Type': {'widget': 'Dropdown', 'description': 'Distribution Type', 'value': 'Lognormal',
                                   'values': ['Lognormal', 'Normal']},
             'Alpha': {'widget': 'Float', 'description': 'Alpha', 'value': 0},
+            'Beta': {'widget': 'Float', 'description': 'Beta', 'value': 0},
+            'Omega': {'widget': 'Float', 'description': 'Omega', 'value': 0},
+            'Gamma_Star': {'widget': 'Float', 'description': 'Gamma Star', 'value': 0},
+            'H0': {'widget': 'Float', 'description': 'H0', 'value': 0},
             'Issuer': {'widget': 'Text', 'description': 'Issuer', 'value': ''},
             'Index': {'widget': 'Flot', 'description': 'Index', 'value': default['Flot']},
             'Vol': {'widget': 'Flot', 'description': 'Vol', 'value': default['Flot']},
@@ -464,6 +470,7 @@ mapping = {
         "HullWhite2FactorModelParameters": [],
         # "GBMTSImpliedParameters": [],
         "CSForwardPriceModelParameters": [],
+        "HestonNandiModelParameters": [],
         "GBMAssetPriceTSModelParameters": [],
         "EquityPrice": ["GBMAssetPriceModel"],
         "FxRate": ["GBMAssetPriceModel", "GBMAssetPriceTSModelImplied"],
@@ -479,7 +486,8 @@ mapping = {
         # logical groupings
         'groups': {
             'MarketPrices': (
-                'group', ['InterestRatePrices', 'GBMTSModelPrices', 'HullWhite2FactorInterestRateModelPrices']),
+                'group', ['InterestRatePrices', 'GBMTSModelPrices', 'HullWhite2FactorInterestRateModelPrices',
+                          'HestonNandiModelPrices']),
             'PointFields': ('default', ['FRADeal', 'SwapInterestDeal', 'DepositDeal']),
         },
 
@@ -490,6 +498,8 @@ mapping = {
             'GBMTSModelPrices':
                 [],
             'HullWhite2FactorInterestRateModelPrices':
+                [],
+            'HestonNandiModelPrices':
                 []
         },
 
@@ -501,6 +511,10 @@ mapping = {
                 ["Asset_Price_Volatility"],
             "HullWhite2FactorInterestRateModelPrices":
                 ["Swaption_Volatility", "Generate_Instruments", "Generation_Parameters", "Instrument_Definitions"],
+            "HestonNandiModelPrices":
+                ["Underlying", "Underlying_Type", "Volatility", "Volatility_Type", "Discount_Rate",
+                 "Yield", "Yield_Type", "Quote_Type", "Use_Forward", "Invert_Moneyness",
+                 "Steps_Per_Year", "Quadrature_Panels", "European_Options"],
             "quote":
                 ["Descriptor", "Use", "Quoted_Market_Value", "DealType", "Quote_Type"]
         },
@@ -568,7 +582,30 @@ mapping = {
                        'value': {"Use": "Yes", "Deal": "", "Descriptor": "", "Quote_Type": "ATM", "DealType": "",
                                  "Quoted_Market_Value": 0.0},
                        'sub_fields': ['Use', 'Deal', 'Descriptor', 'Quote_Type', 'DealType', 'Quoted_Market_Value']},
-            'Quote_Type': {'widget': 'Dropdown', 'description': 'Quote Type', 'value': 'ATM', 'values': ['ATM']},
+            'Quote_Type': {'widget': 'Dropdown', 'description': 'Quote Type', 'value': 'ATM',
+                           'values': ['ATM', 'Implied_Volatility', 'Premium']},
+            # the Heston-Nandi inputs are asset class agnostic - the *_Type fields are optional and
+            # only needed to disambiguate a name that exists under more than one factor type
+            'Underlying': {'widget': 'Text', 'description': 'Underlying spot price factor', 'value': ''},
+            'Underlying_Type': {'widget': 'Dropdown', 'description': 'Underlying Type', 'value': '',
+                                'values': ['', 'FxRate', 'EquityPrice', 'CommodityPrice', 'FuturesPrice']},
+            'Volatility': {'widget': 'Text', 'description': 'Volatility surface price factor', 'value': ''},
+            'Volatility_Type': {'widget': 'Dropdown', 'description': 'Volatility Type', 'value': '',
+                                'values': ['', 'FXVol', 'EquityPriceVol', 'CommodityPriceVol']},
+            'Yield': {'widget': 'Text', 'description': 'Dividend/repo/convenience yield curve', 'value': ''},
+            'Yield_Type': {'widget': 'Dropdown', 'description': 'Yield Type', 'value': '',
+                           'values': ['', 'DividendRate', 'InterestRate']},
+            # the two moneyness flags pricing.calc_moneyness takes - defaults match the pricing path
+            'Use_Forward': {'widget': 'Dropdown', 'description': 'Use Forward', 'value': 'No',
+                            'values': ['Yes', 'No']},
+            'Invert_Moneyness': {'widget': 'Dropdown', 'description': 'Invert Moneyness', 'value': 'No',
+                                 'values': ['Yes', 'No']},
+            'Steps_Per_Year': {'widget': 'Float', 'description': 'Steps Per Year', 'value': 252.0},
+            'Quadrature_Panels': {'widget': 'Integer', 'description': 'Quadrature Panels', 'value': 64},
+            'European_Options': {'widget': 'Table', 'description': 'European Options', 'value': 'null',
+                                 'col_names': ['Expiry_Date', 'Strike', 'Option_Type', 'Units', 'Weight',
+                                               'Quoted_Market_Value'],
+                                 'obj': ['DatePicker', 'Float', 'Text', 'Float', 'Float', 'Float']},
             'Use': {'widget': 'Dropdown', 'description': 'Use', 'value': 'Yes', 'values': ['Yes', 'No']},
             'DealType': {'widget': 'Dropdown', 'description': 'DealType', 'value': 'DepositDeal',
                          'values': ['DepositDeal', 'FRADeal', 'SwapInterestDeal']},

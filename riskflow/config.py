@@ -81,6 +81,10 @@ class ModelParams(object):
         # valid risk factor subtypes (only Interest rates at the moment)
         self.valid_subtype = {'BasisSpread': 'BasisSpread'}
         # these models need these additional price factors
+        # NOTE: HestonNandiModelParameters is deliberately NOT registered here. The pricer path
+        # consumes it as a STATIC dependent factor; registering it as an implied model would mint
+        # a duplicate AAD leaf (implied_var and static_var both creating tensors under identical
+        # scope names).
         self.implied_models = {
             'CSImpliedForwardPriceModel': 'CSForwardPriceModelParameters',
             'GBMAssetPriceTSModelImplied': 'GBMAssetPriceTSModelParameters',
@@ -368,8 +372,9 @@ class Config(object):
             # need parsers here - but for now, can just use the name to know what to do
             try:
                 bootstrapper = construct_bootstrapper(bootstrapper_name, params)
-            except:
-                logging.warning('Cannot execute Bootstrapper for {0} - skipping'.format(bootstrapper_name))
+            except Exception:
+                logging.error('Cannot execute Bootstrapper for {0} - skipping'.format(
+                    bootstrapper_name), exc_info=True)
                 continue
 
             # run the bootstrapper on the market prices and store them in the price factors/price models
@@ -380,6 +385,13 @@ class Config(object):
                                    self.params['Market Prices'],
                                    self.holidays,
                                    debug=self)
+
+            # every bootstrapper writes <its own class name>.<rate> price factors, so an empty result
+            # means it silently did nothing - a misnamed/absent Market Prices section, or a
+            # bootstrapper class name that doesn't match its risk factor class name
+            if not [x for x in self.params['Price Factors'] if x.startswith(bootstrapper_name + '.')]:
+                logging.error('Bootstrapper {0} wrote no {0}.* price factor - check the Market Prices'
+                              ' section'.format(bootstrapper_name))
 
     def calibrate_factors(self, from_date, to_date, factors, smooth=0.0, correlation_cuttoff=0.2,
                           overwrite_correlations=True, vol_shift=0.0):

@@ -20,7 +20,7 @@
 # import standard libraries
 import time
 import logging
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 
 # third party stuff
 import numpy as np
@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 
 # Internal modules
-from . import utils, pricing, instruments, riskfactors, stochasticprocess
+from . import utils, pricing, instruments, riskfactors, stochasticprocess, hn_garch
 
 import scipy.optimize
 
@@ -80,20 +80,20 @@ class RiskNeutralInterestRate_State(utils.Calculation_State):
 def create_float_cashflows(base_date, cashflow_obj, frequency):
     cashflows = []
     for cashflow, reset in zip(cashflow_obj.schedule, cashflow_obj.Resets.schedule):
-        cashflows.append(OrderedDict([
-            ('Payment_Date', base_date + pd.offsets.Day(cashflow[utils.CASHFLOW_INDEX_Pay_Day])),
-            ('Notional', 1.0),
-            ('Accrual_Start_Date', base_date + pd.offsets.Day(cashflow[utils.CASHFLOW_INDEX_Start_Day])),
-            ('Accrual_End_Date', base_date + pd.offsets.Day(cashflow[utils.CASHFLOW_INDEX_End_Day])),
-            ('Accrual_Year_Fraction', cashflow[utils.CASHFLOW_INDEX_Year_Frac]),
-            ('Fixed_Amount', cashflow[utils.CASHFLOW_INDEX_FixedAmt]),
-            ('Resets', [[base_date + pd.offsets.Day(reset[utils.RESET_INDEX_Reset_Day]),
-                         base_date + pd.offsets.Day(reset[utils.RESET_INDEX_Start_Day]),
-                         base_date + pd.offsets.Day(reset[utils.RESET_INDEX_End_Day]),
-                         reset[utils.RESET_INDEX_Accrual],
-                         frequency, 'ACT_365', '0D', 0.0, 'No', utils.Percent(0.0)]]),
-            ('Margin', utils.Basis(0.0))
-        ]))
+        cashflows.append({
+            'Payment_Date': base_date + pd.offsets.Day(cashflow[utils.CASHFLOW_INDEX_Pay_Day]),
+            'Notional': 1.0,
+            'Accrual_Start_Date': base_date + pd.offsets.Day(cashflow[utils.CASHFLOW_INDEX_Start_Day]),
+            'Accrual_End_Date': base_date + pd.offsets.Day(cashflow[utils.CASHFLOW_INDEX_End_Day]),
+            'Accrual_Year_Fraction': cashflow[utils.CASHFLOW_INDEX_Year_Frac],
+            'Fixed_Amount': cashflow[utils.CASHFLOW_INDEX_FixedAmt],
+            'Resets': [[base_date + pd.offsets.Day(reset[utils.RESET_INDEX_Reset_Day]),
+                        base_date + pd.offsets.Day(reset[utils.RESET_INDEX_Start_Day]),
+                        base_date + pd.offsets.Day(reset[utils.RESET_INDEX_End_Day]),
+                        reset[utils.RESET_INDEX_Accrual],
+                        frequency, 'ACT_365', '0D', 0.0, 'No', utils.Percent(0.0)]],
+            'Margin': utils.Basis(0.0)
+        })
     return cashflows
 
 
@@ -283,7 +283,7 @@ class InterestRateJacobian(object):
                     all_tenors = utils.update_tenors(base_date, {ir_factor: ir_curve})
                     # calculate the curve index - need to clean this up - TODO!!!
                     curve_index = [instruments.calc_factor_index(ir_factor, {ir_factor: 0}, {}, all_tenors)]
-                    benchmarks = OrderedDict()
+                    benchmarks = {}
                     # state for all calcs
                     shared_mem = curve_jacobian_class(
                         t_Buffer={},
@@ -344,7 +344,7 @@ class InterestRateJacobian(object):
                     I = np.eye(n)
                     # store the output
                     price_param = utils.Factor('InterestRateJacobian', market_factor.name)
-                    jac = OrderedDict()
+                    jac = {}
                     j = np.array([sess.run(jvp, {dummy_jac_vec: I[i]})[0] for i in range(n)]).T
                     for index, benchmark_name in enumerate(benchmarks.keys()):
                         non_zero = np.where(j[index] != 0.0)
@@ -483,10 +483,309 @@ class CSForwardPriceModelParameters(object):
 
                 price_param = utils.Factor(self.__class__.__name__, market_factor.name)
 
-                price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
-                    [('Property_Aliases', None),
-                     ('Sigma', result.x[0]),
-                     ('Alpha', result.x[1])])
+                price_factors[utils.check_tuple_name(price_param)] = {
+                    'Property_Aliases': None,
+                    'Sigma': result.x[0],
+                    'Alpha': result.x[1]}
+
+
+class HestonNandiModelParameters(object):
+    documentation = (
+        'Fx And Equity',
+        ['For Risk Neutral simulation, the Heston-Nandi GARCH(1,1) model is calibrated to a set of European',
+         'options $J$ on a spot underlying. The model is ASSET CLASS AGNOSTIC - the *Underlying* may be any',
+         'spot (0D) price factor (**FxRate**, **EquityPrice**, **CommodityPrice**, **FuturesPrice**) and the',
+         '*Volatility* any (moneyness, expiry) vol surface (**FXVol**, **EquityPriceVol**,',
+         '**CommodityPriceVol**); the type of each is looked up from the price factors, or named explicitly',
+         'with *Underlying_Type* / *Volatility_Type*. Under the locally risk neutral valuation relationship',
+         '(LRNVR) $\\lambda^*=-\\frac{1}{2}$, so the model is parameterised directly in $\\gamma^*$:',
+         '',
+         '$$\\log\\frac{S_{t+1}}{S_t}=(r-q)-\\frac{h_{t+1}}{2}+\\sqrt{h_{t+1}}z_{t+1}$$',
+         '',
+         '$$h_{t+1}=\\omega+\\beta h_t+\\alpha\\Big(z_t-\\gamma^*\\sqrt{h_t}\\Big)^2$$',
+         '',
+         'with $z\\sim N(0,1)$ i.i.d. and $h_{t+1}$ predictable (known at $t$), hence the fitted initial',
+         'variance is $h_1$ - the variance of the *first* step - and is stored as **H0**. Option values come',
+         'from the recursive characteristic function of Heston and Nandi (2000) inverted by Gauss-Legendre',
+         'quadrature (see `riskflow.hn_garch`). The optional *Yield* (a dividend, repo, convenience or carry',
+         'curve) enters as $q$ - the drift is $r-q$ and the value carries the extra $e^{-qt}$ factor - so',
+         'equity, FX and commodity underlyings are all handled by the same objective.',
+         '',
+         'Writing the persistence as $\\psi=\\beta+\\alpha\\gamma^{*2}$ and the stationary per-step variance as',
+         '$m=\\frac{\\omega+\\alpha}{1-\\psi}$, the objective',
+         '',
+         '$$\\sum_{j\\in J}w_j\\Big(V_j-V_j(\\omega,\\alpha,\\beta,\\gamma^*,h_1)\\Big)^2$$',
+         '',
+         'is minimized with L-BFGS-B over $\\Big(\\log\\omega,\\psi,l,\\frac{\\gamma^*}{1000},\\log h_1\\Big)$',
+         'where $\\alpha=\\frac{l\\psi}{\\gamma^{*2}}$ and $\\beta=\\psi(1-l)$ for a leverage share',
+         '$l\\in[0,1]$. Stationarity is therefore a *box constraint on a fitted parameter*',
+         '($\\psi\\le1-10^{-6}$) and holds at every point the optimizer visits - there is no penalty term and',
+         'no infeasible iterate. Gradients are exact (torch autograd through the inversion).',
+         '',
+         'Target premia are the Black prices at the corresponding vol surface point (as per the Clewlow',
+         'Strickland bootstrapper) unless *Quote_Type* is **Premium**, in which case the quoted values are',
+         'used directly. A previously bootstrapped price factor (if present) is used to warm start the fit.',
+         '',
+         'MONEYNESS CONVENTION. Unlike the other bootstrappers this one queries the surface AWAY FROM',
+         'THE MONEY, where the five moneyness conventions in this framework no longer coincide, so the',
+         'lookup point is produced by `pricing.calc_moneyness` - the same dispatch every option deal',
+         'uses - off the surface *SubType*, with *Use_Forward* and *Invert_Moneyness* (Yes/No, both',
+         'defaulting to **No**, i.e. $\\frac{S}{K}$, as they do in the pricing path). Supported',
+         '*Surface_Types* are **Explicit**, **Relative_Forward** and **Malz** - the ones whose vol at a',
+         'strike is a table lookup. **SVI** and **Skew** surfaces are parametric (the vol needs the',
+         'ATM_Ref/wing machinery of the pricing path) and are REFUSED with an error rather than',
+         'mis-looked-up: quote those premiums directly with *Quote_Type* **Premium**.'
+         ]
+    )
+
+    # The Fourier inversion needs double precision - the framework default (float32) destroys the
+    # cancellation in P1/P2 - so the dtype this is constructed with is deliberately ignored.
+    prec = torch.float64
+    # x = (log Omega, psi, leverage share, Gamma_Star/1000, log H0) - see reparam
+    bounds = [(np.log(1e-12), np.log(1e-3)), (0.0, 1.0 - 1e-6), (0.0, 1.0),
+              (1e-3, 5.0), (np.log(1e-10), np.log(1e-2))]
+    # candidate price factor types for each instrument input - the underlying is any spot (0D)
+    # factor and the volatility any (moneyness, expiry) surface, so one instrument definition
+    # serves FX, equity and commodity underlyings
+    factor_types = {'Underlying': ['FxRate', 'EquityPrice', 'CommodityPrice', 'FuturesPrice'],
+                    'Volatility': ['FXVol', 'EquityPriceVol', 'CommodityPriceVol'],
+                    'Discount_Rate': ['InterestRate'],
+                    'Yield': ['DividendRate', 'InterestRate']}
+    # Surface_Types whose vol at a strike is a TABLE LOOKUP, hence usable here. SVI/Skew are
+    # parametric - their vol needs the ATM_Ref/wing machinery of the pricing path (Factor2D
+    # returns the parameters, not a vol), so a synthesised premium would be silently wrong.
+    tabular_surfaces = ('Explicit', 'Relative_Forward', 'Malz')
+
+    def __init__(self, param, device, dtype):
+        self.device = device
+        self.param = param
+
+    @classmethod
+    def resolve(cls, instrument, field, price_factors):
+        """The factor named by instrument[field], typed by the first candidate that exists in the
+        price factors (the FXVol/EquityPriceVol probe of GBMAssetPriceTSModelParameters,
+        generalised) or by an explicit instrument[field + '_Type']. None if the field is unset."""
+        if not instrument.get(field):
+            return None
+        rate = utils.check_rate_name(instrument[field])
+        types = [instrument[field + '_Type']] if instrument.get(field + '_Type') else cls.factor_types[field]
+        return utils.Factor(next(x for x in types if utils.check_tuple_name(
+            utils.Factor(x, rate)) in price_factors), rate)
+
+    @staticmethod
+    def reparam(x):
+        """Maps the fitted vector x to (Omega, Alpha, Beta, Gamma_Star, H0).
+
+        STATIONARITY IS ENFORCED BY CONSTRUCTION, not by a penalty: the optimizer fits the
+        persistence psi = Beta + Alpha*Gamma_Star^2 itself (a plain box bound psi <= 1-1e-6) and
+        splits it between the two channels with a leverage share l in [0, 1]. Omega and H0 are
+        fitted in logs so they stay positive and so their scale (~1e-6) doesn't wreck the line
+        search against Gamma_Star (~1e3, hence the /1000).
+        """
+        psi, lev, gamma = x[1], x[2], x[3] * 1000.0
+        return torch.exp(x[0]), lev * psi / gamma ** 2, psi * (1.0 - lev), gamma, torch.exp(x[4])
+
+    @staticmethod
+    def unreparam(omega, alpha, beta, gamma, h0):
+        """Inverse of reparam (used to warm start off an existing price factor)."""
+        psi = beta + alpha * gamma ** 2
+        return np.array([np.log(omega), psi, alpha * gamma ** 2 / psi, gamma / 1000.0, np.log(h0)])
+
+    @classmethod
+    def moneyness(cls, strike, spot, forward, vol_surface, use_forward, invert_moneyness):
+        """The moneyness coordinate to look the vol surface up at.
+
+        There are FIVE conventions in this framework and they are dispatched off the surface's
+        SubType, so this DELEGATES to pricing.calc_moneyness - the same function every option deal
+        uses - rather than reimplementing the dispatch. calc_moneyness only reads the SubType out
+        of deal_data, so a minimal Deal_data carrying this surface's SubType is all it needs.
+        """
+        deal_data = utils.DealDataType(
+            Instrument=None, Time_dep=None, Calc_res=None,
+            Factor_dep={'Volatility': [(None, None, vol_surface.get_subtype())]})
+        return float(pricing.calc_moneyness(
+            *[torch.tensor(float(x), dtype=cls.prec) for x in (strike, spot, forward)],
+            deal_data, use_forward, invert_moneyness))
+
+    @staticmethod
+    def price(spot, strike, is_call, units, p, n, h0, panels, yield_discount=1.0):
+        """Heston-Nandi European option value - puts by put-call parity off the call.
+
+        ``p.r`` is the per step COST OF CARRY r-q (so the simulated spot has the right forward) and
+        ``yield_discount`` = exp(-q*t) converts the resulting value back to a discounting at r:
+        the internal price is exp(-(r-q)t)[F P1 - K P2], the value is exp(-rt)[F P1 - K P2]. Parity
+        survives the rescale, so puts are still call - S + K exp(-(r-q)n) times the same factor."""
+        call = hn_garch.hn_call(spot, strike, p, n, h0, panels=panels)
+        return units * yield_discount * (call - (1.0 - is_call) * (spot - strike * torch.exp(-p.r * n)))
+
+    def calc_error(self, x, groups, spot, panels, scale):
+        """Weighted squared premium error and its exact gradient (autograd).
+
+        ``scale`` is the mean squared quoted premium: L-BFGS-B's gradient tolerance is ABSOLUTE, so
+        without it the fit would stop early on a low priced underlying (an fx rate) and late on a
+        high priced one. Dividing by a constant leaves the relative Weights untouched."""
+        x_t = torch.tensor(x, device=self.device, dtype=self.prec, requires_grad=True)
+        omega, alpha, beta, gamma, h0 = self.reparam(x_t)
+        error = 0.0
+        for n, b, q, strike, is_call, units, weight, premium in groups:
+            fitted = self.price(spot, strike, is_call, units,
+                                hn_garch.HNParams(omega, alpha, beta, gamma, b), n, h0, panels, q)
+            error = error + (weight * (premium - fitted) ** 2).sum() / scale
+        error.backward()
+        return float(error.detach()), x_t.grad.cpu().numpy()
+
+    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
+        '''
+        Calibrates the risk neutral Heston-Nandi GARCH(1,1) parameters to a set of European options on any
+        spot underlying and writes them out as a HestonNandiModelParameters price factor.
+        '''
+
+        def tensor(x):
+            return torch.tensor(x, device=self.device, dtype=self.prec)
+
+        for market_price, implied_params in market_prices.items():
+            rate = utils.check_rate_name(market_price)
+            market_factor = utils.Factor(rate[0], rate[1:])
+
+            if market_factor.type == 'HestonNandiModelPrices':
+                instrument = implied_params['instrument']
+
+                # resolve the underlying spot, its vol surface, the discount curve and any yield
+                # this shouldn't fail - if it does, need to log it and move on
+                try:
+                    vol_surface = riskfactors.construct_factor(
+                        self.resolve(instrument, 'Volatility', price_factors), price_factors, factor_interp)
+                    vol_surface.delta = sys_params.get('Volatility_Delta', 0.0)
+                    underlying = riskfactors.construct_factor(
+                        self.resolve(instrument, 'Underlying', price_factors), price_factors, factor_interp)
+                    discount = riskfactors.construct_factor(
+                        self.resolve(instrument, 'Discount_Rate', price_factors), price_factors, factor_interp)
+                    yield_factor = self.resolve(instrument, 'Yield', price_factors)
+                    carry = riskfactors.construct_factor(
+                        yield_factor, price_factors, factor_interp) if yield_factor else None
+                except Exception:
+                    logging.error('Unable to bootstrap {0} - skipping'.format(market_price), exc_info=True)
+                    continue
+
+                spot = float(underlying.current_value()[0])
+                quote_type = instrument['Quote_Type']
+                steps_per_year = instrument.get('Steps_Per_Year', 252.0)
+                panels = instrument.get('Quadrature_Panels', 64)
+                use_forward = instrument.get('Use_Forward') == 'Yes'
+                invert_moneyness = instrument.get('Invert_Moneyness') == 'Yes'
+
+                # a mis-looked-up vol would produce a wrong-but-converged calibration - the worst
+                # outcome - so refuse the surface rather than guess at its convention
+                subtype = vol_surface.get_subtype()
+                if quote_type == 'Implied_Volatility' and subtype[0] not in self.tabular_surfaces:
+                    logging.error(
+                        'Cannot bootstrap {0} - volatility {1} has Surface_Type {2} (Moneyness_Rule {3}); '
+                        'only {4} surfaces can be queried at a strike. Quote premiums directly '
+                        '(Quote_Type Premium) instead'.format(
+                            market_price, instrument['Volatility'], subtype[0], subtype[1],
+                            '/'.join(self.tabular_surfaces)))
+                    continue
+
+                # need to loop over this and create some market prices - group by expiry so that all
+                # the strikes of one expiry share a single characteristic function recursion
+                expiries = {}
+                for option in instrument['European_Options']:
+                    t = discount.get_day_count_accrual(
+                        sys_params['Base_Date'], (option['Expiry_Date'] - sys_params['Base_Date']).days)
+                    r = float(discount.current_value(t))
+                    q = float(carry.current_value(t)) if carry is not None else 0.0
+                    forward = spot * np.exp((r - q) * t)
+                    sign = 1.0 if option['Option_Type'] == 'Call' else -1.0
+                    option['Strike'] = forward if not option['Strike'] else option['Strike']
+                    option['r'] = r
+                    option['q'] = q
+                    option['T'] = t
+                    # the number of GARCH steps to expiry - the carry is spread over them so that
+                    # exp(-b_step*n) is exactly exp(-(r-q)*t)
+                    option['n'] = max(int(round(t * steps_per_year)), 1)
+                    if quote_type == 'Implied_Volatility':
+                        moneyness = self.moneyness(
+                            option['Strike'], spot, forward, vol_surface, use_forward, invert_moneyness)
+                        sigma = vol_surface.current_value([[moneyness, t]])[0] if not option[
+                            'Quoted_Market_Value'] else option['Quoted_Market_Value']
+                        sigma += vol_surface.delta
+                        option['Moneyness'] = moneyness
+                        option['Premium'] = utils.black_european_option_price(
+                            forward, option['Strike'], r, sigma, t, option['Units'], sign)
+                    elif quote_type == 'Premium':
+                        option['Premium'] = option['Units'] * option['Quoted_Market_Value']
+                        # back out the Black vol of the quote (seeds the fit and the diagnostics)
+                        call = option['Quoted_Market_Value'] + (0.0 if sign > 0 else
+                                                                forward - option['Strike']) * np.exp(-r * t)
+                        sigma = np.sqrt(hn_garch.bs_implied_total_var(
+                            call, spot * np.exp(-q * t), option['Strike'], r * t, 1) / t)
+                    else:
+                        logging.error('quote_type {} not supported yet'.format(quote_type))
+                        continue
+                    option['sigma'] = sigma
+                    expiries.setdefault(option['n'], []).append(option)
+
+                groups = [(n, tensor((opts[0]['r'] - opts[0]['q']) * opts[0]['T'] / n),
+                            tensor(np.exp(-opts[0]['q'] * opts[0]['T'])),
+                            tensor([x['Strike'] for x in opts]),
+                            tensor([1.0 if x['Option_Type'] == 'Call' else 0.0 for x in opts]),
+                            tensor([x['Units'] for x in opts]),
+                            tensor([x['Weight'] for x in opts]),
+                            tensor([x['Premium'] for x in opts])) for n, opts in expiries.items()]
+
+                price_param = utils.Factor(self.__class__.__name__, market_factor.name)
+                param_name = utils.check_tuple_name(price_param)
+                if param_name in price_factors:
+                    # warm start off the previous fit
+                    old = price_factors[param_name]
+                    x0 = np.clip(self.unreparam(old['Omega'], old['Alpha'], old['Beta'],
+                                                old['Gamma_Star'], old['H0']), *np.array(self.bounds).T)
+                else:
+                    var = np.mean([x['sigma'] for opts in expiries.values()
+                                   for x in opts]) ** 2 / steps_per_year
+                    x0 = np.array([np.log(0.1 * var), 0.9, 0.5, 0.1, np.log(var)])
+
+                scale = np.mean([x['Premium'] ** 2 for opts in expiries.values() for x in opts])
+                result = scipy.optimize.minimize(
+                    self.calc_error, x0, args=(groups, spot, panels, scale), jac=True,
+                    method='L-BFGS-B', bounds=self.bounds,
+                    # the default ftol/gtol are calibrated for an O(1e2) objective - the normalised
+                    # one starts at O(1) and a good fit is O(1e-12), so let it run to that
+                    options={'ftol': 1e-15, 'gtol': 1e-12})
+
+                omega, alpha, beta, gamma, h0 = [
+                    float(x) for x in self.reparam(tensor(result.x))]
+                fitted_params = hn_garch.HNParams(omega, alpha, beta, gamma)
+
+                # log the results
+                with torch.no_grad():
+                    for n, b, q, strike, is_call, units, weight, premium in groups:
+                        p = hn_garch.HNParams(*[tensor(x) for x in (omega, alpha, beta, gamma)], b)
+                        fitted = self.price(spot, strike, is_call, units, p, n, tensor(h0), panels, q)
+                        for option, fitted_premium in zip(expiries[n], fitted.cpu().numpy()):
+                            vol = hn_garch.hn_implied_vol(
+                                spot, option['Strike'], p, n, tensor(h0), steps_per_year, panels=panels)
+                            logging.info(
+                                'Underlying {} strike {}, expiry {}, steps {}, vol {}, c_vol {}, premium {}, '
+                                'c_premium {}, err {}'.format(
+                                    instrument['Underlying'], option['Strike'], option['Expiry_Date'], n,
+                                    option['sigma'], vol, option['Premium'], fitted_premium,
+                                    (fitted_premium - option['Premium']) ** 2))
+
+                logging.info(
+                    'Underlying {} Heston-Nandi Omega {}, Alpha {}, Beta {}, Gamma_Star {}, H0 {}, '
+                    'persistence {}, long run vol {}, sse {} ({})'.format(
+                        instrument['Underlying'], omega, alpha, beta, gamma, h0,
+                        fitted_params.persistence, fitted_params.ann_vol(steps_per_year),
+                        result.fun, result.message))
+
+                price_factors[param_name] = {
+                    'Property_Aliases': None,
+                    'Omega': omega,
+                    'Alpha': alpha,
+                    'Beta': beta,
+                    'Gamma_Star': gamma,
+                    'H0': h0}
 
 
 class GBMAssetPriceTSModelParameters(object):
@@ -583,23 +882,23 @@ class GBMAssetPriceTSModelParameters(object):
 
                 if is_fx:
                     fx_vols[rate[-1]] = [utils.Curve(['Integrated'], list(zip(vol_surface.expiry, vol))), implied_param]
-                    price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
-                        [('Property_Aliases', None),
-                         ('Vol', fx_vols[rate[-1]][0]),
-                         ('Quanto_FX_Volatility', None),
-                         ('Quanto_FX_Correlation', 0.0)])
-                    price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
+                    price_factors[utils.check_tuple_name(price_param)] = {
+                        'Property_Aliases': None,
+                        'Vol': fx_vols[rate[-1]][0],
+                        'Quanto_FX_Volatility': None,
+                        'Quanto_FX_Correlation': 0.0}
+                    price_models[utils.check_tuple_name(model_param)] = {'Risk_Premium': None}
                 else:
                     quanto_fx_corr = price_factors.get(
                         'Correlation.EquityPrice.{}.{}/FxRate.{}.{}'.format(
                             rate[-1], implied_param[-1], *sorted([sys_params['Base_Currency'], implied_param[-1]])),
                         {'Value': 0.0})['Value']
-                    price_factors[utils.check_tuple_name(price_param)] = OrderedDict(
-                        [('Property_Aliases', None),
-                         ('Vol', utils.Curve(['Integrated'], list(zip(vol_surface.expiry, vol)))),
-                         ('Quanto_FX_Volatility', None),
-                         ('Quanto_FX_Correlation', quanto_fx_corr)])
-                    price_models[utils.check_tuple_name(model_param)] = OrderedDict([('Risk_Premium', None)])
+                    price_factors[utils.check_tuple_name(price_param)] = {
+                        'Property_Aliases': None,
+                        'Vol': utils.Curve(['Integrated'], list(zip(vol_surface.expiry, vol))),
+                        'Quanto_FX_Volatility': None,
+                        'Quanto_FX_Correlation': quanto_fx_corr}
+                    price_models[utils.check_tuple_name(model_param)] = {'Risk_Premium': None}
                     # store this for later quanto correction
                     eq_vols[rate[-1]] = [utils.check_tuple_name(price_param), implied_param[-1]]
 

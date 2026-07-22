@@ -1101,6 +1101,37 @@ class CSForwardPriceModelParameters(Factor0D):
         return {'Alpha': np.array([self.param['Alpha']]), 'Sigma': np.array([self.param['Sigma']])}
 
 
+class HestonNandiModelParameters(Factor0D):
+    """
+    Represents the Bootstrapped Heston-Nandi GARCH(1,1) implied parameters for a risk neutral process.
+    Asset class agnostic - the underlying may be any spot (0D) factor (FX, equity, commodity, futures);
+    the factor name is just the underlying's name.
+    """
+    field_desc = ('Fx And Equity',
+                  ['- **Omega**: Float. Constant $\\omega$ of the per-step variance recursion',
+                   '- **Alpha**: Float. ARCH coefficient $\\alpha$',
+                   '- **Beta**: Float. GARCH coefficient $\\beta$',
+                   '- **Gamma_Star**: Float. Risk neutral leverage $\\gamma^*=\\gamma+\\lambda+\\frac{1}{2}$',
+                   '- **H0**: Float. The predictable variance $h_1$ of the first step from the base date',
+                   '',
+                   'The persistence is $\\psi=\\beta+\\alpha\\gamma^{*2}$ (must be less than 1) and the stationary',
+                   'per-step variance is $\\frac{\\omega+\\alpha}{1-\\psi}$'
+                   ])
+    # one source of truth for the key set - get_tenor_indices and current_value must agree
+    parameters = ('Omega', 'Alpha', 'Beta', 'Gamma_Star', 'H0')
+
+    def __init__(self, param):
+        super(HestonNandiModelParameters, self).__init__(param)
+
+    def get_tenor_indices(self):
+        zero = np.array([[0.0]])
+        return {x: zero for x in self.parameters}
+
+    def current_value(self, tenors=None, offset=0.0):
+        """Returns the parameters of the Heston-Nandi factor model as a dictionary"""
+        return {x: np.array([self.param[x]]) for x in self.parameters}
+
+
 class GBMAssetPriceTSModelParameters(Factor1D):
     """
     Represents the Bootstrapped TS implied parameters for a risk neutral process

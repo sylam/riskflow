@@ -2,10 +2,11 @@
 Heston-Nandi GARCH(1,1) -- semi-analytic European option pricing via the recursive
 characteristic function, plus the affine variance-forecast machinery.
 
-STANDALONE / SELF-CONTAINED.  This module imports nothing from riskflow and is not
-wired into the framework.  It exists to validate a future Heston-Nandi implementation
-and to quantify the multi-step aggregation bias of the one-step-survival (OSS) Monte
-Carlo in ``riskflow/pricing.py``.
+SELF-CONTAINED: this module imports nothing else from riskflow (only math/numpy/torch), so
+it can be used as a standalone pricer.  It IS the pricer behind the
+``HestonNandiModelParameters`` bootstrapper (``riskflow/bootstrappers.py``), and it is also
+used to quantify the multi-step aggregation bias of the one-step-survival (OSS) Monte Carlo
+in ``riskflow/pricing.py``.
 
 --------------------------------------------------------------------------------------
 INDEXING CONVENTION (stated once, pinned by ``tests/test_hn_garch.py``)

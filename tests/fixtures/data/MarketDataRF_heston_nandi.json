@@ -1,0 +1,49 @@
+{"MarketData": {
+  "System Parameters": {"Base_Currency": "USD", "Base_Date": {".Timestamp": "2024-06-28"},
+                        "Correlations_Healing_Method": "Eigenvalue_Raising",
+                        "Exclude_Deals_With_Missing_Market_Data": "No", "Grouping_File": null,
+                        "Proxying_Rules_File": null, "Script_Base_Scenario_Multiplier": 1},
+  "Model Configuration": {".ModelParams": {"modeldefaults": {}, "modelfilters": {}}},
+  "Price Factor Interpolation": {".ModelParams": {"modeldefaults": {}, "modelfilters": {}}},
+  "Price Factors": {
+    "EquityPrice.TEST_HN": {"Spot": 1000.0, "Currency": "USD", "Interest_Rate": "USD",
+                            "Issuer": "", "Respect_Default": "No", "Jump_Level": 0.0},
+    "EquityPriceVol.TEST_HN": {"Surface_Type": "Explicit", "Moneyness_Rule": "Sticky_Moneyness",
+      "Surface": {".Curve": {"meta": [], "data": [
+        [0.9, 0.02, 0.3200], [1.0, 0.02, 0.2800], [1.1, 0.02, 0.2900],
+        [0.9, 0.25, 0.3100], [1.0, 0.25, 0.2750], [1.1, 0.25, 0.2850]]}}},
+    "DividendRate.TEST_HN": {"Currency": "USD", "Floor": null,
+      "Curve": {".Curve": {"meta": [], "data": [[0.01, 0.02], [5.0, 0.02]]}}},
+    "InterestRate.USD": {"Currency": "USD", "Day_Count": "ACT_365", "Sub_Type": null,
+      "Curve": {".Curve": {"meta": [], "data": [[0.0, 0.03], [5.0, 0.03]]}}}
+  },
+  "Price Models": {},
+  "Correlations": {},
+  "Valuation Configuration": {},
+  "Market Prices": {
+    "HestonNandiModelPrices.TEST_HN": {"instrument": {
+      "Underlying": "TEST_HN",
+      "Volatility": "TEST_HN",
+      "Discount_Rate": "USD",
+      "Yield": "TEST_HN",
+      "Quote_Type": "Implied_Volatility",
+      "Steps_Per_Year": 252.0,
+      "Quadrature_Panels": 64,
+      "European_Options": [
+        {"Expiry_Date": {".Timestamp": "2024-07-05"}, "Strike": 950.0, "Option_Type": "Put",
+         "Units": 1.0, "Weight": 1.0, "Quoted_Market_Value": 0.0},
+        {"Expiry_Date": {".Timestamp": "2024-07-05"}, "Strike": 1000.0, "Option_Type": "Call",
+         "Units": 1.0, "Weight": 1.0, "Quoted_Market_Value": 0.0},
+        {"Expiry_Date": {".Timestamp": "2024-07-05"}, "Strike": 1050.0, "Option_Type": "Call",
+         "Units": 1.0, "Weight": 1.0, "Quoted_Market_Value": 0.0},
+        {"Expiry_Date": {".Timestamp": "2024-07-12"}, "Strike": 950.0, "Option_Type": "Put",
+         "Units": 1.0, "Weight": 1.0, "Quoted_Market_Value": 0.0},
+        {"Expiry_Date": {".Timestamp": "2024-07-12"}, "Strike": 1000.0, "Option_Type": "Call",
+         "Units": 1.0, "Weight": 1.0, "Quoted_Market_Value": 0.0},
+        {"Expiry_Date": {".Timestamp": "2024-07-12"}, "Strike": 1050.0, "Option_Type": "Call",
+         "Units": 1.0, "Weight": 1.0, "Quoted_Market_Value": 0.0}
+      ]}}
+  },
+  "Bootstrapper Configuration": {"HestonNandiModelParameters": {}}
+ },
+ "Version": ["AnalyticsVersion", "231.200.901.0"]}
