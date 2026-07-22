@@ -2259,6 +2259,16 @@ class MarkovSwitchingLogOUSpotModel(StochasticProcess):
                 out[f'state{i}_{attr.lower()}'] = torch.full((T, B, 1), float(s[attr]), dtype=torch.float32, device=device)
         return out
 
+    def inner_fork_seed(self, factor_key, outer_buf, t):
+        """Per-outer-path t=0 regime seed: the regime at the fork step, read by generate()'s
+        `regime0_inner` hook so the inner fan-out continues the forked path's regime instead
+        of redrawing from π_0."""
+        return {(factor_key, 'regime0_inner'): outer_buf[(factor_key, 'regimes')][t]}
+
+    def outer_reseed(self):
+        """t=0 regime seed for the next outer run's burn-in: the terminal regime of this run."""
+        return {(self.factor_key, 'regime0_outer'): self.last_regime_path[-1].detach()}
+
 
 class MarkovHMMSpotModel(StochasticProcess):
     """N-state hidden-Markov spot-price model. Conditional on regime z_t, the per-step

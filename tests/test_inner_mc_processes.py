@@ -962,6 +962,42 @@ def test_inner_mc_shape_and_init_on_correct_axis(setup, is_curve):
         f'the wrong axis. level0={level0.tolist()}')
 
 
+def test_mslogou_inner_fork_seed_and_outer_reseed():
+    """MSLogOU's reseed verbs (added to mirror MarkovHMMSpotModel exactly): inner_fork_seed
+    publishes the regime AT the fork step t under (factor_key, 'regime0_inner'); outer_reseed
+    publishes the terminal regime under (factor_key, 'regime0_outer'). Before this migration
+    MSLogOU inherited the base no-ops, so nothing produced these keys and generate()'s existing
+    consumer reads (regime0_inner/regime0_outer) silently fell back to a pi0 redraw. Round-trip:
+    the seed produced here, fed into an inner-mode generate, must start every B2 inner path in
+    the per-outer-path forked regime (no redraw)."""
+    B, B2, T = 4, 8, 10
+    # outer run populates last_regime_path + (factor_key, 'regimes')
+    p_o, sh_o = _setup_mslogou(batch_size=B, T=T)
+    p_o.generate(sh_o)
+    regimes = p_o.last_regime_path                                                # (T, B)
+    assert regimes.shape == (T, B)
+
+    # inner_fork_seed at an interior fork step returns the regime AT t, keyed for the inner read.
+    t_fork = 5
+    seed = p_o.inner_fork_seed(p_o.factor_key, sh_o.t_Scenario_Buffer, t_fork)
+    assert set(seed) == {(p_o.factor_key, 'regime0_inner')}
+    assert torch.equal(seed[(p_o.factor_key, 'regime0_inner')], regimes[t_fork])
+
+    # outer_reseed returns the TERMINAL regime for the next burn-in's t=0.
+    reseed = p_o.outer_reseed()
+    assert set(reseed) == {(p_o.factor_key, 'regime0_outer')}
+    assert torch.equal(reseed[(p_o.factor_key, 'regime0_outer')], regimes[-1])
+
+    # round-trip: feed the fork seed into an inner-mode generate; every B2 inner path for
+    # outer b must start in regimes[t_fork][b] instead of drawing from pi0.
+    p_i, sh_i = _setup_mslogou_inner(B, B2, T)
+    sh_i.t_Scenario_Buffer[(p_i.factor_key, 'regime0_inner')] = regimes[t_fork]
+    p_i.generate(sh_i)
+    got_regime0 = p_i.last_regime_path[0]                                         # (B, B2)
+    expected = regimes[t_fork].view(B, 1).expand(B, B2)
+    assert torch.equal(got_regime0, expected), 'MSLogOU regime0_inner seed not honored by generate'
+
+
 # --- GBMTSImplied: the one process that gathers OTHER (rate) factors during generate. ---
 # Faithful inner-MC test: build real stochastic zero-rate curve codes + a (T,n_tenors,B,B2)
 # scenario buffer (the shape the live factor graph feeds it), so the drift gather exercises

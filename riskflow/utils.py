@@ -176,7 +176,6 @@ DimensionLessFactors = ['DiscountRate', 'ReferenceVol', 'Correlation']
 OneDimensionalFactors = ['InterestRate', 'InflationRate', 'DividendRate', 'SurvivalProb', 'ForwardPrice', 'ForwardRate']
 TwoDimensionalFactors = ['FXVol', 'EquityPriceVol', 'CommodityPriceVol']
 ThreeDimensionalFactors = ['InterestRateVol', 'InterestYieldVol', 'ForwardPriceVol']
-ImpliedFactors = ['HullWhite2FactorModelParameters', 'GBMAssetPriceTSModelParameters', 'PCAMixedFactorModelParameters']
 
 # weekends and weekdays
 WeekendMap = {'Friday and Saturday': 'Sun Mon Tue Wed Thu',

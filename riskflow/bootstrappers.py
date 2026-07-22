@@ -32,9 +32,6 @@ from . import utils, pricing, instruments, riskfactors, stochasticprocess, hn_ga
 
 import scipy.optimize
 
-curve_jacobian_class = namedtuple('shared_mem', 't_Buffer t_Static_Buffer \
-                                precision riskneutral simulation_batch')
-
 market_swap_class = namedtuple('market_swap', 'deal_data price weight')
 date_desc = {'years': 'Y', 'months': 'M', 'days': 'D'}
 # date formatter
@@ -100,35 +97,6 @@ def create_float_cashflows(base_date, cashflow_obj, frequency):
 def normalize(sample):
     '''Simple function to ensure that the sample used for the monte carlo sim has mean 0 and var 1'''
     return (sample - sample.mean(axis=0)) / sample.std(axis=0)
-
-
-def atm_swap(base_date, curve_factor, time_grid, effective, maturity, float_freq, daycount):
-    float_pay_dates = instruments.generate_dates_backward(
-        maturity, effective, float_freq)
-
-    float_cash = utils.generate_float_cashflows(
-        base_date, time_grid, float_pay_dates, 1.0, None, None,
-        float_freq, pd.DateOffset(months=0), utils.get_day_count(daycount), 0.0)
-
-    K, pvbp = float_cash.get_par_swap_rate(base_date, curve_factor)
-    float_cash.set_fixed_amount(-K)
-    return float_cash, K, pvbp
-
-
-def atm_depo(base_date, curve_factor, time_grid, maturity, daycount):
-    time_in_years = utils.get_day_count_accrual(
-        base_date, (maturity - base_date).days, utils.get_day_count(daycount))
-
-    fixed_pay_dates = instruments.generate_dates_backward(
-        maturity, base_date, maturity - base_date)
-
-    fixed_cash = utils.generate_fixed_cashflows(
-        base_date, fixed_pay_dates, 1.0, None,
-        utils.get_day_count(daycount), 0.0)
-
-    fixed_cash.overwrite_rate(utils.CASHFLOW_INDEX_FixedAmt, 1.0)
-
-    return fixed_cash
 
 
 def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_factor,
@@ -238,120 +206,6 @@ def create_market_swaps(base_date, time_grid, curve_index, vol_surface, curve_fa
             )
 
     return all_deals, benchmarks
-
-
-class InterestRateJacobian(object):
-    def __init__(self, param, device, dtype):
-        self.device = device
-        self.prec = dtype
-        self.param = param
-        self.batch_size = 1
-
-    def bootstrap(self, sys_params, price_models, price_factors, factor_interp, market_prices, calendars, debug=None):
-
-        def fwd_gradients(ys, xs, d_xs):
-            """ Forward-mode pushforward analogous to the pullback defined by tf.gradients.
-                With tf.gradients, grad_ys is the vector being pulled back, and here d_xs is
-                the vector being pushed forward."""
-            v = tf.placeholder_with_default(
-                np.ones([x.value for x in ys.get_shape()], dtype=self.prec), shape=ys.get_shape())
-            g = tf.concat(tf.gradients(ys, xs, grad_ys=v), axis=0)
-            return tf.gradients(g, v, grad_ys=d_xs)
-
-        base_date = sys_params['Base_Date']
-        # do all of this at time 0        
-        time_grid = utils.TimeGrid({base_date}, {base_date}, {base_date})
-        time_grid.set_base_date(base_date)
-        # now prepare for inverse bootstrap
-        for market_price, implied_params in market_prices.items():
-            rate = utils.check_rate_name(market_price)
-            market_factor = utils.Factor(rate[0], rate[1:])
-            if market_factor.type == 'InterestRatePrices':
-                # get the currency 
-                curr = implied_params['instrument']['Currency']
-                graph = tf.Graph()
-                with graph.as_default():
-                    # this shouldn't fail - if it does, need to log it and move on
-                    try:
-                        ir_factor = utils.Factor('InterestRate', rate[1:])
-                        ir_curve = riskfactors.construct_factor(ir_factor, price_factors, factor_interp)
-                    except Exception:
-                        logging.warning('Unable to calculate the Jacobian for {0} - skipping'.format(market_price))
-                        continue
-
-                    # calculate a reverse lookup for the tenors and store the daycount code
-                    all_tenors = utils.update_tenors(base_date, {ir_factor: ir_curve})
-                    # calculate the curve index - need to clean this up - TODO!!!
-                    curve_index = [instruments.calc_factor_index(ir_factor, {ir_factor: 0}, {}, all_tenors)]
-                    benchmarks = {}
-                    # state for all calcs
-                    shared_mem = curve_jacobian_class(
-                        t_Buffer={},
-                        t_Static_Buffer=[tf.constant(ir_curve.current_value(), dtype=self.prec)],
-                        precision=self.prec,
-                        riskneutral=False,
-                        simulation_batch=self.batch_size)
-
-                    for child in implied_params['Children']:
-                        if child['quote']['DealType'] == 'DepositDeal':
-                            maturity = base_date + child['instrument']['Payment_Frequency']
-                            fixed_cash = atm_depo(base_date, ir_curve, time_grid, maturity,
-                                                  child['instrument']['Accrual_Day_Count'])
-                            deal_data = utils.DealDataType(
-                                Instrument=None, Factor_dep={'Cashflows': fixed_cash, 'Discount': curve_index},
-                                Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, [0]), Calc_res=None)
-                            fmt_fn = str if isinstance(child['quote']['Descriptor'], str) else date_fmt
-                            benchmarks['Deposit_' + fmt_fn(child['quote']['Descriptor'])] = pricing.pv_fixed_cashflows(
-                                shared_mem, time_grid, deal_data, settle_cash=False)
-                        elif child['quote']['DealType'] == 'FRADeal':
-                            float_cash, K, pvbp = atm_swap(
-                                base_date, ir_curve, time_grid,
-                                base_date + pd.DateOffset(months=child['quote']['Descriptor'].data[0]),
-                                base_date + pd.DateOffset(months=child['quote']['Descriptor'].data[1]),
-                                pd.DateOffset(months=np.diff(child['quote']['Descriptor'].data)[0]),
-                                child['instrument']['Day_Count'])
-                            deal_data = utils.DealDataType(
-                                Instrument=None, Factor_dep={'Cashflows': float_cash, 'Forward': curve_index,
-                                                             'Discount': curve_index, 'CompoundingMethod': 'None'},
-                                Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, [0]), Calc_res=None)
-                            benchmarks['FRA_' + str(child['quote']['Descriptor'])] = pricing.pv_float_cashflow_list(
-                                shared_mem, time_grid, deal_data, pricing.pricer_float_cashflows, settle_cash=False)
-                        elif child['quote']['DealType'] == 'SwapInterestDeal':
-                            float_cash, K, pvbp = atm_swap(
-                                base_date, ir_curve, time_grid,
-                                base_date,
-                                base_date + child['quote']['Descriptor'],
-                                child['instrument']['Pay_Frequency'],
-                                child['instrument']['Pay_Day_Count'])
-                            deal_data = utils.DealDataType(
-                                Instrument=None, Factor_dep={'Cashflows': float_cash, 'Forward': curve_index,
-                                                             'Discount': curve_index, 'CompoundingMethod': 'None'},
-                                Time_dep=utils.DealTimeDependencies(time_grid.mtm_time_grid, [0]), Calc_res=None)
-                            benchmarks[
-                                'Swap_' + date_fmt(child['quote']['Descriptor'])] = pricing.pv_float_cashflow_list(
-                                shared_mem, time_grid, deal_data, pricing.pricer_float_cashflows, settle_cash=False)
-                        else:
-                            raise Exception('quote type not supported')
-
-                    n = ir_curve.tenors.shape[0]
-                    dummy_jac_vec = tf.placeholder(self.prec, n)
-                    bench = tf.squeeze(tf.concat(list(benchmarks.values()), axis=0), axis=1)
-                    jvp = fwd_gradients(bench, shared_mem.t_Static_Buffer, dummy_jac_vec)
-
-                config = tf.ConfigProto(allow_soft_placement=True)
-
-                with tf.Session(graph=graph, config=config) as sess:
-                    I = np.eye(n)
-                    # store the output
-                    price_param = utils.Factor('InterestRateJacobian', market_factor.name)
-                    jac = {}
-                    j = np.array([sess.run(jvp, {dummy_jac_vec: I[i]})[0] for i in range(n)]).T
-                    for index, benchmark_name in enumerate(benchmarks.keys()):
-                        non_zero = np.where(j[index] != 0.0)
-                        jac[benchmark_name] = utils.Curve([], list(zip(ir_curve.tenors[non_zero], j[index][non_zero])))
-                    # jac = pd.DataFrame(j, index=list(benchmarks.keys()), columns=ir_curve.tenors)
-
-                price_factors[utils.check_tuple_name(price_param)] = jac
 
 
 class CSForwardPriceModelParameters(object):
@@ -1098,13 +952,6 @@ class RiskNeutralInterestRateModel(object):
 
                 # save this
                 final_implied_obj = self.save_params(soln[1], price_factors, implied_obj, rate)
-                # calculate the jacobians and final premiums
-                jacobians, premiums = self.calc_jacobians(
-                    implied_params, base_date, time_grid, process, final_implied_obj, ir_factor, swaptionvol)
-                # price_param = utils.Factor(implied_obj.__class__.__name__ + 'Jacobian', market_factor.name)
-                # price_factors[utils.check_tuple_name(price_param)] = jacobians
-                # prem_param = utils.Factor(implied_obj.__class__.__name__ + 'Premiums', market_factor.name)
-                # price_factors[utils.check_tuple_name(prem_param)] = premiums
 
                 # record the time
                 logging.info('This took {} seconds.'.format(time.monotonic() - time_now))
@@ -1248,38 +1095,6 @@ scipy.optimize.leastsq.html) are used.',
         self.sigma_bounds = (1e-5, 0.09)
         self.alpha_bounds = (-0.5, 2.4)
         self.corr_bounds = (-.95, 0.95)
-
-    def calc_jacobians(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):
-        # reset the stochastic process with the new implied factor
-        process.reset_implied_factor(implied_obj)
-        # get the swaption error and market values
-        stoch_var, implied_var_dict, loss_fn = self.calc_loss_on_ir_curve(
-            implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface, jac=True)
-
-        # run the loss function
-        jacobians = {}
-        premiums, errors = loss_fn(implied_var_dict)
-        # add the curve
-        implied_var_dict['Curve'] = stoch_var
-        for swaption_name, premium in premiums.items():
-            grad_swaption = torch.autograd.grad(
-                premium, list(implied_var_dict.values()), retain_graph=True)
-            var_names = list(implied_var_dict.keys())
-            for name, val in zip(var_names, grad_swaption):
-                value = val.cpu().numpy()
-                non_zero = np.where(value != 0.0)
-                if name == 'Curve':
-                    curve = utils.Curve([], list(zip(process.factor.get_tenor()[non_zero], value[non_zero])))
-                    jacobians.setdefault(swaption_name, {}).setdefault('Curve', curve)
-                elif name.startswith('Sigma') or name == 'Quanto_FX_Volatility':
-                    curve = utils.Curve([], list(zip(implied_obj.param[name].array[non_zero[0], 0], value[non_zero])))
-                    jacobians.setdefault(swaption_name, {}).setdefault(name, curve)
-                else:
-                    jacobians.setdefault(swaption_name, {}).setdefault(name, float(value[0]))
-
-        all_premiums = {k: float(v.cpu().detach().numpy()) for k, v in premiums.items()}
-
-        return jacobians, all_premiums
 
     def calc_loss(self, implied_params, base_date, time_grid, process, implied_obj, ir_factor, vol_surface):
 
