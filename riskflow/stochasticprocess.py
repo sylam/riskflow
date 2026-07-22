@@ -3115,21 +3115,46 @@ class GARCHSpotModel(StochasticProcess):
         calibration business-day clock (h_t is the per-business-day variance)."""
         return (log_h.exp() / float(self.param['Calibration_DT_Years'])).sqrt()
 
-    @classmethod
-    def calibrate(cls, data_frame, vol_shift=0.0, num_business_days=252.0):
-        """Zero-mean GARCH(1,1)-t MLE on a business-daily close series (§5). The fit runs in
-        percent-return units (100·r) for conditioning, then converts ω, H0 back to fraction
-        (×1e-4). Uses `arch` if importable, else scipy L-BFGS-B on the identical standardised-t
-        log-likelihood. Returns the §2 param dict; H0 is the filtered conditional variance at
-        the final observation. `Mu` is fixed at 0 — 16y of daily data cannot identify the drift
-        (s.e. ≈ σ/√years ≈ 5.6% unconditional)."""
+
+class GARCHSpotCalibration(object):
+    """Zero-mean GARCH(1,1)-t MLE of GARCHSpotModel on a business-daily close series (§5).
+    The fit runs in percent-return units (100·r) for conditioning, then converts ω, H0 back
+    to fraction (×1e-4). Uses `arch` if importable, else scipy L-BFGS-B on the identical
+    standardised-t log-likelihood. H0 is the filtered conditional variance at the final
+    observation, so a calibrated world starts in TODAY's vol state. `Mu` is fixed at 0 —
+    16y of daily data cannot identify the drift (s.e. ≈ σ/√years ≈ 5.6% unconditional) —
+    and `Log_Price` is always True (the model is defined on log returns).
+    `delta` is the standardised residual ε_t = r_t/√h_t — approximately iid under the
+    calibrated model, so the framework's correlation consolidation isn't contaminated by
+    the GARCH heteroskedasticity (the analog of the HMM's regime-standardised innovation).
+
+    JSON config (calibration_config.json):
+        Outlier_Threshold: |Δlog S| guard, returns above it are dropped (default 0.25).
+        Max_Persistence: cap on α+β; β is scaled down to hit it (default 0.999, the
+            model's own stationarity assertion).
+        Nu_Min: floor on the t degrees of freedom (default 2.05, the model's assertion).
+        Convexity_Correction: Yes/No, stamped straight onto the emitted param block
+            (default Yes — a calibrated world is a PRICE martingale, no harvestable
+            Jensen drift; the MODEL's own default stays No for bit-identity)."""
+
+    def __init__(self, model, param):
+        self.model = model
+        self.param = param
+        self.num_factors = 1
+
+    def calibrate(self, data_frame, vol_shift, num_business_days=252.0):
         from scipy.special import gammaln
+
+        outlier = float(self.param.get('Outlier_Threshold', 0.25))
+        max_persistence = float(self.param.get('Max_Persistence', 0.999))
+        nu_min = float(self.param.get('Nu_Min', 2.05))
+        convexity = self.param.get('Convexity_Correction', 'Yes')
 
         dt_c = 1.0 / float(num_business_days)
         px = data_frame.iloc[:, 0].astype(np.float64).dropna()
         r = np.log(px).diff().dropna()
-        r = r[r.abs() < 0.25].values                                            # outlier guard
-        x = 100.0 * r                                                           # percent units
+        r = r[r.abs() < outlier]                                                # outlier guard
+        x = 100.0 * r.values                                                    # percent units
         var0 = float(np.var(x))
 
         def negll(th):
@@ -3151,7 +3176,8 @@ class GARCHSpotModel(StochasticProcess):
             omega, alpha, beta, nu = (float(res.params[k]) for k in ('omega', 'alpha[1]', 'beta[1]', 'nu'))
             se = {k: float(v) for k, v in zip(('omega', 'alpha', 'beta', 'nu'), res.std_err[
                 ['omega', 'alpha[1]', 'beta[1]', 'nu']].values)}
-            h_last = float((res.conditional_volatility ** 2)[-1])
+            h = np.asarray(res.conditional_volatility, dtype=np.float64) ** 2
+            h_last = float(h[-1])
         except ImportError:
             from scipy.optimize import minimize
             opt = minimize(negll, np.array([0.01, 0.05, 0.90, 8.0]), method='L-BFGS-B',
@@ -3176,10 +3202,11 @@ class GARCHSpotModel(StochasticProcess):
                 h[i] = omega + alpha * x[i - 1] ** 2 + beta * h[i - 1]
             h_last = float(h[-1])
 
-        if alpha + beta > 0.999:
-            logging.warning('GARCH persistence %.5f > 0.999 — scaling beta down.', alpha + beta)
-            beta = 0.999 - alpha
-        nu = max(float(nu), 2.05)
+        if alpha + beta > max_persistence:
+            logging.warning('GARCH persistence %.5f > %.5f — scaling beta down.',
+                            alpha + beta, max_persistence)
+            beta = max_persistence - alpha
+        nu = max(float(nu), nu_min)
 
         omega_f = float(omega) * 1.0e-4                                         # percent → fraction
         H0 = h_last * 1.0e-4
@@ -3192,10 +3219,17 @@ class GARCHSpotModel(StochasticProcess):
             omega_f, se['omega'] * 1e-4, alpha, alpha / se['alpha'], beta, beta / se['beta'],
             nu, nu / se['nu'], persistence, half_life, lr_vol_ann, H0, float(np.sqrt(H0 / dt_c)))
 
-        return {
+        param = {
             'Omega': omega_f, 'Alpha': float(alpha), 'Beta': float(beta), 'Nu': float(nu),
             'Mu': 0.0, 'H0': H0, 'Log_Price': True, 'Calibration_DT_Years': dt_c,
+            'Convexity_Correction': convexity,
         }
+
+        # delta = standardised residual ε_t = r_t/√h_t off the filtered variance path (both in
+        # percent units, so the 100· scaling cancels) — approximately iid under the fit.
+        delta = pd.DataFrame({data_frame.columns[0]: x / np.sqrt(h)}, index=r.index)
+
+        return utils.CalibrationInfo(param, [[1.0]], delta)
 
 
 class VARMixedFactorInterestRateModel(StochasticProcess):

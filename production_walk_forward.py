@@ -378,7 +378,7 @@ def calibrate(marketdata, cal_config, cal_end, out_md):
 def garchify_md(hmm_md, arch, cal_end, out_md):
     """Swap ONLY the model layer of a HMM-calibrated md into the GARCH world (causal, series ≤
     cal_end); everything else (carry VAR, SOFR, composed-LME routing) is byte-for-byte untouched:
-      * GARCHSpotModel.PLATINUM_CME from GARCHSpotModel.calibrate on the primary P series (same
+      * GARCHSpotModel.PLATINUM_CME from GARCHSpotCalibration on the primary P series (same
         |r|<0.25 guard and H0 = filtered variance at the trade date — reuses the calibrator).
       * BasisLinkedSpotModel.LME_CME → flat-Sigma OU: keep the HMM A/Phi/Nu (the OU structure);
         σ = unconditional innovation std of b up to the trade date (NO regime conditioning, NO
@@ -387,13 +387,13 @@ def garchify_md(hmm_md, arch, cal_end, out_md):
         under GARCHSpotProcess.PLATINUM_CME.
     Logs the calibrated params (ω, α, β, ν, H0, LR vol, basis σ/κ) + a martingale-by-state
     diagnostic at INFO. Returns the GARCH primary param dict."""
-    from riskflow.stochasticprocess import GARCHSpotModel      # reuse the calibrator (library fn)
+    from riskflow.stochasticprocess import GARCHSpotCalibration   # the framework's calibrator
     md = json.load(open(hmm_md))
     m = md['MarketData']
     pm = m['Price Models']
 
     P = arch[CME_COL].loc[:cal_end].astype(float)
-    block = GARCHSpotModel.calibrate(pd.DataFrame({CME_COL: P}))
+    block = GARCHSpotCalibration('GARCHSpotModel', {}).calibrate(pd.DataFrame({CME_COL: P}), 0.0).param
     block['Convexity_Correction'] = 'Yes'        # price-martingale tradeable (no harvestable Jensen drift)
     pm.pop('MarkovHMMSpotModel.PLATINUM_CME', None)
     pm['GARCHSpotModel.PLATINUM_CME'] = block

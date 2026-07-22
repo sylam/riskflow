@@ -235,10 +235,17 @@ changes; the smoke test (§6.7) asserts the width and that checkpoints stamp the
 recipe hash (`_config_hash` covers it via the solver cfg — world changes flow through
 the corridor/provenance checks already in place).
 
-## 5. `calibrate` classmethod
+## 5. `GARCHSpotCalibration`
 
-Follow the GBM pattern (`stochasticprocess.py:297-305`): input a business-daily
-2pm-London-synced close series; steps:
+Follow the framework's paired-calibration-class pattern (`GBMAssetPriceCalibration`,
+`MarkovHMMSpotCalibration`): `calibrate(self, data_frame, vol_shift,
+num_business_days=252.0) -> utils.CalibrationInfo(param, [[1.0]], delta)`, dispatched by
+`{"GARCHSpotModel": {"Method": "GARCHSpotCalibration", ...}}` in `calibration_config.json`
+(so `calibrate_platinum.py` / `Config.calibrate_factors` drives it). `delta` is the
+standardised residual `ε_t = r_t/√h_t`. Knobs: `Outlier_Threshold`, `Max_Persistence`,
+`Nu_Min`, `Convexity_Correction` (default `Yes` — calibrated worlds are price-martingale;
+the MODEL's own default stays `No`). Input a business-daily 2pm-London-synced close
+series; steps:
 
 1. `r = diff(log px)`, drop NaN, outlier guard `|r| < 0.25`.
 2. Zero-mean GARCH(1,1)-t MLE. Use `arch` (`arch_model(100·r, mean='Zero',
@@ -247,7 +254,7 @@ Follow the GBM pattern (`stochasticprocess.py:297-305`): input a business-daily
    to fraction (`ω ×1e-4`, `h ×1e-4`).
 3. Enforce `α + β ≤ 0.999` (scale β down, log a warning) and `ν ≥ 2.05`.
 4. `H0` = filtered conditional variance at the final observation.
-5. Return the §2 param dict; log parameters with standard errors, persistence,
+5. Return the §2 param dict (plus `Convexity_Correction`); log parameters with standard errors, persistence,
    half-life, and long-run annualized vol. Must reproduce the §2 reference table on
    `pl_exp.csv` within 2% relative on (α, β, LR vol) and 10% on (ω, ν).
 

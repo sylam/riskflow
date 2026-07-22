@@ -142,6 +142,19 @@
                     }
                 }
             },
+            "GARCHSpotModel": {
+                "ID": "",
+                "Method": "GARCHSpotCalibration",
+                "Outlier_Threshold": 0.25,
+                "Max_Persistence": 0.999,
+                "Nu_Min": 2.05,
+                "Convexity_Correction": "Yes",
+                "Data_Retrieval_Parameters": {
+                    "Frequency": "1d",
+                    "Calendar": "",
+                    "Business_Days_In_Year": 252
+                }
+            },
             "MarkovHMMSpotModel": {
                 "ID": "",
                 "Method": "MarkovHMMSpotCalibration",

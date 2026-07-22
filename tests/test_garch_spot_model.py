@@ -14,7 +14,9 @@ Covers the six committed checks:
   6. n_sub grid: production business-daily / calendar-daily grids ⇒ n_sub == 1 every step; a
      synthetic 2-business-day step matches the aggregate-variance approximation analytically.
 
-Plus registration (construct_process resolves the class by name) and the privileged layout / vol.
+Plus registration (construct_process resolves the class by name), the privileged layout / vol and
+GARCHSpotCalibration (dispatched by "Method" out of calibration_config.json — the sole home of the
+fitting math; the model no longer carries a calibrate classmethod).
 
 Deterministic: CMC_State is seeded, and torch.manual_seed fixes the standardised-t Gamma draw.
 CPU-fast sizes throughout.
@@ -32,7 +34,8 @@ from scipy.stats import kurtosis
 from riskflow import utils
 from riskflow.calculation import CMC_State, CMC_State_Inner, construct_process
 from riskflow.stochasticprocess import (
-    GARCHSpotModel, BasisLinkedSpotModel, REVEAL_SUFFICIENT, REVEAL_CONTINUOUS)
+    GARCHSpotModel, GARCHSpotCalibration, BasisLinkedSpotModel, construct_calibration_config,
+    REVEAL_SUFFICIENT, REVEAL_CONTINUOUS)
 
 DEVICE = torch.device('cpu')
 DTYPE = torch.float32
@@ -315,13 +318,22 @@ def test_reveal_state_at_width_both_modes():
 
 
 # ---------------------------------------------------------------------------
-# Calibrator reproduces the §2 reference table (scipy path, full sample ~0.5s)
+# GARCHSpotCalibration: name dispatch + the §2 reference table (scipy path, full sample ~0.5s)
 # ---------------------------------------------------------------------------
 
-def test_calibrate_reproduces_reference():
+def _pl_exp():
     csv = os.path.join(os.path.dirname(__file__), '..', 'data', 'pl_exp.csv')
-    df = pd.read_csv(csv, index_col=0)[['CommodityPrice.PLATINUM']]
-    out = GARCHSpotModel.calibrate(df)                                     # scipy L-BFGS-B path
+    return pd.read_csv(csv, index_col=0)[['CommodityPrice.PLATINUM']]
+
+
+def test_calibration_dispatch_and_reference_fit():
+    df = _pl_exp()
+    # dispatch exactly as Config does off calibration_config.json's "Method"
+    cal = construct_calibration_config('GARCHSpotModel', {'Method': 'GARCHSpotCalibration'})
+    assert isinstance(cal, GARCHSpotCalibration) and cal.num_factors == 1
+
+    info = cal.calibrate(df, 0.0)                                          # scipy L-BFGS-B path
+    out = info.param
     persist = out['Alpha'] + out['Beta']
     lr_vol = np.sqrt(out['Omega'] / (1.0 - persist) / out['Calibration_DT_Years'])
     # §2 reference table (full-sample fit is the source of truth): 2% rel on (α, β, LR-vol),
@@ -333,6 +345,35 @@ def test_calibrate_reproduces_reference():
     assert abs(out['Nu'] - 7.50) / 7.50 < 0.10, out['Nu']
     assert abs(out['H0'] - 7.67e-04) / 7.67e-04 < 0.10, out['H0']
     assert out['Mu'] == 0.0 and out['Log_Price'] is True
+    # a calibrated world is driftless in PRICE (what production stamps); the emitted block
+    # must construct the model (exercises its own param assertions).
+    assert out['Convexity_Correction'] == 'Yes'
+    assert isinstance(construct_process('GARCHSpotModel', types.SimpleNamespace(param={}), out),
+                      GARCHSpotModel)
+
+    # CalibrationInfo contract: single factor, delta = standardised residual r_t/√h_t on the
+    # guarded return index — unit-scale, zero-mean, no serial dependence left in |ε|.
+    assert info.correlation == [[1.0]]
+    eps = info.delta['CommodityPrice.PLATINUM']
+    r = np.log(df.iloc[:, 0]).diff().dropna()
+    assert len(eps) == int((r.abs() < 0.25).sum()) and eps.index.equals(r[r.abs() < 0.25].index)
+    assert abs(eps.std() - 1.0) < 0.1 and abs(eps.mean()) < 0.1, (eps.mean(), eps.std())
+    assert abs(pd.Series(eps.abs()).autocorr(1)) < 0.1, 'GARCH left vol clustering in ε'
+
+
+def test_calibration_knobs():
+    """The JSON knobs are read (short window keeps this ~0.1s): the ν floor, the persistence
+    cap, the outlier guard, the Convexity_Correction passthrough and the calibration clock."""
+    df = _pl_exp().iloc[-500:]
+    cal = construct_calibration_config('GARCHSpotModel', {
+        'Method': 'GARCHSpotCalibration', 'Nu_Min': 12.0, 'Max_Persistence': 0.90,
+        'Outlier_Threshold': 0.01, 'Convexity_Correction': 'No'})
+    out = cal.calibrate(df, 0.0, num_business_days=260.0).param
+    assert out['Nu'] >= 12.0 and out['Alpha'] + out['Beta'] <= 0.90 + 1e-12
+    assert out['Convexity_Correction'] == 'No'
+    assert out['Calibration_DT_Years'] == 1.0 / 260.0
+    r = np.log(df.iloc[:, 0]).diff().dropna()
+    assert len(cal.calibrate(df, 0.0).delta) == int((r.abs() < 0.01).sum()) < len(r)
 
 
 def test_registration_layout_and_vol():
