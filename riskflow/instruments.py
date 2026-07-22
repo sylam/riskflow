@@ -4308,7 +4308,12 @@ class FXTARFOptionDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Underlying_Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
-                     'FX_Volatility': ['FXVol']}
+                     'FX_Volatility': ['FXVol'],
+                     # opt-in Heston-Nandi spot model (SpotModel='HestonNandi'); resolves ONLY when the
+                     # deal names an HN_Params factor, so get_fieldname yields nothing otherwise. The
+                     # factor lands in static_factors -> t_Static_Buffer (never implied_factors, which
+                     # would duplicate the AAD leaf - test_hn_bootstrapper.test_not_registered...).
+                     'HN_Params': ['HestonNandiModelParameters']}
 
     documentation = (
         'Fx And Equity', [
@@ -4380,6 +4385,26 @@ class FXTARFOptionDeal(Deal):
             'Notional2': self.field['LeverageNotional'],
             'Local_Currency': '{0}.{1}'.format(self.field['Underlying_Currency'], self.field['Currency'])
         }
+
+        # opt-in Heston-Nandi spot model, mirroring FloatingEnergyDeal's ForwardCurve switch: swap the
+        # (moneyness, vol-surface) lookup for the daily GARCH recursion in the pricer. The GBM
+        # field_index['Volatility'] path above is untouched when the switch is off/absent. Resolved
+        # inline via the generic machinery (get_factor_component + the factor's own current_value()
+        # keys), so it works unchanged for any parametric 0D model factor - no per-model getter. The
+        # per-parameter scalars land in t_Static_Buffer (calculation.py's dict-current_value expansion),
+        # read back on the AAD graph exactly like the SVI wing params (utils.py:2052).
+        spot_model = self.options.get('SpotModel', 'None')
+        if spot_model not in ('None', 'HestonNandi'):
+            raise ValueError("SpotModel=%r not recognised; expected one of ('None', 'HestonNandi')"
+                             % (spot_model,))
+        if spot_model == 'HestonNandi':
+            hn = utils.Factor('HestonNandiModelParameters', utils.check_rate_name(self.field['HN_Params']))
+            hn_factor = get_factor_component(hn, all_factors)
+            field_index['HN_Params'] = [tuple([False, [
+                utils.Factor(hn.type, hn.name + (param,)) for param in hn_factor.current_value()],
+                hn_factor.get_subtype()])]
+            # HN is calibrated on a per-DAY clock; a weekly/monthly fixing spans this many daily sub-steps
+            field_index['HN_Steps_Per_Year'] = self.options.get('Steps_Per_Year', 252.0)
 
         # needed for reporting
         return field_index

@@ -1385,6 +1385,19 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
     - Analytic KO-in-step: adds (1 - p_survive) * remaining_target at each fixing
     - Survival branch: GBM step with Z ~ N(0,1) truncated at z_max from the PnL barrier
     - Accrual: only ITM leg contributes to target; OTM affects PV only (and optional knock-in barrier)
+
+    KNOWN LIMITATIONS of the opt-in Heston-Nandi spot model (SpotModel='HestonNandi'); accepted
+    design semantics, stated so they are not re-discovered:
+    (F1) each fixing spans n_sub = max(round(dt * Steps_Per_Year), 1) whole HN daily steps, so the
+         per-fixing variance is quantised to an integer number of trading days with a floor of one -
+         a sub-3-calendar-day fixing still carries one full day of HN variance.
+    (F2) Steps_Per_Year (default 252) MUST match the daily clock the HN factor was calibrated on; a
+         mismatch silently rescales the variance horizon (n_sub and hence Sum h) with no error.
+    (F3) the n_sub-1 unconditional sub-step normals are drawn from the global torch generator, not
+         the reset Sobol stream - deterministic per run seed, but finite-difference greeks w.r.t.
+         NON-HN factors pick up this RNG noise (HN-parameter greeks are AAD and unaffected).
+    (F4) h re-seeds to H0 at the start of every MTM row (static implied factor); there is no
+         outer-grid variance term structure - each valuation date restarts the recursion at H0.
     """
 
     # --- Accumulated target from past observed fixings --------------------------
@@ -1419,13 +1432,14 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
 
             # reduced_samples = number of GBM “substeps” in this coupon/fixing leg
             reduced_samples = len(delta_t)
-            # calculate the total forward rate
-            fixing_t = delta_t.cumsum(0).unsqueeze(-1)
-            forward = s.unsqueeze(0) * torch.exp((carry_rate * fixing_t))
-            # calculate the moneyness based on the forwards
-            moneyness = strike / forward if factor_dep['Invert_Moneyness']  else forward / strike
-            vols = torch.stack([utils.calc_time_grid_vol_rate(
-                factor_dep['Volatility'], mon, s_tau, shared) for mon, s_tau in zip(moneyness, full_t.reshape(-1,1))])
+            if not hn:
+                # calculate the total forward rate
+                fixing_t = delta_t.cumsum(0).unsqueeze(-1)
+                forward = s.unsqueeze(0) * torch.exp((carry_rate * fixing_t))
+                # calculate the moneyness based on the forwards
+                moneyness = strike / forward if factor_dep['Invert_Moneyness']  else forward / strike
+                vols = torch.stack([utils.calc_time_grid_vol_rate(
+                    factor_dep['Volatility'], mon, s_tau, shared) for mon, s_tau in zip(moneyness, full_t.reshape(-1,1))])
             # RNG (uniforms for truncated draws)
             if reduced_samples:
                 if sobol:
@@ -1439,6 +1453,12 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                 u = torch.concat([u,1.0-u], dim=-1)
 
             Sj = torch.unsqueeze(s, 1)  # [batch, 1] as you do
+            # Heston-Nandi predictable variance of the first daily step. h is re-seeded to H0 at the
+            # start of EACH forward simulation (each MTM row) and then recursed continuously - including
+            # the truncated final draw - through every daily sub-step below. At the base date h1=H0 is
+            # exactly the calibrated initial variance; at a future MTM row it is the base-date seed
+            # (HN is a static implied factor here, not a stochastically-simulated h on the outer grid).
+            h = H0 if hn else None
             # Running PV and survival weight
             P = shared.one.new_zeros((shared.simulation_batch, 2*num_sims))
             L = shared.one.new_ones((shared.simulation_batch, 2*num_sims))
@@ -1463,9 +1483,10 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                 if dt > 0:
                     fwd_carry = ((carry_rate[j] * full_t[j] - carry_rate[j - 1] * full_t[j - 1]) / dt
                                  if j > 0 else carry_rate[j]).reshape(-1, 1)  # [batch,1]
-                    safe_fwd_vol = (full_t[j] * vols[j] ** 2 - full_t[j - 1] * vols[j - 1] ** 2).clamp(min=eps)
-                    fwd_vol = (torch.sqrt(safe_fwd_vol/dt) if j > 0 else vols[j]).T
-                    vol_dt = fwd_vol * torch.sqrt(dt)
+                    if not hn:
+                        safe_fwd_vol = (full_t[j] * vols[j] ** 2 - full_t[j - 1] * vols[j - 1] ** 2).clamp(min=eps)
+                        fwd_vol = (torch.sqrt(safe_fwd_vol/dt) if j > 0 else vols[j]).T
+                        vol_dt = fwd_vol * torch.sqrt(dt)
                 else:
                     #use past fixing
                     use_past_fixing = True
@@ -1484,10 +1505,36 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                         rhs = (1.0 / K) + (R / N_i) * (-callOrPut)
                         B_pnl = 1.0 / rhs
 
-                    # Lognormal cap -> z_max
-                    # NOTE: use current Sj as “S_{i-1}”
-                    fwd_drift = (fwd_carry - 0.5 * fwd_vol * fwd_vol) * dt
-                    z_max = (torch.log(B_pnl/Sj) - fwd_drift) / vol_dt
+                    if hn:
+                        # --- Heston-Nandi daily sub-stepping. HN calibrates per day; this fixing spans
+                        # n_sub daily steps. The first n_sub-1 are UNCONDITIONAL and UNMONITORED (the TARF
+                        # only accrues/knocks AT the fixing), so the OSS truncation is applied ONLY on the
+                        # last step - where, given h, the daily log-return is conditionally Gaussian. The
+                        # barrier B_pnl depends only on the remaining target R, constant over the interval
+                        # and F-measurable at the truncation, so this scheme is EXACT (product unchanged).
+                        # A mean-matched single-step normal bridge was MEASURED and REJECTED (KO-prob error
+                        # 29% at n=5 -> ~2000% at n=63); naive daily-monitored OSS prices a DIFFERENT product.
+                        n_sub = max(int(round(float(dt) * hn_spy)), 1)
+                        b_step = fwd_carry * dt / n_sub  # per-step cost-of-carry r-q; total = fwd_carry*dt
+                        for _ in range(n_sub - 1):
+                            # regular-stream normals for the unmonitored sub-steps (Sobol/antithetic
+                            # variance reduction is reserved for the truncated final draw), made antithetic
+                            # by negating the normal on the paired half - matching u<->1-u on that draw.
+                            zc = torch.randn([shared.simulation_batch, num_sims],
+                                             dtype=shared.one.dtype, device=shared.one.device)
+                            z = torch.cat([zc, -zc], dim=-1)
+                            sh = torch.sqrt(h)
+                            Sj = Sj * torch.exp(b_step - 0.5 * h + sh * z)
+                            # feed the realized draw; h stays lock-step across sub-steps AND fixings
+                            h = Omega + Beta * h + Alpha * (z - Gamma_Star * sh) ** 2
+                        sh = torch.sqrt(h)
+                        fwd_drift = b_step - 0.5 * h  # per-step drift of the FINAL (monitored) daily step
+                        z_max = (torch.log(B_pnl / Sj) - fwd_drift) / sh
+                    else:
+                        # Lognormal cap -> z_max
+                        # NOTE: use current Sj as “S_{i-1}”
+                        fwd_drift = (fwd_carry - 0.5 * fwd_vol * fwd_vol) * dt
+                        z_max = (torch.log(B_pnl/Sj) - fwd_drift) / vol_dt
                     PhiB = utils.norm_cdf(z_max)  # = P(Z <= z_max)
                     
                     if (callOrPut > 0):
@@ -1500,8 +1547,18 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                     # ---- Analytic KO-in-step contribution -------------------------------------
                     # KO pays the *remaining target* this step, discounted at the j-th discount point
                     P = P + (1.0 - p) * L * R * Dj
-                    # GBM increment
-                    Sj = Sj * (torch.exp(fwd_drift + vol_dt * Z) if dt > 0 else 1.0)
+                    if hn:
+                        # HN increment on the truncated final draw
+                        Sj = Sj * torch.exp(fwd_drift + sh * Z)
+                        # NOTE (leverage asymmetry - DO NOT "fix" back to an unconditional draw): the
+                        # h-recursion is fed the TRUNCATED final draw Z, correct because we simulate the
+                        # survival-CONDITIONED law. Under leverage (Gamma_Star>0) this makes the simulated
+                        # h-path deviate from unconditional GARCH moments ASYMMETRICALLY (a call's
+                        # suppressed up-moves feed a systematically smaller (Z - Gamma_Star*sqrt(h))^2).
+                        h = Omega + Beta * h + Alpha * (Z - Gamma_Star * sh) ** 2
+                    else:
+                        # GBM increment
+                        Sj = Sj * (torch.exp(fwd_drift + vol_dt * Z) if dt > 0 else 1.0)
                 else:
                     Sj = all_samples[-min(reduced_samples, num_samples)].reshape(-1, 1)
                     p = 1.0
@@ -1580,6 +1637,18 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
     strike = factor_dep['Strike_Price']
     invertedTarget = deal_data.Instrument.field['InvertedTarget']
     callOrPut = factor_dep['Option_Type']
+
+    # opt-in Heston-Nandi spot model: the (Omega, Alpha, Beta, Gamma_Star, H0) scalars ride the AAD
+    # graph out of t_Static_Buffer, unpacked exactly like the SVI wing params (utils.py:2052). When
+    # absent, sim_spot_tarf takes the byte-identical GBM path. Asset-class agnostic (works for the FX
+    # cross here, and unchanged for an equity/commodity underlying).
+    hn = 'HN_Params' in factor_dep
+    if hn:
+        hn_p = {x.name[-1]: shared.t_Static_Buffer[x].reshape(-1, 1)
+                for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
+        Omega, Alpha, Beta, Gamma_Star, H0 = (
+            hn_p['Omega'], hn_p['Alpha'], hn_p['Beta'], hn_p['Gamma_Star'], hn_p['H0'])
+        hn_spy = factor_dep['HN_Steps_Per_Year']
 
     # calculate the correct accumulation to date
     acc = shared.one * 0.0
