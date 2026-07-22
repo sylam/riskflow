@@ -20,7 +20,9 @@ import pandas as pd
 import torch
 
 from . import utils
-from .hedge_runtime import assemble_privileged_factors, per_contract_kappa
+from .hedge_runtime import (
+    assemble_privileged_factors, per_contract_kappa, _privileged_multi, _privileged_name,
+)
 
 
 # --- spot realized-vol + timeline (relocated from the deleted hedge_features.py); feed the
@@ -69,6 +71,65 @@ def compute_spot_realized_vol(bundle, window=PRICE_ZSCORE_WINDOW, min_periods=5,
         rv[:min_periods] = 0.0
         out[commodity] = rv
     return out
+
+
+def _realized_vol_series(spot, window=PRICE_ZSCORE_WINDOW):
+    """Per-step annualized realized log-vol of a `(T, B)` mark path, batch-reduced to `(T,)`.
+    The trailing-window (rolling std of log-returns × √252) proxy the state-dependent bid/offer
+    spread falls back to when a world exposes no revealed conditional-vol state. Floored strictly
+    positive so the warm-up window (before the window fills) never zeros the spread."""
+    log_ret = spot.clamp_min(1e-9).log().diff(dim=0)                                  # (T-1, B)
+    ret_sq = torch.cat([torch.zeros_like(log_ret[:1]), log_ret * log_ret], dim=0)     # (T, B)
+    cum = torch.cat([torch.zeros_like(ret_sq[:1]), ret_sq.cumsum(dim=0)], dim=0)      # (T+1, B)
+    T = ret_sq.shape[0]
+    idx = torch.arange(T + 1, device=spot.device)
+    lo = (idx - window).clamp_min(0)
+    count = (idx - lo).to(dtype=torch.float32).clamp_min(1.0).unsqueeze(-1)
+    rv = (252.0 * (cum[idx[1:]] - cum[lo[1:]]) / count[1:]).clamp_min(0.0).sqrt()     # (T, B)
+    return rv.mean(dim=-1).clamp_min(1e-6)                                            # (T,)
+
+
+def _build_step_annual_vol(bundle, runtime, stoch_factors):
+    """Per-step scalar annualized-vol series `(T_full,)` driving BOTH the state-dependent bid/offer
+    half-spread (`hedge_runtime.per_contract_kappa` Vol_Scale) and the vol-linked initial-margin
+    funding charge (`_im_funding_charge`). Built once at bundle build, and ONLY when a Vol_Scale
+    spec OR IM funding is active — absent otherwise so `per_contract_kappa` ignores vol and no
+    funding accrues (today's behaviour, bit-identical). World-agnostic source: PREFER a
+    process-revealed conditional vol (GARCH publishes log h_t → σ_t = √(exp(log h_t)/dt_c)); else
+    the trailing realized-vol proxy off the primary spot factor path. Batch-reduced to one scalar
+    per step — the cost model charges a single spread per step, matching the solver's mean-mark
+    kappa. The chosen source is logged EXACTLY once per bundle build: a silent proxy fallback under
+    a GARCH retrain would invalidate the whole vol coupling, so it must be observable + test-pinned."""
+    acc = runtime.get('accounting') or {}
+    spec = acc.get('bid_offer_spread_spec')
+    vol_scale_active = bool(spec and spec.get('vol_scale'))
+    im_funding_active = bool(acc.get('im_funding_spread_bps'))
+    if not (vol_scale_active or im_funding_active):
+        return None
+    pf = bundle.get('privileged_factors') or {}
+    multi = _privileged_multi(stoch_factors)
+    for factor, proc in (stoch_factors or {}).items():
+        if 'log_h' not in type(proc).privileged_layout(proc.param):
+            continue
+        block = pf.get(_privileged_name(factor.name[0], 'log_h', multi))
+        if block is not None:
+            logging.info('step_annual_vol source: revealed %s log_h (Vol_Scale=%s IM_funding=%s)',
+                         factor.name[0], vol_scale_active, im_funding_active)
+            return proc.revealed_annual_vol(block[..., 0]).mean(dim=-1)               # (T_full,)
+    factors = bundle.get('factors') or {}
+    commodity = next((c for c in (runtime.get('referenced_commodities') or ()) if c in factors), None)
+    if commodity is None:
+        return None
+    logging.info('step_annual_vol source: realized-vol proxy on %s (Vol_Scale=%s IM_funding=%s)',
+                 commodity, vol_scale_active, im_funding_active)
+    return _realized_vol_series(factors[commodity])
+
+
+def _step_vol(bundle, t):
+    """Scalar annualized vol at full-grid step `t` for the Vol_Scale spread, or None when no
+    Vol_Scale is configured (`per_contract_kappa` then ignores vol)."""
+    series = bundle.get('step_annual_vol')
+    return None if series is None else series[int(t)]
 
 
 def _batch_size_from_bundle(bundle):
@@ -544,9 +605,82 @@ def _realized_structured_action(action, current_positions, runtime, *, batch_siz
     }
 
 
-def _transaction_costs(trade_delta, price, runtime, name):
+def _transaction_costs(trade_delta, price, runtime, name, vol=None):
     # Realized debit on |Δq| contracts at the turnover-cost rule (hedge_runtime.per_contract_kappa).
-    return trade_delta.abs() * per_contract_kappa(runtime, price.abs(), name)
+    return trade_delta.abs() * per_contract_kappa(runtime, price.abs(), name, vol)
+
+
+def _roll_rebate(deltas, prices, runtime, vol=None):
+    """Calendar-spread rebate for a step's turnover (Evaluator.Roll_As_Calendar_Spread='Yes').
+    A rebalance that REDUCES one contract month and INCREASES an adjacent month is a roll: the
+    matched quantity should pay a single calendar-spread half-cost, not two independent outright
+    half-spreads. Greedily match offsetting Δq (opposite signs) across CONSECUTIVE maturities
+    (`names['hedges']` is maturity-ordered): the matched x on each pair earns
+    `rebate = outright(x on both legs) − calendar(x)`; the unmatched residual keeps paying the
+    per-instrument outright debit (untouched). Returns the per-path rebate `(B,)` to CREDIT back.
+
+    Default calendar rate = half the sum of the two outright kappas (so it composes with the
+    per-instrument / Vol_Scale spread from Task 1 automatically); `Evaluator.Calendar_Spread_Bps`
+    overrides the matched leg with an absolute half-spread bps on the average leg notional (still
+    charging the flat per-unit fee on both legs). `deltas`/`prices` key by hedge name; `vol` is
+    the step's scalar annualized vol."""
+    acc = runtime["accounting"]
+    hedges = list(runtime["names"]["hedges"])
+    rem = [deltas[h].to(torch.float32) for h in hedges]                 # remaining unmatched Δq
+    rebate = torch.zeros_like(rem[0])
+    cal_bps = acc["calendar_spread_bps"]
+    for i in range(len(hedges) - 1):
+        di, dj = rem[i], rem[i + 1]
+        x = torch.minimum(di.abs(), dj.abs()) * ((di * dj) < 0)         # (B,) matched contracts
+        rem[i] = di - di.sign() * x
+        rem[i + 1] = dj - dj.sign() * x
+        ni, nj = hedges[i], hedges[i + 1]
+        pi, pj = prices[ni].abs(), prices[nj].abs()
+        k_i = per_contract_kappa(runtime, pi, ni, vol)
+        k_j = per_contract_kappa(runtime, pj, nj, vol)
+        outright = x * (k_i + k_j)
+        if cal_bps is None:
+            cal = x * 0.5 * (k_i + k_j)
+        else:
+            cs_i = float(_runtime_tradable(runtime, ni).get("contract_size", 1.0))
+            cs_j = float(_runtime_tradable(runtime, nj).get("contract_size", 1.0))
+            n_avg = 0.5 * (pi * cs_i + pj * cs_j)
+            cal = x * (2.0 * acc["transaction_cost_per_unit"] + 0.5 * cal_bps * 1.0e-4 * n_avg)
+        rebate = rebate + (outright - cal)
+    return rebate
+
+
+def _calendar_dt(bundle, current, next_idx):
+    """CALENDAR-clock step-year fraction `(time_grid_days[next]-time_grid_days[cur])/365.25` — the
+    sim dt convention (dt=1/365.25) over which posted initial margin is funded. Scalar Python
+    float off the cached CPU day mirror (no CUDA sync)."""
+    days = bundle["time_grid_days_cpu"]
+    return (days[int(next_idx)] - days[int(current)]) / 365.25
+
+
+def _im_funding_charge(positions, prices, runtime, vol, dt):
+    """Per-hedge-leg initial-margin funding debit `{name: (B,)}` on a step's POST-trade book. The
+    desk posts vol-linked IM on GROSS per-leg |q| — conservative: it over-margins calendar spreads,
+    since a −1/+1 roll posts two legs' IM, not a netted spread margin —
+        IM_i = IM_Vol_Multiplier · (σ_t/IM_Ref_Vol) · F_i · |q_i^post| · cs_i
+    and pays `IM_i · IM_Funding_Spread_Bps · 1e-4 · dt` to FUND it over the calendar step. This is
+    the spread the desk pays ABOVE the risk-free the margin ledger already earns (see
+    `_daily_growth_factors`), so it is a pure debit. σ_t is the SAME shared per-step vol that drives
+    the Vol_Scale bid/offer spread, so funding rises with vol — a documented coupling. Anchoring:
+    with IM_Ref_Vol and IM_Vol_Multiplier chosen so IM_i at the base σ_0/F_0 equals today's flat
+    Initial_Margin.Amount per contract, the level is pinned to reality (calibration sets the knobs).
+    Only called when `im_funding_spread_bps` is truthy — at which point `step_annual_vol` is built
+    so `vol` is a scalar, never None (per `_build_step_annual_vol` gating)."""
+    acc = runtime["accounting"]
+    # mult · (σ/ref) · spread_bps · 1e-4 · dt — the per-leg scalar; ×(F_i·|q_i|·cs_i) gives funding_i.
+    factor = (acc["im_vol_multiplier"] * (vol / acc["im_ref_vol"])
+              * acc["im_funding_spread_bps"] * 1.0e-4 * dt)
+    out = {}
+    for name in _runtime_names(runtime, "hedges"):
+        n = str(name)
+        cs = float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
+        out[n] = factor * prices[n].abs() * positions[n].abs() * cs
+    return out
 
 
 def _apply_cash_trade(cash_accounts, account_name, trade_delta, price, transaction_cost, contract_size):
@@ -593,17 +727,17 @@ def _step_cumulative_pnl(cumulative_pnl, variation_margin, next_positions):
     return out
 
 
-def _flatten_cash_inventory(positions, cash_accounts, terminal_values, runtime):
+def _flatten_cash_inventory(positions, cash_accounts, terminal_values, runtime, vol=None):
     for name in _runtime_names(runtime, "hedges"):
         n = str(name)
         delta = -positions[n]
-        cost = _transaction_costs(delta, terminal_values[n], runtime, n)
+        cost = _transaction_costs(delta, terminal_values[n], runtime, n, vol)
         cs = float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
         _apply_cash_trade(cash_accounts, _cash_account_for_instrument(n, runtime), delta, terminal_values[n], cost, cs)
         positions[n] = positions[n] + delta
 
 
-def _flatten_futures_inventory(positions, margin_accounts, settlement_prices, terminal_values, runtime):
+def _flatten_futures_inventory(positions, margin_accounts, settlement_prices, terminal_values, runtime, vol=None):
     """Close hedge positions at `terminal_values` and capture any residual variation margin.
 
     `settlement_prices` is the price each position last settled at; `terminal_values` is the
@@ -611,13 +745,16 @@ def _flatten_futures_inventory(positions, margin_accounts, settlement_prices, te
     applied to margin to ensure no PnL leaks between the last settlement and close. When the
     caller has already advanced settlement to terminal (current futures_account_step path), the
     residual is 0 and only the trade cost is debited; otherwise the residual is captured here.
-    Trade cost is always computed at `terminal_values` (the actual close price)."""
+    Trade cost is always computed at `terminal_values` (the actual close price). `vol` is the
+    flatten-step scalar vol so the forced-flat turnover scales with the Vol_Scale spread exactly
+    like every other decision-step debit — the realized accounting is uniformly vol-scaled (None ⇒
+    vol-independent, bit-identical)."""
     for name in _runtime_names(runtime, "hedges"):
         n = str(name)
         cs = float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
         residual_vm = positions[n] * (terminal_values[n] - settlement_prices[n]) * cs
         delta = -positions[n]
-        cost = _transaction_costs(delta, terminal_values[n], runtime, n)
+        cost = _transaction_costs(delta, terminal_values[n], runtime, n, vol)
         account = _cash_account_for_instrument(n, runtime)
         _apply_account_flow(margin_accounts, account, residual_vm)
         _apply_account_flow(margin_accounts, account, -cost)
@@ -689,16 +826,28 @@ def cash_account_step(state, action, bundle, runtime):
     growth = _daily_growth_factors(bundle, runtime, current, next_idx)
     next_cash = _compound_accounts(state["cash_accounts"], growth)
     deltas = _resolve_trade_deltas(action, runtime, batch_size=batch_size, device=device)
+    vol_t = _step_vol(bundle, current)
     for name in _runtime_names(runtime, "action_instruments"):
         n = str(name)
         delta = deltas.get(n)
         price = state["tradable_values"][n]
-        cost = _transaction_costs(delta, price, runtime, n)
+        cost = _transaction_costs(delta, price, runtime, n, vol_t)
         cs = float(_runtime_tradable(runtime, n).get("contract_size", 1.0))
         _apply_cash_trade(next_cash, _cash_account_for_instrument(n, runtime), delta, price, cost, cs)
         next_positions[n] = (next_positions[n] + delta).round()
+    if runtime["accounting"]["roll_as_calendar_spread"]:
+        hedges = _runtime_names(runtime, "hedges")
+        rebate = _roll_rebate(deltas, {h: state["tradable_values"][h] for h in hedges}, runtime, vol_t)
+        _apply_account_flow(next_cash, _cash_account_for_instrument(hedges[0], runtime), rebate)
+    if runtime["accounting"]["im_funding_spread_bps"]:
+        # Vol-linked IM funding on the post-trade book over the calendar step — a pure debit into the
+        # same realized cash P&L path as transaction cost (per-leg, routed by currency), so it flows
+        # through _portfolio_value → _pnl_excess → the utility objective exactly like a cost.
+        dt = _calendar_dt(bundle, current, next_idx)
+        for n, funding in _im_funding_charge(next_positions, state["tradable_values"], runtime, vol_t, dt).items():
+            _apply_account_flow(next_cash, _cash_account_for_instrument(n, runtime), -funding)
     if _should_terminal_flatten(runtime, current, last):
-        _flatten_cash_inventory(next_positions, next_cash, _current_tradable_values(bundle, runtime, last), runtime)
+        _flatten_cash_inventory(next_positions, next_cash, _current_tradable_values(bundle, runtime, last), runtime, vol_t)
     # cash-account mode tracks no daily VM — cumulative_pnl can only be added to in futures
     # mode. Still reset at flat for the same per-trade-lifetime semantics as time_held.
     zero_vm = _zeros_by_name(_runtime_names(runtime, "hedges"), batch_size, device=device)
@@ -767,16 +916,28 @@ def futures_account_step(state, action, bundle, runtime):
         next_settlement[n] = next_values[n].clone()
         account = _cash_account_for_instrument(n, runtime)
         _apply_account_flow(next_margin, account, vm)
+    vol_t = _step_vol(bundle, current)
     for name in _runtime_names(runtime, "action_instruments"):
         n = str(name)
         delta = deltas.get(n)
         # Trade cost references the price the agent actually saw and acted on (decision-time).
         # Using next_values[n] would let unrelated overnight mid moves distort the spread cost.
-        cost = _transaction_costs(delta, state["tradable_values"][n], runtime, n)
+        cost = _transaction_costs(delta, state["tradable_values"][n], runtime, n, vol_t)
         account = _cash_account_for_instrument(n, runtime)
         _apply_account_flow(next_margin, account, -cost)
+    if runtime["accounting"]["roll_as_calendar_spread"]:
+        hedges = _runtime_names(runtime, "hedges")
+        rebate = _roll_rebate(deltas, {h: state["tradable_values"][h] for h in hedges}, runtime, vol_t)
+        _apply_account_flow(next_margin, _cash_account_for_instrument(hedges[0], runtime), rebate)
+    if runtime["accounting"]["im_funding_spread_bps"]:
+        # Vol-linked IM funding on the post-trade book over the calendar step — a pure debit into the
+        # same realized margin P&L path as transaction cost (per-leg, routed by currency), so it flows
+        # through _portfolio_value → _pnl_excess → the utility objective exactly like a cost.
+        dt = _calendar_dt(bundle, current, settlement_idx)
+        for n, funding in _im_funding_charge(next_positions, state["tradable_values"], runtime, vol_t, dt).items():
+            _apply_account_flow(next_margin, _cash_account_for_instrument(n, runtime), -funding)
     if _should_terminal_flatten(runtime, current, last):
-        _flatten_futures_inventory(next_positions, next_margin, next_settlement, next_values, runtime)
+        _flatten_futures_inventory(next_positions, next_margin, next_settlement, next_values, runtime, vol_t)
     next_cumulative_pnl = _step_cumulative_pnl(state["cumulative_pnl"], variation_margin, next_positions)
     next_time_held = _step_time_held(state["time_held"], next_positions)
     next_state = {
@@ -1094,6 +1255,10 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
             )
             for name, tensor in bundle['privileged_factors'].items()
         }
+    # Per-step vol series for the state-dependent bid/offer spread (None unless a Vol_Scale spec
+    # is configured). Built after the privileged prefix so a revealed log_h source is full-grid.
+    if runtime is not None:
+        bundle['step_annual_vol'] = _build_step_annual_vol(bundle, runtime, stoch_factors)
     return bundle
 
 
@@ -1123,6 +1288,13 @@ def _diag_expand_per_day(rollout, bundle, runtime):
     realised = mtm_running.gather(0, last_nz.unsqueeze(0)).expand(T, B)
     mtm = torch.where(fill_mask, realised, mtm_running)
 
+    # Per-step vol `(T, 1)` for the vol-scaled kappa — index-aligned with the full-grid `fut`
+    # (both are full time-grid tensors). None when no Vol_Scale/IM-funding series was built; inert
+    # on the scalar-spread fast-path (per_contract_kappa ignores vol), so threading it is
+    # bit-identical when Vol_Scale is off and reconciles the reconstructed cost with the realized
+    # vol-scaled debit when it is on.
+    vol_series = bundle.get('step_annual_vol')
+    diag_vol = None if vol_series is None else vol_series.detach().cpu().float().unsqueeze(-1)
     times = [int(t) for t in rollout['times']]
     per_instr = {}
     for name in instrument_order:
@@ -1139,7 +1311,7 @@ def _diag_expand_per_day(rollout, bundle, runtime):
                 j += 1
             pos[t] = cur
         trade_cash = -trd * fut * cs
-        trade_cost = trd.abs() * per_contract_kappa(runtime, fut, name)
+        trade_cost = trd.abs() * per_contract_kappa(runtime, fut, name, diag_vol)
         position_mtm = pos * fut * cs
         cum_cash = trade_cash.cumsum(0)
         cum_cost = trade_cost.cumsum(0)
@@ -1151,6 +1323,18 @@ def _diag_expand_per_day(rollout, bundle, runtime):
     portfolio_pos_mtm = sum(p['position_mtm'] for p in per_instr.values())
     portfolio_cum_cash = sum(p['cum_cash'] for p in per_instr.values())
     portfolio_cum_cost = sum(p['cum_cost'] for p in per_instr.values())
+    # Roll-as-calendar-spread rebate, threaded with the SAME per-step vol as the cost above so the
+    # matched-roll credit reconstructs the realized vol-scaled rebate (vol=None ⇒ scalar-spread
+    # fast-path, unchanged when Vol_Scale is off): credit the savings back so the reconstructed
+    # cost matches the realized accounting.
+    if runtime['accounting'].get('roll_as_calendar_spread'):
+        hedges = list(runtime['names']['hedges'])
+        rebate = torch.stack([
+            _roll_rebate({h: per_instr[h]['trd'][t] for h in hedges},
+                         {h: per_instr[h]['fut'][t] for h in hedges}, runtime,
+                         None if diag_vol is None else diag_vol[t])
+            for t in range(T)])
+        portfolio_cum_cost = portfolio_cum_cost - rebate.cumsum(0)
     hp = portfolio_cum_cash + portfolio_pos_mtm - portfolio_cum_cost
     total = mtm + hp
     return {

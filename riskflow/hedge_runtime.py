@@ -233,6 +233,33 @@ def _build_instrument_cash_account_map(normalized_tradables, cash_account_names)
     }
 
 
+def _normalize_bid_offer_spread(evaluator_config: Mapping[str, Any]):
+    """`Evaluator.Bid_Offer_Spread_Bps` is EITHER a scalar half-spread bps applied to every
+    instrument (the existing behaviour — kept as a fast-path, bit-identical) OR a spec dict for
+    maturity/liquidity- and volatility-dependent spreads:
+
+        {"Default_Bps": d,
+         "Per_Instrument": {name: base_bps, ...},
+         "Vol_Scale": {"Ref_Vol": r, "Beta": b}}
+
+    The effective half-spread for instrument `name` at annualized vol σ_t is
+    `base_bps[name] · (σ_t/Ref_Vol)**Beta`, where `base_bps[name]` falls back to `Default_Bps`
+    (Per_Instrument absent ⇒ Default_Bps for all) and the vol factor is 1 when Vol_Scale is
+    absent, Beta==0, or σ_t is unknown. Returns `(scalar_bps, spec)`; `spec` is None in the
+    scalar case, and `scalar_bps` (the Default_Bps in the dict case) also feeds the diagnostic
+    CSV display column + the scalar fast-path in `per_contract_kappa`."""
+    raw = evaluator_config.get("Bid_Offer_Spread_Bps", 0.0)
+    if not isinstance(raw, Mapping):
+        return float(raw), None
+    default_bps = float(raw.get("Default_Bps", 0.0))
+    per_instrument = {str(k): float(v) for k, v in (raw.get("Per_Instrument") or {}).items()}
+    vs = raw.get("Vol_Scale") or {}
+    vol_scale = ({"ref_vol": float(vs["Ref_Vol"]), "beta": float(vs.get("Beta", 0.0))}
+                 if vs else None)
+    return default_bps, {"default_bps": default_bps, "per_instrument": per_instrument,
+                         "vol_scale": vol_scale}
+
+
 def _normalize_position_limits(evaluator_config: Mapping[str, Any]) -> Dict[str, Dict[str, int]]:
     position_limits = {}
     for instrument_name, limit_config in evaluator_config.get("Position_Limits", {}).items():
@@ -403,6 +430,7 @@ def construct_hedge_runtime(
         if str(account_name) not in tradables:
             raise ValueError(f"Evaluator cash account '{account_name}' is not in Tradable_Instruments")
     position_limits = _normalize_position_limits(evaluator_config)
+    scalar_spread_bps, spread_spec = _normalize_bid_offer_spread(evaluator_config)
     hedge_names = tuple(
         instrument_name
         for instrument_name in tradables.keys()
@@ -489,7 +517,27 @@ def construct_hedge_runtime(
             "instrument_to_cash_account": _build_instrument_cash_account_map(
                 normalized_tradables, cash_account_names),
             "transaction_cost_per_unit": float(evaluator_config.get("Transaction_Cost_Per_Unit", 0.0)),
-            "bid_offer_spread_bps": float(evaluator_config.get("Bid_Offer_Spread_Bps", 0.0)),
+            # Scalar half-spread bps (fast-path + diagnostic display); `spec` is None for a scalar
+            # Bid_Offer_Spread_Bps (bit-identical) and a normalized per-instrument/vol-scale dict
+            # otherwise — resolved in `per_contract_kappa`.
+            "bid_offer_spread_bps": scalar_spread_bps,
+            "bid_offer_spread_spec": spread_spec,
+            # Roll-as-calendar-spread: when a rebalance offsets Δq across adjacent maturities, the
+            # matched quantity pays a single calendar half-cost instead of two outright half-spreads
+            # (realized accounting only — see hedge_bundle._roll_rebate). Default off ⇒ bit-identical.
+            "roll_as_calendar_spread": evaluator_config.get("Roll_As_Calendar_Spread", "No") == "Yes",
+            "calendar_spread_bps": (float(evaluator_config["Calendar_Spread_Bps"])
+                                    if evaluator_config.get("Calendar_Spread_Bps") is not None else None),
+            # Vol-linked initial-margin FUNDING charge on the post-trade book (realized accounting
+            # only — see hedge_bundle._im_funding_charge). Per hedge leg i at step t the desk posts
+            # IM_i = IM_Vol_Multiplier·(σ_t/IM_Ref_Vol)·F_i·|q_i^post|·cs_i and pays
+            # IM_Funding_Spread_Bps·1e-4·dt to FUND it over the calendar step (above the risk-free
+            # the margin ledger already earns). IM_Funding_Spread_Bps default 0.0 ⇒ the term is
+            # exactly 0 and never executes ⇒ bit-identical. IM_Ref_Vol default 1.0 is inert (only
+            # divided when the spread is on, at which point the calibration sets all three knobs).
+            "im_funding_spread_bps": float(evaluator_config.get("IM_Funding_Spread_Bps", 0.0)),
+            "im_vol_multiplier": float(evaluator_config.get("IM_Vol_Multiplier", 0.0)),
+            "im_ref_vol": float(evaluator_config.get("IM_Ref_Vol", 1.0)),
             "force_flat_at_end": evaluator_config.get("Force_Flat_At_End", "Yes") == "Yes",
             "total_position_abs_limit": float(evaluator_config.get("Total_Position_Abs_Limit", 0.0)),
             "total_position_schedule": _normalize_total_position_schedule(evaluator_config),
@@ -499,17 +547,30 @@ def construct_hedge_runtime(
     return runtime
 
 
-def per_contract_kappa(runtime, price, name):
+def per_contract_kappa(runtime, price, name, vol=None):
     """Per-contract turnover cost for tradable `name` at mark `price`: a flat
     Transaction_Cost_Per_Unit plus a half-spread charge on notional
-    (`0.5 · Bid_Offer_Spread_Bps · 1e-4 · price · contract_size`). `price` is a scalar or
-    tensor mark. Single source for the solver's decision-time kappa, the env's realized
-    debit, and the diagnostic CSV writer — any change (asymmetric bid/offer, tiered spread)
-    lives here alone."""
+    (`0.5 · half_bps · 1e-4 · price · contract_size`). `price` is a scalar or tensor mark.
+    Single source for the solver's decision-time kappa, the env's realized debit, and the
+    diagnostic CSV writer — any change (asymmetric bid/offer, tiered spread) lives here alone.
+
+    `half_bps` is the scalar `Bid_Offer_Spread_Bps` (fast-path) unless a spread SPEC is
+    configured, in which case it is the instrument's `Per_Instrument` base (falling back to
+    `Default_Bps`) scaled by `(vol/Ref_Vol)**Beta` when the spec declares a `Vol_Scale` and a
+    world-agnostic annualized `vol` is supplied. `vol=None` (or scalar spread / no Vol_Scale) ⇒
+    vol-independent, bit-identical to the scalar behaviour."""
     acc = runtime["accounting"]
     contract_size = float(runtime["tradables"][name]["contract_size"])
+    spec = acc.get("bid_offer_spread_spec")
+    if spec is None:
+        half_bps = acc["bid_offer_spread_bps"]
+    else:
+        half_bps = spec["per_instrument"].get(str(name), spec["default_bps"])
+        vscale = spec["vol_scale"]
+        if vscale is not None and vol is not None:
+            half_bps = half_bps * (vol / vscale["ref_vol"]) ** vscale["beta"]
     return (acc["transaction_cost_per_unit"]
-            + 0.5 * acc["bid_offer_spread_bps"] * 1.0e-4 * price * contract_size)
+            + 0.5 * half_bps * 1.0e-4 * price * contract_size)
 
 
 def initial_q_from_runtime(runtime, batch, device):

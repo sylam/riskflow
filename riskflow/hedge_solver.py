@@ -46,6 +46,14 @@ class SolverResult:
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
+def _sim_vol(bundle):
+    """Sim-grid slice of the bundle's per-step annualized vol series (for the Vol_Scale spread),
+    or None when no Vol_Scale is configured. The bundle series is full-grid; strip the history
+    prefix so it indexes by sim-grid t like `tradables_sim`."""
+    v = bundle.get("step_annual_vol")
+    return None if v is None else v[int(bundle.get("initial_time_index", 0)):]
+
+
 def _turnover_cost(delta_contracts, kappa):
     """L1 turnover cost: Σ_i |Δcontracts_i| · kappa_i. `delta_contracts` is
     `(..., n_hedge)`, `kappa` is `(n_hedge,)` per-contract cost. Hard (no smoothing) —
@@ -86,9 +94,12 @@ class HedgeActionSpace:
         instrument's mean mark), off the single `hedge_runtime.per_contract_kappa` rule.
       * `initial_q(batch, device)` — the opening book `q0` (see `initial_q_from_runtime`)."""
 
-    def __init__(self, runtime, device):
+    def __init__(self, runtime, device, vol_sim=None):
         self.runtime = runtime
         self.device = device
+        # Sim-grid per-step annualized vol series (or None) for the state-dependent bid/offer
+        # spread — threaded through `kappa` into `per_contract_kappa`'s Vol_Scale.
+        self.vol_sim = vol_sim
         self.hedges = list(runtime["names"]["hedges"])
         self.n_hedge = len(self.hedges)
         acc = runtime["accounting"]
@@ -200,9 +211,11 @@ class HedgeActionSpace:
 
     def kappa(self, tradables_sim, t_index):
         """Per-hedge kappa `(n_hedge,)` at sim-grid `t_index` — each instrument's mean mark
-        through `hedge_runtime.per_contract_kappa` (the single turnover-cost rule)."""
+        through `hedge_runtime.per_contract_kappa` (the single turnover-cost rule). The step's
+        scalar vol (when a Vol_Scale spread is configured) drives per_contract_kappa's Vol_Scale."""
+        vol = None if self.vol_sim is None else self.vol_sim[int(t_index)]
         return torch.stack(
-            [per_contract_kappa(self.runtime, tradables_sim[r][t_index].mean(), r)
+            [per_contract_kappa(self.runtime, tradables_sim[r][t_index].mean(), r, vol)
              for r in self.hedges])
 
     def initial_q(self, batch, device):
@@ -250,7 +263,7 @@ def run_textbook_benchmark(bundle, runtime):
     F, L_T, t_outer = _realized_paths(bundle, runtime)
     device = F.device
     acc = runtime["accounting"]
-    aspace = HedgeActionSpace(runtime, device)
+    aspace = HedgeActionSpace(runtime, device, _sim_vol(bundle))
     tradables_sim, _ = _bundle_sim_views(bundle)
     # The static hold is chosen ONCE at entry and held; a per-t corridor is a dynamic constraint a
     # constant hold can't track, so the single well-defined filter is the entry-step corridor
@@ -298,7 +311,7 @@ class HindsightDpSolver:
     def __init__(self, bundle, runtime):
         self.bundle = bundle
         self.runtime = runtime
-        self.aspace = HedgeActionSpace(runtime, bundle["time_grid_days"].device)
+        self.aspace = HedgeActionSpace(runtime, bundle["time_grid_days"].device, _sim_vol(bundle))
 
     def solve(self):
         bundle, runtime, aspace = self.bundle, self.runtime, self.aspace
@@ -434,7 +447,7 @@ class DiffSolverV2:
         # The shared action universe (mask-aware grid + per-contract kappa + opening book) —
         # the SAME object the benchmark tracks and the stepper rollout consume, so every track
         # optimizes over identical positions and prices identical frictions.
-        self.aspace = HedgeActionSpace(runtime, self.device)
+        self.aspace = HedgeActionSpace(runtime, self.device, _sim_vol(bundle))
         self.hedges = self.aspace.hedges
         self.n_hedge = self.aspace.n_hedge
         self.contract_size = self.aspace.contract_size                # (n_hedge,)
