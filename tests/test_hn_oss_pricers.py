@@ -15,8 +15,8 @@ EquityPrice conditional in config.py when the switch is on. So the HN path is ac
 
 SHARED PER-STEP HELPER + MUTATION KILL MATRIX. All three pricers route every daily HN step -
 the unmonitored sub-steps AND the survival-truncated final step of each interval - through the
-single ``pricing.hn_daily_advance`` (the ONLY copy of the h-recursion
-``h = Omega + Beta*h + Alpha*(z - Gamma_Star*sqrt(h))**2``). Four one-line mutants of it were
+single ``utils.hn_daily_advance`` (which routes the h-recursion through
+``utils.hn_variance_step``, the one copy). Four one-line mutants of it were
 applied to the shared helper (source edit, run, revert BY HAND) and each is killed by BOTH
 recursion closed-form gates below (measured reldiff vs the HN closed form; correct code
 passes at <=2.2e-3, gate tol 5e-3):
@@ -112,10 +112,7 @@ def _cfg(field, ref, sig=SIGMA, hn_params=None, r=0.0, q=0.0, spot_model='auto')
 
 def _run(cfg_ref, seed=1, sims=1 << 14):
     cfg, ref = cfg_ref
-    calc, out = run_baseval(cfg, overrides={'MCMC_Simulations': sims, 'Random_Seed': seed})
-    df = out['Results']['mtm']
-    rows = df[df['Reference'] == ref]
-    mtm = float(rows['Value'].iloc[0]) if len(rows) else None
+    mtm, calc = hnref.run_mtm(run_baseval, cfg, ref, seed, sims)
     return mtm, calc
 
 

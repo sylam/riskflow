@@ -1791,9 +1791,8 @@ def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims,
 # --------------------------------------------------------------------------------------
 # Black-Scholes reference + HN implied vol (the HN smile/skew diagnostic and the bootstrapper seed)
 # --------------------------------------------------------------------------------------
-# A differentiable, CONVENTION-FREE (total-variance) BS call in torch -- distinct from
-# ``black_european_option_price`` (scipy/numpy, keyed on vol+tenor+r).  The standard-normal CDF
-# is the framework's ``norm_cdf`` (erfc form), NOT a private twin.
+# bs_call_np is a thin ADAPTER over the canonical ``black_european_option_price`` (total-variance
+# parameterisation); bs_implied_total_var bisects on it for the smile/skew diagnostics.
 
 def bs_call_np(S, K, r, n, total_var):
     """BS call from TOTAL variance (r, n in per-step units) -- a thin adapter over the canonical

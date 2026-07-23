@@ -117,9 +117,7 @@ def _cfg(hn, target, fix_days, sigma=SIGMA, hn_params=None, steps_per_year=None,
 
 
 def _run(cfg, seed, sims):
-    calc, out = run_baseval(cfg, overrides={'MCMC_Simulations': sims, 'Random_Seed': seed})
-    df = out['Results']['mtm']
-    mtm = float(df[df['Reference'] == 'TARF1']['Value'].iloc[0])
+    mtm, calc = hnref.run_mtm(run_baseval, cfg, 'TARF1', seed, sims)
     return mtm, calc
 
 

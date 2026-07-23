@@ -169,3 +169,12 @@ def hn_simulate_sum_h(p, n_steps, h1, n_paths, seed=0, device='cpu',
         done += m
     s = torch.cat(tot)
     return float(s.mean()), float(s.std() / np.sqrt(len(s)))
+
+
+def run_mtm(run_baseval, cfg, ref, seed=1, sims=1 << 14):
+    """Price cfg via the caller's run_baseval and return (mtm for Reference==ref, calc).
+    Shared MtM extraction for the OSS/TARF pricer tests (single copy of the filter idiom)."""
+    calc, out = run_baseval(cfg, overrides={'MCMC_Simulations': sims, 'Random_Seed': seed})
+    rows = out['Results']['mtm']
+    rows = rows[rows['Reference'] == ref]
+    return (float(rows['Value'].iloc[0]) if len(rows) else None), calc
