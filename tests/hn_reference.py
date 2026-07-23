@@ -6,18 +6,20 @@ itself consumes it (bootstrappers.py, pricing.py, stochasticprocess.py).  Everyt
 consumed ONLY by the HN test suite: the brute-force daily Monte Carlo cross-check, the exact
 aggregate cumulants / variance-forecast, and the target-hitting parameter builder the tests
 use to construct example laws.  They route through ``utils.hn_variance_step`` /
-``utils.hn_logmgf`` so the h-recursion stays a single source of truth.
+``utils.hn_logmgf`` so the h-recursion stays a single source of truth.  A "param dict" here is
+a ``{'omega','alpha','beta','gamma_star','r'}`` name->value mapping (the explicit-arg convention
+of the utils hn_* functions); ``as_tensors`` seeds it with 0-dim tensors.
 """
 
 import numpy as np
 import torch
 
-from riskflow.utils import HNParams, hn_variance_step, hn_logmgf
+from riskflow import utils
 
 
 def hn_params_from_targets(ann_vol, persistence, gamma, leverage_share, r=0.0,
                            steps_per_year=252.0):
-    """Build an HNParams hitting a target annualised vol / persistence / gamma*.
+    """Build a param dict hitting a target annualised vol / persistence / gamma*.
 
     ``leverage_share`` = alpha*gamma*^2 / psi, i.e. the fraction of the persistence that
     comes from the ARCH-with-leverage channel rather than from beta.  Solving:
@@ -38,7 +40,12 @@ def hn_params_from_targets(ann_vol, persistence, gamma, leverage_share, r=0.0,
             'infeasible: omega=%.3e <= 0 (m*(1-psi)=%.3e < alpha=%.3e); '
             'raise gamma, lower leverage_share, or lower persistence'
             % (omega, m * (1.0 - persistence), alpha))
-    return HNParams(omega, alpha, beta, gamma, r)
+    return {'omega': omega, 'alpha': alpha, 'beta': beta, 'gamma_star': gamma, 'r': r}
+
+
+def as_tensors(p, dtype=torch.float64, device='cpu'):
+    """Map a param dict of python floats to 0-dim torch tensors (differentiable seeds)."""
+    return {k: torch.tensor(v, dtype=dtype, device=device) for k, v in p.items()}
 
 
 # ======================================================================================
@@ -56,17 +63,17 @@ def hn_expected_sum_h(p, n_steps, h1):
 
     EXACT at n=1 (returns h1 identically), which ``test_expected_sum_h`` pins.
     """
-    psi = p.persistence
-    m = (p.omega + p.alpha) / (1.0 - psi)
+    psi = utils.hn_persistence(p['alpha'], p['beta'], p['gamma_star'])
+    m = (p['omega'] + p['alpha']) / (1.0 - psi)
     n = int(n_steps)
     return n * m + (h1 - m) * (1.0 - psi ** n) / (1.0 - psi)
 
 
 def hn_expected_h_path(p, n_steps, h1):
     """E_t[h_{t+k}] for k = 1..n as a tensor (same closed form, per-k)."""
-    psi = p.persistence
-    m = (p.omega + p.alpha) / (1.0 - psi)
-    k = torch.arange(int(n_steps), dtype=p.omega.dtype, device=p.omega.device)
+    psi = utils.hn_persistence(p['alpha'], p['beta'], p['gamma_star'])
+    m = (p['omega'] + p['alpha']) / (1.0 - psi)
+    k = torch.arange(int(n_steps), dtype=p['omega'].dtype, device=p['omega'].device)
     return m + psi ** k * (h1 - m)
 
 
@@ -77,9 +84,9 @@ def hn_cumulants(p, n_steps, h1, order=4):
     kappa_1 must equal n*r - V/2 with V = E[Sum h] (LRNVR); kappa_2 is the TRUE variance
     of the aggregate, which is NOT V (see the module report).
     """
-    phi = torch.zeros((), dtype=p.omega.dtype, device=p.omega.device, requires_grad=True)
-    h1t = torch.as_tensor(h1, dtype=p.omega.dtype, device=p.omega.device)
-    y = hn_logmgf(phi, p, n_steps, h1t)
+    phi = torch.zeros((), dtype=p['omega'].dtype, device=p['omega'].device, requires_grad=True)
+    h1t = torch.as_tensor(h1, dtype=p['omega'].dtype, device=p['omega'].device)
+    y = utils.hn_logmgf(phi, n_steps, h1t, **p)
     out = []
     for _ in range(order):
         # n = 1 is EXACTLY Gaussian, so the graph legitimately terminates at kappa_2 and
@@ -115,7 +122,8 @@ def hn_simulate(p, n_steps, h1, n_paths, seed=0, device='cpu', dtype=torch.float
     product from the discrete fixing).
     """
     g = torch.Generator(device=device).manual_seed(int(seed))
-    om, al, be, ga, r = (float(x) for x in (p.omega, p.alpha, p.beta, p.gamma, p.r))
+    r = float(p['r'])                                 # the recursion rides utils.hn_variance_step directly
+    om, al, be, ga = (p[k] for k in ('omega', 'alpha', 'beta', 'gamma_star'))
     outs, mx, mn = [], [], []
     done = 0
     while done < n_paths:
@@ -128,7 +136,7 @@ def hn_simulate(p, n_steps, h1, n_paths, seed=0, device='cpu', dtype=torch.float
             z = torch.randn((m,), generator=g, dtype=dtype, device=device)
             sh = h.sqrt()
             x = x + (r - 0.5 * h + sh * z)
-            h = hn_variance_step(h, sh, z, om, al, be, ga)
+            h = utils.hn_variance_step(h, sh, z, om, al, be, ga)
             if track_extrema:
                 hi = torch.maximum(hi, x)
                 lo = torch.minimum(lo, x)
@@ -147,7 +155,7 @@ def hn_simulate_sum_h(p, n_steps, h1, n_paths, seed=0, device='cpu',
     """Brute-force E_t[Sum_{k=1..n} h_{t+k}] -- the check on :func:`hn_expected_sum_h`.
     Returns (mean, standard_error)."""
     g = torch.Generator(device=device).manual_seed(int(seed))
-    om, al, be, ga = (float(x) for x in (p.omega, p.alpha, p.beta, p.gamma))
+    om, al, be, ga = (p[k] for k in ('omega', 'alpha', 'beta', 'gamma_star'))
     tot, done = [], 0
     while done < n_paths:
         m = min(chunk, n_paths - done)
@@ -156,7 +164,7 @@ def hn_simulate_sum_h(p, n_steps, h1, n_paths, seed=0, device='cpu',
         for _ in range(int(n_steps)):
             s = s + h
             z = torch.randn((m,), generator=g, dtype=dtype, device=device)
-            h = hn_variance_step(h, h.sqrt(), z, om, al, be, ga)
+            h = utils.hn_variance_step(h, h.sqrt(), z, om, al, be, ga)
         tot.append(s)
         done += m
     s = torch.cat(tot)

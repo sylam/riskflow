@@ -462,15 +462,15 @@ class HestonNandiModelParameters(object):
             deal_data, use_forward, invert_moneyness))
 
     @staticmethod
-    def price(spot, strike, is_call, units, p, n, h0, panels, yield_discount=1.0):
+    def price(spot, strike, is_call, units, omega, alpha, beta, gamma, r, n, h0, panels, yield_discount=1.0):
         """Heston-Nandi European option value - puts by put-call parity off the call.
 
-        ``p.r`` is the per step COST OF CARRY r-q (so the simulated spot has the right forward) and
+        ``r`` is the per step COST OF CARRY r-q (so the simulated spot has the right forward) and
         ``yield_discount`` = exp(-q*t) converts the resulting value back to a discounting at r:
         the internal price is exp(-(r-q)t)[F P1 - K P2], the value is exp(-rt)[F P1 - K P2]. Parity
         survives the rescale, so puts are still call - S + K exp(-(r-q)n) times the same factor."""
-        call = utils.hn_call(spot, strike, p, n, h0, panels=panels)
-        return units * yield_discount * (call - (1.0 - is_call) * (spot - strike * torch.exp(-p.r * n)))
+        call = utils.hn_call(spot, strike, n, h0, omega, alpha, beta, gamma, r, panels=panels)
+        return units * yield_discount * (call - (1.0 - is_call) * (spot - strike * torch.exp(-r * n)))
 
     def calc_error(self, x, groups, spot, panels, scale):
         """Weighted squared premium error and its exact gradient (autograd).
@@ -483,7 +483,7 @@ class HestonNandiModelParameters(object):
         error = 0.0
         for n, b, q, strike, is_call, units, weight, premium in groups:
             fitted = self.price(spot, strike, is_call, units,
-                                utils.HNParams(omega, alpha, beta, gamma, b), n, h0, panels, q)
+                                omega, alpha, beta, gamma, b, n, h0, panels, q)
             error = error + (weight * (premium - fitted) ** 2).sum() / scale
         error.backward()
         return float(error.detach()), x_t.grad.cpu().numpy()
@@ -592,8 +592,8 @@ class HestonNandiModelParameters(object):
                 if param_name in price_factors:
                     # warm start off the previous fit
                     old = price_factors[param_name]
-                    x0 = np.clip(self.unreparam(old['Omega'], old['Alpha'], old['Beta'],
-                                                old['Gamma_Star'], old['H0']), *np.array(self.bounds).T)
+                    x0 = np.clip(self.unreparam(*(old[k] for k in utils.HN_PARAM_NAMES)),
+                                 *np.array(self.bounds).T)
                 else:
                     var = np.mean([x['sigma'] for opts in expiries.values()
                                    for x in opts]) ** 2 / steps_per_year
@@ -609,16 +609,15 @@ class HestonNandiModelParameters(object):
 
                 omega, alpha, beta, gamma, h0 = [
                     float(x) for x in self.reparam(tensor(result.x))]
-                fitted_params = utils.HNParams(omega, alpha, beta, gamma)
 
                 # log the results
                 with torch.no_grad():
                     for n, b, q, strike, is_call, units, weight, premium in groups:
-                        p = utils.HNParams(*[tensor(x) for x in (omega, alpha, beta, gamma)], b)
-                        fitted = self.price(spot, strike, is_call, units, p, n, tensor(h0), panels, q)
+                        pt = [tensor(x) for x in (omega, alpha, beta, gamma)]     # the four recursion params
+                        fitted = self.price(spot, strike, is_call, units, *pt, b, n, tensor(h0), panels, q)
                         for option, fitted_premium in zip(expiries[n], fitted.cpu().numpy()):
                             vol = utils.hn_implied_vol(
-                                spot, option['Strike'], p, n, tensor(h0), steps_per_year, panels=panels)
+                                spot, option['Strike'], n, tensor(h0), *pt, b, steps_per_year, panels=panels)
                             logging.info(
                                 'Underlying {} strike {}, expiry {}, steps {}, vol {}, c_vol {}, premium {}, '
                                 'c_premium {}, err {}'.format(
@@ -630,16 +629,15 @@ class HestonNandiModelParameters(object):
                     'Underlying {} Heston-Nandi Omega {}, Alpha {}, Beta {}, Gamma_Star {}, H0 {}, '
                     'persistence {}, long run vol {}, sse {} ({})'.format(
                         instrument['Underlying'], omega, alpha, beta, gamma, h0,
-                        fitted_params.persistence, fitted_params.ann_vol(steps_per_year),
+                        utils.hn_persistence(alpha, beta, gamma),
+                        utils.hn_ann_vol(omega, alpha, beta, gamma, steps_per_year),
                         result.fun, result.message))
 
+                # emit in the canonical HN_PARAM_NAMES order (single source), paired with reparam's
+                # documented (Omega, Alpha, Beta, Gamma_Star, H0) output tuple
                 price_factors[param_name] = {
                     'Property_Aliases': None,
-                    'Omega': omega,
-                    'Alpha': alpha,
-                    'Beta': beta,
-                    'Gamma_Star': gamma,
-                    'H0': h0}
+                    **dict(zip(utils.HN_PARAM_NAMES, (omega, alpha, beta, gamma, h0)))}
 
 
 class GBMAssetPriceTSModelParameters(object):

@@ -61,7 +61,7 @@ def _flat_vol_surface(sigma):
 
 def _price_factors(sigma, hn_params, r_dom=0.0, r_for=0.0):
     # r_dom/r_for are flat annualised USD/AUD rates. Zero (default) => driftless FX forward =>
-    # utils.HNParams(..., r=0) is the reference law. With r_for=0 the carry (r_dom-r_for) and
+    # a param dict with r=0 is the reference law. With r_for=0 the carry (r_dom-r_for) and
     # the USD discount coincide, so a single hn_call r = r_dom/365 (per ACT/365 day) pins BOTH the
     # forward drift and the discount (see test_never_knock_daily_hn_matches_summed_closed_form).
     pf = {
@@ -150,8 +150,8 @@ def _cum_days(fix_days, spy=252.0):
 def _real_garch(persistence=0.96):
     p = hnref.hn_params_from_targets(
         ann_vol=0.28, persistence=persistence, gamma=250.0, leverage_share=0.5, steps_per_year=252.0)
-    return {'Omega': float(p.omega), 'Alpha': float(p.alpha), 'Beta': float(p.beta),
-            'Gamma_Star': float(p.gamma), 'H0': 1.2 * float(p.stationary_var)}, p
+    return {'Omega': float(p['omega']), 'Alpha': float(p['alpha']), 'Beta': float(p['beta']),
+            'Gamma_Star': float(p['gamma_star']), 'H0': 1.2 * float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))}, p
 
 
 def test_uses_repo_under_test():
@@ -241,9 +241,7 @@ def test_single_fixing_hn_matches_hn_garch_closed_form(persistence):
     hn_params, p = _real_garch(persistence)
     horizon = 60
     n_sub = max(int(round(horizon / 365.0 * 252.0)), 1)
-    ref = float(utils.hn_call(
-        SPOT, STRIKE, utils.HNParams(p.omega, p.alpha, p.beta, p.gamma, 0.0).as_tensors(),
-        n_sub, hn_params['H0'])) * N1
+    ref = float(utils.hn_call(SPOT, STRIKE, n_sub, hn_params['H0'], **hnref.as_tensors({'omega': p['omega'], 'alpha': p['alpha'], 'beta': p['beta'], 'gamma_star': p['gamma_star'], 'r': 0.0}))) * N1
     price = _mtm(_cfg(True, 1e9, [horizon], hn_params=hn_params, steps_per_year=252.0),
                  seed=3, sims=1 << 17)  # ~7e-4 MC error observed; tol is ~4x that
     assert price == pytest.approx(ref, rel=3e-3)
@@ -257,7 +255,7 @@ def test_hn_garch_dynamics_are_engaged_vs_flat_vol_gbm():
     horizon = 60
     hn = _mtm(_cfg(True, 1e9, [horizon], hn_params=hn_params, steps_per_year=252.0),
               seed=3, sims=1 << 16)
-    gbm = _mtm(_cfg(False, 1e9, [horizon], sigma=float(p.ann_vol(252.0))), seed=3, sims=1 << 16)
+    gbm = _mtm(_cfg(False, 1e9, [horizon], sigma=float(utils.hn_ann_vol(p['omega'], p['alpha'], p['beta'], p['gamma_star'], 252.0))), seed=3, sims=1 << 16)
     assert abs(hn - gbm) / gbm > 3e-3  # ~1% observed; comfortably above MC noise (~2e-3)
 
 
@@ -291,9 +289,9 @@ def test_never_knock_daily_hn_matches_summed_closed_form(r_dom):
     Non-zero carry (r_dom, r_for=0 => carry=discount) threads into hn_call as r = r_dom/365 (one
     ACT/365 day per step), pinning b_step = fwd_carry*dt/n_sub."""
     hn_params, p = _real_garch(0.94)
-    hn_params = dict(hn_params, H0=1.5 * float(p.stationary_var))  # H0 != stationary => term structure
-    ptens = utils.HNParams(p.omega, p.alpha, p.beta, p.gamma, r_dom / 365.0).as_tensors()
-    ref = sum(float(utils.hn_call(SPOT, STRIKE, ptens, c, hn_params['H0']))
+    hn_params = dict(hn_params, H0=1.5 * float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star'])))  # H0 != stationary => term structure
+    ptens = hnref.as_tensors({'omega': p['omega'], 'alpha': p['alpha'], 'beta': p['beta'], 'gamma_star': p['gamma_star'], 'r': r_dom / 365.0})
+    ref = sum(float(utils.hn_call(SPOT, STRIKE, c, hn_params['H0'], **ptens))
               for c in _cum_days(_DAILY_NK)) * N1
     price = _mtm(_cfg(True, 1e9, _DAILY_NK, hn_params=hn_params, steps_per_year=252.0, r_dom=r_dom),
                  seed=3, sims=1 << 17)  # correct reldiff ~1.7e-3; tol ~3x, mutants >= 1.2e-2
@@ -305,8 +303,8 @@ def test_never_knock_daily_hn_matches_summed_closed_form(r_dom):
 def _knock_params():
     p = hnref.hn_params_from_targets(ann_vol=0.30, persistence=0.94, gamma=400.0,
                                         leverage_share=0.8, steps_per_year=252.0)
-    return {'Omega': float(p.omega), 'Alpha': float(p.alpha), 'Beta': float(p.beta),
-            'Gamma_Star': float(p.gamma), 'H0': 1.5 * float(p.stationary_var)}
+    return {'Omega': float(p['omega']), 'Alpha': float(p['alpha']), 'Beta': float(p['beta']),
+            'Gamma_Star': float(p['gamma_star']), 'H0': 1.5 * float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))}
 
 
 _KNOCK_FIX = list(range(1, 41))  # 40 daily fixings

@@ -29,7 +29,7 @@ R_STEP = 0.03 / 252.0
 
 
 def _p(ann_vol=0.20, psi=0.98, gamma=400.0, lev=0.12, r=R_STEP):
-    return hnref.hn_params_from_targets(ann_vol, psi, gamma, lev, r=r).as_tensors(DT)
+    return hnref.as_tensors(hnref.hn_params_from_targets(ann_vol, psi, gamma, lev, r=r), DT)
 
 
 def _t(x):
@@ -52,9 +52,9 @@ def test_martingale_phi_one(n):
     Any of those three wrong and B(1) != 0.
     """
     p = _p()
-    A, B = utils.hn_ab(_t(1.0), p, n)
+    A, B = utils.hn_ab(_t(1.0), n, **p)
     assert abs(float(B)) < 1e-14
-    assert abs(float(A) - float(p.r) * n) < 1e-14
+    assert abs(float(A) - float(p['r']) * n) < 1e-14
 
 
 def test_dropping_the_half_phi_breaks_the_martingale():
@@ -65,7 +65,7 @@ def test_dropping_the_half_phi_breaks_the_martingale():
     here so nobody 'simplifies' the recursion back to it.
     """
     p = _p()
-    ga = p.gamma
+    ga = p['gamma_star']
     phi = _t(1.0)
     B_wrong = phi * ga - 0.5 * ga ** 2 + 0.5 * (phi - ga) ** 2       # one step, B_T = 0
     assert abs(float(B_wrong) - 0.5) < 1e-12
@@ -74,11 +74,11 @@ def test_dropping_the_half_phi_breaks_the_martingale():
 def test_forward_is_martingale_in_mc():
     """The simulator and the CF agree on the forward -- independent check of the drift."""
     p = _p()
-    h1 = float(p.stationary_var)
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     r = hnref.hn_simulate(p, 63, h1, 2_000_000, seed=3, device=DEV)
     st = S0 * torch.exp(r)
     se = float(st.std() / math.sqrt(len(st)))
-    assert abs(float(st.mean()) - S0 * math.exp(float(p.r) * 63)) < 4.0 * se
+    assert abs(float(st.mean()) - S0 * math.exp(float(p['r']) * 63)) < 4.0 * se
 
 
 # ======================================================================================
@@ -97,11 +97,10 @@ def test_alpha_zero_collapses_to_black_scholes(gamma, n, k):
     gamma*-independence is itself part of the assertion.
     """
     beta = 0.7
-    p = utils.HNParams(omega=0.04 / 252 * (1 - beta), alpha=0.0, beta=beta,
-                    gamma=gamma, r=R_STEP).as_tensors(DT)
-    h = float(p.omega / (1.0 - p.beta))
-    got = float(utils.hn_call(S0, S0 * k, p, n, h))
-    want = utils.bs_call_np(S0, S0 * k, float(p.r), n, h * n)
+    p = hnref.as_tensors({'omega': 0.04 / 252 * (1 - beta), 'alpha': 0.0, 'beta': beta, 'gamma_star': gamma, 'r': R_STEP}, DT)
+    h = float(p['omega'] / (1.0 - p['beta']))
+    got = float(utils.hn_call(S0, S0 * k, n, h, **p))
+    want = utils.bs_call_np(S0, S0 * k, float(p['r']), n, h * n)
     assert abs(got - want) < 1e-11 + 1e-12 * abs(want)
 
 
@@ -110,15 +109,14 @@ def test_alpha_zero_cdf_matches_normal_in_the_tails():
     alpha=0 limit Q(R_n <= b) is an exact normal CDF.  This is the property DELIVERABLE 2
     leans on -- survival probabilities out to 3.5 sigma."""
     beta = 0.7
-    p = utils.HNParams(omega=0.04 / 252 * (1 - beta), alpha=0.0, beta=beta,
-                    gamma=0.0, r=R_STEP).as_tensors(DT)
-    h = float(p.omega / (1.0 - p.beta))
+    p = hnref.as_tensors({'omega': 0.04 / 252 * (1 - beta), 'alpha': 0.0, 'beta': beta, 'gamma_star': 0.0, 'r': R_STEP}, DT)
+    h = float(p['omega'] / (1.0 - p['beta']))
     for n in (5, 21, 63):
         v = h * n
-        mu = float(p.r) * n - 0.5 * v
+        mu = float(p['r']) * n - 0.5 * v
         for z in (-3.5, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 3.5):
             b = mu + z * math.sqrt(v)
-            got = float(utils.hn_cdf_logret(b, p, n, h))
+            got = float(utils.hn_cdf_logret(b, n, h, **p))
             want = 0.5 * math.erfc(-z / math.sqrt(2.0))
             assert abs(got - want) < 1e-12, (n, z, got, want)
 
@@ -131,10 +129,10 @@ def test_alpha_zero_cdf_matches_normal_in_the_tails():
 @pytest.mark.parametrize('k', [0.8, 1.0, 1.2])
 def test_put_call_parity(n, k):
     p = _p()
-    h1 = float(p.stationary_var)
-    c = float(utils.hn_call(S0, S0 * k, p, n, h1))
-    pu = float(utils.hn_put(S0, S0 * k, p, n, h1))
-    assert abs((c - pu) - (S0 - S0 * k * math.exp(-float(p.r) * n))) < 1e-10
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
+    c = float(utils.hn_call(S0, S0 * k, n, h1, **p))
+    pu = float(utils.hn_put(S0, S0 * k, n, h1, **p))
+    assert abs((c - pu) - (S0 - S0 * k * math.exp(-float(p['r']) * n))) < 1e-10
 
 
 @pytest.mark.parametrize('n', [21, 63])
@@ -143,13 +141,14 @@ def test_p1_p2_are_probabilities_and_match_mc(n):
     daily simulator -- an INDEPENDENT confirmation of the inversion, not just parity
     algebra (which is automatic once the put is defined by parity)."""
     p = _p()
-    h1 = float(p.stationary_var)
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     ks = torch.tensor([0.85, 0.95, 1.0, 1.05, 1.15], dtype=DT) * S0
-    p1, p2 = utils._p1_p2(torch.log(ks / S0), p, n, torch.tensor(h1, dtype=DT),
-                       None, None, 8, True)
+    p1, p2 = utils._p1_p2(torch.log(ks / S0), n, torch.tensor(h1, dtype=DT),
+                          p['omega'], p['alpha'], p['beta'], p['gamma_star'], p['r'],
+                          None, None, 8, True)
     assert bool(((p1 >= 0) & (p1 <= 1) & (p2 >= 0) & (p2 <= 1)).all())
     st = S0 * torch.exp(hnref.hn_simulate(p, n, h1, 4_000_000, seed=5, device=DEV))
-    fwd = S0 * math.exp(float(p.r) * n)
+    fwd = S0 * math.exp(float(p['r']) * n)
     for i, k in enumerate(ks):
         ind = (st > float(k)).to(DT)
         m2, s2 = float(ind.mean()), float(ind.std() / math.sqrt(len(ind)))
@@ -169,14 +168,14 @@ def test_price_matches_mc(n):
     not masquerade as bias (single-seed z-scores are all the same sign by construction).
     """
     p = _p()
-    h1 = float(p.stationary_var)
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     ks = [85.0, 95.0, 100.0, 105.0, 115.0]
-    cf = [float(utils.hn_call(S0, k, p, n, h1)) for k in ks]
+    cf = [float(utils.hn_call(S0, k, n, h1, **p)) for k in ks]
     zs = []
     for seed in range(4):
         st = S0 * torch.exp(hnref.hn_simulate(p, n, h1, 2_000_000, seed=200 + seed, device=DEV))
         for k, c in zip(ks, cf):
-            pay = torch.clamp(st - k, min=0) * math.exp(-float(p.r) * n)
+            pay = torch.clamp(st - k, min=0) * math.exp(-float(p['r']) * n)
             se = float(pay.std() / math.sqrt(len(pay)))
             zs.append((c - float(pay.mean())) / se)
     zs = np.array(zs)
@@ -193,11 +192,11 @@ def test_price_matches_mc(n):
 #     stationary variance (you cannot supply h0).
 #   * Rouah-Vainberg VBA / PyPI ``hngoption`` / Christoffersen-Jacobs-Ornthanalai: you
 #     pass RISK-NEUTRAL (lambda* = -1/2, gamma*) and supply h0 yourself.
-# THIS MODULE uses the second convention (``HNParams.gamma`` IS gamma*).  Both reference
+# THIS MODULE uses the second convention (the ``gamma_star`` param IS gamma*).  Both reference
 # sets below are translated into it explicitly.
 
 FOPTIONS = dict(omega=2.3e-6, alpha=2.9e-6, beta=0.85,
-                gamma=184.25 + (-0.5) + 0.5,      # physical lambda = -0.5 => gamma* = gamma
+                gamma_star=184.25 + (-0.5) + 0.5,      # physical lambda = -0.5 => gamma* = gamma
                 r=0.05 / 252.0)
 
 
@@ -214,14 +213,14 @@ def test_published_foptions_hngoption_example():
         call 8.9920997701416, put 4.115042220213013.
 
     fOptions forces h(0) to the stationary variance, so this ALSO pins
-    ``HNParams.stationary_var`` = (omega+alpha)/(1-beta-alpha*gamma*^2) = 1.008717e-4.
+    ``utils.hn_stationary_var`` = (omega+alpha)/(1-beta-alpha*gamma*^2) = 1.008717e-4.
     """
-    p = utils.HNParams(**FOPTIONS).as_tensors(DT)
-    h0 = float(p.stationary_var)
+    p = hnref.as_tensors(dict(FOPTIONS), DT)
+    h0 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     assert abs(h0 - 1.008717e-4) < 1e-10
-    assert abs(float(utils.hn_call(S0, 100.0, p, 252, h0)) - 8.9920997701416) < 1e-11
-    assert abs(float(utils.hn_put(S0, 100.0, p, 252, h0)) - 4.115042220213013) < 1e-11
-    assert abs(float(utils.hn_call(S0, 90.0, p, 252, h0)) - 15.854473) < 5e-7
+    assert abs(float(utils.hn_call(S0, 100.0, 252, h0, **p)) - 8.9920997701416) < 1e-11
+    assert abs(float(utils.hn_put(S0, 100.0, 252, h0, **p)) - 4.115042220213013) < 1e-11
+    assert abs(float(utils.hn_call(S0, 90.0, 252, h0, **p)) - 15.854473) < 5e-7
 
 
 def test_published_foptions_integrand_at_phi_20():
@@ -234,12 +233,12 @@ def test_published_foptions_integrand_at_phi_20():
     additionally carries the spot; with S = X the log-moneyness shift is 1, so the
     comparable quantity here is  (S or 1)/pi * Re[ exp(A + B h0) / (i phi) ].
     """
-    p = utils.HNParams(**FOPTIONS).as_tensors(DT)
-    h0 = float(p.stationary_var)
+    p = hnref.as_tensors(dict(FOPTIONS), DT)
+    h0 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     iphi = torch.tensor([20.0], dtype=DT) * 1j
     for const, target, fac in ((1.0, 0.01201464798465922, S0 / math.pi),
                                (0.0, 0.00015242037661681416, 1.0 / math.pi)):
-        a, b = utils.hn_ab(iphi + const, p, 252)
+        a, b = utils.hn_ab(iphi + const, 252, **p)
         got = float((torch.exp(a + b * h0) / iphi).real) * fac
         assert abs(got - target) < 1e-14 * target, (const, got, target)
 
@@ -258,8 +257,8 @@ def test_published_rouah_vainberg_chapter6():
     not_reproducible``); $3.4735 implies a daily r of 1.787e-4, which is 4.50%/252 --
     not 5% on any convention.  The r=0 figure is the usable benchmark.
     """
-    p = utils.HNParams(5.02e-6, 1.32e-6, 0.589, 421.39, 0.0).as_tensors(DT)
-    got = float(utils.hn_call(S0, 100.0, p, 100, 0.15 ** 2 / 252.0))
+    p = hnref.as_tensors({'omega': 5.02e-6, 'alpha': 1.32e-6, 'beta': 0.589, 'gamma_star': 421.39, 'r': 0.0}, DT)
+    got = float(utils.hn_call(S0, 100.0, 100, 0.15 ** 2 / 252.0, **p))
     assert abs(got - 2.476704) < 1e-6, got
 
 
@@ -270,8 +269,8 @@ def test_rouah_five_percent_figure_is_not_reproducible():
     the discrepancy in the book, not here."""
     h0 = 0.15 ** 2 / 252.0
     for basis, want in ((252.0, 3.594107), (365.0, 3.224850), (360.0, 3.235984)):
-        p = utils.HNParams(5.02e-6, 1.32e-6, 0.589, 421.39, 0.05 / basis).as_tensors(DT)
-        assert abs(float(utils.hn_call(S0, 100.0, p, 100, h0)) - want) < 1e-6
+        p = hnref.as_tensors({'omega': 5.02e-6, 'alpha': 1.32e-6, 'beta': 0.589, 'gamma_star': 421.39, 'r': 0.05 / basis}, DT)
+        assert abs(float(utils.hn_call(S0, 100.0, 100, h0, **p)) - want) < 1e-6
     assert not any(abs(w - 3.4735) < 1e-3 for w in (3.594107, 3.224850, 3.235984))
 
 
@@ -285,8 +284,8 @@ def test_third_party_implementation_grid(n, k, want):
     implementation of the same recursion, over a 3-strike x 4-maturity grid.  Not a
     published table (only the (252, 100) and (252, 90) cells are), but it exercises
     short and long maturities and deep OTM where quadrature error would show first."""
-    p = utils.HNParams(**FOPTIONS).as_tensors(DT)
-    got = float(utils.hn_call(S0, float(k), p, n, float(p.stationary_var)))
+    p = hnref.as_tensors(dict(FOPTIONS), DT)
+    got = float(utils.hn_call(S0, float(k), n, float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star'])), **p))
     assert abs(got - want) < 1e-6, (n, k, got, want)
 
 
@@ -312,15 +311,14 @@ def test_heston_nandi_2000_mle_set_regression():
     for alpha, want_psi, want_vol, want in (
             (1.0e-6, 0.767164, 0.080719, [11.1237046772, 2.5984016955, 0.0614696912]),
             (1.32e-6, 0.824177, 0.095325, [11.1718940770, 2.9366492383, 0.1317679989])):
-        p = utils.HNParams(5.02e-6, alpha, 0.589, 421.39 + 0.205 + 0.5,
-                        0.05 / 365.0).as_tensors(DT)
-        assert abs(float(p.persistence) - want_psi) < 1e-5
-        assert abs(float(p.ann_vol(252.0)) - want_vol) < 1e-5
-        h1 = float(p.stationary_var)
-        got = [float(utils.hn_call(S0, k, p, 90, h1)) for k in (90.0, 100.0, 110.0)]
+        p = hnref.as_tensors({'omega': 5.02e-6, 'alpha': alpha, 'beta': 0.589, 'gamma_star': 421.39 + 0.205 + 0.5, 'r': 0.05 / 365.0}, DT)
+        assert abs(float(utils.hn_persistence(p['alpha'], p['beta'], p['gamma_star'])) - want_psi) < 1e-5
+        assert abs(float(utils.hn_ann_vol(p['omega'], p['alpha'], p['beta'], p['gamma_star'], 252.0)) - want_vol) < 1e-5
+        h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
+        got = [float(utils.hn_call(S0, k, 90, h1, **p)) for k in (90.0, 100.0, 110.0)]
         for g, w in zip(got, want):
             assert abs(g - w) < 5e-8, (alpha, got, want)
-        fine = [float(utils.hn_call(S0, k, p, 90, h1, phi_max=4000.0, panels=2048, order=12))
+        fine = [float(utils.hn_call(S0, k, 90, h1, phi_max=4000.0, panels=2048, order=12, **p))
                 for k in (90.0, 100.0, 110.0)]
         for g, f in zip(got, fine):
             assert abs(g - f) < 1e-9, (alpha, got, fine)
@@ -332,15 +330,15 @@ def test_heston_nandi_2000_mle_set_regression():
 
 def test_price_increasing_in_h1_and_in_maturity():
     p = _p()
-    m = float(p.stationary_var)
+    m = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     prev = -1.0
     for mult in (0.25, 0.5, 1.0, 2.0, 4.0):
-        c = float(utils.hn_call(S0, S0, p, 63, m * mult))
+        c = float(utils.hn_call(S0, S0, 63, m * mult, **p))
         assert c > prev
         prev = c
     prev = -1.0
     for n in (5, 21, 63, 126, 252):
-        c = float(utils.hn_call(S0, S0, p, n, m))
+        c = float(utils.hn_call(S0, S0, n, m, **p))
         assert c > prev
         prev = c
 
@@ -354,10 +352,10 @@ def test_gamma_star_sign_controls_skew():
         # hold persistence and stationary variance fixed so only the leverage sign moves
         alpha, beta = 0.12 * 0.98 / gamma ** 2, 0.98 * 0.88
         omega = (0.04 / 252) * 0.02 - alpha
-        p = utils.HNParams(omega, alpha, beta, gamma, R_STEP).as_tensors(DT)
-        h1 = float(p.stationary_var)
-        return (utils.hn_implied_vol(S0, 0.90 * S0, p, n, h1)
-                - utils.hn_implied_vol(S0, 1.10 * S0, p, n, h1))
+        p = hnref.as_tensors({'omega': omega, 'alpha': alpha, 'beta': beta, 'gamma_star': gamma, 'r': R_STEP}, DT)
+        h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
+        return (utils.hn_implied_vol(S0, 0.90 * S0, n, h1, **p)
+                - utils.hn_implied_vol(S0, 1.10 * S0, n, h1, **p))
 
     assert skew(400.0) > 0.01           # negative skew: low strikes richer
     assert skew(-400.0) < -0.01         # mirror image
@@ -368,8 +366,8 @@ def test_gamma_star_sign_controls_skew():
 def test_smile_is_curved():
     """HN must produce a genuine smile, not a flat BS vol."""
     p = _p()
-    h1 = float(p.stationary_var)
-    ivs = [utils.hn_implied_vol(S0, k * S0, p, 63, h1) for k in (0.85, 1.0, 1.15)]
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
+    ivs = [utils.hn_implied_vol(S0, k * S0, 63, h1, **p) for k in (0.85, 1.0, 1.15)]
     assert ivs[0] > ivs[1] > ivs[2]                       # monotone skew
     assert ivs[0] - ivs[2] > 0.02                         # material
 
@@ -390,21 +388,21 @@ def test_no_branch_winding(cfg, n):
     for contour in (0.0, 1.0):
         z = nodes * 1j + contour
         B = torch.zeros_like(z)
-        lin = z * (p.gamma - 0.5) - 0.5 * p.gamma ** 2
-        hs = 0.5 * (z - p.gamma) ** 2
+        lin = z * (p['gamma_star'] - 0.5) - 0.5 * p['gamma_star'] ** 2
+        hs = 0.5 * (z - p['gamma_star']) ** 2
         for _ in range(n):
-            w = 1.0 - 2.0 * p.alpha * B
+            w = 1.0 - 2.0 * p['alpha'] * B
             assert float(w.real.min()) > 0.999999
             assert float(torch.angle(w).abs().max()) < 0.5 * math.pi
-            B = lin + p.beta * B + hs / w
+            B = lin + p['beta'] * B + hs / w
 
 
 @pytest.mark.parametrize('n', [63, 252, 1260])
 def test_unwrap_is_a_noop_but_kept(n):
     p = _p(0.35, 0.99, 500.0, 0.55)
-    h1 = float(p.stationary_var)
-    a = float(utils.hn_call(S0, S0, p, n, h1, unwrap=True))
-    b = float(utils.hn_call(S0, S0, p, n, h1, unwrap=False))
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
+    a = float(utils.hn_call(S0, S0, n, h1, unwrap=True, **p))
+    b = float(utils.hn_call(S0, S0, n, h1, unwrap=False, **p))
     assert abs(a - b) < 1e-11
 
 
@@ -412,11 +410,11 @@ def test_unwrap_is_a_noop_but_kept(n):
 def test_quadrature_is_converged(n):
     """Default (auto phi_max, 256 panels x 8-pt GL) vs 4x the range and 8x the nodes."""
     p = _p()
-    h1 = float(p.stationary_var)
-    pm = utils.auto_phi_max(p, n, torch.tensor(h1, dtype=DT))
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
+    pm = utils.auto_phi_max(n, torch.tensor(h1, dtype=DT), p['omega'], p['alpha'], p['beta'], p['gamma_star'], p['r'])
     for k in (0.8, 1.0, 1.2):
-        a = float(utils.hn_call(S0, S0 * k, p, n, h1))
-        b = float(utils.hn_call(S0, S0 * k, p, n, h1, phi_max=4 * pm, panels=2048, order=12))
+        a = float(utils.hn_call(S0, S0 * k, n, h1, **p))
+        b = float(utils.hn_call(S0, S0 * k, n, h1, phi_max=4 * pm, panels=2048, order=12, **p))
         assert abs(a - b) < 1e-9, (n, k, a, b)
 
 
@@ -428,7 +426,7 @@ def test_gradients_match_finite_difference():
     h1b = 1.5873e-4
 
     def price(vals, h1v):
-        return utils.hn_call(_t(S0), _t(105.0), utils.HNParams(*vals), 63, h1v, **kw)
+        return utils.hn_call(_t(S0), _t(105.0), 63, h1v, **kw, **dict(zip(('omega', 'alpha', 'beta', 'gamma_star', 'r'), vals)))
 
     vals = [torch.tensor(v, dtype=DT, requires_grad=True) for v in base]
     h1 = torch.tensor(h1b, dtype=DT, requires_grad=True)
@@ -458,7 +456,7 @@ def test_gradients_match_finite_difference():
 @pytest.mark.parametrize('h_mult', [0.5, 1.0, 2.0])
 def test_expected_sum_h_exact_at_n1_and_matches_mc(h_mult):
     p = _p()
-    h1 = h_mult * float(p.stationary_var)
+    h1 = h_mult * float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     assert abs(float(hnref.hn_expected_sum_h(p, 1, _t(h1))) - h1) < 1e-18
     for n in (5, 21, 63):
         cf = float(hnref.hn_expected_sum_h(p, n, _t(h1)))
@@ -475,16 +473,16 @@ def test_cumulant_one_is_minus_half_expected_sum_h():
     closed-form variance forecast."""
     p = _p()
     for h_mult in (0.5, 1.0, 2.0):
-        h1 = h_mult * float(p.stationary_var)
+        h1 = h_mult * float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
         for n in (1, 5, 21, 63):
             k1 = hnref.hn_cumulants(p, n, _t(h1), 1)[0]
             v = float(hnref.hn_expected_sum_h(p, n, _t(h1)))
-            assert abs(k1 - (float(p.r) * n - 0.5 * v)) < 1e-15
+            assert abs(k1 - (float(p['r']) * n - 0.5 * v)) < 1e-15
 
 
 def test_n1_aggregate_is_exactly_gaussian():
     p = _p()
-    h1 = float(p.stationary_var)
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     k1, k2, sk, ek = hnref.hn_moments(p, 1, _t(h1))
     assert abs(k2 - h1) < 1e-18 and abs(sk) < 1e-12 and abs(ek) < 1e-12
 
@@ -492,7 +490,7 @@ def test_n1_aggregate_is_exactly_gaussian():
 @pytest.mark.parametrize('n', [5, 21, 63])
 def test_cumulants_match_mc(n):
     p = _p()
-    h1 = float(p.stationary_var)
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     _, k2, sk, ek = hnref.hn_moments(p, n, _t(h1))
     r = hnref.hn_simulate(p, n, h1, 8_000_000, seed=11, device=DEV)
     d = r - r.mean()
@@ -511,7 +509,7 @@ def test_true_variance_exceeds_expected_sum_h():
 
     and the excess grows with n."""
     p = _p()
-    h1 = float(p.stationary_var)
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     prev = 1.0
     for n in (1, 5, 21, 63):
         v = float(hnref.hn_expected_sum_h(p, n, _t(h1)))
@@ -526,13 +524,13 @@ def test_true_variance_exceeds_expected_sum_h():
 def test_cdf_matches_mc_in_the_tails(n):
     """The exact survival probability used by DELIVERABLE 2, vs brute force."""
     p = _p()
-    h1 = float(p.stationary_var)
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     v = float(hnref.hn_expected_sum_h(p, n, _t(h1)))
-    mu = float(p.r) * n - 0.5 * v
+    mu = float(p['r']) * n - 0.5 * v
     r = hnref.hn_simulate(p, n, h1, 8_000_000, seed=13, device=DEV)
     for z in (-2.5, -1.0, 0.0, 1.0, 2.5):
         b = mu + z * math.sqrt(v)
-        cf = float(utils.hn_cdf_logret(b, p, n, h1))
+        cf = float(utils.hn_cdf_logret(b, n, h1, **p))
         ind = (r <= b).to(DT)
         mc, se = float(ind.mean()), float(ind.std() / math.sqrt(len(ind)))
         assert abs(cf - mc) < 4.5 * se, (n, z, cf, mc, se)
@@ -540,9 +538,9 @@ def test_cdf_matches_mc_in_the_tails(n):
 
 def test_cdf_is_a_valid_distribution_function():
     p = _p()
-    h1 = float(p.stationary_var)
+    h1 = float(utils.hn_stationary_var(p['omega'], p['alpha'], p['beta'], p['gamma_star']))
     for n in (5, 21, 63):
         bs = torch.linspace(-1.0, 1.0, 41, dtype=DT)
-        f = utils.hn_cdf_logret(bs, p, n, h1)
+        f = utils.hn_cdf_logret(bs, n, h1, **p)
         assert bool((f.diff() > -1e-13).all())
         assert float(f[0]) < 1e-10 and float(f[-1]) > 1.0 - 1e-10

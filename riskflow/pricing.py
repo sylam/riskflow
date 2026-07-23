@@ -21,9 +21,6 @@ import torch
 import torch.nn.functional as F
 
 from . import utils
-# The HN daily-step recursion lives in utils (ONE source of truth); the OSS pricers below use it
-# under these bare names. See utils.hn_variance_step.
-from .utils import hn_daily_advance, hn_unmonitored_substeps
 
 # useful constants
 BARRIER_UP = -1.0
@@ -38,7 +35,7 @@ OPTION_CALL = 1.0
 # Heston-Nandi GARCH(1,1) OSS pricers (TARF, discrete barrier, autocall). Opt-in per deal via
 # the Valuation Configuration switch SpotModel='HestonNandi' (see the deal calc_dependencies
 # branches and pv_MC_Tarf for the OSS scheme + known limitations F1-F4). The per-step advance
-# (hn_daily_advance / hn_unmonitored_substeps) is owned by utils and imported above; both the
+# (utils.hn_daily_advance / utils.hn_unmonitored_substeps) is owned by utils; both the
 # unmonitored sub-steps and the survival-truncated final step of every
 # fixing/observation interval, in ALL THREE pricers, route through it.
 # ======================================================================================
@@ -571,15 +568,16 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                             'carry or price this deal under GBM'.format(
                                 float(carry_total.max() - carry_total.min())))
                     r_step = carry_total[0] / n_total  # scalar b*T/n
-                    p_hn = utils.HNParams(*(v.reshape(-1)[0] for v in hn_params), r_step)
+                    om, al, be, ga = (v.reshape(-1)[0] for v in hn_params)  # scalar recursion params
                     H0_s = H0.reshape(-1)[0]
                     if isdigital:
-                        q_below = utils.hn_cdf_logret(torch.log(strike / s), p_hn, n_total, H0_s)
+                        q_below = utils.hn_cdf_logret(
+                            torch.log(strike / s), n_total, H0_s, om, al, be, ga, r_step)
                         vanilla_pv = ((1.0 - q_below) if phi == OPTION_CALL else q_below) * D[-1]
                     else:
                         fwd_growth = torch.exp(r_step * n_total)
                         vanilla = (utils.hn_call if phi == OPTION_CALL else utils.hn_put)(
-                            s, strike, p_hn, n_total, H0_s)
+                            s, strike, n_total, H0_s, om, al, be, ga, r_step)
                         vanilla_pv = vanilla * fwd_growth * D[-1]
                 vanilla_pv = vanilla_pv.reshape(-1, 1)  # [batch, 1]
 
@@ -594,7 +592,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                     if isBarrierDate_block[j] > 0:
                         # nj-1 unmonitored daily steps + 1 monitored (OSS truncation at the
                         # CONSTANT barrier, F-measurable over the interval - exact, product unchanged)
-                        Sj, h = hn_unmonitored_substeps(
+                        Sj, h = utils.hn_unmonitored_substeps(
                             Sj, h, b_step, nj[j] - 1, hn_params, shared, num_sims, antithetic=True)
                         sh = torch.sqrt(h)
                         z_max = (torch.log(barrier / Sj) - (b_step - 0.5 * h)) / sh
@@ -607,10 +605,10 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                         if direction == BARRIER_OUT:
                             P = P + (1.0 - p) * L * cash_rebate * D[j].reshape(-1, 1)
                         L = p * L
-                        Sj, h = hn_daily_advance(Sj, h, b_step, Z, *hn_params)
+                        Sj, h = utils.hn_daily_advance(Sj, h, b_step, Z, *hn_params)
                     else:
                         # non-barrier observation date (incl. expiry): full nj unconditional steps
-                        Sj, h = hn_unmonitored_substeps(
+                        Sj, h = utils.hn_unmonitored_substeps(
                             Sj, h, b_step, nj[j], hn_params, shared, num_sims, antithetic=True)
                     continue
 
@@ -694,9 +692,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
     if hn:
         hn_p = {x.name[-1]: shared.t_Static_Buffer[x].reshape(-1, 1)
                 for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
-        Omega, Alpha, Beta, Gamma_Star, H0 = (
-            hn_p['Omega'], hn_p['Alpha'], hn_p['Beta'], hn_p['Gamma_Star'], hn_p['H0'])
-        hn_params = (Omega, Alpha, Beta, Gamma_Star)
+        *hn_params, H0 = (hn_p[k] for k in utils.HN_PARAM_NAMES)  # the four recursion params + H0 (seeds h)
         hn_spy = factor_dep['HN_Steps_Per_Year']
 
     sobol = False
@@ -1347,7 +1343,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                         b_step = fwd_carry * dt / n_sub  # per-step cost-of-carry r-q; total = fwd_carry*dt
                         # the first n_sub-1 unmonitored daily steps (shared advance; antithetic to
                         # align with the u<->1-u halves of the truncated final draw below)
-                        Sj, h = hn_unmonitored_substeps(
+                        Sj, h = utils.hn_unmonitored_substeps(
                             Sj, h, b_step, n_sub - 1, hn_params, shared, num_sims, antithetic=True)
                         sh = torch.sqrt(h)
                         fwd_drift = b_step - 0.5 * h  # per-step drift of the FINAL (monitored) daily step
@@ -1372,7 +1368,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                     if hn:
                         # HN increment + h-recursion on the truncated final draw (shared advance;
                         # leverage-asymmetric because Z is survival-truncated - see hn_daily_advance)
-                        Sj, h = hn_daily_advance(Sj, h, b_step, Z, *hn_params)
+                        Sj, h = utils.hn_daily_advance(Sj, h, b_step, Z, *hn_params)
                     else:
                         # GBM increment
                         Sj = Sj * (torch.exp(fwd_drift + vol_dt * Z) if dt > 0 else 1.0)
@@ -1463,9 +1459,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
     if hn:
         hn_p = {x.name[-1]: shared.t_Static_Buffer[x].reshape(-1, 1)
                 for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
-        Omega, Alpha, Beta, Gamma_Star, H0 = (
-            hn_p['Omega'], hn_p['Alpha'], hn_p['Beta'], hn_p['Gamma_Star'], hn_p['H0'])
-        hn_params = (Omega, Alpha, Beta, Gamma_Star)  # the four recursion params (H0 seeds h)
+        *hn_params, H0 = (hn_p[k] for k in utils.HN_PARAM_NAMES)  # the four recursion params + H0 (seeds h)
         hn_spy = factor_dep['HN_Steps_Per_Year']
 
     # calculate the correct accumulation to date
@@ -1636,7 +1630,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                                 # BELOW the autocall threshold K - applies only on the final daily step)
                                 n_sub = max(int(round(float(dt) * hn_spy)), 1)
                                 b_step = forward_carry * dt / n_sub
-                                Sj, h = hn_unmonitored_substeps(
+                                Sj, h = utils.hn_unmonitored_substeps(
                                     Sj, h, b_step, n_sub - 1, hn_params, shared, num_sims, antithetic=False)
                                 sh = torch.sqrt(h)
                                 p = utils.norm_cdf((torch.log(K / Sj) - (b_step - 0.5 * h)) / sh)
@@ -1659,7 +1653,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                             if hn:
                                 # survival-truncated final draw + h-recursion (shared advance)
                                 if dt > 0:
-                                    Sj, h = hn_daily_advance(
+                                    Sj, h = utils.hn_daily_advance(
                                         Sj, h, b_step, utils.norm_icdf(safe_pu), *hn_params)
                                 # dt<=0 (terminal fixing): no interval, Sj/h unchanged (mirrors Sj*1.0)
                             else:
@@ -1787,9 +1781,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
     if hn:
         hn_p = {x.name[-1]: shared.t_Static_Buffer[x].reshape(-1, 1)
                 for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
-        Omega, Alpha, Beta, Gamma_Star, H0 = (
-            hn_p['Omega'], hn_p['Alpha'], hn_p['Beta'], hn_p['Gamma_Star'], hn_p['H0'])
-        hn_params = (Omega, Alpha, Beta, Gamma_Star)
+        *hn_params, H0 = (hn_p[k] for k in utils.HN_PARAM_NAMES)  # the four recursion params + H0 (seeds h)
         hn_spy = factor_dep['HN_Steps_Per_Year']
 
     sobol = False

@@ -54,15 +54,15 @@ DT_C = 1.0 / 252.0
 # AND the leverage cross-term engaged (skew ≈ -0.9), so the oracle match is a real test.
 _SP = hnref.hn_params_from_targets(
     ann_vol=0.30, persistence=0.94, gamma=350.0, leverage_share=0.7, steps_per_year=252.0)
-H0_STAT = float(_SP.stationary_var)
+H0_STAT = float(utils.hn_stationary_var(_SP['omega'], _SP['alpha'], _SP['beta'], _SP['gamma_star']))
 H0_TS = 1.6 * H0_STAT
-IMPLIED_PARAM = {'Omega': float(_SP.omega), 'Alpha': float(_SP.alpha), 'Beta': float(_SP.beta),
-                 'Gamma_Star': float(_SP.gamma), 'H0': H0_TS, 'Steps_Per_Year': 252.0}
+IMPLIED_PARAM = {'Omega': float(_SP['omega']), 'Alpha': float(_SP['alpha']), 'Beta': float(_SP['beta']),
+                 'Gamma_Star': float(_SP['gamma_star']), 'H0': H0_TS, 'Steps_Per_Year': 252.0}
 
 
 def _hn_params(h0=None):
-    """utils.HNParams (tensors, r=0) mirroring IMPLIED_PARAM for the closed-form oracle."""
-    return utils.HNParams(_SP.omega, _SP.alpha, _SP.beta, _SP.gamma, 0.0).as_tensors()
+    """Param dict (tensors, r=0) mirroring IMPLIED_PARAM for the closed-form oracle."""
+    return hnref.as_tensors({'omega': _SP['omega'], 'alpha': _SP['alpha'], 'beta': _SP['beta'], 'gamma_star': _SP['gamma_star'], 'r': 0.0})
 
 
 def test_uses_repo_under_test():
@@ -185,8 +185,8 @@ def test_nsub_two_business_day_bridge_analytic():
     assert list(p.n_sub) == [1, 2], f'expected n_sub [1,2], got {list(p.n_sub)}'
     spot = p.generate(sh)
     d = spot.log()[1] - spot.log()[0]
-    psi = float(_SP.beta + _SP.alpha * _SP.gamma ** 2)
-    v_analytic = H0_TS + (float(_SP.omega) + float(_SP.alpha) + psi * H0_TS)
+    psi = float(_SP['beta'] + _SP['alpha'] * _SP['gamma_star'] ** 2)
+    v_analytic = H0_TS + (float(_SP['omega']) + float(_SP['alpha']) + psi * H0_TS)
     assert abs(d.var().item() / v_analytic - 1.0) < 0.02, \
         f'2-bd aggregate variance {d.var().item():.4e} != analytic {v_analytic:.4e}'
 
@@ -231,7 +231,7 @@ def test_oracle_call_prices():
     p, sh = _make(T, B, seed=11)
     ST = p.generate(sh)[T - 1]
     for K in (95.0, 100.0, 105.0):
-        oracle = float(utils.hn_call(100.0, K, _hn_params(), T - 1, H0_TS))
+        oracle = float(utils.hn_call(100.0, K, T - 1, H0_TS, **_hn_params()))
         payoff = torch.clamp(ST - K, min=0.0)
         sim, se = payoff.mean().item(), payoff.std().item() / np.sqrt(B)
         assert abs(sim - oracle) < 4.0 * se, f'call K={K}: sim {sim:.5f} != oracle {oracle:.5f} ({abs(sim-oracle)/se:.1f} se)'
@@ -243,7 +243,7 @@ def test_oracle_terminal_cdf():
     p, sh = _make(T, B, seed=5)
     R = (p.generate(sh).log()[T - 1] - float(np.log(100.0))).numpy()
     for b in (-0.05, 0.0, 0.05):
-        oracle = float(utils.hn_cdf_logret(b, _hn_params(), T - 1, H0_TS))
+        oracle = float(utils.hn_cdf_logret(b, T - 1, H0_TS, **_hn_params()))
         sim = float((R <= b).mean())
         se = float(np.sqrt(oracle * (1 - oracle) / B))
         assert abs(sim - oracle) < 4.0 * se, f'cdf b={b:+.2f}: sim {sim:.5f} != oracle {oracle:.5f}'

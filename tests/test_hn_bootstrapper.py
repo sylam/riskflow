@@ -39,7 +39,7 @@ FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # the parameters the round trip has to recover
 TRUTH = hnref.hn_params_from_targets(
     ann_vol=0.28, persistence=0.96, gamma=250.0, leverage_share=0.5, steps_per_year=SPY)
-H0_TRUTH = 1.3 * TRUTH.stationary_var
+H0_TRUTH = 1.3 * utils.hn_stationary_var(TRUTH['omega'], TRUTH['alpha'], TRUTH['beta'], TRUTH['gamma_star'])
 
 # (name, spot, underlying type + params, vol type, yield type + params) - the factor is asset
 # class agnostic, so the round trip runs for all of these
@@ -76,11 +76,10 @@ def synthetic_quotes(asset, days, moneyness, option_type):
     t = days / 365.0
     n = max(int(round(t * SPY)), 1)
     strikes = np.array(moneyness) * spot * np.exp((RATE - q) * t)
-    p = utils.HNParams(TRUTH.omega, TRUTH.alpha, TRUTH.beta, TRUTH.gamma,
-                          (RATE - q) * t / n).as_tensors(DT)
+    p = hnref.as_tensors({'omega': TRUTH['omega'], 'alpha': TRUTH['alpha'], 'beta': TRUTH['beta'], 'gamma_star': TRUTH['gamma_star'], 'r': (RATE - q) * t / n}, DT)
     k = torch.tensor(strikes, dtype=DT)
-    call = utils.hn_call(spot, k, p, n, H0_TRUTH, panels=PANELS)
-    value = np.exp(-q * t) * (call if option_type == 'Call' else call - spot + k * torch.exp(-p.r * n))
+    call = utils.hn_call(spot, k, n, H0_TRUTH, panels=PANELS, **p)
+    value = np.exp(-q * t) * (call if option_type == 'Call' else call - spot + k * torch.exp(-p['r'] * n))
     return [{'Expiry_Date': BASE_DATE + pd.Timedelta(days=days), 'Strike': float(strike),
              'Option_Type': option_type, 'Units': 1.0, 'Weight': 1.0, 'Quoted_Market_Value': float(v)}
             for strike, v in zip(strikes, value)]
@@ -117,19 +116,19 @@ def round_trip(request):
 # ======================================================================================
 
 @pytest.mark.parametrize('field,truth,rtol', [
-    ('Omega', float(TRUTH.omega), 5e-2),
-    ('Alpha', float(TRUTH.alpha), 5e-2),
-    ('Beta', float(TRUTH.beta), 2e-2),
-    ('Gamma_Star', float(TRUTH.gamma), 2e-2),
+    ('Omega', float(TRUTH['omega']), 5e-2),
+    ('Alpha', float(TRUTH['alpha']), 5e-2),
+    ('Beta', float(TRUTH['beta']), 2e-2),
+    ('Gamma_Star', float(TRUTH['gamma_star']), 2e-2),
     ('H0', float(H0_TRUTH), 1e-2)])
 def test_round_trip_recovers_parameters(round_trip, field, truth, rtol):
     assert round_trip[0][field] == pytest.approx(truth, rel=rtol)
 
 
 def test_round_trip_recovers_persistence_and_long_run_vol(round_trip):
-    p = utils.HNParams(*[round_trip[0][x] for x in ('Omega', 'Alpha', 'Beta', 'Gamma_Star')])
-    assert p.persistence == pytest.approx(float(TRUTH.persistence), abs=1e-3)
-    assert p.ann_vol(SPY) == pytest.approx(TRUTH.ann_vol(SPY), rel=1e-2)
+    p = dict(zip(('omega', 'alpha', 'beta', 'gamma_star'), (round_trip[0][x] for x in ('Omega', 'Alpha', 'Beta', 'Gamma_Star'))))
+    assert utils.hn_persistence(p['alpha'], p['beta'], p['gamma_star']) == pytest.approx(float(utils.hn_persistence(TRUTH['alpha'], TRUTH['beta'], TRUTH['gamma_star'])), abs=1e-3)
+    assert utils.hn_ann_vol(p['omega'], p['alpha'], p['beta'], p['gamma_star'], SPY) == pytest.approx(utils.hn_ann_vol(TRUTH['omega'], TRUTH['alpha'], TRUTH['beta'], TRUTH['gamma_star'], SPY), rel=1e-2)
 
 
 def test_round_trip_reprices_the_quotes(round_trip):
@@ -138,11 +137,10 @@ def test_round_trip_reprices_the_quotes(round_trip):
     param, _, prices, boot, asset = round_trip
     quotes = prices['HestonNandiModelPrices.' + asset[0]]['instrument']['European_Options']
     for option in quotes:
-        p = utils.HNParams(*[torch.tensor(param[k], dtype=DT) for k in
-                                ('Omega', 'Alpha', 'Beta', 'Gamma_Star')],
-                              torch.tensor((option['r'] - option['q']) * option['T'] / option['n'], dtype=DT))
+        pt = [torch.tensor(param[k], dtype=DT) for k in ('Omega', 'Alpha', 'Beta', 'Gamma_Star')]
+        r = torch.tensor((option['r'] - option['q']) * option['T'] / option['n'], dtype=DT)
         fitted = boot.price(asset[1], torch.tensor(option['Strike'], dtype=DT),
-                            1.0 if option['Option_Type'] == 'Call' else 0.0, 1.0, p, option['n'],
+                            1.0 if option['Option_Type'] == 'Call' else 0.0, 1.0, *pt, r, option['n'],
                             torch.tensor(param['H0'], dtype=DT), PANELS,
                             np.exp(-option['q'] * option['T']))
         assert float(fitted) == pytest.approx(option['Premium'], rel=1e-4, abs=1e-6)

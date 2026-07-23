@@ -60,9 +60,9 @@ N = 10.0
 # exercised AND the leverage cross-term is engaged (kills the leverage-sign mutant via the skew).
 _STRONG = hnref.hn_params_from_targets(
     ann_vol=0.30, persistence=0.94, gamma=350.0, leverage_share=0.7, steps_per_year=252.0)
-_STRONG_H0 = 1.6 * float(_STRONG.stationary_var)
-STRONG = {'Omega': float(_STRONG.omega), 'Alpha': float(_STRONG.alpha), 'Beta': float(_STRONG.beta),
-          'Gamma_Star': float(_STRONG.gamma), 'H0': _STRONG_H0}
+_STRONG_H0 = 1.6 * float(utils.hn_stationary_var(_STRONG['omega'], _STRONG['alpha'], _STRONG['beta'], _STRONG['gamma_star']))
+STRONG = {'Omega': float(_STRONG['omega']), 'Alpha': float(_STRONG['alpha']), 'Beta': float(_STRONG['beta']),
+          'Gamma_Star': float(_STRONG['gamma_star']), 'H0': _STRONG_H0}
 # the degenerate GARCH that collapses to constant-variance GBM at a 1-day step: no ARCH, no
 # leverage, no GARCH memory, so h == Omega == H0 == sigma^2 * (1 day) for all t.
 _H0_DAY = SIGMA ** 2 / 365.0
@@ -287,10 +287,7 @@ def test_autocall_bit_identity_degenerate_hn_reproduces_gbm(thr, seed):
 # ======================================================================================
 
 def _hn_call_ref(n_total, h0):
-    return float(utils.hn_call(
-        SPOT, STRIKE, utils.HNParams(
-            _STRONG.omega, _STRONG.alpha, _STRONG.beta, _STRONG.gamma, 0.0).as_tensors(),
-        n_total, h0)) * N
+    return float(utils.hn_call(SPOT, STRIKE, n_total, h0, **hnref.as_tensors({'omega': _STRONG['omega'], 'alpha': _STRONG['alpha'], 'beta': _STRONG['beta'], 'gamma_star': _STRONG['gamma_star'], 'r': 0.0}))) * N
 
 
 def test_barrier_ko_never_knock_matches_hn_call():
@@ -320,10 +317,7 @@ def test_autocall_single_coupon_matches_hn_cdf():
     every h-recursion mutant - incl. the leverage-sign flip at 2.2e-1 (tol 5e-3, correct ~1.3e-3)."""
     horizon, coup, thr = 30, 0.05, 1.05
     n_total = max(round(horizon / 365 * 252), 1)
-    q_below = float(utils.hn_cdf_logret(
-        torch.log(torch.tensor(thr * STRIKE / SPOT)),
-        utils.HNParams(_STRONG.omega, _STRONG.alpha, _STRONG.beta, _STRONG.gamma, 0.0).as_tensors(),
-        n_total, _STRONG_H0))
+    q_below = float(utils.hn_cdf_logret(torch.log(torch.tensor(thr * STRIKE / SPOT)), n_total, _STRONG_H0, **hnref.as_tensors({'omega': _STRONG['omega'], 'alpha': _STRONG['alpha'], 'beta': _STRONG['beta'], 'gamma_star': _STRONG['gamma_star'], 'r': 0.0})))
     ref = N * coup * (1.0 - q_below)
     price = _mtm(_autocall_cfg([horizon], [thr], [coup], horizon, hn_params=STRONG), seed=3, sims=1 << 17)
     assert price == pytest.approx(ref, rel=5e-3)

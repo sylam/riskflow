@@ -2894,7 +2894,7 @@ class EquityBarrierBinaryOption(Deal):
             all_factors, static_offsets, stochastic_offsets, ('None', 'HestonNandi'))
         if hn is not None:
             field_index['HN_Params'] = hn
-            field_index['HN_Steps_Per_Year'] = 252.0
+            field_index['HN_Steps_Per_Year'] = self.options.get('Steps_Per_Year', 252.0)
 
         return field_index
 
@@ -3223,7 +3223,7 @@ class QEDI_CustomAutoCallSwap(Deal):
             ('None', 'HestonNandi'))
         if hn is not None:
             field_index['HN_Params'] = hn
-            field_index['HN_Steps_Per_Year'] = 252.0
+            field_index['HN_Steps_Per_Year'] = self.options.get('Steps_Per_Year', 252.0)
 
         return field_index
 
@@ -3572,7 +3572,7 @@ class EquityBarrierOption(Deal):
             ('None', 'HestonNandi'))
         if hn is not None:
             field_index['HN_Params'] = hn
-            field_index['HN_Steps_Per_Year'] = 252.0
+            field_index['HN_Steps_Per_Year'] = self.options.get('Steps_Per_Year', 252.0)
 
         return field_index
 

@@ -1117,8 +1117,9 @@ class HestonNandiModelParameters(Factor0D):
                    'The persistence is $\\psi=\\beta+\\alpha\\gamma^{*2}$ (must be less than 1) and the stationary',
                    'per-step variance is $\\frac{\\omega+\\alpha}{1-\\psi}$'
                    ])
-    # one source of truth for the key set - get_tenor_indices and current_value must agree
-    parameters = ('Omega', 'Alpha', 'Beta', 'Gamma_Star', 'H0')
+    # one source of truth for the key set - get_tenor_indices and current_value must agree; the
+    # canonical name tuple lives in utils (the explicit-arg hn_* pricers/simulator consume the same set)
+    parameters = utils.HN_PARAM_NAMES
 
     def __init__(self, param):
         super(HestonNandiModelParameters, self).__init__(param)

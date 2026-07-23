@@ -31,7 +31,6 @@ import torch.nn.functional as F
 
 # Internal modules
 from . import utils
-from .utils import hn_variance_step
 from .instruments import get_fx_zero_rate_factor, get_equity_zero_rate_factor, get_dividend_rate_factor
 
 
@@ -3257,7 +3256,7 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
 
         Δlog S = (r - q) - ½ h + √h · z,   h_{t+1} = ω + β h + α (z - γ* √h)²
 
-    the variance recursion is `utils.hn_variance_step` (the ONE source of truth, imported not
+    the variance recursion is `utils.hn_variance_step` (the ONE source of truth, shared not
     copied); (r-q) is the per-step cost of carry read from the spot factor's OWN interest-rate and
     dividend/repo curves — the identical r_t / q_t gather as GBMAssetPriceTSModelImplied
     (EquityPrice: equity zero + dividend; FxRate: domestic + foreign zero). The -½ h is the EXACT
@@ -3287,21 +3286,6 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
     (T,B,B2) with the fork seed on the MIDDLE axis. The single framework Gaussian per step feeds the
     HN z directly (plain normal — HN has no Student-t emission, unlike GARCH)."""
 
-    documentation = ('Framework', [
-        'The Heston-Nandi GARCH(1,1) risk-neutral spot process (implied: parameters from the',
-        'bootstrapped HestonNandiModelParameters factor). INDEXING (original Heston & Nandi 2000):',
-        'the conditional variance carries the index of the END of the period it governs, so h_{t+1}',
-        'is F_t-measurable (predictable): log(S_{t+1}/S_t) = r - h_{t+1}/2 + sqrt(h_{t+1}) z_{t+1},',
-        'h_{t+1} = omega + beta h_t + alpha (z_t - gamma* sqrt(h_t))^2 with gamma* = gamma + lambda + 1/2',
-        'under Q (lambda* = -1/2). The -1/2 h drift is the exact Gaussian convexity, so the discounted',
-        'spot is a price-martingale by construction. Persistence psi = beta + alpha gamma*^2; stationary',
-        'variance (omega + alpha)/(1 - psi). Semi-analytic European prices come from the A/B backward',
-        'recursion (utils.hn_ab - note the load-bearing -phi/2 term) fed into the model-agnostic',
-        'Fourier inversion (utils.cf_european_probabilities). The daily-step recursion is shared with',
-        'the one-step-survival MC pricers (utils.hn_daily_advance). Simulation uses the fractional',
-        'trading clock f = dt/dt_c (exact at f=1; variance blended by f; aggregate-variance bridge for',
-        'n_sub >= 2). Conventions and references are pinned by tests/test_hn_garch.py (R fOptions to',
-        '2.8e-14) and tests/test_hn_implied_process.py (closed-form oracle, both-grids martingale).'])
 
     documentation = (
         'Asset Pricing',
@@ -3319,7 +3303,15 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
          'The parameters $(\\omega,\\alpha,\\beta,\\gamma^*,h_0)$ are the implied '
          '$HestonNandiModelParameters$ factor bootstrapped from the option surface — the same factor '
          'the semi-analytic pricer consumes. The persistence is $\\psi=\\beta+\\alpha\\gamma^{*2}$ and '
-         'the stationary per-step variance $\\frac{\\omega+\\alpha}{1-\\psi}$.'])
+         'the stationary per-step variance $\\frac{\\omega+\\alpha}{1-\\psi}$.',
+         '',
+         'Implementation seams: the A/B recursion is utils.hn_ab (note the load-bearing -phi/2), '
+         'inverted through the model-agnostic utils.cf_european_probabilities; the daily-step '
+         'recursion is utils.hn_variance_step (shared with the OSS pricers). Simulation runs on '
+         'the fractional trading clock f=dt/dt_c (exact at f=1, variance blended by f, '
+         'aggregate-variance bridge for n_sub>=2). Conventions pinned by tests/test_hn_garch.py '
+         '(R fOptions to 2.8e-14) and tests/test_hn_implied_process.py (closed-form oracle; '
+         'both-grids martingale + forward/replay).'])
 
     def __init__(self, factor, param, implied_factor=None):
         super().__init__(factor, param)
@@ -3360,18 +3352,15 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
         # branch); otherwise the calibrated scalars from the implied factor. Either way they are 0-dim
         # and broadcast against the (…B) variance state.
         p = self.implied.param
+        # Read the HestonNandiModelParameters factor block by the canonical HN_PARAM_NAMES (single
+        # source, mirrors CS's implied_tensor consumption): the implied_tensor branch when greeks are
+        # on (0-dim AAD leaves), else the calibrated scalars. The five scalars feed the explicit-arg
+        # utils.hn_* functions; H0 is the variance state (seeds h), the rest the recursion params.
         if implied_tensor is not None:
-            self.omega = implied_tensor['Omega'].reshape(())
-            self.alpha = implied_tensor['Alpha'].reshape(())
-            self.beta = implied_tensor['Beta'].reshape(())
-            self.gamma = implied_tensor['Gamma_Star'].reshape(())
-            self.h0_default = implied_tensor['H0'].reshape(())
+            vals = [implied_tensor[k].reshape(()) for k in utils.HN_PARAM_NAMES]
         else:
-            self.omega = shared.one.new_tensor(float(p['Omega']))
-            self.alpha = shared.one.new_tensor(float(p['Alpha']))
-            self.beta = shared.one.new_tensor(float(p['Beta']))
-            self.gamma = shared.one.new_tensor(float(p['Gamma_Star']))
-            self.h0_default = shared.one.new_tensor(float(p['H0']))
+            vals = [shared.one.new_tensor(float(p[k])) for k in utils.HN_PARAM_NAMES]
+        self.omega, self.alpha, self.beta, self.gamma, self.h0_default = vals
         self.psi = self.beta + self.alpha * self.gamma ** 2                       # persistence ψ
         # detached scalar long-run log-variance for the reveal fallback (buffer key absent)
         om, al = float(p['Omega']), float(p['Alpha'])
@@ -3452,7 +3441,7 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
                 sh = h.sqrt()
                 r = var_step.sqrt() * z[t]
                 # fractional HN variance update: exact hn_variance_step at f=1, blended by f for f<1
-                h = h + ft * (hn_variance_step(h, sh, z[t], omega, alpha, beta, gamma) - h)
+                h = h + ft * (utils.hn_variance_step(h, sh, z[t], omega, alpha, beta, gamma) - h)
             else:
                 # n_sub≥2: one Gaussian per grid step — forward h deterministically through the integer
                 # sub-steps via the HN mean recursion E[h_{j+1}]=ω+α+ψ h_j and draw the aggregate return
@@ -3551,7 +3540,7 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
                 var_step = h * ft
                 sh = h.sqrt()
                 z = ((logret[t] - logret[t - 1]) - carry[t] + 0.5 * var_step) / var_step.sqrt()
-                h = h + ft * (hn_variance_step(h, sh, z, omega, alpha, beta, gamma) - h)
+                h = h + ft * (utils.hn_variance_step(h, sh, z, omega, alpha, beta, gamma) - h)
             else:
                 h_j = h                                                         # deterministic bridge (as generate)
                 for _ in range(1, n_sub[t]):
