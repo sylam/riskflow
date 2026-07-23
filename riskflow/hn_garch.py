@@ -142,7 +142,6 @@ a user-supplied h0.  THIS MODULE IS THE SECOND: ``HNParams.gamma`` is gamma*, an
 always supplied by the caller.
 """
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -507,7 +506,7 @@ def hn_simulate_sum_h(p, n_steps, h1, n_paths, seed=0, device='cpu',
         tot.append(s)
         done += m
     s = torch.cat(tot)
-    return float(s.mean()), float(s.std() / math.sqrt(len(s)))
+    return float(s.mean()), float(s.std() / np.sqrt(len(s)))
 
 
 # ======================================================================================
@@ -515,7 +514,7 @@ def hn_simulate_sum_h(p, n_steps, h1, n_paths, seed=0, device='cpu',
 # ======================================================================================
 
 def _ncdf(x):
-    return 0.5 * torch.erfc(-x / math.sqrt(2.0))
+    return 0.5 * torch.erfc(-x / np.sqrt(2.0))
 
 
 def bs_call(S, K, total_var, disc, fwd_growth):
@@ -528,7 +527,7 @@ def bs_call(S, K, total_var, disc, fwd_growth):
 
 
 def bs_call_np(S, K, r, n, total_var):
-    d = math.exp(-r * n)
+    d = np.exp(-r * n)
     return float(bs_call(torch.as_tensor(float(S), dtype=torch.float64),
                          torch.as_tensor(float(K), dtype=torch.float64),
                          torch.as_tensor(float(total_var), dtype=torch.float64),
@@ -552,4 +551,4 @@ def hn_implied_vol(S, K, p, n_steps, h1, steps_per_year=252.0, **kw):
     """Annualised BS implied vol of the HN price (for the smile/skew diagnostics)."""
     c = float(hn_call(S, K, p, n_steps, h1, **kw))
     tv = bs_implied_total_var(c, float(S), float(K), float(p.r), int(n_steps))
-    return math.sqrt(tv / (int(n_steps) / steps_per_year))
+    return np.sqrt(tv / (int(n_steps) / steps_per_year))

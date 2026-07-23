@@ -17,7 +17,6 @@
 ########################################################################
 
 import calendar
-import math
 from functools import reduce, wraps
 from collections import namedtuple, deque
 from typing import Tuple, List
@@ -1515,7 +1514,7 @@ def complex_log_unwrap(w, dim=-1):
     correct because the winding correction is a locally-constant integer.  Reduces to the
     principal branch when the size along ``dim`` is 1.
     """
-    two_pi = 2.0 * math.pi
+    two_pi = 2.0 * np.pi
     ang = torch.angle(w)
     if w.shape[dim] > 1:
         d = torch.diff(ang, dim=dim)
@@ -1544,7 +1543,7 @@ def cf_adaptive_phi_max(logcf, carry, dtype=torch.float64, device='cpu',
             z = torch.tensor([phi], dtype=dtype, device=device) * 1j
             m0 = logcf(z).real
             m1 = logcf(z + 1.0).real - carry
-            if float(torch.maximum(m0, m1).max()) - math.log(phi) < log_tol:
+            if float(torch.maximum(m0, m1).max()) - np.log(phi) < log_tol:
                 return phi
             phi *= 2.0
         return phi
@@ -1590,7 +1589,7 @@ def cf_european_probabilities(logcf, log_moneyness, carry, phi_max, panels=256, 
             out.append(None)
             continue
         d = (shift * torch.exp(logcf(iphi + off) - disc)).real
-        out.append(0.5 + (d * wts).sum(-1) / math.pi)
+        out.append(0.5 + (d * wts).sum(-1) / np.pi)
     return out[0], out[1]
 
 
