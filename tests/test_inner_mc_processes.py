@@ -798,7 +798,7 @@ from riskflow.stochasticprocess import (                                       #
     GBMAssetPriceModel, GBMPriceIndexModel, GBMAssetPriceTSModelImplied,
     SingleRegimeOU1FactorKalmanModel, HWHazardRateModel,
     HullWhite2FactorImpliedInterestRateModel, CSForwardPriceModel,
-    PCAInterestRateModel, GARCHSpotModel,
+    PCAInterestRateModel, GARCHSpotModel, HestonNandiImpliedSpotModel,
 )
 
 
@@ -857,6 +857,31 @@ def _setup_garch_inner(B, B2, T=10):
                               'Calibration_DT_Years': 1.0 / 252.0})
     p.factor_key = utils.Factor('CommodityPrice', ('GARCH',))
     spot = torch.linspace(1800.0, 2200.0, B, dtype=DTYPE, device=DEVICE)        # distinct per outer
+    p.precalculate(REF_DATE, _time_grid(T), spot, sh, process_ofs=0)
+    return p, sh
+
+
+def _hn_static_rate_code(name):
+    # a flat static zero curve read like GBMAssetPriceTSModelImplied's r_t/q_t (is_stoch=False)
+    factor = utils.Factor('InterestRate', (name,))
+    tp = np.array([0.0, 1.0, 5.0, 30.0], dtype=np.float64)
+    td = utils.tenor_diff(tp, 'Linear')
+    dc = (lambda days: utils.get_day_count_accrual(REF_DATE, days, utils.DAYCOUNT_ACT365))
+    return [(False, factor, None, td, dc)], factor, torch.zeros(tp.size, dtype=DTYPE, device=DEVICE)
+
+
+def _setup_hn_implied_inner(B, B2, T=10):
+    sh = _inner_shared(1, B, B2)
+    implied = types.SimpleNamespace(param={'Omega': 8.028e-07, 'Alpha': 0.0328, 'Beta': 0.9639,
+                                           'Gamma_Star': 0.0, 'H0': 7.671e-04, 'Steps_Per_Year': 252.0})
+    p = HestonNandiImpliedSpotModel(factor=types.SimpleNamespace(param={}), param=None,
+                                    implied_factor=implied)
+    p.factor_type = 'EquityPrice'
+    p.factor_key = utils.Factor('EquityPrice', ('HN',))
+    rc, rf, rcur = _hn_static_rate_code('R')                                     # carry=0 (r_t==q_t)
+    sh.t_Static_Buffer[rf] = rcur
+    p.r_t = p.q_t = rc
+    spot = torch.linspace(1800.0, 2200.0, B, dtype=DTYPE, device=DEVICE)         # distinct per outer
     p.precalculate(REF_DATE, _time_grid(T), spot, sh, process_ofs=0)
     return p, sh
 
@@ -935,6 +960,7 @@ def _setup_hw2f_inner(B, B2, T=10):
     (_setup_gbmindex_inner, False),
     (_setup_singleregime_inner, False),
     (_setup_garch_inner, False),
+    (_setup_hn_implied_inner, False),
     (_setup_logou_inner, False),
     (_setup_mslogou_inner, False),
     (_setup_hw1f_inner, True),

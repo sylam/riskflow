@@ -399,10 +399,14 @@ def test_fields_mapping_matches_the_factor():
                mapping['MarketPrices']['types']['HestonNandiModelPrices'])
 
 
-def test_not_registered_as_an_implied_model():
-    """HN is consumed as a STATIC dependent factor - registering it in implied_models would mint a
-    duplicate AAD leaf (implied_var and static_var under identical scope names)."""
-    assert 'HestonNandiModelParameters' not in ModelParams().implied_models.values()
+def test_registered_as_the_implied_spot_model():
+    """HestonNandiImpliedSpotModel is registered as the implied model for HestonNandiModelParameters
+    so the SAME calibrated factor that the OSS pricer consumes ALSO drives the outer-scenario
+    evolution of its underlying. The duplicate-AAD-leaf this could mint (implied_var and static_var
+    under identical scope names) is resolved in Calculation._build_factor_state — the static leaf
+    reuses the implied one — and pinned by
+    tests/test_hn_implied_process.py::test_dedupe_single_leaf_and_gradient_flow."""
+    assert ModelParams().implied_models.get('HestonNandiImpliedSpotModel') == 'HestonNandiModelParameters'
 
 
 # ======================================================================================

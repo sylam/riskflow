@@ -344,6 +344,8 @@ mapping = {
         'types': {
             "GBMAssetPriceTSModelImplied":
                 ["Risk_Premium"],
+            "HestonNandiImpliedSpotModel":
+                [],
             "HullWhite2FactorImpliedInterestRateModel":
                 ["Lambda_1", "Lambda_2"],
             "GBMAssetPriceModel":
@@ -472,8 +474,8 @@ mapping = {
         "CSForwardPriceModelParameters": [],
         "HestonNandiModelParameters": [],
         "GBMAssetPriceTSModelParameters": [],
-        "EquityPrice": ["GBMAssetPriceModel"],
-        "FxRate": ["GBMAssetPriceModel", "GBMAssetPriceTSModelImplied"],
+        "EquityPrice": ["GBMAssetPriceModel", "HestonNandiImpliedSpotModel"],
+        "FxRate": ["GBMAssetPriceModel", "GBMAssetPriceTSModelImplied", "HestonNandiImpliedSpotModel"],
         "SurvivalProb": ["HWHazardRateModel"],
         "InterestRate": ["HullWhite1FactorInterestRateModel", "PCAInterestRateModel",
                           "VARMixedFactorInterestRateModel"],

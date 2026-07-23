@@ -868,6 +868,15 @@ class Credit_Monte_Carlo(Calculation):
 
         # and then get the static risk factors ready - these will just be looked up
         calc_grad = greeks and sensitivities in ['All', 'Factors']
+        # A factor can be BOTH a static dependent factor (e.g. the OSS pricer's
+        # HestonNandiModelParameters, pulled in via the EquityPrice/FxRate conditional field) AND
+        # a spot process's implied factor (implied_var, e.g. HestonNandiImpliedSpotModel). With
+        # greeks on, minting a fresh static leaf here would create a SECOND AAD leaf under the
+        # exact scope name the implied leaf already owns: the pricer (t_Static_Buffer) and the
+        # scenario path (implied_tensor) would then read different tensors, splitting the gradient
+        # and desyncing a bump. Reuse the single implied leaf so one tensor serves both consumers
+        # and `value.backward()` sums both paths' sensitivities into it.
+        implied_leaves = {fk: t for vars in self.implied_var.values() for fk, t in vars.items()}
         for key, value in self.static_factors.items():
             if key.type not in utils.DimensionLessFactors:
                 # check the daycount for the tenor_offset
@@ -881,10 +890,11 @@ class Credit_Monte_Carlo(Calculation):
                 current_val = value.current_value(offset=factor_tenor_offset)
                 if isinstance(current_val, dict):
                     for k, v in current_val.items():
-                        self.static_var[utils.Factor(key.type, key.name + (k,))] = torch.tensor(
+                        fkey = utils.Factor(key.type, key.name + (k,))
+                        self.static_var[fkey] = implied_leaves[fkey] if fkey in implied_leaves else torch.tensor(
                             v, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
                 else:
-                    self.static_var[key] = torch.tensor(
+                    self.static_var[key] = implied_leaves[key] if key in implied_leaves else torch.tensor(
                         current_val, device=self.device, dtype=self.dtype, requires_grad=calc_grad)
 
         # set up the device and allocate memory

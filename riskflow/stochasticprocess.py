@@ -31,6 +31,7 @@ import torch.nn.functional as F
 
 # Internal modules
 from . import utils
+from .hn_garch import hn_variance_step
 from .instruments import get_fx_zero_rate_factor, get_equity_zero_rate_factor, get_dividend_rate_factor
 
 
@@ -3240,6 +3241,322 @@ class GARCHSpotCalibration(object):
         delta = pd.DataFrame({data_frame.columns[0]: x / np.sqrt(h)}, index=r.index)
 
         return utils.CalibrationInfo(param, [[1.0]], delta)
+
+
+class HestonNandiImpliedSpotModel(StochasticProcess):
+    """Heston-Nandi GARCH(1,1) spot-price model under the risk-neutral (LRNVR) measure — an IMPLIED
+    process, so the calibrated `HestonNandiModelParameters` factor (Omega, Alpha, Beta, Gamma_Star,
+    H0) that the semi-analytic option pricer consumes ALSO drives the outer-scenario evolution of its
+    own underlying (CVA / credit-MC). The SAME bootstrapped surface prices the book and diffuses the
+    spot. Like every process in the implied family (GBMAssetPriceTSModelImplied,
+    CSImpliedForwardPriceModel, HullWhite2FactorImpliedInterestRateModel) it is risk-neutral by
+    construction and reads its parameters from the implied tensors (`implied_tensor`), so greeks flow
+    to the single shared AAD leaf (the static-leaf dedupe lives in Calculation._build_factor_state).
+
+    Dynamics under Q (λ*=-1/2, γ=γ*), per HN trading-day step:
+
+        Δlog S = (r - q) - ½ h + √h · z,   h_{t+1} = ω + β h + α (z - γ* √h)²
+
+    the variance recursion is `hn_garch.hn_variance_step` (the ONE source of truth, imported not
+    copied); (r-q) is the per-step cost of carry read from the spot factor's OWN interest-rate and
+    dividend/repo curves — the identical r_t / q_t gather as GBMAssetPriceTSModelImplied
+    (EquityPrice: equity zero + dividend; FxRate: domestic + foreign zero). The -½ h is the EXACT
+    Gaussian convexity, so the discounted spot is a Q PRICE-martingale BY CONSTRUCTION — verified in
+    PRICE space E[S_t e^{-∫(r-q)}] flat, not log space (the platinum GARCH lesson; log-space
+    martingale tests are structurally blind to a Jensen price drift).
+
+    THE CLOCK (the platinum GARCH trap, NOT re-created): the HN recursion is calibrated per TRADING
+    day (dt_c = 1/`Steps_Per_Year`, default 252) while the scenario grid runs in CALENDAR time (dt_t
+    from time_grid_years). f_t = dt_t/dt_c is the trading-time length of a grid step. This mirrors
+    GARCHSpotModel's fractional trading clock:
+      * n_sub = round(f) ≥ 2 (grid coarser than ~1.5 bd — the usual CVA grid): the integer
+        aggregate-variance bridge — h is forwarded DETERMINISTICALLY through the sub-steps via the HN
+        mean recursion E[h_{j+1}] = ω+α+ψ h_j (ψ=β+αγ*², = hn_expected_h_path) and a SINGLE aggregate
+        Gaussian return with the summed variance Σ h_j is drawn (loses within-step vol-of-vol — the
+        documented approximation, exactly as GARCH's n_sub≥2 branch).
+      * n_sub == 1 (f ≤ 1.5, incl. the calendar-daily production grid f≈0.69 AND the business-daily
+        grid f=1): the exact fractional step — return variance h·f and the variance update BLENDED by
+        f: h ← h + f·(hn_variance_step(h,z) − h). At f=1 this is EXACTLY hn_variance_step (a
+        business-day grid reproduces the hn_garch closed-form oracle to MC error); for f<1 it keeps
+        the annualized vol and the mean-reversion RATE grid-invariant in real time.
+
+    Observable state: log h_t = log h_{t+1}^{HN} (the predictable variance of the step t→t+1,
+    F_t-measurable — no lookahead), revealed to the value function exactly as GARCHSpotModel's log_h.
+    The 7-verb protocol (privileged_layout / reveal_state_at / revealed_annual_vol / inner_fork_seed /
+    outer_reseed / reseed_from_path) mirrors GARCHSpotModel; generate handles outer (T,B) and inner
+    (T,B,B2) with the fork seed on the MIDDLE axis. The single framework Gaussian per step feeds the
+    HN z directly (plain normal — HN has no Student-t emission, unlike GARCH)."""
+
+    documentation = (
+        'Asset Pricing',
+        ['A Heston-Nandi GARCH(1,1) risk-neutral spot model. Under the LRNVR measure the daily step '
+         'is',
+         '',
+         '$$ \\Delta\\log S = (r-q) - \\tfrac12 h + \\sqrt{h}\\,z,\\quad '
+         'h_{t+1} = \\omega + \\beta h + \\alpha (z - \\gamma^* \\sqrt{h})^2 $$',
+         '',
+         'with $z\\sim N(0,1)$ iid and $(r-q)$ the per-step cost of carry from the underlying\'s own '
+         'interest-rate and dividend/repo curves. The $-\\tfrac12 h$ is the exact Gaussian convexity '
+         'so the discounted spot is a price-martingale. The conditional variance $h_t$ is exactly '
+         'observable (predictable) and revealed to the value function as $\\log h_t$.',
+         '',
+         'The parameters $(\\omega,\\alpha,\\beta,\\gamma^*,h_0)$ are the implied '
+         '$HestonNandiModelParameters$ factor bootstrapped from the option surface — the same factor '
+         'the semi-analytic pricer consumes. The persistence is $\\psi=\\beta+\\alpha\\gamma^{*2}$ and '
+         'the stationary per-step variance $\\frac{\\omega+\\alpha}{1-\\psi}$.'])
+
+    def __init__(self, factor, param, implied_factor=None):
+        super().__init__(factor, param)
+        self.implied = implied_factor
+        # the underlying's class name selects the r/q curve gather in calc_references (EquityPrice /
+        # FxRate), exactly as GBMAssetPriceTSModelImplied.
+        self.factor_type = self.factor.__class__.__name__
+
+    @staticmethod
+    def num_factors():
+        return 1
+
+    @property
+    def correlation_name(self):
+        return 'HestonNandiSpotProcess', [()]
+
+    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
+        self.z_offset = process_ofs
+        self.scenario_horizon = time_grid.scen_time_grid.size
+
+        # Fractional trading clock. Anchor dt at time_grid_years[0] so the per-step spacing is
+        # correct under BOTH outer mode (scen_time_grid[0]=0) and inner-MC kept-base mode (>0),
+        # mirroring GARCHSpotModel. dt_c is the calibration (trading-day) step; the option
+        # bootstrapper works at Steps_Per_Year (default 252), so the same convention drives the sim.
+        tg_years = time_grid.time_grid_years
+        dt_arr = np.diff(np.hstack(([tg_years[0]], tg_years)))
+        dt_c = 1.0 / float(self.implied.param.get('Steps_Per_Year', 252.0))
+        self.dt_c = dt_c
+        self.f = shared.one.new_tensor(dt_arr / dt_c)                             # (T,) trading-time step length
+        self.n_sub = np.maximum(1, np.round(dt_arr / dt_c)).astype(int)
+        if np.any(self.n_sub >= 2):
+            # INFO (precalculate reruns on every inner fork): only the coarse-grid aggregate-variance
+            # bridge is an approximation; the fractional step is exact for n_sub == 1.
+            logging.info('HestonNandiImpliedSpotModel coarse grid: n_sub up to %d — aggregate-variance '
+                         'bridge active (within-step vol-of-vol approximated).', int(self.n_sub.max()))
+
+        # Parameters ride the implied tensors when greeks are on (mirrors CS's numpy-vs-implied_tensor
+        # branch); otherwise the calibrated scalars from the implied factor. Either way they are 0-dim
+        # and broadcast against the (…B) variance state.
+        p = self.implied.param
+        if implied_tensor is not None:
+            self.omega = implied_tensor['Omega'].reshape(())
+            self.alpha = implied_tensor['Alpha'].reshape(())
+            self.beta = implied_tensor['Beta'].reshape(())
+            self.gamma = implied_tensor['Gamma_Star'].reshape(())
+            self.h0_default = implied_tensor['H0'].reshape(())
+        else:
+            self.omega = shared.one.new_tensor(float(p['Omega']))
+            self.alpha = shared.one.new_tensor(float(p['Alpha']))
+            self.beta = shared.one.new_tensor(float(p['Beta']))
+            self.gamma = shared.one.new_tensor(float(p['Gamma_Star']))
+            self.h0_default = shared.one.new_tensor(float(p['H0']))
+        self.psi = self.beta + self.alpha * self.gamma ** 2                       # persistence ψ
+        # detached scalar long-run log-variance for the reveal fallback (buffer key absent)
+        om, al = float(p['Omega']), float(p['Alpha'])
+        be, ga = float(p['Beta']), float(p['Gamma_Star'])
+        self._log_lr_var = float(np.log((om + al) / (1.0 - (be + al * ga ** 2))))
+
+        # Risk-neutral drift plumbing — identical to GBMAssetPriceTSModelImplied: the per-step carry
+        # (r-q)·dt is read from the curve as-of each step's START node, anchored at today (t=0) so the
+        # first step evolves from spot. delta_scen_t are the calendar step sizes.
+        self.delta_scen_t = np.diff(np.insert(time_grid.scen_time_grid, 0, 0)).reshape(-1, 1)
+        today = time_grid.scenario_grid[:1].copy()
+        today[:, utils.TIME_GRID_MTM] = 0.0
+        self.scen_grid = np.vstack([today, time_grid.scenario_grid[:-1]])
+
+        # AAD: keep spot0 on the graph. In log space h depends only on the generated innovations,
+        # never on spot0. Outer passes a (1,) scalar; inner-MC a (B,) per-outer-path vector.
+        self.spot0 = tensor
+
+    def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
+        # Risk-neutral drift links — the underlying's own curves supply r and q (mirrors
+        # GBMAssetPriceTSModelImplied). EquityPrice: equity repo/zero + dividend; FxRate: domestic +
+        # foreign (repo) zero.
+        if self.factor_type == 'EquityPrice':
+            self.r_t = get_equity_zero_rate_factor(
+                factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
+            self.q_t = get_dividend_rate_factor(factor.name, static_ofs, stoch_ofs, all_tenors)
+        elif self.factor_type == 'FxRate':
+            self.r_t = get_fx_zero_rate_factor(
+                self.factor.get_domestic_currency(None), static_ofs, stoch_ofs, all_tenors, all_factors)
+            self.q_t = get_fx_zero_rate_factor(factor.name, static_ofs, stoch_ofs, all_tenors, all_factors)
+        else:
+            raise Exception('HestonNandiImpliedSpotModel unsupported factor type {}'.format(self.factor_type))
+
+    def _carry_per_step(self, shared_mem, shape):
+        """Per-step cost of carry (r-q)·dt as a (T, …batch) tensor — the same r_t/q_t curve gather
+        GBMAssetPriceTSModelImplied uses for its drift, but kept PER STEP (not cumulated): each HN
+        daily step carries its own (r-q) and the full log-return is cumulated in generate. Outer
+        (T,B); inner (T,B,B2) via n_batch_dims=2 (the curve stack collapses (B,B2)→B*B2, reshaped
+        back). ds[0] stays the anchor (0) so carry[0] is unused. `shape` is the driver tensor's shape
+        (Z in generate, the observed path in reseed_from_path)."""
+        if len(shape) == 2:
+            rt = utils.calc_time_grid_curve_rate(self.r_t, self.scen_grid, shared_mem)
+            qt = utils.calc_time_grid_curve_rate(self.q_t, self.scen_grid, shared_mem)
+            rt_rates = rt.gather_weighted_curve(shared_mem, self.delta_scen_t)
+            qt_rates = qt.gather_weighted_curve(shared_mem, self.delta_scen_t)
+            return torch.squeeze(rt_rates - qt_rates, dim=1)                      # (T, B)
+        T, B, B2 = shape
+        rt = utils.calc_time_grid_curve_rate(self.r_t, self.scen_grid, shared_mem, n_batch_dims=2)
+        qt = utils.calc_time_grid_curve_rate(self.q_t, self.scen_grid, shared_mem, n_batch_dims=2)
+        rt_rates = rt.gather_weighted_curve(shared_mem, self.delta_scen_t)
+        qt_rates = qt.gather_weighted_curve(shared_mem, self.delta_scen_t)
+        carry = torch.squeeze(rt_rates - qt_rates, dim=1)
+        # A STOCHASTIC (simulated) curve fans the collapsed (B,B2)→B*B2 batch — reshape it back.
+        # A STATIC curve carries no batch axis; keep it (T,1,1) so each per-step scalar broadcasts
+        # across the (B,B2) fan-out.
+        if carry.numel() == T * B * B2:
+            return carry.reshape(T, B, B2)
+        return carry.reshape(T, 1, 1)
+
+    def _simulate_returns(self, z, h, carry):
+        """Shared HN recursion (outer/inner) on the FRACTIONAL TRADING CLOCK. `z` (T, …) standard
+        normals, `h` (…) the entry variance h_0. Returns (ds, log_h): ds[t] is Δlog S landing at t
+        (ds[0]=0, the dt=0 anchor), log_h[t] the revealed variance of the move t→t+1 (F_t-measurable —
+        a function of z[1..t] only, no lookahead).
+
+        n_sub≤1: exact fractional step — var = h·f_t, and the variance update h ← h + f·(hn step − h)
+        which is EXACTLY hn_variance_step at f=1. n_sub≥2: aggregate-variance bridge — h forwarded
+        deterministically through the sub-steps via E[h]=ω+α+ψ h, single aggregate draw."""
+        omega, alpha, beta, gamma, psi = self.omega, self.alpha, self.beta, self.gamma, self.psi
+        f, n_sub = self.f, self.n_sub
+        log_h = torch.empty_like(z)
+        ds = torch.zeros_like(z)
+        log_h[0] = h.log()
+        for t in range(1, z.shape[0]):
+            if n_sub[t] <= 1:
+                ft = f[t]
+                var_step = h * ft                                                # Var(Δlog S) over the step
+                sh = h.sqrt()
+                r = var_step.sqrt() * z[t]
+                # fractional HN variance update: exact hn_variance_step at f=1, blended by f for f<1
+                h = h + ft * (hn_variance_step(h, sh, z[t], omega, alpha, beta, gamma) - h)
+            else:
+                # n_sub≥2: one Gaussian per grid step — forward h deterministically through the integer
+                # sub-steps via the HN mean recursion E[h_{j+1}]=ω+α+ψ h_j and draw the aggregate return
+                # with the summed variance Σ h_j (documented within-step vol-of-vol approximation).
+                h_j, var_step = h, h
+                for _ in range(1, n_sub[t]):
+                    h_j = omega + alpha + psi * h_j
+                    var_step = var_step + h_j
+                r = var_step.sqrt() * z[t]
+                h = omega + alpha + psi * h_j
+            ds[t] = carry[t] - 0.5 * var_step + r
+            log_h[t] = h.log()
+        return ds, log_h
+
+    def generate(self, shared_mem):
+        # One framework Gaussian per step drives the HN z DIRECTLY (no Student-t rescale, no auxiliary
+        # sampling stream). Z is (T, B) outer, (T, B, B2) inner.
+        Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
+        carry = self._carry_per_step(shared_mem, Z.shape)
+
+        if Z.ndim == 2:
+            B = Z.shape[1]
+            # h0: diff-ML t=0 randomization hook (mirrors GARCH regime0/h0_outer); else H0 expanded.
+            h0 = shared_mem.t_Scenario_Buffer.get((self.factor_key, 'h0_outer'))
+            h = h0 if h0 is not None else torch.zeros_like(Z[0]) + self.h0_default
+            ds, log_h = self._simulate_returns(Z, h, carry)
+            s0 = self.spot0.expand(B)                                            # (1,) -> (B,)
+            log_path = s0.log().unsqueeze(0) + ds.cumsum(dim=0)                  # (T, B)
+        else:
+            B, B2 = Z.shape[1], Z.shape[2]
+            # h0: per-outer-path fork seed on the MIDDLE (B) axis, expanded across B2; else H0.
+            h0 = shared_mem.t_Scenario_Buffer.get((self.factor_key, 'h0_inner'))
+            h = h0.view(B, 1).expand(B, B2) if h0 is not None else torch.zeros_like(Z[0]) + self.h0_default
+            ds, log_h = self._simulate_returns(Z, h, carry)
+            s0 = self.spot0                                                      # (B,)
+            log_path = s0.view(B, 1).log() + ds.cumsum(dim=0)                    # (T, B, B2)
+        # Floor before exp(): a large negative innovation can underflow exp() to 0.0 and break the
+        # price invariant (same guard as GARCHSpotModel).
+        spot_path = log_path.clamp_min(-10.0).exp()
+
+        # Revealed log h, detached (a state coordinate, not differentiated through). B-LAST so the
+        # buffer's dim=-1 concat works: (T,1,B) outer / (T,1,B,B2) inner.
+        shared_mem.t_Scenario_Buffer[(self.factor_key, 'hn_log_h')] = log_h.detach().unsqueeze(1)
+        self.last_log_h = log_h.detach()
+        return spot_path
+
+    @classmethod
+    def privileged_layout(cls, param):
+        return {'log_h': 1}
+
+    def privileged_factors(self, simulated):
+        # (T, B, 1) — the HMM/GARCH accumulator convention. Called outer-mode only.
+        return {'log_h': self.last_log_h.to(torch.float32).unsqueeze(-1)}
+
+    def reveal_state_at(self, t, buffer):
+        """log_h-first / price-last (matching GARCHSpotModel and the HMM belief-first/price-last
+        packing). log h_t is the exactly-observable predictable variance; the spot level is the last
+        CONTINUOUS coordinate. Rank-check the buffered log-h against the current mode, else the
+        long-run-variance fallback when the buffer key is absent."""
+        key = self.factor_key
+        price = buffer[key][t].unsqueeze(0)                                      # (1, …batch)
+        log_h = buffer.get((key, 'hn_log_h'))
+        if log_h is not None and log_h.dim() == buffer[key].dim() + 1:
+            block = log_h[t]                                                     # (1, …batch)
+        else:
+            block = torch.full_like(price, self._log_lr_var)
+        return [(block, REVEAL_SUFFICIENT), (price, REVEAL_CONTINUOUS)]
+
+    def inner_fork_seed(self, factor_key, outer_buf, t):
+        """Per-outer-path t=0 conditional-variance seed: h0_inner = exp(outer log h_t), so the inner
+        fan-out reprices from the forked path's vol state (not the calibrated H0)."""
+        return {(factor_key, 'h0_inner'): outer_buf[(factor_key, 'hn_log_h')][t].reshape(-1).exp()}
+
+    def outer_reseed(self):
+        """t=0 conditional-variance seed for the next outer run's burn-in: terminal h of this run."""
+        return {(self.factor_key, 'h0_outer'): self.last_log_h[-1].exp()}
+
+    def reseed_from_path(self, simulated, shared_mem):
+        """Observed-path replay: rerun the HN variance recursion (fractional clock) on the REALIZED
+        returns of the supplied price path, publishing `hn_log_h` (so reveal returns the right log h
+        along the replayed path) and `h0_outer` (terminal h). The innovation is recovered from the
+        realized log-return with the SAME carry/convexity the forward sim used, so the h recursion
+        stays lock-step: z = (Δlog S − carry + ½·Var)/√Var, Var = h·f (n_sub≤1). n_sub≥2 sub-steps
+        are deterministic (no z needed)."""
+        obs = simulated.detach()
+        logret = obs.clamp_min(1.0e-30).log()
+        omega, alpha, beta, gamma, psi = self.omega, self.alpha, self.beta, self.gamma, self.psi
+        f, n_sub = self.f, self.n_sub
+        carry = self._carry_per_step(shared_mem, obs.shape).detach()
+        h = torch.zeros_like(obs[0]) + self.h0_default                          # (…B) = H0
+        log_h = torch.empty_like(obs)
+        log_h[0] = h.log()
+        for t in range(1, obs.shape[0]):
+            if n_sub[t] <= 1:
+                ft = f[t]
+                var_step = h * ft
+                sh = h.sqrt()
+                z = ((logret[t] - logret[t - 1]) - carry[t] + 0.5 * var_step) / var_step.sqrt()
+                h = h + ft * (hn_variance_step(h, sh, z, omega, alpha, beta, gamma) - h)
+            else:
+                h_j = h                                                         # deterministic bridge (as generate)
+                for _ in range(1, n_sub[t]):
+                    h_j = omega + alpha + psi * h_j
+                h = omega + alpha + psi * h_j
+            log_h[t] = h.log()
+        shared_mem.t_Scenario_Buffer[(self.factor_key, 'hn_log_h')] = log_h.unsqueeze(1)
+        shared_mem.t_Scenario_Buffer[(self.factor_key, 'h0_outer')] = h
+
+    def calibrated_annual_vol(self):
+        """Long-run annualised vol √( (ω+α)/(1−ψ) / dt_c ) — the stationary HN vol off the
+        calibration (trading-day) clock."""
+        p = self.implied.param
+        om, al, be, ga = (float(p[k]) for k in ('Omega', 'Alpha', 'Beta', 'Gamma_Star'))
+        lr_var = (om + al) / (1.0 - (be + al * ga ** 2))
+        return float(np.sqrt(lr_var / self.dt_c))
+
+    def revealed_annual_vol(self, log_h):
+        """σ_t = √(exp(log h_t)/dt_c): the exactly-observed conditional vol annualized off the
+        calibration trading-day clock (h_t is the per-trading-day variance)."""
+        return (log_h.exp() / self.dt_c).sqrt()
 
 
 class VARMixedFactorInterestRateModel(StochasticProcess):

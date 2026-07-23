@@ -81,14 +81,16 @@ class ModelParams(object):
         # valid risk factor subtypes (only Interest rates at the moment)
         self.valid_subtype = {'BasisSpread': 'BasisSpread'}
         # these models need these additional price factors
-        # NOTE: HestonNandiModelParameters is deliberately NOT registered here. The pricer path
-        # consumes it as a STATIC dependent factor; registering it as an implied model would mint
-        # a duplicate AAD leaf (implied_var and static_var both creating tensors under identical
-        # scope names).
+        # HestonNandiImpliedSpotModel and the OSS option pricer share ONE HestonNandiModelParameters
+        # factor: the process consumes it as its implied factor (implied_var) and the pricer as a
+        # static dependent factor. The duplicate-AAD-leaf that this would otherwise create is
+        # deduped in Calculation._build_factor_state (the static leaf reuses the implied one), so
+        # the single tensor drives both the scenario path and the pricer and backward sums both.
         self.implied_models = {
             'CSImpliedForwardPriceModel': 'CSForwardPriceModelParameters',
             'GBMAssetPriceTSModelImplied': 'GBMAssetPriceTSModelParameters',
-            'HullWhite2FactorImpliedInterestRateModel': 'HullWhite2FactorModelParameters'
+            'HullWhite2FactorImpliedInterestRateModel': 'HullWhite2FactorModelParameters',
+            'HestonNandiImpliedSpotModel': 'HestonNandiModelParameters'
         }
 
         self.modeldefaults = {}
