@@ -17,6 +17,7 @@
 ########################################################################
 
 import calendar
+import math
 from functools import reduce, wraps
 from collections import namedtuple, deque
 from typing import Tuple, List
@@ -1468,6 +1469,129 @@ def black_european_option_price(F, X, r, vol, tenor, buyOrSell, callOrPut):
     d2 = d1 - stddev
     return buyOrSell * callOrPut * (F * scipy.stats.norm.cdf(callOrPut * sign * d1) -
                                     X * scipy.stats.norm.cdf(callOrPut * sign * d2)) * np.exp(-r * tenor)
+
+
+# ======================================================================================
+# Characteristic-function (Fourier) inversion primitive for affine option pricers
+# ======================================================================================
+#
+# A MODEL-AGNOSTIC European vanilla / digital pricer for any model whose aggregate
+# log-return R = log(S_T/S_t) has a known characteristic function.  The quadrature
+# machinery lives here once; a model supplies ONLY its log-CF and reuses everything below
+# with zero inversion code.  Heston-Nandi is the first client (riskflow.hn_garch); Heston,
+# Bates and Variance-Gamma would each just pass their own ``logcf`` closure (see the
+# ``cf_european_probabilities`` documentation for the plug-in contract).
+#
+# Float64 is mandatory: the S*P1 - K*e^{-rn}*P2 assembly is a cancellation of two O(1)
+# probabilities and float32 destroys it.
+
+def gauss_legendre(a, b, panels, order=8, dtype=torch.float64, device='cpu'):
+    """Composite Gauss-Legendre nodes/weights on [a, b], ASCENDING, endpoints excluded.
+
+    ``panels`` sub-intervals each carry an ``order``-point rule; because the panel edges
+    (hence the interval endpoints ``a`` and ``b``) are never sampled, an integrand with a
+    removable singularity at an endpoint - e.g. the ``1/(i*phi)`` of a Fourier inversion at
+    ``phi = 0`` - can be integrated on ``[0, phi_max]`` directly without a hole.
+    """
+    x, w = np.polynomial.legendre.leggauss(order)
+    edges = np.linspace(a, b, panels + 1)
+    lo, hi = edges[:-1, None], edges[1:, None]
+    mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo)
+    nodes = (mid + half * x[None, :]).ravel()
+    wts = (half * w[None, :]).ravel()
+    o = np.argsort(nodes)
+    return (torch.tensor(nodes[o], dtype=dtype, device=device),
+            torch.tensor(wts[o], dtype=dtype, device=device))
+
+
+def complex_log_unwrap(w, dim=-1):
+    """Complex log with the branch fixed by continuity ALONG ``dim`` (the phi grid).
+
+    ``dim`` must be an axis along which phi varies smoothly and monotonically, anchored at
+    its first entry (smallest phi, where ``w`` is near ``1+0j``).  This is the general guard
+    against the discrete "Heston trap": taking the principal branch of ``log(1 - 2*alpha*B)``
+    independently at each backward step of an affine A/B recursion is wrong whenever that
+    argument winds around the origin.  ``torch.round`` carries zero gradient, which is
+    correct because the winding correction is a locally-constant integer.  Reduces to the
+    principal branch when the size along ``dim`` is 1.
+    """
+    two_pi = 2.0 * math.pi
+    ang = torch.angle(w)
+    if w.shape[dim] > 1:
+        d = torch.diff(ang, dim=dim)
+        d = d - two_pi * torch.round(d / two_pi)
+        first = ang.narrow(dim, 0, 1)
+        ang = torch.cat([first, first + torch.cumsum(d, dim=dim)], dim=dim)
+    return torch.complex(torch.log(torch.abs(w)), ang)
+
+
+def cf_adaptive_phi_max(logcf, carry, dtype=torch.float64, device='cpu',
+                        log_tol=-40.0, start=8.0, cap=2.0 ** 24):
+    """Smallest power-of-two ``phi_max`` at which the inversion integrand has decayed.
+
+    Doubles ``phi`` until ``Re(logcf) - ln(phi)`` drops below ``log_tol`` on BOTH inversion
+    contours (``i*phi`` and ``i*phi + 1``), the +1 (share-measure) contour being normalised
+    by the log forward-growth ``carry`` = log E[S_T/S_t].  ``logcf`` must already be reduced
+    to the SLOWEST-DECAYING state in the batch (for a stochastic-variance model that is the
+    smallest instantaneous variance, whose integrand envelope decays slowest by Jensen), so
+    the scan stays cheap - one recursion per doubling on a 2-element phi.  A closed-form
+    cutoff is wrong here because the envelope decays slower than the pure-Gaussian
+    ``exp(-phi^2 V/2)``.  Runs under ``no_grad`` (the result is a scalar quadrature bound).
+    """
+    with torch.no_grad():
+        phi = float(start)
+        while phi < cap:
+            z = torch.tensor([phi], dtype=dtype, device=device) * 1j
+            m0 = logcf(z).real
+            m1 = logcf(z + 1.0).real - carry
+            if float(torch.maximum(m0, m1).max()) - math.log(phi) < log_tol:
+                return phi
+            phi *= 2.0
+        return phi
+
+
+def cf_european_probabilities(logcf, log_moneyness, carry, phi_max, panels=256, order=8,
+                              dtype=torch.float64, device='cpu', want=3):
+    """The two exercise probabilities P1, P2 of a European claim, by Fourier inversion.
+
+    MODEL-AGNOSTIC.  Given a model whose aggregate log-return ``R = log(S_T/S_t)`` has the
+    generalised (complex-phi) characteristic function ``E_t[(S_T/S_t)^phi] = exp(logcf(phi))``,
+
+        P2 = 1/2 + (1/pi) Int_0^inf Re[ e^{-i phi m} exp(logcf(i phi))            / (i phi) ] d phi
+        P1 = 1/2 + (1/pi) Int_0^inf Re[ e^{-i phi m} exp(logcf(i phi + 1) - carry)/ (i phi) ] d phi
+
+    with ``m = log_moneyness = ln(K/S)`` and ``carry = ln E_t[S_T/S_t]`` (= r*n under the
+    risk-neutral measure, r the per-step rate).  Then a vanilla is priced by the caller as
+    ``S*P1 - K*e^{-carry}*P2`` (call), and a digital / CDF by ``Q(R <= b) = 1 - P2`` evaluated
+    at ``m = b`` (spot-free by construction).  ``want`` is a bit mask: 1 = P1, 2 = P2, 3 =
+    both; a CDF (``want = 2``) is exactly half the cost of a price.
+
+    THE PLUG-IN CONTRACT.  ``logcf(phi)`` receives a complex tensor whose trailing axis is
+    the quadrature grid and must return ``log E_t[(S_T/S_t)^phi]`` broadcasting to
+    ``(batch, node)`` - the state (e.g. the instantaneous variance) is captured by the
+    closure, so a single strike-vector priced against one variance is one ``batch`` row.
+    For an AFFINE model that log-CF is ``A(phi) + B(phi)*V_t`` with ``(A, B)`` from the
+    model's own backward recursion (use :func:`complex_log_unwrap` inside that recursion for
+    the branch of any ``log(1 - ...)`` term); a Levy model returns ``A(phi)`` alone.  A
+    future Heston / Bates / VG model therefore adds ZERO inversion code: it supplies its
+    ``logcf`` closure and ``carry``, resolves ``phi_max`` via :func:`cf_adaptive_phi_max`
+    (feeding it the same closure reduced to the worst-case state), and calls this function.
+
+    Differentiable w.r.t. every leaf reachable through ``logcf`` and ``carry`` (spot, strike
+    and the model parameters); float64 is required for the P1-P2 cancellation.
+    """
+    lm = log_moneyness.unsqueeze(-1)
+    nodes, wts = gauss_legendre(0.0, phi_max, panels, order, dtype, device)
+    iphi = nodes * 1j
+    shift = torch.exp(-1j * nodes * lm) / iphi                # K^{-i phi} S^{i phi} / (i phi)
+    out = []
+    for bit, off, disc in ((1, 1.0, carry), (2, 0.0, 0.0)):
+        if not (want & bit):
+            out.append(None)
+            continue
+        d = (shift * torch.exp(logcf(iphi + off) - disc)).real
+        out.append(0.5 + (d * wts).sum(-1) / math.pi)
+    return out[0], out[1]
 
 
 def Bjerksund_Stensland(A1, A2, B, x1, x2, K, sigma1, sigma2, rho, callOrPut):

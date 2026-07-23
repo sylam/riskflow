@@ -2,11 +2,16 @@
 Heston-Nandi GARCH(1,1) -- semi-analytic European option pricing via the recursive
 characteristic function, plus the affine variance-forecast machinery.
 
-SELF-CONTAINED: this module imports nothing else from riskflow (only math/numpy/torch), so
-it can be used as a standalone pricer.  It IS the pricer behind the
-``HestonNandiModelParameters`` bootstrapper (``riskflow/bootstrappers.py``), and it is also
-used to quantify the multi-step aggregation bias of the one-step-survival (OSS) Monte Carlo
-in ``riskflow/pricing.py``.
+THE MODEL MODULE.  This holds the Heston-Nandi model itself: the parameters, the A/B
+backward recursion, the daily-step simulation recursion, and the exact aggregate cumulants.
+The MODEL-AGNOSTIC Fourier-inversion machinery (composite Gauss-Legendre quadrature, the
+adaptive ``phi_max`` scan, the branch-continuity complex log, and the P1/P2 primitive) lives
+once in ``riskflow.utils`` next to the other pricing primitives; ``hn_call`` / ``hn_put`` /
+``hn_cdf_logret`` here are thin delegations that pass the HN log-CF into it (Heston / Bates /
+VG would reuse the same primitive with their own log-CF).  It IS the pricer behind the
+``HestonNandiModelParameters`` bootstrapper (``riskflow/bootstrappers.py``), it supplies the
+daily-step recursion shared by the one-step-survival (OSS) Monte Carlo pricers in
+``riskflow/pricing.py``, and it quantifies the multi-step OSS aggregation bias there.
 
 --------------------------------------------------------------------------------------
 INDEXING CONVENTION (stated once, pinned by ``tests/test_hn_garch.py``)
@@ -94,16 +99,17 @@ every case (``test_no_branch_winding``).  Prices with and without the unwrap agr
 The correct branch is anyway fixed by continuity in phi along the contour, anchored at
 u = 0 where B == 0 exactly (for P2) and, for P1, at phi = 1 where B == 0 exactly by the
 martingale property -- in both cases ln(1) = 0.  We evaluate the recursion VECTORISED
-over an ascending grid of phi and unwrap along that grid (``_clog``) as a zero-risk
-guard that costs ~nothing and would still be correct if this module were ever re-used
-with alpha < 0 or with a non-LRNVR lambda.  ``unwrap=False`` selects the naive
-principal branch.
+over an ascending grid of phi and unwrap along that grid (``utils.complex_log_unwrap``,
+called from ``hn_ab``) as a zero-risk guard that costs ~nothing and would still be correct
+if this recursion were ever re-used with alpha < 0 or with a non-LRNVR lambda.
+``unwrap=False`` selects the naive principal branch.
 
-QUADRATURE.  Composite Gauss-Legendre on [0, phi_max]: panel endpoints are excluded so
-the removable 1/(i phi) singularity at phi = 0 is never evaluated.  ``phi_max`` defaults
-to an automatic scan that doubles phi until the integrand modulus
-``Re(A + B h1) - ln(phi)`` drops below ``exp(-40)``, evaluated at the extreme h1 in the
-batch (small h1 decays slowest).  The integrand's envelope is roughly
+QUADRATURE (in ``riskflow.utils``).  Composite Gauss-Legendre on [0, phi_max]: panel
+endpoints are excluded so the removable 1/(i phi) singularity at phi = 0 is never evaluated
+(``utils.gauss_legendre`` / ``utils.cf_european_probabilities``).  ``phi_max`` defaults to
+the automatic scan ``utils.cf_adaptive_phi_max`` that doubles phi until the integrand
+modulus ``Re(A + B h1) - ln(phi)`` drops below ``exp(-40)``, evaluated at the extreme h1 in
+the batch (small h1 decays slowest).  The integrand's envelope is roughly
 E[exp(-phi^2 Sum h / 2)], which by Jensen decays SLOWER than the pure-Gaussian
 exp(-phi^2 V/2) -- hence the scan rather than a closed-form phi_max.
 
@@ -142,7 +148,9 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-TWO_PI = 2.0 * math.pi
+from . import utils
+from .utils import gauss_legendre   # re-exported: the composite Gauss-Legendre grid now
+# lives in utils (model-agnostic quadrature); kept importable as ``hn_garch.gauss_legendre``.
 
 
 # ======================================================================================
@@ -213,29 +221,15 @@ def hn_params_from_targets(ann_vol, persistence, gamma, leverage_share, r=0.0,
 # the A/B recursion
 # ======================================================================================
 
-def _clog(w, dim=-1):
-    """Complex log with the branch fixed by continuity ALONG ``dim`` (the phi grid).
-
-    ``dim`` must be an axis along which phi varies smoothly and monotonically, anchored
-    at its first entry (smallest phi, where w is near 1+0j).  Reduces to the principal
-    branch when the size along ``dim`` is 1.
-    """
-    ang = torch.angle(w)
-    if w.shape[dim] > 1:
-        d = torch.diff(ang, dim=dim)
-        d = d - TWO_PI * torch.round(d / TWO_PI)
-        first = ang.narrow(dim, 0, 1)
-        ang = torch.cat([first, first + torch.cumsum(d, dim=dim)], dim=dim)
-    return torch.complex(torch.log(torch.abs(w)), ang)
-
-
 def hn_ab(phi, p, n_steps, unwrap=True, phi_dim=-1):
     """Backward A/B recursion for ``n_steps`` steps.  Returns ``(A, B)``.
 
     ``phi``     : real OR complex tensor.  If complex it is assumed to vary smoothly and
                   ascending along ``phi_dim`` (needed for the branch unwrap).
     ``p``       : HNParams (tensors).
-    Result satisfies E_t[S_{t+n}^phi] = S_t^phi * exp(A + B * h_{t+1}).
+    Result satisfies E_t[S_{t+n}^phi] = S_t^phi * exp(A + B * h_{t+1}); i.e. the HN affine
+    log-CF of the aggregate log-return is ``A + B * h1`` (the closure handed to the
+    model-agnostic inversion primitive ``utils.cf_european_probabilities``).
     """
     A = torch.zeros_like(phi)
     B = torch.zeros_like(phi)
@@ -245,7 +239,7 @@ def hn_ab(phi, p, n_steps, unwrap=True, phi_dim=-1):
     phir = phi * r
     for _ in range(int(n_steps)):
         w = 1.0 - 2.0 * al * B
-        logw = _clog(w, dim=phi_dim) if (unwrap and w.is_complex()) else torch.log(w)
+        logw = utils.complex_log_unwrap(w, dim=phi_dim) if (unwrap and w.is_complex()) else torch.log(w)
         A = A + phir + B * om - 0.5 * logw
         B = lin + be * B + half_sq / w
     return A, B
@@ -261,48 +255,20 @@ def hn_logmgf(phi, p, n_steps, h1, **kw):
 # quadrature
 # ======================================================================================
 
-def gauss_legendre(a, b, panels, order=8, dtype=torch.float64, device='cpu'):
-    """Composite Gauss-Legendre nodes/weights on [a, b], ASCENDING, endpoints excluded."""
-    x, w = np.polynomial.legendre.leggauss(order)
-    edges = np.linspace(a, b, panels + 1)
-    lo, hi = edges[:-1, None], edges[1:, None]
-    mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo)
-    nodes = (mid + half * x[None, :]).ravel()
-    wts = (half * w[None, :]).ravel()
-    o = np.argsort(nodes)
-    return (torch.tensor(nodes[o], dtype=dtype, device=device),
-            torch.tensor(wts[o], dtype=dtype, device=device))
-
-
 def auto_phi_max(p, n_steps, h1, log_tol=-40.0, start=8.0, cap=2.0 ** 24):
     """Smallest power-of-two phi_max with Re(A + B*h1) - ln(phi) < log_tol.
 
-    Checked for BOTH inversion contours (i*phi and i*phi+1) and at the extreme h1 in the
-    batch (the smallest h1 decays slowest).  Cheap: one recursion per doubling, on a
-    2-element phi.
+    The HN glue for the model-agnostic scan ``utils.cf_adaptive_phi_max``: it reduces the
+    batch to the extreme h1 (the smallest, whose integrand decays slowest) so the scan runs
+    on a 2-element phi and checks BOTH inversion contours (i*phi and i*phi+1, the latter
+    normalised by the log forward-growth r*n).
     """
-    with torch.no_grad():
-        h1t = torch.as_tensor(h1).detach()
-        hs = torch.stack([h1t.min(), h1t.max()]).to(p.omega.dtype).reshape(-1, 1)
-        rn = torch.as_tensor(p.r).detach() * int(n_steps)
-        phi = float(start)
-        while phi < cap:
-            z = torch.tensor([phi], dtype=p.omega.dtype, device=p.omega.device) * 1j
-            m0 = hn_logmgf(z, p, n_steps, hs).real
-            m1 = hn_logmgf(z + 1.0, p, n_steps, hs).real - rn
-            if float(torch.maximum(m0, m1).max()) - math.log(phi) < log_tol:
-                return phi
-            phi *= 2.0
-        return phi
-
-
-def _grid(p, n_steps, h1, phi_max, panels, order, dtype, device):
-    if phi_max is None:
-        phi_max = auto_phi_max(p, n_steps, h1)
-    if panels is None:
-        panels = 256
-    nodes, wts = gauss_legendre(0.0, phi_max, panels, order, dtype, device)
-    return nodes, wts, phi_max
+    h1t = torch.as_tensor(h1).detach()
+    hs = torch.stack([h1t.min(), h1t.max()]).to(p.omega.dtype).reshape(-1, 1)
+    carry = torch.as_tensor(p.r).detach() * int(n_steps)
+    return utils.cf_adaptive_phi_max(
+        lambda z: hn_logmgf(z, p, n_steps, hs), carry,
+        p.omega.dtype, p.omega.device, log_tol, start, cap)
 
 
 # ======================================================================================
@@ -310,29 +276,29 @@ def _grid(p, n_steps, h1, phi_max, panels, order, dtype, device):
 # ======================================================================================
 
 def _p1_p2(logm, p, n_steps, h1, phi_max, panels, order, unwrap, want=3):
-    """P1, P2 for log-moneyness ``logm`` = ln(K/S).  ``logm``/``h1`` broadcast together;
-    a trailing quadrature axis is appended internally.
+    """P1, P2 for log-moneyness ``logm`` = ln(K/S).  ``logm``/``h1`` broadcast together.
 
-    ``want`` is a bit mask: 1 = P1, 2 = P2, 3 = both.  The (batch x node) complex exp is
-    the whole cost, so a CDF (P2 only) is exactly half the price of a price.
+    Thin HN glue over the model-agnostic Fourier-inversion primitive
+    ``utils.cf_european_probabilities``: it hands over the HN affine log-CF ``A + B*h1``
+    (from :func:`hn_ab`) as the ``logcf`` closure and the log forward-growth ``r*n`` as the
+    P1-contour normalisation.  ``want`` is a bit mask: 1 = P1, 2 = P2, 3 = both.
     """
     logm = torch.as_tensor(logm, dtype=p.omega.dtype, device=p.omega.device)
     h1 = torch.as_tensor(h1, dtype=p.omega.dtype, device=p.omega.device)
     logm, h1 = torch.broadcast_tensors(logm, h1)
-    nodes, wts, _ = _grid(p, n_steps, h1, phi_max, panels, order,
-                          p.omega.dtype, p.omega.device)
-    iphi = nodes * 1j
-    lm, hh = logm.unsqueeze(-1), h1.unsqueeze(-1)
-    shift = torch.exp(-1j * nodes * lm) / iphi                # K^{-i phi} S^{i phi}/(i phi)
-    out = []
-    for bit, off, disc in ((1, 1.0, p.r * n_steps), (2, 0.0, 0.0)):
-        if not (want & bit):
-            out.append(None)
-            continue
-        A, B = hn_ab(iphi + off, p, n_steps, unwrap=unwrap)
-        d = (shift * torch.exp(A + B * hh - disc)).real
-        out.append(0.5 + (d * wts).sum(-1) / math.pi)
-    return out[0], out[1]
+    if phi_max is None:
+        phi_max = auto_phi_max(p, n_steps, h1)
+    if panels is None:
+        panels = 256
+    hh = h1.unsqueeze(-1)
+
+    def logcf(phi):
+        A, B = hn_ab(phi, p, n_steps, unwrap=unwrap)
+        return A + B * hh
+
+    return utils.cf_european_probabilities(
+        logcf, logm, p.r * n_steps, phi_max, panels, order,
+        p.omega.dtype, p.omega.device, want)
 
 
 def hn_call(S, K, p, n_steps, h1, phi_max=None, panels=None, order=8, unwrap=True):
@@ -426,6 +392,62 @@ def hn_moments(p, n_steps, h1):
 
 
 # ======================================================================================
+# The daily-step recursion -- ONE SOURCE OF TRUTH for the HN step
+# ======================================================================================
+#
+# The predictable-variance recursion h_{t+1} = omega + beta*h_t + alpha*(z_t - gamma*sqrt(h_t))^2
+# lives ONLY in ``hn_variance_step``.  Every consumer routes through it: the standalone daily
+# simulator (``hn_simulate`` / ``hn_simulate_sum_h``) AND the one-step-survival (OSS) Monte
+# Carlo pricers in ``riskflow/pricing.py`` (which import ``hn_daily_advance`` /
+# ``hn_unmonitored_substeps`` from here).  So a single mutation-kill matrix on the step covers
+# every pricer, and the simulator and the pricers can never drift apart.
+
+def hn_variance_step(h, sh, z, omega, alpha, beta, gamma_star):
+    """The HN predictable-variance recursion h_{t+1} = omega + beta*h + alpha*(z - gamma*sqrt(h))^2.
+
+    ``sh`` = sqrt(h) is passed in (the caller already needs it for the log-spot step), so the
+    square root is computed exactly once.  All args broadcast on the simulation axis.
+    """
+    return omega + beta * h + alpha * (z - gamma_star * sh) ** 2
+
+
+def hn_daily_advance(Sj, h, b_step, z, omega, alpha, beta, gamma_star):
+    """One daily Heston-Nandi step under the risk-neutral (LRNVR) measure. Returns (Sj, h).
+
+    Advances the log-spot by ``(b_step - 0.5*h) + sqrt(h)*z`` and recurses the predictable
+    variance (via :func:`hn_variance_step`). ``z`` is either a fresh unconditional normal (an
+    unmonitored sub-step) or the survival-truncated final draw of a monitored interval; in
+    BOTH cases the recursion is fed the REALISED z (the survival-conditioned law -
+    leverage-asymmetric under truncation, DO NOT 'fix' back to an unconditional draw, see the
+    pv_MC_Tarf note). ``b_step`` is the per-step cost-of-carry (r-q). All args broadcast on
+    the trailing simulation axis.
+    """
+    sh = torch.sqrt(h)
+    Sj = Sj * torch.exp((b_step - 0.5 * h) + sh * z)
+    h = hn_variance_step(h, sh, z, omega, alpha, beta, gamma_star)
+    return Sj, h
+
+
+def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
+    """Advance (Sj, h) through ``n_steps`` UNCONDITIONAL (unmonitored) daily HN steps. These
+    carry no barrier - the OSS truncation applies only on the monitored final step (done by
+    the caller). A monitored interval of n_sub days passes ``n_steps = n_sub - 1`` here; a
+    non-monitored interval (e.g. the run from the last barrier date to expiry) passes the full
+    ``n_steps = n_sub``. Fresh regular-stream normals per step (Sobol/antithetic variance
+    reduction is reserved for the truncated final draw); with ``antithetic`` the normal is
+    negated on the paired half (z, -z) to align with the u<->1-u halves of the final draw
+    (TARF/barrier), otherwise a plain num_sims-wide normal (autocall, whose final draw is not
+    antithetic). ``hn_params`` = (Omega, Alpha, Beta, Gamma_Star).
+    """
+    for _ in range(n_steps):
+        zc = torch.randn([shared.simulation_batch, num_sims],
+                         dtype=shared.one.dtype, device=shared.one.device)
+        z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
+        Sj, h = hn_daily_advance(Sj, h, b_step, z, *hn_params)
+    return Sj, h
+
+
+# ======================================================================================
 # Monte Carlo (the independent cross-check, and the brute-force answer for D2)
 # ======================================================================================
 
@@ -453,7 +475,7 @@ def hn_simulate(p, n_steps, h1, n_paths, seed=0, device='cpu', dtype=torch.float
             z = torch.randn((m,), generator=g, dtype=dtype, device=device)
             sh = h.sqrt()
             x = x + (r - 0.5 * h + sh * z)
-            h = om + be * h + al * (z - ga * sh) ** 2
+            h = hn_variance_step(h, sh, z, om, al, be, ga)
             if track_extrema:
                 hi = torch.maximum(hi, x)
                 lo = torch.minimum(lo, x)
@@ -481,7 +503,7 @@ def hn_simulate_sum_h(p, n_steps, h1, n_paths, seed=0, device='cpu',
         for _ in range(int(n_steps)):
             s = s + h
             z = torch.randn((m,), generator=g, dtype=dtype, device=device)
-            h = om + be * h + al * (z - ga * h.sqrt()) ** 2
+            h = hn_variance_step(h, h.sqrt(), z, om, al, be, ga)
         tot.append(s)
         done += m
     s = torch.cat(tot)

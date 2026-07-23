@@ -22,6 +22,9 @@ import torch.nn.functional as F
 
 from . import utils
 from . import hn_garch
+# The HN daily-step recursion lives in the model module (hn_garch, ONE source of truth); the
+# OSS pricers below use it under these bare names. See hn_garch.hn_variance_step.
+from .hn_garch import hn_daily_advance, hn_unmonitored_substeps
 
 # useful constants
 BARRIER_UP = -1.0
@@ -33,52 +36,13 @@ OPTION_CALL = 1.0
 
 
 # ======================================================================================
-# Heston-Nandi GARCH(1,1) daily spot recursion, shared by the one-step-survival (OSS) Monte
-# Carlo pricers (TARF, discrete barrier, autocall). Opt-in per deal via the Valuation
-# Configuration switch SpotModel='HestonNandi' (see the deal calc_dependencies branches and
-# pv_MC_Tarf for the OSS scheme + known limitations F1-F4).
-#
-# ONE SOURCE OF TRUTH for the per-step advance: the log-spot increment AND the predictable
-# variance recursion h_{t+1} = Omega + Beta*h + Alpha*(z - Gamma_Star*sqrt(h))^2 live ONLY in
-# hn_daily_advance. Both the unmonitored sub-steps and the survival-truncated final step of
-# every fixing/observation interval, in ALL THREE pricers, route through it - so a single
-# mutation-kill matrix on hn_daily_advance covers every pricer (tests/test_hn_oss_pricers.py).
+# Heston-Nandi GARCH(1,1) OSS pricers (TARF, discrete barrier, autocall). Opt-in per deal via
+# the Valuation Configuration switch SpotModel='HestonNandi' (see the deal calc_dependencies
+# branches and pv_MC_Tarf for the OSS scheme + known limitations F1-F4). The per-step advance
+# (hn_daily_advance / hn_unmonitored_substeps) is owned by the model module hn_garch and
+# imported above; both the unmonitored sub-steps and the survival-truncated final step of every
+# fixing/observation interval, in ALL THREE pricers, route through it.
 # ======================================================================================
-
-def hn_daily_advance(Sj, h, b_step, z, omega, alpha, beta, gamma_star):
-    """One daily Heston-Nandi step under the risk-neutral (LRNVR) measure. Returns (Sj, h).
-
-    Advances the log-spot by ``(b_step - 0.5*h) + sqrt(h)*z`` and recurses the predictable
-    variance. ``z`` is either a fresh unconditional normal (an unmonitored sub-step) or the
-    survival-truncated final draw of a monitored interval; in BOTH cases the recursion is fed
-    the REALISED z (the survival-conditioned law - leverage-asymmetric under truncation, DO
-    NOT 'fix' back to an unconditional draw, see the pv_MC_Tarf note). ``b_step`` is the
-    per-step cost-of-carry (r-q). All args broadcast on the trailing simulation axis.
-    """
-    sh = torch.sqrt(h)
-    Sj = Sj * torch.exp((b_step - 0.5 * h) + sh * z)
-    h = omega + beta * h + alpha * (z - gamma_star * sh) ** 2
-    return Sj, h
-
-
-def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
-    """Advance (Sj, h) through ``n_steps`` UNCONDITIONAL (unmonitored) daily HN steps. These
-    carry no barrier - the OSS truncation applies only on the monitored final step (done by
-    the caller). A monitored interval of n_sub days passes ``n_steps = n_sub - 1`` here; a
-    non-monitored interval (e.g. the run from the last barrier date to expiry) passes the full
-    ``n_steps = n_sub``. Fresh regular-stream normals per step (Sobol/antithetic variance
-    reduction is reserved for the truncated final draw); with ``antithetic`` the normal is
-    negated on the paired half (z, -z) to align with the u<->1-u halves of the final draw
-    (TARF/barrier), otherwise a plain num_sims-wide normal (autocall, whose final draw is not
-    antithetic). ``hn_params`` = (Omega, Alpha, Beta, Gamma_Star).
-    """
-    for _ in range(n_steps):
-        zc = torch.randn([shared.simulation_batch, num_sims],
-                         dtype=shared.one.dtype, device=shared.one.device)
-        z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
-        Sj, h = hn_daily_advance(Sj, h, b_step, z, *hn_params)
-    return Sj, h
-
 
 def cash_settle(shared, currency, time_index, value):
     # need to check if the time_index
