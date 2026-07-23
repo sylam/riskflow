@@ -88,11 +88,10 @@ CARRY_COL = 'ForwardRate.PLATINUM_CARRY'          # + ',<tenor>'
 SOFR_PREFIX = 'InterestRate.USD-SOFR'
 
 # validated objective (matches artifacts/platinum_hedge_shipping.json)
-OBJECTIVE = {'Object': 'AsymmetricUtility_Huber', 'Huber_Aversion': 6.0, 'Huber_Delta': 1.0,
-             'Floor_Penalty': 10.0, 'Surplus_Reward': 1.0, 'Power': 1.0,
-             'Expiry_Penalty': 1.0, 'Expiry_Threshold_Days': 4.0,
-             'Post_Deal_Trade_Penalty': 1.0, 'Position_Bounds_Penalty': 0.25,
-             'Per_Instrument_Bounds_Penalty': 0.5}
+OBJECTIVE = {'Object': 'AsymmetricUtility_Huber', 'Huber_Aversion': 6.0, 'Huber_Delta': 1.0}
+# (RL-era keys Floor_Penalty/Surplus_Reward/Power/Expiry_*/Post_Deal_Trade_Penalty/
+#  *_Bounds_Penalty removed 2026-07-24: read by nothing - _normalize_objective_config
+#  consumes only Object/Huber_*/CARA_Gamma/Utility_Scale_*.)
 
 
 def _ts(d):

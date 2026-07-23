@@ -1,0 +1,35 @@
+phase,layer,probe,month,is_loser,knob,u_pre,control_u_pre,d_u_pre,greedy_usd_oz,churn,bound_pass,train_u,train_u_moved,roll_u_pre_moved,override_engaged,dead_key,roll_scale,cost_aware,bid_offer,roll_inner
+1,TRAIN,control,202105,True,base config,0.3596,0.3596,0.0,-166.63,237.5,True,-0.5867,False,False,True,False,-0.6211956739425659,,,512
+1,TRAIN,H1c_Hub24,202105,True,Huber_Aversion 6->24,0.3808,0.3596,0.0212,-154.37,250.0,True,-2.6768,True,True,True,False,-2.7712302207946777,,,512
+1,TRAIN,H1e_Hub2,202105,True,Huber_Aversion 6->2,0.3077,0.3596,-0.0519,-186.04,256.2,True,-0.1212,True,True,True,False,-0.14383426308631897,,,512
+1,TRAIN,H1f_Hub100,202105,True,Huber_Aversion 6->100,0.3962,0.3596,0.0366,-155.48,281.2,True,-11.4599,True,True,True,False,-11.838190078735352,,,512
+1,TRAIN,H1g_Delta025,202105,True,Huber_Delta 1.0->0.25,0.3423,0.3596,-0.0173,-200.69,187.5,True,-0.2925,True,True,True,False,-0.33879631757736206,,,512
+1,TRAIN,H1h_Delta4,202105,True,Huber_Delta 1.0->4.0,0.3596,0.3596,0.0,-166.63,237.5,True,-0.5987,True,False,True,False,-0.624751627445221,,,512
+1,TRAIN,H2_inner16,202105,True,train Inner_Sub_Batch 64->16,0.3596,0.3596,0.0,-166.63,237.5,True,-0.6097,True,False,True,False,-0.6214014291763306,,,512
+1,TRAIN,H2_inner256,202105,True,train Inner_Sub_Batch 64->256,0.3596,0.3596,0.0,-166.63,237.5,True,-0.6373,True,False,True,False,-0.6211123466491699,,,512
+1,TRAIN,H3_grid21,202105,True,Action_Grid_Levels 9->21,0.3608,0.3596,0.0012,-167.27,227.5,True,-0.5872,True,True,True,False,-0.6211854219436646,,,512
+1,TRAIN,H1a_SR0.1,202105,True,Surplus_Reward 1->0.1 (DEAD KEY),0.3596,0.3596,0.0,-166.63,237.5,True,-0.5867,False,False,True,True,-0.6211956739425659,,,512
+1,TRAIN,control,202011,False,base config,0.6212,0.6212,0.0,103.5,325.0,True,-0.6321,False,False,True,False,-0.6519235968589783,,,512
+1,TRAIN,H1c_Hub24,202011,False,Huber_Aversion 6->24,0.6769,0.6212,0.0557,115.28,381.2,True,-2.761,True,True,True,False,-2.8426742553710938,,,512
+1,TRAIN,H1e_Hub2,202011,False,Huber_Aversion 6->2,0.6808,0.6212,0.0596,111.52,331.2,True,-0.1566,True,True,True,False,-0.16522985696792603,,,512
+1,TRAIN,H1f_Hub100,202011,False,Huber_Aversion 6->100,0.6519,0.6212,0.0307,125.21,418.8,True,-11.7858,True,True,True,False,-12.103683471679688,,,512
+1,TRAIN,H1g_Delta025,202011,False,Huber_Delta 1.0->0.25,0.6212,0.6212,0.0,109.17,312.5,True,-0.3346,True,False,True,False,-0.3640322685241699,,,512
+1,TRAIN,H1h_Delta4,202011,False,Huber_Delta 1.0->4.0,0.6212,0.6212,0.0,103.5,325.0,True,-0.6381,True,False,True,False,-0.6584985256195068,,,512
+1,TRAIN,H2_inner16,202011,False,train Inner_Sub_Batch 64->16,0.6212,0.6212,0.0,103.5,325.0,True,-0.6408,True,False,True,False,-0.6521497368812561,,,512
+1,TRAIN,H2_inner256,202011,False,train Inner_Sub_Batch 64->256,0.6212,0.6212,0.0,103.5,325.0,True,-0.6395,True,False,True,False,-0.6513152122497559,,,512
+1,TRAIN,H3_grid21,202011,False,Action_Grid_Levels 9->21,0.6092,0.6212,-0.012,134.02,292.5,True,-0.6315,True,True,True,False,-0.6519151329994202,,,512
+1,TRAIN,H1a_SR0.1,202011,False,Surplus_Reward 1->0.1 (DEAD KEY),0.6212,0.6212,0.0,103.5,325.0,True,-0.6321,False,False,True,True,-0.6519235968589783,,,512
+2,ROLL,R0_ctrl_repro,202105,True,roll base (parity sanity),0.3596,0.3596,0.0,-166.63,237.5,True,,,False,True,False,922786.26,Yes,10.0,512
+2,ROLL,R1_scale10,202105,True,roll utility_scale /10,0.3596,0.3596,0.0,-166.63,237.5,True,,,False,True,False,92278.62599747514,Yes,10.0,512
+2,ROLL,R1_scale100,202105,True,roll utility_scale /100,0.3596,0.3596,0.0,-166.63,237.5,True,,,False,True,False,9227.862599747514,Yes,10.0,512
+2,ROLL,R2a_costoff,202105,True,DiffV2_Cost_Aware_Argmax No,0.4327,0.3596,0.0731,-154.95,1481.2,True,,,True,True,False,922786.26,No,10.0,512
+2,ROLL,R2b_kappa0,202105,True,Bid_Offer_Spread_Bps 10->0,0.4288,0.3596,0.0692,-139.82,1518.8,True,,,True,True,False,922786.26,Yes,0.0,512
+2,ROLL,R3_inner16,202105,True,roll Inner_Sub_Batch 512->16,0.4615,0.3596,0.1019,-147.63,1181.2,True,,,True,True,False,922786.26,Yes,10.0,16
+2,ROLL,R4_combo,202105,True,scale/100 + cost No + bid 0,0.4288,0.3596,0.0692,-139.82,1518.8,True,,,True,True,False,9227.862599747514,No,0.0,512
+2,ROLL,R0_ctrl_repro,202011,False,roll base (parity sanity),0.6212,0.6212,0.0,103.5,325.0,True,,,False,True,False,922786.26,Yes,10.0,512
+2,ROLL,R1_scale10,202011,False,roll utility_scale /10,0.6212,0.6212,0.0,103.5,325.0,True,,,False,True,False,66418.9636653851,Yes,10.0,512
+2,ROLL,R1_scale100,202011,False,roll utility_scale /100,0.6212,0.6212,0.0,103.5,325.0,True,,,False,True,False,6641.89636653851,Yes,10.0,512
+2,ROLL,R2a_costoff,202011,False,DiffV2_Cost_Aware_Argmax No,0.4192,0.6212,-0.202,245.08,2237.5,True,,,True,True,False,922786.26,No,10.0,512
+2,ROLL,R2b_kappa0,202011,False,Bid_Offer_Spread_Bps 10->0,0.4019,0.6212,-0.2193,281.68,2225.0,True,,,True,True,False,922786.26,Yes,0.0,512
+2,ROLL,R3_inner16,202011,False,roll Inner_Sub_Batch 512->16,0.3635,0.6212,-0.2577,359.45,1162.5,True,,,True,True,False,922786.26,Yes,10.0,16
+2,ROLL,R4_combo,202011,False,scale/100 + cost No + bid 0,0.4019,0.6212,-0.2193,281.68,2225.0,True,,,True,True,False,6641.89636653851,No,0.0,512
