@@ -682,6 +682,28 @@ class Config(object):
                 sorted([instrument.field['Currency'], instrument.field['Payoff_Currency']])))
              ] if instrument.field['Currency'] != instrument.field.get(
                 'Payoff_Currency', instrument.field['Currency']) else [],
+            # the model link lives at the factor/config layer: when a deal turns on a non-GBM spot
+            # model via the Valuation Configuration switch SpotModel (per deal type), its EquityPrice
+            # pulls in the correspondingly-named params factor <SpotModel>ModelParameters.<equity> as a
+            # dependent STATIC factor - a naming convention generic over the model family (HestonNandi
+            # today, Heston/SLV/... later with zero change here). Switch off/absent -> [] (GBM). If the
+            # switch is on but the factor is missing from the market data it simply is not constructed,
+            # and the capable deal's calc_dependencies then fails loud (never silent GBM).
+            'EquityPrice': lambda instrument, factor_fields, params:
+            [utils.Factor(instrument.options['SpotModel'] + 'ModelParameters',
+                          utils.check_rate_name(instrument.field['Equity']))]
+            if instrument.options.get('SpotModel', 'None') != 'None'
+            and instrument.field.get('Equity') is not None else [],
+            # FX-underlying analogue of the EquityPrice link above: an FX deal (the TARF) that turns on
+            # a non-GBM SpotModel pulls in <SpotModel>ModelParameters.<Underlying_Currency>. FxRate is a
+            # broad type (also the base/report currency, which get_rates visits with a bare {} sentinel),
+            # so guard via getattr on a REAL deal carrying the switch AND an Underlying_Currency field;
+            # everything else -> [] (GBM/no-op).
+            'FxRate': lambda instrument, factor_fields, params:
+            [utils.Factor(instrument.options['SpotModel'] + 'ModelParameters',
+                          utils.check_rate_name(instrument.field['Underlying_Currency']))]
+            if getattr(instrument, 'options', {}).get('SpotModel', 'None') != 'None'
+            and getattr(instrument, 'field', {}).get('Underlying_Currency') is not None else [],
         }
 
         # the list of returned factors

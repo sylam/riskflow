@@ -392,6 +392,31 @@ def get_equity_price_vol_factor(fieldname, static_offsets, stochastic_offsets, a
         raise Exception('Cannot find {}'.format(utils.check_tuple_name(factor_name)))
 
 
+def get_spot_model_params_factor(spot_model, name, all_factors, static_offsets, stochastic_offsets, accepted):
+    """Resolve a non-GBM spot model's parameter factor by NAMING CONVENTION off the underlying the
+    deal already references: <spot_model>ModelParameters.<name>. Model-agnostic - HestonNandi today,
+    Heston/SLV/... add zero code here (only a <Model>ModelParameters factor + a pricer branch).
+    Returns the SVI-shaped index [(stoch, [per-parameter sub-factors], spot_model)] - subtype tagged
+    with spot_model for the pricer's branch - or None for spot_model=='None' (GBM, byte-identical).
+    Unknown model -> ValueError naming the accepted set; switch on but the factor absent from the
+    market data -> KeyError. Both propagate to the engine's dependency loop (deal skipped, ERROR
+    logged), never a silent GBM fallback."""
+    if spot_model not in accepted:
+        raise ValueError('SpotModel=%r not recognised; expected one of %s' % (spot_model, accepted))
+    if spot_model == 'None':
+        return None
+    mp = utils.Factor(spot_model + 'ModelParameters', name)
+    if static_offsets.get(mp) is not None:
+        stoch = False
+    elif stochastic_offsets.get(mp) is not None:
+        stoch = True
+    else:
+        raise KeyError('SpotModel=%s but %s not in the market data'
+                       % (spot_model, utils.check_tuple_name(mp)))
+    return [tuple([stoch, [utils.Factor(mp.type, mp.name + (param,))
+                           for param in get_factor_component(mp, all_factors).current_value()], spot_model])]
+
+
 def get_interest_vol_factor(fieldname, tenor, static_offsets, stochastic_offsets, all_tenors):
     """Read the index of the interest vol price factor"""
     pricefactor = 'InterestRateVol' if pd.Timestamp('1900-01-01') + tenor <= pd.Timestamp('1900-01-01') + pd.DateOffset(
@@ -2861,6 +2886,16 @@ class EquityBarrierBinaryOption(Deal):
 
         self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
 
+        # Non-GBM spot model, resolved by NAMING CONVENTION off the equity underlying (no deal field):
+        # <SpotModel>ModelParameters.<equity>, pulled into the universe by the EquityPrice conditional
+        # in config.py. Switch off/absent -> None (GBM, byte-identical). See get_spot_model_params_factor.
+        hn = get_spot_model_params_factor(
+            self.options.get('SpotModel', 'None'), field['Equity'],
+            all_factors, static_offsets, stochastic_offsets, ('None', 'HestonNandi'))
+        if hn is not None:
+            field_index['HN_Params'] = hn
+            field_index['HN_Steps_Per_Year'] = 252.0
+
         return field_index
 
     def generate(self, shared, time_grid, deal_data):
@@ -3174,6 +3209,21 @@ class QEDI_CustomAutoCallSwap(Deal):
         })
 
         self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+
+        # Non-GBM spot model, resolved by NAMING CONVENTION off the equity underlying (no deal field):
+        # <SpotModel>ModelParameters.<equity>, pulled into the universe by the EquityPrice conditional
+        # in config.py. Switch off/absent -> None (GBM, byte-identical). Only the fast no_averaging OSS
+        # path carries the non-GBM branch. See get_spot_model_params_factor.
+        spot_model = self.options.get('SpotModel', 'None')
+        if spot_model != 'None' and not field_index['no_averaging']:
+            raise ValueError('SpotModel=%s requires the non-averaging autocall (one fixing per '
+                             'coupon); the averaging (full-path) sim has no non-GBM path' % spot_model)
+        hn = get_spot_model_params_factor(
+            spot_model, field['Equity'], all_factors, static_offsets, stochastic_offsets,
+            ('None', 'HestonNandi'))
+        if hn is not None:
+            field_index['HN_Params'] = hn
+            field_index['HN_Steps_Per_Year'] = 252.0
 
         return field_index
 
@@ -3508,6 +3558,21 @@ class EquityBarrierOption(Deal):
                 (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0)
 
         self.check_option_data(field, field_index, static_offsets, stochastic_offsets, all_tenors, all_factors)
+
+        # Non-GBM spot model, resolved by NAMING CONVENTION off the equity underlying (no deal field):
+        # <SpotModel>ModelParameters.<equity>, pulled into the universe by the EquityPrice conditional
+        # in config.py. Switch off/absent -> None (GBM, byte-identical). Only the DISCRETE (Barrier_Dates)
+        # OSS pricer carries the non-GBM branch. See get_spot_model_params_factor.
+        spot_model = self.options.get('SpotModel', 'None')
+        if spot_model != 'None' and 'Barrier_Dates' not in field_index:
+            raise ValueError('SpotModel=%s requires the discrete (Barrier_Dates) barrier; the '
+                             'continuous Barrier_Monitoring variant has no non-GBM path' % spot_model)
+        hn = get_spot_model_params_factor(
+            spot_model, field['Equity'], all_factors, static_offsets, stochastic_offsets,
+            ('None', 'HestonNandi'))
+        if hn is not None:
+            field_index['HN_Params'] = hn
+            field_index['HN_Steps_Per_Year'] = 252.0
 
         return field_index
 
@@ -4308,12 +4373,7 @@ class FXTARFOptionDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
                      'Underlying_Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],
-                     'FX_Volatility': ['FXVol'],
-                     # opt-in Heston-Nandi spot model (SpotModel='HestonNandi'); resolves ONLY when the
-                     # deal names an HN_Params factor, so get_fieldname yields nothing otherwise. The
-                     # factor lands in static_factors -> t_Static_Buffer (never implied_factors, which
-                     # would duplicate the AAD leaf - test_hn_bootstrapper.test_not_registered...).
-                     'HN_Params': ['HestonNandiModelParameters']}
+                     'FX_Volatility': ['FXVol']}
 
     documentation = (
         'Fx And Equity', [
@@ -4388,21 +4448,15 @@ class FXTARFOptionDeal(Deal):
 
         # opt-in Heston-Nandi spot model, mirroring FloatingEnergyDeal's ForwardCurve switch: swap the
         # (moneyness, vol-surface) lookup for the daily GARCH recursion in the pricer. The GBM
-        # field_index['Volatility'] path above is untouched when the switch is off/absent. Resolved
-        # inline via the generic machinery (get_factor_component + the factor's own current_value()
-        # keys), so it works unchanged for any parametric 0D model factor - no per-model getter. The
-        # per-parameter scalars land in t_Static_Buffer (calculation.py's dict-current_value expansion),
-        # read back on the AAD graph exactly like the SVI wing params (utils.py:2052).
-        spot_model = self.options.get('SpotModel', 'None')
-        if spot_model not in ('None', 'HestonNandi'):
-            raise ValueError("SpotModel=%r not recognised; expected one of ('None', 'HestonNandi')"
-                             % (spot_model,))
-        if spot_model == 'HestonNandi':
-            hn = utils.Factor('HestonNandiModelParameters', utils.check_rate_name(self.field['HN_Params']))
-            hn_factor = get_factor_component(hn, all_factors)
-            field_index['HN_Params'] = [tuple([False, [
-                utils.Factor(hn.type, hn.name + (param,)) for param in hn_factor.current_value()],
-                hn_factor.get_subtype()])]
+        # field_index['Volatility'] path above is untouched when the switch is off/absent. NO deal field -
+        # the params factor is resolved by NAMING CONVENTION off the FX underlying the deal references
+        # (<SpotModel>ModelParameters.<Underlying_Currency>), pulled into the universe by the FxRate
+        # conditional in config.py, exactly like the equity OSS deals. See get_spot_model_params_factor.
+        hn = get_spot_model_params_factor(
+            self.options.get('SpotModel', 'None'), field['Underlying_Currency'],
+            all_factors, static_offsets, stochastic_offsets, ('None', 'HestonNandi'))
+        if hn is not None:
+            field_index['HN_Params'] = hn
             # HN is calibrated on a per-DAY clock; a weekly/monthly fixing spans this many daily sub-steps
             field_index['HN_Steps_Per_Year'] = self.options.get('Steps_Per_Year', 252.0)
 

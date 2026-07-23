@@ -79,9 +79,12 @@ def _price_factors(sigma, hn_params, r_dom=0.0, r_for=0.0):
     return pf
 
 
-def _tarf(target, fix_days, hn):
+def _tarf(target, fix_days):
+    # No deal field: HN is activated purely by the SpotModel switch (in _cfg's Valuation
+    # Configuration) + the HestonNandiModelParameters.AUD factor (in _price_factors), resolved by
+    # naming convention off Underlying_Currency='AUD'. Matches the equity OSS deals (test_hn_oss_pricers).
     fix_dates = [BASE + pd.Timedelta(days=d) for d in fix_days]
-    field = {
+    return {
         'Object': 'FXTARFOptionDeal', 'Reference': 'TARF1',
         'Currency': 'USD', 'Underlying_Currency': 'AUD', 'Discount_Rate': 'USD',
         'FX_Volatility': 'AUD.USD', 'Buy_Sell': 'Buy', 'Expiry_Date': fix_dates[-1],
@@ -90,9 +93,6 @@ def _tarf(target, fix_days, hn):
         'InvertedTarget': False, 'LeverageNotional': 0.0, 'TargetAdjustment': '',
         'TargetLevel': target, 'TARF_ExpiryDates': [[d, d, None] for d in fix_dates],
     }
-    if hn:
-        field['HN_Params'] = 'AUD'
-    return field
 
 
 def _cfg(hn, target, fix_days, sigma=SIGMA, hn_params=None, steps_per_year=None, r_dom=0.0, r_for=0.0,
@@ -108,7 +108,7 @@ def _cfg(hn, target, fix_days, sigma=SIGMA, hn_params=None, steps_per_year=None,
         if steps_per_year is not None:
             val['FXTARFOptionDeal']['Steps_Per_Year'] = steps_per_year
     cfg.params['Valuation Configuration'] = val
-    inst = construct_instrument(_tarf(target, fix_days, hn), val)
+    inst = construct_instrument(_tarf(target, fix_days), val)
     cfg.deals = {'Attributes': {'Reference': 'test', 'Tag_Titles': ''},
                  'Deals': {'Children': [{'Instrument': inst}]},
                  'Calculation': {'Base_Date': BASE, 'Currency': 'USD'}}
