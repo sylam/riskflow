@@ -18,7 +18,7 @@ the unmonitored sub-steps AND the survival-truncated final step of each interval
 single ``pricing.hn_daily_advance`` (the ONLY copy of the h-recursion
 ``h = Omega + Beta*h + Alpha*(z - Gamma_Star*sqrt(h))**2``). Four one-line mutants of it were
 applied to the shared helper (source edit, run, revert BY HAND) and each is killed by BOTH
-recursion closed-form gates below (measured reldiff vs the hn_garch closed form; correct code
+recursion closed-form gates below (measured reldiff vs the HN closed form; correct code
 passes at <=2.2e-3, gate tol 5e-3):
 
     mutant                         barrier_ko_never   autocall_single_coupon
@@ -30,7 +30,7 @@ passes at <=2.2e-3, gate tol 5e-3):
 
 The autocall single-coupon gate prices a 5%-OTM tail probability Q(S_T>K), which is acutely
 skew-sensitive, so it kills the leverage-sign flip at 2.2e-1 (no brute-force reference needed -
-the aggregate-variance-normal rejection is the TARF's; here the closed form IS hn_garch).
+the aggregate-variance-normal rejection is the TARF's; here the closed form IS the HN price).
 """
 import io
 import logging
@@ -45,7 +45,8 @@ import pytest
 import torch
 
 import riskflow
-from riskflow import hn_garch, run_baseval, utils
+from riskflow import run_baseval, utils
+import hn_reference as hnref
 from riskflow.config import Config
 from riskflow.instruments import construct_instrument
 
@@ -57,7 +58,7 @@ N = 10.0
 
 # strong-leverage GARCH with a term structure (H0 != stationary) - the recursion is genuinely
 # exercised AND the leverage cross-term is engaged (kills the leverage-sign mutant via the skew).
-_STRONG = hn_garch.hn_params_from_targets(
+_STRONG = hnref.hn_params_from_targets(
     ann_vol=0.30, persistence=0.94, gamma=350.0, leverage_share=0.7, steps_per_year=252.0)
 _STRONG_H0 = 1.6 * float(_STRONG.stationary_var)
 STRONG = {'Omega': float(_STRONG.omega), 'Alpha': float(_STRONG.alpha), 'Beta': float(_STRONG.beta),
@@ -286,8 +287,8 @@ def test_autocall_bit_identity_degenerate_hn_reproduces_gbm(thr, seed):
 # ======================================================================================
 
 def _hn_call_ref(n_total, h0):
-    return float(hn_garch.hn_call(
-        SPOT, STRIKE, hn_garch.HNParams(
+    return float(utils.hn_call(
+        SPOT, STRIKE, utils.HNParams(
             _STRONG.omega, _STRONG.alpha, _STRONG.beta, _STRONG.gamma, 0.0).as_tensors(),
         n_total, h0)) * N
 
@@ -295,7 +296,7 @@ def _hn_call_ref(n_total, h0):
 def test_barrier_ko_never_knock_matches_hn_call():
     """KILL MATRIX GATE 1 (spot recursion). A knock-OUT call whose barrier is far out of the way
     (never knocks) pays the survivors the vanilla payoff, so its price is the HN vanilla call under
-    the pricer's 30-step daily recursion == hn_garch.hn_call (zero carry). A wrong final-step
+    the pricer's 30-step daily recursion == utils.hn_call (zero carry). A wrong final-step
     h-update desynchronises the whole 30-step variance path and breaks the match (tol 5e-3; correct
     ~2.1e-3, every mutant >= 2.0e-2)."""
     price = _mtm(_barrier_cfg('Down_And_Out', 1.0, BDAYS30, 30, hn_params=STRONG), seed=3, sims=1 << 17)
@@ -305,7 +306,7 @@ def test_barrier_ko_never_knock_matches_hn_call():
 def test_barrier_ki_always_knock_matches_hn_call_closed_form():
     """KI leg via in-out parity. An up-and-IN call whose barrier sits well below spot knocks in on
     the first observation (survival ~ 0), so the price collapses to the analytic parity vanilla -
-    which under HN is the hn_garch CLOSED FORM (NOT a normal at aggregate variance). This pins that
+    which under HN is the HN CLOSED FORM (NOT a normal at aggregate variance). This pins that
     closed-form leg deterministically (matches to ~1e-12, not just MC error)."""
     price = _mtm(_barrier_cfg('Up_And_In', 50.0, BDAYS30, 30, hn_params=STRONG), seed=3, sims=1 << 15)
     assert price == pytest.approx(_hn_call_ref(30, _STRONG_H0), rel=1e-6)
@@ -319,9 +320,9 @@ def test_autocall_single_coupon_matches_hn_cdf():
     every h-recursion mutant - incl. the leverage-sign flip at 2.2e-1 (tol 5e-3, correct ~1.3e-3)."""
     horizon, coup, thr = 30, 0.05, 1.05
     n_total = max(round(horizon / 365 * 252), 1)
-    q_below = float(hn_garch.hn_cdf_logret(
+    q_below = float(utils.hn_cdf_logret(
         torch.log(torch.tensor(thr * STRIKE / SPOT)),
-        hn_garch.HNParams(_STRONG.omega, _STRONG.alpha, _STRONG.beta, _STRONG.gamma, 0.0).as_tensors(),
+        utils.HNParams(_STRONG.omega, _STRONG.alpha, _STRONG.beta, _STRONG.gamma, 0.0).as_tensors(),
         n_total, _STRONG_H0))
     ref = N * coup * (1.0 - q_below)
     price = _mtm(_autocall_cfg([horizon], [thr], [coup], horizon, hn_params=STRONG), seed=3, sims=1 << 17)

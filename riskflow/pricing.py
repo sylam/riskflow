@@ -21,10 +21,9 @@ import torch
 import torch.nn.functional as F
 
 from . import utils
-from . import hn_garch
-# The HN daily-step recursion lives in the model module (hn_garch, ONE source of truth); the
-# OSS pricers below use it under these bare names. See hn_garch.hn_variance_step.
-from .hn_garch import hn_daily_advance, hn_unmonitored_substeps
+# The HN daily-step recursion lives in utils (ONE source of truth); the OSS pricers below use it
+# under these bare names. See utils.hn_variance_step.
+from .utils import hn_daily_advance, hn_unmonitored_substeps
 
 # useful constants
 BARRIER_UP = -1.0
@@ -39,8 +38,8 @@ OPTION_CALL = 1.0
 # Heston-Nandi GARCH(1,1) OSS pricers (TARF, discrete barrier, autocall). Opt-in per deal via
 # the Valuation Configuration switch SpotModel='HestonNandi' (see the deal calc_dependencies
 # branches and pv_MC_Tarf for the OSS scheme + known limitations F1-F4). The per-step advance
-# (hn_daily_advance / hn_unmonitored_substeps) is owned by the model module hn_garch and
-# imported above; both the unmonitored sub-steps and the survival-truncated final step of every
+# (hn_daily_advance / hn_unmonitored_substeps) is owned by utils and imported above; both the
+# unmonitored sub-steps and the survival-truncated final step of every
 # fixing/observation interval, in ALL THREE pricers, route through it.
 # ======================================================================================
 
@@ -554,7 +553,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                         vanilla_pv = utils.black_european_option(
                             fwd_to_T, strike, vol_to_T, 1.0, 1.0, phi, shared) * D[-1]
                 else:
-                    # HN smile bites HERE: the in-out-parity vanilla is the hn_garch CLOSED FORM,
+                    # HN smile bites HERE: the in-out-parity vanilla is the HN CLOSED FORM,
                     # NOT a normal at aggregate variance (the rejected bridge). n_total daily steps
                     # to expiry, h1=H0; the per-step carry r_step reproduces the forward S*exp(b*T)
                     # (undiscounted forward-measure value = hn_call * exp(b*T)), then discounted at
@@ -572,14 +571,14 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                             'carry or price this deal under GBM'.format(
                                 float(carry_total.max() - carry_total.min())))
                     r_step = carry_total[0] / n_total  # scalar b*T/n
-                    p_hn = hn_garch.HNParams(*(v.reshape(-1)[0] for v in hn_params), r_step)
+                    p_hn = utils.HNParams(*(v.reshape(-1)[0] for v in hn_params), r_step)
                     H0_s = H0.reshape(-1)[0]
                     if isdigital:
-                        q_below = hn_garch.hn_cdf_logret(torch.log(strike / s), p_hn, n_total, H0_s)
+                        q_below = utils.hn_cdf_logret(torch.log(strike / s), p_hn, n_total, H0_s)
                         vanilla_pv = ((1.0 - q_below) if phi == OPTION_CALL else q_below) * D[-1]
                     else:
                         fwd_growth = torch.exp(r_step * n_total)
-                        vanilla = (hn_garch.hn_call if phi == OPTION_CALL else hn_garch.hn_put)(
+                        vanilla = (utils.hn_call if phi == OPTION_CALL else utils.hn_put)(
                             s, strike, p_hn, n_total, H0_s)
                         vanilla_pv = vanilla * fwd_growth * D[-1]
                 vanilla_pv = vanilla_pv.reshape(-1, 1)  # [batch, 1]
@@ -688,7 +687,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
 
     # opt-in Heston-Nandi spot model (SpotModel='HestonNandi'): the five GARCH scalars ride the
     # AAD graph out of t_Static_Buffer (identical resolution to the TARF). When absent, sim_spot_oss
-    # takes the byte-identical GBM path. The KI in-out-parity vanilla switches to the hn_garch
+    # takes the byte-identical GBM path. The KI in-out-parity vanilla switches to the HN
     # closed form. Known limitation: the outer-CVA already-hit vanilla (hit_value below) stays GBM -
     # HN is wired into the inner OSS pricing (base/CVA-inner), not the outer path-state override.
     hn = 'HN_Params' in factor_dep

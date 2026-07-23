@@ -9,13 +9,13 @@ Covered:
       the dummy Price Models entry.
   (b) PRICE-space martingale: E[S_t e^{-∫(r-q)}] flat (carry=0 ⇒ E[S_t]=S_0), AND the by-log-h-state
       version (the LOG-space test is structurally blind to a Jensen price drift — the platinum lesson).
-  (c) hn_garch ORACLE: the simulated terminal distribution matches the closed-form hn_moments /
-      hn_call prices / hn_cdf_logret probabilities within MC error (the closed form validates the
-      whole process end-to-end).
+  (c) HN CLOSED-FORM ORACLE: the simulated terminal distribution matches the closed-form
+      hnref.hn_moments / utils.hn_call prices / utils.hn_cdf_logret probabilities within MC error
+      (the closed form validates the whole process end-to-end).
   (d) reveal / fork: privileged_layout width, reveal_state_at packing (log_h first / price last),
       inner_fork_seed fidelity (inner h[0] == exp(outer log h_t) EXACTLY), reseed_from_path
       forward/replay consistency, revealed_annual_vol.
-  THE CLOCK: business-daily (f=1, EXACT hn_garch), calendar-daily (f≈0.69) and 2-bd (n_sub=2 bridge)
+  THE CLOCK: business-daily (f=1, EXACT HN), calendar-daily (f≈0.69) and 2-bd (n_sub=2 bridge)
       grids; grid-invariant annualized vol (the platinum GARCH trap NOT re-created).
   DRIFT / MEASURE: the risk-neutral (r-q) drift is read from the underlying's OWN interest-rate and
       dividend curves (E[S_T/S_0] = exp(∫(r-q)) end-to-end).
@@ -38,7 +38,8 @@ import torch
 from scipy.stats import skew, kurtosis
 
 import riskflow
-from riskflow import hn_garch, utils
+from riskflow import utils
+import hn_reference as hnref
 from riskflow.calculation import CMC_State, CMC_State_Inner, construct_calculation, construct_process
 from riskflow.config import Config
 from riskflow.instruments import construct_instrument
@@ -51,7 +52,7 @@ DT_C = 1.0 / 252.0
 
 # Strong-leverage HN with a term structure (H0 != stationary): the recursion is genuinely exercised
 # AND the leverage cross-term engaged (skew ≈ -0.9), so the oracle match is a real test.
-_SP = hn_garch.hn_params_from_targets(
+_SP = hnref.hn_params_from_targets(
     ann_vol=0.30, persistence=0.94, gamma=350.0, leverage_share=0.7, steps_per_year=252.0)
 H0_STAT = float(_SP.stationary_var)
 H0_TS = 1.6 * H0_STAT
@@ -60,8 +61,8 @@ IMPLIED_PARAM = {'Omega': float(_SP.omega), 'Alpha': float(_SP.alpha), 'Beta': f
 
 
 def _hn_params(h0=None):
-    """hn_garch.HNParams (tensors, r=0) mirroring IMPLIED_PARAM for the closed-form oracle."""
-    return hn_garch.HNParams(_SP.omega, _SP.alpha, _SP.beta, _SP.gamma, 0.0).as_tensors()
+    """utils.HNParams (tensors, r=0) mirroring IMPLIED_PARAM for the closed-form oracle."""
+    return utils.HNParams(_SP.omega, _SP.alpha, _SP.beta, _SP.gamma, 0.0).as_tensors()
 
 
 def test_uses_repo_under_test():
@@ -74,7 +75,7 @@ def test_uses_repo_under_test():
 # ---------------------------------------------------------------------------
 
 def _time_grid(T, year_per_day=DT_C, day_step=1.0):
-    """`year_per_day=DT_C` ⇒ business-daily grid (dt=dt_c, f=1, EXACT hn_garch). `1/365.25` ⇒ the
+    """`year_per_day=DT_C` ⇒ business-daily grid (dt=dt_c, f=1, EXACT HN). `1/365.25` ⇒ the
     calendar-daily production convention (f≈0.69). `day_step` scales spacing (the 2-bd grid)."""
     days = np.cumsum(np.full(T, day_step, dtype=np.float64))
     tg = types.SimpleNamespace()
@@ -206,16 +207,16 @@ def test_clock_grid_invariant_annualized_vol():
 
 
 # ---------------------------------------------------------------------------
-# (c) hn_garch ORACLE
+# (c) HN CLOSED-FORM ORACLE
 # ---------------------------------------------------------------------------
 
 def test_oracle_terminal_moments():
-    # Business-daily grid (f=1) ⇒ the process IS the exact hn_garch daily recursion (r=0). The
-    # simulated T-1-step terminal log-return matches the closed-form hn_moments within MC error.
+    # Business-daily grid (f=1) ⇒ the process IS the exact HN daily recursion (r=0). The
+    # simulated T-1-step terminal log-return matches the closed-form hnref.hn_moments within MC error.
     T, B = 40, 60000
     p, sh = _make(T, B, seed=7)                                    # carry=0 (r_t==q_t)
     R = (p.generate(sh).log()[T - 1] - float(np.log(100.0)))
-    k1, k2, k3, k4 = hn_garch.hn_moments(_hn_params(), T - 1, H0_TS)
+    k1, k2, k3, k4 = hnref.hn_moments(_hn_params(), T - 1, H0_TS)
     se_mean = R.std().item() / np.sqrt(B)
     assert abs(R.mean().item() - k1) < 4.0 * se_mean, f'mean {R.mean().item():.4e} != oracle {k1:.4e}'
     assert abs(R.var().item() / k2 - 1.0) < 0.03, f'var {R.var().item():.4e} != oracle {k2:.4e}'
@@ -230,7 +231,7 @@ def test_oracle_call_prices():
     p, sh = _make(T, B, seed=11)
     ST = p.generate(sh)[T - 1]
     for K in (95.0, 100.0, 105.0):
-        oracle = float(hn_garch.hn_call(100.0, K, _hn_params(), T - 1, H0_TS))
+        oracle = float(utils.hn_call(100.0, K, _hn_params(), T - 1, H0_TS))
         payoff = torch.clamp(ST - K, min=0.0)
         sim, se = payoff.mean().item(), payoff.std().item() / np.sqrt(B)
         assert abs(sim - oracle) < 4.0 * se, f'call K={K}: sim {sim:.5f} != oracle {oracle:.5f} ({abs(sim-oracle)/se:.1f} se)'
@@ -242,7 +243,7 @@ def test_oracle_terminal_cdf():
     p, sh = _make(T, B, seed=5)
     R = (p.generate(sh).log()[T - 1] - float(np.log(100.0))).numpy()
     for b in (-0.05, 0.0, 0.05):
-        oracle = float(hn_garch.hn_cdf_logret(b, _hn_params(), T - 1, H0_TS))
+        oracle = float(utils.hn_cdf_logret(b, _hn_params(), T - 1, H0_TS))
         sim = float((R <= b).mean())
         se = float(np.sqrt(oracle * (1 - oracle) / B))
         assert abs(sim - oracle) < 4.0 * se, f'cdf b={b:+.2f}: sim {sim:.5f} != oracle {oracle:.5f}'

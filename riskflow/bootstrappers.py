@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 
 # Internal modules
-from . import utils, pricing, instruments, riskfactors, stochasticprocess, hn_garch
+from . import utils, pricing, instruments, riskfactors, stochasticprocess
 
 import scipy.optimize
 
@@ -361,7 +361,7 @@ class HestonNandiModelParameters(object):
          'with $z\\sim N(0,1)$ i.i.d. and $h_{t+1}$ predictable (known at $t$), hence the fitted initial',
          'variance is $h_1$ - the variance of the *first* step - and is stored as **H0**. Option values come',
          'from the recursive characteristic function of Heston and Nandi (2000) inverted by Gauss-Legendre',
-         'quadrature (see `riskflow.hn_garch`). The optional *Yield* (a dividend, repo, convenience or carry',
+         'quadrature (see the Heston-Nandi section of `riskflow.utils`). The optional *Yield* (a dividend, repo, convenience or carry',
          'curve) enters as $q$ - the drift is $r-q$ and the value carries the extra $e^{-qt}$ factor - so',
          'equity, FX and commodity underlyings are all handled by the same objective.',
          '',
@@ -469,7 +469,7 @@ class HestonNandiModelParameters(object):
         ``yield_discount`` = exp(-q*t) converts the resulting value back to a discounting at r:
         the internal price is exp(-(r-q)t)[F P1 - K P2], the value is exp(-rt)[F P1 - K P2]. Parity
         survives the rescale, so puts are still call - S + K exp(-(r-q)n) times the same factor."""
-        call = hn_garch.hn_call(spot, strike, p, n, h0, panels=panels)
+        call = utils.hn_call(spot, strike, p, n, h0, panels=panels)
         return units * yield_discount * (call - (1.0 - is_call) * (spot - strike * torch.exp(-p.r * n)))
 
     def calc_error(self, x, groups, spot, panels, scale):
@@ -483,7 +483,7 @@ class HestonNandiModelParameters(object):
         error = 0.0
         for n, b, q, strike, is_call, units, weight, premium in groups:
             fitted = self.price(spot, strike, is_call, units,
-                                hn_garch.HNParams(omega, alpha, beta, gamma, b), n, h0, panels, q)
+                                utils.HNParams(omega, alpha, beta, gamma, b), n, h0, panels, q)
             error = error + (weight * (premium - fitted) ** 2).sum() / scale
         error.backward()
         return float(error.detach()), x_t.grad.cpu().numpy()
@@ -571,7 +571,7 @@ class HestonNandiModelParameters(object):
                         # back out the Black vol of the quote (seeds the fit and the diagnostics)
                         call = option['Quoted_Market_Value'] + (0.0 if sign > 0 else
                                                                 forward - option['Strike']) * np.exp(-r * t)
-                        sigma = np.sqrt(hn_garch.bs_implied_total_var(
+                        sigma = np.sqrt(utils.bs_implied_total_var(
                             call, spot * np.exp(-q * t), option['Strike'], r * t, 1) / t)
                     else:
                         logging.error('quote_type {} not supported yet'.format(quote_type))
@@ -609,15 +609,15 @@ class HestonNandiModelParameters(object):
 
                 omega, alpha, beta, gamma, h0 = [
                     float(x) for x in self.reparam(tensor(result.x))]
-                fitted_params = hn_garch.HNParams(omega, alpha, beta, gamma)
+                fitted_params = utils.HNParams(omega, alpha, beta, gamma)
 
                 # log the results
                 with torch.no_grad():
                     for n, b, q, strike, is_call, units, weight, premium in groups:
-                        p = hn_garch.HNParams(*[tensor(x) for x in (omega, alpha, beta, gamma)], b)
+                        p = utils.HNParams(*[tensor(x) for x in (omega, alpha, beta, gamma)], b)
                         fitted = self.price(spot, strike, is_call, units, p, n, tensor(h0), panels, q)
                         for option, fitted_premium in zip(expiries[n], fitted.cpu().numpy()):
-                            vol = hn_garch.hn_implied_vol(
+                            vol = utils.hn_implied_vol(
                                 spot, option['Strike'], p, n, tensor(h0), steps_per_year, panels=panels)
                             logging.info(
                                 'Underlying {} strike {}, expiry {}, steps {}, vol {}, c_vol {}, premium {}, '

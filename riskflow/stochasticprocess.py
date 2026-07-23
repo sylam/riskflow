@@ -31,7 +31,7 @@ import torch.nn.functional as F
 
 # Internal modules
 from . import utils
-from .hn_garch import hn_variance_step
+from .utils import hn_variance_step
 from .instruments import get_fx_zero_rate_factor, get_equity_zero_rate_factor, get_dividend_rate_factor
 
 
@@ -3257,7 +3257,7 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
 
         Δlog S = (r - q) - ½ h + √h · z,   h_{t+1} = ω + β h + α (z - γ* √h)²
 
-    the variance recursion is `hn_garch.hn_variance_step` (the ONE source of truth, imported not
+    the variance recursion is `utils.hn_variance_step` (the ONE source of truth, imported not
     copied); (r-q) is the per-step cost of carry read from the spot factor's OWN interest-rate and
     dividend/repo curves — the identical r_t / q_t gather as GBMAssetPriceTSModelImplied
     (EquityPrice: equity zero + dividend; FxRate: domestic + foreign zero). The -½ h is the EXACT
@@ -3271,13 +3271,13 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
     GARCHSpotModel's fractional trading clock:
       * n_sub = round(f) ≥ 2 (grid coarser than ~1.5 bd — the usual CVA grid): the integer
         aggregate-variance bridge — h is forwarded DETERMINISTICALLY through the sub-steps via the HN
-        mean recursion E[h_{j+1}] = ω+α+ψ h_j (ψ=β+αγ*², = hn_expected_h_path) and a SINGLE aggregate
+        mean recursion E[h_{j+1}] = ω+α+ψ h_j (ψ=β+αγ*²) and a SINGLE aggregate
         Gaussian return with the summed variance Σ h_j is drawn (loses within-step vol-of-vol — the
         documented approximation, exactly as GARCH's n_sub≥2 branch).
       * n_sub == 1 (f ≤ 1.5, incl. the calendar-daily production grid f≈0.69 AND the business-daily
         grid f=1): the exact fractional step — return variance h·f and the variance update BLENDED by
         f: h ← h + f·(hn_variance_step(h,z) − h). At f=1 this is EXACTLY hn_variance_step (a
-        business-day grid reproduces the hn_garch closed-form oracle to MC error); for f<1 it keeps
+        business-day grid reproduces the HN closed-form oracle to MC error); for f<1 it keeps
         the annualized vol and the mean-reversion RATE grid-invariant in real time.
 
     Observable state: log h_t = log h_{t+1}^{HN} (the predictable variance of the step t→t+1,
@@ -3286,6 +3286,22 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
     outer_reseed / reseed_from_path) mirrors GARCHSpotModel; generate handles outer (T,B) and inner
     (T,B,B2) with the fork seed on the MIDDLE axis. The single framework Gaussian per step feeds the
     HN z directly (plain normal — HN has no Student-t emission, unlike GARCH)."""
+
+    documentation = ('Framework', [
+        'The Heston-Nandi GARCH(1,1) risk-neutral spot process (implied: parameters from the',
+        'bootstrapped HestonNandiModelParameters factor). INDEXING (original Heston & Nandi 2000):',
+        'the conditional variance carries the index of the END of the period it governs, so h_{t+1}',
+        'is F_t-measurable (predictable): log(S_{t+1}/S_t) = r - h_{t+1}/2 + sqrt(h_{t+1}) z_{t+1},',
+        'h_{t+1} = omega + beta h_t + alpha (z_t - gamma* sqrt(h_t))^2 with gamma* = gamma + lambda + 1/2',
+        'under Q (lambda* = -1/2). The -1/2 h drift is the exact Gaussian convexity, so the discounted',
+        'spot is a price-martingale by construction. Persistence psi = beta + alpha gamma*^2; stationary',
+        'variance (omega + alpha)/(1 - psi). Semi-analytic European prices come from the A/B backward',
+        'recursion (utils.hn_ab - note the load-bearing -phi/2 term) fed into the model-agnostic',
+        'Fourier inversion (utils.cf_european_probabilities). The daily-step recursion is shared with',
+        'the one-step-survival MC pricers (utils.hn_daily_advance). Simulation uses the fractional',
+        'trading clock f = dt/dt_c (exact at f=1; variance blended by f; aggregate-variance bridge for',
+        'n_sub >= 2). Conventions and references are pinned by tests/test_hn_garch.py (R fOptions to',
+        '2.8e-14) and tests/test_hn_implied_process.py (closed-form oracle, both-grids martingale).'])
 
     documentation = (
         'Asset Pricing',

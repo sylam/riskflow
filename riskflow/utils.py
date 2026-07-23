@@ -1477,9 +1477,9 @@ def black_european_option_price(F, X, r, vol, tenor, buyOrSell, callOrPut):
 # A MODEL-AGNOSTIC European vanilla / digital pricer for any model whose aggregate
 # log-return R = log(S_T/S_t) has a known characteristic function.  The quadrature
 # machinery lives here once; a model supplies ONLY its log-CF and reuses everything below
-# with zero inversion code.  Heston-Nandi is the first client (riskflow.hn_garch); Heston,
-# Bates and Variance-Gamma would each just pass their own ``logcf`` closure (see the
-# ``cf_european_probabilities`` documentation for the plug-in contract).
+# with zero inversion code.  Heston-Nandi is the first client (the HN section immediately
+# below); Heston, Bates and Variance-Gamma would each just pass their own ``logcf`` closure
+# (see the ``cf_european_probabilities`` documentation for the plug-in contract).
 #
 # Float64 is mandatory: the S*P1 - K*e^{-rn}*P2 assembly is a cancellation of two O(1)
 # probabilities and float32 destroys it.
@@ -1591,6 +1591,239 @@ def cf_european_probabilities(logcf, log_moneyness, carry, phi_max, panels=256, 
         d = (shift * torch.exp(logcf(iphi + off) - disc)).real
         out.append(0.5 + (d * wts).sum(-1) / np.pi)
     return out[0], out[1]
+
+
+# ======================================================================================
+# Heston-Nandi GARCH(1,1): params + A/B recursion + daily-step recursion + semi-analytic
+# pricing via the model-agnostic CF machinery above. Theory/conventions: the harvested
+# HestonNandiImpliedSpotModel.documentation (stochasticprocess) and tests/test_hn_garch.py.
+
+@dataclass
+class HNParams:
+    """Risk-neutral Heston-Nandi(1,1) parameters.  ``gamma`` IS gamma* (lambda* = -1/2).
+
+    All fields may be python floats or 0-dim torch tensors; make them
+    ``requires_grad=True`` tensors to differentiate prices w.r.t. them.
+    ``r`` is the PER-STEP risk-free rate (per Delta, not annualised).
+    """
+    omega: object
+    alpha: object
+    beta: object
+    gamma: object
+    r: object = 0.0
+
+    def as_tensors(self, dtype=torch.float64, device='cpu'):
+        def t(x):
+            return x if torch.is_tensor(x) else torch.tensor(x, dtype=dtype, device=device)
+        return HNParams(t(self.omega), t(self.alpha), t(self.beta), t(self.gamma), t(self.r))
+
+    @property
+    def persistence(self):
+        """psi = beta + alpha * gamma*^2."""
+        return self.beta + self.alpha * self.gamma ** 2
+
+    @property
+    def stationary_var(self):
+        """E[h] = (omega + alpha) / (1 - psi), the per-step stationary variance."""
+        return (self.omega + self.alpha) / (1.0 - self.persistence)
+
+    def ann_vol(self, steps_per_year=252.0):
+        v = self.stationary_var * steps_per_year
+        return float(v) ** 0.5 if not torch.is_tensor(v) else v.sqrt()
+
+
+def hn_ab(phi, p, n_steps, unwrap=True, phi_dim=-1):
+    """Backward A/B recursion for ``n_steps`` steps.  Returns ``(A, B)``.
+
+    ``phi``     : real OR complex tensor.  If complex it is assumed to vary smoothly and
+                  ascending along ``phi_dim`` (needed for the branch unwrap).
+    ``p``       : HNParams (tensors).
+    Result satisfies E_t[S_{t+n}^phi] = S_t^phi * exp(A + B * h_{t+1}); i.e. the HN affine
+    log-CF of the aggregate log-return is ``A + B * h1`` (the closure handed to the
+    model-agnostic inversion primitive :func:`cf_european_probabilities`).
+    """
+    A = torch.zeros_like(phi)
+    B = torch.zeros_like(phi)
+    om, al, be, ga, r = p.omega, p.alpha, p.beta, p.gamma, p.r
+    lin = phi * (ga - 0.5) - 0.5 * ga ** 2          # <-- the -phi/2 is the LRNVR drift
+    half_sq = 0.5 * (phi - ga) ** 2
+    phir = phi * r
+    for _ in range(int(n_steps)):
+        w = 1.0 - 2.0 * al * B
+        logw = complex_log_unwrap(w, dim=phi_dim) if (unwrap and w.is_complex()) else torch.log(w)
+        A = A + phir + B * om - 0.5 * logw
+        B = lin + be * B + half_sq / w
+    return A, B
+
+
+def hn_logmgf(phi, p, n_steps, h1, **kw):
+    """log E_t[exp(phi * R_n)] where R_n = log(S_{t+n}/S_t).  = A + B*h1."""
+    A, B = hn_ab(phi, p, n_steps, **kw)
+    return A + B * h1
+
+
+def auto_phi_max(p, n_steps, h1, log_tol=-40.0, start=8.0, cap=2.0 ** 24):
+    """Smallest power-of-two phi_max with Re(A + B*h1) - ln(phi) < log_tol.
+
+    The HN glue for the model-agnostic scan :func:`cf_adaptive_phi_max`: it reduces the
+    batch to the extreme h1 (the smallest, whose integrand decays slowest) so the scan runs
+    on a 2-element phi and checks BOTH inversion contours (i*phi and i*phi+1, the latter
+    normalised by the log forward-growth r*n).
+    """
+    h1t = torch.as_tensor(h1).detach()
+    hs = torch.stack([h1t.min(), h1t.max()]).to(p.omega.dtype).reshape(-1, 1)
+    carry = torch.as_tensor(p.r).detach() * int(n_steps)
+    return cf_adaptive_phi_max(
+        lambda z: hn_logmgf(z, p, n_steps, hs), carry,
+        p.omega.dtype, p.omega.device, log_tol, start, cap)
+
+
+def _p1_p2(logm, p, n_steps, h1, phi_max, panels, order, unwrap, want=3):
+    """P1, P2 for log-moneyness ``logm`` = ln(K/S).  ``logm``/``h1`` broadcast together.
+
+    Thin HN glue over the model-agnostic Fourier-inversion primitive
+    :func:`cf_european_probabilities`: it hands over the HN affine log-CF ``A + B*h1``
+    (from :func:`hn_ab`) as the ``logcf`` closure and the log forward-growth ``r*n`` as the
+    P1-contour normalisation.  ``want`` is a bit mask: 1 = P1, 2 = P2, 3 = both.
+    """
+    logm = torch.as_tensor(logm, dtype=p.omega.dtype, device=p.omega.device)
+    h1 = torch.as_tensor(h1, dtype=p.omega.dtype, device=p.omega.device)
+    logm, h1 = torch.broadcast_tensors(logm, h1)
+    if phi_max is None:
+        phi_max = auto_phi_max(p, n_steps, h1)
+    if panels is None:
+        panels = 256
+    hh = h1.unsqueeze(-1)
+
+    def logcf(phi):
+        A, B = hn_ab(phi, p, n_steps, unwrap=unwrap)
+        return A + B * hh
+
+    return cf_european_probabilities(
+        logcf, logm, p.r * n_steps, phi_max, panels, order,
+        p.omega.dtype, p.omega.device, want)
+
+
+def hn_call(S, K, p, n_steps, h1, phi_max=None, panels=None, order=8, unwrap=True):
+    """European CALL, ``n_steps`` steps to expiry, spot ``S``, strike ``K``.
+
+    ``h1`` is the (predictable) variance of the FIRST step.  Differentiable w.r.t.
+    (omega, alpha, beta, gamma, r, h1, S, K).
+    """
+    S = torch.as_tensor(S, dtype=p.omega.dtype, device=p.omega.device)
+    K = torch.as_tensor(K, dtype=p.omega.dtype, device=p.omega.device)
+    P1, P2 = _p1_p2(torch.log(K / S), p, n_steps, h1, phi_max, panels, order, unwrap)
+    return S * P1 - K * torch.exp(-p.r * n_steps) * P2
+
+
+def hn_put(S, K, p, n_steps, h1, **kw):
+    """European PUT.  By put-call parity off :func:`hn_call` (the parity residual of the
+    inversion itself is tested separately via the phi=1 martingale identity)."""
+    S = torch.as_tensor(S, dtype=p.omega.dtype, device=p.omega.device)
+    K = torch.as_tensor(K, dtype=p.omega.dtype, device=p.omega.device)
+    return hn_call(S, K, p, n_steps, h1, **kw) - S + K * torch.exp(-p.r * n_steps)
+
+
+def hn_cdf_logret(b, p, n_steps, h1, phi_max=None, panels=None, order=8, unwrap=True):
+    """EXACT  Q( R_n <= b )  where R_n = log(S_{t+n}/S_t), by Fourier inversion.
+
+    This is the quantity the one-step-survival loop needs for an UP barrier at
+    S*exp(b) (survival = stay below).  Spot-free by construction.  ``b`` and ``h1``
+    broadcast against each other.
+    """
+    _, P2 = _p1_p2(b, p, n_steps, h1, phi_max, panels, order, unwrap, want=2)
+    return 1.0 - P2
+
+
+# --------------------------------------------------------------------------------------
+# The daily-step recursion -- ONE SOURCE OF TRUTH for the HN step
+# --------------------------------------------------------------------------------------
+#
+# The predictable-variance recursion h_{t+1} = omega + beta*h_t + alpha*(z_t - gamma*sqrt(h_t))^2
+# lives ONLY in ``hn_variance_step``.  Every consumer routes through it: the one-step-survival
+# (OSS) Monte Carlo pricers in ``riskflow/pricing.py`` (which import ``hn_daily_advance`` /
+# ``hn_unmonitored_substeps``), the ``HestonNandiImpliedSpotModel`` diffusion in
+# ``riskflow/stochasticprocess.py``, AND the standalone daily simulator in
+# ``tests/hn_reference.py``.  So a single mutation-kill matrix on the step covers every pricer.
+
+def hn_variance_step(h, sh, z, omega, alpha, beta, gamma_star):
+    """The HN predictable-variance recursion h_{t+1} = omega + beta*h + alpha*(z - gamma*sqrt(h))^2.
+
+    ``sh`` = sqrt(h) is passed in (the caller already needs it for the log-spot step), so the
+    square root is computed exactly once.  All args broadcast on the simulation axis.
+    """
+    return omega + beta * h + alpha * (z - gamma_star * sh) ** 2
+
+
+def hn_daily_advance(Sj, h, b_step, z, omega, alpha, beta, gamma_star):
+    """One daily Heston-Nandi step under the risk-neutral (LRNVR) measure. Returns (Sj, h).
+
+    Advances the log-spot by ``(b_step - 0.5*h) + sqrt(h)*z`` and recurses the predictable
+    variance (via :func:`hn_variance_step`). ``z`` is either a fresh unconditional normal (an
+    unmonitored sub-step) or the survival-truncated final draw of a monitored interval; in
+    BOTH cases the recursion is fed the REALISED z (the survival-conditioned law -
+    leverage-asymmetric under truncation, DO NOT 'fix' back to an unconditional draw, see the
+    pv_MC_Tarf note). ``b_step`` is the per-step cost-of-carry (r-q). All args broadcast on
+    the trailing simulation axis.
+    """
+    sh = torch.sqrt(h)
+    Sj = Sj * torch.exp((b_step - 0.5 * h) + sh * z)
+    h = hn_variance_step(h, sh, z, omega, alpha, beta, gamma_star)
+    return Sj, h
+
+
+def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
+    """Advance (Sj, h) through ``n_steps`` UNCONDITIONAL (unmonitored) daily HN steps. These
+    carry no barrier - the OSS truncation applies only on the monitored final step (done by
+    the caller). A monitored interval of n_sub days passes ``n_steps = n_sub - 1`` here; a
+    non-monitored interval (e.g. the run from the last barrier date to expiry) passes the full
+    ``n_steps = n_sub``. Fresh regular-stream normals per step (Sobol/antithetic variance
+    reduction is reserved for the truncated final draw); with ``antithetic`` the normal is
+    negated on the paired half (z, -z) to align with the u<->1-u halves of the final draw
+    (TARF/barrier), otherwise a plain num_sims-wide normal (autocall, whose final draw is not
+    antithetic). ``hn_params`` = (Omega, Alpha, Beta, Gamma_Star).
+    """
+    for _ in range(n_steps):
+        zc = torch.randn([shared.simulation_batch, num_sims],
+                         dtype=shared.one.dtype, device=shared.one.device)
+        z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
+        Sj, h = hn_daily_advance(Sj, h, b_step, z, *hn_params)
+    return Sj, h
+
+
+# --------------------------------------------------------------------------------------
+# Black-Scholes reference + implied vol (the HN smile/skew diagnostic and the bootstrapper seed)
+# --------------------------------------------------------------------------------------
+# A differentiable, CONVENTION-FREE (total-variance) BS call in torch -- distinct from
+# ``black_european_option_price`` (scipy/numpy, keyed on vol+tenor+r).  The standard-normal CDF
+# is the framework's ``norm_cdf`` (erfc form), NOT a private twin.
+
+def bs_call_np(S, K, r, n, total_var):
+    """BS call from TOTAL variance (r, n in per-step units) -- a thin adapter over the canonical
+    ``black_european_option_price`` (F = S*e^{r*n}; vol=sqrt(tv), tenor=1 so stddev^2 = tv)."""
+    return float(black_european_option_price(
+        S * np.exp(r * n), K, r * n, np.sqrt(total_var), 1.0, 1.0, 1.0))
+
+
+
+def bs_implied_total_var(price, S, K, r, n, lo=1e-12, hi=25.0, tol=1e-14, iters=200):
+    """Bisection on TOTAL variance (no time units, so this is convention-free)."""
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        if bs_call_np(S, K, r, n, mid) < price:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return 0.5 * (lo + hi)
+
+
+def hn_implied_vol(S, K, p, n_steps, h1, steps_per_year=252.0, **kw):
+    """Annualised BS implied vol of the HN price (for the smile/skew diagnostics)."""
+    c = float(hn_call(S, K, p, n_steps, h1, **kw))
+    tv = bs_implied_total_var(c, float(S), float(K), float(p.r), int(n_steps))
+    return np.sqrt(tv / (int(n_steps) / steps_per_year))
 
 
 def Bjerksund_Stensland(A1, A2, B, x1, x2, K, sigma1, sigma2, rho, callOrPut):

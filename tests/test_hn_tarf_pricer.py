@@ -14,7 +14,7 @@ THE GATES
   * bit-identity        - Alpha=Gamma_Star=Beta=0, Omega=H0=sigma^2*dt and a fixing schedule with
                           exactly ONE daily sub-step per fixing (n_sub=1) makes the HN branch
                           reproduce the GBM branch. It is NOT torch.equal - see the test docstring.
-  * closed form         - a single-fixing, never-knocking HN TARF == N1 * hn_garch.hn_call (the
+  * closed form         - a single-fixing, never-knocking HN TARF == N1 * utils.hn_call (the
                           validated 98-test semi-analytic HN pricer) to Monte-Carlo error, over two
                           persistences (so the daily h-recursion is exercised, not bypassed).
   * dynamics engaged    - the GARCH term structure / leverage move the price off a flat-vol GBM at
@@ -42,7 +42,8 @@ import pytest
 import torch
 
 import riskflow
-from riskflow import hn_garch, run_baseval, utils
+from riskflow import run_baseval, utils
+import hn_reference as hnref
 from riskflow.config import Config
 from riskflow.instruments import construct_instrument
 
@@ -60,7 +61,7 @@ def _flat_vol_surface(sigma):
 
 def _price_factors(sigma, hn_params, r_dom=0.0, r_for=0.0):
     # r_dom/r_for are flat annualised USD/AUD rates. Zero (default) => driftless FX forward =>
-    # hn_garch.HNParams(..., r=0) is the reference law. With r_for=0 the carry (r_dom-r_for) and
+    # utils.HNParams(..., r=0) is the reference law. With r_for=0 the carry (r_dom-r_for) and
     # the USD discount coincide, so a single hn_call r = r_dom/365 (per ACT/365 day) pins BOTH the
     # forward drift and the discount (see test_never_knock_daily_hn_matches_summed_closed_form).
     pf = {
@@ -147,7 +148,7 @@ def _cum_days(fix_days, spy=252.0):
 
 
 def _real_garch(persistence=0.96):
-    p = hn_garch.hn_params_from_targets(
+    p = hnref.hn_params_from_targets(
         ann_vol=0.28, persistence=persistence, gamma=250.0, leverage_share=0.5, steps_per_year=252.0)
     return {'Omega': float(p.omega), 'Alpha': float(p.alpha), 'Beta': float(p.beta),
             'Gamma_Star': float(p.gamma), 'H0': 1.2 * float(p.stationary_var)}, p
@@ -233,15 +234,15 @@ def test_bit_identity_degenerate_hn_reproduces_gbm(seed, target):
 @pytest.mark.parametrize('persistence', [0.90, 0.96])
 def test_single_fixing_hn_matches_hn_garch_closed_form(persistence):
     """A single-fixing, never-knocking (huge target) HN TARF pays N1*relu(S_n-K) discounted; with
-    zero carry that is exactly N1 * hn_garch.hn_call under the HN law simulated by the pricer's daily
+    zero carry that is exactly N1 * utils.hn_call under the HN law simulated by the pricer's daily
     recursion. Running it at two persistences (different h term structures) pins that the h-recursion
     is engaged AND that the OSS final-step draw feeds it (the never-knock terminal law is the law of
     the recursion where the last draw feeds h - it would not match hn_call otherwise)."""
     hn_params, p = _real_garch(persistence)
     horizon = 60
     n_sub = max(int(round(horizon / 365.0 * 252.0)), 1)
-    ref = float(hn_garch.hn_call(
-        SPOT, STRIKE, hn_garch.HNParams(p.omega, p.alpha, p.beta, p.gamma, 0.0).as_tensors(),
+    ref = float(utils.hn_call(
+        SPOT, STRIKE, utils.HNParams(p.omega, p.alpha, p.beta, p.gamma, 0.0).as_tensors(),
         n_sub, hn_params['H0'])) * N1
     price = _mtm(_cfg(True, 1e9, [horizon], hn_params=hn_params, steps_per_year=252.0),
                  seed=3, sims=1 << 17)  # ~7e-4 MC error observed; tol is ~4x that
@@ -283,7 +284,7 @@ _DAILY_NK = list(range(1, 21))  # cum_days = 1..20
 @pytest.mark.parametrize('r_dom', [0.0, 0.05])  # r_dom=0.05 (r_for=0) exercises b_step != 0 (Task 3)
 def test_never_knock_daily_hn_matches_summed_closed_form(r_dom):
     """Never-knock (huge target) 20-fixing DAILY TARF: survival ~ 1, so each fixing pays
-    N1*relu(S_d - K) and the total equals N1 * sum_d hn_garch.hn_call at the cumulative day counts
+    N1*relu(S_d - K) and the total equals N1 * sum_d utils.hn_call at the cumulative day counts
     with h1=H0. Because n_sub=1, every daily step feeds h through the survival-conditioned final-step
     recursion, and h is carried continuously across all 20 fixings - so a wrong final-step update
     (frozen/mis-scaled/sign-flipped) desynchronises h for every later fixing and breaks the match.
@@ -291,8 +292,8 @@ def test_never_knock_daily_hn_matches_summed_closed_form(r_dom):
     ACT/365 day per step), pinning b_step = fwd_carry*dt/n_sub."""
     hn_params, p = _real_garch(0.94)
     hn_params = dict(hn_params, H0=1.5 * float(p.stationary_var))  # H0 != stationary => term structure
-    ptens = hn_garch.HNParams(p.omega, p.alpha, p.beta, p.gamma, r_dom / 365.0).as_tensors()
-    ref = sum(float(hn_garch.hn_call(SPOT, STRIKE, ptens, c, hn_params['H0']))
+    ptens = utils.HNParams(p.omega, p.alpha, p.beta, p.gamma, r_dom / 365.0).as_tensors()
+    ref = sum(float(utils.hn_call(SPOT, STRIKE, ptens, c, hn_params['H0']))
               for c in _cum_days(_DAILY_NK)) * N1
     price = _mtm(_cfg(True, 1e9, _DAILY_NK, hn_params=hn_params, steps_per_year=252.0, r_dom=r_dom),
                  seed=3, sims=1 << 17)  # correct reldiff ~1.7e-3; tol ~3x, mutants >= 1.2e-2
@@ -302,7 +303,7 @@ def test_never_knock_daily_hn_matches_summed_closed_form(r_dom):
 # Strong-leverage KNOCKING config (gamma*=400, leverage_share=0.8): the KO-truncated final draw
 # biases E[Z]<0, engaging the leverage cross-term so the (Z - Gamma_Star*sh) SIGN moves E[h'].
 def _knock_params():
-    p = hn_garch.hn_params_from_targets(ann_vol=0.30, persistence=0.94, gamma=400.0,
+    p = hnref.hn_params_from_targets(ann_vol=0.30, persistence=0.94, gamma=400.0,
                                         leverage_share=0.8, steps_per_year=252.0)
     return {'Omega': float(p.omega), 'Alpha': float(p.alpha), 'Beta': float(p.beta),
             'Gamma_Star': float(p.gamma), 'H0': 1.5 * float(p.stationary_var)}

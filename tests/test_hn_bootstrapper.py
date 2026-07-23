@@ -2,7 +2,7 @@
 factor (riskflow/riskfactors.py).
 
 The KEY test is the round trip: synthesise European option quotes FROM a known set of
-risk-neutral HN parameters with the validated pricer (riskflow/hn_garch.py, 98 tests), hand them
+risk-neutral HN parameters with the validated pricer (riskflow.utils, tests/test_hn_garch.py), hand them
 to the bootstrapper as market prices, and recover the parameters. It runs for THREE asset
 classes - an FX rate (FXVol, no yield), an equity (EquityPriceVol + DividendRate) and a
 commodity (CommodityPriceVol + a carry InterestRate) - because the factor is asset class
@@ -23,7 +23,8 @@ import pandas as pd
 import pytest
 import torch
 
-from riskflow import bootstrappers, hn_garch, riskfactors, utils
+from riskflow import bootstrappers, riskfactors, utils
+import hn_reference as hnref
 from riskflow.config import Config, ModelParams
 
 DT = torch.float64
@@ -36,7 +37,7 @@ FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        'fixtures', 'data', 'MarketDataRF_heston_nandi.json')
 
 # the parameters the round trip has to recover
-TRUTH = hn_garch.hn_params_from_targets(
+TRUTH = hnref.hn_params_from_targets(
     ann_vol=0.28, persistence=0.96, gamma=250.0, leverage_share=0.5, steps_per_year=SPY)
 H0_TRUTH = 1.3 * TRUTH.stationary_var
 
@@ -75,10 +76,10 @@ def synthetic_quotes(asset, days, moneyness, option_type):
     t = days / 365.0
     n = max(int(round(t * SPY)), 1)
     strikes = np.array(moneyness) * spot * np.exp((RATE - q) * t)
-    p = hn_garch.HNParams(TRUTH.omega, TRUTH.alpha, TRUTH.beta, TRUTH.gamma,
+    p = utils.HNParams(TRUTH.omega, TRUTH.alpha, TRUTH.beta, TRUTH.gamma,
                           (RATE - q) * t / n).as_tensors(DT)
     k = torch.tensor(strikes, dtype=DT)
-    call = hn_garch.hn_call(spot, k, p, n, H0_TRUTH, panels=PANELS)
+    call = utils.hn_call(spot, k, p, n, H0_TRUTH, panels=PANELS)
     value = np.exp(-q * t) * (call if option_type == 'Call' else call - spot + k * torch.exp(-p.r * n))
     return [{'Expiry_Date': BASE_DATE + pd.Timedelta(days=days), 'Strike': float(strike),
              'Option_Type': option_type, 'Units': 1.0, 'Weight': 1.0, 'Quoted_Market_Value': float(v)}
@@ -126,7 +127,7 @@ def test_round_trip_recovers_parameters(round_trip, field, truth, rtol):
 
 
 def test_round_trip_recovers_persistence_and_long_run_vol(round_trip):
-    p = hn_garch.HNParams(*[round_trip[0][x] for x in ('Omega', 'Alpha', 'Beta', 'Gamma_Star')])
+    p = utils.HNParams(*[round_trip[0][x] for x in ('Omega', 'Alpha', 'Beta', 'Gamma_Star')])
     assert p.persistence == pytest.approx(float(TRUTH.persistence), abs=1e-3)
     assert p.ann_vol(SPY) == pytest.approx(TRUTH.ann_vol(SPY), rel=1e-2)
 
@@ -137,7 +138,7 @@ def test_round_trip_reprices_the_quotes(round_trip):
     param, _, prices, boot, asset = round_trip
     quotes = prices['HestonNandiModelPrices.' + asset[0]]['instrument']['European_Options']
     for option in quotes:
-        p = hn_garch.HNParams(*[torch.tensor(param[k], dtype=DT) for k in
+        p = utils.HNParams(*[torch.tensor(param[k], dtype=DT) for k in
                                 ('Omega', 'Alpha', 'Beta', 'Gamma_Star')],
                               torch.tensor((option['r'] - option['q']) * option['T'] / option['n'], dtype=DT))
         fitted = boot.price(asset[1], torch.tensor(option['Strike'], dtype=DT),
