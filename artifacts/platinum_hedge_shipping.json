@@ -101,7 +101,8 @@
        "Sampling_Type": "USD",
        "FX_Sampling_Type": "USD",
        "Discount_Rate": "USD-SOFR",
-       "Commodity": "PLATINUM_LME",
+       "Commodity": "PLATINUM_CME",
+       "Implied_Basis": "LME_CME",
        "Reference_Type": "PLATINUM",
        "Payer_Receiver": "Receiver",
        "Payments": {
@@ -191,14 +192,6 @@
       "Domestic_Currency": "",
       "Interest_Rate": "USD-SOFR",
       "Spot": 1.0
-     },
-     "CommodityPrice.PLATINUM_LME": {
-      "Currency": "USD",
-      "Interest_Rate": "USD-SOFR",
-      "Forward_Rate": "PLATINUM_CARRY",
-      "Spot": 1677.0,
-      "Implied_Basis": "LME_CME",
-      "Property_Aliases": ""
      },
      "CommodityPrice.PLATINUM_CME": {
       "Currency": "USD",
@@ -466,9 +459,6 @@
      "FloatingEnergyDeal": {
       "ForwardCurve": "Components"
      }
-    },
-    "Price Models": {
-     "BasisComposedSpotModel.PLATINUM_LME": {}
     }
    }
   },

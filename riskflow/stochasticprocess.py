@@ -3999,8 +3999,9 @@ class BasisLinkedSpotModel(StochasticProcess):
         # field — declared via dependant_fields['ObservedBasis'], which orders it before us.
         # At sim time the framework has populated the Price Factor entry from the job file's
         # ExplicitMarketData. Observed_Factor is both the SIM driver and the pricing anchor:
-        # the composed sibling (BasisComposedSpotModel) publishes primary + basis, so the basis
-        # is driven by the primary and the graph stays acyclic (primary -> basis -> composed).
+        # a deal that prices off primary + basis (FloatingEnergyDeal with an Implied_Basis)
+        # references the primary and this basis by their explicit fields, so the basis is driven
+        # by the primary and the graph stays acyclic (primary -> basis).
         linked_id = self.factor.param['Observed_Factor']
         self.linked_key = utils.Factor('CommodityPrice', tuple(linked_id.split('.')))
 
@@ -4076,61 +4077,6 @@ class BasisLinkedSpotModel(StochasticProcess):
             for t in range(1, T):
                 out[t] = a * (linked_path[t] - linked_path[t - 1]) + phi * out[t - 1] + eta[t]
         return out
-
-
-class BasisComposedSpotModel(StochasticProcess):
-    """Derived spot published as PRIMARY + BASIS: the composed sibling of
-    BasisLinkedSpotModel. This factor's `Implied_Basis` field names the ObservedBasis;
-    the basis's `Observed_Factor` is the primary. Publishing composed = primary + basis
-    makes the composed price carry the basis dynamics (e.g. LBMA fixing = CME + (LBMA−CME))
-    while deals reference it as an ordinary CommodityPrice. Futures reference the primary
-    through a separate identity basis (CME_FLAT, zero-dynamics) so they never touch this
-    composed side — the dependency graph is primary -> {identity, spread} -> composed,
-    strictly acyclic. Consumes no random numbers and reveals no market state — its
-    information (primary price/belief + basis) is already revealed by its parents. config.py
-    orders the basis after its primary and this factor after the basis, so both parent
-    buffers exist at generate time; outer (T,B) and inner (T,B,B2) modes compose identically,
-    and per-path t0 forks need no state here — composition is memoryless (parents own state)."""
-
-    documentation = (
-        'Asset Pricing',
-        ['A derived spot published as the primary spot plus its linked basis:',
-         '',
-         '$$ S_{composed}(t) = S_{primary}(t) + b(t) $$',
-         '',
-         'the composed sibling of `BasisLinkedSpotModel` — deals reference the composed',
-         'price as an ordinary CommodityPrice while the basis dynamics carry the spread.',
-         '',
-         '- **Implied_Basis** (on the Price Factor): the ObservedBasis factor to add'])
-
-    def __init__(self, factor, param, implied_factor=None):
-        super().__init__(factor, param)
-
-    @staticmethod
-    def num_factors():
-        return 0
-
-    @property
-    def correlation_name(self):
-        return 'BasisComposedSpotProcess', []
-
-    def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
-        pass
-
-    def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
-        self.basis_key = utils.Factor(
-            'ObservedBasis', utils.check_rate_name(self.factor.param['Implied_Basis']))
-        basis = all_factors[self.basis_key]
-        basis_param = (basis.factor if hasattr(basis, 'factor') else basis).param
-        self.primary_key = utils.Factor('CommodityPrice', utils.check_rate_name(
-            basis_param['Observed_Factor']))
-
-    def reveal_state_at(self, t, buffer):
-        return []
-
-    def generate(self, shared_mem):
-        return (shared_mem.t_Scenario_Buffer[self.primary_key]
-                + shared_mem.t_Scenario_Buffer[self.basis_key])
 
 
 class BasisLinkedSpotCalibration(object):

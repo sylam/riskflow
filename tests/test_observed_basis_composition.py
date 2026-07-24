@@ -6,9 +6,9 @@ fields, names stay atomic.
 Two layers of coverage:
   * unit — calc_time_grid_spot_rate on a hand-built code/buffer: single-element bit-path,
     multi-element sum (stoch + static), cache-hit reuse.
-  * deal — FloatingEnergyDeal (Components) with an explicit Implied_Basis produces the same
-    priced liability as the BasisComposedSpotModel composed factor (bit-identical), and an
-    Observed_Factor/Commodity mismatch raises loudly.
+  * deal — FloatingEnergyDeal (Components) with an explicit Implied_Basis sums the basis into
+    the priced liability (a zero basis is a bit-exact no-op), and an Observed_Factor/Commodity
+    mismatch raises loudly.
 """
 import json
 import os
@@ -99,8 +99,11 @@ def test_spot_rate_cache_hit_reuse():
 
 
 # --- deal-level: explicit Implied_Basis on FloatingEnergyDeal ------------------------------
+# The shipping config's liability now prices off Commodity=PLATINUM_CME + Implied_Basis=LME_CME
+# (the migrated composed spot). PLATINUM_CME, ObservedBasis.LME_CME and the zero-dynamics
+# ObservedBasis.CME_FLAT are all present, so these run against the shipped config directly.
 
-def _ship_cfg(mutate=None):
+def _ship_cfg(mutate=None, factor_override=None):
     cfg = json.load(open(SHIPPING))
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = 'simulate_only'
@@ -110,6 +113,8 @@ def _ship_cfg(mutate=None):
     calc['Hedging_Problem'].pop('Solver', None)
     if mutate:
         mutate(calc['Hedging_Problem']['Liabilities']['FloatingEnergyDeal']['PLAT_JUL29'])
+    if factor_override:
+        factor_override(cfg['Calc']['MergeMarketData']['ExplicitMarketData']['Price Factors'])
     return cfg
 
 
@@ -120,33 +125,33 @@ def _liability_mtm(cfg):
     return out.bundle['liability_mtm']
 
 
-def test_explicit_basis_matches_composed_factor():
-    # Composed: deal references PLATINUM_LME (BasisComposedSpotModel = PLATINUM_CME + LME_CME).
-    composed = _liability_mtm(_ship_cfg())
+def test_explicit_basis_sums_into_liability():
+    # Full: Commodity=PLATINUM_CME + Implied_Basis=LME_CME -> composed = CME + basis.
+    full = _liability_mtm(_ship_cfg())
 
-    # Explicit: deal references the primary PLATINUM_CME plus Implied_Basis=LME_CME. The multi-
-    # element deal code sums the SAME two buffers; the composed factor is now unreferenced.
-    def _explicit(deal):
-        deal['Commodity'] = 'PLATINUM_CME'
-        deal['Implied_Basis'] = 'LME_CME'
-    explicit = _liability_mtm(_ship_cfg(_explicit))
+    # Primary-only: drop Implied_Basis -> single-element code, spot = CME alone.
+    primary = _liability_mtm(_ship_cfg(lambda d: d.pop('Implied_Basis')))
 
-    assert composed.shape == explicit.shape
-    assert torch.equal(composed, explicit), \
-        f'max|diff|={ (composed - explicit).abs().max().item() }'
+    # Zero-basis: Implied_Basis=CME_FLAT (identity basis, all-zero buffer) -> CME + 0.
+    zero = _liability_mtm(_ship_cfg(lambda d: d.update(Implied_Basis='CME_FLAT')))
+
+    # The real basis moves the liability; the zero basis is a bit-exact no-op through the sum
+    # (x + 0.0f == x), and the factor discovery order is unchanged so the random path matches.
+    assert not torch.equal(full, primary), 'LME_CME basis made no difference to the liability'
+    assert torch.equal(zero, primary), 'a zero (CME_FLAT) basis must be a bit-exact no-op'
 
 
 def test_observed_factor_mismatch_raises(caplog):
-    # Deal Commodity=PLATINUM_LME but Implied_Basis=LME_CME observes PLATINUM_CME — incoherent.
-    # The ValueError fires in calc_dependencies (loud, names both); the framework's dependency
-    # walker logs it and skips the deal (its standard bad-config contract), so the calc then
-    # fails downstream on the missing liability — assert the validation message was emitted.
-    def _mismatch(deal):
-        deal['Commodity'] = 'PLATINUM_LME'
-        deal['Implied_Basis'] = 'LME_CME'
+    # Corrupt the deal's basis (LME_CME) so its Observed_Factor no longer names the deal's
+    # Commodity (PLATINUM_CME) — only the liability uses LME_CME, so the futures are untouched.
+    # The ValueError fires in calc_dependencies (loud, names both spots + the basis); the
+    # framework's dependency walker logs it and skips the deal (its standard bad-config
+    # contract), so the calc then fails downstream on the missing liability.
+    def _corrupt(pf):
+        pf['ObservedBasis.LME_CME']['Observed_Factor'] = 'PLATINUM_WRONG'
     with caplog.at_level('ERROR'):
         with pytest.raises(Exception):
-            _liability_mtm(_ship_cfg(_mismatch))
+            _liability_mtm(_ship_cfg(factor_override=_corrupt))
     joined = ' '.join(r.getMessage() for r in caplog.records)
-    assert 'FloatingEnergyDeal' in joined and 'PLATINUM_LME' in joined \
+    assert 'FloatingEnergyDeal' in joined and 'PLATINUM_WRONG' in joined \
         and 'PLATINUM_CME' in joined and 'LME_CME' in joined, joined

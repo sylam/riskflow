@@ -18,7 +18,7 @@
                     "ForwardPrice": "CSForwardPriceModel",
                     "ForwardRate": "VARMixedFactorInterestRateModel",
                     "FxRate": "GBMAssetPriceModel",
-                    "CommodityBasis": "BasisLinkedSpotModel"
+                    "ObservedBasis": "BasisLinkedSpotModel"
                 },
                 "modelfilters": {}
             }

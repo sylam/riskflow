@@ -34,10 +34,11 @@ This solver is config-agnostic — it applies the same best block to whatever wo
 describes. The shipping deliverable (artifacts/platinum_hedge_shipping.json) is the corrected
 composed-spot platinum world: CommodityPrice.PLATINUM_CME = P is the martingale primary,
 ObservedBasis.LME_CME (Observed_Factor=PLATINUM_CME) carries the published basis b = S - P
-(LME - CME), and CommodityPrice.PLATINUM_LME = P + b is the composed LBMA fixing
-(BasisComposedSpotModel, routed by modelfilters, never calibrated). Every tradeable future
-references the primary through the identity basis CME_FLAT (synthetic = P + 0 = P), so the
-graph is acyclic (CME -> {CME_FLAT, LME_CME} -> LME). The world's invariant is E[dF|b] ≈ 0 —
+(LME - CME), and the composed LBMA fixing S = P + b is priced by the swap declaring
+Commodity=PLATINUM_CME + Implied_Basis=LME_CME (the multi-element spot lookup sums the two
+buffers — no separate composed factor). Every tradeable future references the primary through
+the identity basis CME_FLAT (synthetic = P + 0 = P), so the graph is acyclic
+(CME -> {CME_FLAT, LME_CME}). The world's invariant is E[dF|b] ≈ 0 —
 each future references P (martingale), so its expected one-step change conditional on the basis
 is ~0 (no unexecutable reversion for the solver to harvest); enforce it at calibration.
 

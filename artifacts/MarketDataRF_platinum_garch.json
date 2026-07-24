@@ -19,17 +19,7 @@
      "FxRate": "GBMAssetPriceModel",
      "ObservedBasis": "BasisLinkedSpotModel"
     },
-    "modelfilters": {
-     "CommodityPrice": [
-      [
-       [
-        "ID",
-        "PLATINUM_LME"
-       ],
-       "BasisComposedSpotModel"
-      ]
-     ]
-    }
+    "modelfilters": {}
    }
   },
   "Price Factor Interpolation": {

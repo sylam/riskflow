@@ -1840,10 +1840,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         shared_mem = self._build_factor_state(
             dependent_factors, stochastic_factors, additional_factors, params, base_date, job_id, num_jobs)
-        # Derived factors (zero-random processes, e.g. BasisComposedSpotModel) generate after
-        # the stochastic factors they compose — ordering by process kind, no dependency edges.
-        self.stoch_factors = ({k: p for k, p in self.stoch_factors.items() if p.num_factors() != 0}
-                              | {k: p for k, p in self.stoch_factors.items() if p.num_factors() == 0})
         return shared_mem
 
     def _liability_schedule_scalars(self):
@@ -2179,8 +2175,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         runtime-owned underlying set (`self._underlying_names`); map back to the live key
         object via stoch_factors. The sufficient statistic (HMM regime/belief, GARCH log-
         variance) lives on the martingale primary — prefer the spot exposing a revealed
-        sufficient statistic (non-empty `privileged_layout`) when derived spots
-        (BasisComposedSpotModel) add further CommodityPrice factors. Raises unless exactly one."""
+        sufficient statistic (non-empty `privileged_layout`) when more than one CommodityPrice
+        factor is simulated. Raises unless exactly one."""
         spots = [k for k in self.stoch_factors
                  if utils.check_tuple_name(k) in self._underlying_names]
         primaries = [k for k in spots if self.stoch_factors[k].privileged_layout(self.stoch_factors[k].param)]
