@@ -4,7 +4,7 @@ Calibration is RiskFlow's process for fitting [price model](../json/price_models
 from historical timeseries. Distinct from
 [bootstrapping](../bootstrapping/general.md), which fits to current market quotes for
 risk-neutral simulation, calibration produces real-world (P-measure) parameters used in PFE,
-capital, and policy-training simulations.
+capital, and hedge-solver simulations.
 
 ## Inputs
 

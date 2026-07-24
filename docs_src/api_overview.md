@@ -41,7 +41,7 @@ dispatcher:
 |---|---|---|
 | `cx.Base_Valuation(overrides)` | `BaseValuation` | Single-point MTM revaluation |
 | `cx.Credit_Monte_Carlo(overrides)` | `CreditMonteCarlo` | Path-dependent simulation (CVA / FVA / PFE) |
-| `cx.Hedge_Monte_Carlo(overrides)` | `HedgeMonteCarlo` | Same simulation engine, used as the env for an RL hedger |
+| `cx.Hedge_Monte_Carlo(overrides)` | `HedgeMonteCarlo` | Same simulation engine, used to solve a dynamic hedging problem (DiffSolverV2) |
 | `cx.run_job(overrides)` | (any of the above) | Dispatches based on the loaded JSON's `Calculation.Object` |
 
 Use `run_job()` when the JSON itself fully specifies which calculation to run:
@@ -121,20 +121,21 @@ visible CUDA devices and merges the results.
 
 ### Hedge Monte Carlo
 
-A specialisation of Credit Monte Carlo wired into a TorchRL training loop. The same scenario engine
-generates trajectories which are consumed by a structured policy that learns to hedge a portfolio
-of liabilities by trading a configured set of futures or other instruments. See the
-[Hedging_Problem](../json/index.md#calculation) JSON section for the configuration contract.
+A specialisation of Credit Monte Carlo wired into a differential-ML hedging solver (DiffSolverV2).
+The same scenario engine generates trajectories which are consumed by a backward-DP value-function
+solver that hedges a portfolio of liabilities by trading a configured set of futures or other
+instruments. See the [Hedging_Problem](../json/index.md#calculation) JSON section for the
+configuration contract.
 
 ```python
 calc, out = cx.Hedge_Monte_Carlo(overrides={'Random_Seed': 42})
 out['Results'].keys()
 ```
 
-When `Execution_Mode` is `optimize_policy`, the optimiser trains the policy in-process and
-`out['Results']` contains the trained policy artifact alongside diagnostic metrics. When
-`Execution_Mode` is `simulate_only`, only the scenario bundle is computed (useful for offline
-analysis).
+When `Execution_Mode` is `solve_hedge`, the solver fits the value function in-process and
+`out['Results']` contains the fitted value-function artifact, the greedy-policy verdict, and the
+benchmark comparison table. When `Execution_Mode` is `simulate_only`, only the scenario bundle is
+computed and the no-trade baseline is run (useful for offline analysis).
 
 ## Overrides
 
@@ -148,7 +149,7 @@ just before execution. Common overrides:
 - `Time_Grid` — re-shape the simulation time grid (Credit / Hedge Monte Carlo)
 
 Overrides are merged shallowly into the loaded `Calculation` object, so nested fields (e.g.
-`Hedging_Problem.Optimizer.Epochs`) need to be passed as a complete sub-dict if you want to change
+`Hedging_Problem.Solver.Object`) need to be passed as a complete sub-dict if you want to change
 just one entry.
 
 ## Inspecting and modifying loaded data
