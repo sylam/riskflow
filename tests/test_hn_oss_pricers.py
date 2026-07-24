@@ -1,8 +1,8 @@
 """Heston-Nandi spot model wired into the two remaining one-step-survival (OSS) Monte Carlo
 pricers - the DISCRETE BARRIER option (riskflow/pricing.py pv_discrete_barrier_option) and the
-AUTOCALL (pv_MC_AutoCallSwap) - extending the committed TARF pattern (commit bf449d1).
+AUTOCALL (pv_MC_AutoCallSwap) - extending the TARF OSS pattern.
 
-RESOLUTION (settled design). Opt-in per deal TYPE via the Valuation Configuration switch
+Opt-in per deal TYPE via the Valuation Configuration switch
 ``SpotModel`` (default 'None' = GBM/surface). There is NO deal field: the params factor is found
 by NAMING CONVENTION off the equity underlying the deal already references -
 ``<SpotModel>ModelParameters.<equity>`` - and pulled in as a dependent STATIC factor by the

@@ -717,7 +717,7 @@ class CommodityPrice(EquityPrice):
     """
     field_desc = ('Commodity',
                   ['- **Currency**: String',
-                   '- **Interest_Rate**: String representing the equity repo curve',
+                   '- **Interest_Rate**: String representing the repo/lease (carry funding) curve',
                    '- **Spot**:Spot rate in the specified *Currency*'])
 
     def __init__(self, param):
@@ -965,7 +965,8 @@ class InterestRate(Factor1D):
     field_desc = ('Interest Rates',
                   ['- **Currency**: String. The associated currency for this curve',
                    '- **Curve**: *Curve* object specifying the continuously compounded interest rate',
-                   '- **Day_Count**: String. Either ACT_365 or ACT_360. The daycount convention for this curve',
+                   '- **Day_Count**: String. One of ACT_365, ACT_360, ACT_365_ISDA, _30_360, _30E_360, '
+                   'ACT_ACT_ICMA. The daycount convention for this curve',
                    '- **Sub_Type**: Optional String can be null or set to **BasisSpread** if this curve is a spread',
                    'over its parent'])
 
@@ -995,7 +996,8 @@ class InflationRate(Factor1D):
                    '- **Reference_Name**: String. allowed values listed [here]'
                    '(../Theory/Inflation/#price-index-references)',
                    '- **Curve**: *Curve* object specifying the continuously compounded inflation growth rate',
-                   '- **Day_Count**: String. Either ACT_365 or ACT_360. The daycount convention for this curve',
+                   '- **Day_Count**: String. One of ACT_365, ACT_360, ACT_365_ISDA, _30_360, _30E_360, '
+                   'ACT_ACT_ICMA. The daycount convention for this curve',
                    '- **Price_Index**: String. Name of associated PriceIndex factor'])
 
     def __init__(self, param):
@@ -1052,8 +1054,7 @@ class ReferencePrice(Factor1D):
     Used to represent how lookups on the Forward/Futures curve are performed.
     """
     field_desc = ('Energy',
-                  ['- **Currency**: String. The associated currency for this curve.',
-                   '- **Fixing_Curve**: *Curve* object of date, reference date pairs specifying the delivery date for',
+                  ['- **Fixing_Curve**: *Curve* object of date, reference date pairs specifying the delivery date for',
                    'a particular date. Both dates are in excel format.',
                    '- **ForwardPrice**: String. The name of associated ForwardPrice factor'
                    ])
@@ -1241,7 +1242,8 @@ class HullWhite2FactorModelParameters(Factor1D):
 
 class PCAMixedFactorModelParameters(Factor1D):
     """
-    Represents the Bootstrapped implied paramters for a hull-white 2 factor model
+    Represents the Bootstrapped implied parameters for a PCA-mixed factor model
+    (Reversion_Speed, Yield_Volatility)
     """
 
     def __init__(self, param):
@@ -1267,7 +1269,7 @@ class PCAMixedFactorModelParameters(Factor1D):
 
 
 class CommodityPriceVol(Factor2D):
-    field_desc = ('Commodities',
+    field_desc = ('Commodity',
                   ['- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat',
                    'extrapolated and linearly interpolated. All Floats.'
                    ])

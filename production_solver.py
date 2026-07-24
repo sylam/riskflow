@@ -1,7 +1,7 @@
 """Production DiffSolverV2 hedge solver — trains (or evaluates) a day-1 hedge policy with the
 validated best configuration.
 
-BEST CONFIG (validated 2026-07): full decision window (T_Min=0), 8k outer paths, 64 inner
+BEST CONFIG: full decision window (T_Min=0), 8k outer paths, 64 inner
 draws, one-step forks + trust-region clamp + per-column differential normalization (Huge-Savine
 lambda_j) + cost-aware argmax + antithetic inner draws, on the Components forward-curve world.
 Single-seed training is reliable; pass several seeds for an ensemble-argmax deployment (each

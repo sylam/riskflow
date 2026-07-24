@@ -34,9 +34,8 @@ SOLVER_VERSION = "diffsolverv2/2026-07"
 
 @dataclass
 class SolverResult:
-    """High-level result of a hedge solver. Field shapes vary by solver — MPC produces
-    a single decision state (`actions` is one `(n_hedge,)` target-position vector,
-    `values` a scalar expected utility); the DP solvers produce per-(t, outer-path) grids."""
+    """High-level result of a hedge solver. The DP solvers (HindsightDpSolver, DiffSolverV2)
+    produce per-(t, outer-path) grids of `actions` and `values`."""
     solver_name: str
     actions: Any
     values: Any
@@ -1325,7 +1324,7 @@ class DiffSolverV2:
 # The differential-ML solver `DiffSolverV2` is the production deliverable; the
 # clairvoyant `HindsightDpSolver` is kept as the upper-bound (oracle) benchmark
 # track. `run_textbook_benchmark` supplies the lower-bound (min-var / averaging)
-# track. The legacy DP/MPC/DifferentialSolverOld stack was removed.
+# track.
 _SOLVERS: Dict[str, Callable] = {
     "hindsightdpsolver": HindsightDpSolver,
     "diffsolverv2": DiffSolverV2,

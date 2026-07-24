@@ -212,7 +212,7 @@ class CSForwardPriceModelParameters(object):
     documentation = (
         'Energy',
         ['For Risk Neutral simulation, the Clewlow Strickland Model is calibrated to a set of European Energy',
-         'futures options $J$. We use scipy',
+         'futures options $J$.',
          'an integrated curve $\\bar{\\sigma}(t)$ needs to be specified and is',
          'interpreted as the average volatility at time $t$. This is typically obtained from the corresponding',
          'ATM volatility. This is then used to construct a new variance curve $V(t)$ which is defined as',
@@ -1087,8 +1087,6 @@ scipy.optimize.leastsq.html) are used.',
 
     def __init__(self, param, device, dtype):
         super(HullWhite2FactorModelParameters, self).__init__(param, device, dtype)
-        # HullWhite2FactorModelPrices
-        # HullWhite2FactorInterestRateModelPrices
         self.market_factor_type = 'HullWhite2FactorModelPrices'
         self.sigma_bounds = (1e-5, 0.09)
         self.alpha_bounds = (-0.5, 2.4)

@@ -565,8 +565,7 @@ class CMC_State_Inner(CMC_State):
             # the shared Sobol tensor. One low-discrepancy stream strided across (T,B,B2)
             # loses its uniformity guarantees on the per-(t,b) B2-slices as B grows — the
             # measured B=512 label/argmax degradation. iid draws have no cross-(B,B2)
-            # coupling: per-fork label noise is B-independent (the toy's full-depth T=119
-            # validation ran plain randn throughout).
+            # coupling: per-fork label noise is B-independent.
             half = B2 // 2 if use_antithetic else B2
             z = torch.randn(num_factors, T, B, half, dtype=self.one.dtype, device=self.one.device)
             z = torch.einsum('fg,gtbi->ftbi', self.t_cholesky, z)

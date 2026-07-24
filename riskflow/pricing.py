@@ -551,14 +551,14 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                             fwd_to_T, strike, vol_to_T, 1.0, 1.0, phi, shared) * D[-1]
                 else:
                     # HN smile bites HERE: the in-out-parity vanilla is the HN CLOSED FORM,
-                    # NOT a normal at aggregate variance (the rejected bridge). n_total daily steps
+                    # NOT a normal at aggregate variance. n_total daily steps
                     # to expiry, h1=H0; the per-step carry r_step reproduces the forward S*exp(b*T)
                     # (undiscounted forward-measure value = hn_call * exp(b*T)), then discounted at
                     # the real curve D[-1] - forward/discount separated as in black_european_option.
                     # r_step reduces the carry to a scalar - valid ONLY when carry is batch-constant
                     # (deterministic rates/dividends). Under stochastic-rate CVA the per-scenario
                     # carries diverge and a scalar leg would misprice the KI vanilla by O(10%) of its
-                    # value, silently - so guard loud; the fix is a batched-carry hn_call (punchlist).
+                    # value, silently - so guard loud; the fix is a batched-carry hn_call.
                     n_total = int(sum(nj))
                     carry_total = carry_int[blk].sum(dim=0).reshape(-1)
                     if float(carry_total.max() - carry_total.min()) > 1.0e-9:
@@ -1337,8 +1337,8 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                         # last step - where, given h, the daily log-return is conditionally Gaussian. The
                         # barrier B_pnl depends only on the remaining target R, constant over the interval
                         # and F-measurable at the truncation, so this scheme is EXACT (product unchanged).
-                        # A mean-matched single-step normal bridge was MEASURED and REJECTED (KO-prob error
-                        # 29% at n=5 -> ~2000% at n=63); naive daily-monitored OSS prices a DIFFERENT product.
+                        # A mean-matched single-step normal bridge mis-prices the KO probability (error grows
+                        # with n); naive daily-monitored OSS prices a DIFFERENT product.
                         n_sub = max(int(round(float(dt) * hn_spy)), 1)
                         b_step = fwd_carry * dt / n_sub  # per-step cost-of-carry r-q; total = fwd_carry*dt
                         # the first n_sub-1 unmonitored daily steps (shared advance; antithetic to

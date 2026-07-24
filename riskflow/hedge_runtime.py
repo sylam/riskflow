@@ -202,7 +202,7 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
         # rather than re-lowercasing on every reward call.
         "object": str(objective_config["Object"]).lower(),
         # Utility-transform scale. Consumed by any utility Object (Symlog / Huber / CARA);
-        # legacy "TerminalFloorThenSurplusUtility" path ignores it. `utility_scale` is mirrored
+        # the non-utility (identity) path ignores it. `utility_scale` is mirrored
         # from `bundle["utility_scale"]` (see hedge_bundle._mirror_utility_scale_to_runtime).
         "utility_scale_mode": str(objective_config.get("Utility_Scale_Mode", "vol_scaled_notional")).lower(),
         "utility_scale_explicit": None if explicit is None else float(explicit),

@@ -41,8 +41,9 @@ def fetch_module_documentation(module_name, attribute='documentation', package='
     try:
         module = importlib.import_module(module_name, package=package)
         for class_name, cls in inspect.getmembers(module, inspect.isclass):
-            # Get 'documentation' attribute
-            doc = getattr(cls, attribute, None)
+            # Get 'documentation' attribute (own attribute only, not inherited via the MRO,
+            # so behaviour-identical alias subclasses don't duplicate their parent's entry)
+            doc = cls.__dict__.get(attribute)
             if doc and isinstance(doc, (list, tuple)) and len(doc) == 2:
                 section_name, doc_content = doc
                 if isinstance(doc_content, list):
@@ -50,9 +51,9 @@ def fetch_module_documentation(module_name, attribute='documentation', package='
                 else:
                     logging.warning(f"Documentation attribute '{attribute}' in class '{class_name}' in module '{module_name}' has unexpected format.")
 
-            # Get 'field_desc' attribute specifically if module is riskfactors
-            if module_name == '.riskfactors' and hasattr(cls, 'field_desc'):
-                field_desc = getattr(cls, 'field_desc', None)
+            # Get 'field_desc' attribute specifically if module is riskfactors (own attribute only)
+            if module_name == '.riskfactors' and 'field_desc' in cls.__dict__:
+                field_desc = cls.__dict__.get('field_desc')
                 if field_desc and isinstance(field_desc, (list, tuple)) and len(field_desc) == 2:
                     section_name, desc_content = field_desc
                     if isinstance(desc_content, list):

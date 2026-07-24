@@ -1,24 +1,24 @@
 """Realistic-friction upgrades to the hedging cost model, both behind JSON switches and all
 bit-identical when the switch is off (verified here + by the rest of the suite staying green):
 
-  Task 1 — maturity/liquidity- and volatility-dependent bid/offer half-spread. The single
+  Bid/offer half-spread — maturity/liquidity- and volatility-dependent. The single
            chokepoint `hedge_runtime.per_contract_kappa` grows a spec form (Per_Instrument +
            Vol_Scale) and a world-agnostic `vol` argument; the scalar path is untouched.
 
-  Task 2 — vol-linked initial-margin FUNDING charge on the post-trade book. Per hedge leg the desk
+  IM funding charge — vol-linked initial-margin FUNDING charge on the post-trade book. Per hedge leg the desk
            posts IM = IM_Vol_Multiplier·(σ_t/IM_Ref_Vol)·F·|q^post|·cs and pays
            IM_Funding_Spread_Bps·1e-4·dt to fund it over the calendar step — a pure realized debit
            into the SAME account-step P&L path as transaction cost (`_im_funding_charge`).
            IM_Funding_Spread_Bps default 0 ⇒ term is exactly 0 ⇒ bit-identical.
 
-  Task 3 — a roll (reduce one contract month, increase an adjacent month) charges the matched
+  Roll rebate (calendar-spread half-cost) — a roll (reduce one contract month, increase an adjacent month) charges the matched
            quantity a single calendar-spread half-cost, not two outright half-spreads. Realized
            accounting only (`hedge_bundle._roll_rebate` credited into the env debit); the
            decision-time argmax keeps the conservative per-instrument outright kappa.
 
-Audit-hardening (protect a GARCH retrain's integrity): the per-step vol SOURCE is logged + pinned
-(revealed log_h vs realized proxy), and the diagnostic CSV reconstruction threads the same per-step
-vol so its cost reconciles with the realized vol-scaled debit.
+Vol-source coverage: the per-step vol SOURCE is logged + pinned (revealed log_h vs realized proxy),
+and the diagnostic CSV reconstruction threads the same per-step vol so its cost reconciles with the
+realized vol-scaled debit.
 
 Runtimes are built through the public JSON contract (`construct_hedge_runtime`) so the tests
 exercise the real Evaluator → accounting normalization.
@@ -445,7 +445,7 @@ def test_roll_rebate_flows_through_realized_futures_debit():
     assert checked
 
 
-# =============== Audit-hardening — vol source is observable + diagnostic reconciles ===========
+# =============== Vol source is observable + diagnostic reconciles ===========
 
 def _garch(param=None):
     p = dict(Omega=8.028e-07, Alpha=0.0328, Beta=0.9639, Nu=7.50,

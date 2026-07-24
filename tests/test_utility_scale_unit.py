@@ -1,7 +1,5 @@
-"""Utility-scale plumbing tests — re-homed live-code coverage from the deleted RL-era
-test_symlog_legacy_identical.py (the band tests died with the band; these guard code that
-survives: _mirror_utility_scale_to_runtime, resolve_utility_scale, _utility_wrap_signed's
-fail-loud missing-scale contract)."""
+"""Utility-scale plumbing tests: _mirror_utility_scale_to_runtime, resolve_utility_scale,
+and _utility_wrap_signed's fail-loud missing-scale contract."""
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

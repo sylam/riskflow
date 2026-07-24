@@ -2,10 +2,9 @@
 hedging gate on the platinum deal.
 
 Locks the two things the build hinged on:
-  • the value stays BOUNDED at depth (the expired-contract fake-dF bug inflated it to 1e3+;
-    pre-rebuild the legacy solver blew to 1e8) — `max|Y_boot|` small, V_0 finite/small;
+  • the value stays BOUNDED at depth — `max|Y_boot|` small, V_0 finite/small;
   • the greedy policy HEDGES out-of-sample — on held-out paths it does not underperform
-    no-hedge (the full result is greedy ≫ textbook OOS at full depth; see the build notes).
+    no-hedge (greedy ≫ textbook OOS at full depth).
 The verdict rolls on paths the value function never saw (`DiffV2_OOS_Frac`), so a policy
 that merely overfits the fitted paths fails this.
 

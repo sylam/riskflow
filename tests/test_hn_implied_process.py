@@ -377,9 +377,9 @@ def test_outer_reseed_terminal_h():
 def test_reseed_from_path_forward_replay(year_per_day):             # production calendar grid f≈0.69:
     # Observed-path replay reruns the HN variance recursion on the REALIZED returns; with the same
     # carry/convexity the innovation is recovered exactly, so the replayed log h matches the forward
-    # sim to float precision. The calendar-grid row is the audit's regression gate: the forward
+    # sim to float precision. The calendar-grid row is the regression gate: the forward
     # update must apply the SAME fractional blend as the replay (unblended forward desyncs by
-    # max|Δlog h|≈1.5 at f≈0.69 — the platinum clock trap, caught 2026-07-23).
+    # max|Δlog h|≈1.5 at f≈0.69 — the platinum clock trap).
     T, B = 120, 800
     tg = _time_grid(T, year_per_day=year_per_day)
     pf, shf = _make(T, B, tg=tg, seed=5)

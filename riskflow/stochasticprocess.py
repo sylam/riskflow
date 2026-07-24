@@ -137,10 +137,9 @@ def hmm_forward_backward(log_pi, log_P, log_emit):
     return gamma, xi, log_lik
 
 
-# State-reveal tags for `reveal_state_at` (see [[project-diffpca-reveal-design]]): a CONTINUOUS
-# segment is a first-order-differentiable risk factor (the diff-PCA pool of migration step 2); a
-# SUFFICIENT segment is a minimal sufficient statistic (regime belief) revealed verbatim, bypassing
-# PCA. Migration step 1 concatenates every segment regardless of tag (IDENTITY treatment).
+# State-reveal tags for `reveal_state_at`: a CONTINUOUS segment is a first-order-differentiable
+# risk factor (the diff-PCA pool); a SUFFICIENT segment is a minimal sufficient statistic (regime
+# belief) revealed verbatim, bypassing PCA.
 REVEAL_CONTINUOUS = 'continuous'
 REVEAL_SUFFICIENT = 'sufficient'
 
@@ -1204,6 +1203,37 @@ class CSForwardPriceModel(StochasticProcess):
 class CSImpliedForwardPriceModel(CSForwardPriceModel):
     """The Clewlow Strickland Stochastic Process with implied vol and mean reversion"""
 
+    documentation = ('Energy Pricing',
+                     ['The risk-neutral (implied) variant of the Clewlow-Strickland forward price '
+                      'model. The drift is set to zero, so the forward price is a martingale under '
+                      'the pricing measure. For each settlement date T, the SDE for the forward '
+                      'price is:',
+                      '',
+                      '$$ dF(t,T) = \\sigma e^{-\\alpha(T-t)}F(t,T)dW(t)$$',
+                      '',
+                      'Where:',
+                      '',
+                      '- $\\sigma$ is the volatility',
+                      '- $\\alpha$ is the mean reversion speed',
+                      '- $W(t)$ is the standard Weiner Process',
+                      '',
+                      'The volatility $\\sigma$ and mean reversion speed $\\alpha$ are read from the '
+                      'implied vol surface.',
+                      '',
+                      'Final form of the model is',
+                      '',
+                      '$$ F(t,T) = F(0,T)exp\\Big(-\\frac{1}{2}\\sigma^2e^{-2\\alpha(T-t)}v(t)+\\sigma '
+                      'e^{-\\alpha(T-t)}Y(t)\\Big)$$',
+                      '',
+                      'Where $Y$ is a standard Ornstein-Uhlenbeck Process with variance:',
+                      '',
+                      '$$v(t) = \\frac{1-e^{-2\\alpha t}}{2\\alpha}$$',
+                      '',
+                      'The spot rate is given by',
+                      '',
+                      '$$S(t)=F(t,t)=F(0,t)exp\\Big(-\\frac{1}{2}\\sigma^2v(t)+\\sigma Y(t)\\Big)$$',
+                      ''])
+
     def __init__(self, factor, param, implied_factor=None):
         super(CSImpliedForwardPriceModel, self).__init__(factor, param)
         self.implied = implied_factor
@@ -1328,7 +1358,7 @@ class PCAInterestRateModel(StochasticProcess):
 
         # Anchor at time_grid_years[0] so per-step dt and elapsed time are correct in both
         # outer mode (time_grid_years[0] = 0) and inner-MC kept-base mode (> 0). `elapsed`
-        # is time since sim start, used wherever the legacy code used absolute time_grid_years.
+        # is time since sim start.
         # Exact OU discretisation: Y_{k+1} = exp(-α Δt_k) Y_k + sqrt((1-exp(-2α Δt_k))/(2α)) Z_{k+1}
         dt_steps   = np.diff(np.append([time_grid_years[0]], time_grid_years))  # [T]
         elapsed    = dt_steps.cumsum()                                        # [T] — time since sim start
@@ -1416,10 +1446,8 @@ class PCAInterestRateModel(StochasticProcess):
         return self.align_rank(self.fwd_component, stoch.ndim) * torch.exp(stoch)
 
     def reveal_state_at(self, t, buffer):
-        # MIGRATION STEP 1 (temporary): this InterestRate curve is EXCLUDED from the V̂ market
-        # state — its hedging content is already carried by the tradable futures, and revealing
-        # every tenor bloats the basis past the training-row count. Step 2 (diff-PCA) deletes this
-        # override; the base default then declares every tenor and the reducer derives k_curve≈0.
+        # Excluded from the V̂ market state: the tradable futures already carry this curve's
+        # hedging content; revealing every tenor bloats the basis.
         return []
 
 
@@ -2293,13 +2321,16 @@ class MarkovHMMSpotModel(StochasticProcess):
          '$$ \\Delta S_t \\sim \\mathcal{N}(\\mu_{z_t}\\delta,\\, \\sigma_{z_t}^2\\delta) $$',
          '',
          'No mean reversion at the spot level; long-memory autocorrelation arises from regime '
-         'persistence and fat tails from regime occupancy.',
+         'persistence and fat tails from regime occupancy. Innovations are optionally Student-t '
+         '(rescaled to unit variance) when a state carries a $\\nu$.',
          '',
          'Parameters:',
          '- **States**: List of $\\{\\mu, \\sigma\\}$ per regime (annualised).',
+         '- **Nu** (optional, per state): Student-t degrees of freedom.',
          '- **Transition_Matrix**: NxN row-stochastic at the calibration step.',
          '- **Initial_State_Probs**: Initial regime distribution.',
-         '- **Calibration_DT_Years**: Step size of $P$ (default 1/252).'])
+         '- **Calibration_DT_Years**: Step size of $P$ (default 1/252).',
+         '- **Log_Price**: bool (default False) — emit log returns instead of raw price diffs.'])
 
     def __init__(self, factor, param, implied_factor=None):
         super().__init__(factor, param)
@@ -2519,7 +2550,7 @@ class MarkovHMMSpotModel(StochasticProcess):
         `(T,n,B)` vs regimes `(T,B)`; inner belief `(T,n,B,B2)` vs regimes `(T,B,B2)` ⇒
         `belief.dim() == regimes.dim() + 1`), else the degenerate true-regime one-hot fallback.
         The observable spot level — the deployable LME quote the liability marks to — is the last
-        (CONTINUOUS) coordinate. Reproduces the pre-migration privileged packing byte-for-byte."""
+        (CONTINUOUS) coordinate."""
         key = self.factor_key
         price = buffer[key][t].unsqueeze(0)                                   # (1, ...batch)
         regimes = buffer[(key, 'regimes')]
@@ -2906,7 +2937,11 @@ class GARCHSpotModel(StochasticProcess):
          '- **Alpha, Beta**: GARCH weights ($\\alpha+\\beta\\le 0.999$).',
          '- **Nu**: Student-t degrees of freedom.',
          '- **Mu**: annualised drift (default 0).',
-         '- **Calibration_DT_Years**: step size of the recursion (default 1/252).'])
+         '- **Calibration_DT_Years**: step size of the recursion (default 1/252).',
+         '- **Convexity_Correction**: Yes/No (default No). Yes makes the PRICE a Mu-martingale by '
+         'subtracting $\\tfrac{1}{2}\\text{Var}(r_t)$ from the per-step log-drift; No leaves a '
+         '$+\\tfrac{1}{2}\\text{var}$ Jensen drift.',
+         '- **Log_Price**: bool (default True; the model is defined on log returns).'])
 
     def __init__(self, factor, param, implied_factor=None):
         super().__init__(factor, param)
@@ -2951,8 +2986,8 @@ class GARCHSpotModel(StochasticProcess):
         # the sim grid runs in CALENDAR time (Time_Grid "0d 1d(1d)" ⇒ dt=1/365.25, NOT
         # business-day adjusted), so f_t = dt_t/dt_c is the trading-time length of a grid
         # step (≈0.69 on the production grid). generate scales per-step variance by f_t so
-        # the annualized vol and the mean-reversion RATE are grid-invariant (see §1a of the
-        # spec). n_sub = round(f) ≥ 2 (grid ≥ ~1.5 bd/step) falls back to the integer
+        # the annualized vol and the mean-reversion RATE are grid-invariant. n_sub = round(f)
+        # ≥ 2 (grid ≥ ~1.5 bd/step) falls back to the integer
         # aggregate-variance bridge; n_sub == 1 uses the exact fractional step.
         self.f = _t(dt_arr / dt_c)                                               # (T,) trading-time step length
         self.n_sub = np.maximum(1, np.round(dt_arr / dt_c)).astype(int)
@@ -3097,7 +3132,7 @@ class GARCHSpotModel(StochasticProcess):
         """Observed-path replay: rerun the GARCH variance recursion (fractional clock) on the
         REALIZED returns of the supplied price path, publishing `garch_log_h` (so reveal returns
         the right log h along the replayed path) and `h0_outer` (the terminal h, for a continuing
-        replay). Closes the stepper-replay gap — replays used to reseed nothing in a GARCH world.
+        replay).
         Convexity coupling: the forward sim writes ds = drift − ½Var(r) + r, so the innovation is
         recovered as r = realized_logret − drift + ½Var(r) with the SAME correction, keeping the
         h recursion identical between forward sim and replay (Var(r)=h·f on the n_sub≤1 clock)."""
@@ -3132,7 +3167,7 @@ class GARCHSpotModel(StochasticProcess):
 
 
 class GARCHSpotCalibration(object):
-    """Zero-mean GARCH(1,1)-t MLE of GARCHSpotModel on a business-daily close series (§5).
+    """Zero-mean GARCH(1,1)-t MLE of GARCHSpotModel on a business-daily close series.
     The fit runs in percent-return units (100·r) for conditioning, then converts ω, H0 back
     to fraction (×1e-4). Uses `arch` if importable, else scipy L-BFGS-B on the identical
     standardised-t log-likelihood. H0 is the filtered conditional variance at the final
@@ -3286,8 +3321,8 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
 
     Observable state: log h_t = log h_{t+1}^{HN} (the predictable variance of the step t→t+1,
     F_t-measurable — no lookahead), revealed to the value function exactly as GARCHSpotModel's log_h.
-    The 7-verb protocol (privileged_layout / reveal_state_at / revealed_annual_vol / inner_fork_seed /
-    outer_reseed / reseed_from_path) mirrors GARCHSpotModel; generate handles outer (T,B) and inner
+    The 7-verb protocol (privileged_layout / privileged_factors / reveal_state_at / revealed_annual_vol /
+    inner_fork_seed / outer_reseed / reseed_from_path) mirrors GARCHSpotModel; generate handles outer (T,B) and inner
     (T,B,B2) with the fork seed on the MIDDLE axis. The single framework Gaussian per step feeds the
     HN z directly (plain normal — HN has no Student-t emission, unlike GARCH)."""
 

@@ -89,9 +89,7 @@ SOFR_PREFIX = 'InterestRate.USD-SOFR'
 
 # validated objective (matches artifacts/platinum_hedge_shipping.json)
 OBJECTIVE = {'Object': 'AsymmetricUtility_Huber', 'Huber_Aversion': 6.0, 'Huber_Delta': 1.0}
-# (RL-era keys Floor_Penalty/Surplus_Reward/Power/Expiry_*/Post_Deal_Trade_Penalty/
-#  *_Bounds_Penalty removed 2026-07-24: read by nothing - _normalize_objective_config
-#  consumes only Object/Huber_*/CARA_Gamma/Utility_Scale_*.)
+# _normalize_objective_config consumes only Object/Huber_*/CARA_Gamma/Utility_Scale_*.
 
 
 def _ts(d):
@@ -480,7 +478,7 @@ def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
     observed_scenario_npz(arch, trade_date, obs_npz)
     roll = apply_config(copy.deepcopy(cfg), batch=1, seed=args.seeds[0], load=ckpts,
                         stepper_rollout=True, randomize_initial_state=False)
-    # The ROLL's inner draws are independent of training's (validated 64): at Batch_Size=1 a
+    # The ROLL's inner draws are independent of training's: at Batch_Size=1 a
     # large inner sub-batch is nearly free and shrinks the causal one-step forecast noise
     # (the argmax input is E_inner[C_{t+1}]) that dominates single-realized-path dispersion.
     roll['Calc']['Calculation']['Inner_Sub_Batch'] = args.roll_inner

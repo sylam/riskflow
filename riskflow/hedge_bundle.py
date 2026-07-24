@@ -25,8 +25,7 @@ from .hedge_runtime import (
 )
 
 
-# --- spot realized-vol + timeline (relocated from the deleted hedge_features.py); feed the
-#     symlog utility scale c in resolve_utility_scale ------------------------------------------ #
+# --- spot realized-vol + timeline; feed the symlog utility scale c in resolve_utility_scale --- #
 PRICE_ZSCORE_WINDOW = 20
 
 
@@ -347,7 +346,7 @@ def wealth_step(W, q, contract_size, dF, dL):
 
 # The terminal-utility SHAPES (all map dollars→O(1) utility via the deal scale c: x = W/c).
 # symlog is odd/symmetric; huber and cara are asymmetric (downside-averse). Selected by
-# `Objective.Object`; the legacy `TerminalFloorThenSurplusUtility` is the identity path.
+# `Objective.Object`; any non-utility Object takes the identity (no-op) path.
 # All consume the same scale `c` and live in "utility space" (the DP / value-fn recursion).
 _UTILITY_OBJECTS = (
     "asymmetricutility_symlog", "asymmetricutility_huber", "asymmetricutility_cara")
@@ -1179,8 +1178,8 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
         for currency, blocks in (hedge_profile_blocks.get('realized_cashflows') or {}).items()
     }
     if liability_mtm is not None:
-        # The liability MTM sets the mtm/hedge time axis (its native length is the mtm grid —
-        # the same axis the old leg-feature tensor defined); everything else pads/truncates to it.
+        # The liability MTM sets the mtm/hedge time axis (its native length is the mtm grid);
+        # everything else pads/truncates to it.
         aligned_time_steps = int(liability_mtm.shape[0])
     else:
         candidate_lengths = [int(time_grid_days.shape[0])]
@@ -1228,8 +1227,7 @@ def build_hedge_bundle(base_date, business_day, time_grid_days, tradable_blocks,
     )
     # Liability descriptors the symlog utility-scale needs, from the cashflow schedule (no leg
     # tensor). `total_leg_volume` = Σ|notional|; `last_settlement_index` = last (history-prefixed)
-    # grid step still strictly before the final payment — the same value the old leg-feature
-    # `time_to_payment > 0` reduction produced (time_to_payment>0 ⟺ grid_day < payment_day).
+    # grid step still strictly before the final payment (grid_day < payment_day).
     if total_leg_volume:
         bundle['total_leg_volume'] = float(total_leg_volume)
     if last_payment_day is not None:
