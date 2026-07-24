@@ -23,7 +23,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "PLATINUM_CME.CME_FLAT",
+       "Commodity": "PLATINUM_CME",
        "Contract_Size": 50
       },
       "PL_M2": {
@@ -33,7 +33,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "PLATINUM_CME.CME_FLAT",
+       "Commodity": "PLATINUM_CME",
        "Contract_Size": 50
       },
       "PL_M3": {
@@ -43,7 +43,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "PLATINUM_CME.CME_FLAT",
+       "Commodity": "PLATINUM_CME",
        "Contract_Size": 50
       }
      },
@@ -197,12 +197,7 @@
       "Property_Aliases": ""
      },
      "ObservedBasis.PLATINUM_CME.LME_CME": {
-      "Spot": 15.516078760020719,
-      "Observed_Factor": "PLATINUM_CME"
-     },
-     "ObservedBasis.PLATINUM_CME.CME_FLAT": {
-      "Spot": 0.0,
-      "Observed_Factor": "PLATINUM_CME"
+      "Spot": 15.516078760020719
      },
      "ReferencePrice.PLATINUM": {
       "Fixing_Curve": {

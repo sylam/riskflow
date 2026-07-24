@@ -135,9 +135,6 @@ def _hmm_factor():
     return types.SimpleNamespace(param={})
 
 
-def _basis_factor(linked='CommodityPrice.LME'):
-    # Basis reads factor.param['Observed_Factor'] to find the linked CommodityPrice.
-    return types.SimpleNamespace(param={'Observed_Factor': linked})
 
 
 def _var_factor(ref_date):
@@ -347,9 +344,11 @@ def _setup_basis(*, batch_size, T=10, inner_sub=None, seed=42):
                            simulation_sub_batch=inner_sub)
     _do_reset(shared, 1, tg)
 
-    p = BasisLinkedSpotModel(factor=_basis_factor(linked='CommodityPrice.LME'),
-                             param=_basis_param())
-    p.factor_key = utils.Factor('ObservedBasis', ('LME_CME', 'LME'))
+    p = BasisLinkedSpotModel(factor=None, param=_basis_param())
+    # chained name <parent>.<basis>; the linked parent is the name prefix (set here in place of
+    # the framework's calc_references, which resolves the parent's type from all_factors)
+    p.factor_key = utils.Factor('ObservedBasis', ('CME', 'LME_CME'))
+    p.linked_key = utils.Factor('CommodityPrice', ('CME',))
     if inner_sub is None:
         tensor = torch.tensor([3.0], dtype=DTYPE, device=DEVICE)
         lme_shape = (T, batch_size)

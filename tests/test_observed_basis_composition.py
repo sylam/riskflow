@@ -7,7 +7,8 @@ Coverage:
   * spot rate — calc_time_grid_spot_rate: single-element bit-path, multi-element sum, cache reuse,
     stacked (3-element) sum.
   * resolver — positional single/composite/stack for commodity + fx, and the IR identity case.
-  * validation — Observed_Factor vs name-prefix, at the consumer (BasisLinkedSpotModel.calc_references).
+  * linkage — BasisLinkedSpotModel.calc_references derives its linked parent from the name prefix
+    (composable-type resolution at depth 2, ObservedBasis chain deeper; loud if not exactly one).
   * deal — a composed-name Commodity sums the basis into the priced liability (zero basis is a no-op).
 """
 import json
@@ -148,15 +149,20 @@ def test_stacked_basis_sums_in_spot_rate():
     assert torch.equal(out, prim[idx] + b1[idx] + b2[idx])
 
 
-def test_observed_factor_validation_at_consumer():
+def test_linked_parent_derived_from_name():
     from riskflow.stochasticprocess import BasisLinkedSpotModel
-    key = utils.Factor('ObservedBasis', ('PLATINUM_CME', 'LME_CME'))
-    # Observed_Factor must equal the name minus the last element
-    bad = BasisLinkedSpotModel(factor=None, param={'Observed_Factor': 'PLATINUM_WRONG'})
-    with pytest.raises(Exception, match='Observed_Factor'):
-        bad.calc_references(key, {}, {}, {}, {})
-    good = BasisLinkedSpotModel(factor=None, param={'Observed_Factor': 'PLATINUM_CME'})
-    good.calc_references(key, {}, {}, {}, {})   # agrees -> no raise
+    F = utils.Factor
+    # depth-2: parent = name[:-1], type resolved from all_factors (exactly one composable type)
+    b = BasisLinkedSpotModel(factor=None, param={})
+    b.calc_references(F('ObservedBasis', ('PLATINUM_CME', 'LME_CME')), {}, {},
+                      {}, {F('CommodityPrice', ('PLATINUM_CME',)): object()})
+    assert b.linked_key == F('CommodityPrice', ('PLATINUM_CME',))
+    # stacked (len>2): the immediate parent is the previous chain prefix as ObservedBasis
+    b.calc_references(F('ObservedBasis', ('PLATINUM_CME', 'LME_CME', 'SHF')), {}, {}, {}, {})
+    assert b.linked_key == F('ObservedBasis', ('PLATINUM_CME', 'LME_CME'))
+    # ambiguous / missing parent type -> loud
+    with pytest.raises(Exception, match='exactly one composable'):
+        b.calc_references(F('ObservedBasis', ('PLATINUM_CME', 'LME_CME')), {}, {}, {}, {})
 
 
 # --- deal-level: composed reference in the Commodity NAME -----------------------------------
@@ -185,6 +191,4 @@ def _liability_mtm(cfg):
 def test_composed_name_sums_into_liability():
     full = _liability_mtm(_ship_cfg())                                  # CME + LME_CME
     primary = _liability_mtm(_ship_cfg(commodity='PLATINUM_CME'))       # CME alone
-    zero = _liability_mtm(_ship_cfg(commodity='PLATINUM_CME.CME_FLAT')) # CME + 0
     assert not torch.equal(full, primary), 'LME_CME basis made no difference to the liability'
-    assert torch.equal(zero, primary), 'a zero (CME_FLAT) basis must be a bit-exact no-op'

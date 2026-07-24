@@ -87,7 +87,8 @@ def test_solve_reveal_width_9_vs_7():
         diag = (_run(mkt, 'solve_hedge').evaluation_summary or {}).get('diagnostics') or {}
         assert diag.get('bounded') is True, f'{name}: solve not bounded'
         dims[name] = diag.get('market_dim')
-    # V̂ market width resizes with the model: HMM belief(3)+price(1)+shared(5)=9; GARCH log_h(1)+price(1)+5=7.
-    assert dims['HMM'] == 9, dims['HMM']
-    assert dims['GARCH'] == 7, dims['GARCH']
+    # V̂ market width resizes with the model: HMM belief(3)+price(1)+shared(4)=8; GARCH log_h(1)+price(1)+4=6.
+    # (shared is 4, not 5, since the CME_FLAT identity basis was removed — a composed name needs no +0 factor.)
+    assert dims['HMM'] == 8, dims['HMM']
+    assert dims['GARCH'] == 6, dims['GARCH']
     assert dims['HMM'] - dims['GARCH'] == 2, dims

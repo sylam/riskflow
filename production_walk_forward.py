@@ -16,16 +16,14 @@ Aggregate across all trades and print the table (mean/min/max, positives, bound-
 
 CORRECTED (composed-spot) architecture, all validated:
   * CommodityPrice.PLATINUM_CME = P is the martingale primary (MarkovHMMSpotModel).
-  * ObservedBasis.PLATINUM_CME.LME_CME (BasisLinkedSpotModel, Observed_Factor=PLATINUM_CME) carries the
-    published basis b = S - P (LME - CME) — the LBMA catch-up.
+  * ObservedBasis.PLATINUM_CME.LME_CME (BasisLinkedSpotModel) carries the published basis
+    b = S - P (LME - CME) — the LBMA catch-up. Its linked parent is the name prefix PLATINUM_CME.
   * The LBMA fixing S = P + b is the composed spot: the swap's Commodity is the composed
     reference PLATINUM_CME.LME_CME (primary + basis carried in the NAME, like InterestRate.
-    USD.LIBOR), so its FloatingEnergyDeal prices off primary + basis directly (the basis-aware
-    spot lookup sums the two buffers — no separate composed factor/model, no deal-side fields).
-  * The CME futures reference the primary through the identity basis PLATINUM_CME.CME_FLAT
-    (Observed_Factor=PLATINUM_CME, zero dynamics) so synthetic = P + 0 = P (martingale) and
-    E[dF|b] ≈ 0 (unexecutable reversion not harvested). The dependency graph is acyclic:
-    CME -> {CME_FLAT, LME_CME}.
+    USD_SOFR.FUNDING), so both the swap and the CME futures price off it via the basis-aware spot
+    lookup — no separate composed factor/model, no deal-side basis fields.
+  * The CME futures reference the primary directly (Commodity=PLATINUM_CME = P, a martingale),
+    so E[dF|b] ≈ 0 (unexecutable reversion not harvested).
 
 The raw futures file (--archive, default data/pl_exp.csv) is decomposed internally into the
 corrected series by build_corrected_archive() (CME-implied continuous spot P, published basis,
@@ -85,7 +83,7 @@ CARRY_TENORS = ('PLATINUM_TAU1', 'PLATINUM_TAU2', 'PLATINUM_TAU3')
 # --- corrected archive column names ---
 CME_COL = 'CommodityPrice.PLATINUM_CME'          # martingale primary P
 LME_COL = 'CommodityPrice.PLATINUM_LME'          # LBMA fixing S = P - b
-BASIS_COL = 'ObservedBasis.PLATINUM_CME.LME_CME,PLATINUM_CME'  # published basis b = S - P (LME - CME)
+BASIS_COL = 'ObservedBasis.PLATINUM_CME.LME_CME'  # published basis b = S - P (LME - CME)
 CARRY_COL = 'ForwardRate.PLATINUM_CARRY'          # + ',<tenor>'
 SOFR_PREFIX = 'InterestRate.USD-SOFR'
 
@@ -194,16 +192,15 @@ def delta_corridor_schedule(trade_date, fixings, band):
             for s, (lo, hi) in sorted(knots.items())]
 
 
-def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume, delta_corridor=None,
-                      spot_model='hmm'):
+def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume, delta_corridor=None):
     """Reshape the deal template to the trade date in the corrected world, reading every market
     level off the corrected archive row. Returns (cfg, info) where info carries the strike and
     the dates the causal bound / observed path need. Adapt this for a different product.
 
     Deal: a 3-month average-price swap (Receiver) on the pure LBMA fixing, averaged over the full
     3rd calendar month after the trade date, paid +5 days, struck at fair - margin. Hedges: the
-    CME futures strip at the 3 carry tenors, each referencing the primary through the identity
-    basis Implied_Basis=CME_FLAT (synthetic = P + 0 = P, the martingale primary).
+    CME futures strip at the 3 carry tenors, each referencing the martingale primary directly
+    (Commodity=PLATINUM_CME = P).
     """
     row = arch.loc[:trade_date].iloc[-1]
     cfg = copy.deepcopy(template)
@@ -236,12 +233,12 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
         'FX_Period_Start': _ts(avg_start), 'FX_Period_End': _ts(avg_end), 'Volume': volume,
         'Realized_Average': 0.0, 'FX_Realized_Average': 0.0, 'Fixed_Basis': -(k_fair - margin)})
 
-    # --- tradables: CME strip at the tenor ladder (primary via CME_FLAT identity basis = P) -----
+    # --- tradables: CME strip at the tenor ladder (Commodity=PLATINUM_CME = the primary P) -------
     futs, positions, setts, margins, limits = {}, {}, {}, {}, {}
     for i, (mat, c, tau) in enumerate(zip(mats, carry, taus), 1):
         name = f'PL_M{i}'
         futs[name] = {'Maturity_Date': _ts(mat), 'Currency': 'USD', 'Carry': 'PLATINUM_CARRY',
-                      'Repo_Rate': 'USD-SOFR', 'Implied_Basis': 'PLATINUM_CME.CME_FLAT', 'Contract_Size': CONTRACT_SIZE}
+                      'Repo_Rate': 'USD-SOFR', 'Commodity': 'PLATINUM_CME', 'Contract_Size': CONTRACT_SIZE}
         positions[name] = 0
         setts[name] = round(p0 * float(np.exp(c * tau)), 4)
         margins[name] = {'Method': 'per_contract', 'Amount': round(0.085 * setts[name] * CONTRACT_SIZE, 0)}
@@ -270,8 +267,7 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
         'FxRate.USD': {'Domestic_Currency': '', 'Interest_Rate': 'USD-SOFR', 'Spot': 1.0},
         CME_COL: {'Currency': 'USD', 'Interest_Rate': 'USD-SOFR', 'Forward_Rate': 'PLATINUM_CARRY',
                   'Spot': p0, 'Property_Aliases': ''},
-        'ObservedBasis.PLATINUM_CME.LME_CME': {'Spot': b0, 'Observed_Factor': 'PLATINUM_CME'},
-        'ObservedBasis.PLATINUM_CME.CME_FLAT': {'Spot': 0.0, 'Observed_Factor': 'PLATINUM_CME'},
+        'ObservedBasis.PLATINUM_CME.LME_CME': {'Spot': b0},
         'ReferencePrice.PLATINUM': {'Fixing_Curve': {'.Curve': {'meta': [], 'data': [[40000, 40000], [50000, 50000]]}},
                                     'ForwardPrice': None, 'Property_Aliases': ''},
         'ForwardRate.PLATINUM_CARRY': {'Currency': 'USD', 'Curve': {'.Curve': {'meta': [], 'data': [
@@ -283,14 +279,7 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
         'ForwardPriceSample.USD': {'Offset': 0, 'Holiday_Calendar': 'New York',
                                    'Sampling_Convention': 'ForwardPriceSampleDaily'},
     }
-    emd_pm = emd.setdefault('Price Models', {})
-    # CME_FLAT is the zero-dynamics identity basis (not calibrated — carries no archive series);
-    # inject its params so the futures' synthetic = P + 0 = P references the martingale primary.
-    # Sigma form must match the primary: regime-conditional (HMM publishes 'regimes') vs flat
-    # (GARCH publishes no regimes — a Sigma_By_State basis would fail loud on the missing key).
-    flat = {'A': 0.0, 'Phi': 0.0, 'Nu': 5.0, 'Mu': 0.0}
-    emd_pm['BasisLinkedSpotModel.PLATINUM_CME.CME_FLAT'] = (
-        {**flat, 'Sigma': 0.0} if spot_model == 'garch' else {**flat, 'Sigma_By_State': [0.0, 0.0, 0.0]})
+    emd.setdefault('Price Models', {})
     emd['Valuation Configuration'] = {'FloatingEnergyDeal': {'ForwardCurve': 'Components'}}
 
     info = {'k_fair': k_fair, 'mats': mats, 'pay': pay}
@@ -446,7 +435,7 @@ def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
     killed lane re-pointed at the same run dir resumes mid-trade without retraining. Row diagnostics
     train_u / V_0 report the primary member (seeds[0]); train_u_seeds carries the per-seed spread."""
     cfg, info = build_deal_config(template, arch, trade_date, calibrated_md, args.margin, args.volume,
-                                  delta_corridor=args.delta_corridor, spot_model=args.spot_model)
+                                  delta_corridor=args.delta_corridor)
     # Model tag stamped into every per-trade artifact name so a GARCH lane pointed at an HMM run
     # dir (or vice-versa) never reuses the wrong checkpoint/md/obs; HMM names are unchanged.
     sfx = '' if args.spot_model == 'hmm' else f'_{args.spot_model}'

@@ -266,21 +266,8 @@ def get_commodity_rate_factor(fieldname, static_offsets, stochastic_offsets):
     return calc_factor_code_chain('CommodityPrice', 'ObservedBasis', fieldname, static_offsets, stochastic_offsets)
 
 
-def get_impliedbasis_factor(fieldname, static_offsets, stochastic_offsets):
-    """Read the index of the ObservedBasis scalar price factor"""
-    return [calc_factor_index(utils.Factor('ObservedBasis', fieldname),
-                              static_offsets, stochastic_offsets)]
-
-
 def get_forward_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors):
     return [calc_factor_index(utils.Factor('ForwardRate', fieldname), static_offsets, stochastic_offsets, all_tenors)]
-
-
-def get_observed_factor_name(fieldname, all_factors):
-    """Read the name of the CommodityPrice factor that this ObservedBasis is observed against."""
-    basis = all_factors.get(utils.Factor('ObservedBasis', fieldname))
-    return basis.factor.observed_factor() if hasattr(basis, 'factor') \
-        else basis.observed_factor()
 
 
 def get_equity_rate_factor(fieldname, static_offsets, stochastic_offsets):
@@ -3728,22 +3715,21 @@ class CommodityForwardDeal(Deal):
 
 class CommodityFutureDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
-                     'Implied_Basis': ['ObservedBasis'],
+                     'Commodity': ['CommodityPrice'],
                      'Repo_Rate': ['InterestRate'],
                      'Carry': ['ForwardRate']}
 
     documentation = ('Energy', [
-        'A standardised futures contract on a commodity. The pricing spot is constructed as',
-        'an observed market spot plus an implied basis adjustment; the **Implied_Basis** factor',
-        'declares the linked **Observed_Factor** via its own field, so the deal references',
-        'the basis only and the framework wires the observed spot in automatically.',
+        'A standardised futures contract on a commodity. **Commodity** is the pricing spot — a',
+        'plain spot, or a composed name (primary + ObservedBasis chain, e.g.',
+        '`PLATINUM_CME.LME_CME`) whose periods are summed by the basis-aware spot lookup.',
         '',
-        '$$F(t,T)=(S(t)+b(t))\\exp\\Big(c(t,T)\\,(T-t) + \\int_t^T r(t,u)du\\Big)$$',
+        '$$F(t,T)=S(t)\\exp\\Big(c(t,T)\\,(T-t) + \\int_t^T r(t,u)du\\Big)$$',
         '',
-        'where $S(t)$ is the observed spot, $b(t)$ is the implied basis, $r(t,u)$ is the forward',
-        'repo rate from **Repo_Rate**, and $c(t,T)$ is the carry rate at the contract\'s expiry',
-        'date $T$ from the **Carry** factor (a `ForwardPrice`-shaped factor with absolute-date',
-        'tenors). Output is converted to the report currency via **Currency**.',
+        'where $S(t)$ is the (possibly composed) spot, $r(t,u)$ is the forward repo rate from',
+        '**Repo_Rate**, and $c(t,T)$ is the carry rate at the contract\'s expiry date $T$ from the',
+        '**Carry** factor (a `ForwardPrice`-shaped factor with absolute-date tenors). Output is',
+        'converted to the report currency via **Currency**.',
     ])
 
     def __init__(self, params, valuation_options):
@@ -3755,21 +3741,16 @@ class CommodityFutureDeal(Deal):
 
     def calc_dependencies(self, base_date, static_offsets, stochastic_offsets, all_factors, all_tenors, time_grid,
                           calendars):
-        # The basis carries the observed-commodity link in its own Price Factor entry; resolve
-        # the observed commodity through the basis rather than declaring it on the deal.
-        basis_field = utils.check_rate_name(self.field['Implied_Basis'])
-        observed_field = utils.check_rate_name(get_observed_factor_name(basis_field, all_factors))
+        # Commodity is the (possibly composed) pricing-spot name; get_commodity_rate_factor is
+        # basis-aware, so the code is one element for a plain spot or primary + basis chain.
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Carry': utils.check_rate_name(self.field['Carry']),
                  'Repo_Rate': utils.check_rate_name(self.field['Repo_Rate']),
-                 'Implied_Basis': basis_field,
-                 'Observed_Factor': observed_field}
+                 'Commodity': utils.check_rate_name(self.field['Commodity'])}
 
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-                       'Observed_Factor': get_commodity_rate_factor(
-                           field['Observed_Factor'], static_offsets, stochastic_offsets),
-                       'Implied_Basis': get_impliedbasis_factor(
-                           field['Implied_Basis'], static_offsets, stochastic_offsets),
+                       'Commodity': get_commodity_rate_factor(
+                           field['Commodity'], static_offsets, stochastic_offsets),
                        'Repo': get_interest_factor(
                            field['Repo_Rate'], static_offsets, stochastic_offsets, all_tenors),
                        'Carry': get_forward_rate_factor(
@@ -3782,8 +3763,7 @@ class CommodityFutureDeal(Deal):
     def generate(self, shared, time_grid, deal_data):
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        observed_spot = utils.calc_time_grid_spot_rate(factor_dep['Observed_Factor'], deal_time, shared)
-        basis = utils.calc_time_grid_spot_rate(factor_dep['Implied_Basis'], deal_time, shared)
+        spot = utils.calc_time_grid_spot_rate(factor_dep['Commodity'], deal_time, shared)
         repo = utils.calc_time_grid_curve_rate(factor_dep['Repo'], deal_time, shared)
         carry = utils.calc_time_grid_curve_rate(factor_dep['Carry'], deal_time, shared)
         T_t = factor_dep['Expiry'] - deal_time[:, utils.TIME_GRID_MTM].reshape(-1, 1)
@@ -3796,9 +3776,8 @@ class CommodityFutureDeal(Deal):
 
         fx_rep = utils.calc_fx_cross(
             factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
-        # Synthetic spot = observed + basis; cost-of-carry forward.
-        synthetic_spot = observed_spot + basis
-        mtm = synthetic_spot * torch.exp(
+        # cost-of-carry forward on the (possibly composed) spot
+        mtm = spot * torch.exp(
             carry_rate * T_t_years + repo.gather_weighted_curve(shared, T_t)).squeeze(1)
 
         return mtm * fx_rep

@@ -229,7 +229,7 @@ mapping = {
             "PriceIndex":
                 ["Index", "Next_Publication_Date", "Last_Period_Start", "Publication_Period", "Currency"],
             "ObservedBasis":
-                ["Spot", "Observed_Factor"],
+                ["Spot"],
             "ForwardPrice":
                 ["Currency", "Curve", "Fixings"],
             "ForwardRate":
@@ -329,9 +329,6 @@ mapping = {
                               'max': 1.0},
             'Seasonal_Adjustment': {'widget': 'Text', 'description': 'Seasonal Adjustment', 'value': ''},
             'Spot': {'widget': 'Float', 'description': 'Spot', 'value': 0},
-            'Observed_Factor': {'widget': 'Text', 'description':
-                                'Name of the CommodityPrice factor this basis is observed against',
-                                'value': ''},
             'Price': {'widget': 'Float', 'description': 'Price', 'value': 0},
             'Surface': {'widget': 'Three', 'description': 'Surface', 'value': default['Surface']},
             'Delta_Surface': {'widget': 'Three', 'description': 'Delta_Surface', 'value': default['Surface']},

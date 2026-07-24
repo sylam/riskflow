@@ -40,14 +40,6 @@
     "Calibration_DT_Years": 0.003968253968253968,
     "Sigma": 8.079302632269696
    },
-   "BasisLinkedSpotModel.PLATINUM_CME.CME_FLAT": {
-    "A": 0.0,
-    "Phi": 0.0,
-    "Nu": 5.0,
-    "Mu": 0.0,
-    "Calibration_DT_Years": 0.003968253968253968,
-    "Sigma": 0.0
-   },
    "VARMixedFactorInterestRateModel.PLATINUM_CARRY": {
     "Mean": [
      -0.0008763147108637331,

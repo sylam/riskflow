@@ -33,13 +33,12 @@ The best solver/calc knobs below are applied on top, so the JSON need not carry 
 This solver is config-agnostic — it applies the same best block to whatever world the JSON
 describes. The shipping deliverable (artifacts/platinum_hedge_shipping.json) is the corrected
 composed-spot platinum world: CommodityPrice.PLATINUM_CME = P is the martingale primary,
-ObservedBasis.PLATINUM_CME.LME_CME (Observed_Factor=PLATINUM_CME) carries the published basis
-b = S - P (LME - CME), and the composed LBMA fixing S = P + b is priced by the swap's Commodity
-being the composed reference PLATINUM_CME.LME_CME (primary + basis chained POSITIONALLY in the
-NAME, like InterestRate.USD_SOFR.FUNDING; the basis-aware spot lookup sums the two buffers — no
-separate composed factor). Every tradeable future references the primary through the identity
-basis PLATINUM_CME.CME_FLAT (synthetic = P + 0 = P), so the graph is acyclic
-(CME -> {CME_FLAT, LME_CME}). The world's invariant is E[dF|b] ≈ 0 —
+ObservedBasis.PLATINUM_CME.LME_CME carries the published basis b = S - P (LME - CME) — its linked
+parent is the name prefix PLATINUM_CME — and the composed LBMA fixing S = P + b is priced by the
+swap's Commodity being the composed reference PLATINUM_CME.LME_CME (primary + basis chained
+POSITIONALLY in the NAME, like InterestRate.USD_SOFR.FUNDING; the basis-aware spot lookup sums the
+two buffers — no separate composed factor). Every tradeable future references the primary directly
+(Commodity=PLATINUM_CME = P), so the graph is acyclic. The world's invariant is E[dF|b] ≈ 0 —
 each future references P (martingale), so its expected one-step change conditional on the basis
 is ~0 (no unexecutable reversion for the solver to harvest); enforce it at calibration.
 

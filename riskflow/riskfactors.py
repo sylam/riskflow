@@ -732,19 +732,15 @@ class ObservedBasis(Factor0D):
     """
     Represents the implied basis between two related observables (e.g. LME spot
     fix vs CME-derived synthetic spot for platinum), expressed as the price-level
-    offset b(t) such that one observable = the other + b(t). The state is exposed
-    as the spot value.
+    offset b(t) such that one observable = the other + b(t). The observed parent is
+    the factor's own name minus its last period (e.g. ObservedBasis.PLATINUM_CME.LME_CME
+    is observed against CommodityPrice.PLATINUM_CME). The state is exposed as the spot value.
     """
     field_desc = ('Energy',
-                  ['- **Spot**: Float. Initial basis level $b_0$.',
-                   '- **Observed_Factor**: String. Name of the CommodityPrice factor '
-                   'this basis is observed against (the "anchor" spot).'])
+                  ['- **Spot**: Float. Initial basis level $b_0$.'])
 
     def __init__(self, param):
         super(ObservedBasis, self).__init__(param)
-
-    def observed_factor(self):
-        return self.param.get('Observed_Factor')
 
 
 class ForwardPriceSample(Factor0D):

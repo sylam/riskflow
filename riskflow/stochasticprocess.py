@@ -3953,8 +3953,8 @@ class BasisLinkedSpotModel(StochasticProcess):
     is the regime-keyed innovation std. Innovation is built from a framework-correlated
     Gaussian Z plus an internal Chi²(ν) draw; the √((ν-2)/ν) rescaling makes σ(s) the
     realised std of η regardless of ν. The linked spot's path and regime path are read
-    from `shared_mem.t_Scenario_Buffer`; sim ordering is enforced by
-    `dependant_fields['ObservedBasis']` and the `Observed_Factor` Price Factor field.
+    from `shared_mem.t_Scenario_Buffer`; the linked parent is this factor's own name minus its
+    last period, and sim ordering is enforced by the name-prefix chain (parent -> basis).
     Initial b(0) is taken from the factor's `Spot` value.
 
     JSON config:
@@ -3993,25 +3993,23 @@ class BasisLinkedSpotModel(StochasticProcess):
         return 'BasisLinkedSpotProcess', [()]
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
-        # Observed_Factor is redundant with the chained name prefix; if set, it must agree
-        observed = self.param.get('Observed_Factor')
-        if observed is not None and utils.check_rate_name(observed) != factor.name[:-1]:
-            raise Exception('ObservedBasis {0} Observed_Factor {1} disagrees with its name prefix'.format(
-                utils.check_tuple_name(factor), observed))
+        # The linked parent is the name minus its last period (positional, like the InterestRate
+        # parent chain): ObservedBasis if that parent is itself a basis, else the one composable
+        # spot type it resolves under (loud if not exactly one). Set here (before generate) since
+        # the type needs all_factors; the graph stays acyclic (parent -> basis).
+        parent = factor.name[:-1]
+        if len(parent) > 1:
+            self.linked_key = utils.Factor('ObservedBasis', parent)
+        else:
+            types = [t for t in utils.BASIS_COMPOSABLE_TYPES if utils.Factor(t, parent) in all_factors]
+            if len(types) != 1:
+                raise Exception('ObservedBasis {0}: parent {1} must resolve under exactly one composable '
+                                'spot type, found {2}'.format(utils.check_tuple_name(factor), '.'.join(parent), types))
+            self.linked_key = utils.Factor(types[0], parent)
 
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size
-        # The linked CommodityPrice factor is named in this Price Factor's Observed_Factor
-        # field — declared via dependant_fields['ObservedBasis'], which orders it before us.
-        # At sim time the framework has populated the Price Factor entry from the job file's
-        # ExplicitMarketData. Observed_Factor is both the SIM driver and the pricing anchor:
-        # a deal that prices off primary + basis (FloatingEnergyDeal with an Implied_Basis)
-        # references the primary and this basis by their explicit fields, so the basis is driven
-        # by the primary and the graph stays acyclic (primary -> basis).
-        linked_id = self.factor.param['Observed_Factor']
-        self.linked_key = utils.Factor('CommodityPrice', tuple(linked_id.split('.')))
-
         self.A = float(self.param['A'])
         self.Phi = float(self.param['Phi'])
         self.Nu = float(self.param['Nu'])
@@ -4088,8 +4086,8 @@ class BasisLinkedSpotModel(StochasticProcess):
 
 class BasisLinkedSpotCalibration(object):
     """Calibration of BasisLinkedSpotModel. Self-contained: data_frame carries the basis
-    column (`ObservedBasis.<basis>,<linked>`) plus the linked CommodityPrice column,
-    delivered via the comma-subkey archive-pull. OLS on `b(t) = a·ΔS + φ·b(t-1) + η(t)`
+    column (`ObservedBasis.<primary>.<basis>`) plus the linked spot column, pulled by the
+    archive-side name-prefix dependency. OLS on `b(t) = a·ΔS + φ·b(t-1) + η(t)`
     recovers (a, φ); ν from method-of-moments on the η excess kurt; per-regime σ from
     rolling-vol-tercile partitioning of η — terciles indexed in σ-ascending order to
     match the linked spot's HMM regime convention.
@@ -4111,15 +4109,17 @@ class BasisLinkedSpotCalibration(object):
         vol_window = int(self.param.get('Vol_Window', 21))
         dt_calib = 1.0 / float(num_business_days)
 
-        # Basis col is `ObservedBasis.<basis>,<linked>`; linked col is `CommodityPrice.<linked>`.
+        # Basis col is `ObservedBasis.<primary>.<basis>`; the linked parent is the name minus the
+        # last period (CommodityPrice.<parent> at depth 2, else the parent ObservedBasis chain).
         basis_col = next(c for c in data_frame.columns if c.split('.', 1)[0] == 'ObservedBasis')
-        linked_id = basis_col.split(',', 1)[1]
-        linked_col = f'CommodityPrice.{linked_id}'
-        if linked_col not in data_frame.columns:
+        parent = '.'.join(basis_col.split(',', 1)[0].split('.')[1:-1])
+        linked_col = next((c for c in data_frame.columns
+                           if c.split(',', 1)[0] in (f'CommodityPrice.{parent}', f'ObservedBasis.{parent}')), None)
+        if linked_col is None:
             raise ValueError(
-                f'BasisLinkedSpotCalibration: required linked-spot column {linked_col!r} '
-                f'not in data_frame (have {list(data_frame.columns)}). The framework should '
-                f'have auto-pulled it via the comma-subkey on {basis_col!r}.')
+                f'BasisLinkedSpotCalibration: no linked-spot column for parent {parent!r} '
+                f'in data_frame (have {list(data_frame.columns)}). The framework should '
+                f'have auto-pulled it from the {basis_col!r} name prefix.')
 
         joint = data_frame[[basis_col, linked_col]].astype(np.float64).dropna()
         b = joint[basis_col].values

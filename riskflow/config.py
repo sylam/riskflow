@@ -409,13 +409,11 @@ class Config(object):
         ak = []
         num_indexes = 0
         num_factors = 0
-        # Pull primary calibration columns plus any related-factor archive columns referenced
-        # by non-numeric sub-keys. Two patterns share this mechanism:
-        #   - InterestRate.PLATINUM_CARRY,PLATINUM_TAU1  pairs with Tenor.PLATINUM_TAU1
-        #   - ObservedBasis.LME_CME,PLATINUM_LME         pairs with CommodityPrice.PLATINUM_LME
-        # Generalisation: for each non-numeric sub_key, find any archive_name that ends in
-        # `.{sub_key}`. This keeps the dependency declaration in the archive header, no JSON
-        # config needed in calibration_config.
+        # Pull primary calibration columns plus related-factor columns. Two dependency forms:
+        #   - comma sub-key: InterestRate.PLATINUM_CARRY,PLATINUM_TAU1 pairs with Tenor.PLATINUM_TAU1
+        #     (find any archive_name ending in `.{sub_key}`)
+        #   - name prefix: ObservedBasis.PLATINUM_CME.LME_CME pulls its parent CommodityPrice.PLATINUM_CME
+        # Either way the dependency lives in the archive header, no calibration_config JSON needed.
         def _related_archive_cols(archive_name):
             extras = []
             for col in self.archive_columns.get(archive_name, []):
@@ -432,6 +430,14 @@ class Config(object):
                         other_parts = other_arch.split('.', 1)
                         if len(other_parts) >= 2 and other_parts[1] == sub:
                             extras.extend(self.archive_columns[other_arch])
+            # an ObservedBasis is named by its parent chain; pull the parent's columns by that prefix
+            parts = archive_name.split('.')
+            if parts[0] == 'ObservedBasis' and len(parts) > 2:
+                parent = '.'.join(parts[1:-1])
+                for other_arch in self.archive_columns:
+                    op = other_arch.split('.', 1)
+                    if other_arch != archive_name and len(op) >= 2 and op[1] == parent:
+                        extras.extend(self.archive_columns[other_arch])
             return extras
 
         total_rates = reduce(operator.concat,
@@ -666,8 +672,7 @@ class Config(object):
                             'InflationRate': [('Price_Index', 'PriceIndex')],
                             'CommodityPrice': [('Interest_Rate', 'InterestRate'),
                                                ('Forward_Rate', 'ForwardRate'), ('Currency', 'FxRate')],
-                            'EquityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')],
-                            'ObservedBasis': [('Observed_Factor', 'CommodityPrice')]}
+                            'EquityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')]}
 
         # nested fields need to include all their children
         # name-prefix chains {head type: tail-period type}: identity for a curve, ObservedBasis for a 0D spot

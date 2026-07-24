@@ -30,26 +30,11 @@ calibration class receives both the primary column(s) and the partner column(s) 
 
 ## Sim-time wiring
 
-For factors that need a sibling's *simulated path* at runtime (not just archive data at
-calibration time), declare the dependency in
-[`config.py`](../json/model_configuration.md)'s `dependant_fields`:
-
-```python
-dependant_fields = {
-    ...
-    'ObservedBasis': [('Observed_Factor', 'CommodityPrice')],
-}
-```
-
-This says: *a ObservedBasis factor depends on the CommodityPrice factor named in its
-own `Observed_Factor` field*. The framework's
-[`calculate_dependencies`](../json/model_configuration.md) walker uses this to:
-
-1. Pull the linked CommodityPrice factor into the simulation set whenever a
-   ObservedBasis is requested.
-2. Generate the linked factor first so its simulated path and (if applicable) HMM regime
-   path are available in `shared_mem.t_Scenario_Buffer` when the dependent factor's
-   `generate()` runs.
+An `ObservedBasis` needs its linked *simulated path* at runtime. That link is carried in the
+factor's NAME, not a field: the parent is the name minus its last period (positional, like the
+InterestRate parent chain — see the composed-spot section below). The name-prefix nesting registers
+the parent and orders it first, so its simulated path (and HMM regime path, if any) is in
+`shared_mem.t_Scenario_Buffer` when the basis's `generate()` runs.
 
 Inside `generate()`, the dependent factor reads:
 
@@ -58,8 +43,9 @@ linked_path    = shared_mem.t_Scenario_Buffer[linked_key]              # (T, B)
 linked_regimes = shared_mem.t_Scenario_Buffer[(linked_key, 'regimes')] # (T, B), if HMM
 ```
 
-`linked_key` is the `utils.Factor` form of the linked factor's name; resolve it from
-`self.factor.param[<dep_field>]` (e.g. `self.factor.param['Observed_Factor']`).
+`linked_key` is derived in `calc_references` from the factor's own name (`factor.name[:-1]`),
+resolving the parent's type — `ObservedBasis` if the parent is itself a basis chain, else the one
+composable spot type (`FxRate`/`EquityPrice`/`CommodityPrice`) it exists under.
 
 ## Auxiliary publish convention
 
@@ -80,25 +66,10 @@ branching for specific process subtypes).
 
 ## Deal-side resolution
 
-When a deal references a factor that itself has a linked dependency (e.g.
-`CommodityFutureDeal` references `Implied_Basis: PLATINUM_BASIS`, and the basis carries
-its own `Observed_Factor`), the deal does **not** declare the linked factor in its
-`factor_fields`. Instead, the deal's `calc_dependencies` looks up the linked name through
-a small helper:
-
-```python
-basis_field    = utils.check_rate_name(self.field['Implied_Basis'])
-observed_field = utils.check_rate_name(get_observed_factor_name(basis_field, all_factors))
-```
-
-`get_observed_factor_name` reads the basis Price Factor's `Observed_Factor` field
-and returns the linked CommodityPrice's name. This mirrors the existing pattern used by
-`get_inflation_index_name`, `get_interest_rate_currency`, and similar two-tier resolvers
-in `instruments.py`.
-
-The benefit: the deal's JSON definition only needs the *direct* linkage
-(`Implied_Basis`); the framework's dependency walker pulls the rest in via the
-`dependant_fields` declaration.
+A deal that prices off a composed spot names it directly in its `Commodity` field — a plain
+spot, or a composed name (`PLATINUM_CME.LME_CME`). `get_commodity_rate_factor` is basis-aware
+(the positional chain below), so the deal carries **no** basis fields and no linked-name lookup:
+both `FloatingEnergyDeal` and `CommodityFutureDeal` just declare `Commodity`.
 
 ## Composed spot: the positional name-prefix chain
 
@@ -126,11 +97,12 @@ chain first and then applies the dependant/conditional fields to the head; the t
 full-name key (`Factor('CommodityPrice', ('PLATINUM_CME','LME_CME'))`) is never a real factor, so
 it is dropped from both `rates_to_add` and the tenor map.
 
-**`Observed_Factor` is now redundant** with the name prefix (`<primary>.<basis>`). It is kept for
-now, but validated once, where it is consumed — `BasisLinkedSpotModel.calc_references` raises if
-`Observed_Factor` disagrees with the name minus its last period. Deleting the field entirely (and
-deriving the link from the name) would also remove the hardcoded `CommodityPrice` tail type in
-`dependant_fields['ObservedBasis']` — a follow-up left to the user.
+**No `Observed_Factor` field, no `Implied_Basis` field.** The link is the name prefix, so
+`BasisLinkedSpotModel.calc_references` derives its linked parent as `factor.name[:-1]` (its type
+resolved from `all_factors`), and both deal types just name the composed spot in `Commodity`. The
+`dependant_fields['ObservedBasis']` entry, the `CommodityFutureDeal` `Implied_Basis` field, the
+`CME_FLAT` identity basis (a composed name needs no `+0` factor) and the linked getters all go
+away with the redundancy.
 
 **Collision note.** The positional rule reinterprets any multi-period 0D factor name as
 primary + basis chain, so a genuine multi-part `CommodityPrice`/`EquityPrice`/`FxRate` name would
@@ -138,9 +110,9 @@ now be split. A sweep of the shipped configs found none.
 
 ## Design notes — when calibrations need sibling state
 
-The two mechanisms above (archive subkeys, `dependant_fields`) handle the cases where a
-factor needs sibling **archive data** (calibration-time) or sibling **simulated path**
-(sim-time). Neither lets a calibration class see another factor's *calibrated parameters*.
+The mechanisms above (archive subkeys / name-prefix pulls, and the name-prefix sim chain) handle
+the cases where a factor needs sibling **archive data** (calibration-time) or sibling **simulated
+path** (sim-time). Neither lets a calibration class see another factor's *calibrated parameters*.
 That's deliberate: the framework's calibration loop runs each class self-contained, with
 inputs limited to its `data_frame` slice plus its own `param` from
 `calibration_config.json`. No reach-through to `Config.params['Price Models']`.
