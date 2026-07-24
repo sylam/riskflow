@@ -2988,30 +2988,40 @@ class GARCHSpotModel(StochasticProcess):
         r_t. The correction touches ONLY ds (the log-price shift); the innovation r_t and the h
         recursion — hence revealed log_h — are untouched. (Student-t r has E[exp(r)]=∞, so −½Var
         slightly under-corrects, leaving a small positive residual price drift on the fat tail.)"""
-        omega, alpha, beta = self.omega, self.alpha, self.beta
-        drift, n_sub, f = self.drift, self.n_sub, self.f
+        drift = self.drift
         log_h = torch.empty_like(eps)
         ds = torch.zeros_like(eps)
         log_h[0] = h.log()
         for t in range(1, eps.shape[0]):
-            if n_sub[t] <= 1:
-                ft = f[t]
-                var_step = h * ft                                                # Var(r_t)
-                r = var_step.sqrt() * eps[t]
-                h = h + ft * (omega - (1.0 - beta) * h) + alpha * r * r
-            else:
-                # n_sub≥2: only one Gaussian per grid step — forward h deterministically through
-                # the integer sub-steps via E[r²]=h and draw the aggregate return with the summed
-                # variance. Loses within-step vol-of-vol (documented approximation).
-                h_j, var_step = h, h
-                for _ in range(1, n_sub[t]):
-                    h_j = omega + (alpha + beta) * h_j
-                    var_step = var_step + h_j
-                r = var_step.sqrt() * eps[t]
-                h = omega + (alpha + beta) * h_j
+            h, var_step, r = self._advance_variance(h, t, lambda v: v.sqrt() * eps[t])
             ds[t] = drift[t] + (r - 0.5 * var_step if self.convexity else r)
             log_h[t] = h.log()
         return ds, log_h
+
+    def _advance_variance(self, h, t, innovation):
+        """One fractional-clock GARCH variance step, shared by the forward sim (`_simulate_returns`)
+        and the observed-path replay (`reseed_from_path`) so the forward≡replay invariant is
+        STRUCTURAL, not maintained by copying. Computes Var(r_t) for the step, obtains the innovation
+        via `innovation(var_step)` — the ONLY thing that differs between the two paths (√Var·ε in the
+        forward sim; the realized convexity-undone log-return in replay) — and returns
+        (h_{t+1}, var_step, r). n_sub ≤ 1 is the exact fractional recursion
+        h + f·(ω − (1−β)·h) + α·r²; n_sub ≥ 2 the deterministic aggregate-variance bridge (r does
+        NOT enter the h update there — the sub-steps are forwarded via E[r²]=h)."""
+        omega, alpha, beta = self.omega, self.alpha, self.beta
+        if self.n_sub[t] <= 1:
+            ft = self.f[t]
+            var_step = h * ft                                                    # Var(r_t)
+            r = innovation(var_step)
+            return h + ft * (omega - (1.0 - beta) * h) + alpha * r * r, var_step, r
+        # n_sub≥2: only one Gaussian per grid step — forward h deterministically through the integer
+        # sub-steps and draw the aggregate return with the summed variance. Loses within-step
+        # vol-of-vol (documented approximation).
+        h_j, var_step = h, h
+        for _ in range(1, self.n_sub[t]):
+            h_j = omega + (alpha + beta) * h_j
+            var_step = var_step + h_j
+        r = innovation(var_step)
+        return omega + (alpha + beta) * h_j, var_step, r
 
     def generate(self, shared_mem):
         # Z is (T, B) outer, (T, B, B2) inner. One framework Gaussian per step; the
@@ -3093,22 +3103,17 @@ class GARCHSpotModel(StochasticProcess):
         h recursion identical between forward sim and replay (Var(r)=h·f on the n_sub≤1 clock)."""
         obs = simulated.detach()
         logret = obs.clamp_min(1.0e-30).log()
-        omega, alpha, beta = self.omega, self.alpha, self.beta
-        f, drift, n_sub = self.f, self.drift, self.n_sub
+        drift = self.drift
         h = torch.zeros_like(obs[0]) + self.h0_default                       # (…B) = H0
         log_h = torch.empty_like(obs)
         log_h[0] = h.log()
+
+        def realized(var_step, t):                                           # realized innovation r_t
+            r = (logret[t] - logret[t - 1]) - drift[t]
+            return r + 0.5 * var_step if self.convexity else r               # undo the −½Var(r) drift shift
+
         for t in range(1, obs.shape[0]):
-            if n_sub[t] <= 1:
-                r = (logret[t] - logret[t - 1]) - drift[t]                   # realized innovation
-                if self.convexity:
-                    r = r + 0.5 * (h * f[t])                                 # undo the −½Var(r) drift shift
-                h = h + f[t] * (omega - (1.0 - beta) * h) + alpha * r * r
-            else:
-                h_j = h                                                      # deterministic bridge (as generate)
-                for _ in range(1, n_sub[t]):
-                    h_j = omega + (alpha + beta) * h_j
-                h = omega + (alpha + beta) * h_j
+            h, _, _ = self._advance_variance(h, t, lambda v: realized(v, t))
             log_h[t] = h.log()
         shared_mem.t_Scenario_Buffer[(self.factor_key, 'garch_log_h')] = log_h.unsqueeze(1)
         shared_mem.t_Scenario_Buffer[(self.factor_key, 'h0_outer')] = h
@@ -3429,32 +3434,43 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
         n_sub≤1: exact fractional step — var = h·f_t, and the variance update h ← h + f·(hn step − h)
         which is EXACTLY hn_variance_step at f=1. n_sub≥2: aggregate-variance bridge — h forwarded
         deterministically through the sub-steps via E[h]=ω+α+ψ h, single aggregate draw."""
-        omega, alpha, beta, gamma, psi = self.omega, self.alpha, self.beta, self.gamma, self.psi
-        f, n_sub = self.f, self.n_sub
         log_h = torch.empty_like(z)
         ds = torch.zeros_like(z)
         log_h[0] = h.log()
         for t in range(1, z.shape[0]):
-            if n_sub[t] <= 1:
-                ft = f[t]
-                var_step = h * ft                                                # Var(Δlog S) over the step
-                sh = h.sqrt()
-                r = var_step.sqrt() * z[t]
-                # fractional HN variance update: exact hn_variance_step at f=1, blended by f for f<1
-                h = h + ft * (utils.hn_variance_step(h, sh, z[t], omega, alpha, beta, gamma) - h)
-            else:
-                # n_sub≥2: one Gaussian per grid step — forward h deterministically through the integer
-                # sub-steps via the HN mean recursion E[h_{j+1}]=ω+α+ψ h_j and draw the aggregate return
-                # with the summed variance Σ h_j (documented within-step vol-of-vol approximation).
-                h_j, var_step = h, h
-                for _ in range(1, n_sub[t]):
-                    h_j = omega + alpha + psi * h_j
-                    var_step = var_step + h_j
-                r = var_step.sqrt() * z[t]
-                h = omega + alpha + psi * h_j
+            h, var_step, r = self._advance_variance(h, t, lambda v: z[t])
             ds[t] = carry[t] - 0.5 * var_step + r
             log_h[t] = h.log()
         return ds, log_h
+
+    def _advance_variance(self, h, t, standard_normal):
+        """One fractional-clock Heston–Nandi variance step, shared by the forward sim
+        (`_simulate_returns`) and the observed-path replay (`reseed_from_path`) so the forward≡replay
+        invariant is STRUCTURAL, not maintained by copying. Computes Var(Δlog S) for the step, obtains
+        the standard normal z via `standard_normal(var_step)` — the ONLY thing that differs between the
+        paths (the drawn z[t] forward; the realized z=(Δlog S − carry + ½·Var)/√Var in replay) — and
+        returns (h_{t+1}, var_step, r) with r = √Var·z. n_sub ≤ 1 blends the exact hn_variance_step by
+        f (EXACT at f=1); n_sub ≥ 2 the deterministic aggregate-variance bridge (z does NOT enter the
+        h update there — the sub-steps are forwarded via E[h_{j+1}]=ω+α+ψ·h_j)."""
+        omega, alpha, beta, gamma, psi = self.omega, self.alpha, self.beta, self.gamma, self.psi
+        if self.n_sub[t] <= 1:
+            ft = self.f[t]
+            var_step = h * ft                                                    # Var(Δlog S) over the step
+            sh = h.sqrt()
+            z = standard_normal(var_step)
+            r = var_step.sqrt() * z
+            # fractional HN variance update: exact hn_variance_step at f=1, blended by f for f<1
+            return h + ft * (utils.hn_variance_step(h, sh, z, omega, alpha, beta, gamma) - h), var_step, r
+        # n_sub≥2: one Gaussian per grid step — forward h deterministically through the integer
+        # sub-steps via the HN mean recursion E[h_{j+1}]=ω+α+ψ h_j and draw the aggregate return
+        # with the summed variance Σ h_j (documented within-step vol-of-vol approximation).
+        h_j, var_step = h, h
+        for _ in range(1, self.n_sub[t]):
+            h_j = omega + alpha + psi * h_j
+            var_step = var_step + h_j
+        z = standard_normal(var_step)
+        r = var_step.sqrt() * z
+        return omega + alpha + psi * h_j, var_step, r
 
     def generate(self, shared_mem):
         # One framework Gaussian per step drives the HN z DIRECTLY (no Student-t rescale, no auxiliary
@@ -3528,24 +3544,16 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
         are deterministic (no z needed)."""
         obs = simulated.detach()
         logret = obs.clamp_min(1.0e-30).log()
-        omega, alpha, beta, gamma, psi = self.omega, self.alpha, self.beta, self.gamma, self.psi
-        f, n_sub = self.f, self.n_sub
         carry = self._carry_per_step(shared_mem, obs.shape).detach()
         h = torch.zeros_like(obs[0]) + self.h0_default                          # (…B) = H0
         log_h = torch.empty_like(obs)
         log_h[0] = h.log()
+
+        def realized(var_step, t):                                             # z recovered from the realized return
+            return ((logret[t] - logret[t - 1]) - carry[t] + 0.5 * var_step) / var_step.sqrt()
+
         for t in range(1, obs.shape[0]):
-            if n_sub[t] <= 1:
-                ft = f[t]
-                var_step = h * ft
-                sh = h.sqrt()
-                z = ((logret[t] - logret[t - 1]) - carry[t] + 0.5 * var_step) / var_step.sqrt()
-                h = h + ft * (utils.hn_variance_step(h, sh, z, omega, alpha, beta, gamma) - h)
-            else:
-                h_j = h                                                         # deterministic bridge (as generate)
-                for _ in range(1, n_sub[t]):
-                    h_j = omega + alpha + psi * h_j
-                h = omega + alpha + psi * h_j
+            h, _, _ = self._advance_variance(h, t, lambda v: realized(v, t))
             log_h[t] = h.log()
         shared_mem.t_Scenario_Buffer[(self.factor_key, 'hn_log_h')] = log_h.unsqueeze(1)
         shared_mem.t_Scenario_Buffer[(self.factor_key, 'h0_outer')] = h
