@@ -4929,8 +4929,25 @@ class FloatingEnergyDeal(Deal):
             reference_factor = get_reference_factor(field["Reference_Type"], all_factors)
             commodity_factor = get_factor_component(
                 utils.Factor('CommodityPrice', field["Commodity"]), all_factors)
+            # Commodity is a plain primary spot; repo/carry resolve off it. When the deal also
+            # declares an Implied_Basis, the priced spot is primary + basis — append the
+            # ObservedBasis index so calc_time_grid_spot_rate sums the two buffers (composition
+            # lives in the explicit fields, not in the name). Validate the basis observes THIS
+            # primary so the pair is coherent.
             field_index['Commodity'] = get_commodity_rate_factor(
                 field['Commodity'], static_offsets, stochastic_offsets)
+            if self.field.get('Implied_Basis'):
+                basis_field = utils.check_rate_name(self.field['Implied_Basis'])
+                observed = utils.check_rate_name(get_observed_factor_name(basis_field, all_factors))
+                if observed != field['Commodity']:
+                    raise ValueError(
+                        f"FloatingEnergyDeal Implied_Basis "
+                        f"{utils.check_tuple_name(utils.Factor('ObservedBasis', basis_field))} observes "
+                        f"{utils.check_tuple_name(utils.Factor('CommodityPrice', observed))} but the deal's "
+                        f"Commodity is {utils.check_tuple_name(utils.Factor('CommodityPrice', field['Commodity']))} "
+                        f"— a composed spot = primary + basis requires them to match.")
+                field_index['Commodity'] = field_index['Commodity'] + get_impliedbasis_factor(
+                    basis_field, static_offsets, stochastic_offsets)
             field_index["ForwardPrice"], field_index["ForwardFX"], field_index["CashFX"] = get_forwardprice_factor(
                 field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors,
                 all_factors, None, commodity_factor, base_date)

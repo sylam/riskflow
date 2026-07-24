@@ -2629,15 +2629,23 @@ def calc_time_grid_curve_rate(code, time_grid, shared, n_batch_dims=1):
 
 
 def calc_time_grid_spot_rate(rate, time_grid, shared):
-    key_code = ('spot', tuple(rate[0][:2]), time_grid[:, TIME_GRID_MTM].tobytes())
+    # `rate` is a CODE (list of resolved factor indices), mirroring calc_time_grid_curve_rate:
+    # element 0 is the primary spot; any tail elements are ObservedBasis components. The spot is
+    # the SUM of the gathered components (composed spot = primary + basis), the get_* layer having
+    # already turned the explicit deal fields into indices. A single-element code is the plain
+    # spot — same ops in the same order as before, so bit-identical.
+    key_code = ('spot', tuple(tuple(r[:2]) for r in rate), time_grid[:, TIME_GRID_MTM].tobytes())
 
     if key_code not in shared.t_Buffer:
-        if rate[0][FACTOR_INDEX_Stoch]:
-            tensor = shared.t_Scenario_Buffer[rate[0][FACTOR_INDEX_Offset]]
-            value = gather_scenario_interp(Interpolation(tensor, []), time_grid, shared, as_curve_tensor=False)
-        else:
-            tensor = shared.t_Static_Buffer[rate[0][FACTOR_INDEX_Offset]]
-            value = tensor.reshape(1, -1)
+        value = None
+        for r in rate:
+            if r[FACTOR_INDEX_Stoch]:
+                tensor = shared.t_Scenario_Buffer[r[FACTOR_INDEX_Offset]]
+                component = gather_scenario_interp(Interpolation(tensor, []), time_grid, shared, as_curve_tensor=False)
+            else:
+                tensor = shared.t_Static_Buffer[r[FACTOR_INDEX_Offset]]
+                component = tensor.reshape(1, -1)
+            value = component if value is None else value + component
 
         shared.t_Buffer[key_code] = value
 
