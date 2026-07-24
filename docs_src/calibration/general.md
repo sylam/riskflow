@@ -68,5 +68,5 @@ through `data_frame`, not through any cross-class lookup.
 
 If a calibration must use another factor's already-fitted *parameters* (rare), the factor
 naming convention happens to put commodity dependencies (e.g. `CommodityPrice.X`) before
-their basis derivatives (e.g. `CommodityBasis.X_Y`) alphabetically, but this is not a
+their basis derivatives (e.g. `ObservedBasis.X_Y`) alphabetically, but this is not a
 guarantee the framework provides. Prefer self-contained calibration classes.

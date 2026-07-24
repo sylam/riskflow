@@ -728,7 +728,7 @@ class CommodityPrice(EquityPrice):
             self.param['Forward_Rate'] if self.param.get('Forward_Rate') else self.param['Currency'])
 
 
-class CommodityBasis(Factor0D):
+class ObservedBasis(Factor0D):
     """
     Represents the implied basis between two related observables (e.g. LME spot
     fix vs CME-derived synthetic spot for platinum), expressed as the price-level
@@ -737,14 +737,14 @@ class CommodityBasis(Factor0D):
     """
     field_desc = ('Energy',
                   ['- **Spot**: Float. Initial basis level $b_0$.',
-                   '- **Observed_Commodity**: String. Name of the CommodityPrice factor '
+                   '- **Observed_Factor**: String. Name of the CommodityPrice factor '
                    'this basis is observed against (the "anchor" spot).'])
 
     def __init__(self, param):
-        super(CommodityBasis, self).__init__(param)
+        super(ObservedBasis, self).__init__(param)
 
-    def observed_commodity(self):
-        return self.param.get('Observed_Commodity')
+    def observed_factor(self):
+        return self.param.get('Observed_Factor')
 
 
 class ForwardPriceSample(Factor0D):

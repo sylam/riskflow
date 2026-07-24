@@ -177,7 +177,7 @@
    "Inner_MC_Enabled": "Yes",
    "Inner_Antithetic": "Yes",
    "Scenario_Factors": [
-    "CommodityBasis.LME_CME"
+    "ObservedBasis.LME_CME"
    ]
   },
   "MergeMarketData": {
@@ -207,13 +207,13 @@
       "Spot": 1661.4839212399793,
       "Property_Aliases": ""
      },
-     "CommodityBasis.LME_CME": {
+     "ObservedBasis.LME_CME": {
       "Spot": 15.516078760020719,
-      "Observed_Commodity": "PLATINUM_CME"
+      "Observed_Factor": "PLATINUM_CME"
      },
-     "CommodityBasis.CME_FLAT": {
+     "ObservedBasis.CME_FLAT": {
       "Spot": 0.0,
-      "Observed_Commodity": "PLATINUM_CME"
+      "Observed_Factor": "PLATINUM_CME"
      },
      "ReferencePrice.PLATINUM": {
       "Fixing_Curve": {

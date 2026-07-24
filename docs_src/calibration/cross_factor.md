@@ -2,7 +2,7 @@
 
 Some factors depend on a sibling factor's data — the calibration of an
 [`InterestRate`](../json/price_models.md) carry curve observed at floating-tenor knots
-needs the day-by-day tenor values; a [`CommodityBasis`](../json/price_factors_overview.md)
+needs the day-by-day tenor values; a [`ObservedBasis`](../json/price_factors_overview.md)
 needs the linked commodity's spot series. The framework handles both with a single
 mechanism: **archive column subkeys**.
 
@@ -18,7 +18,7 @@ Two patterns share this mechanism:
 | Primary archive column | Sub-key | Auto-pulled partner |
 |---|---|---|
 | `InterestRate.PLATINUM_CARRY,PLATINUM_TAU1` | `PLATINUM_TAU1` | `Tenor.PLATINUM_TAU1` |
-| `CommodityBasis.LME_CME,PLATINUM_LME` | `PLATINUM_LME` | `CommodityPrice.PLATINUM_LME` |
+| `ObservedBasis.LME_CME,PLATINUM_LME` | `PLATINUM_LME` | `CommodityPrice.PLATINUM_LME` |
 
 The matching rule is: for a non-numeric sub-key, look up any other archive entry whose
 name ends in `.<sub_key>`. (Numeric sub-keys are interpreted as fixed tenors and need no
@@ -37,16 +37,16 @@ calibration time), declare the dependency in
 ```python
 dependant_fields = {
     ...
-    'CommodityBasis': [('Observed_Commodity', 'CommodityPrice')],
+    'ObservedBasis': [('Observed_Factor', 'CommodityPrice')],
 }
 ```
 
-This says: *a CommodityBasis factor depends on the CommodityPrice factor named in its
-own `Observed_Commodity` field*. The framework's
+This says: *a ObservedBasis factor depends on the CommodityPrice factor named in its
+own `Observed_Factor` field*. The framework's
 [`calculate_dependencies`](../json/model_configuration.md) walker uses this to:
 
 1. Pull the linked CommodityPrice factor into the simulation set whenever a
-   CommodityBasis is requested.
+   ObservedBasis is requested.
 2. Generate the linked factor first so its simulated path and (if applicable) HMM regime
    path are available in `shared_mem.t_Scenario_Buffer` when the dependent factor's
    `generate()` runs.
@@ -59,7 +59,7 @@ linked_regimes = shared_mem.t_Scenario_Buffer[(linked_key, 'regimes')] # (T, B),
 ```
 
 `linked_key` is the `utils.Factor` form of the linked factor's name; resolve it from
-`self.factor.param[<dep_field>]` (e.g. `self.factor.param['Observed_Commodity']`).
+`self.factor.param[<dep_field>]` (e.g. `self.factor.param['Observed_Factor']`).
 
 ## Auxiliary publish convention
 
@@ -82,16 +82,16 @@ branching for specific process subtypes).
 
 When a deal references a factor that itself has a linked dependency (e.g.
 `CommodityFutureDeal` references `Implied_Basis: PLATINUM_BASIS`, and the basis carries
-its own `Observed_Commodity`), the deal does **not** declare the linked factor in its
+its own `Observed_Factor`), the deal does **not** declare the linked factor in its
 `factor_fields`. Instead, the deal's `calc_dependencies` looks up the linked name through
 a small helper:
 
 ```python
 basis_field    = utils.check_rate_name(self.field['Implied_Basis'])
-observed_field = utils.check_rate_name(get_observed_commodity_name(basis_field, all_factors))
+observed_field = utils.check_rate_name(get_observed_factor_name(basis_field, all_factors))
 ```
 
-`get_observed_commodity_name` reads the basis Price Factor's `Observed_Commodity` field
+`get_observed_factor_name` reads the basis Price Factor's `Observed_Factor` field
 and returns the linked CommodityPrice's name. This mirrors the existing pattern used by
 `get_inflation_index_name`, `get_interest_rate_currency`, and similar two-tier resolvers
 in `instruments.py`.

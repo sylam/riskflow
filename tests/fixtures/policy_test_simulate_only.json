@@ -356,9 +356,9 @@
       "Spot": 2055.0,
       "Property_Aliases": ""
      },
-     "CommodityBasis.LME_CME": {
+     "ObservedBasis.LME_CME": {
       "Spot": -32.5375,
-      "Observed_Commodity": "PLATINUM_LME"
+      "Observed_Factor": "PLATINUM_LME"
      },
      "ReferencePrice.PLATINUM": {
       "Fixing_Curve": {

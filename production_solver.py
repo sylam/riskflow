@@ -33,7 +33,7 @@ The best solver/calc knobs below are applied on top, so the JSON need not carry 
 This solver is config-agnostic — it applies the same best block to whatever world the JSON
 describes. The shipping deliverable (artifacts/platinum_hedge_shipping.json) is the corrected
 composed-spot platinum world: CommodityPrice.PLATINUM_CME = P is the martingale primary,
-CommodityBasis.LME_CME (Observed_Commodity=PLATINUM_CME) carries the published basis b = S - P
+ObservedBasis.LME_CME (Observed_Factor=PLATINUM_CME) carries the published basis b = S - P
 (LME - CME), and CommodityPrice.PLATINUM_LME = P + b is the composed LBMA fixing
 (BasisComposedSpotModel, routed by modelfilters, never calibrated). Every tradeable future
 references the primary through the identity basis CME_FLAT (synthetic = P + 0 = P), so the

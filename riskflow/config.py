@@ -412,7 +412,7 @@ class Config(object):
         # Pull primary calibration columns plus any related-factor archive columns referenced
         # by non-numeric sub-keys. Two patterns share this mechanism:
         #   - InterestRate.PLATINUM_CARRY,PLATINUM_TAU1  pairs with Tenor.PLATINUM_TAU1
-        #   - CommodityBasis.LME_CME,PLATINUM_LME        pairs with CommodityPrice.PLATINUM_LME
+        #   - ObservedBasis.LME_CME,PLATINUM_LME         pairs with CommodityPrice.PLATINUM_LME
         # Generalisation: for each non-numeric sub_key, find any archive_name that ends in
         # `.{sub_key}`. This keeps the dependency declaration in the archive header, no JSON
         # config needed in calibration_config.
@@ -660,7 +660,7 @@ class Config(object):
                             'CommodityPrice': [('Interest_Rate', 'InterestRate'),
                                                ('Forward_Rate', 'ForwardRate'), ('Currency', 'FxRate')],
                             'EquityPrice': [('Interest_Rate', 'InterestRate'), ('Currency', 'FxRate')],
-                            'CommodityBasis': [('Observed_Commodity', 'CommodityPrice')]}
+                            'ObservedBasis': [('Observed_Factor', 'CommodityPrice')]}
 
         # nested fields need to include all their children
         nested_fields = {'InterestRate'}

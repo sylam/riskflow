@@ -3954,7 +3954,7 @@ class BasisLinkedSpotModel(StochasticProcess):
     Gaussian Z plus an internal Chi²(ν) draw; the √((ν-2)/ν) rescaling makes σ(s) the
     realised std of η regardless of ν. The linked spot's path and regime path are read
     from `shared_mem.t_Scenario_Buffer`; sim ordering is enforced by
-    `dependant_fields['CommodityBasis']` and the `Observed_Commodity` Price Factor field.
+    `dependant_fields['ObservedBasis']` and the `Observed_Factor` Price Factor field.
     Initial b(0) is taken from the factor's `Spot` value.
 
     JSON config:
@@ -3995,13 +3995,13 @@ class BasisLinkedSpotModel(StochasticProcess):
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size
-        # The linked CommodityPrice factor is named in this Price Factor's Observed_Commodity
-        # field — declared via dependant_fields['CommodityBasis'], which orders it before us.
+        # The linked CommodityPrice factor is named in this Price Factor's Observed_Factor
+        # field — declared via dependant_fields['ObservedBasis'], which orders it before us.
         # At sim time the framework has populated the Price Factor entry from the job file's
-        # ExplicitMarketData. Observed_Commodity is both the SIM driver and the pricing anchor:
+        # ExplicitMarketData. Observed_Factor is both the SIM driver and the pricing anchor:
         # the composed sibling (BasisComposedSpotModel) publishes primary + basis, so the basis
         # is driven by the primary and the graph stays acyclic (primary -> basis -> composed).
-        linked_id = self.factor.param['Observed_Commodity']
+        linked_id = self.factor.param['Observed_Factor']
         self.linked_key = utils.Factor('CommodityPrice', tuple(linked_id.split('.')))
 
         self.A = float(self.param['A'])
@@ -4029,7 +4029,7 @@ class BasisLinkedSpotModel(StochasticProcess):
         dtype = Z.dtype
 
         # Cross-process reads. The linked spot must have been generated first; the
-        # `dependant_fields` declaration on CommodityBasis enforces the ordering by
+        # `dependant_fields` declaration on ObservedBasis enforces the ordering by
         # making CommodityPrice a dependency, so the simulator topo-orders it before us.
         # The linked spot path is in *price level* (dollars), not log-space — the HMM
         # process exp()s its log-cumsum before publishing. Path/regime shapes match
@@ -4080,8 +4080,8 @@ class BasisLinkedSpotModel(StochasticProcess):
 
 class BasisComposedSpotModel(StochasticProcess):
     """Derived spot published as PRIMARY + BASIS: the composed sibling of
-    BasisLinkedSpotModel. This factor's `Implied_Basis` field names the CommodityBasis;
-    the basis's `Observed_Commodity` is the primary. Publishing composed = primary + basis
+    BasisLinkedSpotModel. This factor's `Implied_Basis` field names the ObservedBasis;
+    the basis's `Observed_Factor` is the primary. Publishing composed = primary + basis
     makes the composed price carry the basis dynamics (e.g. LBMA fixing = CME + (LBMA−CME))
     while deals reference it as an ordinary CommodityPrice. Futures reference the primary
     through a separate identity basis (CME_FLAT, zero-dynamics) so they never touch this
@@ -4101,7 +4101,7 @@ class BasisComposedSpotModel(StochasticProcess):
          'the composed sibling of `BasisLinkedSpotModel` — deals reference the composed',
          'price as an ordinary CommodityPrice while the basis dynamics carry the spread.',
          '',
-         '- **Implied_Basis** (on the Price Factor): the CommodityBasis factor to add'])
+         '- **Implied_Basis** (on the Price Factor): the ObservedBasis factor to add'])
 
     def __init__(self, factor, param, implied_factor=None):
         super().__init__(factor, param)
@@ -4119,11 +4119,11 @@ class BasisComposedSpotModel(StochasticProcess):
 
     def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
         self.basis_key = utils.Factor(
-            'CommodityBasis', utils.check_rate_name(self.factor.param['Implied_Basis']))
+            'ObservedBasis', utils.check_rate_name(self.factor.param['Implied_Basis']))
         basis = all_factors[self.basis_key]
         basis_param = (basis.factor if hasattr(basis, 'factor') else basis).param
         self.primary_key = utils.Factor('CommodityPrice', utils.check_rate_name(
-            basis_param['Observed_Commodity']))
+            basis_param['Observed_Factor']))
 
     def reveal_state_at(self, t, buffer):
         return []
@@ -4135,7 +4135,7 @@ class BasisComposedSpotModel(StochasticProcess):
 
 class BasisLinkedSpotCalibration(object):
     """Calibration of BasisLinkedSpotModel. Self-contained: data_frame carries the basis
-    column (`CommodityBasis.<basis>,<linked>`) plus the linked CommodityPrice column,
+    column (`ObservedBasis.<basis>,<linked>`) plus the linked CommodityPrice column,
     delivered via the comma-subkey archive-pull. OLS on `b(t) = a·ΔS + φ·b(t-1) + η(t)`
     recovers (a, φ); ν from method-of-moments on the η excess kurt; per-regime σ from
     rolling-vol-tercile partitioning of η — terciles indexed in σ-ascending order to
@@ -4158,8 +4158,8 @@ class BasisLinkedSpotCalibration(object):
         vol_window = int(self.param.get('Vol_Window', 21))
         dt_calib = 1.0 / float(num_business_days)
 
-        # Basis col is `CommodityBasis.<basis>,<linked>`; linked col is `CommodityPrice.<linked>`.
-        basis_col = next(c for c in data_frame.columns if c.split('.', 1)[0] == 'CommodityBasis')
+        # Basis col is `ObservedBasis.<basis>,<linked>`; linked col is `CommodityPrice.<linked>`.
+        basis_col = next(c for c in data_frame.columns if c.split('.', 1)[0] == 'ObservedBasis')
         linked_id = basis_col.split(',', 1)[1]
         linked_col = f'CommodityPrice.{linked_id}'
         if linked_col not in data_frame.columns:

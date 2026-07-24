@@ -258,8 +258,8 @@ def get_commodity_rate_factor(fieldname, static_offsets, stochastic_offsets):
 
 
 def get_impliedbasis_factor(fieldname, static_offsets, stochastic_offsets):
-    """Read the index of the CommodityBasis scalar price factor"""
-    return [calc_factor_index(utils.Factor('CommodityBasis', fieldname),
+    """Read the index of the ObservedBasis scalar price factor"""
+    return [calc_factor_index(utils.Factor('ObservedBasis', fieldname),
                               static_offsets, stochastic_offsets)]
 
 
@@ -267,11 +267,11 @@ def get_forward_rate_factor(fieldname, static_offsets, stochastic_offsets, all_t
     return [calc_factor_index(utils.Factor('ForwardRate', fieldname), static_offsets, stochastic_offsets, all_tenors)]
 
 
-def get_observed_commodity_name(fieldname, all_factors):
-    """Read the name of the CommodityPrice factor that this CommodityBasis is observed against."""
-    basis = all_factors.get(utils.Factor('CommodityBasis', fieldname))
-    return basis.factor.observed_commodity() if hasattr(basis, 'factor') \
-        else basis.observed_commodity()
+def get_observed_factor_name(fieldname, all_factors):
+    """Read the name of the CommodityPrice factor that this ObservedBasis is observed against."""
+    basis = all_factors.get(utils.Factor('ObservedBasis', fieldname))
+    return basis.factor.observed_factor() if hasattr(basis, 'factor') \
+        else basis.observed_factor()
 
 
 def get_equity_rate_factor(fieldname, static_offsets, stochastic_offsets):
@@ -3725,14 +3725,14 @@ class CommodityForwardDeal(Deal):
 
 class CommodityFutureDeal(Deal):
     factor_fields = {'Currency': ['FxRate'],
-                     'Implied_Basis': ['CommodityBasis'],
+                     'Implied_Basis': ['ObservedBasis'],
                      'Repo_Rate': ['InterestRate'],
                      'Carry': ['ForwardRate']}
 
     documentation = ('Energy', [
         'A standardised futures contract on a commodity. The pricing spot is constructed as',
         'an observed market spot plus an implied basis adjustment; the **Implied_Basis** factor',
-        'declares the linked **Observed_Commodity** via its own field, so the deal references',
+        'declares the linked **Observed_Factor** via its own field, so the deal references',
         'the basis only and the framework wires the observed spot in automatically.',
         '',
         '$$F(t,T)=(S(t)+b(t))\\exp\\Big(c(t,T)\\,(T-t) + \\int_t^T r(t,u)du\\Big)$$',
@@ -3755,16 +3755,16 @@ class CommodityFutureDeal(Deal):
         # The basis carries the observed-commodity link in its own Price Factor entry; resolve
         # the observed commodity through the basis rather than declaring it on the deal.
         basis_field = utils.check_rate_name(self.field['Implied_Basis'])
-        observed_field = utils.check_rate_name(get_observed_commodity_name(basis_field, all_factors))
+        observed_field = utils.check_rate_name(get_observed_factor_name(basis_field, all_factors))
         field = {'Currency': utils.check_rate_name(self.field['Currency']),
                  'Carry': utils.check_rate_name(self.field['Carry']),
                  'Repo_Rate': utils.check_rate_name(self.field['Repo_Rate']),
                  'Implied_Basis': basis_field,
-                 'Observed_Commodity': observed_field}
+                 'Observed_Factor': observed_field}
 
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-                       'Observed_Commodity': get_commodity_rate_factor(
-                           field['Observed_Commodity'], static_offsets, stochastic_offsets),
+                       'Observed_Factor': get_commodity_rate_factor(
+                           field['Observed_Factor'], static_offsets, stochastic_offsets),
                        'Implied_Basis': get_impliedbasis_factor(
                            field['Implied_Basis'], static_offsets, stochastic_offsets),
                        'Repo': get_interest_factor(
@@ -3779,7 +3779,7 @@ class CommodityFutureDeal(Deal):
     def generate(self, shared, time_grid, deal_data):
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
-        observed_spot = utils.calc_time_grid_spot_rate(factor_dep['Observed_Commodity'], deal_time, shared)
+        observed_spot = utils.calc_time_grid_spot_rate(factor_dep['Observed_Factor'], deal_time, shared)
         basis = utils.calc_time_grid_spot_rate(factor_dep['Implied_Basis'], deal_time, shared)
         repo = utils.calc_time_grid_curve_rate(factor_dep['Repo'], deal_time, shared)
         carry = utils.calc_time_grid_curve_rate(factor_dep['Carry'], deal_time, shared)

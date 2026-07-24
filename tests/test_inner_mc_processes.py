@@ -137,8 +137,8 @@ def _hmm_factor():
 
 
 def _basis_factor(linked='CommodityPrice.LME'):
-    # Basis reads factor.param['Observed_Commodity'] to find the linked CommodityPrice.
-    return types.SimpleNamespace(param={'Observed_Commodity': linked})
+    # Basis reads factor.param['Observed_Factor'] to find the linked CommodityPrice.
+    return types.SimpleNamespace(param={'Observed_Factor': linked})
 
 
 def _var_factor(ref_date):
@@ -350,7 +350,7 @@ def _setup_basis(*, batch_size, T=10, inner_sub=None, seed=42):
 
     p = BasisLinkedSpotModel(factor=_basis_factor(linked='CommodityPrice.LME'),
                              param=_basis_param())
-    p.factor_key = utils.Factor('CommodityBasis', ('LME_CME', 'LME'))
+    p.factor_key = utils.Factor('ObservedBasis', ('LME_CME', 'LME'))
     if inner_sub is None:
         tensor = torch.tensor([3.0], dtype=DTYPE, device=DEVICE)
         lme_shape = (T, batch_size)
@@ -398,16 +398,16 @@ def test_basis_inner_shape_init_and_independence():
 @pytest.mark.parametrize('inner_sub', [None, 8])
 def test_composed_spot_shape_and_composition(inner_sub):
     """BasisComposedSpotModel: published path == primary + basis bitwise in outer (T,B)
-    and inner (T,B,B2) modes; the primary is the basis's Observed_Commodity (sim driver
+    and inner (T,B,B2) modes; the primary is the basis's Observed_Factor (sim driver
     and pricing anchor unified), resolved via calc_references."""
     B, T = 4, 10
     shared = _build_shared(num_factors=1, batch_size=B, seed=42, simulation_sub_batch=inner_sub)
     _do_reset(shared, 1, _time_grid(T))
     primary_key = utils.Factor('CommodityPrice', ('CME',))
-    basis_key = utils.Factor('CommodityBasis', ('LME_CME',))
-    # basis: sim driver and pricing anchor are both CME (Observed_Commodity); the composed
+    basis_key = utils.Factor('ObservedBasis', ('LME_CME',))
+    # basis: sim driver and pricing anchor are both CME (Observed_Factor); the composed
     # LME spot published here is derived FROM the basis, never drives it (acyclic).
-    basis_factor = types.SimpleNamespace(param={'Observed_Commodity': 'CME'})
+    basis_factor = types.SimpleNamespace(param={'Observed_Factor': 'CME'})
     p = BasisComposedSpotModel(
         factor=types.SimpleNamespace(param={'Implied_Basis': 'LME_CME'}), param={})
     p.factor_key = utils.Factor('CommodityPrice', ('LME',))

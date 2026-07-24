@@ -400,10 +400,10 @@ def _garch_primary(sh, T, B, seed_manual):
 
 
 def _basis(param, linked='CME'):
-    # Observed_Commodity is the bare CommodityPrice name (no type prefix), as in the market data.
-    b = BasisLinkedSpotModel(factor=types.SimpleNamespace(param={'Observed_Commodity': linked}),
+    # Observed_Factor is the bare CommodityPrice name (no type prefix), as in the market data.
+    b = BasisLinkedSpotModel(factor=types.SimpleNamespace(param={'Observed_Factor': linked}),
                              param=param)
-    b.factor_key = utils.Factor('CommodityBasis', ('LME_CME',))
+    b.factor_key = utils.Factor('ObservedBasis', ('LME_CME',))
     return b
 
 

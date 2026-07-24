@@ -16,12 +16,12 @@ Aggregate across all trades and print the table (mean/min/max, positives, bound-
 
 CORRECTED (composed-spot) architecture, all validated:
   * CommodityPrice.PLATINUM_CME = P is the martingale primary (MarkovHMMSpotModel).
-  * CommodityBasis.LME_CME (BasisLinkedSpotModel, Observed_Commodity=PLATINUM_CME) carries the
+  * ObservedBasis.LME_CME (BasisLinkedSpotModel, Observed_Factor=PLATINUM_CME) carries the
     published basis b = S - P (LME - CME) — the LBMA catch-up.
   * CommodityPrice.PLATINUM_LME = P + b is the observable LBMA fixing (BasisComposedSpotModel;
     routed via the source MarketDataRF modelfilters, never calibrated — it carries no params).
   * The swap references pure PLATINUM_LME; the CME futures reference the primary through the
-    identity basis CME_FLAT (Observed_Commodity=PLATINUM_CME, zero dynamics) so synthetic = P + 0
+    identity basis CME_FLAT (Observed_Factor=PLATINUM_CME, zero dynamics) so synthetic = P + 0
     = P (martingale) and E[dF|b] ≈ 0 (unexecutable reversion not harvested). The dependency graph
     is acyclic: CME -> {CME_FLAT, LME_CME} -> LME (no cycle, so no cycle-breaking needed).
 
@@ -83,7 +83,7 @@ CARRY_TENORS = ('PLATINUM_TAU1', 'PLATINUM_TAU2', 'PLATINUM_TAU3')
 # --- corrected archive column names ---
 CME_COL = 'CommodityPrice.PLATINUM_CME'          # martingale primary P
 LME_COL = 'CommodityPrice.PLATINUM_LME'          # LBMA fixing S = P - b
-BASIS_COL = 'CommodityBasis.LME_CME,PLATINUM_CME'  # published basis b = S - P (LME - CME)
+BASIS_COL = 'ObservedBasis.LME_CME,PLATINUM_CME'  # published basis b = S - P (LME - CME)
 CARRY_COL = 'ForwardRate.PLATINUM_CARRY'          # + ',<tenor>'
 SOFR_PREFIX = 'InterestRate.USD-SOFR'
 
@@ -210,7 +210,7 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
     hp = calc['Hedging_Problem']
 
     calc['Base_Date'] = _ts(trade_date)
-    calc['Scenario_Factors'] = ['CommodityBasis.LME_CME']  # reached only via the composed LME spot
+    calc['Scenario_Factors'] = ['ObservedBasis.LME_CME']  # reached only via the composed LME spot
     mm['MarketDataFile'] = calibrated_md
     hp['Objective'] = dict(OBJECTIVE)
 
@@ -272,8 +272,8 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
                   'Spot': s0, 'Implied_Basis': 'LME_CME', 'Property_Aliases': ''},
         CME_COL: {'Currency': 'USD', 'Interest_Rate': 'USD-SOFR', 'Forward_Rate': 'PLATINUM_CARRY',
                   'Spot': p0, 'Property_Aliases': ''},
-        'CommodityBasis.LME_CME': {'Spot': b0, 'Observed_Commodity': 'PLATINUM_CME'},
-        'CommodityBasis.CME_FLAT': {'Spot': 0.0, 'Observed_Commodity': 'PLATINUM_CME'},
+        'ObservedBasis.LME_CME': {'Spot': b0, 'Observed_Factor': 'PLATINUM_CME'},
+        'ObservedBasis.CME_FLAT': {'Spot': 0.0, 'Observed_Factor': 'PLATINUM_CME'},
         'ReferencePrice.PLATINUM': {'Fixing_Curve': {'.Curve': {'meta': [], 'data': [[40000, 40000], [50000, 50000]]}},
                                     'ForwardPrice': None, 'Property_Aliases': ''},
         'ForwardRate.PLATINUM_CARRY': {'Currency': 'USD', 'Curve': {'.Curve': {'meta': [], 'data': [
@@ -312,7 +312,7 @@ def observed_scenario_npz(arch, base_date, path):
             f'{arch.index[-1].date()}: the realized roll would run on fabricated flat prices')
     rows = arch.reindex(arch.index.union(dates)).ffill().loc[dates]
     np.savez(path, **{CME_COL: rows[CME_COL].to_numpy(),
-                      'CommodityBasis.LME_CME': rows[BASIS_COL].to_numpy()})
+                      'ObservedBasis.LME_CME': rows[BASIS_COL].to_numpy()})
 
 
 def pf_bound(arch, trade_date, mats, pay):
