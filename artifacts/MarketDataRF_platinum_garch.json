@@ -32,7 +32,7 @@
   },
   "Price Factors": {},
   "Price Models": {
-   "BasisLinkedSpotModel.LME_CME": {
+   "BasisLinkedSpotModel.PLATINUM_CME.LME_CME": {
     "A": -0.6090393403931138,
     "Phi": 0.35795333829682124,
     "Nu": 5.3936611012885685,
@@ -40,7 +40,7 @@
     "Calibration_DT_Years": 0.003968253968253968,
     "Sigma": 8.079302632269696
    },
-   "BasisLinkedSpotModel.CME_FLAT": {
+   "BasisLinkedSpotModel.PLATINUM_CME.CME_FLAT": {
     "A": 0.0,
     "Phi": 0.0,
     "Nu": 5.0,

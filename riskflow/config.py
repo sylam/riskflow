@@ -521,12 +521,21 @@ class Config(object):
         reset dates and optionally the potential currency settlements
         """
         def update_nested_rates(factor, rates_to_add):
+            # tail periods take the mapped nested type, linked to their parent prefix; a type switch
+            # leaves the full-name head key virtual (drop it)
+            nested = nested_fields[factor.type]
             for i in range(1, len(factor.name) + 1):
-                rates_to_add.update({utils.Factor(factor.type, factor.name[:i]): [
-                    utils.Factor(factor.type, factor.name[:i - 1])] if i > 1 else []})
+                rates_to_add.update({utils.Factor(factor.type if i == 1 else nested, factor.name[:i]): [
+                    utils.Factor(factor.type if i == 2 else nested, factor.name[:i - 1])] if i > 1 else []})
+            if nested != factor.type and len(factor.name) > 1:
+                rates_to_add.pop(factor, None)
 
         def get_rates(factor, instrument):
             rates_to_add = {factor: []}
+            # pull the name-prefix chain first; the head period carries the dependant/conditional fields
+            if factor.type in nested_fields and len(factor.name) > 1:
+                update_nested_rates(factor, rates_to_add)
+                factor = utils.Factor(factor.type, factor.name[:1])
             factor_name = utils.check_tuple_name(factor)
 
             if factor.type in dependant_fields:
@@ -544,12 +553,8 @@ class Config(object):
                     rates_to_add[factor].append(linked_factor)
 
                     # check that we include any nested factors
-                    if linked_factor.type in nested_fields:
+                    if linked_factor.type in nested_fields and len(linked_factor.name) > 1:
                         update_nested_rates(linked_factor, rates_to_add)
-
-
-            if factor.type in nested_fields:
-                update_nested_rates(factor, rates_to_add)
 
             if factor.type in conditional_fields:
                 for conditional_factor in conditional_fields[factor.type](
@@ -595,6 +600,8 @@ class Config(object):
                                 rate_tenors.setdefault(factor, set()).add(max_reval)
                             if factor not in rates_to_add or factor.type in conditional_fields:
                                 add_rates_for_factor(factor)
+                            if factor not in rates_to_add:      # virtual type-switched full name
+                                rate_tenors.pop(factor, None)
 
             resets = {base_date}
             children = []
@@ -663,7 +670,9 @@ class Config(object):
                             'ObservedBasis': [('Observed_Factor', 'CommodityPrice')]}
 
         # nested fields need to include all their children
-        nested_fields = {'InterestRate'}
+        # name-prefix chains {head type: tail-period type}: identity for a curve, ObservedBasis for a 0D spot
+        nested_fields = {'InterestRate': 'InterestRate', 'CommodityPrice': 'ObservedBasis',
+                         'EquityPrice': 'ObservedBasis', 'FxRate': 'ObservedBasis'}
 
         # conditional fields need to potentially include correlation and fx vol surfaces (e.g. reference prices)
         conditional_fields = {

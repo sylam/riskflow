@@ -1,14 +1,14 @@
-"""Multi-element commodity spot: a composed spot (primary + ObservedBasis) is declared by the
-EXPLICIT deal fields Commodity + Implied_Basis, resolved by the get_* layer into a multi-element
-CODE, and summed by utils.calc_time_grid_spot_rate. No name parsing — composition lives in the
-fields, names stay atomic.
+"""Composed spot = primary + ObservedBasis, carried POSITIONALLY in the NAME
+(CommodityPrice.PLATINUM_CME.LME_CME — the InterestRate.USD_SOFR.FUNDING prefix chain, tail a
+different type). instruments.calc_factor_code_chain is the one resolver (get_interest_factor is its
+head==tail case); bases stack; deals carry NO composition fields.
 
-Two layers of coverage:
-  * unit — calc_time_grid_spot_rate on a hand-built code/buffer: single-element bit-path,
-    multi-element sum (stoch + static), cache-hit reuse.
-  * deal — FloatingEnergyDeal (Components) with an explicit Implied_Basis sums the basis into
-    the priced liability (a zero basis is a bit-exact no-op), and an Observed_Factor/Commodity
-    mismatch raises loudly.
+Coverage:
+  * spot rate — calc_time_grid_spot_rate: single-element bit-path, multi-element sum, cache reuse,
+    stacked (3-element) sum.
+  * resolver — positional single/composite/stack for commodity + fx, and the IR identity case.
+  * validation — Observed_Factor vs name-prefix, at the consumer (BasisLinkedSpotModel.calc_references).
+  * deal — a composed-name Commodity sums the basis into the priced liability (zero basis is a no-op).
 """
 import json
 import os
@@ -98,12 +98,71 @@ def test_spot_rate_cache_hit_reuse():
     assert len([k for k in shared.t_Buffer if k[0] == 'spot']) == 2
 
 
-# --- deal-level: explicit Implied_Basis on FloatingEnergyDeal ------------------------------
-# The shipping config's liability now prices off Commodity=PLATINUM_CME + Implied_Basis=LME_CME
-# (the migrated composed spot). PLATINUM_CME, ObservedBasis.LME_CME and the zero-dynamics
-# ObservedBasis.CME_FLAT are all present, so these run against the shipped config directly.
+# --- unit: the positional prefix-chain resolver --------------------------------------------
 
-def _ship_cfg(mutate=None, factor_override=None):
+class _Stub:
+    def get_subtype(self):
+        return 'sub'
+
+
+def _offsets(*names):
+    # {Factor(type, field): stub}; calc_factor_index reads .get_subtype()
+    return {utils.Factor(t, f): _Stub() for t, f in names}
+
+
+def test_chain_positional_single_and_composite_and_stack():
+    from riskflow.instruments import calc_factor_code_chain
+    stat = _offsets(('CommodityPrice', ('CME',)), ('ObservedBasis', ('CME', 'LME')),
+                    ('ObservedBasis', ('CME', 'LME', 'SHF')))
+    # plain name -> one element (bit-path)
+    assert [c[1] for c in calc_factor_code_chain('CommodityPrice', 'ObservedBasis', ('CME',), stat, {})] \
+        == [utils.Factor('CommodityPrice', ('CME',))]
+    # composite -> [primary, basis named by the whole prefix]
+    assert [c[1] for c in calc_factor_code_chain('CommodityPrice', 'ObservedBasis', ('CME', 'LME'), stat, {})] \
+        == [utils.Factor('CommodityPrice', ('CME',)), utils.Factor('ObservedBasis', ('CME', 'LME'))]
+    # bases stack
+    assert [c[1] for c in calc_factor_code_chain('CommodityPrice', 'ObservedBasis', ('CME', 'LME', 'SHF'), stat, {})] \
+        == [utils.Factor('CommodityPrice', ('CME',)), utils.Factor('ObservedBasis', ('CME', 'LME')),
+            utils.Factor('ObservedBasis', ('CME', 'LME', 'SHF'))]
+
+
+def test_chain_generic_fx_and_ir_identity():
+    from riskflow.instruments import calc_factor_code_chain, get_interest_factor
+    fx = _offsets(('FxRate', ('EUR',)), ('ObservedBasis', ('EUR', 'PROXY')))
+    assert [c[1] for c in calc_factor_code_chain('FxRate', 'ObservedBasis', ('EUR', 'PROXY'), fx, {})] \
+        == [utils.Factor('FxRate', ('EUR',)), utils.Factor('ObservedBasis', ('EUR', 'PROXY'))]
+    # get_interest_factor is the identity (head==tail) case of the same function
+    ir = _offsets(('InterestRate', ('USD',)), ('InterestRate', ('USD', 'LIBOR')))
+    assert [c[1] for c in get_interest_factor(('USD', 'LIBOR'), ir, {}, {})] \
+        == [utils.Factor('InterestRate', ('USD',)), utils.Factor('InterestRate', ('USD', 'LIBOR'))]
+
+
+def test_stacked_basis_sums_in_spot_rate():
+    torch.manual_seed(4)
+    prim, b1, b2 = torch.randn(5, 4), torch.randn(5, 4), torch.randn(5, 4)
+    shared = _shared()
+    shared.t_Scenario_Buffer.update({'P': prim, 'B1': b1, 'B2': b2})
+    tg = _grid([0, 2, 4])
+    idx = torch.tensor([0, 2, 4])
+    out = utils.calc_time_grid_spot_rate([(True, 'P'), (True, 'B1'), (True, 'B2')], tg, shared)
+    assert torch.equal(out, prim[idx] + b1[idx] + b2[idx])
+
+
+def test_observed_factor_validation_at_consumer():
+    from riskflow.stochasticprocess import BasisLinkedSpotModel
+    key = utils.Factor('ObservedBasis', ('PLATINUM_CME', 'LME_CME'))
+    # Observed_Factor must equal the name minus the last element
+    bad = BasisLinkedSpotModel(factor=None, param={'Observed_Factor': 'PLATINUM_WRONG'})
+    with pytest.raises(Exception, match='Observed_Factor'):
+        bad.calc_references(key, {}, {}, {}, {})
+    good = BasisLinkedSpotModel(factor=None, param={'Observed_Factor': 'PLATINUM_CME'})
+    good.calc_references(key, {}, {}, {}, {})   # agrees -> no raise
+
+
+# --- deal-level: composed reference in the Commodity NAME -----------------------------------
+# The shipping liability's Commodity is the composed name PLATINUM_CME.LME_CME (primary + basis).
+
+def _ship_cfg(commodity=None):
     cfg = json.load(open(SHIPPING))
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = 'simulate_only'
@@ -111,10 +170,8 @@ def _ship_cfg(mutate=None, factor_override=None):
     calc['Simulation_Batches'] = 1
     calc['Random_Seed'] = 1
     calc['Hedging_Problem'].pop('Solver', None)
-    if mutate:
-        mutate(calc['Hedging_Problem']['Liabilities']['FloatingEnergyDeal']['PLAT_JUL29'])
-    if factor_override:
-        factor_override(cfg['Calc']['MergeMarketData']['ExplicitMarketData']['Price Factors'])
+    if commodity is not None:
+        calc['Hedging_Problem']['Liabilities']['FloatingEnergyDeal']['PLAT_JUL29']['Commodity'] = commodity
     return cfg
 
 
@@ -125,33 +182,9 @@ def _liability_mtm(cfg):
     return out.bundle['liability_mtm']
 
 
-def test_explicit_basis_sums_into_liability():
-    # Full: Commodity=PLATINUM_CME + Implied_Basis=LME_CME -> composed = CME + basis.
-    full = _liability_mtm(_ship_cfg())
-
-    # Primary-only: drop Implied_Basis -> single-element code, spot = CME alone.
-    primary = _liability_mtm(_ship_cfg(lambda d: d.pop('Implied_Basis')))
-
-    # Zero-basis: Implied_Basis=CME_FLAT (identity basis, all-zero buffer) -> CME + 0.
-    zero = _liability_mtm(_ship_cfg(lambda d: d.update(Implied_Basis='CME_FLAT')))
-
-    # The real basis moves the liability; the zero basis is a bit-exact no-op through the sum
-    # (x + 0.0f == x), and the factor discovery order is unchanged so the random path matches.
+def test_composed_name_sums_into_liability():
+    full = _liability_mtm(_ship_cfg())                                  # CME + LME_CME
+    primary = _liability_mtm(_ship_cfg(commodity='PLATINUM_CME'))       # CME alone
+    zero = _liability_mtm(_ship_cfg(commodity='PLATINUM_CME.CME_FLAT')) # CME + 0
     assert not torch.equal(full, primary), 'LME_CME basis made no difference to the liability'
     assert torch.equal(zero, primary), 'a zero (CME_FLAT) basis must be a bit-exact no-op'
-
-
-def test_observed_factor_mismatch_raises(caplog):
-    # Corrupt the deal's basis (LME_CME) so its Observed_Factor no longer names the deal's
-    # Commodity (PLATINUM_CME) — only the liability uses LME_CME, so the futures are untouched.
-    # The ValueError fires in calc_dependencies (loud, names both spots + the basis); the
-    # framework's dependency walker logs it and skips the deal (its standard bad-config
-    # contract), so the calc then fails downstream on the missing liability.
-    def _corrupt(pf):
-        pf['ObservedBasis.LME_CME']['Observed_Factor'] = 'PLATINUM_WRONG'
-    with caplog.at_level('ERROR'):
-        with pytest.raises(Exception):
-            _liability_mtm(_ship_cfg(factor_override=_corrupt))
-    joined = ' '.join(r.getMessage() for r in caplog.records)
-    assert 'FloatingEnergyDeal' in joined and 'PLATINUM_WRONG' in joined \
-        and 'PLATINUM_CME' in joined and 'LME_CME' in joined, joined

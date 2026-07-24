@@ -3015,6 +3015,12 @@ def check_tuple_name(factor):
     return '.'.join((factor.type,) + factor.name) if type(factor.name) == tuple else factor
 
 
+# 0D spot factor types whose NAME may carry a composed reference: a primary spot plus one or
+# more ObservedBasis periods, positional like the InterestRate curve+basis parent chain
+# (InterestRate.USD_SOFR.FUNDING; here CommodityPrice.PLATINUM_CME.LME_CME).
+BASIS_COMPOSABLE_TYPES = ('FxRate', 'EquityPrice', 'CommodityPrice')
+
+
 def check_scope_name(factor):
     """Uses check_tuple_name but makes sure TF can use the result as a scope name"""
     return check_tuple_name(factor).translate(

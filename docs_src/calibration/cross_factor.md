@@ -100,6 +100,42 @@ The benefit: the deal's JSON definition only needs the *direct* linkage
 (`Implied_Basis`); the framework's dependency walker pulls the rest in via the
 `dependant_fields` declaration.
 
+## Composed spot: the positional name-prefix chain
+
+A composed spot (primary + basis) is carried **in the name**, positionally, exactly like an
+interest-rate curve and its basis spread. `InterestRate.USD_SOFR.FUNDING` is the SOFR curve
+(period 1) plus its FUNDING basis curve (period 2); `CommodityPrice.PLATINUM_CME.LME_CME` is the
+CME spot plus the LME_CME basis observed against it. Bases stack
+(`...PLATINUM_CME.LME_CME.SHF` adds a third). A deal referencing the composed name carries **no**
+composition fields — the name is the whole story.
+
+**Resolution is positional, not by probing.** One rule, `instruments.calc_factor_code_chain`:
+period 1 is the *head* factor; every longer prefix is a *tail* factor named by that whole prefix
+chain. For a curve `head == tail == InterestRate` (so `get_interest_factor` is just its identity
+case); for a 0D spot `head` is the spot type and `tail = ObservedBasis`. The resulting multi-element
+code is summed by `calc_time_grid_spot_rate` (composed spot = primary + Σ bases). A plain
+single-period name yields a one-element code — bit-identical to the pre-chain lookup. Repo / carry /
+dividend / currency lookups take the head (`fieldname[:1]`), since those live on the primary.
+
+**Discovery is the existing curve mechanism, generalized as data.** `nested_fields` is a
+`{head type: tail type}` map (identity for `InterestRate`, `ObservedBasis` for the 0D spot types);
+`update_nested_rates` walks the name prefixes, giving period 1 the head type and the tail periods
+the mapped type, each linked to its parent prefix so `topological_sort` orders them. Because
+`CommodityPrice` (unlike `InterestRate`) also carries `dependant_fields`, `get_rates` pulls the
+chain first and then applies the dependant/conditional fields to the head; the type-switched
+full-name key (`Factor('CommodityPrice', ('PLATINUM_CME','LME_CME'))`) is never a real factor, so
+it is dropped from both `rates_to_add` and the tenor map.
+
+**`Observed_Factor` is now redundant** with the name prefix (`<primary>.<basis>`). It is kept for
+now, but validated once, where it is consumed — `BasisLinkedSpotModel.calc_references` raises if
+`Observed_Factor` disagrees with the name minus its last period. Deleting the field entirely (and
+deriving the link from the name) would also remove the hardcoded `CommodityPrice` tail type in
+`dependant_fields['ObservedBasis']` — a follow-up left to the user.
+
+**Collision note.** The positional rule reinterprets any multi-period 0D factor name as
+primary + basis chain, so a genuine multi-part `CommodityPrice`/`EquityPrice`/`FxRate` name would
+now be split. A sweep of the shipped configs found none.
+
 ## Design notes — when calibrations need sibling state
 
 The two mechanisms above (archive subkeys, `dependant_fields`) handle the cases where a

@@ -3992,6 +3992,13 @@ class BasisLinkedSpotModel(StochasticProcess):
     def correlation_name(self):
         return 'BasisLinkedSpotProcess', [()]
 
+    def calc_references(self, factor, static_ofs, stoch_ofs, all_tenors, all_factors):
+        # Observed_Factor is redundant with the chained name prefix; if set, it must agree
+        observed = self.param.get('Observed_Factor')
+        if observed is not None and utils.check_rate_name(observed) != factor.name[:-1]:
+            raise Exception('ObservedBasis {0} Observed_Factor {1} disagrees with its name prefix'.format(
+                utils.check_tuple_name(factor), observed))
+
     def precalculate(self, ref_date, time_grid, tensor, shared, process_ofs, implied_tensor=None):
         self.z_offset = process_ofs
         self.scenario_horizon = time_grid.scen_time_grid.size

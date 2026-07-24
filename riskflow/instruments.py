@@ -138,6 +138,14 @@ def calc_factor_index(field, static_offsets, stochastic_offsets, all_tenors={}):
         raise Exception('Cannot find {}'.format(utils.check_tuple_name(field)))
 
 
+def calc_factor_code_chain(head, tail, fieldname, static_offsets, stochastic_offsets, all_tenors={}):
+    """Positional prefix-chain code: period 1 is the `head` factor, each longer prefix a `tail`
+    factor named by the whole chain (curve: head==tail; 0D spot: tail=ObservedBasis). See docs."""
+    return [calc_factor_index(utils.Factor(head if x == 1 else tail, fieldname[:x]),
+                              static_offsets, stochastic_offsets, all_tenors)
+            for x in range(1, len(fieldname) + 1)]
+
+
 def calc_factor_value(field, static_offsets, stochastic_offsets, all_factors):
     """Utility function to determine if a factor is static or stochastic and returns its offset in the scenario block"""
     if static_offsets.get(field) is not None:
@@ -183,8 +191,8 @@ def get_inflation_index_objects(inflation_name, index_name, all_factors):
 
 
 def get_fxrate_factor(fieldname, static_offsets, stochastic_offsets):
-    """Read the index of the FX rate price factor"""
-    return [calc_factor_index(utils.Factor('FxRate', fieldname), static_offsets, stochastic_offsets)]
+    """Read the (basis-aware) code of the FX rate price factor"""
+    return calc_factor_code_chain('FxRate', 'ObservedBasis', fieldname, static_offsets, stochastic_offsets)
 
 
 def get_fxrate_spot(fieldname, static_offsets, stochastic_offsets, all_factors):
@@ -229,7 +237,9 @@ def get_reference_factor(fieldname, all_factors):
 
 
 def get_factor_component(componentname, all_factors):
-    underlying = all_factors.get(componentname)
+    # repo/carry/dividend/currency live on the primary spot = the first period of the name
+    primary = componentname.name[:1] if componentname.type in utils.BASIS_COMPOSABLE_TYPES else componentname.name
+    underlying = all_factors.get(utils.Factor(componentname.type, primary))
     under_factor = underlying.factor if hasattr(underlying, "factor") else underlying
     return under_factor
 
@@ -252,9 +262,8 @@ def get_implied_correlation(rate1, rate2, all_factors):
 
 
 def get_commodity_rate_factor(fieldname, static_offsets, stochastic_offsets):
-    """Read the index of the Equity rate price factor"""
-    return [calc_factor_index(utils.Factor('CommodityPrice', fieldname),
-                              static_offsets, stochastic_offsets)]
+    """Read the (basis-aware) code of the commodity spot price factor"""
+    return calc_factor_code_chain('CommodityPrice', 'ObservedBasis', fieldname, static_offsets, stochastic_offsets)
 
 
 def get_impliedbasis_factor(fieldname, static_offsets, stochastic_offsets):
@@ -275,9 +284,8 @@ def get_observed_factor_name(fieldname, all_factors):
 
 
 def get_equity_rate_factor(fieldname, static_offsets, stochastic_offsets):
-    """Read the index of the Equity rate price factor"""
-    return [calc_factor_index(utils.Factor('EquityPrice', fieldname),
-                              static_offsets, stochastic_offsets)]
+    """Read the (basis-aware) code of the equity spot price factor"""
+    return calc_factor_code_chain('EquityPrice', 'ObservedBasis', fieldname, static_offsets, stochastic_offsets)
 
 
 def get_equity_spot(fieldname, static_offsets, stochastic_offsets, all_factors):
@@ -287,38 +295,33 @@ def get_equity_spot(fieldname, static_offsets, stochastic_offsets, all_factors):
 
 
 def get_equity_currency_factor(fieldname, static_offsets, stochastic_offsets, all_factors):
-    """Read the index of the Equity's Currency price factor"""
-    equity_factor = all_factors.get(utils.Factor('EquityPrice', fieldname))
-    fxrate = (equity_factor.factor if hasattr(equity_factor, 'factor') else equity_factor).get_currency()
+    """Read the index of the Equity's Currency price factor (off the primary spot)"""
+    fxrate = get_factor_component(utils.Factor('EquityPrice', fieldname), all_factors).get_currency()
     return [calc_factor_index(utils.Factor('FxRate', fxrate),
                               static_offsets, stochastic_offsets)]
 
 
 def get_dividend_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors):
-    """Read the index of the dividend rate price factor"""
-    return [calc_factor_index(utils.Factor('DividendRate', fieldname), static_offsets,
+    """Read the index of the dividend rate price factor (off the primary spot = first period)"""
+    return [calc_factor_index(utils.Factor('DividendRate', fieldname[:1]), static_offsets,
                               stochastic_offsets, all_tenors)]
 
 
 def get_interest_factor(fieldname, static_offsets, stochastic_offsets, all_tenors):
-    """Read the index of the interest rate price factor"""
-    return [calc_factor_index(utils.Factor('InterestRate', fieldname[:x]),
-                              static_offsets, stochastic_offsets, all_tenors)
-            for x in range(1, len(fieldname) + 1)]
+    """Read the index of the interest rate price factor (a curve + its basis-spread chain)"""
+    return calc_factor_code_chain('InterestRate', 'InterestRate', fieldname,
+                                  static_offsets, stochastic_offsets, all_tenors)
 
 
 def get_equity_zero_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors, all_factors):
-    """Read the equity's interest rate price factor"""
-    equity_factor = all_factors.get(utils.Factor('EquityPrice', fieldname))
-    ir_curve = (equity_factor.factor if hasattr(equity_factor, 'factor') else equity_factor).get_repo_curve_name()
+    """Read the equity's interest rate price factor (off the primary spot)"""
+    ir_curve = get_factor_component(utils.Factor('EquityPrice', fieldname), all_factors).get_repo_curve_name()
     return get_interest_factor(ir_curve, static_offsets, stochastic_offsets, all_tenors)
 
 
 def get_commodity_zero_rate_factor(fieldname, static_offsets, stochastic_offsets, all_tenors, all_factors):
-    """Read the equity's interest rate price factor"""
-    commodity_factor = all_factors.get(utils.Factor('CommodityPrice', fieldname))
-    ir_curve = (
-        commodity_factor.factor if hasattr(commodity_factor, 'factor') else commodity_factor).get_repo_curve_name()
+    """Read the commodity's interest rate price factor (off the primary spot)"""
+    ir_curve = get_factor_component(utils.Factor('CommodityPrice', fieldname), all_factors).get_repo_curve_name()
     return get_interest_factor(ir_curve, static_offsets, stochastic_offsets, all_tenors)
 
 
@@ -4925,29 +4928,16 @@ class FloatingEnergyDeal(Deal):
 
         if self.options.get('ForwardCurve', 'Full') == 'Components':
             # need to construct the forwardcurve from the components already simulated
+            # Commodity may name a composed spot (primary + ObservedBasis, e.g.
+            # PLATINUM_CME.LME_CME): get_commodity_rate_factor is basis-aware and returns the
+            # summed code, and get_factor_component resolves repo/carry off the primary. No
+            # composition fields or branches on the deal.
             field["Commodity"] = utils.check_rate_name(self.field["Commodity"])
             reference_factor = get_reference_factor(field["Reference_Type"], all_factors)
             commodity_factor = get_factor_component(
                 utils.Factor('CommodityPrice', field["Commodity"]), all_factors)
-            # Commodity is a plain primary spot; repo/carry resolve off it. When the deal also
-            # declares an Implied_Basis, the priced spot is primary + basis — append the
-            # ObservedBasis index so calc_time_grid_spot_rate sums the two buffers (composition
-            # lives in the explicit fields, not in the name). Validate the basis observes THIS
-            # primary so the pair is coherent.
             field_index['Commodity'] = get_commodity_rate_factor(
                 field['Commodity'], static_offsets, stochastic_offsets)
-            if self.field.get('Implied_Basis'):
-                basis_field = utils.check_rate_name(self.field['Implied_Basis'])
-                observed = utils.check_rate_name(get_observed_factor_name(basis_field, all_factors))
-                if observed != field['Commodity']:
-                    raise ValueError(
-                        f"FloatingEnergyDeal Implied_Basis "
-                        f"{utils.check_tuple_name(utils.Factor('ObservedBasis', basis_field))} observes "
-                        f"{utils.check_tuple_name(utils.Factor('CommodityPrice', observed))} but the deal's "
-                        f"Commodity is {utils.check_tuple_name(utils.Factor('CommodityPrice', field['Commodity']))} "
-                        f"— a composed spot = primary + basis requires them to match.")
-                field_index['Commodity'] = field_index['Commodity'] + get_impliedbasis_factor(
-                    basis_field, static_offsets, stochastic_offsets)
             field_index["ForwardPrice"], field_index["ForwardFX"], field_index["CashFX"] = get_forwardprice_factor(
                 field['Payoff_Currency'], static_offsets, stochastic_offsets, all_tenors,
                 all_factors, None, commodity_factor, base_date)

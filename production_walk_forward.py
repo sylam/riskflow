@@ -16,12 +16,13 @@ Aggregate across all trades and print the table (mean/min/max, positives, bound-
 
 CORRECTED (composed-spot) architecture, all validated:
   * CommodityPrice.PLATINUM_CME = P is the martingale primary (MarkovHMMSpotModel).
-  * ObservedBasis.LME_CME (BasisLinkedSpotModel, Observed_Factor=PLATINUM_CME) carries the
+  * ObservedBasis.PLATINUM_CME.LME_CME (BasisLinkedSpotModel, Observed_Factor=PLATINUM_CME) carries the
     published basis b = S - P (LME - CME) — the LBMA catch-up.
-  * The LBMA fixing S = P + b is the composed spot: the swap declares Commodity=PLATINUM_CME +
-    Implied_Basis=LME_CME, so its FloatingEnergyDeal prices off primary + basis directly (the
-    multi-element spot lookup sums the two buffers — no separate composed factor/model).
-  * The CME futures reference the primary through the identity basis CME_FLAT
+  * The LBMA fixing S = P + b is the composed spot: the swap's Commodity is the composed
+    reference PLATINUM_CME.LME_CME (primary + basis carried in the NAME, like InterestRate.
+    USD.LIBOR), so its FloatingEnergyDeal prices off primary + basis directly (the basis-aware
+    spot lookup sums the two buffers — no separate composed factor/model, no deal-side fields).
+  * The CME futures reference the primary through the identity basis PLATINUM_CME.CME_FLAT
     (Observed_Factor=PLATINUM_CME, zero dynamics) so synthetic = P + 0 = P (martingale) and
     E[dF|b] ≈ 0 (unexecutable reversion not harvested). The dependency graph is acyclic:
     CME -> {CME_FLAT, LME_CME}.
@@ -84,7 +85,7 @@ CARRY_TENORS = ('PLATINUM_TAU1', 'PLATINUM_TAU2', 'PLATINUM_TAU3')
 # --- corrected archive column names ---
 CME_COL = 'CommodityPrice.PLATINUM_CME'          # martingale primary P
 LME_COL = 'CommodityPrice.PLATINUM_LME'          # LBMA fixing S = P - b
-BASIS_COL = 'ObservedBasis.LME_CME,PLATINUM_CME'  # published basis b = S - P (LME - CME)
+BASIS_COL = 'ObservedBasis.PLATINUM_CME.LME_CME,PLATINUM_CME'  # published basis b = S - P (LME - CME)
 CARRY_COL = 'ForwardRate.PLATINUM_CARRY'          # + ',<tenor>'
 SOFR_PREFIX = 'InterestRate.USD-SOFR'
 
@@ -102,7 +103,7 @@ def build_corrected_archive(raw):
     corrected series. Returns a DataFrame with the martingale primary P (CME-implied continuous
     spot), the published basis b = S - P (LME - CME), clean calendar-spread carry knots, tenors,
     the SOFR curve, and the LBMA fixing S. (The calibration CSV drops S — the composed spot is
-    P + b, reconstructed at pricing from Commodity=PLATINUM_CME + Implied_Basis=LME_CME, so it
+    P + b, reconstructed at pricing from the composed name Commodity=PLATINUM_CME.LME_CME, so it
     carries no archive series and is never calibrated.)"""
     F1, F2, F3 = raw['PL1'].astype(float), raw['PL2'].astype(float), raw['PL3'].astype(float)
     t1, t2, t3 = raw['PL1_tau'].astype(float), raw['PL2_tau'].astype(float), raw['PL3_tau'].astype(float)
@@ -212,7 +213,6 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
     hp = calc['Hedging_Problem']
 
     calc['Base_Date'] = _ts(trade_date)
-    calc['Scenario_Factors'] = ['ObservedBasis.LME_CME']  # reached only via the composed LME spot
     mm['MarketDataFile'] = calibrated_md
     hp['Objective'] = dict(OBJECTIVE)
 
@@ -229,8 +229,7 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
     fixings = pd.bdate_range(avg_start, avg_end)
     k_fair = fair_strike(row, trade_date, fixings)
     deal = next(iter(hp['Liabilities']['FloatingEnergyDeal'].values()))
-    deal['Commodity'] = 'PLATINUM_CME'          # primary; composed LBMA spot = primary + basis
-    deal['Implied_Basis'] = 'LME_CME'
+    deal['Commodity'] = 'PLATINUM_CME.LME_CME'   # composed LBMA spot = primary + basis, in the name
     deal['Reference_Type'] = 'PLATINUM'
     deal['Payments']['Items'][0].update({
         'Payment_Date': _ts(pay), 'Period_Start': _ts(avg_start), 'Period_End': _ts(avg_end),
@@ -242,7 +241,7 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
     for i, (mat, c, tau) in enumerate(zip(mats, carry, taus), 1):
         name = f'PL_M{i}'
         futs[name] = {'Maturity_Date': _ts(mat), 'Currency': 'USD', 'Carry': 'PLATINUM_CARRY',
-                      'Repo_Rate': 'USD-SOFR', 'Implied_Basis': 'CME_FLAT', 'Contract_Size': CONTRACT_SIZE}
+                      'Repo_Rate': 'USD-SOFR', 'Implied_Basis': 'PLATINUM_CME.CME_FLAT', 'Contract_Size': CONTRACT_SIZE}
         positions[name] = 0
         setts[name] = round(p0 * float(np.exp(c * tau)), 4)
         margins[name] = {'Method': 'per_contract', 'Amount': round(0.085 * setts[name] * CONTRACT_SIZE, 0)}
@@ -271,8 +270,8 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
         'FxRate.USD': {'Domestic_Currency': '', 'Interest_Rate': 'USD-SOFR', 'Spot': 1.0},
         CME_COL: {'Currency': 'USD', 'Interest_Rate': 'USD-SOFR', 'Forward_Rate': 'PLATINUM_CARRY',
                   'Spot': p0, 'Property_Aliases': ''},
-        'ObservedBasis.LME_CME': {'Spot': b0, 'Observed_Factor': 'PLATINUM_CME'},
-        'ObservedBasis.CME_FLAT': {'Spot': 0.0, 'Observed_Factor': 'PLATINUM_CME'},
+        'ObservedBasis.PLATINUM_CME.LME_CME': {'Spot': b0, 'Observed_Factor': 'PLATINUM_CME'},
+        'ObservedBasis.PLATINUM_CME.CME_FLAT': {'Spot': 0.0, 'Observed_Factor': 'PLATINUM_CME'},
         'ReferencePrice.PLATINUM': {'Fixing_Curve': {'.Curve': {'meta': [], 'data': [[40000, 40000], [50000, 50000]]}},
                                     'ForwardPrice': None, 'Property_Aliases': ''},
         'ForwardRate.PLATINUM_CARRY': {'Currency': 'USD', 'Curve': {'.Curve': {'meta': [], 'data': [
@@ -290,7 +289,7 @@ def build_deal_config(template, arch, trade_date, calibrated_md, margin, volume,
     # Sigma form must match the primary: regime-conditional (HMM publishes 'regimes') vs flat
     # (GARCH publishes no regimes — a Sigma_By_State basis would fail loud on the missing key).
     flat = {'A': 0.0, 'Phi': 0.0, 'Nu': 5.0, 'Mu': 0.0}
-    emd_pm['BasisLinkedSpotModel.CME_FLAT'] = (
+    emd_pm['BasisLinkedSpotModel.PLATINUM_CME.CME_FLAT'] = (
         {**flat, 'Sigma': 0.0} if spot_model == 'garch' else {**flat, 'Sigma_By_State': [0.0, 0.0, 0.0]})
     emd['Valuation Configuration'] = {'FloatingEnergyDeal': {'ForwardCurve': 'Components'}}
 
@@ -310,7 +309,7 @@ def observed_scenario_npz(arch, base_date, path):
             f'{arch.index[-1].date()}: the realized roll would run on fabricated flat prices')
     rows = arch.reindex(arch.index.union(dates)).ffill().loc[dates]
     np.savez(path, **{CME_COL: rows[CME_COL].to_numpy(),
-                      'ObservedBasis.LME_CME': rows[BASIS_COL].to_numpy()})
+                      'ObservedBasis.PLATINUM_CME.LME_CME': rows[BASIS_COL].to_numpy()})
 
 
 def pf_bound(arch, trade_date, mats, pay):
@@ -375,7 +374,7 @@ def garchify_md(hmm_md, arch, cal_end, out_md):
     cal_end); everything else (carry VAR, SOFR, composed-LME routing) is byte-for-byte untouched:
       * GARCHSpotModel.PLATINUM_CME from GARCHSpotCalibration on the primary P series (same
         |r|<0.25 guard and H0 = filtered variance at the trade date — reuses the calibrator).
-      * BasisLinkedSpotModel.LME_CME → flat-Sigma OU: keep the HMM A/Phi/Nu (the OU structure);
+      * BasisLinkedSpotModel.PLATINUM_CME.LME_CME → flat-Sigma OU: keep the HMM A/Phi/Nu (the OU structure);
         σ = unconditional innovation std of b up to the trade date (NO regime conditioning, NO
         shipping constant).
       * modeldefaults.CommodityPrice → GARCHSpotModel; Correlations mirror the carry-spot entry
@@ -399,7 +398,7 @@ def garchify_md(hmm_md, arch, cal_end, out_md):
     if hmm_corr is not None:
         corr['GARCHSpotProcess.PLATINUM_CME'] = dict(hmm_corr)
 
-    lme = pm['BasisLinkedSpotModel.LME_CME']
+    lme = pm['BasisLinkedSpotModel.PLATINUM_CME.LME_CME']
     A, Phi = float(lme['A']), float(lme['Phi'])
     b = arch[BASIS_COL].loc[:cal_end].astype(float)            # published basis S - P
     eta = (b - A * P.diff() - Phi * b.shift(1)).dropna()       # AR(1)-on-ΔP innovations, no regime split

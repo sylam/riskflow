@@ -23,7 +23,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "CME_FLAT",
+       "Implied_Basis": "PLATINUM_CME.CME_FLAT",
        "Contract_Size": 50
       },
       "PL_M2": {
@@ -33,7 +33,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "CME_FLAT",
+       "Implied_Basis": "PLATINUM_CME.CME_FLAT",
        "Contract_Size": 50
       },
       "PL_M3": {
@@ -43,7 +43,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "CME_FLAT",
+       "Implied_Basis": "PLATINUM_CME.CME_FLAT",
        "Contract_Size": 50
       }
      },
@@ -101,8 +101,7 @@
        "Sampling_Type": "USD",
        "FX_Sampling_Type": "USD",
        "Discount_Rate": "USD-SOFR",
-       "Commodity": "PLATINUM_CME",
-       "Implied_Basis": "LME_CME",
+       "Commodity": "PLATINUM_CME.LME_CME",
        "Reference_Type": "PLATINUM",
        "Payer_Receiver": "Receiver",
        "Payments": {
@@ -176,10 +175,7 @@
    },
    "Inner_Sub_Batch": 64,
    "Inner_MC_Enabled": "Yes",
-   "Inner_Antithetic": "Yes",
-   "Scenario_Factors": [
-    "ObservedBasis.LME_CME"
-   ]
+   "Inner_Antithetic": "Yes"
   },
   "MergeMarketData": {
    "MarketDataFile": "./artifacts/MarketDataRF_platinum_calibrated_cme.json",
@@ -200,11 +196,11 @@
       "Spot": 1661.4839212399793,
       "Property_Aliases": ""
      },
-     "ObservedBasis.LME_CME": {
+     "ObservedBasis.PLATINUM_CME.LME_CME": {
       "Spot": 15.516078760020719,
       "Observed_Factor": "PLATINUM_CME"
      },
-     "ObservedBasis.CME_FLAT": {
+     "ObservedBasis.PLATINUM_CME.CME_FLAT": {
       "Spot": 0.0,
       "Observed_Factor": "PLATINUM_CME"
      },

@@ -23,7 +23,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "LME_CME",
+       "Implied_Basis": "PLATINUM_LME.LME_CME",
        "Contract_Size": 50
       },
       "PL_JUL_2026": {
@@ -33,7 +33,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "LME_CME",
+       "Implied_Basis": "PLATINUM_LME.LME_CME",
        "Contract_Size": 50
       },
       "PL_OCT_2026": {
@@ -43,7 +43,7 @@
        "Currency": "USD",
        "Carry": "PLATINUM_CARRY",
        "Repo_Rate": "USD-SOFR",
-       "Implied_Basis": "LME_CME",
+       "Implied_Basis": "PLATINUM_LME.LME_CME",
        "Contract_Size": 50
       }
      },
@@ -356,7 +356,7 @@
       "Spot": 2055.0,
       "Property_Aliases": ""
      },
-     "ObservedBasis.LME_CME": {
+     "ObservedBasis.PLATINUM_LME.LME_CME": {
       "Spot": -32.5375,
       "Observed_Factor": "PLATINUM_LME"
      },
