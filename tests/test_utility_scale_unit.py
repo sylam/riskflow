@@ -10,19 +10,19 @@ from riskflow.hedge_bundle import (
     _mirror_utility_scale_to_runtime, _utility_wrap_signed, resolve_utility_scale)
 
 
-def make_legacy_runtime():
-    return {"objective": {"object": "terminalfloorthensurplusutility", "utility_scale": 1.0e6}}
+def make_identity_runtime():
+    return {"objective": {"object": "terminalvalue", "utility_scale": 1.0e6}}
 
 
-def test_mirror_utility_scale_legacy_safe():
-    """Mirroring utility_scale onto a legacy runtime caches the value but the legacy
+def test_mirror_utility_scale_identity_safe():
+    """Mirroring utility_scale onto a non-utility runtime caches the value but the identity
     objective stays identity — the utility gate is False regardless of the cached scale."""
-    runtime = make_legacy_runtime()
+    runtime = make_identity_runtime()
     bundle = {"utility_scale": 9.99e9}
     _mirror_utility_scale_to_runtime(bundle, runtime)
     assert runtime["objective"]["utility_scale"] == 9.99e9
     x = torch.tensor([1.0e6])
-    assert _utility_wrap_signed(x, runtime).item() == 1.0e6  # identity for legacy
+    assert _utility_wrap_signed(x, runtime).item() == 1.0e6  # identity path (non-utility Object)
 
 
 def test_mirror_runtime_no_objective():
@@ -34,7 +34,7 @@ def test_mirror_runtime_no_objective():
 
 def test_mirror_bundle_no_utility_scale():
     """Mirror gracefully no-ops when bundle has no utility_scale (cached pre-change bundle)."""
-    runtime = make_legacy_runtime()
+    runtime = make_identity_runtime()
     saved = runtime["objective"]["utility_scale"]
     _mirror_utility_scale_to_runtime({}, runtime)
     assert runtime["objective"]["utility_scale"] == saved
@@ -42,13 +42,13 @@ def test_mirror_bundle_no_utility_scale():
 
 def test_resolve_utility_scale_fails_loud_on_symlog_degeneracies():
     """Each silent-degrade path in resolve_utility_scale must raise under a utility
-    objective (a $1k floor silently breaks tail compression); legacy returns the floor."""
+    objective (a $1k floor silently breaks tail compression); the identity path returns the floor."""
     def runtime_with_object(obj_name, **objective_extras):
         return {'objective': {'object': obj_name, **objective_extras},
                 'history_lookback_business_days': 0}
 
     sym = lambda **kw: runtime_with_object('asymmetricutility_symlog', **kw)
-    legacy = lambda **kw: runtime_with_object('terminalfloorthensurplusutility', **kw)
+    identity = lambda **kw: runtime_with_object('terminalvalue', **kw)
 
     # Path 1: last_settlement_index missing
     bundle = {'total_leg_volume': 2500.0, 'spot_price_history': {}, 'spot_realized_vol': {}}
@@ -57,7 +57,7 @@ def test_resolve_utility_scale_fails_loud_on_symlog_degeneracies():
         raise AssertionError("symlog should raise on missing last_settlement_index")
     except ValueError as e:
         assert 'last_settlement_index' in str(e), e
-    assert resolve_utility_scale(bundle, legacy()) == 1.0e3
+    assert resolve_utility_scale(bundle, identity()) == 1.0e3
 
     # Path 2: empty spot_price_history
     bundle = {'last_settlement_index': 200, 'total_leg_volume': 2500.0,
@@ -67,7 +67,7 @@ def test_resolve_utility_scale_fails_loud_on_symlog_degeneracies():
         raise AssertionError("symlog should raise on empty spot_price_history")
     except ValueError as e:
         assert 'spot_price_history' in str(e), e
-    assert resolve_utility_scale(bundle, legacy()) == 1.0e3
+    assert resolve_utility_scale(bundle, identity()) == 1.0e3
 
     # Path 3: zero total_leg_volume
     bundle = {'last_settlement_index': 200, 'total_leg_volume': 0.0,
@@ -78,11 +78,11 @@ def test_resolve_utility_scale_fails_loud_on_symlog_degeneracies():
         raise AssertionError("symlog should raise on zero total_leg_volume")
     except ValueError as e:
         assert 'total_leg_volume' in str(e), e
-    assert resolve_utility_scale(bundle, legacy()) == 1.0e3
+    assert resolve_utility_scale(bundle, identity()) == 1.0e3
 
     # Explicit override always honored (no degeneracy check fires).
     assert resolve_utility_scale({}, sym(utility_scale_explicit=5_000_000.0)) == 5_000_000.0
-    assert resolve_utility_scale({}, legacy(utility_scale_explicit=5_000_000.0)) == 5_000_000.0
+    assert resolve_utility_scale({}, identity(utility_scale_explicit=5_000_000.0)) == 5_000_000.0
 
 
 def test_unknown_utility_scale_mode_fails_loud():

@@ -3283,48 +3283,28 @@ class GARCHSpotCalibration(object):
 
 
 class HestonNandiImpliedSpotModel(StochasticProcess):
-    """Heston-Nandi GARCH(1,1) spot-price model under the risk-neutral (LRNVR) measure — an IMPLIED
-    process, so the calibrated `HestonNandiModelParameters` factor (Omega, Alpha, Beta, Gamma_Star,
-    H0) that the semi-analytic option pricer consumes ALSO drives the outer-scenario evolution of its
-    own underlying (CVA / credit-MC). The SAME bootstrapped surface prices the book and diffuses the
-    spot. Like every process in the implied family (GBMAssetPriceTSModelImplied,
-    CSImpliedForwardPriceModel, HullWhite2FactorImpliedInterestRateModel) it is risk-neutral by
-    construction and reads its parameters from the implied tensors (`implied_tensor`), so greeks flow
-    to the single shared AAD leaf (the static-leaf dedupe lives in Calculation._build_factor_state).
+    """Heston-Nandi GARCH(1,1) spot under the risk-neutral (LRNVR) measure — an IMPLIED process:
+    the bootstrapped `HestonNandiModelParameters` factor that the semi-analytic pricer consumes
+    ALSO drives the outer-scenario evolution of its own underlying, reading its parameters from
+    `implied_tensor` so greeks flow to the single shared AAD leaf (static-leaf dedupe in
+    Calculation._build_factor_state). The model itself is described in the `documentation` attr
+    below; this docstring covers the code-facing seams only.
 
-    Dynamics under Q (λ*=-1/2, γ=γ*), per HN trading-day step:
-
-        Δlog S = (r - q) - ½ h + √h · z,   h_{t+1} = ω + β h + α (z - γ* √h)²
-
-    the variance recursion is `utils.hn_variance_step` (the ONE source of truth, shared not
-    copied); (r-q) is the per-step cost of carry read from the spot factor's OWN interest-rate and
-    dividend/repo curves — the identical r_t / q_t gather as GBMAssetPriceTSModelImplied
-    (EquityPrice: equity zero + dividend; FxRate: domestic + foreign zero). The -½ h is the EXACT
-    Gaussian convexity, so the discounted spot is a Q PRICE-martingale BY CONSTRUCTION — verified in
-    PRICE space E[S_t e^{-∫(r-q)}] flat, not log space (the platinum GARCH lesson; log-space
-    martingale tests are structurally blind to a Jensen price drift).
-
-    THE CLOCK (the platinum GARCH trap, NOT re-created): the HN recursion is calibrated per TRADING
-    day (dt_c = 1/`Steps_Per_Year`, default 252) while the scenario grid runs in CALENDAR time (dt_t
-    from time_grid_years). f_t = dt_t/dt_c is the trading-time length of a grid step. This mirrors
-    GARCHSpotModel's fractional trading clock:
-      * n_sub = round(f) ≥ 2 (grid coarser than ~1.5 bd — the usual CVA grid): the integer
-        aggregate-variance bridge — h is forwarded DETERMINISTICALLY through the sub-steps via the HN
-        mean recursion E[h_{j+1}] = ω+α+ψ h_j (ψ=β+αγ*²) and a SINGLE aggregate
-        Gaussian return with the summed variance Σ h_j is drawn (loses within-step vol-of-vol — the
-        documented approximation, exactly as GARCH's n_sub≥2 branch).
-      * n_sub == 1 (f ≤ 1.5, incl. the calendar-daily production grid f≈0.69 AND the business-daily
-        grid f=1): the exact fractional step — return variance h·f and the variance update BLENDED by
-        f: h ← h + f·(hn_variance_step(h,z) − h). At f=1 this is EXACTLY hn_variance_step (a
-        business-day grid reproduces the HN closed-form oracle to MC error); for f<1 it keeps
-        the annualized vol and the mean-reversion RATE grid-invariant in real time.
-
-    Observable state: log h_t = log h_{t+1}^{HN} (the predictable variance of the step t→t+1,
-    F_t-measurable — no lookahead), revealed to the value function exactly as GARCHSpotModel's log_h.
-    The 7-verb protocol (privileged_layout / privileged_factors / reveal_state_at / revealed_annual_vol /
-    inner_fork_seed / outer_reseed / reseed_from_path) mirrors GARCHSpotModel; generate handles outer (T,B) and inner
-    (T,B,B2) with the fork seed on the MIDDLE axis. The single framework Gaussian per step feeds the
-    HN z directly (plain normal — HN has no Student-t emission, unlike GARCH)."""
+    * Variance recursion: `utils.hn_variance_step` (ONE source of truth, shared with the OSS
+      pricers). (r-q) is gathered from the underlying's own rate/dividend curves exactly as
+      GBMAssetPriceTSModelImplied (EquityPrice / FxRate branch on factor_type).
+    * THE CLOCK: calibrated per trading day (dt_c = 1/`Steps_Per_Year`) vs a calendar scenario
+      grid; f = dt/dt_c. n_sub == 1 (f ≤ 1.5): exact fractional step — return variance h·f,
+      variance update BLENDED by f (h ← h + f·(hn_variance_step(h,z) − h)); at f=1 this is
+      exactly hn_variance_step. n_sub ≥ 2 (coarse CVA grids): h forwarded deterministically
+      through the mean recursion E[h_{j+1}] = ω+α+ψ h_j plus ONE aggregate Gaussian draw at the
+      summed variance (documented approximation — loses within-step vol-of-vol).
+    * Observable state: log h_t (predictable, F_t-measurable — no lookahead) in the `hn_log_h`
+      buffer. The 7-verb protocol (privileged_layout / privileged_factors / reveal_state_at /
+      revealed_annual_vol / inner_fork_seed / outer_reseed / reseed_from_path) mirrors
+      GARCHSpotModel; generate handles outer (T,B) and inner (T,B,B2) with the fork seed on the
+      MIDDLE axis. The framework Gaussian feeds z directly (no Student-t emission, unlike
+      GARCH)."""
 
 
     documentation = (
@@ -3343,15 +3323,9 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
          'The parameters $(\\omega,\\alpha,\\beta,\\gamma^*,h_0)$ are the implied '
          '$HestonNandiModelParameters$ factor bootstrapped from the option surface — the same factor '
          'the semi-analytic pricer consumes. The persistence is $\\psi=\\beta+\\alpha\\gamma^{*2}$ and '
-         'the stationary per-step variance $\\frac{\\omega+\\alpha}{1-\\psi}$.',
-         '',
-         'Implementation seams: the A/B recursion is utils.hn_ab (note the load-bearing -phi/2), '
-         'inverted through the model-agnostic utils.cf_european_probabilities; the daily-step '
-         'recursion is utils.hn_variance_step (shared with the OSS pricers). Simulation runs on '
-         'the fractional trading clock f=dt/dt_c (exact at f=1, variance blended by f, '
-         'aggregate-variance bridge for n_sub>=2). Conventions pinned by tests/test_hn_garch.py '
-         '(R fOptions to 2.8e-14) and tests/test_hn_implied_process.py (closed-form oracle; '
-         'both-grids martingale + forward/replay).'])
+         'the stationary per-step variance $\\frac{\\omega+\\alpha}{1-\\psi}$. Simulation runs on the '
+         'fractional trading clock $f=dt/dt_c$: exact at $f=1$, variance blended by $f$ for finer '
+         'grids, and an aggregate-variance bridge on grids coarser than the trading day.'])
 
     def __init__(self, factor, param, implied_factor=None):
         super().__init__(factor, param)

@@ -34,29 +34,29 @@ def _run(data, *, expect_eval=True):
 
 
 def test_bundle_resolves_utility_scale():
-    """Bundle build always sets utility_scale (consumed by symlog, harmless for legacy)."""
+    """Bundle build always sets utility_scale (consumed by symlog, harmless for the identity path)."""
     result = _run(_load())
     c = float(result.bundle.get('utility_scale', 0.0))
     assert c > 1e3, f"utility_scale should be > $1k floor; got ${c:,.0f}"
     print(f"test_bundle_resolves_utility_scale: PASS  (c = ${c:,.0f})")
 
 
-def test_legacy_objective_runs():
-    """Legacy TerminalFloorThenSurplusUtility evaluates without crashing.
+def test_identity_objective_runs():
+    """A non-utility Objective.Object takes the identity path and evaluates without crashing.
     Position limits are now reward-side (Per_Instrument_Bounds_Penalty), not hard-masked,
     so an untrained 1-epoch policy may briefly explore past [Min, Max] before the penalty
     teaches it; we just verify the run produces a finite headline summary."""
-    data = _load(Object='TerminalFloorThenSurplusUtility', Floor_Penalty=10.0)
+    data = _load(Object='TerminalValue', Unused_Key=10.0)
     result = _run(data)
     metrics = result.evaluation_summary['metrics']
     assert metrics['average_net_pnl'] is not None and not (metrics['average_net_pnl'] != metrics['average_net_pnl']), \
-        f"legacy run produced NaN headline: {metrics}"
-    print(f"test_legacy_objective_runs: PASS  (mean=${metrics['average_net_pnl']:+,.0f})")
+        f"identity run produced NaN headline: {metrics}"
+    print(f"test_identity_objective_runs: PASS  (mean=${metrics['average_net_pnl']:+,.0f})")
 
 
 def test_symlog_objective_runs():
     """AsymmetricUtility_Symlog evaluates and produces a finite utility-space reward.
-    Position limits are reward-side, not hard-masked — see test_legacy_objective_runs."""
+    Position limits are reward-side, not hard-masked — see test_identity_objective_runs."""
     data = _load(Object='AsymmetricUtility_Symlog', Floor_Penalty=10.0,
                  Surplus_Reward=1.0, Power=1.0)
     result = _run(data)
@@ -114,7 +114,7 @@ def test_explicit_utility_scale_override():
 
 if __name__ == '__main__':
     test_bundle_resolves_utility_scale()
-    test_legacy_objective_runs()
+    test_identity_objective_runs()
     test_symlog_objective_runs()
     test_unknown_utility_scale_mode_fails_loud()
     test_explicit_utility_scale_override()

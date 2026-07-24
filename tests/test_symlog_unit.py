@@ -27,7 +27,7 @@ def _restore_default_dtype():
 def make_runtime(symlog: bool, c: float = 1.0e6):
     return {
         "objective": {
-            "object": "asymmetricutility_symlog" if symlog else "terminalfloorthensurplusutility",
+            "object": "asymmetricutility_symlog" if symlog else "terminalvalue",
             "utility_scale": c,
             "floor_penalty": 10.0,
             "surplus_reward": 1.0,
@@ -36,12 +36,12 @@ def make_runtime(symlog: bool, c: float = 1.0e6):
 
 
 def make_util_runtime(shape: str, c: float = 1.0e6, **params):
-    """Runtime for a terminal-utility shape: 'symlog' | 'huber' | 'cara' (or 'legacy')."""
+    """Runtime for a terminal-utility shape: 'symlog' | 'huber' | 'cara' (or 'identity')."""
     obj = {
         "symlog": "asymmetricutility_symlog",
         "huber": "asymmetricutility_huber",
         "cara": "asymmetricutility_cara",
-        "legacy": "terminalfloorthensurplusutility",
+        "identity": "terminalvalue",
     }[shape]
     cfg = {"object": obj, "utility_scale": c}
     cfg.update(params)
@@ -58,7 +58,7 @@ def test_is_utility_objective():
     """All three shapes are utility objectives (need c); symlog check is symlog-only."""
     for shape in ("symlog", "huber", "cara"):
         assert _is_utility_objective(make_util_runtime(shape)), shape
-    assert not _is_utility_objective(make_util_runtime("legacy"))
+    assert not _is_utility_objective(make_util_runtime("identity"))
     # _is_symlog_objective stays symlog-specific (for the saturation tripwire etc.)
     assert _is_symlog_objective(make_util_runtime("symlog"))
     assert not _is_symlog_objective(make_util_runtime("huber"))
@@ -115,11 +115,11 @@ def test_utility_shapes_differentiable():
     print("test_utility_shapes_differentiable: PASS  (incl. huber knee C¹)")
 
 
-def test_utility_signed_legacy_identity():
+def test_utility_signed_identity():
     """Legacy objective: _utility_wrap_signed returns the dollar value unchanged."""
     W = torch.tensor([-1.0e6, 0.0, 1.0e6])
-    assert torch.equal(_utility_wrap_signed(W, make_util_runtime("legacy")), W)
-    print("test_utility_signed_legacy_identity: PASS")
+    assert torch.equal(_utility_wrap_signed(W, make_util_runtime("identity")), W)
+    print("test_utility_signed_identity: PASS")
 
 
 def test_pbrs_telescoping():
@@ -167,7 +167,7 @@ if __name__ == "__main__":
     test_is_utility_objective()
     test_utility_shapes_match_reference()
     test_utility_shapes_differentiable()
-    test_utility_signed_legacy_identity()
+    test_utility_signed_identity()
     test_pbrs_telescoping()
     test_magnitude_sanity()
     print("\nAll symlog unit tests passed.")
