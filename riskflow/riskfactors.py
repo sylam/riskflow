@@ -1240,34 +1240,6 @@ class HullWhite2FactorModelParameters(Factor1D):
         return params
 
 
-class PCAMixedFactorModelParameters(Factor1D):
-    """
-    Represents the Bootstrapped implied parameters for a PCA-mixed factor model
-    (Reversion_Speed, Yield_Volatility)
-    """
-
-    def __init__(self, param):
-        super(PCAMixedFactorModelParameters, self).__init__(param)
-
-    def get_tenor(self):
-        """Gets the tenor points stored in the Curve attribute"""
-        if self.param['Quanto_FX_Volatility'] is None:
-            self.param['Quanto_FX_Volatility'] = utils.Curve([], [(0.0, 0.0)])
-        return self.param['Quanto_FX_Volatility'].array[:, 0]
-
-    def get_tenor_indices(self):
-        return {'Reversion_Speed': np.array([[0.0]]),
-                'Yield_Volatility': self.param['Yield_Volatility'].array[:, 0].reshape(-1, 1)}
-
-    def get_vol_tenor(self):
-        return self.param['Yield_Volatility'].array[:, 0]
-
-    def current_value(self, tenors=None, offset=0.0):
-        """Returns the parameters of the mixed factor model as a dictionary"""
-        return dict([('Reversion_Speed', np.array([self.param['Reversion_Speed']])),
-                     ('Yield_Volatility', self.param['Yield_Volatility'].array[:, 1])])
-
-
 class CommodityPriceVol(Factor2D):
     field_desc = ('Commodity',
                   ['- **Surface**: *Curve* object consisting of (moneyness, expiry, volatility) triples. Flat',

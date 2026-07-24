@@ -2828,7 +2828,8 @@ class EquityBarrierBinaryOption(Deal):
                      'A discrete barrier binary (digital) option priced using the same One-Step Survival (OSS)',
                      'Monte Carlo approach as `EquityBarrierOption`, with `isdigital=True` so the terminal payoff',
                      'is a fixed cash amount rather than a vanilla call/put payoff.',
-                     'See `EquityBarrierOption` for the full OSS methodology.'
+                     'See `EquityBarrierOption` for the full OSS methodology, including the **SpotModel**',
+                     'valuation option shared by both deals.'
                      ])
 
     def __init__(self, params, valuation_options):
@@ -3089,7 +3090,19 @@ class QEDI_CustomAutoCallSwap(Deal):
                       'each payment date using the same survival weight $L_j$, so the full swap value is:',
                       '',
                       '$$V = \\sum_{j} (1-p_j)L_{j-1}\\,\\text{Coupon}_j\\,D_j + L_T\\,V_{\\text{terminal}}\\,D_T',
-                      '    - \\sum_k L_{t_k}\\,\\text{Float}_k\\,D_{t_k}$$'
+                      '    - \\sum_k L_{t_k}\\,\\text{Float}_k\\,D_{t_k}$$',
+                      '',
+                      '**Valuation options** (set in the Valuation Configuration section, per deal type)',
+                      '',
+                      '- **SpotModel**: `None` (default — lognormal dynamics off the implied vol surface) or',
+                      '`HestonNandi`. Selects the model family driving the OSS simulation and its analytic legs;',
+                      'the parameters are resolved by naming convention from the',
+                      '`<SpotModel>ModelParameters.<underlying>` price factor (e.g.',
+                      '`HestonNandiModelParameters.SPX`). Switching the model on without that factor in the',
+                      'market data is a loud skip, never a silent lognormal fallback. Requires the',
+                      'non-averaging autocall (one fixing per coupon).',
+                      '- **Steps_Per_Year**: trading-day count converting year fractions to integer GARCH steps',
+                      '(default 252; only read when SpotModel is not `None`).'
                       ])
 
     def __init__(self, params, valuation_options):
@@ -3480,7 +3493,19 @@ class EquityBarrierOption(Deal):
                      '| Knock-In | Black-Scholes vanilla at current outer spot |',
                      '',
                      'When *all* outer scenarios have resolved, the inner OSS simulation is skipped entirely;',
-                     'only a single Black-Scholes evaluation per outer scenario is needed.'
+                     'only a single Black-Scholes evaluation per outer scenario is needed.',
+                     '',
+                     '**Valuation options** (set in the Valuation Configuration section, per deal type)',
+                     '',
+                     '- **SpotModel**: `None` (default — lognormal dynamics off the implied vol surface) or',
+                     '`HestonNandi`. Selects the model family driving the OSS simulation; the barrier-hit and',
+                     'in-out-parity legs then use the matching closed form (the Heston-Nandi CF pricer instead',
+                     'of Black-Scholes). Parameters are resolved by naming convention from the',
+                     '`<SpotModel>ModelParameters.<underlying>` price factor (e.g.',
+                     '`HestonNandiModelParameters.SPX`). Switching the model on without that factor in the',
+                     'market data is a loud skip, never a silent lognormal fallback.',
+                     '- **Steps_Per_Year**: trading-day count converting year fractions to integer GARCH steps',
+                     '(default 252; only read when SpotModel is not `None`).'
                      ])
 
     def __init__(self, params, valuation_options):
@@ -4393,7 +4418,18 @@ class FXTARFOptionDeal(Deal):
             '(i.e. the TARF does not terminate at fixing $j$). The knocked-out weight',
             '$(1-p_j)L_{j-1}$ contributes the partial accrual needed to exactly reach $T^*$ plus any',
             'OTM payments from the terminated fixing. Surviving paths continue with $A_j = A_{j-1} + \\Delta_j$',
-            'drawn from the truncated distribution.'
+            'drawn from the truncated distribution.',
+            '',
+            '**Valuation options** (set in the Valuation Configuration section, per deal type)',
+            '',
+            '- **SpotModel**: `None` (default — lognormal dynamics off the implied vol surface) or',
+            '`HestonNandi`. Selects the model family driving the OSS fixing-to-fixing simulation.',
+            'Parameters are resolved by naming convention from the',
+            '`<SpotModel>ModelParameters.<underlying>` price factor (e.g.',
+            '`HestonNandiModelParameters.EUR.USD`). Switching the model on without that factor in the',
+            'market data is a loud skip, never a silent lognormal fallback.',
+            '- **Steps_Per_Year**: trading-day count converting year fractions to integer GARCH steps',
+            '(default 252; only read when SpotModel is not `None`).'
         ])
 
     def __init__(self, params, valuation_options):
@@ -4850,7 +4886,15 @@ class FloatingEnergyDeal(Deal):
         '',
         '$$V (A S^R(t,t_s^s,t_e^s,\\mathcal S)+b)D(t,T)$$',
         '',
-        'where $A$ is the **Price Multiplier** and $b$ is the **Fixed Basis**.'
+        'where $A$ is the **Price Multiplier** and $b$ is the **Fixed Basis**.',
+        '',
+        '**Valuation options** (set in the Valuation Configuration section, per deal type)',
+        '',
+        '- **ForwardCurve**: `Full` (default — sample the simulated `ForwardPrice` curve directly) or',
+        '`Components`. With `Components` the forward curve is *derived* from the simulated spot',
+        'components instead: the deal reads its **Commodity** (`CommodityPrice`) factor and builds the',
+        'curve with $F(t,t)=S(t)$, so a spot model (e.g. a GARCH or regime world) drives the fixings',
+        'without a separately simulated forward curve.'
     ])
 
     def __init__(self, params, valuation_options):
