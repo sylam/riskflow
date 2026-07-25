@@ -80,12 +80,8 @@ class ModelParams(object):
     def __init__(self, state=None):
         # valid risk factor subtypes (only Interest rates at the moment)
         self.valid_subtype = {'BasisSpread': 'BasisSpread'}
-        # these models need these additional price factors
-        # HestonNandiImpliedSpotModel and the OSS option pricer share ONE HestonNandiModelParameters
-        # factor: the process consumes it as its implied factor (implied_var) and the pricer as a
-        # static dependent factor. The duplicate-AAD-leaf that this would otherwise create is
-        # deduped in Calculation._build_factor_state (the static leaf reuses the implied one), so
-        # the single tensor drives both the scenario path and the pricer and backward sums both.
+        # these models need these additional price factors; process + pricer share ONE params
+        # factor (the duplicate AAD leaf is deduped in Calculation._build_factor_state)
         self.implied_models = {
             'CSImpliedForwardPriceModel': 'CSForwardPriceModelParameters',
             'GBMAssetPriceTSModelImplied': 'GBMAssetPriceTSModelParameters',
@@ -113,10 +109,7 @@ class ModelParams(object):
             self.modelfilters.setdefault(price_factor, []).append((price_filter, stoch_proc))
 
     def update(self, modelparams):
-        # Explicit-update semantics: incoming defaults/filters OVERRIDE existing entries.
-        # (`append`/`setdefault` stays first-wins for file parsing; an ExplicitMarketData
-        # merge is deliberately last-wins — otherwise a Model Configuration override that
-        # remaps an already-mapped factor type is a silent no-op.)
+        # ExplicitMarketData merges are last-wins (overrides remap existing entries); file parsing stays first-wins
         self.modeldefaults.update(modelparams.modeldefaults)
         for factor, mappings in modelparams.modelfilters.items():
             self.modelfilters[factor] = list(mappings)
@@ -347,9 +340,7 @@ class Config(object):
                                                       self.calibration_process_map.get(model))
 
         remaining_factor = {}
-        # Subtract present factors by archive_name (which carries the subtype) — the JSON
-        # key (factor) lacks the subtype suffix so it can't be compared to archive column
-        # roots directly.
+        # compare by archive_name — the JSON key lacks the subtype suffix
         covered_archives = {v.archive_name for v in model_factor.values()}
         remaining_rates = set([col.split(',')[0] for col in self.archive.columns]).difference(covered_archives)
         for factor in remaining_rates:
@@ -388,9 +379,7 @@ class Config(object):
                                    self.holidays,
                                    debug=self)
 
-            # every bootstrapper writes <its own class name>.<rate> price factors, so an empty result
-            # means it silently did nothing - a misnamed/absent Market Prices section, or a
-            # bootstrapper class name that doesn't match its risk factor class name
+            # empty result = the bootstrapper silently did nothing (misnamed Market Prices or class-name mismatch)
             if not [x for x in self.params['Price Factors'] if x.startswith(bootstrapper_name + '.')]:
                 logging.error('Bootstrapper {0} wrote no {0}.* price factor - check the Market Prices'
                               ' section'.format(bootstrapper_name))
@@ -409,11 +398,8 @@ class Config(object):
         ak = []
         num_indexes = 0
         num_factors = 0
-        # Pull primary calibration columns plus related-factor columns. Two dependency forms:
-        #   - comma sub-key: InterestRate.PLATINUM_CARRY,PLATINUM_TAU1 pairs with Tenor.PLATINUM_TAU1
-        #     (find any archive_name ending in `.{sub_key}`)
-        #   - name prefix: ObservedBasis.PLATINUM_CME.LME_CME pulls its parent CommodityPrice.PLATINUM_CME
-        # Either way the dependency lives in the archive header, no calibration_config JSON needed.
+        # related columns come from the archive header: a comma sub-key (`X,SUB` pairs with `Tenor.SUB`)
+        # or a chained-name prefix (an ObservedBasis pulls its parent spot)
         def _related_archive_cols(archive_name):
             extras = []
             for col in self.archive_columns.get(archive_name, []):
@@ -698,23 +684,13 @@ class Config(object):
                 sorted([instrument.field['Currency'], instrument.field['Payoff_Currency']])))
              ] if instrument.field['Currency'] != instrument.field.get(
                 'Payoff_Currency', instrument.field['Currency']) else [],
-            # the model link lives at the factor/config layer: when a deal turns on a non-GBM spot
-            # model via the Valuation Configuration switch SpotModel (per deal type), its EquityPrice
-            # pulls in the correspondingly-named params factor <SpotModel>ModelParameters.<equity> as a
-            # dependent STATIC factor - a naming convention generic over the model family (HestonNandi
-            # today, Heston/SLV/... later with zero change here). Switch off/absent -> [] (GBM). If the
-            # switch is on but the factor is missing from the market data it simply is not constructed,
-            # and the capable deal's calc_dependencies then fails loud (never silent GBM).
+            # SpotModel switch pulls in the <SpotModel>ModelParameters.<equity> static factor
             'EquityPrice': lambda instrument, factor_fields, params:
             [utils.Factor(instrument.options['SpotModel'] + 'ModelParameters',
                           utils.check_rate_name(instrument.field['Equity']))]
             if instrument.options.get('SpotModel', 'None') != 'None'
             and instrument.field.get('Equity') is not None else [],
-            # FX-underlying analogue of the EquityPrice link above: an FX deal (the TARF) that turns on
-            # a non-GBM SpotModel pulls in <SpotModel>ModelParameters.<Underlying_Currency>. FxRate is a
-            # broad type (also the base/report currency, which get_rates visits with a bare {} sentinel),
-            # so guard via getattr on a REAL deal carrying the switch AND an Underlying_Currency field;
-            # everything else -> [] (GBM/no-op).
+            # FX analogue; getattr-guarded (FxRate is also visited with a bare {} sentinel)
             'FxRate': lambda instrument, factor_fields, params:
             [utils.Factor(instrument.options['SpotModel'] + 'ModelParameters',
                           utils.check_rate_name(instrument.field['Underlying_Currency']))]
@@ -906,10 +882,7 @@ class Config(object):
             self.archive = pd.read_csv(mkt_data_details['name'], skiprows=mkt_data_details['skiprows'],
                                        sep=mkt_data_details.get('sep', '\t'),
                                        index_col=mkt_data_details['index_column'])
-            # Normalise the archive index to Excel-offset integers (filter_data_frame and
-            # calibrate_PFE assume that convention). If the file already stores ints, this is
-            # a no-op; if it has parsed-date strings (e.g. plat_archive.csv: "2009/11/10"), we
-            # convert via the project's excel_offset.
+            # normalise the archive index to Excel-offset ints (filter_data_frame/calibrate_PFE convention)
             if self.archive.index.dtype == object:
                 self.archive.index = (pd.to_datetime(self.archive.index) - utils.excel_offset).days
             # load the calibration
