@@ -19,7 +19,6 @@
 
 # import standard libraries
 
-import os
 import time
 import logging
 import itertools
@@ -47,25 +46,26 @@ from .hedge_bundle import (
     run_hedge_execution, HedgeRuntimeExecutionResult, build_hedge_bundle,
 )
 
-# Inner-MC memory cap (M2g): generation and pricing both scale with B_outer*B_inner —
-# the curve-interpolation / path slabs OOM past ~32k flat on a 10GB card. `_run_inner_mc_at_t`
-# runs the whole inner MC in outer-path sub-chunks of at most this many flat samples, so
-# peak memory tracks the chunk and B_outer scales freely. Overridable via the env var
-# RF_INNER_MC_FLAT_LIMIT — raise it on a large GPU (fewer chunks = faster).
-_INNER_MC_FLAT_LIMIT = int(os.environ.get('RF_INNER_MC_FLAT_LIMIT', 32768))
+# Flat-sample cap (outer chunk x Inner_Sub_Batch) per inner-MC fork pass at a 64-row reference;
+# per-job override = Calculation.Inner_MC_Flat_Limit.
+_INNER_MC_FLAT_DEFAULT = 32768
 
 
 def _concat_inner_chunks(chunks, want_raw_samples):
     """Concatenate per-outer-chunk `_run_inner_mc_chunk` results back to full B_outer.
     The outer-path axis is dim 0 of every per-chunk tensor; chunk order is outer-path
-    order. Scalars (`t`, `cutoff_idx`) are taken from the first chunk."""
+    order. Scalars (`t`, `cutoff_idx`) are taken from the first chunk.
+
+    A field the chunks leave empty (`L_T` on a one-step window) is carried through as an
+    explicit None — never dropped: the key set must not depend on how many chunks ran, or a
+    consumer reading it breaks only at the batch size that starts chunking."""
     out = {'features': torch.cat([c['features'] for c in chunks], dim=0)}
     if want_raw_samples:
         first = chunks[0]
         out['t'], out['cutoff_idx'] = first['t'], first['cutoff_idx']
         for key in ('L_T', 'market_t', 'market_t1', 'L_t', 'L_t1'):
-            if key in first and first[key] is not None:
-                out[key] = torch.cat([c[key] for c in chunks], dim=0)
+            out[key] = (torch.cat([c[key] for c in chunks], dim=0)
+                        if first.get(key) is not None else None)
         for key in ('F_t1', 'dF_T', 'dF_min'):
             out[key] = {ref: torch.cat([c[key][ref] for c in chunks], dim=0)
                         for ref in first[key]}
@@ -1771,6 +1771,17 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         'The configuration contract is documented in the',
         '[Hedging_Problem](../json/index.md#calculation) section of the JSON reference.',
         '',
+        '### Inner-MC Calculation fields',
+        '',
+        'The nested simulation is configured alongside the outer `Batch_Size`:',
+        '`Inner_MC_Enabled` (`Yes`/`No`, required by `solve_hedge`), `Inner_Sub_Batch` (inner draws',
+        'per outer path), `Inner_Antithetic` (`Yes` mirrors the Sobol draws as (z, −z) pairs — needs',
+        'an even `Inner_Sub_Batch`), `Inner_Draws` (`sobol` default, or `random` for iid Gaussians),',
+        'and `Inner_MC_Flat_Limit` (default 32768) — the flat-sample cap per fork pass that bounds',
+        'fork peak memory. Raise the last on a bigger GPU for fewer, wider passes; because each pass',
+        'draws its own Sobol stream, changing it changes the draws (statistically, not bitwise,',
+        'equivalent), so it belongs in the job JSON where the rest of the run is reproducible from.',
+        '',
         '### Execution modes',
         '',
         '- `Execution_Mode = "solve_hedge"` — run the configured `Solver.Object` (DiffSolverV2).',
@@ -2118,7 +2129,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             # Grad-slice sizing inputs: cell budget (flat limit at its 64-row calibration
             # reference, halved — the AAD tape roughly doubles per-cell memory vs no-grad)
             # + the inner sub-batch. The solver divides by the per-t remaining rows.
-            bundle['inner_mc_cell_budget'] = (_INNER_MC_FLAT_LIMIT * 64) // 2
+            bundle['inner_mc_cell_budget'] = (self._inner_mc_flat_limit() * 64) // 2
             bundle['inner_sub_batch'] = int(shared_mem.simulation_sub_batch)
 
         evaluation_summary = None
@@ -2260,6 +2271,13 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             ))
         return inner
 
+    def _inner_mc_flat_limit(self):
+        """Flat-sample budget per inner-MC fork pass — `Calculation.Inner_MC_Flat_Limit`. Sizes both
+        the no-grad outer chunk and (x64/2) the solver's grad-slice cell budget, so one JSON field
+        owns fork peak memory. Raise it on a bigger GPU (fewer chunks = faster); note the chunk
+        partition assigns per-chunk Sobol streams, so changing it changes the draws."""
+        return int(self.params.get('Inner_MC_Flat_Limit', _INNER_MC_FLAT_DEFAULT))
+
     def _run_inner_mc_at_t(self, t, outer_scenario_buffer, shared_mem, base_date,
                            tradable_refs, want_raw_samples=True, with_grad=False,
                            max_inner_steps=None, outer_rows=None):
@@ -2288,11 +2306,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         so the DP/MPC solvers consume it without knowing what the factors are.
 
         M2g: this is a dispatcher — the whole inner MC (generation + pricing) runs in
-        outer-path sub-chunks (`_run_inner_mc_chunk`) of at most `_INNER_MC_FLAT_LIMIT`
+        outer-path sub-chunks (`_run_inner_mc_chunk`) of at most `Calculation.Inner_MC_Flat_Limit`
         flat samples, so peak memory tracks the chunk and B_outer scales freely. Each
         chunk draws its own Sobol stream (valid quasi-MC per outer path; the inner MC has
         no cross-outer-path CRN to preserve), so a chunked run is statistically — not
-        bitwise — equivalent to a single pass."""
+        bitwise — equivalent to a single pass: the partition is part of the job's contract
+        (hence a JSON field, never an env var — results must follow the config, not the host)."""
         spot_key = self._find_spot_key()
         if outer_rows is not None:
             lo, hi = outer_rows
@@ -2349,10 +2368,11 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # size-1 reshape crash. Cells = flat × rows, budgeted against the flat limit at a
         # 64-row reference (the calibration regime of the original limit).
         n_rows = int(inner_time_grid.scen_time_grid.size)
+        flat_limit = self._inner_mc_flat_limit()
         # Dual cap: never exceed the flat limit (per-row slabs also OOM on wide-flat/short-row
         # shapes — measured at width 2520×13 rows), and scale down for long grids (cells).
-        chunk = max(1, min(_INNER_MC_FLAT_LIMIT // B_inner,
-                           (_INNER_MC_FLAT_LIMIT * 64) // (B_inner * max(1, n_rows))))
+        chunk = max(1, min(flat_limit // B_inner,
+                           (flat_limit * 64) // (B_inner * max(1, n_rows))))
         if chunk >= B_outer:
             return self._run_inner_mc_chunk(
                 t, cutoff_idx, outer_scenario_buffer, shared_mem, inner_base_date,
@@ -2363,7 +2383,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             # per-chunk .backward()'s; punt on that until a real B_outer needs it.
             raise NotImplementedError(
                 f'with_grad=True requires single-chunk inner-MC; B_outer={B_outer} > '
-                f'chunk={chunk}. Reduce B_outer or raise _INNER_MC_FLAT_LIMIT.')
+                f'chunk={chunk}. Reduce Batch_Size or raise Calculation.Inner_MC_Flat_Limit.')
         results = []
         for lo in range(0, B_outer, chunk):
             hi = min(lo + chunk, B_outer)
@@ -2403,171 +2423,177 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # read `.grad` per process/per outer path.
         state_t_leaves = {} if with_grad else None
         with grad_ctx:
-            shared_mem.simulation_batch = B_outer
-            shared_mem.reset_inner(self.num_factors, inner_time_grid,
-                                   use_antithetic=self.params.get('Inner_Antithetic', 'No') == 'Yes',
-                                   use_random=str(self.params.get('Inner_Draws', 'sobol')).lower() == 'random')
+            try:
+                shared_mem.simulation_batch = B_outer
+                shared_mem.reset_inner(self.num_factors, inner_time_grid,
+                                       use_antithetic=self.params.get('Inner_Antithetic', 'No') == 'Yes',
+                                       use_random=str(self.params.get('Inner_Draws', 'sobol')).lower() == 'random')
 
-            market_t1_parts = []
-            for key, proc_inner in self.stoch_factors_inner.items():
-                if key.type in utils.DimensionLessFactors:
-                    continue
-                # Raw per-path init state for this factor's inner-MC precalculate fork. Never was
-                # type-specific: raw CommodityPrice `outer[t,:]`, raw ForwardRate/ForwardPrice/
-                # InterestRate `outer[t,:,:]` all equal `outer[key][t]`.
-                init_state = outer_buf[key][t]
-                if with_grad:
-                    # Leaf with grad: differentiates inner-sim + pricing back to state_t.
-                    init_state = init_state.detach().clone().requires_grad_(True)
-                    state_t_leaves[key] = init_state
-                proc_inner.precalculate(
-                    inner_base_date, inner_time_grid,
-                    init_state,
-                    shared_mem, self.process_ofs[key],
-                    implied_tensor=self._factor_precalc_args[key][1],
-                )
-                # Per-outer-path t=0 privileged-state seed read by this process's inner generate
-                # (regime for the HMM, conditional variance h0 for GARCH). Capability lives on the
-                # process — a no-op dict for factors without a revealed sufficient statistic — so
-                # the forker runs one uniform loop across model worlds (no isinstance branch).
-                for seed_key, seed_val in proc_inner.inner_fork_seed(key, outer_buf, t).items():
-                    shared_mem.t_Scenario_Buffer[seed_key] = seed_val
-                simulated = proc_inner.generate(shared_mem)
-                shared_mem.t_Scenario_Buffer[key] = simulated
-                # Post-generate inner-fork state coherence: the process publishes any path-
-                # dependent revealed state its `reveal_state_at` needs at t+1 (e.g. a filtered
-                # belief) and returns differentiable leaves for the twin loss. Opts are forwarded
-                # opaquely; base/GARCH processes are no-ops (their revealed state is already
-                # published by generate, or detached by design).
-                inner_leaves = proc_inner.reseed_inner_state(
-                    key, simulated, outer_buf, t, shared_mem, self._inner_state_opts, with_grad)
-                if with_grad:
-                    state_t_leaves.update(inner_leaves)
-                if want_raw_samples:
-                    # Market state at outer t+1 (inner-time index 1): each factor reveals its
-                    # informative segments (its sufficient statistic + price/curve) from the live
-                    # buffer (factor path + any aux its generate()/reseed just published). The calc
-                    # owns the (factor_flat, B, SB) reshape and concatenates in reveal order.
-                    for block, _kind in proc_inner.reveal_state_at(1, shared_mem.t_Scenario_Buffer):
-                        market_t1_parts.append(block.reshape(-1, B_outer, B_inner))
-
-            # Stuff the outer-realized past into each factor buffer + flatten (B,SB)→B*SB.
-            for key in self.stoch_factors_inner:
-                if key.type in utils.DimensionLessFactors:
-                    continue
-                inner_path = shared_mem.t_Scenario_Buffer[key]                  # (T_inner, ..., B, SB)
-                outer_past = outer_buf[key][:cutoff_idx]                         # (cutoff, ..., B)
-                outer_past_b2 = outer_past.unsqueeze(-1).expand(*outer_past.shape, B_inner)
-                stuffed = torch.cat([outer_past_b2, inner_path], dim=0)          # (T_outer, ..., B, SB)
-                shared_mem.t_Scenario_Buffer[key] = stuffed.reshape(
-                    *stuffed.shape[:-2], B_flat)
-
-            # Single-pass pricing — the chunk is sized so B_flat fits the memory budget.
-            shared_mem.t_Buffer.clear()
-            shared_mem.simulation_batch = B_flat
-            # `fillvalue` is a batch-sized empty tensor frozen at State construction (the
-            # energy-leg reset code uses it as the empty-cat fallback) — it must track the
-            # current simulation_batch or cash_settle size-mismatches.
-            shared_mem.fillvalue = shared_mem.one.new_zeros((0, 1, B_flat))
-            # Per-chunk restricted DealStructures: same instruments + Factor_dep,
-            # fresh Time_dep slicing off past events (windowed to [t, t+1] on the
-            # one-step path), fresh Calc_res.
-            inner_netting_sets = self._restricted_struct(self.netting_sets, cutoff_idx, window_end_idx)
-            inner_liabilities = self._restricted_struct(self.liabilities, cutoff_idx, window_end_idx)
-            inner_netting_sets.resolve_structure(shared_mem, self.time_grid)
-            shared_mem.reset_cashflows(self.time_grid)
-            mtm_flat = inner_liabilities.resolve_hedge_structure(
-                shared_mem, self.time_grid)['mtm']
-            if mtm_flat.dim() < 2 or mtm_flat.shape[-1] != B_outer * B_inner:
-                # The canonical deal guard swallows exceptions (e.g. CUDA OOM) into a scalar-0
-                # mark. Inside an inner fork that silently corrupts the solver's LABELS —
-                # fail loudly instead (the CRITICAL 'Deal skipped' log above names the cause).
-                raise RuntimeError(
-                    f'inner-fork liability pricing degenerated (shape '
-                    f'{tuple(mtm_flat.shape)}, expected (*, {B_outer * B_inner})) — a deal '
-                    f'was skipped inside the fork; see the CRITICAL log above for the cause.')
-            inner_mtm = mtm_flat.reshape(*mtm_flat.shape[:-1], B_outer, B_inner)
-            inner_trade_tensors = {
-                ref: t.reshape(*t.shape[:-1], B_outer, B_inner)
-                for ref, t in inner_netting_sets.tensor_marks().items()
-            }
-            # One-step window: the feature builder and the horizon stats (L_T, dF_T,
-            # dF_min) read terminal rows that a 2-row window doesn't price — emit the
-            # zero placeholder / None / {} instead (the diff-ML bootstrap only reads
-            # the t/t+1 fields below). Consumers of the horizon stats always fork
-            # without a window.
-            one_step = window_end_idx is not None
-            result = {'features': shared_mem.one.new_zeros(B_outer, 3 + 2 * len(tradable_refs))
-                      if one_step else self._calc_inner_features(
-                          inner_mtm, inner_trade_tensors, tradable_refs, cutoff_idx)}
-
-            if want_raw_samples:
-                F_t1, dF_T, dF_min = {}, {}, {}
-                zero_bs = inner_mtm[-2].new_zeros(inner_mtm[-2].shape)   # (B_outer, B_inner)
-                for ref in tradable_refs:
-                    td = inner_trade_tensors.get(ref)
-                    if td is None:
-                        # Tradable expired before this fork — zero moves, no position.
-                        F_t1[ref] = dF_T[ref] = dF_min[ref] = zero_bs
+                market_t1_parts = []
+                for key, proc_inner in self.stoch_factors_inner.items():
+                    if key.type in utils.DimensionLessFactors:
                         continue
-                    td = td[cutoff_idx:]                                # (T_inner, B_outer, B_inner)
-                    # td has < 2 time points when the tradable's last deal event is at t
-                    # (it expires this step) — no t+1 slice; freeze it (dF == 0).
-                    F_t1[ref] = (td[1] if td.shape[0] >= 2 else td[-1]).clone()
-                    dF_T[ref] = (td[-1] - td[0]).clone()
-                    dF_min[ref] = (td.min(dim=0).values - td[0]).clone()
-                # Market state — every simulated factor's informative state (sufficient
-                # statistic + price, carry curve, …) concatenated; factor order is the
-                # `stoch_factors_inner` iteration order, identical for market_t/market_t1.
-                market_t1 = torch.cat(market_t1_parts, dim=0).permute(1, 2, 0).contiguous()
-                market_t_parts = []
-                market_t_widths = []
+                    # Raw per-path init state for this factor's inner-MC precalculate fork. Never was
+                    # type-specific: raw CommodityPrice `outer[t,:]`, raw ForwardRate/ForwardPrice/
+                    # InterestRate `outer[t,:,:]` all equal `outer[key][t]`.
+                    init_state = outer_buf[key][t]
+                    if with_grad:
+                        # Leaf with grad: differentiates inner-sim + pricing back to state_t.
+                        init_state = init_state.detach().clone().requires_grad_(True)
+                        state_t_leaves[key] = init_state
+                    proc_inner.precalculate(
+                        inner_base_date, inner_time_grid,
+                        init_state,
+                        shared_mem, self.process_ofs[key],
+                        implied_tensor=self._factor_precalc_args[key][1],
+                    )
+                    # Per-outer-path t=0 privileged-state seed read by this process's inner generate
+                    # (regime for the HMM, conditional variance h0 for GARCH). Capability lives on the
+                    # process — a no-op dict for factors without a revealed sufficient statistic — so
+                    # the forker runs one uniform loop across model worlds (no isinstance branch).
+                    for seed_key, seed_val in proc_inner.inner_fork_seed(key, outer_buf, t).items():
+                        shared_mem.t_Scenario_Buffer[seed_key] = seed_val
+                    simulated = proc_inner.generate(shared_mem)
+                    shared_mem.t_Scenario_Buffer[key] = simulated
+                    # Post-generate inner-fork state coherence: the process publishes any path-
+                    # dependent revealed state its `reveal_state_at` needs at t+1 (e.g. a filtered
+                    # belief) and returns differentiable leaves for the twin loss. Opts are forwarded
+                    # opaquely; base/GARCH processes are no-ops (their revealed state is already
+                    # published by generate, or detached by design).
+                    inner_leaves = proc_inner.reseed_inner_state(
+                        key, simulated, outer_buf, t, shared_mem, self._inner_state_opts, with_grad)
+                    if with_grad:
+                        state_t_leaves.update(inner_leaves)
+                    if want_raw_samples:
+                        # Market state at outer t+1 (inner-time index 1): each factor reveals its
+                        # informative segments (its sufficient statistic + price/curve) from the live
+                        # buffer (factor path + any aux its generate()/reseed just published). The calc
+                        # owns the (factor_flat, B, SB) reshape and concatenates in reveal order.
+                        for block, _kind in proc_inner.reveal_state_at(1, shared_mem.t_Scenario_Buffer):
+                            market_t1_parts.append(block.reshape(-1, B_outer, B_inner))
+
+                # Stuff the outer-realized past into each factor buffer + flatten (B,SB)→B*SB.
                 for key in self.stoch_factors_inner:
                     if key.type in utils.DimensionLessFactors:
                         continue
-                    proc_inner = self.stoch_factors_inner[key]
-                    width = 0
-                    for block, _kind in proc_inner.reveal_state_at(t, outer_buf):
-                        b = block.reshape(-1, B_outer)
-                        market_t_parts.append(b)
-                        width += b.shape[0]
-                    # Forward the process's differentiable-state-leaf suffixes to the solver's
-                    # label projection, so it maps leaf grads → market columns with no model concept.
-                    market_t_widths.append((key, width, tuple(proc_inner.diff_state_leaves())))
-                market_t = torch.cat(market_t_parts, dim=0).permute(1, 0).contiguous()
-                # Exact liability MTM at the fork (outer-t) and outer-t+1, on the inner draws —
-                # the resolve_hedge_structure marks themselves (same time-indexing as F_t1:
-                # mtm[cutoff_idx:][0] is outer-t, [1] is outer-t+1). These replace the Jacobian
-                # linearization of the liability in the diff-ML one-step bootstrap, so the
-                # bootstrap value marks the liability EXACTLY at each inner draw.
-                mtm_fwd = inner_mtm[cutoff_idx:]                            # (T_inner, B_outer, B_inner)
-                L_t_inner = mtm_fwd[0].clone()                             # outer-t (shared across draws)
-                L_t1_inner = (mtm_fwd[1] if mtm_fwd.shape[0] >= 2
-                              else mtm_fwd[-1]).clone()                     # outer-t+1 per inner draw
-                result.update(
-                    t=t, cutoff_idx=cutoff_idx,
-                    L_T=None if one_step else inner_mtm[-2].clone(),
-                    L_t=L_t_inner, L_t1=L_t1_inner,
-                    F_t1=F_t1, dF_T={} if one_step else dF_T,
-                    dF_min={} if one_step else dF_min,
-                    market_t=market_t, market_t1=market_t1)
-                if with_grad:
-                    # Pair each leaf with the market_t column width it occupies — the
-                    # differential-label projection in the differential-ML solver needs
-                    # this to write per-leaf gradients into the right deep-state columns
-                    # without re-deriving factor widths (which would silently drift
-                    # if a process's `reveal_state_at` packing changes).
-                    result['state_t_leaves'] = state_t_leaves
-                    result['state_t_leaf_widths'] = market_t_widths
+                    inner_path = shared_mem.t_Scenario_Buffer[key]                  # (T_inner, ..., B, SB)
+                    outer_past = outer_buf[key][:cutoff_idx]                         # (cutoff, ..., B)
+                    outer_past_b2 = outer_past.unsqueeze(-1).expand(*outer_past.shape, B_inner)
+                    stuffed = torch.cat([outer_past_b2, inner_path], dim=0)          # (T_outer, ..., B, SB)
+                    shared_mem.t_Scenario_Buffer[key] = stuffed.reshape(
+                        *stuffed.shape[:-2], B_flat)
 
-            shared_mem.simulation_batch = B_outer
-            shared_mem.t_Buffer.clear()
-            shared_mem.t_Scenario_Buffer.clear()
-            # Drop the Sobol sample cache — it is keyed by sample_size and would otherwise
-            # grow unbounded across chunks / t-steps. Each chunk re-draws a fresh,
-            # independent quasi-MC stream (the engine advances); the pricer's per-pass
-            # `reset_qrg` caching is intact within a chunk — only cleared between them.
-            shared_mem.t_quasi_rng.clear()
+                # Single-pass pricing — the chunk is sized so B_flat fits the memory budget.
+                shared_mem.t_Buffer.clear()
+                shared_mem.simulation_batch = B_flat
+                # `fillvalue` is a batch-sized empty tensor frozen at State construction (the
+                # energy-leg reset code uses it as the empty-cat fallback) — it must track the
+                # current simulation_batch or cash_settle size-mismatches.
+                shared_mem.fillvalue = shared_mem.one.new_zeros((0, 1, B_flat))
+                # Per-chunk restricted DealStructures: same instruments + Factor_dep,
+                # fresh Time_dep slicing off past events (windowed to [t, t+1] on the
+                # one-step path), fresh Calc_res.
+                inner_netting_sets = self._restricted_struct(self.netting_sets, cutoff_idx, window_end_idx)
+                inner_liabilities = self._restricted_struct(self.liabilities, cutoff_idx, window_end_idx)
+                inner_netting_sets.resolve_structure(shared_mem, self.time_grid)
+                shared_mem.reset_cashflows(self.time_grid)
+                mtm_flat = inner_liabilities.resolve_hedge_structure(
+                    shared_mem, self.time_grid)['mtm']
+                if mtm_flat.dim() < 2 or mtm_flat.shape[-1] != B_outer * B_inner:
+                    # The canonical deal guard swallows exceptions (e.g. CUDA OOM) into a scalar-0
+                    # mark. Inside an inner fork that silently corrupts the solver's LABELS —
+                    # fail loudly instead (the CRITICAL 'Deal skipped' log above names the cause).
+                    raise RuntimeError(
+                        f'inner-fork liability pricing degenerated (shape '
+                        f'{tuple(mtm_flat.shape)}, expected (*, {B_outer * B_inner})) — a deal '
+                        f'was skipped inside the fork; see the CRITICAL log above for the cause.')
+                inner_mtm = mtm_flat.reshape(*mtm_flat.shape[:-1], B_outer, B_inner)
+                inner_trade_tensors = {
+                    ref: t.reshape(*t.shape[:-1], B_outer, B_inner)
+                    for ref, t in inner_netting_sets.tensor_marks().items()
+                }
+                # One-step window: the feature builder and the horizon stats (L_T, dF_T,
+                # dF_min) read terminal rows that a 2-row window doesn't price — emit the
+                # zero placeholder / None / {} instead (the diff-ML bootstrap only reads
+                # the t/t+1 fields below). Consumers of the horizon stats always fork
+                # without a window.
+                one_step = window_end_idx is not None
+                result = {'features': shared_mem.one.new_zeros(B_outer, 3 + 2 * len(tradable_refs))
+                          if one_step else self._calc_inner_features(
+                              inner_mtm, inner_trade_tensors, tradable_refs, cutoff_idx)}
+
+                if want_raw_samples:
+                    F_t1, dF_T, dF_min = {}, {}, {}
+                    zero_bs = inner_mtm[-2].new_zeros(inner_mtm[-2].shape)   # (B_outer, B_inner)
+                    for ref in tradable_refs:
+                        td = inner_trade_tensors.get(ref)
+                        if td is None:
+                            # Tradable expired before this fork — zero moves, no position.
+                            F_t1[ref] = dF_T[ref] = dF_min[ref] = zero_bs
+                            continue
+                        td = td[cutoff_idx:]                                # (T_inner, B_outer, B_inner)
+                        # td has < 2 time points when the tradable's last deal event is at t
+                        # (it expires this step) — no t+1 slice; freeze it (dF == 0).
+                        F_t1[ref] = (td[1] if td.shape[0] >= 2 else td[-1]).clone()
+                        dF_T[ref] = (td[-1] - td[0]).clone()
+                        dF_min[ref] = (td.min(dim=0).values - td[0]).clone()
+                    # Market state — every simulated factor's informative state (sufficient
+                    # statistic + price, carry curve, …) concatenated; factor order is the
+                    # `stoch_factors_inner` iteration order, identical for market_t/market_t1.
+                    market_t1 = torch.cat(market_t1_parts, dim=0).permute(1, 2, 0).contiguous()
+                    market_t_parts = []
+                    market_t_widths = []
+                    for key in self.stoch_factors_inner:
+                        if key.type in utils.DimensionLessFactors:
+                            continue
+                        proc_inner = self.stoch_factors_inner[key]
+                        width = 0
+                        for block, _kind in proc_inner.reveal_state_at(t, outer_buf):
+                            b = block.reshape(-1, B_outer)
+                            market_t_parts.append(b)
+                            width += b.shape[0]
+                        # Forward the process's differentiable-state-leaf suffixes to the solver's
+                        # label projection, so it maps leaf grads → market columns with no model concept.
+                        market_t_widths.append((key, width, tuple(proc_inner.diff_state_leaves())))
+                    market_t = torch.cat(market_t_parts, dim=0).permute(1, 0).contiguous()
+                    # Exact liability MTM at the fork (outer-t) and outer-t+1, on the inner draws —
+                    # the resolve_hedge_structure marks themselves (same time-indexing as F_t1:
+                    # mtm[cutoff_idx:][0] is outer-t, [1] is outer-t+1). These replace the Jacobian
+                    # linearization of the liability in the diff-ML one-step bootstrap, so the
+                    # bootstrap value marks the liability EXACTLY at each inner draw.
+                    mtm_fwd = inner_mtm[cutoff_idx:]                            # (T_inner, B_outer, B_inner)
+                    L_t_inner = mtm_fwd[0].clone()                             # outer-t (shared across draws)
+                    L_t1_inner = (mtm_fwd[1] if mtm_fwd.shape[0] >= 2
+                                  else mtm_fwd[-1]).clone()                     # outer-t+1 per inner draw
+                    result.update(
+                        t=t, cutoff_idx=cutoff_idx,
+                        L_T=None if one_step else inner_mtm[-2].clone(),
+                        L_t=L_t_inner, L_t1=L_t1_inner,
+                        F_t1=F_t1, dF_T={} if one_step else dF_T,
+                        dF_min={} if one_step else dF_min,
+                        market_t=market_t, market_t1=market_t1)
+                    if with_grad:
+                        # Pair each leaf with the market_t column width it occupies — the
+                        # differential-label projection in the differential-ML solver needs
+                        # this to write per-leaf gradients into the right deep-state columns
+                        # without re-deriving factor widths (which would silently drift
+                        # if a process's `reveal_state_at` packing changes).
+                        result['state_t_leaves'] = state_t_leaves
+                        result['state_t_leaf_widths'] = market_t_widths
+            finally:
+                # Restore on ANY exit: the fork borrows `shared_mem`, mutating simulation_batch
+                # (B_outer -> B_flat for pricing) and `fillvalue` in place. Without this a
+                # mid-fork raise (CUDA OOM, a degenerate-pricing RuntimeError) left the state
+                # flat-sized, so the NEXT chunk / t-step failed on shapes instead of the real cause.
+                shared_mem.simulation_batch = B_outer
+                shared_mem.fillvalue = shared_mem.one.new_zeros((0, 1, B_outer))
+                shared_mem.t_Buffer.clear()
+                shared_mem.t_Scenario_Buffer.clear()
+                # Drop the Sobol sample cache — it is keyed by sample_size and would otherwise
+                # grow unbounded across chunks / t-steps. Each chunk re-draws a fresh,
+                # independent quasi-MC stream (the engine advances); the pricer's per-pass
+                # `reset_qrg` caching is intact within a chunk — only cleared between them.
+                shared_mem.t_quasi_rng.clear()
 
         return result
 
