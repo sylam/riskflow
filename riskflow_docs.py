@@ -396,7 +396,7 @@ class ConstructMarkdown(object):
         sub_sub_sub_indent = "                " # For JSON Factor/Model/Trade types
 
         # Order sections based on SECTIONS definition
-        nav_order = ['Theory', 'Valuation', 'Bootstrapping', 'Calibration', 'API_Usage', 'JSON_Config', 'Developer']
+        nav_order = ['Theory', 'Valuation', 'Bootstrapping', 'Calibration', 'API_Usage', 'Developer', 'JSON_Config']
         for section_key in nav_order:
             if section_key in self.SECTIONS:
                  display_name = self.SECTIONS[section_key][0]
