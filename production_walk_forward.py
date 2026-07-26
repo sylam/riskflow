@@ -452,6 +452,14 @@ def one_trade(template, arch, trade_date, calibrated_md, args, run_dir, tag):
         train = apply_config(copy.deepcopy(cfg), batch=args.batch, seed=seed, save=ckpt)
         if args.fit_iters is not None:
             train['Calc']['Calculation']['Hedging_Problem']['Solver']['DiffV2_Fit_Iters'] = args.fit_iters
+        if args.streaming_batches:
+            # TRAINING only: N batches of Batch_Size, of which N-1 train (warmup + steps) and the
+            # last is held out for the verdict. The realized ROLL stays non-streaming — it is a
+            # Batch_Size=1 eval of frozen checkpoints, and keeping it identical to the fixed-set
+            # campaign's roll is what makes greedy_usd_oz comparable across arms.
+            tc = train['Calc']['Calculation']
+            tc['Simulation_Batches'] = args.streaming_batches
+            tc['Hedging_Problem']['Solver']['DiffV2_Streaming_Batches'] = 'Yes'
         logging.info('=== TRAIN %s seed=%d (fair=%.2f, strike=%.2f) ===',
                      tag, seed, info['k_fair'], info['k_fair'] - args.margin)
         tdiag = run(train, f'train_{tag}_s{seed}')
@@ -528,6 +536,11 @@ def main():
                          'nearly free and de-noises the causal one-step argmax forecast. '
                          'Default 256; pass 64 to recover the pre-lever roll behavior.')
     ap.add_argument('--fit-iters', type=int, default=None, help='Override DiffV2_Fit_Iters (smoke tests).')
+    ap.add_argument('--streaming-batches', type=int, default=0,
+                    help='Train with Solver.DiffV2_Streaming_Batches=Yes over N batches of '
+                         '--batch paths: N-1 train (warmup + steps), the last is held out for the '
+                         'verdict. 0 (default) = the fixed-set path (one bundle over '
+                         'Simulation_Batches). Trained paths = (N-1) x --batch.')
     ap.add_argument('--delta-corridor', type=float, default=None,
                     help='Enforce a causal delta-ramp corridor on the SIGNED total position: '
                          'BAND = half-width as a fraction of the 50-contract notional (e.g. 0.40). '
