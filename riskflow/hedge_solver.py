@@ -428,10 +428,24 @@ class DiffSolverV2:
         # One-step forks: window inner generation+pricing to {t, t+1} (the bootstrap only
         # reads t/t+1 fields) — fork cost stops scaling with the remaining horizon.
         self.one_step = bool(self.cfg.get("diffv2_one_step_fork", True))
-        # History-stripped, sim-grid-indexed views of the outer-realised paths.
-        self.tradables_sim, self.n_steps = bundle.tradables_sim, bundle.n_outer_steps
-        self.liability_sim = bundle.liability_sim                     # (n_steps, B_outer)
-        self.B_outer = int(self.liability_sim.shape[-1])
+        # Bundle-per-batch streaming: warmup/step/finish across batches instead of one solve on
+        # one bundle. Everything the frame owns (utility scale, z-frame, trust region) is locked
+        # at warmup; see `_bind`.
+        self.streaming = bool(self.cfg.get("diffv2_streaming_batches", False))
+        # Bank exploration RNG — deterministic, and PERSISTENT across streaming batches so each
+        # batch explores a fresh noise draw (a one-shot solve draws the same stream as before).
+        self.gen = torch.Generator(device=self.device)
+        self.gen.manual_seed(0)
+        # Per-t Adam optimizers, created at the first fit of t and KEPT: a streaming step
+        # continues the same moments on the same net rather than restarting them each batch.
+        self._opts = {}
+        # The locked frame. `utility_scale` is None until the first bind completes (below), which
+        # is what marks that bind as the warmup one; `_bounds_frozen` turns `a_bounds` from
+        # fitted-per-batch into frozen-and-reported (streaming only).
+        self.utility_scale = None
+        self._bounds_frozen = False
+        self._breaches = []
+        self._bind(bundle)
         # Effective terminal = the last LIVE liability mark. The time grid appends one
         # post-settlement clean-exit row (the deal pays out — the platinum average-rate forward
         # marks its realised payoff at T-1, then 0 at the payment date T), so the meaningful
@@ -442,6 +456,30 @@ class DiffSolverV2:
         if self.t_min >= self.T_dec:
             raise ValueError(
                 f"Solver.T_Min={self.t_min} must be < decision horizon T_dec={self.T_dec}")
+        self.utility_scale = float(bundle.utility_scale)      # locked here; re-asserted by _bind
+
+    def _bind(self, bundle):
+        """Point the solver at a bundle: the history-stripped sim views the sweep indexes by `t`
+        and the friction vol series the action space prices with. A one-shot solve binds once at
+        construction; a streaming step re-binds to each fresh batch — which is also where the
+        LOCKED utility scale is re-asserted, because every batch resolves its own `c` at build
+        time and letting a later one reach the runtime would silently rescale the objective (and
+        with it every fitted C_t) mid-training."""
+        self.bundle = bundle
+        self.aspace.vol_sim = bundle.vol_sim
+        self.tradables_sim, self.n_steps = bundle.tradables_sim, bundle.n_outer_steps
+        self.liability_sim = bundle.liability_sim                     # (n_steps, B_outer)
+        self.B_outer = int(self.liability_sim.shape[-1])
+        if self.utility_scale is None:
+            return                                                    # construction; nothing locked yet
+        if int(bundle.last_live_mtm_index) != self.T_dec:
+            raise ValueError(
+                f"streaming batch has decision horizon T_dec={int(bundle.last_live_mtm_index)} "
+                f"but the frame was locked at {self.T_dec} — every batch must share one time grid")
+        logging.info("DiffSolverV2 bound batch: B_outer=%d | frame utility_scale=%.6g "
+                     "(this batch resolved %.6g)", self.B_outer, self.utility_scale,
+                     float(bundle.utility_scale))
+        self.runtime["objective"]["utility_scale"] = self.utility_scale
 
     def _config_hash(self):
         """sha1 of the stable-JSON solver cfg — the stamp identifying this TRAINING RECIPE.
@@ -818,8 +856,13 @@ class DiffSolverV2:
         nrm_m = (g_zn_m.var(dim=0, keepdim=True) + 1e-8
                  if bool(self.cfg.get("diffv2_per_column_grad_norm", False))
                  else g_zn_m.var() + 1e-8)
-        opt = torch.optim.Adam(net.parameters(), lr=self.lr,
-                               weight_decay=float(self.cfg.get("diffv2_weight_decay", 0.0)))
+        # One optimizer per t, created at its first fit and kept: a streaming step resumes the
+        # same Adam moments on a warm-started net instead of restarting them on every batch.
+        opt = self._opts.get(t)
+        if opt is None:
+            opt = self._opts[t] = torch.optim.Adam(
+                net.parameters(), lr=self.lr,
+                weight_decay=float(self.cfg.get("diffv2_weight_decay", 0.0)))
         for _ in range(self.fit_iters):
             mn = ((market0 - self.m_mean) / self.m_std).detach().requires_grad_(True)
             wn = ((W0_bank - self.w_mean) / self.w_std).detach().requires_grad_(True)
@@ -836,8 +879,16 @@ class DiffSolverV2:
             # Trust region for all future EVALUATIONS of this net (argmax, bootstrap labels,
             # verdict): its fitted-target range plus one range-width of headroom each side.
             lo, hi = float(a_val.min()), float(a_val.max())
-            pad = max(hi - lo, 1e-3)
-            self.a_bounds[t] = (lo - pad, hi + pad)
+            if self._bounds_frozen:
+                # Streaming: the region is part of the LOCKED frame — re-fitting it per batch
+                # would re-open the phantom-extrapolation basin the clamp exists to close. A
+                # later batch only REPORTS how often its own targets fall outside it.
+                b0, b1 = self.a_bounds[t]
+                self._breaches.append(
+                    (t, float(((a_val < b0) | (a_val > b1)).to(torch.float32).mean()), lo, hi))
+            else:
+                pad = max(hi - lo, 1e-3)
+                self.a_bounds[t] = (lo - pad, hi + pad)
         return {
             "t": t, "val_loss": val_loss,
             "Y_absmean": float(Y.abs().mean()),
@@ -935,7 +986,15 @@ class DiffSolverV2:
         q_log = {"greedy": [], "t": []}
 
         def roll(policy):
-            stepper = BundleStepper(self.bundle, self.runtime)
+            # STREAMING passes mirror_scale=False so the stepper leaves the runtime's utility
+            # scale alone: under DiffV2_Load_Value_Fn that scale is the CHECKPOINT's — the value
+            # function's own frame — and the argmax below must read the same `c` the nets were
+            # fitted against. The default (non-streaming) path keeps the historical re-mirror,
+            # which replaces it with this world's `c` and so decides under a different scale than
+            # `_verdict` did; every walk-forward anchor to date was measured through that, so it
+            # stays bit-identical there.
+            stepper = BundleStepper(self.bundle, self.runtime,
+                                    mirror_scale=not self.streaming)
             # Seed the cost-aware decision q_prev from the OPENING book (the stepper's own
             # positions already open here too, so its realized first-step turnover is measured
             # from q0). The frozen value is position-free — q0 only shifts first-step cost/P&L.
@@ -989,12 +1048,25 @@ class DiffSolverV2:
         out["greedy_q_t"] = q_log["t"]
         return out
 
-    # ---- driver --------------------------------------------------------------
+    # ---- driver: warmup (fit + frame lock) -> step (fresh batch) -> finish (verdict) ----
     def solve(self):
-        # Bank RNG is deterministic; multi-seed repeats (solve_hedge calls solve() N times)
-        # advance the framework's inner-MC Sobol stream, so V_0 spread reflects inner-MC noise.
-        gen = torch.Generator(device=self.device)
-        gen.manual_seed(0)
+        """One-shot solve on a single bundle: warm up on it, then finish on it (the
+        `DiffV2_OOS_Frac` row split supplies the held-out verdict rows). Streaming drives the same
+        three phases across batches — see `StreamingSolve`."""
+        self.warmup()
+        return self.finish(self.bundle)
+
+    def warmup(self, bundle=None):
+        """Fit the value function on the first (or only) bundle and LOCK the frame: the
+        standardization stats, the utility scale and the per-t trust region are computed here and
+        frozen for every later batch. Re-fitting them per batch would mean batch 1's C_t and batch
+        2's were different functions of different inputs, and the DP recursion would compose
+        mismatched frames.
+
+        Bank RNG is deterministic; multi-seed repeats (N solvers, each warmed up once) advance the
+        framework's inner-MC Sobol stream, so V_0 spread reflects inner-MC noise."""
+        if bundle is not None:
+            self._bind(bundle)
         logging.info(
             "DiffSolverV2 setup: n_hedge=%d active=%s T_dec=%d (of %d sim steps; last-live "
             "mtm=[-2]) B_outer=%d levels=%d fit_iters=%d lr=%.3g | "
@@ -1007,33 +1079,36 @@ class DiffSolverV2:
                      "DiffSolverV2 inner forks: one_step=%s (full remaining-horizon forks)",
                      self.one_step)
 
-        W_bank, _q_bank = self._build_bank(gen)
+        W_bank, _q_bank = self._build_bank(self.gen)
         # Cache the framework inner-MC one-step quantities over the swept range — one
         # inner-MC fork per swept t, reused for the argmax, the bootstrap, AND market_t.
-        sweep_ts = list(range(self.t_min, self.T_dec))
-        inner_cache = {t: self._inner_step(t) for t in sweep_ts}
+        self.sweep_ts = sweep_ts = list(range(self.t_min, self.T_dec))
+        self.inner_cache = inner_cache = {t: self._inner_step(t) for t in sweep_ts}
 
         # OUT-OF-SAMPLE split: hold out a fraction of outer paths from the bank/fit; the
         # verdict's headline rolls the policy on the HELD-OUT paths so a +EV that's just
         # overfitting to the fitted paths is exposed (in-sample is reported alongside).
-        oos_frac = float(self.cfg.get("diffv2_oos_frac", 0.5))
+        # STREAMING ignores it: the held-out BATCH is the out-of-sample world (an independent
+        # draw, not sibling rows of the same call), so every path here trains.
+        oos_frac = 0.0 if self.streaming else float(self.cfg.get("diffv2_oos_frac", 0.5))
         n_tr = self.B_outer if oos_frac <= 0 else max(1, int(self.B_outer * (1.0 - oos_frac)))
         train, test = slice(0, n_tr), slice(n_tr, self.B_outer)
         has_oos = n_tr < self.B_outer
+        self.train, self.test, self.has_oos, self.n_tr = train, test, has_oos, n_tr
 
         # Standardization stats: market/wealth from the TRAIN swept states (no test peeking).
         M = torch.cat([inner_cache[t][3][train] for t in sweep_ts], 0)                    # (n_swept*n_tr, md)
         self.m_mean, self.m_std = M.mean(0), M.std(0).clamp_min(1e-6)
         Wall = torch.stack([W_bank[t][train] for t in sweep_ts], 0).reshape(-1)
         self.w_mean, self.w_std = Wall.mean(), Wall.std().clamp_min(1e-6)
-        md = M.shape[-1]
+        self.md = md = M.shape[-1]
         logging.info(
             "DiffSolverV2 bank: market_dim=%d | swept W∈[%.4g, %.4g] mean=%.4g std=%.4g | "
             "q_rep(t=0)=%s", md, float(Wall.min()), float(Wall.max()),
             float(self.w_mean), float(self.w_std),
             self._replication_hedge(0).detach().cpu().tolist())
 
-        grid = self._action_grid()
+        self.grid_size = int(self._action_grid().shape[0])
         hidden = int(self.cfg.get("diffv2_hidden", 128))
         load_cfg = self.cfg.get("diffv2_load_value_fn", "") or ""
         # A load member is either a checkpoint PATH (JSON contract) or an already-materialised
@@ -1093,12 +1168,29 @@ class DiffSolverV2:
                         "total_position_schedule stamp) but this run sets a Total_Position_Schedule "
                         "— cannot verify the frozen policy was trained in it; roll validity "
                         "unverified.", src)
+                # Frame provenance, same idiom as the corridor guard above: a STREAMING frame is
+                # locked on the warmup batch alone, a fixed-set frame on the whole simulation, so
+                # the two standardize their inputs off different path populations. Loading either
+                # under the other mode still evaluates (the checkpoint's own frame is restored),
+                # but it is worth saying out loud.
+                if bool(ck.get("streaming", False)) != self.streaming:
+                    logging.warning(
+                        "DiffV2_Load_Value_Fn: %s was fitted with DiffV2_Streaming_Batches=%s but "
+                        "this run is %s — the frozen frame was locked on a different path "
+                        "population; the policy evaluates in ITS frame, not this run's.",
+                        src, bool(ck.get("streaming", False)), self.streaming)
                 drift = ((M.mean(0) - ck["m_mean"]).abs() / ck["m_std"]).max()
                 logging.info(
                     "DiffSolverV2 LOADED value fn from %s (train V_0=%+.6g) | eval-world "
-                    "market drift vs train frame: max %.3g σ | utility_scale %.6g",
-                    src, ck["V_0"], float(drift), ck["utility_scale"])
+                    "market drift vs train frame: max %.3g σ | utility_scale %.6g | frame %s",
+                    src, ck["V_0"], float(drift), ck["utility_scale"], ck.get("frame_stamp"))
                 members.append(ck)
+            if len({bool(ck.get("streaming", False)) for ck in members}) > 1:
+                raise ValueError(
+                    "DiffV2_Load_Value_Fn ensemble mixes a streaming-locked frame with a "
+                    "fixed-set one. The argmax averages the members' continuations, which is "
+                    "only meaningful when each member standardizes the same state the same way — "
+                    "load one provenance or the other, never both.")
             loaded = members[0]
             scales = [float(ck["utility_scale"]) for ck in members]
             if max(scales) - min(scales) > 0.01 * max(scales):
@@ -1108,7 +1200,10 @@ class DiffSolverV2:
                     100.0 * (max(scales) - min(scales)) / max(scales))
             self.m_mean, self.m_std = loaded["m_mean"], loaded["m_std"]
             self.w_mean, self.w_std = loaded["w_mean"], loaded["w_std"]
-            self.runtime["objective"]["utility_scale"] = float(sum(scales) / len(scales))
+            # The checkpoint's scale IS the value function's frame, so it also becomes the
+            # locked scale a streaming re-bind re-asserts (never the eval world's).
+            self.utility_scale = float(sum(scales) / len(scales))
+            self.runtime["objective"]["utility_scale"] = self.utility_scale
             hidden = int(loaded["hidden"])
         nets = [_DiffV2Residual(md + 1, hidden=hidden).to(self.device)  # position-free: (market | W)
                 for _ in range(self.T_dec)]
@@ -1117,9 +1212,12 @@ class DiffSolverV2:
         self.a_bounds = (list(loaded["a_bounds"]) if loaded is not None and loaded.get("a_bounds")
                          else [None] * self.T_dec)
         logging.info("DiffSolverV2 action grid: K=%d actions (levels=%d ^ active=%d)",
-                     int(grid.shape[0]), self.levels, self.n_active)
+                     self.grid_size, self.levels, self.n_active)
 
-        rows = []
+        self.nets = nets
+        self.hidden = hidden
+        self.loaded = loaded
+        self.rows = []
         if loaded is not None:
             for net, sd in zip(nets, loaded["state_dicts"]):
                 net.load_state_dict(sd)
@@ -1137,22 +1235,97 @@ class DiffSolverV2:
                         (m_nets, ck["m_mean"], ck["m_std"], ck["w_mean"], ck["w_std"],
                          ck.get("a_bounds")))
                 logging.info("DiffSolverV2 ENSEMBLE argmax over %d value fns", len(members))
-            worst = float(loaded["max_abs_Y_boot"])
-            root = {"t": self.t_min, "Y_mean": float(loaded["V_0"]),
-                    "q_star_mean": list(loaded["n_star_0"])}
+            self.worst = float(loaded["max_abs_Y_boot"])
+            self.root = {"t": self.t_min, "Y_mean": float(loaded["V_0"]),
+                         "q_star_mean": list(loaded["n_star_0"])}
         else:
-            for t in reversed(sweep_ts):
-                r = self._fit_step(nets, W_bank, t, inner_cache[t], rows=train)
-                rows.append(r)
-                logging.info(
-                    "DiffSolverV2 C[t=%d] fitted: val_loss=%.4g |Y_boot|=%.4g |A|=%.4g "
-                    "Y_mean=%+.4g q*_mean=%s", r["t"], r["val_loss"], r["Y_absmean"],
-                    r["A_absmean"], r["Y_mean"],
-                    ["%.3f" % v for v in r["q_star_mean"]])
-            worst = max((r["Y_absmean"] for r in rows if math.isfinite(r["Y_absmean"])),
-                        default=0.0)
-            root = rows[-1] if rows else {"t": self.t_min, "Y_mean": 0.0, "q_star_mean":
-                                          [0.0] * self.n_hedge}
+            self._sweep(W_bank)
+        # The frame is now locked. Streaming freezes the trust region from here on (later batches
+        # report their breach rate instead of re-fitting it); a one-shot solve never gets here
+        # twice, so its regions stay exactly as this sweep fitted them.
+        self._bounds_frozen = self.streaming
+
+    def _sweep(self, W_bank):
+        """One backward pass over the swept range on the CURRENTLY BOUND bundle: fit C_t for
+        t = T_dec-1 .. t_min against the cached inner-MC forks. warmup runs it on batch 1, each
+        streaming step runs it again on fresh paths with the same nets and optimizers."""
+        rows = []
+        for t in reversed(self.sweep_ts):
+            r = self._fit_step(self.nets, W_bank, t, self.inner_cache[t], rows=self.train)
+            rows.append(r)
+            logging.info(
+                "DiffSolverV2 C[t=%d] fitted: val_loss=%.4g |Y_boot|=%.4g |A|=%.4g "
+                "Y_mean=%+.4g q*_mean=%s", r["t"], r["val_loss"], r["Y_absmean"],
+                r["A_absmean"], r["Y_mean"],
+                ["%.3f" % v for v in r["q_star_mean"]])
+        self.rows = rows
+        self.worst = max((r["Y_absmean"] for r in rows if math.isfinite(r["Y_absmean"])),
+                         default=0.0)
+        self.root = rows[-1] if rows else {"t": self.t_min, "Y_mean": 0.0, "q_star_mean":
+                                           [0.0] * self.n_hedge}
+
+    def step(self, bundle):
+        """Continue training on a FRESH batch: re-bind, rebuild the exploration bank and the
+        inner-MC cache on the new paths, then sweep again with the same nets, the same optimizer
+        moments and the frozen frame. Fresh paths per fit step are the point — overfitting to one
+        simulated set stops being structurally possible."""
+        self._bind(bundle)
+        W_bank, _q_bank = self._build_bank(self.gen)
+        self.inner_cache = {t: self._inner_step(t) for t in self.sweep_ts}
+        self._breaches = []
+        self._sweep(W_bank)
+        self._log_breaches()
+        logging.info("DiffSolverV2 streaming step complete: max|Y_boot|=%.4g V_0=%+.6g "
+                     "n_star@t=%d=%s", self.worst, float(self.root["Y_mean"]),
+                     self.root["t"], self.root["q_star_mean"])
+
+    def _log_breaches(self):
+        """Report how often this batch's fitted A-targets fell OUTSIDE the frozen trust region.
+        A materially non-zero rate means the region locked at warmup no longer covers the states
+        fresh batches produce — the signal for widening it from real targets."""
+        if not self._breaches:
+            return
+        worst = max(self._breaches, key=lambda r: r[1])
+        lo, hi = self.a_bounds[worst[0]]
+        logging.info(
+            "DiffSolverV2 trust region (frozen at warmup) breach rate over %d fitted steps: "
+            "mean=%.4f max=%.4f | worst t=%d frac=%.4f targets∈[%+.4g, %+.4g] "
+            "bounds=[%+.4g, %+.4g]", len(self._breaches),
+            sum(r[1] for r in self._breaches) / len(self._breaches), worst[1], worst[0],
+            worst[1], worst[2], worst[3], lo, hi)
+
+    def _frame_stamp(self):
+        """sha1 of the LOCKED frame — the utility scale, the z-frame (market/wealth mean+std), the
+        trust-region envelope and the streaming flag. Two checkpoints with the same stamp compute
+        the same function of the same standardized state; a different stamp is a different frame,
+        which is exactly what makes averaging them in one argmax (or reloading under a re-locked
+        frame) invalid. Stamped into every artifact, logged on every load."""
+        env = [b for b in self.a_bounds if b is not None]
+        frame = {
+            "utility_scale": round(float(self.runtime["objective"]["utility_scale"]), 6),
+            "m_mean": [round(float(v), 6) for v in self.m_mean.tolist()],
+            "m_std": [round(float(v), 6) for v in self.m_std.tolist()],
+            "w_mean": round(float(self.w_mean), 6), "w_std": round(float(self.w_std), 6),
+            "a_bounds": ([round(min(b[0] for b in env), 6), round(max(b[1] for b in env), 6)]
+                         if env else None),
+            "streaming": self.streaming,
+        }
+        return hashlib.sha1(json.dumps(frame, sort_keys=True).encode()).hexdigest()
+
+    def finish(self, bundle):
+        """Verdict, benchmarks-facing headline and the policy artifact. STREAMING passes the
+        HELD-OUT batch — a world no fit step ever saw, so the whole batch is out-of-sample and
+        `DiffV2_OOS_Frac` plays no part; a one-shot solve passes its own bundle back and the row
+        split provides the held-out rows."""
+        if self.streaming:
+            self._bind(bundle)
+            # The held-out world needs its own forks: the argmax reads E_inner[C_{t+1}] at each
+            # swept t, and the cached ones belong to the last TRAINING batch.
+            self.inner_cache = {t: self._inner_step(t) for t in self.sweep_ts}
+        nets, sweep_ts, inner_cache = self.nets, self.sweep_ts, self.inner_cache
+        loaded, rows, worst, root = self.loaded, self.rows, self.worst, self.root
+        train, test, has_oos, n_tr = self.train, self.test, self.has_oos, self.n_tr
+        md, hidden = self.md, self.hidden
         V_0 = float(root["Y_mean"])
         n_star_0 = root["q_star_mean"]
         bounded = math.isfinite(V_0) and worst < 1.0e4
@@ -1183,6 +1356,10 @@ class DiffSolverV2:
                 "T_dec": self.T_dec, "t_min": self.t_min, "md": md, "hidden": hidden,
                 "solver_version": SOLVER_VERSION,
                 "config_hash": self._config_hash(),
+                # Frame provenance: WHICH path population locked the frame this policy reads its
+                # inputs through, and a stamp over the frame itself (loads compare both).
+                "streaming": self.streaming,
+                "frame_stamp": self._frame_stamp(),
                 # Headline echoed so a loaded eval reads it back rather than recomputing.
                 "V_0": V_0, "n_star_0": list(n_star_0), "max_abs_Y_boot": worst,
             }
@@ -1197,8 +1374,10 @@ class DiffSolverV2:
 
         # Downside verdict: greedy policy vs textbook delta hedge vs no hedge. HEADLINE is the
         # OUT-OF-SAMPLE rollout (held-out paths the nets never saw); in-sample reported too.
-        if loaded is not None:
-            # Frozen nets never saw ANY of this run's paths — the whole batch is out-of-sample.
+        if loaded is not None or self.streaming:
+            # Frozen nets never saw ANY of this run's paths; a streaming finish rolls the HELD-OUT
+            # batch, a world no fit step touched. Either way the whole batch is out-of-sample
+            # (there is no in-sample counterpart on it — the training batches are already gone).
             verdict = verdict_is = self._verdict(nets, inner_cache, sweep_ts,
                                                  rows=slice(None))
             has_oos = True
@@ -1207,7 +1386,9 @@ class DiffSolverV2:
                                     rows=(test if has_oos else train))
             verdict_is = (self._verdict(nets, inner_cache, sweep_ts, rows=train)
                           if has_oos else verdict)
-        if has_oos and loaded is None:
+        if has_oos and loaded is None and not self.streaming:
+            # (streaming has no in-sample counterpart on the held-out batch — the training
+            # batches are gone by now, so the IS/OOS gap is not a thing to report)
             logging.info(
                 "DiffSolverV2 IN-SAMPLE vs OOS u(W_T): greedy IS=%+.5f OOS=%+.5f | "
                 "textbook IS=%+.5f OOS=%+.5f (gap IS−OOS greedy=%+.5f → overfit if large)",
@@ -1246,7 +1427,7 @@ class DiffSolverV2:
             "  → on the OBJECTIVE E[u(W_T)]: beats no-hedge=%s, beats textbook=%s | "
             "tail(CVaR5) competitive w/ textbook=%s",
             "OUT-OF-SAMPLE" if has_oos else "in-sample", self.t_min,
-            self.B_outer if loaded is not None else (
+            self.B_outer if (loaded is not None or self.streaming) else (
                 self.B_outer - n_tr if has_oos else self.B_outer),
             g["u_mean"], g["wT_mean"], g["wT_p5"], g["wT_cvar5"],
             tb["u_mean"], tb["wT_mean"], tb["wT_p5"], tb["wT_cvar5"],
@@ -1271,8 +1452,8 @@ class DiffSolverV2:
                 "bounded": bool(bounded),
                 "root_t": int(root["t"]),
                 "per_t": rows,
-                "action_grid_size": int(grid.shape[0]),
-                "market_dim": int(M.shape[-1]),
+                "action_grid_size": self.grid_size,
+                "market_dim": md,
                 "value_fn_path": save_path or None,       # where the artifact was persisted (if any)
                 "verdict": verdict,                       # OUT-OF-SAMPLE (held-out paths)
                 "stepper_verdict": stepper_verdict,       # frozen-policy realized-path rollout (real accounting)
@@ -1295,12 +1476,72 @@ _SOLVERS: Dict[str, Callable] = {
 }
 
 
+class StreamingSolve:
+    """Bundle-per-batch driver (`Solver.DiffV2_Streaming_Batches='Yes'`).
+
+    `HedgeMonteCarlo.execute` builds a `Bundle` INSIDE its simulation loop and hands each one
+    straight over: `warmup` on batch 1 (which constructs the solver(s) and locks the frame),
+    `step` on every later batch (fresh paths, same nets / optimizer moments / frame), and
+    `finish` on the final batch — never trained on, so it is the held-out world the verdict and
+    the benchmark tracks are measured on.
+
+    What this buys: the inner-MC fork width becomes `Batch_Size` instead of
+    `Batch_Size x Simulation_Batches` (peak fork memory divided by the batch count, at unchanged
+    total training paths), and every fit step sees paths no earlier step did, so overfitting to
+    one simulated set stops being structurally possible. What it costs: the data order changes by
+    construction, so a streaming run is NOT comparable bit-for-bit with a fixed-set one — it is a
+    revalidation event, measured against the walk-forward baseline.
+
+    Multi-seed keeps one persistent solver per seed, all fed the same batches in the same order."""
+
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.cfg = runtime["solver"]
+        if self.cfg["object"] != "diffsolverv2":
+            raise ValueError(
+                "Solver.DiffV2_Streaming_Batches='Yes' requires Solver.Object='DiffSolverV2' "
+                f"(the incremental warmup/step/finish API); got {self.cfg['object']!r}.")
+        self.solvers = []
+        self.trained_batches = 0
+
+    def warmup(self, bundle):
+        """Batch 1: build the solver(s) and fit the first backward sweep. The frame (utility
+        scale, z-frame, trust region) is locked here and frozen for every later batch."""
+        n_seed = max(1, int(self.cfg.get("multi_seed_count", 1)))
+        self.solvers = [DiffSolverV2(bundle, self.runtime) for _ in range(n_seed)]
+        for solver in self.solvers:
+            solver.warmup(bundle)
+        self.trained_batches = 1
+        logging.info(
+            "StreamingSolve WARMUP on batch 1: %d outer paths x %d seed(s) — frame LOCKED "
+            "(utility_scale=%.6g, z-frame + trust region from this batch)",
+            self.solvers[0].B_outer, len(self.solvers), self.solvers[0].utility_scale)
+
+    def step(self, bundle):
+        """A later batch: continue the same nets on fresh paths under the frozen frame."""
+        self.trained_batches += 1
+        logging.info("StreamingSolve STEP on batch %d (%d outer paths)",
+                     self.trained_batches, int(bundle.liability_sim.shape[-1]))
+        for solver in self.solvers:
+            solver.step(bundle)
+
+    def finish(self, held_out):
+        """The held-out batch: verdict + benchmarks + artifact, on paths no fit step saw."""
+        logging.info(
+            "StreamingSolve FINISH on the held-out batch (%d outer paths) after %d training "
+            "batch(es) — this world was never fitted, so the whole batch is out-of-sample and "
+            "DiffV2_OOS_Frac plays no part", int(held_out.liability_sim.shape[-1]),
+            self.trained_batches)
+        runs = [solver.finish(held_out) for solver in self.solvers]
+        return assemble_hedge_result(runs, held_out, self.runtime)
+
+
 def solve_hedge(bundle, runtime):
-    """Dispatcher + orchestration for `Execution_Mode='solve_hedge'`. Runs the configured
-    `Solver.Object`; when that is the `DiffSolverV2` deliverable it also assembles the
-    benchmark tracks (hindsight upper bound / textbook lower bound) enabled by the `Run_*`
-    flags into a `comparison` table — V_0 mean ± std per track — plus the acceptance ladder.
-    Multi-seed repeats re-use the cached outer paths but advance the inner-MC Sobol stream.
+    """Dispatcher for `Execution_Mode='solve_hedge'` (the one-shot path): run the configured
+    `Solver.Object` on the single bundle `Simulation_Batches` accumulated, then assemble the
+    tracks. Multi-seed repeats re-use the cached outer paths but advance the inner-MC Sobol
+    stream. The streaming path (`Solver.DiffV2_Streaming_Batches='Yes'`) does not come through
+    here — `HedgeMonteCarlo.execute` drives `StreamingSolve` batch by batch instead.
 
     Returns the dict shape `HedgeMonteCarlo.execute` unpacks (`evaluation_output` /
     `optimizer_diagnostics` / `policy_artifact`)."""
@@ -1310,10 +1551,21 @@ def solve_hedge(bundle, runtime):
         raise ValueError(
             f"Unknown Solver Object {obj!r}; available: {sorted(_SOLVERS)}")
     n_seed = max(1, int(solver_cfg.get("multi_seed_count", 1)))
-    have_liability = bundle.liability_mtm is not None
-
     # Primary solver — multi-seed repeats advance the inner-MC Sobol stream.
-    primary_runs = [_SOLVERS[obj](bundle, runtime).solve() for _ in range(n_seed)]
+    return assemble_hedge_result(
+        [_SOLVERS[obj](bundle, runtime).solve() for _ in range(n_seed)], bundle, runtime)
+
+
+def assemble_hedge_result(primary_runs, bundle, runtime):
+    """Assemble the primary solver runs (one per seed) plus the benchmark tracks (hindsight upper
+    bound / textbook lower bound, enabled by the `Run_*` flags) into the `comparison` table —
+    V_0 mean ± std per track — the acceptance ladder, and the result dict
+    `HedgeMonteCarlo.execute` unpacks. Shared by the one-shot `solve_hedge` and `StreamingSolve`,
+    so both modes report the same shape; under streaming `bundle` is the HELD-OUT batch, which is
+    exactly the world the verdict was rolled on, so the benchmark tracks measure the same paths."""
+    solver_cfg = runtime["solver"]
+    obj = solver_cfg["object"]
+    have_liability = bundle.liability_mtm is not None
     primary = primary_runs[0]
     comparison = {primary.solver_name: SolverResult.multiseed_summary(primary_runs)}
 

@@ -238,6 +238,13 @@ def _solver_config(solver_config: Optional[Mapping[str, Any]]) -> Optional[Dict[
         # expected value against the cost of getting there. Training stays cost-free.
         "diffv2_cost_aware_argmax":
             solver_config.get("DiffV2_Cost_Aware_Argmax", "No") == "Yes",
+        # Bundle-per-batch STREAMING: the calc builds a Bundle inside its simulation loop and a
+        # persistent solver warms up on batch 1, steps on each later batch and finishes on the
+        # final (held-out) one. Fork width becomes Batch_Size instead of Batch_Size x
+        # Simulation_Batches, and every fit step sees fresh paths. 'No' (default) = the
+        # generate-all-then-solve path, byte-identical.
+        "diffv2_streaming_batches":
+            solver_config.get("DiffV2_Streaming_Batches", "No") == "Yes",
         # Deployment-faithful backtest: with a frozen policy loaded, roll it day-by-day on the
         # observed path via BundleStepper (real futures accounting; decisions off the stepper's
         # own wealth). Exposes diagnostics['stepper_verdict']. 'No' = only the fast _verdict.
@@ -342,6 +349,12 @@ def construct_hedge_runtime(
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires Inner_Sub_Batch >= "
                 f"{min_inner} for Solver.Object={solver_config.get('Object')!r}")
+        if (solver_config.get("DiffV2_Streaming_Batches", "No") == "Yes"
+                and int(config.get("Simulation_Batches", 1)) < 3):
+            raise ValueError(
+                "Solver.DiffV2_Streaming_Batches='Yes' requires Simulation_Batches >= 3 "
+                f"(warmup + at least one step + the held-out batch); got "
+                f"{config.get('Simulation_Batches')}.")
         if str((objective_config or {}).get("Object", "")).lower() not in _UTILITY_OBJECTS:
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires a utility Objective.Object — one of "

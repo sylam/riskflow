@@ -724,9 +724,10 @@ class BundleStepper:
     Vectorized over the bundle's full batch (B paths advance in lockstep). Action values can be
     scalars (broadcast) or per-path `(B,)` tensors. `runtime` is a PARAMETER of the replay, not
     the bundle's: passing a variant (e.g. one accounting switch flipped) is how the cost
-    decomposition isolates each friction on an unchanged world."""
+    decomposition isolates each friction on an unchanged world. `mirror_scale=False` keeps the
+    runtime's utility scale as the caller set it (see `__init__`)."""
 
-    def __init__(self, bundle, runtime):
+    def __init__(self, bundle, runtime, mirror_scale=True):
         self.bundle = bundle
         self.runtime = runtime
         self._accounting = runtime['accounting']
@@ -739,13 +740,16 @@ class BundleStepper:
         self._batch_size = bundle.batch_size
         self._last_idx = bundle.last_index
         self._decision_set = set(int(i) for i in bundle.business_indices)
-        # The replay's rewards are marked against THIS bundle, so its scale is re-mirrored onto
-        # the (possibly variant) runtime. TRAP: under a frozen-policy run (DiffV2_Load_Value_Fn)
-        # the solver has already restored the CHECKPOINT's scale — the value function's own frame
-        # — and this line overwrites it with the eval world's, so the stepper rollout decides
-        # under a different c than `_verdict` did. Kept as-is because the REVAL48 walk-forward
-        # anchors were measured through it; changing it is a revalidation event, not a refactor.
-        bundle.mirror_utility_scale(runtime)
+        # The replay's rewards are marked against THIS bundle, so by default its scale is
+        # re-mirrored onto the (possibly variant) runtime. TRAP: under a frozen-policy run
+        # (DiffV2_Load_Value_Fn) the solver has already restored the CHECKPOINT's scale — the
+        # value function's own frame — and this overwrites it with the eval world's, so a policy
+        # rollout decides under a different c than the solver's own verdict did. `mirror_scale`
+        # =False leaves the runtime's scale alone, which is what a rollout of a FROZEN value
+        # function wants (hedge_solver passes it in streaming mode). The default stays True
+        # because every walk-forward anchor to date was measured through the re-mirror.
+        if mirror_scale:
+            bundle.mirror_utility_scale(runtime)
         self._state = self._initial_state()
         # Per-decision recording for post-hoc diagnostic CSV writing. Cheap (a few (B,) tensors
         # per decision step); always-on so write_diagnostic_csvs has data to use.

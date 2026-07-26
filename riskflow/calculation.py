@@ -43,6 +43,7 @@ from .pricing import SensitivitiesEstimator
 from . import utils, pricing
 from .hedge_runtime import construct_hedge_runtime
 from .hedge_bundle import Bundle, run_hedge_execution, HedgeRuntimeExecutionResult
+from .hedge_solver import StreamingSolve
 
 # Flat-sample cap (outer chunk x Inner_Sub_Batch) per inner-MC fork pass at a 64-row reference;
 # per-job override = Calculation.Inner_MC_Flat_Limit.
@@ -1780,6 +1781,30 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         'draws its own Sobol stream, changing it changes the draws (statistically, not bitwise,',
         'equivalent), so it belongs in the job JSON where the rest of the run is reproducible from.',
         '',
+        '### Streaming batches (`Solver.DiffV2_Streaming_Batches`)',
+        '',
+        'Default `No`: every simulation batch is accumulated into ONE bundle and the solver runs',
+        'once on the whole path set. `Yes` inverts it — a bundle is built per batch inside the',
+        'simulation loop and a persistent solver warms up on batch 1, steps on each later batch,',
+        'and finishes on the final batch, which is never trained on. Consequences worth knowing',
+        'before flipping it:',
+        '',
+        '- Inner-MC fork width follows `Batch_Size` instead of `Batch_Size x Simulation_Batches`,',
+        '  so peak fork memory is divided by the batch count at unchanged total training paths.',
+        '- Every fit step sees paths no earlier step did, so overfitting to the simulated set is',
+        '  not structurally possible; the data order changes, so results are NOT comparable',
+        '  bit-for-bit with a fixed-set run.',
+        '- The **frame is locked on the warmup batch**: the utility scale `c`, the market/wealth',
+        '  standardization stats, and the per-t trust region are computed on batch 1 and frozen.',
+        '  Later batches report how often their fitted targets fall outside the frozen region',
+        '  (an INFO line per step) rather than re-fitting it.',
+        '- `DiffV2_OOS_Frac` is IGNORED: the held-out final batch is an independent draw and',
+        '  replaces the row split as the out-of-sample world for the verdict and the benchmarks.',
+        '- Requires `Simulation_Batches >= 3` (warmup + at least one step + the held-out batch)',
+        '  and `Solver.Object = "DiffSolverV2"`.',
+        '- Checkpoints stamp `streaming` + a `frame_stamp` (scale, z-frame, trust-region envelope).',
+        '  Loading across provenances warns; an ensemble that MIXES provenances is refused.',
+        '',
         '### Execution modes',
         '',
         '- `Execution_Mode = "solve_hedge"` — run the configured `Solver.Object` (DiffSolverV2).',
@@ -1863,7 +1888,11 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         """Simulate the scenario engine over batches, accumulate the tensor bundle
         (tradable prices, liability MtM, factor paths), then hand it to the configured
         hedge solver (solve_hedge) or expose it for stepping (simulate_only). Returns a
-        HedgeRuntimeExecutionResult."""
+        HedgeRuntimeExecutionResult.
+
+        `Solver.DiffV2_Streaming_Batches='Yes'` inverts the loop: a Bundle per batch, handed to a
+        persistent solver as it is built (warmup / step / finish on a held-out final batch), so
+        the inner-MC forks are only ever `Batch_Size` wide and every fit step sees fresh paths."""
         base_date = pd.Timestamp(params['Run_Date'])
         self.input_time_grid = params['Time_Grid']
         params['Simulation_Batches'] = params['Simulation_Batches'] // num_jobs
@@ -1932,20 +1961,31 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         solve_hedge_mode = str(execution_mode).lower() == 'solve_hedge'
         if inner_mc_enabled:
             self.stoch_factors_inner = {k: proc.copy() for k, proc in self.stoch_factors.items()}
-        outer_state_blocks = defaultdict(list) if solve_hedge_mode else None
+        # STREAMING (Solver.DiffV2_Streaming_Batches='Yes'): build a Bundle per batch INSIDE this
+        # loop and hand it to a persistent solver (warmup on batch 1, step on each later batch,
+        # finish on the held-out last one) instead of accumulating every batch into one bundle and
+        # solving once. The fork width then follows Batch_Size rather than the whole run, and each
+        # fit step sees fresh paths. Default 'No' keeps the accumulate-then-solve path byte-identical.
+        streaming = solve_hedge_mode and bool(
+            (normalized_runtime['solver'] or {}).get('diffv2_streaming_batches'))
+        streaming_solve = StreamingSolve(normalized_runtime) if streaming else None
+        held_out = None
+        outer_state_blocks = defaultdict(list) if (solve_hedge_mode and not streaming) else None
 
-        factor_tensor_blocks = {
-            self._factor_bundle_key(key): [] for key in self.stoch_factors
-        }
-        tradable_blocks = defaultdict(list)
-        hedge_profile_blocks = {
-            'mtm': [],
-            'realized_cashflows': defaultdict(list),
-        }
-        # Per-batch privileged-factor accumulator. Keyed by (factor_name, factor_attr) where
-        # factor_attr is whatever the process exposes via `privileged_factors()`. Concatenated
-        # along the batch dim after all simulation batches finish.
-        privileged_factor_blocks = defaultdict(list)
+        # Per-batch tensor accumulators. The non-streaming path appends every batch and
+        # concatenates once at the end; streaming re-inits them each batch (one block per key).
+        def _new_blocks():
+            return ({self._factor_bundle_key(key): [] for key in self.stoch_factors},
+                    defaultdict(list),
+                    {'mtm': [], 'realized_cashflows': defaultdict(list)},
+                    defaultdict(list))
+
+        # `privileged_factor_blocks` is keyed by (factor_name, factor_attr) — whatever the process
+        # exposes via `privileged_factors()`.
+        (factor_tensor_blocks, tradable_blocks, hedge_profile_blocks,
+         privileged_factor_blocks) = _new_blocks()
+        # Static liability descriptors (read off the cashflow schedules, batch-independent).
+        total_leg_volume, last_payment_day = self._liability_schedule_scalars()
         # get the calendar for business day
         bus_day = self.config.holidays.get(
             self.params['Calendar'], {'businessday': pd.offsets.BDay(1)})['businessday']
@@ -2041,8 +2081,14 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                         privileged_factor_blocks[(factor_name, attr_name)].append(tensor.detach().clone())
 
             # solve_hedge: snapshot this batch's outer scenario buffer (factor paths + every
-            # per-process aux key each generate() published) for on-demand inner-MC forking later.
-            if outer_state_blocks is not None:
+            # per-process aux key each generate() published) for on-demand inner-MC forking. The
+            # non-streaming path accumulates and concatenates after the loop; streaming forks THIS
+            # batch, so it keeps just this batch's snapshot.
+            batch_buffer = None
+            if streaming:
+                batch_buffer = {key: tensor.detach().clone()
+                                for key, tensor in shared_mem.t_Scenario_Buffer.items()}
+            elif outer_state_blocks is not None:
                 for key, tensor in shared_mem.t_Scenario_Buffer.items():
                     outer_state_blocks[key].append(tensor.detach().clone())
 
@@ -2078,6 +2124,29 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
             shared_mem.t_Buffer.clear()
 
+            if streaming:
+                # This batch IS a bundle: build it, attach its own forks, and hand it to the
+                # persistent solver. The last batch is reserved — never fitted — as the held-out
+                # world `finish` measures the verdict and the benchmark tracks on.
+                bundle = Bundle.from_batch(
+                    base_date, bus_day, shared_mem.one.new_tensor(t_days_arr),
+                    tradable_blocks, factor_tensor_blocks, hedge_profile_blocks, 1,
+                    self.stoch_factors, normalized_runtime,
+                    privileged_factor_blocks=privileged_factor_blocks,
+                    total_leg_volume=total_leg_volume, last_payment_day=last_payment_day)
+                self._attach_inner_mc(bundle, batch_buffer, shared_mem, base_date, tradable_refs)
+                if run == 0:
+                    streaming_solve.warmup(bundle)
+                elif run < params['Simulation_Batches'] - 1:
+                    streaming_solve.step(bundle)
+                else:
+                    held_out = bundle
+                # Fresh accumulators for the next batch — this one has been consumed. (The forks
+                # the solver just ran borrowed `shared_mem`; `_run_inner_mc_chunk` hands it back as
+                # it found it, so outer generation resumes unaffected.)
+                (factor_tensor_blocks, tradable_blocks, hedge_profile_blocks,
+                 privileged_factor_blocks) = _new_blocks()
+
         self.calc_stats[execution_label] = time.monotonic() - self.calc_stats[execution_label]
 
         if outer_state_blocks is not None:
@@ -2087,55 +2156,36 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 key: torch.cat(blocks, dim=-1) for key, blocks in outer_state_blocks.items()
             }
 
-        total_leg_volume, last_payment_day = self._liability_schedule_scalars()
-        bundle = Bundle.from_batch(
-            base_date,
-            bus_day,
-            shared_mem.one.new_tensor(t_days_arr),
-            tradable_blocks,
-            factor_tensor_blocks,
-            hedge_profile_blocks,
-            params['Simulation_Batches'],
-            self.stoch_factors,
-            normalized_runtime,
-            privileged_factor_blocks=privileged_factor_blocks,
-            total_leg_volume=total_leg_volume,
-            last_payment_day=last_payment_day,
-        )
-        if solve_hedge_mode:
-            # Closure lets the solver fork inner MC on demand without a calc handle —
-            # captures `self` (the inner-MC machinery), the cached outer state, shared_mem.
-            # `one_step=True` windows the fork to {t, t+1}: 2-row generation AND a real
-            # 2-row pricing pass (exact per-tradable F_t1, exact L_t/L_t1) — the only
-            # fields the diff-ML bootstrap reads. Horizon fields (L_T, dF_T, dF_min,
-            # features) are only produced on full forks.
-            bundle.inner_mc = lambda t, one_step=False: self._run_inner_mc_at_t(
-                t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
-                max_inner_steps=1 if one_step else None)
-            # Grad-enabled twin: per-process state-at-t leaves attached so the solver can
-            # `.backward()` from any function of inner outputs back to state-at-t and read
-            # gradient labels (differential ML twin-loss). `outer_rows`
-            # lets the solver run the grad fork in outer-path sub-slices at large B_outer
-            # (per-slice tapes; the single-chunk grad constraint applies per slice —
-            # with `one_step=True` the tape covers 2 rows, so the flat cap binds instead
-            # of the cells cap and slices get wide).
-            bundle.inner_mc_grad = lambda t, outer_rows=None, one_step=False: \
-                self._run_inner_mc_at_t(
-                    t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
-                    with_grad=True, outer_rows=outer_rows,
-                    max_inner_steps=1 if one_step else None)
-            # Grad-slice sizing inputs: cell budget (flat limit at its 64-row calibration
-            # reference, halved — the AAD tape roughly doubles per-cell memory vs no-grad)
-            # + the inner sub-batch. The solver divides by the per-t remaining rows.
-            bundle.inner_mc_cell_budget = (self._inner_mc_flat_limit() * 64) // 2
-            bundle.inner_sub_batch = int(shared_mem.simulation_sub_batch)
+        if streaming:
+            bundle = held_out
+        else:
+            bundle = Bundle.from_batch(
+                base_date,
+                bus_day,
+                shared_mem.one.new_tensor(t_days_arr),
+                tradable_blocks,
+                factor_tensor_blocks,
+                hedge_profile_blocks,
+                params['Simulation_Batches'],
+                self.stoch_factors,
+                normalized_runtime,
+                privileged_factor_blocks=privileged_factor_blocks,
+                total_leg_volume=total_leg_volume,
+                last_payment_day=last_payment_day,
+            )
+        if solve_hedge_mode and not streaming:
+            self._attach_inner_mc(bundle, self._outer_scenario_buffer, shared_mem,
+                                  base_date, tradable_refs)
 
         evaluation_summary = None
         optimizer_diagnostics = None
         policy_artifact = None
         runtime_present = False
         runtime_diagnostics = {}
-        optimization_result = run_hedge_execution(bundle, normalized_runtime)
+        # Streaming already ran the solve batch by batch; all that is left is the held-out
+        # verdict + the tracks. Everything else dispatches by Execution_Mode as before.
+        optimization_result = (streaming_solve.finish(held_out) if streaming
+                               else run_hedge_execution(bundle, normalized_runtime))
         if optimization_result is not None:
             evaluation_summary = optimization_result['evaluation_output']
             optimizer_diagnostics = optimization_result['optimizer_diagnostics']
@@ -2266,6 +2316,33 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 Calc_res={} if outer_struct.store_results else None,
             ))
         return inner
+
+    def _attach_inner_mc(self, bundle, outer_buffer, shared_mem, base_date, tradable_refs):
+        """Attach the on-demand inner-MC forks to a bundle. The closures let the solver fork
+        without a calc handle — they capture `self` (the inner-MC machinery), the outer scenario
+        snapshot they fork FROM, and shared_mem. `one_step=True` windows the fork to {t, t+1}:
+        2-row generation AND a real 2-row pricing pass (exact per-tradable F_t1, exact L_t/L_t1)
+        — the only fields the diff-ML bootstrap reads. Horizon fields (L_T, dF_T, dF_min,
+        features) are only produced on full forks. `outer_rows` lets the solver run the GRAD fork
+        in outer-path sub-slices at large B_outer (per-slice tapes; the single-chunk grad
+        constraint applies per slice — with `one_step=True` the tape covers 2 rows, so the flat
+        cap binds instead of the cells cap and slices get wide).
+
+        One bundle per batch under streaming, so the buffer is passed in rather than read off the
+        calc: each bundle forks from ITS OWN batch."""
+        bundle.inner_mc = lambda t, one_step=False: self._run_inner_mc_at_t(
+            t, outer_buffer, shared_mem, base_date, tradable_refs,
+            max_inner_steps=1 if one_step else None)
+        bundle.inner_mc_grad = lambda t, outer_rows=None, one_step=False: \
+            self._run_inner_mc_at_t(
+                t, outer_buffer, shared_mem, base_date, tradable_refs,
+                with_grad=True, outer_rows=outer_rows,
+                max_inner_steps=1 if one_step else None)
+        # Grad-slice sizing inputs: cell budget (flat limit at its 64-row calibration
+        # reference, halved — the AAD tape roughly doubles per-cell memory vs no-grad)
+        # + the inner sub-batch. The solver divides by the per-t remaining rows.
+        bundle.inner_mc_cell_budget = (self._inner_mc_flat_limit() * 64) // 2
+        bundle.inner_sub_batch = int(shared_mem.simulation_sub_batch)
 
     def _inner_mc_flat_limit(self):
         """Flat-sample budget per inner-MC fork pass — `Calculation.Inner_MC_Flat_Limit`. Sizes both
@@ -2418,6 +2495,10 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # dict so the caller can `.backward()` from any function of the inner outputs and
         # read `.grad` per process/per outer path.
         state_t_leaves = {} if with_grad else None
+        # What the fork BORROWS, to give back exactly as found (see the finally below): a fork
+        # over an outer-path SLICE would otherwise leave the state slice-sized, which is invisible
+        # while forks only follow forks but corrupts the next outer batch under streaming.
+        borrowed_batch, borrowed_fill = shared_mem.simulation_batch, shared_mem.fillvalue
         with grad_ctx:
             try:
                 shared_mem.simulation_batch = B_outer
@@ -2581,8 +2662,10 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 # (B_outer -> B_flat for pricing) and `fillvalue` in place. Without this a
                 # mid-fork raise (CUDA OOM, a degenerate-pricing RuntimeError) left the state
                 # flat-sized, so the NEXT chunk / t-step failed on shapes instead of the real cause.
-                shared_mem.simulation_batch = B_outer
-                shared_mem.fillvalue = shared_mem.one.new_zeros((0, 1, B_outer))
+                # Restored to what the fork FOUND, not to this fork's own width: outer generation
+                # resumes on the same state under streaming.
+                shared_mem.simulation_batch = borrowed_batch
+                shared_mem.fillvalue = borrowed_fill
                 shared_mem.t_Buffer.clear()
                 shared_mem.t_Scenario_Buffer.clear()
                 # Drop the Sobol sample cache — it is keyed by sample_size and would otherwise
