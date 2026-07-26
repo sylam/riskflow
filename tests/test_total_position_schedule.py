@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from riskflow.hedge_runtime import _normalize_total_position_schedule as _norm
+from riskflow.hedge_runtime import _position_schedule as _norm
 from riskflow.hedge_solver import HedgeActionSpace
 
 

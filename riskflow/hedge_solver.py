@@ -44,29 +44,18 @@ class SolverResult:
     value_fn_artifacts: Optional[Any] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
-
-def _turnover_cost(delta_contracts, kappa):
-    """L1 turnover cost: Σ_i |Δcontracts_i| · kappa_i. `delta_contracts` is
-    `(..., n_hedge)`, `kappa` is `(n_hedge,)` per-contract cost. Hard (no smoothing) —
-    action search has no gradients on the action."""
-    return (delta_contracts.abs() * kappa).sum(dim=-1)
-
-
-def _config_hash(solver_cfg):
-    """sha1 of the stable-JSON normalized solver cfg — a stamp identifying the TRAINING
-    RECIPE. The persistence paths (save/load) are excluded so the same recipe hashes
-    identically regardless of where its checkpoint lives."""
-    stable = {k: v for k, v in solver_cfg.items()
-              if k not in ("diffv2_save_value_fn", "diffv2_load_value_fn")}
-    return hashlib.sha1(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
-
-
-def _schedule_key(schedule):
-    """Canonical, comparison-stable form of a `Total_Position_Schedule` (None or the sorted
-    `(step, min, max)` knot tuple) — flattens tuple-vs-list and int/float drift so a checkpoint's
-    stored corridor compares bitwise against the run's corridor regardless of round-trip form."""
-    return None if schedule is None else tuple(
-        (int(step), float(lo), float(hi)) for step, lo, hi in schedule)
+    @staticmethod
+    def multiseed_summary(runs):
+        """Aggregate a track's repeated solves into `v0_mean ± v0_std` (population std). Every
+        solver writes its scalar V_0 to `diagnostics`. Multi-seed repeats re-use the cached outer
+        paths but advance the inner-MC Sobol stream, so deterministic tracks (hindsight, textbook)
+        report `std == 0`."""
+        v0 = [float(r.diagnostics["V_0"]) for r in runs]
+        mean = sum(v0) / len(v0)
+        std = (sum((x - mean) ** 2 for x in v0) / len(v0)) ** 0.5 if len(v0) > 1 else 0.0
+        return {"v0_mean": mean, "v0_std": std, "v0_seeds": v0,
+                "n_star": runs[0].diagnostics.get("n_star_0")
+                          or runs[0].diagnostics.get("n_star")}
 
 
 class HedgeActionSpace:
@@ -83,7 +72,10 @@ class HedgeActionSpace:
         and rows over the total-position cap are dropped (identical to the old private grid).
       * `kappa(tradables_sim, t)` — the per-hedge turnover kappa at sim-grid `t` (each
         instrument's mean mark), off the single `hedge_runtime.per_contract_kappa` rule.
-      * `initial_q(batch, device)` — the opening book `q0` (see `initial_q_from_runtime`)."""
+      * `initial_q(batch, device)` — the opening book `q0` (see `initial_q_from_runtime`).
+      * `turnover_cost(dq, kappa)` / `schedule_key(schedule)` — the L1 friction charge on a
+        reposition and the comparison-stable corridor stamp, both owned here because the action
+        universe owns kappa and the corridor."""
 
     def __init__(self, runtime, device, vol_sim=None):
         self.runtime = runtime
@@ -214,6 +206,21 @@ class HedgeActionSpace:
         order) from the normalized `Portfolio_State` positions."""
         return initial_q_from_runtime(self.runtime, batch, device)
 
+    @staticmethod
+    def turnover_cost(delta_contracts, kappa):
+        """L1 turnover cost: Σ_i |Δcontracts_i| · kappa_i. `delta_contracts` is `(..., n_hedge)`,
+        `kappa` is the `(n_hedge,)` per-contract cost from `kappa()`. Hard (no smoothing) — the
+        action search has no gradients on the action."""
+        return (delta_contracts.abs() * kappa).sum(dim=-1)
+
+    @staticmethod
+    def schedule_key(schedule):
+        """Canonical, comparison-stable form of a `Total_Position_Schedule` (None or the sorted
+        `(step, min, max)` knot tuple) — flattens tuple-vs-list and int/float drift so a
+        checkpoint's stored corridor compares against the run's regardless of round-trip form."""
+        return None if schedule is None else tuple(
+            (int(step), float(lo), float(hi)) for step, lo, hi in schedule)
+
 
 def run_textbook_benchmark(bundle, runtime):
     """Static-hedge reference: the single best CONSTANT position, held over the whole horizon
@@ -247,10 +254,10 @@ def run_textbook_benchmark(bundle, runtime):
     n_star = grid[best]                                                # (n_hedge,)
     # Net-of-cost diagnostic (shared kappa): entry |n_star − q0| + terminal unwind |0 − n_star|.
     kappa0 = aspace.kappa(tradables_sim, 0)
-    cost = _turnover_cost(n_star.unsqueeze(0) - q0, kappa0)            # (B,) entry from q0
+    cost = aspace.turnover_cost(n_star.unsqueeze(0) - q0, kappa0)      # (B,) entry from q0
     if acc["force_flat_at_end"]:
         kappa_T = aspace.kappa(tradables_sim, t_outer - 1)
-        cost = cost + _turnover_cost(n_star, kappa_T)                  # unwind to flat (scalar)
+        cost = cost + aspace.turnover_cost(n_star, kappa_T)            # unwind to flat (scalar)
     u_net = _utility_wrap_signed(L_T + g_t[best] - cost, runtime)
     return {"v0_mean": float(obj[best]), "v0_std": 0.0,
             "v0_mean_net": float(u_net.mean()),
@@ -302,13 +309,13 @@ class HindsightDpSolver:
             step_pnl = torch.einsum("ai,ib->ab", grid * cs, dF)        # (n_actions_t, B)
             best_pnl, best_idx = step_pnl.max(dim=0)                   # (B,), (B,)
             q_now = grid[best_idx]                                     # (B, n_h)
-            cost = cost + _turnover_cost(q_now - q_prev, aspace.kappa(tradables_sim, t))
+            cost = cost + aspace.turnover_cost(q_now - q_prev, aspace.kappa(tradables_sim, t))
             G = G + best_pnl
             q_prev = q_now
             if t == 0:
                 n_star_0 = q_now
         if acc["force_flat_at_end"]:
-            cost = cost + _turnover_cost(q_prev, aspace.kappa(tradables_sim, t_outer - 1))
+            cost = cost + aspace.turnover_cost(q_prev, aspace.kappa(tradables_sim, t_outer - 1))
         v0 = _utility_wrap_signed(L_T + G, runtime)                    # (B,) FRICTIONLESS
         v0_net = _utility_wrap_signed(L_T + G - cost, runtime)         # (B,) net-of-cost diagnostic
 
@@ -327,23 +334,6 @@ class HindsightDpSolver:
                 "action_grid_size": int(aspace.grid().shape[0]),
             },
         )
-
-
-def _result_v0(result):
-    """Scalar V_0 of a track's `SolverResult` — every solver writes it to `diagnostics`."""
-    return float(result.diagnostics["V_0"])
-
-
-def _multiseed_summary(runs):
-    """Aggregate a track's repeated solves into `v0_mean ± v0_std` (population std).
-    Multi-seed repeats re-use the cached outer paths but advance the inner-MC Sobol
-    stream, so deterministic tracks (hindsight, textbook) report `std == 0`."""
-    v0 = [_result_v0(r) for r in runs]
-    mean = sum(v0) / len(v0)
-    std = (sum((x - mean) ** 2 for x in v0) / len(v0)) ** 0.5 if len(v0) > 1 else 0.0
-    return {"v0_mean": mean, "v0_std": std, "v0_seeds": v0,
-            "n_star": runs[0].diagnostics.get("n_star_0")
-                      or runs[0].diagnostics.get("n_star")}
 
 
 class _DiffV2Residual(torch.nn.Module):
@@ -452,6 +442,14 @@ class DiffSolverV2:
         if self.t_min >= self.T_dec:
             raise ValueError(
                 f"Solver.T_Min={self.t_min} must be < decision horizon T_dec={self.T_dec}")
+
+    def _config_hash(self):
+        """sha1 of the stable-JSON solver cfg — the stamp identifying this TRAINING RECIPE.
+        The persistence paths are excluded so the same recipe hashes identically regardless of
+        where its checkpoint lives."""
+        stable = {k: v for k, v in self.cfg.items()
+                  if k not in ("diffv2_save_value_fn", "diffv2_load_value_fn")}
+        return hashlib.sha1(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
 
     # ---- utility anchor ------------------------------------------------------
     def _u(self, W):
@@ -892,7 +890,7 @@ class DiffSolverV2:
                     self._replication_hedge(t)[None].expand(n, self.n_hedge), t)
                 z = torch.zeros(n, self.n_hedge, device=self.device)
                 for p, q_now in (("greedy", q_g), ("textbook", q_tb)):
-                    cost[p] = cost[p] + _turnover_cost(q_now - q_prev[p], kappa_t)
+                    cost[p] = cost[p] + self.aspace.turnover_cost(q_now - q_prev[p], kappa_t)
                     q_prev[p] = q_now
                 W["greedy"] = self._wealth_step(W["greedy"], q_g, dF_o, dL_o)
                 W["textbook"] = self._wealth_step(W["textbook"], q_tb, dF_o, dL_o)
@@ -1072,9 +1070,9 @@ class DiffSolverV2:
                 # policy inside ANY corridor only restricts to a learned subset (valid — this is the
                 # roll-only-on-corridor-free validation path). But a policy trained in a specific
                 # corridor is queried off-support under a DIFFERENT or absent one → fail loud.
-                want_sched = _schedule_key(self.aspace.schedule)
+                want_sched = self.aspace.schedule_key(self.aspace.schedule)
                 if "total_position_schedule" in ck:
-                    saved_sched = _schedule_key(ck["total_position_schedule"])
+                    saved_sched = self.aspace.schedule_key(ck["total_position_schedule"])
                     if saved_sched == want_sched:
                         pass                                         # same corridor — exact match
                     elif saved_sched is None:
@@ -1181,10 +1179,10 @@ class DiffSolverV2:
                 "active_hedge_indices": list(self.active),
                 # Corridor provenance: the Total_Position_Schedule this policy was trained inside
                 # (None = unconstrained). A load under a DIFFERENT corridor fails loud (above).
-                "total_position_schedule": _schedule_key(self.aspace.schedule),
+                "total_position_schedule": self.aspace.schedule_key(self.aspace.schedule),
                 "T_dec": self.T_dec, "t_min": self.t_min, "md": md, "hidden": hidden,
                 "solver_version": SOLVER_VERSION,
-                "config_hash": _config_hash(self.cfg),
+                "config_hash": self._config_hash(),
                 # Headline echoed so a loaded eval reads it back rather than recomputing.
                 "V_0": V_0, "n_star_0": list(n_star_0), "max_abs_Y_boot": worst,
             }
@@ -1297,18 +1295,6 @@ _SOLVERS: Dict[str, Callable] = {
 }
 
 
-def _acceptance_ladder(comparison):
-    """The acceptance ordering — hindsight ≥ DiffSolverV2 ≥ textbook — over whatever
-    tracks are present. `holds` allows a tiny tolerance for Monte-Carlo noise."""
-    order = [("HindsightDpSolver", "hindsight"), ("DiffSolverV2", "DiffSolverV2"),
-             ("textbook", "textbook")]
-    rungs = [(label, comparison[key]["v0_mean"])
-             for key, label in order if key in comparison]
-    holds = all(rungs[i][1] >= rungs[i + 1][1] - 1.0e-6
-                for i in range(len(rungs) - 1))
-    return {"order": rungs, "holds": holds}
-
-
 def solve_hedge(bundle, runtime):
     """Dispatcher + orchestration for `Execution_Mode='solve_hedge'`. Runs the configured
     `Solver.Object`; when that is the `DiffSolverV2` deliverable it also assembles the
@@ -1329,7 +1315,7 @@ def solve_hedge(bundle, runtime):
     # Primary solver — multi-seed repeats advance the inner-MC Sobol stream.
     primary_runs = [_SOLVERS[obj](bundle, runtime).solve() for _ in range(n_seed)]
     primary = primary_runs[0]
-    comparison = {primary.solver_name: _multiseed_summary(primary_runs)}
+    comparison = {primary.solver_name: SolverResult.multiseed_summary(primary_runs)}
 
     # Benchmark tracks — assembled alongside the DiffSolverV2 deliverable.
     if obj == "diffsolverv2":
@@ -1339,12 +1325,18 @@ def solve_hedge(bundle, runtime):
                 logging.warning("solve_hedge: %s requested but bundle has no "
                                  "liability_mtm — track skipped", label)
         if solver_cfg.get("run_hindsight_diagnostic") and have_liability:
-            comparison["HindsightDpSolver"] = _multiseed_summary(
+            comparison["HindsightDpSolver"] = SolverResult.multiseed_summary(
                 [HindsightDpSolver(bundle, runtime).solve()])     # deterministic — one run
         if solver_cfg.get("run_textbook_benchmark") and have_liability:
             comparison["textbook"] = run_textbook_benchmark(bundle, runtime)
 
-    ladder = _acceptance_ladder(comparison)
+    # Acceptance ordering — hindsight >= DiffSolverV2 >= textbook over the tracks present,
+    # with a tiny tolerance for Monte-Carlo noise.
+    rungs = [(label, comparison[key]["v0_mean"])
+             for key, label in (("HindsightDpSolver", "hindsight"), ("DiffSolverV2", "DiffSolverV2"),
+                                ("textbook", "textbook")) if key in comparison]
+    ladder = {"order": rungs,
+              "holds": all(rungs[i][1] >= rungs[i + 1][1] - 1.0e-6 for i in range(len(rungs) - 1))}
     logging.info("solve_hedge tracks: %s | ladder holds=%s",
                  {k: round(v["v0_mean"], 4) for k, v in comparison.items()},
                  ladder["holds"])

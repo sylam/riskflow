@@ -44,19 +44,19 @@ def main():
         """Return (string_key, numpy_array_with_history_prefix_stripped) for the first factor
         whose key contains `substr`. Bundle factors are torch tensors of shape (H+T_sim, ...);
         we slice off the history rows so the array matches the original (T_sim, ...) shape."""
-        key = next(k for k in bundle['factors'] if substr in k)
-        arr = bundle['factors'][key].detach().cpu().numpy()
+        key = next(k for k in bundle.factors if substr in k)
+        arr = bundle.factors[key].detach().cpu().numpy()
         return key, arr[H:]
 
-    time_grid = bundle['time_grid_days'].detach().cpu().numpy()[H:]
-    sample_factor = next(iter(bundle['factors'].values()))
+    time_grid = bundle.time_grid_days.detach().cpu().numpy()[H:]
+    sample_factor = next(iter(bundle.factors.values()))
     T_sim = int(sample_factor.shape[0]) - H
     N = int(sample_factor.shape[-1])
     print(f'\nT = {T_sim} time steps    N = {N} paths')
     print(f'time_grid_days[:5]:  {time_grid[:5]}')
     print(f'time_grid_days[-5:]: {time_grid[-5:]}')
     print(f'\nFactors simulated:')
-    for k, t in bundle['factors'].items():
+    for k, t in bundle.factors.items():
         print(f'  {k}    shape={tuple(t.shape)}')
 
     # --- Archive ---
@@ -113,7 +113,7 @@ def main():
         print(f'    {c}:  mean={last.mean():+.6f}  std={last.std():.6f}')
 
     # --- 4. InterestRate.USD-SOFR (PCA) ---
-    sofr_keys = [k for k in bundle['factors'] if 'SOFR' in k]
+    sofr_keys = [k for k in bundle.factors if 'SOFR' in k]
     if sofr_keys:
         key_sofr, sim_sofr = _factor('SOFR')                            # (T, n_tenors, N)
         print(f'\n[InterestRate.USD-SOFR] sim shape: {sim_sofr.shape}')

@@ -1,12 +1,15 @@
-"""Normalized hedging-runtime construction.
+"""The ONE JSON → hedging-runtime boundary.
 
-This module owns the canonical hedging runtime contract:
+`construct_hedge_runtime` reads the `Hedging_Problem` JSON block and returns the normalized
+runtime dict every hedging consumer indexes by key: canonical lowercased modes, the instrument /
+cash-account / hedge name sets, per-instrument metadata, the accounting rules (position limits,
+turnover cost, spreads, margin funding, corridor), the objective, the solver config and the
+portfolio state. Everything is validated HERE and nowhere else — past this boundary the runtime is
+the contract, so downstream code indexes it directly rather than re-checking it.
 
-- runtime dict normalization from JSON/job spec (Evaluator, Objective, Solver, tradables)
-- canonical state/entity layout
-
-The bundle builder, env simulator, and Execution_Mode dispatch live in hedge_bundle.py;
-the differential-ML solver lives in hedge_solver.py.
+Also owns the privileged-factor naming convention (what each stochastic process publishes as
+market state) and `per_contract_kappa`, the single turnover-cost rule the solver, the environment
+and the diagnostic CSV writer all price frictions through.
 """
 
 from __future__ import annotations
@@ -19,25 +22,21 @@ import torch
 from . import utils
 
 
-def _privileged_name(factor_name, attr_name, multi):
-    """Multi-commodity runs prefix factor attribute names with `<factor>_` to disambiguate."""
+def _privileged_name(factor_name, attr_name, stoch_factors):
+    """How a process's published state coordinate is keyed. Multi-commodity runs (more than one
+    distinct primary factor name) prefix the attribute with `<factor>_` to disambiguate."""
+    multi = len({f.name[0] for f in (stoch_factors or {})}) > 1
     return f'{factor_name.lower()}_{attr_name}' if multi else attr_name
-
-
-def _privileged_multi(stoch_factors):
-    """True iff there are multiple distinct primary factor names — drives the prefix decision."""
-    return len({f.name[0] for f in (stoch_factors or {})}) > 1
 
 
 def derive_privileged_layout(stoch_factors):
     """Build the {name: dim} schema by asking each live stoch-factor process what it emits.
     Polymorphic via `type(process).privileged_layout(process.param)` — adding a new
     StochasticProcess subclass with its own privileged surface flows through automatically."""
-    multi = _privileged_multi(stoch_factors)
     layout = {}
     for factor, process in (stoch_factors or {}).items():
         for attr_name, dim in type(process).privileged_layout(process.param).items():
-            layout[_privileged_name(factor.name[0], attr_name, multi)] = int(dim)
+            layout[_privileged_name(factor.name[0], attr_name, stoch_factors)] = int(dim)
     return layout
 
 
@@ -45,73 +44,158 @@ def assemble_privileged_factors(privileged_factor_blocks, stoch_factors):
     """Concatenate per-batch privileged-factor tensors collected during the simulation loop into
     a single dict ready for the bundle. Input keyed by (factor_name, attr_name); output keys match
     the schema produced by `derive_privileged_layout`."""
-    multi = _privileged_multi(stoch_factors)
     return {
-        _privileged_name(factor_name, attr_name, multi): torch.cat(blocks, dim=1)
+        _privileged_name(factor_name, attr_name, stoch_factors): torch.cat(blocks, dim=1)
         for (factor_name, attr_name), blocks in privileged_factor_blocks.items()
     }
 
 
-def _unwrap_calc_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
-    if "Hedging_Problem" in config:
-        return config
-    return config["Calc"]["Calculation"]
+def privileged_block(privileged_factors, stoch_factors, attr_name):
+    """`(factor, process, block)` for the first live factor that PUBLISHES `attr_name` in its
+    privileged layout and has a matching assembled block — the read side of the naming rule above
+    (e.g. GARCH's revealed `log_h`). `(None, None, None)` when no process exposes it."""
+    for factor, process in (stoch_factors or {}).items():
+        if attr_name not in type(process).privileged_layout(process.param):
+            continue
+        block = privileged_factors.get(_privileged_name(factor.name[0], attr_name, stoch_factors))
+        if block is not None:
+            return factor, process, block
+    return None, None, None
 
 
-def _normalize_execution_mode(config: Mapping[str, Any]) -> str:
-    return str(config.get("Execution_Mode", "simulate_only")).lower()
+def _flatten_deals(config: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """`{DealType: {name: params}}` (the JSON object-map form) → `{name: {deal_type, params}}`."""
+    return {str(name): {"deal_type": str(deal_type), "params": deepcopy(dict(params))}
+            for deal_type, deals in config.items() for name, params in deals.items()}
 
 
-def _normalize_accounting_mode(evaluator_config: Mapping[str, Any]) -> str:
-    return str(evaluator_config.get("Accounting_Mode", "futures")).lower()
+def _instrument_metadata(name, entry, *, hedge_names, cash_account_names, liability_expiry):
+    """Per-tradable metadata: the expiry / last-trade dates the pricers and the expiry mask read,
+    the routing flags, and the contract size. Dates fall back Expiry_Date → Maturity_Date →
+    Investment_Horizon → the latest liability expiry."""
+    params = entry["params"]
+    investment_horizon = params.get("Investment_Horizon")
+    maturity_date = params.get("Maturity_Date")
+    fallback = investment_horizon if investment_horizon is not None else liability_expiry
+    default = maturity_date if maturity_date is not None else fallback
+    return {
+        "name": str(name),
+        "deal_type": entry["deal_type"],
+        "is_hedge": name in hedge_names,
+        "is_cash_account": name in cash_account_names,
+        "currency": params.get("Currency"),
+        "last_trade_date": params.get("Last_Trade_Date", default),
+        "expiry_date": params.get("Expiry_Date", default),
+        "first_notice_date": params.get("First_Notice_Date"),
+        "auto_close_days_before_last_trade": int(params.get("Auto_Close_Days_Before_Last_Trade", 0)),
+        "allow_new_positions_until_last_trade":
+            params.get("Allow_New_Positions_Until_Last_Trade", "Yes") == "Yes",
+        "allow_holding_past_last_trade": params.get("Allow_Holding_Past_Last_Trade", "No") == "Yes",
+        "contract_size": float(params.get("Contract_Size", 1.0)),
+        "params": deepcopy(dict(params)),
+    }
 
 
-def _normalize_cash_account_names(evaluator_config: Mapping[str, Any]) -> tuple:
-    if evaluator_config.get("Cash_Instruments") is not None:
-        return tuple(str(name) for name in evaluator_config.get("Cash_Instruments", ()))
-    if evaluator_config.get("Cash_Accounts") is not None:
-        return tuple(str(name) for name in evaluator_config.get("Cash_Accounts", ()))
-    cash_name = evaluator_config.get("Cash_Instrument")
-    if cash_name is None:
-        return tuple()
-    return (str(cash_name),)
+def _bid_offer_spread(evaluator_config: Mapping[str, Any]):
+    """`Evaluator.Bid_Offer_Spread_Bps` is EITHER a scalar half-spread bps applied to every
+    instrument (the fast path) OR a spec dict for maturity/liquidity- and volatility-dependent
+    spreads:
+
+        {"Default_Bps": d,
+         "Per_Instrument": {name: base_bps, ...},
+         "Vol_Scale": {"Ref_Vol": r, "Beta": b}}
+
+    The effective half-spread for instrument `name` at annualized vol σ_t is
+    `base_bps[name] · (σ_t/Ref_Vol)**Beta`, where `base_bps[name]` falls back to `Default_Bps`
+    (Per_Instrument absent ⇒ Default_Bps for all) and the vol factor is 1 when Vol_Scale is
+    absent, Beta==0, or σ_t is unknown. Returns `(scalar_bps, spec)`; `spec` is None in the
+    scalar case, and `scalar_bps` (the Default_Bps in the dict case) also feeds the diagnostic
+    CSV display column + the scalar fast-path in `per_contract_kappa`."""
+    raw = evaluator_config.get("Bid_Offer_Spread_Bps", 0.0)
+    if not isinstance(raw, Mapping):
+        return float(raw), None
+    default_bps = float(raw.get("Default_Bps", 0.0))
+    vs = raw.get("Vol_Scale") or {}
+    return default_bps, {
+        "default_bps": default_bps,
+        "per_instrument": {str(k): float(v) for k, v in (raw.get("Per_Instrument") or {}).items()},
+        "vol_scale": ({"ref_vol": float(vs["Ref_Vol"]), "beta": float(vs.get("Beta", 0.0))}
+                      if vs else None)}
 
 
-def _flatten_tradable_entries(config: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
-    flattened: Dict[str, Dict[str, Any]] = {}
-    for deal_type, deal_mapping in config.items():
-        for instrument_name, instrument_config in deal_mapping.items():
-            flattened[str(instrument_name)] = {
-                "deal_type": str(deal_type),
-                "params": deepcopy(dict(instrument_config)),
-            }
-    return flattened
+def _position_schedule(evaluator_config: Mapping[str, Any]):
+    """Optional per-decision-step corridor on the SIGNED total position Σq_i. A list of
+    `{Step, Min_Total, Max_Total}` knots (piecewise-constant between knots): at sim-grid
+    decision step t the signed book total must lie within [Min_Total, Max_Total] of the
+    rightmost knot with `Step <= t`. Absent → None (no corridor). Returns a sorted tuple of
+    `(step, min_total, max_total)` with strictly ascending, non-negative steps and
+    Min_Total <= Max_Total per knot."""
+    raw = evaluator_config.get("Total_Position_Schedule")
+    if not raw:
+        return None
+    knots = sorted(
+        (int(k["Step"]), float(k["Min_Total"]), float(k["Max_Total"])) for k in raw)
+    if knots[0][0] < 0:
+        raise ValueError(
+            f"Total_Position_Schedule Step must be >= 0; got {knots[0][0]}")
+    for (a, _, _), (b, _, _) in zip(knots, knots[1:]):
+        if b <= a:
+            raise ValueError(
+                f"Total_Position_Schedule Steps must be strictly ascending; got {a} >= {b}")
+    for step, lo, hi in knots:
+        if lo > hi:
+            raise ValueError(
+                f"Total_Position_Schedule knot at Step {step}: Min_Total {lo} > Max_Total {hi}")
+    return tuple(knots)
 
 
-def _normalize_liabilities(hedging_problem: Mapping[str, Any]) -> Dict[str, Dict[str, Any]]:
-    if hedging_problem.get("Liabilities") is not None:
-        liability_entries = _flatten_tradable_entries(hedging_problem.get("Liabilities", {}))
-        normalized = {}
-        for liability_name, liability_entry in liability_entries.items():
-            params = liability_entry["params"]
-            normalized[str(liability_name)] = {
-                "reference": str(liability_name),
-                "object": liability_entry["deal_type"],
-                "deal_type": liability_entry["deal_type"],
-                "underlying": params.get("Underlying"),
-                "currency": params.get("Currency"),
-                "strike": float(params.get("Strike", params.get("Strike_Price", 0.0))),
-                "quantity": float(params.get("Quantity", params.get("Units", 0.0))),
-                "expiry_date": params.get("Expiry_Date"),
-                "params": deepcopy(dict(params)),
-            }
-        return normalized
-    return {}
+def _spot_price_history(hedging_problem: Mapping[str, Any], lookback: int,
+                        referenced_commodities: tuple) -> Dict[str, Dict[str, Any]]:
+    """Realized spot history per commodity — the rolling-feature lookback the bundle prepends.
+    OPTIONAL: absent it the utility scale falls back to the calibrated market data and the prefix
+    no-ops, so an empty history is returned rather than demanding an entry per commodity. A
+    PARTIAL history (some but not all referenced commodities) IS an error, as are ragged
+    dates/prices, a series shorter than the lookback, non-ascending dates, and two commodities
+    whose date axes disagree."""
+    raw_history = (hedging_problem.get("Portfolio_State") or {}).get("Spot_Price_History") or {}
+    if not raw_history:
+        return {}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for commodity, payload in raw_history.items():
+        name = str(commodity)
+        dates_raw = payload.get("Dates", ())
+        prices_raw = payload.get("Prices", ())
+        if len(dates_raw) != len(prices_raw):
+            raise ValueError(
+                f"Spot_Price_History['{name}']: Dates and Prices must have equal length "
+                f"({len(dates_raw)} vs {len(prices_raw)})")
+        if len(dates_raw) < lookback:
+            raise ValueError(
+                f"Spot_Price_History['{name}']: needs at least "
+                f"History_Lookback_Business_Days={lookback} entries, got {len(dates_raw)}")
+        dates = tuple(dates_raw)
+        for i in range(1, len(dates)):
+            if dates[i] <= dates[i - 1]:
+                raise ValueError(
+                    f"Spot_Price_History['{name}']: Dates must be strictly ascending; "
+                    f"found {dates[i - 1]} >= {dates[i]} at index {i}")
+        normalized[name] = {"dates": dates, "prices": tuple(float(p) for p in prices_raw)}
+    missing = tuple(c for c in referenced_commodities if c not in normalized)
+    if missing:
+        raise ValueError(
+            f"Spot_Price_History missing entries for referenced commodities: {missing}")
+    names = list(normalized)
+    for other in names[1:]:
+        if normalized[other]["dates"] != normalized[names[0]]["dates"]:
+            raise ValueError(
+                f"Spot_Price_History['{other}'].Dates must match "
+                f"Spot_Price_History['{names[0]}'].Dates exactly")
+    return normalized
 
 
-def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Normalize the `Solver` config block (Execution_Mode='solve_hedge'). Accepts None
-    (non-solve modes); requires `Object` — one of 'diffsolverv2' | 'hindsightdpsolver'."""
+def _solver_config(solver_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Normalize the `Solver` block (Execution_Mode='solve_hedge'). Accepts None (non-solve
+    modes); requires `Object` — one of 'diffsolverv2' | 'hindsightdpsolver'."""
     if solver_config is None:
         return None
     if "Object" not in solver_config:
@@ -192,359 +276,191 @@ def _normalize_solver_config(solver_config: Optional[Mapping[str, Any]]) -> Opti
     }
 
 
-def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
-    if objective_config is None:
-        return None
-    explicit = objective_config.get("Utility_Scale_Explicit")
-    return {
-        # Canonical lowercased form — every dispatch site compares against the lowercase
-        # literal (e.g. "asymmetricutility_symlog"), so normalize once at the boundary
-        # rather than re-lowercasing on every reward call.
-        "object": str(objective_config["Object"]).lower(),
-        # Utility-transform scale. Consumed by any utility Object (Symlog / Huber / CARA);
-        # the non-utility (identity) path ignores it. `utility_scale` is mirrored
-        # from the bundle's resolved scale (see hedge_bundle.Bundle._resolve_frame).
-        "utility_scale_mode": str(objective_config.get("Utility_Scale_Mode", "vol_scaled_notional")).lower(),
-        "utility_scale_explicit": None if explicit is None else float(explicit),
-        # Utility SHAPE params (DIMENSIONLESS, in units of the scale c — applied to x = W/c).
-        # Huber (AsymmetricUtility_Huber): linear gains, quadratic small losses with curvature
-        # `huber_aversion`, linear deep tail beyond the knee `huber_delta`. CARA
-        # (AsymmetricUtility_CARA): u = (1−e^{−γx})/γ with risk aversion `cara_gamma`. Symlog
-        # ignores all three. See hedge_bundle._utility_wrap_signed for the exact forms.
-        "huber_aversion": float(objective_config.get("Huber_Aversion", 2.5)),
-        "huber_delta": float(objective_config.get("Huber_Delta", 1.0)),
-        "cara_gamma": float(objective_config.get("CARA_Gamma", 1.0)),
-    }
-
-
-def _build_instrument_cash_account_map(normalized_tradables, cash_account_names):
-    """Static instrument→cash_account routing by currency. First cash account whose
-    currency matches the instrument's currency wins; falls back to the first cash account
-    if none match. Computed once at runtime construction; consumed by the env step loop."""
-    accounts = list(cash_account_names)
-    fallback = accounts[0] if accounts else None
-    by_currency = {}
-    for account in accounts:
-        ccy = normalized_tradables.get(account, {}).get("currency")
-        by_currency.setdefault(ccy, account)
-    return {
-        name: by_currency.get(meta.get("currency"), fallback)
-        for name, meta in normalized_tradables.items()
-    }
-
-
-def _normalize_bid_offer_spread(evaluator_config: Mapping[str, Any]):
-    """`Evaluator.Bid_Offer_Spread_Bps` is EITHER a scalar half-spread bps applied to every
-    instrument (the existing behaviour — kept as a fast-path, bit-identical) OR a spec dict for
-    maturity/liquidity- and volatility-dependent spreads:
-
-        {"Default_Bps": d,
-         "Per_Instrument": {name: base_bps, ...},
-         "Vol_Scale": {"Ref_Vol": r, "Beta": b}}
-
-    The effective half-spread for instrument `name` at annualized vol σ_t is
-    `base_bps[name] · (σ_t/Ref_Vol)**Beta`, where `base_bps[name]` falls back to `Default_Bps`
-    (Per_Instrument absent ⇒ Default_Bps for all) and the vol factor is 1 when Vol_Scale is
-    absent, Beta==0, or σ_t is unknown. Returns `(scalar_bps, spec)`; `spec` is None in the
-    scalar case, and `scalar_bps` (the Default_Bps in the dict case) also feeds the diagnostic
-    CSV display column + the scalar fast-path in `per_contract_kappa`."""
-    raw = evaluator_config.get("Bid_Offer_Spread_Bps", 0.0)
-    if not isinstance(raw, Mapping):
-        return float(raw), None
-    default_bps = float(raw.get("Default_Bps", 0.0))
-    per_instrument = {str(k): float(v) for k, v in (raw.get("Per_Instrument") or {}).items()}
-    vs = raw.get("Vol_Scale") or {}
-    vol_scale = ({"ref_vol": float(vs["Ref_Vol"]), "beta": float(vs.get("Beta", 0.0))}
-                 if vs else None)
-    return default_bps, {"default_bps": default_bps, "per_instrument": per_instrument,
-                         "vol_scale": vol_scale}
-
-
-def _normalize_position_limits(evaluator_config: Mapping[str, Any]) -> Dict[str, Dict[str, int]]:
-    position_limits = {}
-    for instrument_name, limit_config in evaluator_config.get("Position_Limits", {}).items():
-        position_limits[str(instrument_name)] = {
-            "min_position": int(limit_config["Min_Position"]),
-            "max_position": int(limit_config["Max_Position"]),
-        }
-    return position_limits
-
-
-def _normalize_total_position_schedule(evaluator_config: Mapping[str, Any]):
-    """Optional per-decision-step corridor on the SIGNED total position Σq_i. A list of
-    `{Step, Min_Total, Max_Total}` knots (piecewise-constant between knots): at sim-grid
-    decision step t the signed book total must lie within [Min_Total, Max_Total] of the
-    rightmost knot with `Step <= t`. Absent → None (no corridor; today's behaviour).
-    Returns a sorted tuple of `(step, min_total, max_total)` with strictly ascending,
-    non-negative steps and Min_Total <= Max_Total per knot."""
-    raw = evaluator_config.get("Total_Position_Schedule")
-    if not raw:
-        return None
-    knots = sorted(
-        (int(k["Step"]), float(k["Min_Total"]), float(k["Max_Total"])) for k in raw)
-    if knots[0][0] < 0:
-        raise ValueError(
-            f"Total_Position_Schedule Step must be >= 0; got {knots[0][0]}")
-    for (a, _, _), (b, _, _) in zip(knots, knots[1:]):
-        if b <= a:
-            raise ValueError(
-                f"Total_Position_Schedule Steps must be strictly ascending; got {a} >= {b}")
-    for step, lo, hi in knots:
-        if lo > hi:
-            raise ValueError(
-                f"Total_Position_Schedule knot at Step {step}: Min_Total {lo} > Max_Total {hi}")
-    return tuple(knots)
-
-
-def _normalize_spot_price_history(
-    hedging_problem: Mapping[str, Any],
-    lookback: int,
-    referenced_commodities: tuple,
-) -> Dict[str, Dict[str, Any]]:
-    state = hedging_problem.get("Portfolio_State") or {}
-    raw_history = state.get("Spot_Price_History") or {}
-    # Spot_Price_History is OPTIONAL. Absent it, the utility scale falls back to the calibrated
-    # market data (hedge_bundle.Bundle._resolve_utility_scale) and the prefix no-ops, so return
-    # empty rather than demanding entries for every referenced commodity. A PARTIAL history (some
-    # but not all commodities) is still an error — that check stays below.
-    if not raw_history:
-        return {}
-    normalized: Dict[str, Dict[str, Any]] = {}
-    for commodity, payload in raw_history.items():
-        commodity_name = str(commodity)
-        dates_raw = payload.get("Dates", ())
-        prices_raw = payload.get("Prices", ())
-        if len(dates_raw) != len(prices_raw):
-            raise ValueError(
-                f"Spot_Price_History['{commodity_name}']: Dates and Prices must have equal length "
-                f"({len(dates_raw)} vs {len(prices_raw)})"
-            )
-        if len(dates_raw) < lookback:
-            raise ValueError(
-                f"Spot_Price_History['{commodity_name}']: needs at least "
-                f"History_Lookback_Business_Days={lookback} entries, got {len(dates_raw)}"
-            )
-        dates = tuple(dates_raw)
-        for i in range(1, len(dates)):
-            if dates[i] <= dates[i - 1]:
-                raise ValueError(
-                    f"Spot_Price_History['{commodity_name}']: Dates must be strictly ascending; "
-                    f"found {dates[i - 1]} >= {dates[i]} at index {i}"
-                )
-        prices = tuple(float(p) for p in prices_raw)
-        normalized[commodity_name] = {"dates": dates, "prices": prices}
-    missing = tuple(c for c in referenced_commodities if c not in normalized)
-    if missing:
-        raise ValueError(
-            f"Spot_Price_History missing entries for referenced commodities: {missing}"
-        )
-    if len(normalized) > 1:
-        commodity_names = list(normalized.keys())
-        ref_dates = normalized[commodity_names[0]]["dates"]
-        for other in commodity_names[1:]:
-            if normalized[other]["dates"] != ref_dates:
-                raise ValueError(
-                    f"Spot_Price_History['{other}'].Dates must match "
-                    f"Spot_Price_History['{commodity_names[0]}'].Dates exactly"
-                )
-    return normalized
-
-
-def _collect_referenced_commodities(stoch_factors: Optional[Mapping[Any, Any]]) -> tuple:
-    """Pull commodity names from the live CommodityPrice factors. Instruments populate
-    `stoch_factors` at construction (in `Calculation.calc_dependencies`); downstream
-    consumers read from there rather than re-parsing instrument JSON params."""
-    return tuple(dict.fromkeys(
-        utils.check_tuple_name(factor) for factor in (stoch_factors or {})
-        if factor.type == 'CommodityPrice'
-    ))
-
-
-def _normalize_portfolio_state(
-    hedging_problem: Mapping[str, Any],
-    *,
-    lookback: int,
-    referenced_commodities: tuple,
-) -> Dict[str, Any]:
-    state = hedging_problem.get("Portfolio_State") or {}
-    spot_history = _normalize_spot_price_history(hedging_problem, lookback, referenced_commodities)
-    return {
-        "positions": {str(name): float(value) for name, value in state.get("Positions", {}).items()},
-        "cash_balances": {str(name): float(value) for name, value in state.get("Cash_Balances", {}).items()},
-        "settlement_prices": {str(name): float(value) for name, value in state.get("Settlement_Prices", {}).items()},
-        "margin_balances": {str(name): float(value) for name, value in state.get("Margin_Balances", {}).items()},
-        "initial_margin": {
-            str(name): {"method": str(spec["Method"]), "amount": float(spec["Amount"])}
-            for name, spec in state.get("Initial_Margin", {}).items()
-        },
-        "spot_price_history": spot_history,
-    }
-
-
-def _normalize_instrument_metadata(
-    instrument_name: str,
-    tradable_entry: Mapping[str, Any],
-    *,
-    hedge_names: tuple,
-    cash_account_names: tuple,
-    liability_expiry: Any,
-) -> Dict[str, Any]:
-    params = tradable_entry["params"]
-    investment_horizon = params.get("Investment_Horizon")
-    maturity_date = params.get("Maturity_Date")
-    fallback = investment_horizon if investment_horizon is not None else liability_expiry
-    expiry_date = params.get("Expiry_Date", maturity_date if maturity_date is not None else fallback)
-    last_trade_date = params.get("Last_Trade_Date", maturity_date if maturity_date is not None else fallback)
-    return {
-        "name": str(instrument_name),
-        "deal_type": tradable_entry["deal_type"],
-        "is_hedge": instrument_name in hedge_names,
-        "is_cash_account": instrument_name in cash_account_names,
-        "currency": params.get("Currency"),
-        "last_trade_date": last_trade_date,
-        "expiry_date": expiry_date,
-        "first_notice_date": params.get("First_Notice_Date"),
-        "auto_close_days_before_last_trade": int(params.get("Auto_Close_Days_Before_Last_Trade", 0)),
-        "allow_new_positions_until_last_trade": params.get("Allow_New_Positions_Until_Last_Trade", "Yes") == "Yes",
-        "allow_holding_past_last_trade": params.get("Allow_Holding_Past_Last_Trade", "No") == "Yes",
-        "contract_size": float(params.get("Contract_Size", 1.0)),
-        "params": deepcopy(dict(params)),
-    }
+# Utility Objectives — the DP / value function lives in utility space and needs the scale c.
+_UTILITY_OBJECTS = ("asymmetricutility_symlog", "asymmetricutility_huber", "asymmetricutility_cara")
 
 
 def construct_hedge_runtime(
     config: Mapping[str, Any],
     stoch_factors: Optional[Mapping[Any, Any]] = None,
 ) -> Dict[str, Any]:
-    config = _unwrap_calc_config(config)
+    """The JSON → runtime boundary: read `Hedging_Problem`, validate it, and return the runtime
+    dict every consumer indexes directly. Nothing downstream re-validates."""
+    config = config if "Hedging_Problem" in config else config["Calc"]["Calculation"]
     hedging_problem = config["Hedging_Problem"]
     evaluator_config = hedging_problem["Evaluator"]
-    liabilities = _normalize_liabilities(hedging_problem)
     objective_config = hedging_problem.get("Objective")
     solver_config = hedging_problem.get("Solver")
-    tradables = _flatten_tradable_entries(hedging_problem["Tradable_Instruments"])
-    execution_mode = _normalize_execution_mode(config)
-    accounting_mode = _normalize_accounting_mode(evaluator_config)
-    cash_account_names = _normalize_cash_account_names(evaluator_config)
+    execution_mode = str(config.get("Execution_Mode", "simulate_only")).lower()
+
+    # --- instruments: the tradable universe splits into cash accounts and hedge legs ---
+    tradables = _flatten_deals(hedging_problem["Tradable_Instruments"])
+    if evaluator_config.get("Cash_Instruments") is not None:
+        cash_account_names = tuple(str(n) for n in evaluator_config["Cash_Instruments"])
+    elif evaluator_config.get("Cash_Accounts") is not None:
+        cash_account_names = tuple(str(n) for n in evaluator_config["Cash_Accounts"])
+    elif evaluator_config.get("Cash_Instrument") is not None:
+        cash_account_names = (str(evaluator_config["Cash_Instrument"]),)
+    else:
+        cash_account_names = ()
     for account_name in cash_account_names:
-        if str(account_name) not in tradables:
-            raise ValueError(f"Evaluator cash account '{account_name}' is not in Tradable_Instruments")
-    position_limits = _normalize_position_limits(evaluator_config)
-    scalar_spread_bps, spread_spec = _normalize_bid_offer_spread(evaluator_config)
-    hedge_names = tuple(
-        instrument_name
-        for instrument_name in tradables.keys()
-        if instrument_name not in cash_account_names
-    )
+        if account_name not in tradables:
+            raise ValueError(
+                f"Evaluator cash account '{account_name}' is not in Tradable_Instruments")
+    hedge_names = tuple(n for n in tradables if n not in cash_account_names)
     if not hedge_names:
         raise ValueError("no hedge instruments: Tradable_Instruments has only cash accounts")
+
+    # --- liabilities: the book being hedged; its latest expiry dates the hedge instruments ---
+    liabilities = {}
+    for name, entry in _flatten_deals(hedging_problem.get("Liabilities") or {}).items():
+        params = entry["params"]
+        liabilities[name] = {
+            "reference": name, "object": entry["deal_type"], "deal_type": entry["deal_type"],
+            "underlying": params.get("Underlying"), "currency": params.get("Currency"),
+            "strike": float(params.get("Strike", params.get("Strike_Price", 0.0))),
+            "quantity": float(params.get("Quantity", params.get("Units", 0.0))),
+            "expiry_date": params.get("Expiry_Date"), "params": deepcopy(dict(params))}
     liability_expiry = None
     for liability in liabilities.values():
-        expiry_date = liability.get("expiry_date")
-        if expiry_date is None:
-            continue
-        if liability_expiry is None or expiry_date > liability_expiry:
+        expiry_date = liability["expiry_date"]
+        if expiry_date is not None and (liability_expiry is None or expiry_date > liability_expiry):
             liability_expiry = expiry_date
     normalized_tradables = {
-        instrument_name: _normalize_instrument_metadata(
-            instrument_name,
-            tradable_entry,
-            hedge_names=hedge_names,
-            cash_account_names=cash_account_names,
-            liability_expiry=liability_expiry,
-        )
-        for instrument_name, tradable_entry in tradables.items()
-    }
+        name: _instrument_metadata(name, entry, hedge_names=hedge_names,
+                                   cash_account_names=cash_account_names,
+                                   liability_expiry=liability_expiry)
+        for name, entry in tradables.items()}
+
     if execution_mode == "solve_hedge":
         if solver_config is None:
             raise ValueError("Execution_Mode 'solve_hedge' requires Hedging_Problem['Solver']")
         if str(config.get("Inner_MC_Enabled", "No")) != "Yes":
             raise ValueError("Execution_Mode 'solve_hedge' requires Inner_MC_Enabled='Yes'")
-        solver_object = str(solver_config.get("Object", "")).lower()
-        min_inner = 2 if solver_object == "diffsolverv2" else 128
+        min_inner = 2 if str(solver_config.get("Object", "")).lower() == "diffsolverv2" else 128
         if int(config.get("Inner_Sub_Batch", 0)) < min_inner:
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires Inner_Sub_Batch >= "
                 f"{min_inner} for Solver.Object={solver_config.get('Object')!r}")
-        _utility_objects = ("asymmetricutility_symlog", "asymmetricutility_huber",
-                            "asymmetricutility_cara")
-        if str((objective_config or {}).get("Object", "")).lower() not in _utility_objects:
+        if str((objective_config or {}).get("Object", "")).lower() not in _UTILITY_OBJECTS:
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires a utility Objective.Object — one of "
                 "'AsymmetricUtility_Symlog' | 'AsymmetricUtility_Huber' | 'AsymmetricUtility_CARA'. "
                 "The DP recursion lives in utility space: an identity (legacy) objective leaves "
                 "V-hat unbounded in dollars and the backward sweep blows up multiplicatively.")
-    names = {
-        "tradables": tuple(normalized_tradables.keys()),
-        "hedges": hedge_names,
-        "cash_accounts": cash_account_names,
-        # The tradable hedge instruments (cash accounts excluded) are the action set; the
-        # differential-ML solver builds its own action grid over them.
-        "action_instruments": hedge_names,
-        "liabilities": tuple(liabilities.keys()),
-    }
+
     history_lookback = int(hedging_problem.get("History_Lookback_Business_Days", 30))
     if history_lookback < 0:
         raise ValueError("Hedging_Problem.History_Lookback_Business_Days must be non-negative")
-    referenced_commodities = _collect_referenced_commodities(stoch_factors)
-    runtime = {
+    # Commodity names come from the live CommodityPrice factors the instruments created at
+    # calc-dependency time — never re-parsed out of instrument JSON params.
+    referenced_commodities = tuple(dict.fromkeys(
+        utils.check_tuple_name(factor) for factor in (stoch_factors or {})
+        if factor.type == 'CommodityPrice'))
+    portfolio_state = hedging_problem.get("Portfolio_State") or {}
+    scalar_spread_bps, spread_spec = _bid_offer_spread(evaluator_config)
+    # Static instrument→cash_account routing by currency: the first cash account whose currency
+    # matches wins, else the first account. Computed once; the env step loop reads it per step.
+    account_by_currency = {}
+    for account_name in cash_account_names:
+        account_by_currency.setdefault(
+            normalized_tradables[account_name]["currency"], account_name)
+    fallback_account = cash_account_names[0] if cash_account_names else None
+
+    return {
         "execution_mode": execution_mode,
-        "accounting_mode": accounting_mode,
-        "names": names,
+        "accounting_mode": str(evaluator_config.get("Accounting_Mode", "futures")).lower(),
+        "names": {
+            "tradables": tuple(normalized_tradables),
+            "hedges": hedge_names,
+            "cash_accounts": cash_account_names,
+            # The hedge legs ARE the action set; the solver builds its action grid over them.
+            "action_instruments": hedge_names,
+            "liabilities": tuple(liabilities),
+        },
         "referenced_commodities": referenced_commodities,
         "tradables": normalized_tradables,
         "liabilities": liabilities,
-        "objective": _normalize_objective_config(objective_config),
+        "objective": None if objective_config is None else {
+            # Canonical lowercased form — every dispatch site compares against the lowercase
+            # literal, so normalize once here rather than re-lowercasing on every reward call.
+            "object": str(objective_config["Object"]).lower(),
+            # Utility-transform scale. Consumed by any utility Object (Symlog / Huber / CARA);
+            # the identity path ignores it. `utility_scale` is mirrored in from the bundle's
+            # resolved c (hedge_bundle.Bundle.mirror_utility_scale).
+            "utility_scale_mode":
+                str(objective_config.get("Utility_Scale_Mode", "vol_scaled_notional")).lower(),
+            "utility_scale_explicit":
+                (None if objective_config.get("Utility_Scale_Explicit") is None
+                 else float(objective_config["Utility_Scale_Explicit"])),
+            # Utility SHAPE params (DIMENSIONLESS, in units of c — applied to x = W/c). Huber:
+            # linear gains, quadratic small losses with curvature `huber_aversion`, linear deep
+            # tail beyond the knee `huber_delta`. CARA: u = (1−e^{−γx})/γ. Symlog ignores all
+            # three. See hedge_bundle._utility_wrap_signed for the exact forms.
+            "huber_aversion": float(objective_config.get("Huber_Aversion", 2.5)),
+            "huber_delta": float(objective_config.get("Huber_Delta", 1.0)),
+            "cara_gamma": float(objective_config.get("CARA_Gamma", 1.0)),
+        },
         "policy": None,
         "optimizer": None,
-        "solver": _normalize_solver_config(solver_config),
+        "solver": _solver_config(solver_config),
         "history_lookback_business_days": history_lookback,
-        "portfolio_state": _normalize_portfolio_state(
-            hedging_problem,
-            lookback=history_lookback,
-            referenced_commodities=referenced_commodities,
-        ),
+        "portfolio_state": {
+            "positions": {str(n): float(v)
+                          for n, v in portfolio_state.get("Positions", {}).items()},
+            "cash_balances": {str(n): float(v)
+                              for n, v in portfolio_state.get("Cash_Balances", {}).items()},
+            "settlement_prices": {str(n): float(v)
+                                  for n, v in portfolio_state.get("Settlement_Prices", {}).items()},
+            "margin_balances": {str(n): float(v)
+                                for n, v in portfolio_state.get("Margin_Balances", {}).items()},
+            "initial_margin": {
+                str(n): {"method": str(spec["Method"]), "amount": float(spec["Amount"])}
+                for n, spec in portfolio_state.get("Initial_Margin", {}).items()},
+            "spot_price_history": _spot_price_history(
+                hedging_problem, history_lookback, referenced_commodities),
+        },
         "accounting": {
-            "position_limits": position_limits,
-            "cash_accounts": {
-                account_name: {
-                    "currency": normalized_tradables[account_name]["currency"],
-                }
-                for account_name in cash_account_names
-            },
-            # Precomputed instrument→cash_account routing by currency match. Avoids
-            # per-step rebuild in env loops; static for the lifetime of the runtime.
-            "instrument_to_cash_account": _build_instrument_cash_account_map(
-                normalized_tradables, cash_account_names),
-            "transaction_cost_per_unit": float(evaluator_config.get("Transaction_Cost_Per_Unit", 0.0)),
+            "position_limits": {
+                str(n): {"min_position": int(limit["Min_Position"]),
+                         "max_position": int(limit["Max_Position"])}
+                for n, limit in evaluator_config.get("Position_Limits", {}).items()},
+            "cash_accounts": {n: {"currency": normalized_tradables[n]["currency"]}
+                              for n in cash_account_names},
+            "instrument_to_cash_account": {
+                n: account_by_currency.get(meta["currency"], fallback_account)
+                for n, meta in normalized_tradables.items()},
+            "transaction_cost_per_unit":
+                float(evaluator_config.get("Transaction_Cost_Per_Unit", 0.0)),
             # Scalar half-spread bps (fast-path + diagnostic display); `spec` is None for a scalar
-            # Bid_Offer_Spread_Bps (bit-identical) and a normalized per-instrument/vol-scale dict
-            # otherwise — resolved in `per_contract_kappa`.
+            # Bid_Offer_Spread_Bps and a normalized per-instrument/vol-scale dict otherwise —
+            # resolved in `per_contract_kappa`.
             "bid_offer_spread_bps": scalar_spread_bps,
             "bid_offer_spread_spec": spread_spec,
             # Roll-as-calendar-spread: when a rebalance offsets Δq across adjacent maturities, the
             # matched quantity pays a single calendar half-cost instead of two outright half-spreads
-            # (realized accounting only — see hedge_bundle._roll_rebate). Default off ⇒ bit-identical.
-            "roll_as_calendar_spread": evaluator_config.get("Roll_As_Calendar_Spread", "No") == "Yes",
+            # (realized accounting only — see hedge_bundle._roll_rebate). Default off.
+            "roll_as_calendar_spread":
+                evaluator_config.get("Roll_As_Calendar_Spread", "No") == "Yes",
             "calendar_spread_bps": (float(evaluator_config["Calendar_Spread_Bps"])
-                                    if evaluator_config.get("Calendar_Spread_Bps") is not None else None),
+                                    if evaluator_config.get("Calendar_Spread_Bps") is not None
+                                    else None),
             # Vol-linked initial-margin FUNDING charge on the post-trade book (realized accounting
             # only — see hedge_bundle._im_funding_charge). Per hedge leg i at step t the desk posts
             # IM_i = IM_Vol_Multiplier·(σ_t/IM_Ref_Vol)·F_i·|q_i^post|·cs_i and pays
             # IM_Funding_Spread_Bps·1e-4·dt to FUND it over the calendar step (above the risk-free
-            # the margin ledger already earns). IM_Funding_Spread_Bps default 0.0 ⇒ the term is
-            # exactly 0 and never executes ⇒ bit-identical. IM_Ref_Vol default 1.0 is inert (only
-            # divided when the spread is on, at which point the calibration sets all three knobs).
+            # the margin ledger already earns). Spread default 0.0 ⇒ the term is exactly 0 and never
+            # executes; IM_Ref_Vol default 1.0 is inert (only divided when the spread is on).
             "im_funding_spread_bps": float(evaluator_config.get("IM_Funding_Spread_Bps", 0.0)),
             "im_vol_multiplier": float(evaluator_config.get("IM_Vol_Multiplier", 0.0)),
             "im_ref_vol": float(evaluator_config.get("IM_Ref_Vol", 1.0)),
             "force_flat_at_end": evaluator_config.get("Force_Flat_At_End", "Yes") == "Yes",
-            "total_position_abs_limit": float(evaluator_config.get("Total_Position_Abs_Limit", 0.0)),
-            "total_position_schedule": _normalize_total_position_schedule(evaluator_config),
+            "total_position_abs_limit":
+                float(evaluator_config.get("Total_Position_Abs_Limit", 0.0)),
+            "total_position_schedule": _position_schedule(evaluator_config),
         },
+        "privileged_layout": derive_privileged_layout(stoch_factors),
     }
-    runtime["privileged_layout"] = derive_privileged_layout(stoch_factors)
-    return runtime
 
 
 def per_contract_kappa(runtime, price, name, vol=None):
@@ -561,7 +477,7 @@ def per_contract_kappa(runtime, price, name, vol=None):
     vol-independent, bit-identical to the scalar behaviour."""
     acc = runtime["accounting"]
     contract_size = float(runtime["tradables"][name]["contract_size"])
-    spec = acc.get("bid_offer_spread_spec")
+    spec = acc["bid_offer_spread_spec"]
     if spec is None:
         half_bps = acc["bid_offer_spread_bps"]
     else:
@@ -584,7 +500,7 @@ def initial_q_from_runtime(runtime, batch, device):
     turnover diagnostics + the rolled P&L, never the fitted value. If turnover cost ever
     becomes material to the objective, the incoming position becomes a genuine state
     variable and `q_prev` must move into the value-function state (V(market, W, q))."""
-    positions = (runtime.get("portfolio_state") or {}).get("positions") or {}
+    positions = runtime["portfolio_state"]["positions"]
     hedges = runtime["names"]["hedges"]
     q0 = torch.tensor([float(positions.get(str(h), 0.0)) for h in hedges], device=device)
     return q0.unsqueeze(0).expand(batch, len(hedges)).contiguous()

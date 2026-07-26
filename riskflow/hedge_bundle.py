@@ -25,9 +25,7 @@ import pandas as pd
 import torch
 
 from . import utils
-from .hedge_runtime import (
-    assemble_privileged_factors, per_contract_kappa, _privileged_multi, _privileged_name,
-)
+from .hedge_runtime import assemble_privileged_factors, per_contract_kappa, privileged_block
 
 
 # Rolling window (business days) for the realized-vol series feeding the symlog utility scale
@@ -632,15 +630,11 @@ class Bundle:
         im_funding_active = bool(acc['im_funding_spread_bps'])
         if not (vol_scale_active or im_funding_active):
             return None
-        multi = _privileged_multi(stoch_factors)
-        for factor, proc in (stoch_factors or {}).items():
-            if 'log_h' not in type(proc).privileged_layout(proc.param):
-                continue
-            block = self.privileged_factors.get(_privileged_name(factor.name[0], 'log_h', multi))
-            if block is not None:
-                logging.info('step_annual_vol source: revealed %s log_h (Vol_Scale=%s IM_funding=%s)',
-                             factor.name[0], vol_scale_active, im_funding_active)
-                return proc.revealed_annual_vol(block[..., 0]).mean(dim=-1)             # (T,)
+        factor, proc, block = privileged_block(self.privileged_factors, stoch_factors, 'log_h')
+        if block is not None:
+            logging.info('step_annual_vol source: revealed %s log_h (Vol_Scale=%s IM_funding=%s)',
+                         factor.name[0], vol_scale_active, im_funding_active)
+            return proc.revealed_annual_vol(block[..., 0]).mean(dim=-1)                 # (T,)
         commodity = next((c for c in runtime['referenced_commodities'] if c in self.factors), None)
         if commodity is None:
             return None

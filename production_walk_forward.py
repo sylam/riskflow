@@ -89,7 +89,7 @@ SOFR_PREFIX = 'InterestRate.USD-SOFR'
 
 # validated objective (matches artifacts/platinum_hedge_shipping.json)
 OBJECTIVE = {'Object': 'AsymmetricUtility_Huber', 'Huber_Aversion': 6.0, 'Huber_Delta': 1.0}
-# _normalize_objective_config consumes only Object/Huber_*/CARA_Gamma/Utility_Scale_*.
+# construct_hedge_runtime consumes only Object/Huber_*/CARA_Gamma/Utility_Scale_*.
 
 
 def _ts(d):

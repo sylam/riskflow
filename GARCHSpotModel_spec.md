@@ -232,7 +232,7 @@ the GARCH primary sorts first in a cross-market strip exactly as the HMM did.
 The V̂ deep-state market block sizes itself off `privileged_layout`, so the market input
 width changes from `n_states(=3 belief) + price` to `1(log h) + price`. No solver code
 changes; the smoke test (§6.7) asserts the width and that checkpoints stamp the new
-recipe hash (`_config_hash` covers it via the solver cfg — world changes flow through
+recipe hash (`DiffSolverV2._config_hash` covers it via the solver cfg — world changes flow through
 the corridor/provenance checks already in place).
 
 ## 5. `GARCHSpotCalibration`
