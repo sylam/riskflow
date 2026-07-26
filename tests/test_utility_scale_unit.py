@@ -1,106 +1,116 @@
-"""Utility-scale plumbing tests: _mirror_utility_scale_to_runtime, resolve_utility_scale,
-and _utility_wrap_signed's fail-loud missing-scale contract."""
+"""Utility-scale plumbing tests: the frame stage that resolves + LOCKS c onto the runtime
+(`Bundle._resolve_frame`), the fail-loud degeneracies of `Bundle._resolve_utility_scale`, and
+`_utility_wrap_signed`'s fail-loud missing-scale contract."""
+import math
 import os
 import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from riskflow.hedge_bundle import (
-    _mirror_utility_scale_to_runtime, _utility_wrap_signed, resolve_utility_scale)
+from riskflow.hedge_bundle import Bundle, _utility_wrap_signed
 
 
-def make_identity_runtime():
-    return {"objective": {"object": "terminalvalue", "utility_scale": 1.0e6}}
+def frame_runtime(objective):
+    """The minimal runtime `Bundle._resolve_frame` reads: an objective, the accounting switches
+    that gate the vol series, and the referenced-commodity set."""
+    return {'objective': objective,
+            'accounting': {'bid_offer_spread_spec': None, 'im_funding_spread_bps': 0.0},
+            'referenced_commodities': ()}
 
 
-def test_mirror_utility_scale_identity_safe():
-    """Mirroring utility_scale onto a non-utility runtime caches the value but the identity
-    objective stays identity — the utility gate is False regardless of the cached scale."""
-    runtime = make_identity_runtime()
-    bundle = {"utility_scale": 9.99e9}
-    _mirror_utility_scale_to_runtime(bundle, runtime)
-    assert runtime["objective"]["utility_scale"] == 9.99e9
-    x = torch.tensor([1.0e6])
-    assert _utility_wrap_signed(x, runtime).item() == 1.0e6  # identity path (non-utility Object)
+def test_frame_locks_and_mirrors_the_utility_scale():
+    """The frame stage resolves c ONCE and mirrors it onto the runtime objective — that mirrored
+    number is what every reward/penalty divides by, so the transform must agree with the bundle."""
+    runtime = frame_runtime({'object': 'asymmetricutility_symlog',
+                             'utility_scale_explicit': 5.0e6})
+    bundle = Bundle()
+    bundle._resolve_frame(runtime, {})
+    assert bundle.utility_scale == 5.0e6
+    assert runtime['objective']['utility_scale'] == 5.0e6
+    u = float(_utility_wrap_signed(torch.tensor([5.0e6]), runtime).item())
+    assert abs(u - math.log1p(1.0)) < 1e-6, u        # x = W/c = 1 → log1p(1)
 
 
-def test_mirror_runtime_no_objective():
-    """Mirror gracefully no-ops when runtime has no objective dict."""
-    runtime = {"objective": None}
-    _mirror_utility_scale_to_runtime({"utility_scale": 1.0e6}, runtime)
-    assert runtime["objective"] is None
+def test_frame_mirror_identity_objective_stays_identity():
+    """Mirroring onto a non-utility (legacy) objective caches the harmless $1k floor but the
+    identity path stays identity regardless of the cached scale."""
+    runtime = frame_runtime({'object': 'terminalvalue'})
+    bundle = Bundle()
+    bundle._resolve_frame(runtime, {})
+    assert bundle.utility_scale == 1.0e3
+    assert runtime['objective']['utility_scale'] == 1.0e3
+    assert _utility_wrap_signed(torch.tensor([1.0e6]), runtime).item() == 1.0e6
 
 
-def test_mirror_bundle_no_utility_scale():
-    """Mirror gracefully no-ops when bundle has no utility_scale (cached pre-change bundle)."""
-    runtime = make_identity_runtime()
-    saved = runtime["objective"]["utility_scale"]
-    _mirror_utility_scale_to_runtime({}, runtime)
-    assert runtime["objective"]["utility_scale"] == saved
+def test_frame_mirror_no_objective():
+    """A runtime with no Objective block (simulate_only) resolves the floor and skips the
+    mirror rather than blowing up."""
+    runtime = frame_runtime(None)
+    bundle = Bundle()
+    bundle._resolve_frame(runtime, {})
+    assert bundle.utility_scale == 1.0e3
+    assert runtime['objective'] is None
+    assert _utility_wrap_signed(torch.tensor([1.0e6]), runtime).item() == 1.0e6
 
 
 def test_resolve_utility_scale_fails_loud_on_symlog_degeneracies():
-    """Each silent-degrade path in resolve_utility_scale must raise under a utility
-    objective (a $1k floor silently breaks tail compression); the identity path returns the floor."""
-    def runtime_with_object(obj_name, **objective_extras):
-        return {'objective': {'object': obj_name, **objective_extras},
-                'history_lookback_business_days': 0}
-
-    sym = lambda **kw: runtime_with_object('asymmetricutility_symlog', **kw)
-    identity = lambda **kw: runtime_with_object('terminalvalue', **kw)
+    """Each silent-degrade path must raise under a utility objective (a $1k floor silently
+    breaks tail compression); the identity path returns the floor."""
+    sym = lambda **kw: {'objective': {'object': 'asymmetricutility_symlog', **kw}}
+    identity = lambda **kw: {'objective': {'object': 'terminalvalue', **kw}}
 
     # Path 1: last_settlement_index missing
-    bundle = {'total_leg_volume': 2500.0, 'spot_price_history': {}, 'spot_realized_vol': {}}
+    bundle = Bundle()
+    bundle.total_leg_volume = 2500.0
     try:
-        resolve_utility_scale(bundle, sym())
+        bundle._resolve_utility_scale(sym())
         raise AssertionError("symlog should raise on missing last_settlement_index")
     except ValueError as e:
         assert 'last_settlement_index' in str(e), e
-    assert resolve_utility_scale(bundle, identity()) == 1.0e3
+    assert bundle._resolve_utility_scale(identity()) == 1.0e3
 
-    # Path 2: empty spot_price_history
-    bundle = {'last_settlement_index': 200, 'total_leg_volume': 2500.0,
-              'spot_price_history': {}, 'spot_realized_vol': {}}
+    # Path 2: empty spot_price_history (and no calibrated fallback)
+    bundle.last_settlement_index = 200
     try:
-        resolve_utility_scale(bundle, sym())
+        bundle._resolve_utility_scale(sym())
         raise AssertionError("symlog should raise on empty spot_price_history")
     except ValueError as e:
         assert 'spot_price_history' in str(e), e
-    assert resolve_utility_scale(bundle, identity()) == 1.0e3
+    assert bundle._resolve_utility_scale(identity()) == 1.0e3
 
     # Path 3: zero total_leg_volume
-    bundle = {'last_settlement_index': 200, 'total_leg_volume': 0.0,
-              'spot_price_history': {'CommodityPrice.X': torch.zeros(1)},
-              'spot_realized_vol': {}}
+    bundle.spot_price_history = {'CommodityPrice.X': torch.zeros(1)}
+    bundle.total_leg_volume = 0.0
     try:
-        resolve_utility_scale(bundle, sym())
+        bundle._resolve_utility_scale(sym())
         raise AssertionError("symlog should raise on zero total_leg_volume")
     except ValueError as e:
         assert 'total_leg_volume' in str(e), e
-    assert resolve_utility_scale(bundle, identity()) == 1.0e3
+    assert bundle._resolve_utility_scale(identity()) == 1.0e3
 
     # Explicit override always honored (no degeneracy check fires).
-    assert resolve_utility_scale({}, sym(utility_scale_explicit=5_000_000.0)) == 5_000_000.0
-    assert resolve_utility_scale({}, identity(utility_scale_explicit=5_000_000.0)) == 5_000_000.0
+    assert Bundle()._resolve_utility_scale(sym(utility_scale_explicit=5_000_000.0)) == 5_000_000.0
+    assert Bundle()._resolve_utility_scale(identity(utility_scale_explicit=5_000_000.0)) == 5_000_000.0
 
 
 def test_unknown_utility_scale_mode_fails_loud():
     """Typo in Utility_Scale_Mode raises with a message naming the typo'd value."""
-    bundle = {'last_settlement_index': 200, 'total_leg_volume': 2500.0,
-              'spot_price_history': {}, 'spot_realized_vol': {}}
-    runtime = {'objective': {'utility_scale_mode': 'vol_scled_notional'},  # typo
-               'history_lookback_business_days': 0}
+    bundle = Bundle()
+    bundle.last_settlement_index = 200
+    bundle.total_leg_volume = 2500.0
+    runtime = {'objective': {'utility_scale_mode': 'vol_scled_notional'}}      # typo
     try:
-        resolve_utility_scale(bundle, runtime)
+        bundle._resolve_utility_scale(runtime)
     except ValueError as e:
         assert 'vol_scled_notional' in str(e) and 'Supported modes' in str(e), e
     else:
-        raise AssertionError("resolve_utility_scale should have raised on unknown mode")
+        raise AssertionError("_resolve_utility_scale should have raised on unknown mode")
     runtime['objective']['utility_scale_mode'] = 'vol_scaled_notional'
-    resolve_utility_scale(bundle, runtime)
+    bundle._resolve_utility_scale(runtime)
     del runtime['objective']['utility_scale_mode']
-    resolve_utility_scale(bundle, runtime)
+    bundle._resolve_utility_scale(runtime)
 
 
 def test_utility_missing_scale_fails_loud():

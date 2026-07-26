@@ -62,8 +62,7 @@ import riskflow as rf
 from riskflow import utils
 from riskflow.hedge_runtime import construct_hedge_runtime, per_contract_kappa
 from riskflow.hedge_bundle import (
-    BundleStepper, _roll_rebate, _realized_vol_series, _build_step_annual_vol,
-    _im_funding_charge, _calendar_dt, _diag_expand_per_day, _daily_growth_factors,
+    Bundle, BundleStepper, _roll_rebate, _realized_vol_series, _im_funding_charge,
 )
 from riskflow.stochasticprocess import GARCHSpotModel, StochasticProcess
 
@@ -171,21 +170,22 @@ def test_realized_vol_proxy_series_annualizes_mark_path():
     assert float(rv[-1]) == pytest.approx((252.0 ** 0.5) * move, rel=1e-3)
 
 
-def test_build_step_annual_vol_gated_on_vol_scale():
+def test_step_vol_gated_on_vol_scale():
     """The bundle vol series is built ONLY when a Vol_Scale spec is configured (None otherwise,
     so per_contract_kappa stays vol-independent); the realized-proxy branch fires off the primary
     spot factor when no process reveals a log-variance."""
-    factors = {'CommodityPrice.X': (100.0 * torch.exp(0.01 * torch.arange(40.0))).unsqueeze(-1).expand(-1, 4)}
-    bundle = {'factors': factors}
+    bundle = Bundle()
+    bundle.factors = {'CommodityPrice.X':
+                      (100.0 * torch.exp(0.01 * torch.arange(40.0))).unsqueeze(-1).expand(-1, 4)}
     # No Vol_Scale -> None.
     rt_off = _runtime({'Bid_Offer_Spread_Bps': {'Default_Bps': 10.0}})
     rt_off = {**rt_off, 'referenced_commodities': ('CommodityPrice.X',)}
-    assert _build_step_annual_vol(bundle, rt_off, {}) is None
+    assert bundle._resolve_step_vol(rt_off, {}) is None
     # Vol_Scale + no revealed log_h -> realized proxy off the factor path.
     rt_on = _runtime({'Bid_Offer_Spread_Bps': {
         'Default_Bps': 10.0, 'Vol_Scale': {'Ref_Vol': 0.25, 'Beta': 1.0}}})
     rt_on = {**rt_on, 'referenced_commodities': ('CommodityPrice.X',)}
-    series = _build_step_annual_vol(bundle, rt_on, {})
+    series = bundle._resolve_step_vol(rt_on, {})
     assert series is not None and series.shape == (40,)
     assert (series > 0).all()
 
@@ -273,10 +273,10 @@ def test_im_funding_debits_realized_wealth_by_exactly_the_step_charge():
     so the margin-account delta gap is −Σ_i funding_i EXACTLY — the same realized channel
     transaction cost debits through, and `_im_funding_charge` reproduces it to the cent."""
     bundle, runtime = _im_fixture(spread_bps=250.0)
-    assert bundle['step_annual_vol'] is not None
+    assert bundle.step_annual_vol is not None
     hedges = list(runtime['names']['hedges'])
     acct = runtime['accounting']['instrument_to_cash_account'][hedges[0]]
-    days, last = bundle['time_grid_days_cpu'], len(bundle['time_grid_days_cpu']) - 1
+    days, last = bundle.time_grid_days_cpu, len(bundle.time_grid_days_cpu) - 1
 
     rt_off = copy.deepcopy(runtime)
     rt_off['accounting']['im_funding_spread_bps'] = 0.0    # in-code switch OFF (JSON is the contract)
@@ -292,7 +292,7 @@ def test_im_funding_debits_realized_wealth_by_exactly_the_step_charge():
             sA.step(act)
             sB.step(act)
             pos_post = {h: sA._state['positions'][h].clone() for h in hedges}
-            vol_t = bundle['step_annual_vol'][t]
+            vol_t = bundle.step_annual_vol[t]
             dt = (days[min(t + 1, last)] - days[t]) / 365.25
             expected = sum(_im_funding_charge(pos_post, prices, runtime, vol_t, dt).values())
             gap = ((sA._state['margin_accounts'][acct] - before_a)
@@ -314,7 +314,7 @@ def test_im_funding_reduces_terminal_wealth_by_compounded_sum_funding():
     bundle, runtime = _im_fixture(spread_bps=250.0, force_flat='No')
     hedges = list(runtime['names']['hedges'])
     acct = runtime['accounting']['instrument_to_cash_account'][hedges[0]]
-    days, last = bundle['time_grid_days_cpu'], len(bundle['time_grid_days_cpu']) - 1
+    days, last = bundle.time_grid_days_cpu, len(bundle.time_grid_days_cpu) - 1
 
     rt_off = copy.deepcopy(runtime)
     rt_off['accounting']['im_funding_spread_bps'] = 0.0
@@ -329,11 +329,11 @@ def test_im_funding_reduces_terminal_wealth_by_compounded_sum_funding():
         sA.step(act)
         sB.step(act)
         pos_post = {h: sA._state['positions'][h].clone() for h in hedges}
-        vol_t = bundle['step_annual_vol'][t]
+        vol_t = bundle.step_annual_vol[t]
         dt = (days[min(t + 1, last)] - days[t]) / 365.25
         funding_t = sum(_im_funding_charge(pos_post, prices, runtime, vol_t, dt).values())
         # env compounds the whole margin (incl. prior funding) at step start, THEN debits funding_t.
-        g = _daily_growth_factors(bundle, runtime, t, min(t + 1, last)).get(acct)
+        g = sA._growth_factors(t, min(t + 1, last)).get(acct)
         acc = acc * (g if g is not None else 1.0) - funding_t
     pnl_a = sA._terminal_transition['pnl_excess']
     pnl_b = sB._terminal_transition['pnl_excess']
@@ -457,8 +457,8 @@ def _garch(param=None):
     return proc
 
 
-def test_build_step_annual_vol_uses_revealed_garch_log_h_and_logs_it():
-    """A GARCH world publishes a revealed log h_t: `_build_step_annual_vol` MUST take the revealed
+def test_step_vol_uses_revealed_garch_log_h_and_logs_it():
+    """A GARCH world publishes a revealed log h_t: `Bundle._resolve_step_vol` MUST take the revealed
     branch (σ_t=√(exp(log h_t)/dt_c)), NOT the realized-vol proxy — a silent proxy fallback under a
     GARCH retrain would invalidate the whole vol coupling. Pinned: the series equals the revealed
     conditional vol, differs from the realized proxy, is index-aligned with the price grid, and the
@@ -469,14 +469,15 @@ def test_build_step_annual_vol_uses_revealed_garch_log_h_and_logs_it():
     log_var = torch.linspace(5.0e-4, 1.5e-3, T).view(T, 1, 1).expand(T, B, 1).contiguous()
     log_h = log_var.log()                                       # revealed log-variance surface (T,B,1)
     spot = (100.0 * torch.exp(0.02 * torch.arange(T, dtype=torch.float32))).unsqueeze(-1).expand(T, B)
-    bundle = {'privileged_factors': {'log_h': log_h},
-              'factors': {'CommodityPrice.PLAT': spot.contiguous()}}
+    bundle = Bundle()
+    bundle.privileged_factors = {'log_h': log_h}
+    bundle.factors = {'CommodityPrice.PLAT': spot.contiguous()}
     rt = _runtime({'Bid_Offer_Spread_Bps': {
         'Default_Bps': 10.0, 'Vol_Scale': {'Ref_Vol': 0.25, 'Beta': 1.0}}})
     rt = {**rt, 'referenced_commodities': ('CommodityPrice.PLAT',)}
 
     with _capture_root_info() as recs:
-        series = _build_step_annual_vol(bundle, rt, {factor: proc})
+        series = bundle._resolve_step_vol(rt, {factor: proc})
 
     expected = proc.revealed_annual_vol(log_h[..., 0]).mean(dim=-1)         # (T,) revealed branch
     assert series.shape == (T,)                                             # index-aligned w/ grid
@@ -488,16 +489,17 @@ def test_build_step_annual_vol_uses_revealed_garch_log_h_and_logs_it():
     assert 'step_annual_vol source: revealed' in msg and 'log_h' in msg and 'PLAT' in msg
 
 
-def test_build_step_annual_vol_is_built_for_im_funding_without_vol_scale():
+def test_step_vol_is_built_for_im_funding_without_vol_scale():
     """IM funding alone (no Vol_Scale spread spec) still needs σ_t, so the series is built and the
     source logged — the realized-vol proxy here, off the primary spot factor."""
-    factors = {'CommodityPrice.X': (100.0 * torch.exp(0.01 * torch.arange(30.0))).unsqueeze(-1).expand(-1, 4)}
-    bundle = {'factors': factors}
+    bundle = Bundle()
+    bundle.factors = {'CommodityPrice.X':
+                      (100.0 * torch.exp(0.01 * torch.arange(30.0))).unsqueeze(-1).expand(-1, 4)}
     rt = _im_rt(spread_bps=40.0)                                # scalar spread ⇒ spec None, no Vol_Scale
     rt = {**rt, 'referenced_commodities': ('CommodityPrice.X',)}
     assert rt['accounting']['bid_offer_spread_spec'] is None
     with _capture_root_info() as recs:
-        series = _build_step_annual_vol(bundle, rt, {})
+        series = bundle._resolve_step_vol(rt, {})
     assert series is not None and series.shape == (30,)
     assert 'realized-vol proxy on CommodityPrice.X' in ' '.join(recs)
 
@@ -517,30 +519,14 @@ def _vol_scale_fixture(default_bps=12.0, ref_vol=0.25, beta=1.0, m1_bps=8.0):
     return result.bundle, result.runtime
 
 
-def _rollout_of(stepper):
-    """The recorded-trajectory dict `_diag_expand_per_day` consumes (mirrors
-    BundleStepper.write_diagnostic_csvs' assembly)."""
-    order = stepper._instrument_order
-    tt = stepper._terminal_transition
-    return {
-        'times': stepper._times,
-        'position': {n: torch.stack(stepper._position_history[n], dim=0) for n in order},
-        'trade': {n: torch.stack(stepper._trade_history[n], dim=0) for n in order},
-        'price': {n: torch.stack(stepper._price_history[n], dim=0) for n in order},
-        'pnl_excess': tt['pnl_excess'].detach().cpu(),
-        'liability': tt['liability_value'].detach().cpu(),
-        'net_pnl': (tt['pnl_excess'] + tt['liability_value']).detach().cpu(),
-    }
-
-
 def test_diagnostic_reconstructed_cost_reconciles_with_realized_vol_scaled_debit():
-    """Under an active Vol_Scale, the diagnostic CSV reconstruction (`_diag_expand_per_day`) must
+    """Under an active Vol_Scale, the diagnostic CSV reconstruction (`BundleStepper._diag_fields`) must
     charge the SAME vol-scaled kappa as the realized env debit. At a decision step: (a) the
     per-instrument reconstructed `trade_cost` equals the vol-scaled per-step formula and DIFFERS
     from the old vol=None reconstruction; (b) their sum equals the realized margin cost isolated by
     a zero-spread twin stepper."""
     bundle, runtime = _vol_scale_fixture()
-    assert bundle['step_annual_vol'] is not None
+    assert bundle.step_annual_vol is not None
     hedges = list(runtime['names']['hedges'])
     acct = runtime['accounting']['instrument_to_cash_account'][hedges[0]]
 
@@ -556,7 +542,7 @@ def test_diagnostic_reconstructed_cost_reconciles_with_realized_vol_scaled_debit
     t0 = None
     realized_cost = None
     while not sA.done:
-        warm = sA.is_decision_step and float(bundle['step_annual_vol'][sA.time_index]) > 0.1
+        warm = sA.is_decision_step and float(bundle.step_annual_vol[sA.time_index]) > 0.1
         if warm and t0 is None:
             t0 = sA.time_index
             before_a = sA._state['margin_accounts'][acct].clone()
@@ -570,9 +556,9 @@ def test_diagnostic_reconstructed_cost_reconciles_with_realized_vol_scaled_debit
             sA.step(None)
             sB.step(None)
     assert t0 is not None
-    fields = _diag_expand_per_day(_rollout_of(sA), bundle, runtime)     # per_instr fields are on CPU
+    fields = sA._diag_fields()                                         # per_instr fields are on CPU
 
-    vol_t = bundle['step_annual_vol'][t0].detach().cpu()
+    vol_t = bundle.step_annual_vol[t0].detach().cpu()
     recon_sum = torch.zeros_like(realized_cost)
     for h in hedges:
         p = fields['per_instr'][h]

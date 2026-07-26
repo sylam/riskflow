@@ -38,7 +38,7 @@ def _t0_mark(forward_curve):
     cx = rf.Context()
     cx.load_json((jsonlib.dumps(cfg), f'components_{forward_curve}.json'))
     _, out = cx.run_job()
-    t0 = out.bundle['liability_mtm'][0]
+    t0 = out.bundle.liability_mtm[0]
     assert t0.std().item() == 0.0, 't0 mark must be deterministic across paths'
     return t0.mean().item(), cfg
 

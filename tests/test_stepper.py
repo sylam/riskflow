@@ -77,8 +77,8 @@ def test_textbook_hedge_as_stepper_loop():
     import pandas as pd
     period_start = pd.Timestamp(period_start)
     period_end = pd.Timestamp(period_end)
-    dates = bundle['scenario_dates']
-    bday = bundle['meta']['business_day']
+    dates = bundle.scenario_dates
+    bday = bundle.business_day
     last_trade = runtime['tradables'][hedge_instrument].get('last_trade_date')
     window_end = min(pd.Timestamp(last_trade), period_end) if last_trade else period_end
     buyback_indices = [i for i, d in enumerate(dates)

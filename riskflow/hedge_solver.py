@@ -2,8 +2,8 @@
 
 `DiffSolverV2` is the production solver: a backward-DP / differential-ML value function
 fit by the Huge–Savine twin loss (value + AAD pathwise-gradient), consuming the simulated
-scenario bundle and forking inner MC on demand via the closure `bundle['inner_mc_fn']`
-attached by `HedgeMonteCarlo.execute`. `HindsightDpSolver` (clairvoyant oracle, the
+scenario bundle and forking inner MC on demand via `Bundle.inner_mc` / `Bundle.inner_mc_grad`
+(attached by `HedgeMonteCarlo.execute`). `HindsightDpSolver` (clairvoyant oracle, the
 upper-bound track) and `run_textbook_benchmark` (averaging / min-var lower-bound track)
 are kept as benchmarks; `solve_hedge` dispatches the primary solver and assembles the
 comparison table + acceptance ladder.
@@ -23,7 +23,7 @@ import torch
 
 from . import utils
 from .hedge_bundle import (
-    _utility_wrap_signed, _mirror_utility_scale_to_runtime, wealth_step,
+    _utility_wrap_signed, wealth_step,
 )
 from .hedge_runtime import per_contract_kappa, initial_q_from_runtime
 
@@ -43,14 +43,6 @@ class SolverResult:
     terminal_utility: Optional[Any] = None
     value_fn_artifacts: Optional[Any] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
-
-
-def _sim_vol(bundle):
-    """Sim-grid slice of the bundle's per-step annualized vol series (for the Vol_Scale spread),
-    or None when no Vol_Scale is configured. The bundle series is full-grid; strip the history
-    prefix so it indexes by sim-grid t like `tradables_sim`."""
-    v = bundle.get("step_annual_vol")
-    return None if v is None else v[int(bundle.get("initial_time_index", 0)):]
 
 
 def _turnover_cost(delta_contracts, kappa):
@@ -223,31 +215,6 @@ class HedgeActionSpace:
         return initial_q_from_runtime(self.runtime, batch, device)
 
 
-def _bundle_sim_views(bundle):
-    """History-stripped views of the bundle's time-indexed tensors. `build_hedge_bundle`
-    prepends a `History_Lookback_Business_Days` prefix to `tradables` / `liability_mtm`, but
-    `inner_mc_fn` works in simulation-grid coords. Stripping the prefix lets the solver index
-    every time tensor by the same sim-grid `t`. Returns `(tradables_sim, n_outer_steps)`."""
-    hist = int(bundle.get("initial_time_index", 0))
-    tradables = {k: v[hist:] for k, v in bundle["tradables"].items()}
-    n_outer_steps = int(bundle["liability_mtm"][hist:].shape[0])
-    return tradables, n_outer_steps
-
-
-def _realized_paths(bundle, runtime):
-    """Realized outer-path data the no-inner-MC tracks (hindsight, textbook) consume:
-    `F` `(n_hedge, t_outer, B_outer)` hedge prices, `L_T` `(B_outer,)` the liability
-    terminal MTM, and `t_outer`. The liability terminal is the bundle's pre-settlement
-    `last_live_mtm_index` (index -1 is the appended clean-exit zero)."""
-    tradables_sim, t_outer = _bundle_sim_views(bundle)
-    hedges = list(runtime["names"]["hedges"])
-    F = torch.stack([tradables_sim[h] for h in hedges], dim=0)        # (n_h, t_outer, B)
-    hist = int(bundle.get("initial_time_index", 0))
-    liab = bundle["liability_mtm"][hist:]                             # (>=t_outer, B)
-    L_T = liab[bundle["last_live_mtm_index"]]                         # (B,)
-    return F, L_T, t_outer
-
-
 def run_textbook_benchmark(bundle, runtime):
     """Static-hedge reference: the single best CONSTANT position, held over the whole horizon
     with no rebalancing, evaluated FRICTIONLESS on the realized outer paths (the shared DP
@@ -259,11 +226,11 @@ def run_textbook_benchmark(bundle, runtime):
     The turnover a real execution of this constant hold would pay — entry from the OPENING
     book `q0` (not from flat) + terminal unwind — is a shared-kappa net-of-cost DIAGNOSTIC
     (`turnover_cost_mean` / `v0_mean_net`), never charged against the V_0 track."""
-    F, L_T, t_outer = _realized_paths(bundle, runtime)
+    F, L_T, t_outer = bundle.realized_paths(runtime)
     device = F.device
     acc = runtime["accounting"]
-    aspace = HedgeActionSpace(runtime, device, _sim_vol(bundle))
-    tradables_sim, _ = _bundle_sim_views(bundle)
+    aspace = HedgeActionSpace(runtime, device, bundle.vol_sim)
+    tradables_sim = bundle.tradables_sim
     # The static hold is chosen ONCE at entry and held; a per-t corridor is a dynamic constraint a
     # constant hold can't track, so the single well-defined filter is the entry-step corridor
     # grid_at(0) (no schedule ⇒ the base grid, unchanged). Keeps textbook a within-entry-mandate
@@ -310,16 +277,16 @@ class HindsightDpSolver:
     def __init__(self, bundle, runtime):
         self.bundle = bundle
         self.runtime = runtime
-        self.aspace = HedgeActionSpace(runtime, bundle["time_grid_days"].device, _sim_vol(bundle))
+        self.aspace = HedgeActionSpace(runtime, bundle.device, bundle.vol_sim)
 
     def solve(self):
         bundle, runtime, aspace = self.bundle, self.runtime, self.aspace
         acc = runtime["accounting"]
 
-        F, L_T, t_outer = _realized_paths(bundle, runtime)             # F (n_h,t_outer,B)
+        F, L_T, t_outer = bundle.realized_paths(runtime)               # F (n_h,t_outer,B)
         device = F.device
         b_outer = F.shape[-1]
-        tradables_sim, _ = _bundle_sim_views(bundle)
+        tradables_sim = bundle.tradables_sim
         cs = aspace.contract_size
 
         # Frictionless clairvoyant: independent per-step argmax over the realized move, within the
@@ -402,7 +369,7 @@ class DiffSolverV2:
     """Clean-room differential-ML hedging solver — rebuilt from the toy (`diffml_hedge_huber.py`
     via `diffsolver_v2.py`, validated BOUNDED at T=119) and wired to the OFFICIAL riskflow
     framework. All dynamics come from the bundle's inner-MC closures
-    (`inner_mc_fn` / `inner_mc_grad_fn`), which fork the simulator and price via
+    (`Bundle.inner_mc` / `Bundle.inner_mc_grad`), which fork the simulator and price via
     `resolve_structure` (tradeables) + `resolve_hedge_structure` (liability) — no analytic
     transition, no Jacobian reconstruction; the framework prices everything.
 
@@ -433,7 +400,7 @@ class DiffSolverV2:
     INCREMENT 1 (this build): value bootstrap + the WEALTH-channel pathwise-gradient twin
     loss. W is the solver's own autograd leaf, so ∂Y_boot/∂W is exact with pure torch (no
     framework AAD needed). INCREMENT 2 adds the market-state (spot/state) gradient via
-    `inner_mc_grad_fn`'s `state_t_leaves` (privileged-layout leaf projection; FD-checked by
+    `inner_mc_grad`'s `state_t_leaves` (privileged-layout leaf projection; FD-checked by
     `test_diffml_spot_grad_fd`). Turnover cost is ignored here (the toy has none) — a
     documented next-increment slot.
     """
@@ -442,11 +409,11 @@ class DiffSolverV2:
         self.bundle = bundle
         self.runtime = runtime
         self.cfg = runtime["solver"]
-        self.device = bundle["time_grid_days"].device
+        self.device = bundle.device
         # The shared action universe (mask-aware grid + per-contract kappa + opening book) —
         # the SAME object the benchmark tracks and the stepper rollout consume, so every track
         # optimizes over identical positions and prices identical frictions.
-        self.aspace = HedgeActionSpace(runtime, self.device, _sim_vol(bundle))
+        self.aspace = HedgeActionSpace(runtime, self.device, bundle.vol_sim)
         self.hedges = self.aspace.hedges
         self.n_hedge = self.aspace.n_hedge
         self.contract_size = self.aspace.contract_size                # (n_hedge,)
@@ -472,9 +439,8 @@ class DiffSolverV2:
         # reads t/t+1 fields) — fork cost stops scaling with the remaining horizon.
         self.one_step = bool(self.cfg.get("diffv2_one_step_fork", True))
         # History-stripped, sim-grid-indexed views of the outer-realised paths.
-        self.tradables_sim, self.n_steps = _bundle_sim_views(bundle)
-        hist = int(bundle.get("initial_time_index", 0))
-        self.liability_sim = bundle["liability_mtm"][hist:]           # (n_steps, B_outer)
+        self.tradables_sim, self.n_steps = bundle.tradables_sim, bundle.n_outer_steps
+        self.liability_sim = bundle.liability_sim                     # (n_steps, B_outer)
         self.B_outer = int(self.liability_sim.shape[-1])
         # Effective terminal = the last LIVE liability mark. The time grid appends one
         # post-settlement clean-exit row (the deal pays out — the platinum average-rate forward
@@ -482,7 +448,7 @@ class DiffSolverV2:
         # terminal is the bundle's `last_live_mtm_index` (the structural pre-settlement `[-2]`).
         # Telescoping wealth THROUGH the settlement drop cancels the liability's settlement risk
         # (no-hedge W_T≡0). Decisions run 0..T_dec-1; the terminal continuation marks at T_dec.
-        self.T_dec = int(bundle["last_live_mtm_index"])
+        self.T_dec = int(bundle.last_live_mtm_index)
         if self.t_min >= self.T_dec:
             raise ValueError(
                 f"Solver.T_Min={self.t_min} must be < decision horizon T_dec={self.T_dec}")
@@ -555,7 +521,7 @@ class DiffSolverV2:
           dL   (B_outer, B_inner)           liability mark change t→t+1
           m1   (B_outer, B_inner, market_dim) market state at t+1
         plus the bank-state market at t (B_outer, market_dim)."""
-        inner = self.bundle["inner_mc_fn"](t, one_step=self.one_step)
+        inner = self.bundle.inner_mc(t, one_step=self.one_step)
         F_t = torch.stack([self.tradables_sim[ref][t] for ref in self.hedges], dim=-1)   # (B_outer, n_hedge)
         F_t1 = torch.stack([inner["F_t1"][ref] for ref in self.hedges], dim=-1)          # (B_outer, B_inner, n_hedge)
         # EXPIRED-CONTRACT GUARD: the framework returns inner F_t1=0 for a tradable that has
@@ -732,8 +698,8 @@ class DiffSolverV2:
         # except one-step forks, whose tape is 2 rows regardless of t (the 64 floor then just
         # reproduces the flat cap, giving constant-width slices across the whole sweep).
         rows_t = max(64, 2 if self.one_step else (self.n_steps + 1 - t))
-        cell_budget = int(self.bundle.get("inner_mc_cell_budget", 1 << 62))
-        inner_sub = int(self.bundle.get("inner_sub_batch", 1))
+        cell_budget = int(self.bundle.inner_mc_cell_budget)
+        inner_sub = int(self.bundle.inner_sub_batch)
         grad_chunk = max(1, cell_budget // (inner_sub * rows_t))
         if self.B_outer > grad_chunk:
             # Large-B mode: the grad fork's AAD tape only fits `grad_chunk` outer paths at a
@@ -743,7 +709,7 @@ class DiffSolverV2:
             Y_parts, gW_parts, gm_parts = [], [], []
             for a in range(r0, r1, grad_chunk):
                 b = min(a + grad_chunk, r1)
-                ig = self.bundle["inner_mc_grad_fn"](t, outer_rows=(a, b), one_step=self.one_step)
+                ig = self.bundle.inner_mc_grad(t, outer_rows=(a, b), one_step=self.one_step)
                 leaves, widths = ig["state_t_leaves"], ig["state_t_leaf_widths"]
                 F_t_c = torch.stack(
                     [self.tradables_sim[r][t][a:b] for r in self.hedges], dim=-1)
@@ -770,7 +736,7 @@ class DiffSolverV2:
             gW = torch.cat(gW_parts)
             g_market = torch.cat(gm_parts)
             return self._fit_from_labels(nets, W0_bank, market0, Y, gW, g_market, t, q_star)
-        ig = self.bundle["inner_mc_grad_fn"](t, one_step=self.one_step)
+        ig = self.bundle.inner_mc_grad(t, one_step=self.one_step)
         leaves, widths = ig["state_t_leaves"], ig["state_t_leaf_widths"]
         if not getattr(self, "_proj_checked", False):
             self._proj_checked = True                  # one-time self-check of the label projection
@@ -965,7 +931,7 @@ class DiffSolverV2:
         the JSON-contract interface for running the precomputed diff-ML nets daily.
         Returns {greedy, textbook, nohedge} terminal-P&L stats in the verdict shape."""
         from .hedge_bundle import BundleStepper, _tracking_error_value
-        hist = int(self.bundle.get("initial_time_index", 0))
+        hist = self.bundle.initial_time_index
         sweep_set = set(int(t) for t in sweep_ts)
 
         q_log = {"greedy": [], "t": []}
@@ -1352,14 +1318,13 @@ def solve_hedge(bundle, runtime):
 
     Returns the dict shape `HedgeMonteCarlo.execute` unpacks (`evaluation_output` /
     `optimizer_diagnostics` / `policy_artifact`)."""
-    _mirror_utility_scale_to_runtime(bundle, runtime)
     solver_cfg = runtime["solver"]
     obj = solver_cfg["object"]
     if obj not in _SOLVERS:
         raise ValueError(
             f"Unknown Solver Object {obj!r}; available: {sorted(_SOLVERS)}")
     n_seed = max(1, int(solver_cfg.get("multi_seed_count", 1)))
-    have_liability = bundle.get("liability_mtm") is not None
+    have_liability = bundle.liability_mtm is not None
 
     # Primary solver — multi-seed repeats advance the inner-MC Sobol stream.
     primary_runs = [_SOLVERS[obj](bundle, runtime).solve() for _ in range(n_seed)]

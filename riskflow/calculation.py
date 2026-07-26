@@ -42,9 +42,7 @@ from .pricing import SensitivitiesEstimator
 # import the documentation and utils modules
 from . import utils, pricing
 from .hedge_runtime import construct_hedge_runtime
-from .hedge_bundle import (
-    run_hedge_execution, HedgeRuntimeExecutionResult, build_hedge_bundle,
-)
+from .hedge_bundle import Bundle, run_hedge_execution, HedgeRuntimeExecutionResult
 
 # Flat-sample cap (outer chunk x Inner_Sub_Batch) per inner-MC fork pass at a 64-row reference;
 # per-job override = Calculation.Inner_MC_Flat_Limit.
@@ -1760,7 +1758,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         '',
         '- A **bundle** built per simulation batch containing the trajectories the solver',
         '  needs (tradable prices, liability MtM, factor history, leg metadata, AAD-derived',
-        '  hedge ratios) plus an on-demand inner-MC fork (`bundle["inner_mc_fn"]`).',
+        '  hedge ratios) plus an on-demand inner-MC fork (`Bundle.inner_mc`).',
         '- A **runtime** dict normalised from the JSON `Hedging_Problem` block (tradables,',
         '  position limits, cash accounts, objective, solver config).',
         '- A **differential-ML solver** (`DiffSolverV2`): a backward-DP value function fit by',
@@ -1857,7 +1855,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         """Static (batch-independent) liability descriptors the symlog utility-scale needs, read
         straight from the cashflow schedules — no per-batch leg pass. Returns
         `(total_leg_volume, last_payment_day)`: the summed |notional| across all liability legs
-        and the latest payment day (offset in days from base_date). `build_hedge_bundle` maps the
+        and the latest payment day (offset in days from base_date). `Bundle.from_batch` maps the
         payment day onto the (history-prefixed) bundle time grid to recover `last_settlement_index`."""
         return self.liabilities.aggregate_leg_descriptors()
 
@@ -2029,7 +2027,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     proc.reseed_from_path(simulated, shared_mem)
                 # Leaf the declared underlying(s) so the base-delta / conditional-feature pass can
                 # read ∂value/∂spot via AAD. The diff-ML solver differentiates the continuation
-                # inside the inner MC off its own fresh state-at-t leaves (see inner_mc_grad_fn),
+                # inside the inner MC off its own fresh state-at-t leaves (see Bundle.inner_mc_grad),
                 # so it needs no outer leaf.
                 if utils.check_tuple_name(key) in self._underlying_names:
                     simulated = simulated.detach().requires_grad_(True)
@@ -2090,7 +2088,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             }
 
         total_leg_volume, last_payment_day = self._liability_schedule_scalars()
-        bundle = None if normalized_runtime is None else build_hedge_bundle(
+        bundle = Bundle.from_batch(
             base_date,
             bus_day,
             shared_mem.one.new_tensor(t_days_arr),
@@ -2099,19 +2097,19 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             hedge_profile_blocks,
             params['Simulation_Batches'],
             self.stoch_factors,
-            runtime=normalized_runtime,
+            normalized_runtime,
             privileged_factor_blocks=privileged_factor_blocks,
             total_leg_volume=total_leg_volume,
             last_payment_day=last_payment_day,
         )
-        if bundle is not None and solve_hedge_mode:
+        if solve_hedge_mode:
             # Closure lets the solver fork inner MC on demand without a calc handle —
             # captures `self` (the inner-MC machinery), the cached outer state, shared_mem.
             # `one_step=True` windows the fork to {t, t+1}: 2-row generation AND a real
             # 2-row pricing pass (exact per-tradable F_t1, exact L_t/L_t1) — the only
             # fields the diff-ML bootstrap reads. Horizon fields (L_T, dF_T, dF_min,
             # features) are only produced on full forks.
-            bundle['inner_mc_fn'] = lambda t, one_step=False: self._run_inner_mc_at_t(
+            bundle.inner_mc = lambda t, one_step=False: self._run_inner_mc_at_t(
                 t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
                 max_inner_steps=1 if one_step else None)
             # Grad-enabled twin: per-process state-at-t leaves attached so the solver can
@@ -2121,7 +2119,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             # (per-slice tapes; the single-chunk grad constraint applies per slice —
             # with `one_step=True` the tape covers 2 rows, so the flat cap binds instead
             # of the cells cap and slices get wide).
-            bundle['inner_mc_grad_fn'] = lambda t, outer_rows=None, one_step=False: \
+            bundle.inner_mc_grad = lambda t, outer_rows=None, one_step=False: \
                 self._run_inner_mc_at_t(
                     t, self._outer_scenario_buffer, shared_mem, base_date, tradable_refs,
                     with_grad=True, outer_rows=outer_rows,
@@ -2129,17 +2127,15 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             # Grad-slice sizing inputs: cell budget (flat limit at its 64-row calibration
             # reference, halved — the AAD tape roughly doubles per-cell memory vs no-grad)
             # + the inner sub-batch. The solver divides by the per-t remaining rows.
-            bundle['inner_mc_cell_budget'] = (self._inner_mc_flat_limit() * 64) // 2
-            bundle['inner_sub_batch'] = int(shared_mem.simulation_sub_batch)
+            bundle.inner_mc_cell_budget = (self._inner_mc_flat_limit() * 64) // 2
+            bundle.inner_sub_batch = int(shared_mem.simulation_sub_batch)
 
         evaluation_summary = None
         optimizer_diagnostics = None
         policy_artifact = None
         runtime_present = False
         runtime_diagnostics = {}
-        optimization_result = None
-        if bundle is not None and normalized_runtime is not None:
-            optimization_result = run_hedge_execution(bundle, normalized_runtime)
+        optimization_result = run_hedge_execution(bundle, normalized_runtime)
         if optimization_result is not None:
             evaluation_summary = optimization_result['evaluation_output']
             optimizer_diagnostics = optimization_result['optimizer_diagnostics']
@@ -2290,7 +2286,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         labels are per-outer-path so slices are independent).
 
         The DP/MPC backward sweep calls this on demand outside the outer loop (via the
-        closure `bundle['inner_mc_fn']`), forking inner MC at the requested `t`.
+        closure `Bundle.inner_mc`), forking inner MC at the requested `t`.
 
         `want_raw_samples=False` returns just `{'features': (B_outer, 3+2*n_tradables)}`.
         `want_raw_samples=True` additionally returns the raw inner samples the solvers need:
@@ -2325,7 +2321,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         # Terminal / past-end — no inner horizon. Emit zero features; `prob_loss == 0`
         # flags this downstream. The DP sweep does not call here at terminal (it uses the
-        # closed-form V_T); a caller querying `inner_mc_fn` at or past terminal does, hence the guard.
+        # closed-form V_T); a caller querying `inner_mc` at or past terminal does, hence the guard.
         if inner_time_grid.scen_time_grid.size < 2:
             result = {'features': shared_mem.one.new_zeros(B_outer, n_features)}
             if want_raw_samples:

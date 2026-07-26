@@ -185,7 +185,7 @@ def _liability_mtm(cfg):
     cx = rf.Context()
     cx.load_json((json.dumps(cfg, default=str), 'basis.json'))
     _, out = cx.run_job()
-    return out.bundle['liability_mtm']
+    return out.bundle.liability_mtm
 
 
 def test_composed_name_sums_into_liability():

@@ -138,15 +138,15 @@ def test_first_step_turnover_measured_from_opening_book():
     n_star = bb['comparison']['textbook']['n_star']
     assert fb['comparison']['textbook']['n_star'] == n_star     # position-free selection
     runtime, bundle = book.runtime, book.bundle
-    hist = int(bundle['initial_time_index'])
+    hist = bundle.initial_time_index
     expected_diff = sum(
         (abs(n_star[i] - float(positions[h])) - abs(n_star[i]))
-        * float(per_contract_kappa(runtime, bundle['tradables'][h][hist:][0].mean(), h))
+        * float(per_contract_kappa(runtime, bundle.tradables[h][hist:][0].mean(), h))
         for i, h in enumerate(_HEDGES))
     assert abs((tb_book - tb_flat) - expected_diff) < 1e-3 * (abs(expected_diff) + 1.0), \
         f'textbook turnover shift {tb_book - tb_flat} != Σ(|n*−q0|−|n*|)·kappa0 {expected_diff}'
 
-    # The stepper OPENS from q0 (build_shared_state seeds Portfolio_State), so its realized
+    # The stepper OPENS from q0 (its opening state seeds Portfolio_State), so its realized
     # first-step trade is measured from the same book — the deployment convention agrees.
     stepper = book.create_stepper()
     opening = stepper.observe()['positions']

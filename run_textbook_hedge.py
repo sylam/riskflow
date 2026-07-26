@@ -125,9 +125,9 @@ def runtime_instrument_order(result) -> list[str]:
 
 def build_schedule_rows(result, instruments: Optional[list[str]] = None) -> list[dict[str, Any]]:
     bundle = result.bundle
-    dates = bundle['scenario_dates']
-    business_day = bundle['meta']['business_day']
-    decision_indices = set(bundle.get('business_indices', ()))
+    dates = bundle.scenario_dates
+    business_day = bundle.business_day
+    decision_indices = set(bundle.business_indices)
     chosen_instruments = instruments or runtime_instrument_order(result)
     rows: list[dict[str, Any]] = []
     for idx, date in enumerate(dates):
@@ -167,7 +167,7 @@ def run_position_target_schedule(result, target_positions_by_date: dict[str, dic
             last = stepper.step(None)
             continue
         observed = stepper.observe()
-        date_key = pd.Timestamp(result.bundle['scenario_dates'][stepper.time_index]).strftime('%Y-%m-%d')
+        date_key = pd.Timestamp(result.bundle.scenario_dates[stepper.time_index]).strftime('%Y-%m-%d')
         targets = target_positions_by_date.get(date_key)
         if not targets:
             last = stepper.step(None)
@@ -239,8 +239,8 @@ def _textbook_targets(result, hedge_instrument):
     period_end = pd.Timestamp(items[0]['Period_End'])
     last_trade = runtime['tradables'][hedge_instrument].get('last_trade_date')
     window_end = min(pd.Timestamp(last_trade), period_end) if last_trade else period_end
-    dates = bundle['scenario_dates']
-    bday = bundle['meta']['business_day']
+    dates = bundle.scenario_dates
+    bday = bundle.business_day
     buyback_indices = [i for i, d in enumerate(dates)
                        if period_start <= d <= window_end and bday.is_on_offset(d)]
     tn_idx = next(i for i, d in enumerate(dates) if d >= period_start)

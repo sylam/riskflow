@@ -203,7 +203,7 @@ def _normalize_objective_config(objective_config: Optional[Mapping[str, Any]]) -
         "object": str(objective_config["Object"]).lower(),
         # Utility-transform scale. Consumed by any utility Object (Symlog / Huber / CARA);
         # the non-utility (identity) path ignores it. `utility_scale` is mirrored
-        # from `bundle["utility_scale"]` (see hedge_bundle._mirror_utility_scale_to_runtime).
+        # from the bundle's resolved scale (see hedge_bundle.Bundle._resolve_frame).
         "utility_scale_mode": str(objective_config.get("Utility_Scale_Mode", "vol_scaled_notional")).lower(),
         "utility_scale_explicit": None if explicit is None else float(explicit),
         # Utility SHAPE params (DIMENSIONLESS, in units of the scale c — applied to x = W/c).
@@ -304,7 +304,7 @@ def _normalize_spot_price_history(
     state = hedging_problem.get("Portfolio_State") or {}
     raw_history = state.get("Spot_Price_History") or {}
     # Spot_Price_History is OPTIONAL. Absent it, the utility scale falls back to the calibrated
-    # market data (hedge_bundle.resolve_utility_scale) and the history prefix no-ops, so return
+    # market data (hedge_bundle.Bundle._resolve_utility_scale) and the prefix no-ops, so return
     # empty rather than demanding entries for every referenced commodity. A PARTIAL history (some
     # but not all commodities) is still an error — that check stays below.
     if not raw_history:

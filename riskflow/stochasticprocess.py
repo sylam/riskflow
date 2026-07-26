@@ -182,7 +182,7 @@ class StochasticProcess(object):
     def calibrated_annual_vol(self):
         """Annualized FRACTIONAL vol implied by this process's calibrated params, or None if
         the process does not characterize a single scalar spot vol. Consumed by the utility-
-        scale fallback (hedge_bundle.resolve_utility_scale) when Spot_Price_History is absent —
+        scale fallback (hedge_bundle.Bundle._resolve_utility_scale) when Spot_Price_History is absent —
         the calibrated substitute for the realized-vol read off the history window. Default None
         (no vol characterization); spot models that own a calibrated vol override it."""
         return None

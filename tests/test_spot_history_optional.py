@@ -57,21 +57,21 @@ def test_spot_price_history_optional_trains_via_calibrated_scale():
         runtime['referenced_commodities']
 
     # History is genuinely absent: no history tensor, prefix no-ops.
-    assert 'spot_price_history' not in bundle
-    assert int(bundle['initial_time_index']) == 0
+    assert not bundle.spot_price_history
+    assert bundle.initial_time_index == 0
 
     # Utility scale came from the calibrated fallback (spot + stationary σ), not the floor.
-    calib = bundle.get('calibrated_utility_inputs')
+    calib = bundle.calibrated_utility_inputs
     assert calib is not None, 'calibrated fallback not assembled'
     commodity, spot, sigma = calib
     assert commodity == 'CommodityPrice.PLATINUM_LME'
     assert spot > 0.0 and sigma > 0.0
-    c = bundle['utility_scale']
+    c = bundle.utility_scale
     assert c > 1.0e3, f'utility_scale collapsed to the floor: {c}'
     # c = total_leg_volume · spot · σ · √τ — reproduce it from the parts.
-    tau = max(float(int(bundle['last_settlement_index']) - int(bundle['initial_time_index'])) / 252.0,
+    tau = max(float(bundle.last_settlement_index - bundle.initial_time_index) / 252.0,
               1.0 / 252.0)
-    expected_c = float(bundle['total_leg_volume']) * spot * sigma * (tau ** 0.5)
+    expected_c = bundle.total_leg_volume * spot * sigma * (tau ** 0.5)
     assert math.isclose(c, expected_c, rel_tol=1e-6), (c, expected_c)
 
     # σ is the stationary regime-weighted vol of the calibrated 3-state HMM (Log_Price=True).
