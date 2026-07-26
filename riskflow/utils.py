@@ -2653,6 +2653,16 @@ def calc_time_grid_spot_rate(rate, time_grid, shared):
 
 
 def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
+    # `tensor` is the curve: (n_tenors,) calibrated, or (n_tenors, B) for a BATCH of per-path
+    # curves. Every op below is elementwise or a tenor-axis gather, so the batch axis just rides
+    # along as a trailing broadcast dim — no reduction reassociates and the batched result is
+    # bitwise equal to looping the columns. `nb == 0` makes every `_bcast` a no-op reshape, so
+    # the 1-D path executes exactly the arithmetic it always did.
+    nb = tensor.dim() - 1
+
+    def _bcast(x):
+        """Right-pad tenor/time-shaped `x` with the curve's trailing batch axes."""
+        return x.reshape(*x.shape, *([1] * nb))
 
     def prepare_tenors(factor_tenor, time_grid, extrapolate):
         """Prepare tenor grid with optional extrapolation."""
@@ -2672,7 +2682,7 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
     def scale_for_rt(tnr, tensor, is_rt):
         """Scale tensor for rate*time interpolation."""
         if is_rt:
-            return tensor * tnr
+            return tensor * _bcast(tnr)
         return tensor
 
     def calculate_interp_params(tnr, tnr_d, time_grid):
@@ -2697,31 +2707,38 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
     def hermite_interpolation_new(tensor, tnr, is_rt, mul_time, full_tnr=None):
 
         def interp(values, indices_t):
-            norm = values if mul_time else 1.0
+            norm = _bcast(values) if mul_time else 1.0
             alpha, ten_t, ten_t_next = indices_t
             if is_rt:
-                norm = norm / values.clamp(full_tnr.min(), full_tnr.max())
-            return calc_hermite_curve(alpha, g[ten_t], c[ten_t], tensor[ten_t], tensor[ten_t_next]) * norm
+                norm = norm / _bcast(values.clamp(full_tnr.min(), full_tnr.max()))
+            return calc_hermite_curve(
+                _bcast(alpha), g[ten_t], c[ten_t], tensor[ten_t], tensor[ten_t_next]) * norm
 
         """Handle Hermite interpolation variants."""
         t = tnr.view(1, -1, 1)
         if full_tnr is None:
             full_tnr = tnr
-        g, c = [torch.squeeze(x) for x in hermite_interpolation_tensor(t, tensor.reshape(1, -1, 1))]
+        # (1, n_tenors, 1) calibrated / (1, n_tenors, B) batched. Squeeze the leading axis only
+        # when batched — a plain squeeze() would also eat the batch axis at B == 1.
+        gc = hermite_interpolation_tensor(t, tensor.reshape(1, tensor.shape[0], -1))
+        g, c = [x.squeeze(0) for x in gc] if nb else [torch.squeeze(x) for x in gc]
 
         return interp
 
     def linear_interpolation_new(tensor, tnr, is_rt, mul_time, extrapolate, full_tnr=None):
 
         def interp(values, indices_t):
-            norm = values if mul_time else 1.0
+            norm = _bcast(values) if mul_time else 1.0
             alpha, ten_t, ten_t_next = indices_t
 
             if is_rt:
-                norm = norm / values.clamp(full_tnr.min(), full_tnr.max())
+                norm = norm / _bcast(values.clamp(full_tnr.min(), full_tnr.max()))
+            alpha = _bcast(alpha)
             val = alpha * tensor[ten_t_next] + (1 - alpha) * tensor[ten_t]
 
-            if extrapolate and len(val.shape)>1:
+            # `> 1 + nb` is the tenor axis test: it selects the (time x tenor) call and skips the
+            # time-only one. Reduces to the original `len(val.shape) > 1` when nb == 0.
+            if extrapolate and val.dim() > 1 + nb:
                 val = val[:, :-1]
             return val * norm
 
@@ -2767,7 +2784,9 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
     M = time_grid.view(-1, 1) + tnr.view(1, -1)
     if len(factor.interpolation)==1:
         f = calc_fwd_interpolated_new(interp_method, tnr, tensor)
-        return f(M, indices_t) - f(time_grid, indices_time).reshape(-1, 1)
+        # insert the tenor axis: (T,) -> (T, 1) calibrated, (T, B) -> (T, 1, B) batched
+        t_leg = f(time_grid, indices_time)
+        return f(M, indices_t) - t_leg.reshape(t_leg.shape[0], 1, *t_leg.shape[1:])
     elif len(factor.interpolation)==2:
         cuttoff_index = factor.interpolation[0][1]
         cuttoff_tenor = tnr[cuttoff_index]
@@ -2799,9 +2818,10 @@ def calc_curve_forwards(factor, tensor, time_grid_years, shared, mul_time=True):
             far_t = f(
                 time_grid,
                 (indices_time[0], (indices_time[1]-cuttoff_index).clamp(min=0), (indices_time[2]-cuttoff_index).clamp(min=0)))
-            mask_near = M <= cuttoff_tenor
-            time_t = torch.where(time_grid <= cuttoff_tenor, near_t, far_t)
-        return torch.where(mask_near, near_tT, far_tT) - time_t.reshape(-1, 1)
+            mask_near = _bcast(M <= cuttoff_tenor)
+            time_t = torch.where(_bcast(time_grid <= cuttoff_tenor), near_t, far_t)
+        return (torch.where(mask_near, near_tT, far_tT)
+                - time_t.reshape(time_t.shape[0], 1, *time_t.shape[1:]))
     else:
         raise ValueError("More than 2 Interpolation Segments not supported")
 
