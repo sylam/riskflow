@@ -23,10 +23,28 @@
 #
 # Expect one WARNING per loaded checkpoint per trade in the roll logs: streaming-trained frames
 # rolled by a non-streaming eval. That is the deliberate arrangement above, not a misconfiguration.
+#
+# ATTEMPT 2 (run dirs *2_*). Attempt 1 is kept alongside as evidence and is NOT comparable: it ran
+# before the multi-batch burn-in rewind, so its batches walked away from the calibrated world
+# (symlog c +94% by the held-out batch) and its arm-A lane lost 9 of 24 months to the X_0 guard.
+# Both are fixed on this branch; every trade below is re-run from scratch on one arithmetic.
+# Arm B stays on two parallel lanes: attempt 1's arm B did NOT die of memory — the host rebooted
+# under it (both lanes stop within 1s at 12:43:11, the logs end in unflushed NUL padding, the
+# launcher died with them, journald itself crashed and the block layer was erroring; no OOM
+# killer, no Xid, uptime confirms the boot). A resource sampler runs alongside so the next
+# failure has arithmetic attached.
 set -u
 cd /home/vretiel/PycharmProjects/riskflow || exit 1
 WF=artifacts/walk_forward/streaming_ladder
 mkdir -p "$WF"
+
+( while true; do
+    printf '%s %s | rss_MB=%s\n' "$(date -Is)" \
+      "$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader | tr '\n' ';')" \
+      "$(ps -o rss= -C python | awk '{s+=$1} END {printf "%d", s/1024}')" >> "$WF/resources.log"
+    sleep 60
+  done ) & SAMPLER=$!
+trap 'kill $SAMPLER 2>/dev/null' EXIT
 
 echo "=== STREAMING LADDER START $(date -Is) | riskflow=$(python -c 'import riskflow;print(riskflow.__file__)') ==="
 echo "=== HEAD: $(git log --oneline -1 | cut -c1-72) ==="
@@ -35,32 +53,32 @@ echo "=== HEAD: $(git log --oneline -1 | cut -c1-72) ==="
 CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python -u production_walk_forward.py \
     --spot-model garch --seeds 7 42 314 --batch 512 --streaming-batches 5 --fit-iters 40 \
-    --start 2020-01 --months 24 --run-dir "$WF/armA_gpu0" \
-    > "$WF/armA_gpu0.log" 2>&1 &
+    --start 2020-01 --months 24 --run-dir "$WF/armA2_gpu0" \
+    > "$WF/armA2_gpu0.log" 2>&1 &
 A0=$!
 CUDA_VISIBLE_DEVICES=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python -u production_walk_forward.py \
     --spot-model garch --seeds 7 42 314 --batch 512 --streaming-batches 5 --fit-iters 40 \
-    --start 2022-01 --months 24 --run-dir "$WF/armA_gpu1" \
-    > "$WF/armA_gpu1.log" 2>&1 &
+    --start 2022-01 --months 24 --run-dir "$WF/armA2_gpu1" \
+    > "$WF/armA2_gpu1.log" 2>&1 &
 A1=$!
 echo "=== arm A lanes launched: gpu0 pid=$A0  gpu1 pid=$A1 ==="
 wait $A0; RA0=$?
 wait $A1; RA1=$?
-echo "=== arm A done $(date -Is): gpu0 rc=$RA0 gpu1 rc=$RA1 | trades gpu0=$(ls "$WF/armA_gpu0"/row_*.json 2>/dev/null | wc -l)/24 gpu1=$(ls "$WF/armA_gpu1"/row_*.json 2>/dev/null | wc -l)/24 ==="
+echo "=== arm A done $(date -Is): gpu0 rc=$RA0 gpu1 rc=$RA1 | trades gpu0=$(ls "$WF/armA2_gpu0"/row_*.json 2>/dev/null | wc -l)/24 gpu1=$(ls "$WF/armA2_gpu1"/row_*.json 2>/dev/null | wc -l)/24 ==="
 
 # ---- Arm B: the 2020 window (12 trades), 4x the trained paths at unchanged fork width -----
 CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python -u production_walk_forward.py \
     --spot-model garch --seeds 7 42 314 --batch 2048 --streaming-batches 5 --fit-iters 40 \
-    --start 2020-01 --months 6 --run-dir "$WF/armB_gpu0" \
-    > "$WF/armB_gpu0.log" 2>&1 &
+    --start 2020-01 --months 6 --run-dir "$WF/armB2_gpu0" \
+    > "$WF/armB2_gpu0.log" 2>&1 &
 B0=$!
 CUDA_VISIBLE_DEVICES=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python -u production_walk_forward.py \
     --spot-model garch --seeds 7 42 314 --batch 2048 --streaming-batches 5 --fit-iters 40 \
-    --start 2020-07 --months 6 --run-dir "$WF/armB_gpu1" \
-    > "$WF/armB_gpu1.log" 2>&1 &
+    --start 2020-07 --months 6 --run-dir "$WF/armB2_gpu1" \
+    > "$WF/armB2_gpu1.log" 2>&1 &
 B1=$!
 echo "=== arm B lanes launched: gpu0 pid=$B0  gpu1 pid=$B1 ==="
 wait $B0; RB0=$?
@@ -97,8 +115,8 @@ def line(tag, s):
 
 
 base = pd.read_csv(BASE) if os.path.exists(BASE) else None
-armA = lanes(f'{WF}/armA_gpu0/trades.csv', f'{WF}/armA_gpu1/trades.csv')
-armB = lanes(f'{WF}/armB_gpu0/trades.csv', f'{WF}/armB_gpu1/trades.csv')
+armA = lanes(f'{WF}/armA2_gpu0/trades.csv', f'{WF}/armA2_gpu1/trades.csv')
+armB = lanes(f'{WF}/armB2_gpu0/trades.csv', f'{WF}/armB2_gpu1/trades.csv')
 for name, df in (('armA', armA), ('armB', armB)):
     if df is not None:
         df.to_csv(f'{WF}/{name}_final.csv', index=False)
