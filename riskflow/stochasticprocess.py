@@ -3786,14 +3786,39 @@ class VARMixedFactorInterestRateModel(StochasticProcess):
         cond_gate = 1.0e8 if M_t.dtype == torch.float64 else 1.0e4
         if float(torch.linalg.cond(M_t)) < cond_gate:
             X0 = torch.linalg.solve(M_t, curve0)                                       # (3,) or (3, B)
-            roundtrip_err_t = (M_t @ X0 - curve0).abs().max()
-            rt_tol = 1.0e-10 if M_t.dtype == torch.float64 else 1.0e-5
-            if roundtrip_err_t.item() > rt_tol:
+            # WHAT THIS GUARD ACTUALLY TESTS: that the solve inverted. On a SQUARE system
+            # `M @ solve(M, c) == c` holds for any invertible M, so it cannot — and never could —
+            # detect a mis-bracketing: a wrong-but-invertible bracket reproduces the curve just
+            # as exactly (measured: bracketing [1,1,2] -> [2,1,2] changes M by 4.0 and leaves the
+            # residual at 4e-8). What it does detect is a ladder so degenerate that the solve
+            # stops inverting — which is real and worth failing on, and is why the message below
+            # reports the geometry as CONTEXT rather than as a diagnosis.
+            # The residual is measured in float64 (a 3x3 @ (3,B) product, free), RELATIVE to the
+            # curve level, and against the solve's OWN backward-stability bound rather than a
+            # constant. A linear solve cannot do better than ~cond(M)·eps·‖curve‖, so any fixed
+            # number is wrong in two directions at once: on this ladder (cond ~1e3, float32) it
+            # demanded better-than-achievable and fired on 9 of the 2022-23 walk-forward months
+            # at 1.1e-6 relative — 9 ulp, a correct answer — while on a well-conditioned ladder
+            # it would have let a decade of genuine error through. Scaling by cond·eps makes the
+            # check dtype- and geometry-aware for free; the factor 64 is margin over the growth
+            # factor of a 3x3 solve. Quality is the cond_gate's job (above); this asks only
+            # whether the solve that ran actually inverted.
+            # The SOLVE deliberately stays in the curve's dtype. Doing it in float64 and casting
+            # back is strictly more accurate, but measured on the golden worlds it moves every
+            # downstream value by ~1 ulp (tradables 2.4e-4 on 2050, liability_mtm 0.6 on 3.5e6,
+            # V_0 by 1.1e-5) — a revalidation event to schedule deliberately, not to slip into a
+            # running campaign whose earlier trades were priced with the float32 solve.
+            cond_M = float(torch.linalg.cond(M_t))
+            rt_rel = float(((M_t.to(torch.float64) @ X0.detach().to(torch.float64)
+                             - curve0.detach().to(torch.float64)).abs().max())
+                           / max(1.0, float(curve0.detach().abs().max())))
+            rt_tol = 64.0 * cond_M * torch.finfo(M_t.dtype).eps
+            if rt_rel > rt_tol:
                 raise ValueError(
-                    f'X_0 round-trip failed: max |M·X_0 - curve_0| = {roundtrip_err_t.item():.2e}'
-                    f' (tol {rt_tol:.0e} for dtype {M_t.dtype}). '
-                    f'Likely boundary mishandling in the slot-bracketing (contract_T0={contract_T0}, '
-                    f'slot_t0={slot_t0}).')
+                    f'X_0 solve did not invert: max |M·X_0 - curve_0| / ‖curve_0‖ = {rt_rel:.2e} '
+                    f'exceeds 64·cond(M)·eps = {rt_tol:.2e} (cond={cond_M:.3e}, dtype '
+                    f'{M_t.dtype}). The contract ladder has collapsed onto a degenerate slot '
+                    f'geometry (contract_T0={contract_T0}, slot_t0={slot_t0}).')
         else:
             gram = M_t.transpose(-1, -2) @ M_t
             ridge = 1.0e-6 * gram.diagonal().mean() * torch.eye(

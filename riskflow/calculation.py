@@ -2020,6 +2020,23 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 use_antithetic=params.get('Antithetic', 'No') == 'Yes')
 
             if randomize_t0:
+                # REWIND to the calibrated t=0 first. The burn-in below leaves each process
+                # precalculated from ITS OWN terminal state, so batch k+1 would otherwise push
+                # forward from batch k's endpoint and the batch sequence becomes a random walk
+                # away from the calibrated world instead of N independent draws from it. The
+                # designer distribution is ONE T-step pushforward of the calibrated state — the
+                # same one for every batch. Measured before this rewind, over 5 streaming
+                # batches of one walk-forward month: the symlog scale drifted 592k -> 1.15M
+                # (+94%), so later batches trained on a materially different world than the one
+                # the frame was locked on, and on some months the drift ran until the sweep went
+                # NaN. Single-batch runs never rewind anything (`run == 0`), so every
+                # Simulation_Batches=1 job is bit-identical.
+                if run:
+                    for key, proc in self.stoch_factors.items():
+                        scenario_grid, implied_tensor = self._factor_precalc_args[key]
+                        proc.precalculate(
+                            self.base_date, scenario_grid, self.stoch_var[key], shared_mem,
+                            self.process_ofs[key], implied_tensor=implied_tensor)
                 # Every factor gets the burn-in — same iteration as the main
                 # generate loop below. Each process's `simulated[-1]` is the
                 # per-path shape its precalculate accepts as `tensor`; the
