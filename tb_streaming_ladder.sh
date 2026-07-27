@@ -38,13 +38,19 @@ cd /home/vretiel/PycharmProjects/riskflow || exit 1
 WF=artifacts/walk_forward/streaming_ladder
 mkdir -p "$WF"
 
+# GPU1 drives the display and can hang under sustained 100% utilization, so the lane that runs on
+# it is duty-cycled by a watchdog (SIGSTOP 3s after 45s at >=98%, ~93% duty). The watchdog targets
+# the device, not a pid, so it follows the campaign from arm A's GPU1 lane to arm B's. GPU0 runs
+# unrestricted. Costs at most ~6% of that lane's wall time, and only while it is actually pinned.
+bash tb_gpu1_throttle.sh "$WF" & THROTTLE=$!
+
 ( while true; do
     printf '%s %s | rss_MB=%s\n' "$(date -Is)" \
       "$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader | tr '\n' ';')" \
       "$(ps -o rss= -C python | awk '{s+=$1} END {printf "%d", s/1024}')" >> "$WF/resources.log"
     sleep 60
   done ) & SAMPLER=$!
-trap 'kill $SAMPLER 2>/dev/null' EXIT
+trap 'kill $SAMPLER $THROTTLE 2>/dev/null' EXIT
 
 echo "=== STREAMING LADDER START $(date -Is) | riskflow=$(python -c 'import riskflow;print(riskflow.__file__)') ==="
 echo "=== HEAD: $(git log --oneline -1 | cut -c1-72) ==="
