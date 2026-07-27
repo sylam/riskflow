@@ -11,3 +11,18 @@
 __pycache__/
 *.pyc
 tests/_stepper_out*/
+
+# generated docs site (riskflow_docs.py output)
+/docs/
+/mkdocs.yml
+
+# campaign & run outputs — curated result CSVs are committed explicitly from
+# artifacts/walk_forward/ top level; run directories are working data
+/artifacts/daily_runs/
+/artifacts/backtest/
+/artifacts/walk_forward/*/
+/artifacts/.~lock.*
+
+# IDE + notebook noise
+/.idea/
+.ipynb_checkpoints/
