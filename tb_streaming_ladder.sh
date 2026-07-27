@@ -62,7 +62,7 @@ python -u production_walk_forward.py \
     --start 2020-01 --months 24 --run-dir "$WF/armA2_gpu0" \
     > "$WF/armA2_gpu0.log" 2>&1 &
 A0=$!
-CUDA_VISIBLE_DEVICES=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python -u production_walk_forward.py \
     --spot-model garch --seeds 7 42 314 --batch 512 --streaming-batches 5 --fit-iters 40 \
     --start 2022-01 --months 24 --run-dir "$WF/armA2_gpu1" \
@@ -80,7 +80,7 @@ python -u production_walk_forward.py \
     --start 2020-01 --months 6 --run-dir "$WF/armB2_gpu0" \
     > "$WF/armB2_gpu0.log" 2>&1 &
 B0=$!
-CUDA_VISIBLE_DEVICES=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python -u production_walk_forward.py \
     --spot-model garch --seeds 7 42 314 --batch 2048 --streaming-batches 5 --fit-iters 40 \
     --start 2020-07 --months 6 --run-dir "$WF/armB2_gpu1" \
