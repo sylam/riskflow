@@ -6,13 +6,13 @@ written, so the deal vanishes from `DealStructure.tensor_marks()`, so the fork r
 `F_t1 = 0` for it, so the solver's expired-contract mask retires it from the hedge set. The run
 finishes and reports a verdict for a hedge book it silently shrank.
 
-Two classes are therefore distinguished and re-raised (`utils.is_fatal_pricing_error`): a violated
-curve window, and running out of memory — the failure mode the single-pass fork documents as its
-contract. Everything else keeps the skip, which is asserted here too, because base valuation and
-credit Monte Carlo depend on it.
+One class is therefore distinguished and re-raised (`utils.is_fatal_pricing_error`): running out
+of memory — the failure mode the single-pass fork documents as its contract. Everything else keeps
+the skip, which is asserted here too, because base valuation and credit Monte Carlo depend on it.
 
-The end-to-end gates rebuild the deal shapes the derived window was wrong for. Each asserts the
-answer, not just the absence of a crash: the windowed run must equal the unwindowed one.
+The end-to-end gates rebuild the deal shapes a fork's curve reads used to be predicted wrong for.
+Each asserts the ANSWER, not just the absence of a crash: the lazily built run must equal the one
+whose Hermite coefficients cover the whole block.
 """
 import copy
 import json as jsonlib
@@ -57,13 +57,6 @@ def _calculate(exc):
         Instrument=deal, Factor_dep={}, Time_dep=None, Calc_res=None))
 
 
-def test_a_window_violation_is_re_raised():
-    """The window is a CLAIM about what the caller reads. Swallowing the violation turns a wrong
-    claim into a wrong number instead of a stopped run."""
-    with pytest.raises(utils.CurveWindowError, match='does not cover this read'):
-        _calculate(utils.CurveWindowError('Hermite window ... does not cover this read.'))
-
-
 @pytest.mark.parametrize('exc', [
     torch.cuda.OutOfMemoryError('CUDA out of memory. Tried to allocate 2.67 GiB'),
     RuntimeError('CUDA out of memory. Tried to allocate 2.67 GiB'),
@@ -95,9 +88,9 @@ def test_build_features_follows_the_same_rule():
     """`build_features` has its own copy of the guard, and a leg swallowed there drops out of the
     liability accumulation, where a second leg's mark broadcasts over the (1,1) gap and the fork's
     shape check cannot see it."""
-    deal = _Boom(utils.CurveWindowError('window does not cover this read'))
+    deal = _Boom(MemoryError('host allocation failed'))
     data = utils.DealDataType(Instrument=deal, Factor_dep={}, Time_dep=None, Calc_res=None)
-    with pytest.raises(utils.CurveWindowError):
+    with pytest.raises(MemoryError):
         deal.build_features(_Shared(), None, data)
     deal.exc = ValueError('unpriceable')
     assert torch.equal(deal.build_features(_Shared(), None, data)['mtm'], torch.zeros(1, 1))
@@ -131,12 +124,22 @@ def _cfg(t_min):
     return cfg
 
 
-def _run(cfg, name, windowed=True, forks=None):
-    """One JSON-only run. `windowed=False` forces the pre-feature full-block path so the windowed
-    answer can be compared against it."""
-    original = HedgeMonteCarlo._hermite_window
-    if not windowed:
-        HedgeMonteCarlo._hermite_window = lambda self, cutoff, rows: None
+def _full_block(self, i00, i10):
+    """The pre-feature `hermite_params`: build g,c for the WHOLE block on the first gather,
+    ignoring the rows it names."""
+    if self.rows is None:
+        g, c = utils.hermite_interpolation_tensor(self.hermite_tenor, self.tensor)
+        self.interp_params = [p.reshape(-1, p.shape[-1]) for p in (g, c)]
+        self.rows = (0, self.tensor.shape[0] - 1)
+    return self.interp_params[0], self.interp_params[1], 0
+
+
+def _run(cfg, name, lazy=True, forks=None):
+    """One JSON-only run. `lazy=False` forces the pre-feature full-block build so the lazily
+    built answer can be compared against it."""
+    original = utils.Interpolation.hermite_params
+    if not lazy:
+        utils.Interpolation.hermite_params = _full_block
     original_fork = HedgeMonteCarlo._run_inner_mc_at_t
     if forks is not None:
         def record(self, t, *a, **kw):
@@ -151,7 +154,7 @@ def _run(cfg, name, windowed=True, forks=None):
         _, result = cx.run_job()
         return ((result.evaluation_summary or {}).get('diagnostics') or {}).get('V_0')
     finally:
-        HedgeMonteCarlo._hermite_window = original
+        utils.Interpolation.hermite_params = original
         HedgeMonteCarlo._run_inner_mc_at_t = original_fork
 
 
@@ -165,12 +168,12 @@ def test_an_averaging_tradable_is_priced_not_retired():
     cfg['Calc']['Calculation']['Hedging_Problem']['Tradable_Instruments']['FloatingEnergyDeal'] = \
         _energy_leg('PL_AVG_SWAP', '2026-04-15', '2026-07-31', '2026-08-05')
     forks = []
-    windowed = _run(copy.deepcopy(cfg), 'avg_tradable', forks=forks)
+    built = _run(copy.deepcopy(cfg), 'avg_tradable', forks=forks)
     assert forks, 'no inner-MC forks ran'
     assert all(f['PL_AVG_SWAP'] > 0.0 for f in forks), \
         'the averaging tradable is zero in some fork — it was retired from the hedge set'
-    assert windowed == _run(cfg, 'avg_tradable_off', windowed=False), \
-        'the windowed answer differs from the full-block one'
+    assert built == _run(cfg, 'avg_tradable_full', lazy=False), \
+        'the lazily built answer differs from the full-block one'
 
 
 def test_a_settlement_lagged_liability_solves():
@@ -183,7 +186,7 @@ def test_a_settlement_lagged_liability_solves():
         'Payment_Date'] = TS('2026-10-30')
     hp['Tradable_Instruments']['CashAccountDeal']['USD_CASH'][
         'Investment_Horizon'] = TS('2026-10-30')
-    assert _run(copy.deepcopy(cfg), 'lagged') == _run(cfg, 'lagged_off', windowed=False)
+    assert _run(copy.deepcopy(cfg), 'lagged') == _run(cfg, 'lagged_full', lazy=False)
 
 
 def test_a_bullet_sampled_leg_solves():
@@ -198,7 +201,20 @@ def test_a_bullet_sampled_leg_solves():
         'Investment_Horizon'] = TS('2026-08-20')
     cfg['Calc']['MergeMarketData']['ExplicitMarketData']['Price Factors'][
         'ForwardPriceSample.USD']['Sampling_Convention'] = 'ForwardPriceSampleBullet'
-    assert _run(copy.deepcopy(cfg), 'bullet') == _run(cfg, 'bullet_off', windowed=False)
+    assert _run(copy.deepcopy(cfg), 'bullet') == _run(cfg, 'bullet_full', lazy=False)
+
+
+def test_a_two_leg_liability_book_solves():
+    """Two averaging legs reading DIFFERENT depths of history. A single bound over the book had to
+    be the min of both, and the second leg's own reads had to already be inside it; the coefficients
+    now follow whichever leg gathers first and widen for the other."""
+    cfg = _cfg(t_min=113)
+    hp = cfg['Calc']['Calculation']['Hedging_Problem']
+    hp['Liabilities']['FloatingEnergyDeal'].update(
+        _energy_leg('PLAT_AUG29', '2026-05-01', '2026-08-31', '2026-09-04'))
+    hp['Tradable_Instruments']['CashAccountDeal']['USD_CASH'][
+        'Investment_Horizon'] = TS('2026-09-04')
+    assert _run(copy.deepcopy(cfg), 'two_leg') == _run(cfg, 'two_leg_full', lazy=False)
 
 
 def test_a_failed_tradable_inside_a_fork_stops_the_run():

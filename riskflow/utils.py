@@ -196,21 +196,13 @@ class InstrumentExpired(Exception):
         self.message = message
 
 
-class CurveWindowError(IndexError):
-    """A curve gather asked for a scenario row outside the window its caller DECLARED
-    (`Interpolation.eval`). Distinguished from an ordinary pricing failure because it means the
-    declaration is wrong, not that this deal cannot price on this grid — see
-    `is_fatal_pricing_error`. Subclasses IndexError so the raise reads the same to any caller
-    that only cares that a gather went out of range."""
-
-
 def is_fatal_pricing_error(e):
-    """Exceptions a deal-level pricing guard must NOT swallow into a scalar-0 mark: a declared
-    window violated, and the machine running out of memory. Both say the FRAMEWORK is wrong
-    rather than the deal, and both produce a silently missing mark if caught — inside an
-    inner-MC fork a missing tradable mark reads as an expired contract and retires the
-    instrument from the hedge set. Everything else keeps the canonical skip."""
-    return isinstance(e, (CurveWindowError, MemoryError, torch.cuda.OutOfMemoryError)) or (
+    """Exceptions a deal-level pricing guard must NOT swallow into a scalar-0 mark: the machine
+    running out of memory. That says the FRAMEWORK is wrong rather than the deal, and it produces
+    a silently missing mark if caught — inside an inner-MC fork a missing tradable mark reads as
+    an expired contract and retires the instrument from the hedge set. Everything else keeps the
+    canonical skip."""
+    return isinstance(e, (MemoryError, torch.cuda.OutOfMemoryError)) or (
         isinstance(e, RuntimeError) and 'out of memory' in str(e).lower())
 
 
@@ -401,17 +393,40 @@ class DateEqualList:
 
 
 class Interpolation(object):
-    def __init__(self, tensor, interp_params, row_offset=0):
+    def __init__(self, tensor, hermite_tenor=None):
         self.tensor = tensor
         self.indexed_tensor = tensor.reshape(-1, tensor.shape[-1])
-        # Flat row that `interp_params` row 0 corresponds to. 0 = params cover the whole block
-        # (every caller outside an inner-MC fork); non-zero = they were built for a window of
-        # scenario rows and `eval` shifts its gather by this much. The curve `tensor` itself is
-        # NEVER windowed — only the Hermite g/c pair is.
-        self.row_offset = row_offset
+        # Hermite only: the tenor grid the coefficient recursion runs over. The g,c pair is NOT
+        # built here — `hermite_params` builds it for the scenario rows a gather names. None for
+        # every other interpolation kind, which needs no parameters at all.
+        self.hermite_tenor = hermite_tenor
         self.interp_params = []
-        for param in interp_params:
-            self.interp_params.append(param.reshape(-1, param.shape[-1]))
+        self.rows = None            # scenario rows g,c currently cover, [lo, hi]
+        self.row_offset = 0         # flat row `interp_params` row 0 corresponds to = lo * n_tenors
+
+    def hermite_params(self, i00, i10):
+        """g,c covering the scenario rows THIS gather indexes, plus the flat offset they start at.
+        The recursion in `hermite_interpolation_tensor` couples along the TENOR axis only, so a
+        scenario row's coefficients depend on that row alone: building a row slice is exact, not
+        an approximation. Deferring to the gather is what makes that usable — construction was
+        eager over the whole block while consumption is sparse (measured on the production book:
+        the forks' spans cover 11% of their blocks, mean 7.3 rows of 64) — and the gather states
+        the rows it needs, so nothing has to predict them. A later gather reaching outside
+        rebuilds the union span; an empty gather (a step with no resets in range) names no rows
+        and keeps what is built."""
+        n_tenors = self.tensor.shape[1]
+        if i00.numel():
+            bounds = (i00.min(), i00.max()) if i10 is None else (
+                torch.minimum(i00.min(), i10.min()), torch.maximum(i00.max(), i10.max()))
+            lo, hi = [int(b) // n_tenors for b in torch.stack(bounds).tolist()]
+            rows = (lo, hi) if self.rows is None else (min(lo, self.rows[0]), max(hi, self.rows[1]))
+        else:
+            rows = self.rows or (0, 0)
+        if rows != self.rows:
+            g, c = hermite_interpolation_tensor(self.hermite_tenor, self.tensor[rows[0]:rows[1] + 1])
+            self.interp_params = [p.reshape(-1, p.shape[-1]) for p in (g, c)]
+            self.rows, self.row_offset = rows, rows[0] * n_tenors
+        return self.interp_params[0], self.interp_params[1], self.row_offset
 
     @staticmethod
     def calculate_indices(t_index, t_index_next, i1, i2):
@@ -448,35 +463,17 @@ class Interpolation(object):
         mult = tenors if time_factor else 1.0
 
         if kind.startswith("Hermite"):
-            g, c = self.interp_params
-            if self.row_offset:
-                # Windowed params: shift into the window. A row below it would become a NEGATIVE
-                # index and silently wrap to the end of the block, so it is checked and raised —
-                # the window is a claim about what the caller reads, and a wrong claim must be
-                # loud (a silent wrap is a wrong curve, not a crash).
-                j00 = i00 - self.row_offset
-                # `numel()` first: a step with no resets in range gathers an EMPTY index set,
-                # and min() on an empty tensor raises for the wrong reason.
-                if j00.numel() and int(j00.min()) < 0:
-                    raise CurveWindowError(
-                        f'Hermite window starts at flat row {self.row_offset} but a gather asked '
-                        f'for {int(i00.min())} — the window does not cover this read.')
-                val = calc_hermite_curve(w2, g[j00,], c[j00,], tensor[i00,], tensor[i01,])
-                if alpha is not None:
-                    j10 = i10 - self.row_offset
-                    if j10.numel() and int(j10.min()) < 0:
-                        raise CurveWindowError(
-                            f'Hermite window starts at flat row {self.row_offset} but a gather '
-                            f'asked for {int(i10.min())} — the window does not cover this read.')
-                    val_t1 = calc_hermite_curve(w2, g[j10,], c[j10,], tensor[i10,], tensor[i11,])
-                    val = (1 - alpha) * val + alpha * val_t1
-            else:
-                val = calc_hermite_curve(w2, g[i00,], c[i00,], tensor[i00,], tensor[i01,])
+            # g,c are built here, for these rows (see `hermite_params`); `ofs` shifts the gather
+            # into them. The curve `tensor` itself is never sliced — only the coefficient pair is.
+            g, c, ofs = self.hermite_params(i00, i10 if alpha is not None else None)
+            j00 = i00 - ofs if ofs else i00
+            val = calc_hermite_curve(w2, g[j00,], c[j00,], tensor[i00,], tensor[i01,])
 
-                if alpha is not None:
-                    # need to linearly interpolate between 2 time points
-                    val_t1 = calc_hermite_curve(w2, g[i10,], c[i10,], tensor[i10,], tensor[i11,])
-                    val = (1 - alpha) * val + alpha * val_t1
+            if alpha is not None:
+                # need to linearly interpolate between 2 time points
+                j10 = i10 - ofs if ofs else i10
+                val_t1 = calc_hermite_curve(w2, g[j10,], c[j10,], tensor[i10,], tensor[i11,])
+                val = (1 - alpha) * val + alpha * val_t1
         else:
             w1 = 1.0 - w2
             # default to linear
@@ -613,11 +610,6 @@ class Calculation_State(object):
         self.MCMC_sims = mcmc_sims
         # keep individual calculation results per dependency?
         self.keep_tensor = keep_tensor
-        # Hermite coefficient window: `(lo, hi)` scenario rows, or None. Set ONLY by the inner-MC
-        # fork around its pricing pass — every other calculation (base valuation, credit MC, the
-        # outer hedge loop) leaves it None and gets the full-block code path untouched. See
-        # `make_curve_tensor`.
-        self.hermite_window = None
 
 
 # often we need a numpy array and its tensor equivalent at the same time
@@ -924,26 +916,6 @@ class TensorCashFlows(TensorSchedule):
     def last_pay_day(self):
         """Latest payment day (offset in days from base_date)."""
         return float(self.schedule[:, CASHFLOW_INDEX_Pay_Day].max())
-
-    def deepest_reset_row(self):
-        """The deepest SCENARIO ROW a reset-driven pricer can gather off this schedule — read
-        from the predicate that selects them rather than from the schedule's intent. The energy
-        pricer takes `sim_resets = schedule[(Scenario > -1) & (Reset_Day <= deal_time.max())]`
-        (`pricing.pv_energy_cashflows`) and gathers every one of them at its own
-        `RESET_INDEX_Scenario` row, which IS the row a curve block is indexed by. That predicate
-        has no lower bound and no cashflow-start filter, so the deepest row is simply the
-        smallest simulated `Scenario` in the whole schedule: the reset->payment settlement lag,
-        the elapsed periods of a multi-period leg and a bullet period's single fixing are all
-        covered by construction. `inf` when nothing is simulated (a fixed or fully-fixed leg
-        reads no row below the step it is priced at).
-
-        This is the DECLARED history bound the inner-MC fork windows its Hermite coefficients
-        by; it is read off the schedule, never inferred from a measured run."""
-        if self.Resets is None:
-            return np.inf
-        rows = self.Resets.schedule[:, RESET_INDEX_Scenario]
-        rows = rows[rows > -1]
-        return float(rows.min()) if rows.size else np.inf
 
     def known_fx_resets(self, num_scenarios, index=CASHFLOW_INDEX_FXResetValue,
                         filter_index=CASHFLOW_INDEX_FXResetDate):
@@ -2618,11 +2590,6 @@ def make_curve_tensor(tensor, curve_component, time_grid, shared, n_batch_dims=1
         tensor = tensor.reshape(*tensor.shape[:-n_batch_dims], -1)
     key_code = (curve_component[FACTOR_INDEX_Tenor_Index].type, curve_component[:2],
                 tuple(tensor.shape))
-    # A windowed entry is only valid for ITS window, so the window joins the cache key. The
-    # default (None) key is left exactly as it was — an unwindowed run cannot collide with a
-    # windowed one, and two forks at different steps cannot reuse each other's coefficients.
-    if getattr(shared, 'hermite_window', None) is not None:
-        key_code = key_code + (shared.hermite_window,)
 
     def calc_interpolation(code, curve_tenor, sub_tensor):
         if code != 'Linear':
@@ -2637,28 +2604,16 @@ def make_curve_tensor(tensor, curve_component, time_grid, shared, n_batch_dims=1
             if code == 'HermiteRT':
                 mod_tenor = sub_tensor * t
 
-            # ROW-RESTRICTED POPULATION. The Hermite recursion couples along the TENOR axis only
-            # (every difference in `hermite_interpolation_tensor` is taken over dim 1), so a
-            # scenario row's g,c depend on that row alone — slicing dim 0 is exact, not an
-            # approximation. `shared.hermite_window` is set ONLY by the inner-MC fork, which
-            # reads a bounded window of rows around its own step while the block spans the whole
-            # grid; measured on three worlds, forks read 0.7% of rows inside a window of ~30%,
-            # and the outer/base-valuation/credit-MC callers read the full block and leave the
-            # window None. None => the original full-block call, byte for byte.
-            window = getattr(shared, 'hermite_window', None)
-            if window is not None:
-                lo, hi = window
-                lo = max(0, min(lo, mod_tenor.shape[0] - 1))
-                hi = max(lo, min(hi, mod_tenor.shape[0] - 1))
-                g, c = hermite_interpolation_tensor(t, mod_tenor[lo:hi + 1])
-                return Interpolation(mod_tenor, [g, c], row_offset=lo * mod_tenor.shape[1])
-            g, c = hermite_interpolation_tensor(t, mod_tenor)
-            return Interpolation(mod_tenor, [g, c])
+            # DEFERRED POPULATION. g,c are built by the first gather, for the scenario rows that
+            # gather indexes (`Interpolation.hermite_params`). An inner-MC fork reads a bounded
+            # slice around its own step; the outer / base-valuation / credit-MC callers read every
+            # row and get the full block, built on their first read instead of at construction.
+            return Interpolation(mod_tenor, hermite_tenor=t)
 
         elif code == 'LinearRT':
-            return Interpolation(sub_tensor * t, [])
+            return Interpolation(sub_tensor * t)
         else:
-            return Interpolation(sub_tensor, [])
+            return Interpolation(sub_tensor)
 
     if key_code not in shared.t_Buffer:
         interpolation_spec = key_code[0]
@@ -2731,7 +2686,7 @@ def calc_time_grid_spot_rate(rate, time_grid, shared):
         for r in rate:
             if r[FACTOR_INDEX_Stoch]:
                 tensor = shared.t_Scenario_Buffer[r[FACTOR_INDEX_Offset]]
-                component = gather_scenario_interp(Interpolation(tensor, []), time_grid, shared, as_curve_tensor=False)
+                component = gather_scenario_interp(Interpolation(tensor), time_grid, shared, as_curve_tensor=False)
             else:
                 tensor = shared.t_Static_Buffer[r[FACTOR_INDEX_Offset]]
                 component = tensor.reshape(1, -1)

@@ -233,24 +233,12 @@ class DealStructure(object):
         sub_structures the way `resolve_hedge_structure` does): summed |notional| across
         all legs and the latest pay-day. Legs with no schedule contribute (0.0, None)."""
         total_volume, last_payment_day = 0.0, None
-        for vol, pay in ([dd.Instrument.leg_descriptors(dd)[:2] for dd in self.dependencies] +
+        for vol, pay in ([dd.Instrument.leg_descriptors(dd) for dd in self.dependencies] +
                          [sub.aggregate_leg_descriptors() for sub in self.sub_structures]):
             total_volume += vol
             if pay is not None:
                 last_payment_day = pay if last_payment_day is None else max(last_payment_day, pay)
         return total_volume, last_payment_day
-
-    def history_declarations(self):
-        """`{deal Reference: deepest scenario row that deal's pricer can gather}` over this
-        structure (same walk as `resolve_hedge_structure`). `inf` = declared to read nothing
-        below the step it is priced at; None = the deal does not declare a bound, which is what
-        makes the fork's Hermite window fail-safe (see `HedgeMonteCarlo._hermite_floor_row`)."""
-        declared = {}
-        for sub in self.sub_structures:
-            declared.update(sub.history_declarations())
-        for dd in self.dependencies:
-            declared[dd.Instrument.field.get('Reference')] = dd.Instrument.leg_descriptors(dd)[2]
-        return declared
 
     def tensor_marks(self):
         """Stored per-deal price series keyed by deal Reference, recursing sub_structures
@@ -1901,23 +1889,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         `last_settlement_index`."""
         return self.liabilities.aggregate_leg_descriptors()
 
-    def _hermite_floor_row(self):
-        """The deepest scenario row ANY deal priced inside an inner-MC fork can gather — the min
-        over BOTH structures the fork prices, because one window covers both: the fork resolves
-        `netting_sets` (the tradables) and `liabilities` under the same `shared.hermite_window`.
-        `inf` when every deal declared it reads nothing below its own step; `None` when a deal did
-        not declare, which switches the window off for the whole book (fail-safe — a window sized
-        from the deals that did declare would be too tight for the one that did not)."""
-        declared = dict(self.netting_sets.history_declarations(),
-                        **self.liabilities.history_declarations())
-        undeclared = sorted(ref for ref, row in declared.items() if row is None)
-        if undeclared:
-            logging.info(
-                'Hermite fork window OFF: %s declare(s) no history bound, so inner-MC forks '
-                'build the full curve block', ', '.join(undeclared))
-            return None
-        return min(declared.values(), default=np.inf)
-
     def execute(self, params, job_id=0, num_jobs=1):
         """Simulate the scenario engine over batches, accumulate the tensor bundle
         (tradable prices, liability MtM, factor paths), then hand it to the configured
@@ -2020,7 +1991,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
          privileged_factor_blocks) = _new_blocks()
         # Static liability descriptors (read off the cashflow schedules, batch-independent).
         total_leg_volume, last_payment_day = self._liability_schedule_scalars()
-        self._hermite_floor = self._hermite_floor_row()
         # get the calendar for business day
         bus_day = self.config.holidays.get(
             self.params['Calendar'], {'businessday': pd.offsets.BDay(1)})['businessday']
@@ -2391,22 +2361,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 with_grad=True, outer_rows=outer_rows,
                 max_inner_steps=1 if one_step else None)
 
-    def _hermite_window(self, cutoff_idx, n_inner_rows):
-        """Rows of the curve block this fork's Hermite coefficients must cover: back to the
-        deepest row any deal it prices can gather, forward across the inner rows it generates.
-        `None` when a deal did not declare a bound — then no window is applied and the full block
-        is built, exactly as before.
-
-        The floor is a scenario ROW, not a span in days: `_hermite_floor_row` reads it off the
-        same `RESET_INDEX_Scenario` column the pricer's gather is indexed by, so there is no
-        day->row conversion to be off by and no dependence on where `cutoff_idx` sits. A read
-        below the window raises `utils.CurveWindowError` — if this derivation is wrong the run
-        stops rather than silently interpolating off the wrong rows."""
-        floor_row = self._hermite_floor
-        if floor_row is None:
-            return None
-        return (int(min(floor_row, cutoff_idx)), cutoff_idx + n_inner_rows)
-
     def _run_inner_mc_at_t(self, t, outer_scenario_buffer, shared_mem, base_date,
                            tradable_refs, want_raw_samples=True, with_grad=False,
                            max_inner_steps=None, outer_rows=None):
@@ -2507,12 +2461,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # over an outer-path SLICE would otherwise leave the state slice-sized, which is invisible
         # while forks only follow forks but corrupts the next outer batch under streaming.
         borrowed_batch, borrowed_fill = shared_mem.simulation_batch, shared_mem.fillvalue
-        # Hermite coefficient window (utils.make_curve_tensor): this fork prices a bounded slice
-        # of the grid — the inner rows it just generated, plus the realized history the deals it
-        # prices still reference — while the curve block spans the whole grid. The bound is
-        # DERIVED from the book's own schedules (`_hermite_window`), so it travels with the deals
-        # instead of being a constant that is either unsafe or inert.
-        window = self._hermite_window(cutoff_idx, int(inner_time_grid.scen_time_grid.size))
         with grad_ctx:
             try:
                 shared_mem.simulation_batch = B_outer
@@ -2576,12 +2524,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
                 # Single-pass pricing — the chunk is sized so B_flat fits the memory budget.
                 shared_mem.t_Buffer.clear()
-                # The window is in OUTER block-row coordinates and only the pricing pass runs in
-                # them: generation above prices nothing and builds its curves against the shifted
-                # `inner_time_grid`, whose rows are 0..n_inner. Installed here, cleared in the
-                # finally — so only the fork's pricing is windowed and every other caller builds
-                # the full block.
-                shared_mem.hermite_window = window
                 shared_mem.simulation_batch = B_flat
                 # `fillvalue` is a batch-sized empty tensor frozen at State construction (the
                 # energy-leg reset code uses it as the empty-cat fallback) — it must track the
@@ -2699,7 +2641,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 # flat-sized, so the NEXT chunk / t-step failed on shapes instead of the real cause.
                 # Restored to what the fork FOUND, not to this fork's own width: outer generation
                 # resumes on the same state under streaming.
-                shared_mem.hermite_window = None
                 shared_mem.simulation_batch = borrowed_batch
                 shared_mem.fillvalue = borrowed_fill
                 shared_mem.t_Buffer.clear()
