@@ -25,6 +25,7 @@ import torch
 BASE = pd.Timestamp('2024-06-28')
 TENORS = [0.003, 0.083, 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 30.0]
 RATES = [0.052, 0.051, 0.049, 0.047, 0.045, 0.043, 0.039, 0.037, 0.036, 0.037, 0.038, 0.039]
+N_DEALS = int(os.environ.get('HERMITE_DEALS', 104))     # weekly expiries -> a 2-year deal grid
 
 
 def snap(v):
@@ -86,9 +87,11 @@ def book(interp='Hermite'):
         'Payoff_Currency': 'USD', 'Equity': 'EQ', 'Dividends': 'EQ', 'Discount_Rate': 'USD-OIS',
         'Equity_Volatility': 'EQ', 'Buy_Sell': 'Buy' if k % 2 else 'Sell',
         'Option_Style': 'European', 'Option_Type': 'Call' if k % 3 else 'Put',
-        'Strike_Price': 80.0 + 10.0 * k, 'Units': 10.0 + k,
-        'Expiry_Date': BASE + pd.DateOffset(months=6 * (k + 1)),
-    }, {}) for k in range(6)]
+        'Strike_Price': 80.0 + 0.5 * k, 'Units': 10.0 + k,
+        # WEEKLY expiries, ascending: each deal's grid ends one scenario row deeper than the last,
+        # which is the shape that made the shared per-factor Interpolation widen a row at a time.
+        'Expiry_Date': BASE + pd.DateOffset(weeks=k + 1),
+    }, {}) for k in range(N_DEALS)]
     cfg.deals = {'Attributes': {'Reference': 'shared_stack', 'Tag_Titles': ''},
                  'Deals': {'Children': [{'Instrument': d} for d in deals]},
                  'Calculation': {'Base_Date': BASE, 'Currency': 'USD'}}
@@ -121,33 +124,44 @@ def measure(label, fn):
             'peak_reserved_MiB': round(torch.cuda.max_memory_reserved() / 2**20, 1)}
 
 
-# `Dynamic_Scenario_Dates` makes scenario dates == mtm dates, so the SPARSE arm gathers 3 scenario
-# rows under heavy time interpolation (alpha non-null everywhere) and the DENSE arm gathers ~157
-# rows with alpha null — the two opposite ends of the row-span/route logic, on the same book.
+# `Time_grid` sets the base mtm dates AND (via `parse_grid`) the sparse scenario grid; the deals'
+# weekly expiries add ~N_DEALS more mtm dates on top. `Dynamic_Scenario_Dates` then makes scenario
+# dates == mtm dates. So the SPARSE arm reads a MONTHLY scenario block under heavy time
+# interpolation (alpha non-null at most mtm points) and the DENSE arm reads a weekly one with alpha
+# null — the two ends of the row-span/route logic, both deep, on the same book.
+#
+# `1m(1m)` is "a point at 1 month, then step 1 month" — a token is offset(step) and the step runs
+# to the NEXT token's offset (or the last deal date). `1w(3y)` would be a 1-week point and then one
+# 3-year stride past the end of the book, i.e. a TWO-date grid; it read like "weekly for 3 years"
+# and quietly made every arm 8 scenario rows deep.
+GRID = '0d 1m(1m)'
 ARMS = [(kind, dense) for kind in ('Hermite', 'HermiteRT', 'Linear') for dense in (False, True)]
 
 
 def run(out_path):
     import riskflow as rf
     tally = instrument()
-    out, builds = {}, 0
+    out = {}
     for kind, dense in ARMS:
         if not dense:                                   # base valuation has no scenario grid to vary
             tally.update(builds=0, rows=0)
             bv = measure(f'BaseVal/{kind}', lambda: rf.run_baseval(
-                book(kind), overrides={'MCMC_Simulations': 8192, 'Random_Seed': 5})[1])
+                book(kind), overrides={'MCMC_Simulations': 2048, 'Random_Seed': 5})[1])
             bv['hermite'] = dict(tally)
             out[f'bv/{kind}'] = bv
         tally.update(builds=0, rows=0)
         cmc = measure(f'CMC/{kind}/{"dense" if dense else "sparse"}', lambda: rf.run_cmc(
             book(kind), overrides={
-                'Time_grid': '0d 1w(3y)', 'Batch_Size': 8192, 'Simulation_Batches': 4,
+                'Time_grid': GRID, 'Batch_Size': 2048, 'Simulation_Batches': 2,
                 'Random_Seed': 5, 'Percentile': '95',
                 'Dynamic_Scenario_Dates': 'Yes' if dense else 'No'})[1]['Results'])
         cmc['hermite'] = dict(tally)
         out[f'cmc/{kind}/{dense}'] = cmc
-        builds += cmc['hermite']['builds'] if kind.startswith('Hermite') else 0
-    assert builds, 'the Hermite branch never ran'
+    # per-arm, not aggregate: one arm carrying the whole book's Hermite work would let the other
+    # five go vacuous with the gate still green.
+    for key, r in out.items():
+        assert r['hermite']['builds'] == 0 if 'Linear' in key else r['hermite']['builds'], \
+            f'{key}: hermite builds {r["hermite"]["builds"]}'
     torch.save(out, out_path)
     for r in out.values():
         print(f"{r['label']:22} wall {r['wall_s']:7.2f}s  peak alloc {r['peak_alloc_MiB']:9.1f} MiB"
