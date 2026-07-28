@@ -72,29 +72,20 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
 - **Bundle + runtime**: `Bundle.from_batch` + `construct_hedge_runtime` + `run_hedge_execution`; in `solve_hedge` mode the bundle carries `inner_mc` / `inner_mc_grad` closures that fork inner MC on demand from the cached outer buffer.
 - **Streaming** (`Solver.DiffV2_Streaming_Batches='Yes'`, the adopted production mode): a bundle per batch, handed to a persistent solver as it is built — `StreamingSolve.warmup` on batch 1 (which locks the frame), `step` on each later batch, `finish` on a held-out final batch. Fork width follows `Batch_Size`, not the whole simulation. The end-to-end reproduction gate is `tb_wf_smoke_gate.sh` (trade 202001, 512x5 batches, seed 7); it replaced the non-streaming `--batch 2048` anchor, which no longer fits single-pass.
 
-!!! note "Row-restricted Hermite coefficients (inner-MC forks only)"
-    `make_curve_tensor` builds the Hermite `g,c` pair per scenario row, and the recursion couples
-    along the TENOR axis only — so a row's coefficients depend on that row alone and the block can
-    be built for a slice of rows. Inside an inner-MC fork it is: the fork sets
-    `shared.hermite_window` to the rows it can reach, and `Interpolation.eval` shifts its gather by
-    the matching offset. Every other caller — base valuation, credit Monte Carlo, the outer hedge
-    loop — leaves the window None and builds the full block, byte for byte as before.
+!!! note "Hermite coefficients are built by the gather that reads them"
+    `make_curve_tensor` defers the Hermite `g,c` pair: the recursion couples along the TENOR axis
+    only, so a row's coefficients depend on that row alone. `Interpolation` therefore holds the
+    curve tensor and the tenor grid, and on its first `eval` takes min/max of the gather's own flat
+    indices, builds `g,c` for exactly that row span, and stores the span next to them. A later eval
+    inside the span reuses; outside it, the span extends. Nothing declares, predicts or bounds the
+    rows in advance — the reader names them — so there is no window to violate and no failure mode
+    that depends on a prediction holding. Every caller behaves the same way, inner fork or not.
 
-    The bound is DERIVED, never guessed, and it is a scenario ROW rather than a span in days:
-    `TensorCashFlows.deepest_reset_row` returns the smallest `RESET_INDEX_Scenario` the energy
-    pricer's own `sim_resets` predicate can select — the column the gather is indexed by — so the
-    reset→payment settlement lag, a multi-period leg's elapsed schedule and a bullet period's
-    single fixing are covered by construction, with no day→row conversion to be off by.
-    `leg_descriptors` publishes it per deal (`prices_at_step_only = True` declares "nothing below
-    my own step"), and `HedgeMonteCarlo._hermite_floor_row` mins it over BOTH structures the fork
-    prices — the tradables and the liabilities, since one window covers both. A deal that does not
-    declare a bound returns None and switches the window off for the whole book, naming itself in
-    the log. A gather below the window raises `utils.CurveWindowError`, which `Deal.calculate`
-    re-raises instead of swallowing into a scalar-0 mark (so does a CUDA OOM) — a swallowed mark
-    vanishes from `tensor_marks`, which a fork reads as an expired contract.
-
-    Measured on the production walk-forward book: peak 18.3 -> 8.1 GiB at 1280x64 (trade wall
-    125 -> 109 s), and 2048x64 — which OOMs without the window — completes at 12.3 GiB.
+    Measured on the production walk-forward book at 1280x64: mean span 7.25 rows of 63.96 (11.3%),
+    peak 15.2 -> 6.3 GiB allocated against an eager full-block build, at identical wall time
+    (170.0 s vs 170.3 s). `Deal.calculate` re-raises `is_fatal_pricing_error` classes (CUDA OOM)
+    instead of swallowing them into a scalar-0 mark — a swallowed mark vanishes from `tensor_marks`,
+    which a fork reads as an expired contract and the solver's `live` mask then retires.
 
 !!! warning "Invariant — `Z.ndim` dispatch (outer vs inner MC)"
     `generate()` must handle both outer (`Z.ndim==2`, `(T,B)`) and inner (`Z.ndim==3`, `(T,B,B2)`) modes, with the per-outer-path initial state broadcast on the **middle** axis in inner mode. This is what lets one process instance serve both loops.
