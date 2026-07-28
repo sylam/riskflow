@@ -70,6 +70,20 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
 - **Inner-MC shared state** (`_init_shared_mem`): builds `CMC_State_Inner` so one `shared_mem` hosts outer mode (`reset()`, pseudo-random `(F,T,B)`) and inner mode (`reset_inner()`, Sobol quasi-random `(F,T,B,B2)`); processes dispatch on `Z.ndim`.
 - **Generate loop** adds: optional `Randomize_Initial_State` burn-in; `Observed_Scenario` path substitution + `reseed_from_path` (walk-forward replay); leafing the declared spot (`requires_grad_(True)`) for base-delta AAD; snapshotting the full outer `t_Scenario_Buffer` for on-demand inner forking. Marks are **harvested, not aggregated**: liability MTM via `resolve_hedge_structure` (post-process-free — no per-batch GPU→CPU copy), tradable tensors via `tensor_marks`.
 - **Bundle + runtime**: `Bundle.from_batch` + `construct_hedge_runtime` + `run_hedge_execution`; in `solve_hedge` mode the bundle carries `inner_mc` / `inner_mc_grad` closures that fork inner MC on demand from the cached outer buffer.
+- **Streaming** (`Solver.DiffV2_Streaming_Batches='Yes'`, the adopted production mode): a bundle per batch, handed to a persistent solver as it is built — `StreamingSolve.warmup` on batch 1 (which locks the frame), `step` on each later batch, `finish` on a held-out final batch. Fork width follows `Batch_Size`, not the whole simulation. The end-to-end reproduction gate is `tb_wf_smoke_gate.sh` (trade 202001, 512x5 batches, seed 7); it replaced the non-streaming `--batch 2048` anchor, which no longer fits single-pass.
+
+!!! note "Queued memory work — row-restricted Hermite coefficients (MEASURED, not merged)"
+    `make_curve_tensor` builds the Hermite `g,c` pair for every `(scen x n_tenors)` row of a curve
+    block at cache-population time. Measured at the recommended operating point (1280x64,
+    `tb_hermite_census.py`): **13.32 GiB** of `g,c` allocated over a run, largest single entry
+    **2.23 GiB**, and consumers gather a mean **2.61%** of the rows — so **~13 GiB is recoverable**
+    and ~2.2 GiB of the 9.26 GiB peak is the largest entry's unused rows. Deferring the build to
+    first gather saves **0.002 GiB** (a null: the un-gathered entries are tiny), so the fix is row
+    restriction, not laziness. Projected: brings `2048x64` back to ~19 GiB on the production world
+    (from the 23.5 GiB that OOMs) and buys ~+308 outer paths at 1280. NOT implemented: it needs
+    index translation in `Interpolation.eval`'s gather (`i00 = t_index + i1` remapped into the
+    restricted block) inside the curve stack `base_valuation` and `credit_monte_carlo` also price
+    through — a maintainer decision, with the numbers above as the case.
 
 !!! warning "Invariant — `Z.ndim` dispatch (outer vs inner MC)"
     `generate()` must handle both outer (`Z.ndim==2`, `(T,B)`) and inner (`Z.ndim==3`, `(T,B,B2)`) modes, with the per-outer-path initial state broadcast on the **middle** axis in inner mode. This is what lets one process instance serve both loops.
