@@ -1226,7 +1226,16 @@ class DiffSolverV2:
         """Continue training on a FRESH batch: re-bind, rebuild the exploration bank and the
         inner-MC cache on the new paths, then sweep again with the same nets, the same optimizer
         moments and the frozen frame. Fresh paths per fit step are the point — overfitting to one
-        simulated set stops being structurally possible."""
+        simulated set stops being structurally possible.
+
+        A LOADED checkpoint means evaluation, so there is nothing to continue: `warmup` skipped
+        its sweep and the value function is the file's. Sweeping here would fine-tune the
+        "frozen" policy on the evaluation world — batch by batch, with the verdict then reported
+        for a policy that is not the checkpoint and is never written anywhere."""
+        if self.loaded is not None:
+            logging.info("DiffSolverV2 streaming step SKIPPED: value fn loaded — frozen-policy "
+                         "eval, so this batch trains nothing")
+            return
         self._bind(bundle)
         W_bank, _q_bank = self._build_bank(self.gen)
         self.inner_cache = {t: self._inner_step(t) for t in self.sweep_ts}
@@ -1297,6 +1306,10 @@ class DiffSolverV2:
         # HedgeRuntimeExecutionResult.policy_artifact) AND torch.saved to DiffV2_Save_Value_Fn
         # — the file and the in-memory dict are byte-for-byte the same object, so the
         # eval-from-artifact path (load member = this dict) is identical to loading the file.
+        # A LOADED run produces none: nothing was fitted, so the only policy in play is the
+        # file's and re-emitting it would claim this run as its provenance. The JSON boundary
+        # rejects a config that asks to save one anyway, so `save_path` is empty here whenever
+        # `loaded` is set.
         artifact = None
         save_path = str(self.cfg.get("diffv2_save_value_fn", "") or "")
         if loaded is None:
@@ -1476,8 +1489,10 @@ class StreamingSolve:
             self.solvers[0].B_outer, len(self.solvers), self.solvers[0].utility_scale)
 
     def step(self, bundle):
-        """A later batch: continue the same nets on fresh paths under the frozen frame."""
-        self.trained_batches += 1
+        """A later batch: continue the same nets on fresh paths under the frozen frame. With a
+        checkpoint loaded the solvers train nothing (a frozen-policy eval), so the batch is just
+        consumed and `trained_batches` does not move."""
+        self.trained_batches += self.solvers[0].loaded is None
         logging.info("StreamingSolve STEP on batch %d (%d outer paths)",
                      self.trained_batches, int(bundle.liability_sim.shape[-1]))
         for solver in self.solvers:

@@ -268,6 +268,9 @@ def _solver_config(solver_config: Optional[Mapping[str, Any]]) -> Optional[Dict[
         # policy under a stressed one). Load accepts a LIST of checkpoint paths for an
         # ENSEMBLE-argmax eval: each member evaluated in its own standardization frame, the
         # continuations averaged before the argmax (cross-fit winner's-curse reduction).
+        # Train and evaluate are SEPARATE runs: loading skips every fit step under streaming too
+        # (`DiffSolverV2.step` no-ops), so a frozen policy stays frozen batch after batch, and
+        # setting both keys at once raises rather than silently discarding a retrained net.
         "diffv2_save_value_fn": str(solver_config.get("DiffV2_Save_Value_Fn", "") or ""),
         "diffv2_load_value_fn":
             ([str(p) for p in solver_config["DiffV2_Load_Value_Fn"]]
@@ -355,6 +358,11 @@ def construct_hedge_runtime(
                 "Solver.DiffV2_Streaming_Batches='Yes' requires Simulation_Batches >= 3 "
                 f"(warmup + at least one step + the held-out batch); got "
                 f"{config.get('Simulation_Batches')}.")
+        if solver_config.get("DiffV2_Load_Value_Fn") and solver_config.get("DiffV2_Save_Value_Fn"):
+            raise ValueError(
+                "Solver.DiffV2_Save_Value_Fn is set alongside DiffV2_Load_Value_Fn: a loaded "
+                "checkpoint is a frozen-policy EVALUATION and fits nothing, so there is no new "
+                "value fn to write. Train (save) and evaluate (load) are separate runs.")
         if str((objective_config or {}).get("Object", "")).lower() not in _UTILITY_OBJECTS:
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires a utility Objective.Object — one of "
