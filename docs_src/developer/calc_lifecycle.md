@@ -77,9 +77,17 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
     only, so a row's coefficients depend on that row alone. `Interpolation` therefore holds the
     curve tensor and the tenor grid, and on its first `eval` takes min/max of the gather's own flat
     indices, builds `g,c` for exactly that row span, and stores the span next to them. A later eval
-    inside the span reuses; outside it, the span extends. Nothing declares, predicts or bounds the
-    rows in advance — the reader names them — so there is no window to violate and no failure mode
-    that depends on a prediction holding. Every caller behaves the same way, inner fork or not.
+    inside the span reuses; outside it, the span extends and only the ADDED rows are built, spliced
+    onto what is there. Nothing declares, predicts or bounds the rows in advance — the reader names
+    them — so there is no window to violate and no failure mode that depends on a prediction
+    holding. Every caller behaves the same way, inner fork or not.
+
+    The splice is not an optimisation of the fork, which barely widens (2 450 of 2 476 objects on
+    the production book widen exactly once). It is what makes the shared case safe: ONE
+    `Interpolation` is cached per curve factor and gathered by every deal through its own deal
+    grid, so a credit-MC book priced in ascending maturity widens a row at a time. Re-deriving the
+    union each time cost 7 501 coefficient rows for a 121-row block against 127 spliced — and made
+    the batch wall depend on deal order.
 
     Measured on the production walk-forward book at 1280x64: mean span 7.25 rows of 63.96 (11.3%)
     across all 375 forks — but the MEAN does not set peak memory. The peak fork (the first grad

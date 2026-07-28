@@ -507,6 +507,8 @@ class Interpolation(object):
         read reaches `index + 1`, so a row just below a cut reads ACROSS it and names two blocks —
         classify on where a read ENDS, not where it starts. Decided from the numpy indices a
         `CurveTensor` already holds, so it costs no device sync."""
+        if not self.cuts.size:
+            return WHOLE_GRID       # no interior cut: every row is in the one group, whole
         hi = np.minimum(index + 1, self.shape[0] - 1) if has_alpha else index
         at_t = np.searchsorted(self.cuts, index, side='right')
         at_t1 = np.searchsorted(self.cuts, hi, side='right')
@@ -547,6 +549,11 @@ class Interpolation(object):
 
         return self.routed(route, index.shape[0], group)
 
+    def hermite_rows(self, lo, hi):
+        """The g,c pair for scenario rows [lo, hi], flattened to the (row, tenor) gather axis."""
+        return [p.reshape(-1, p.shape[-1]) for p in
+                hermite_interpolation_tensor(self.hermite_tenor, self.tensor[lo:hi + 1])]
+
     def hermite_params(self, i00, i10):
         """g,c covering the scenario rows THIS gather indexes, plus the flat offset they start at.
         The recursion in `hermite_interpolation_tensor` couples along the TENOR axis only, so a
@@ -554,9 +561,16 @@ class Interpolation(object):
         an approximation. Deferring to the gather is what makes that usable — construction was
         eager over the whole block while consumption is sparse (measured on the production book:
         the forks' spans cover 11% of their blocks, mean 7.3 rows of 64) — and the gather states
-        the rows it needs, so nothing has to predict them. A later gather reaching outside
-        rebuilds the union span; an empty gather (a step with no resets in range) names no rows
-        and keeps what is built."""
+        the rows it needs, so nothing has to predict them. An empty gather (a step with no resets
+        in range) names no rows and keeps what is built.
+
+        A widening builds only the rows it ADDS and splices them onto what is there. Re-deriving
+        the union instead is quadratic in a reader that walks the grid forward, and ONE
+        `Interpolation` is cached per curve factor and gathered by every deal — so a book priced in
+        ascending maturity widens a row at a time: measured on a 120-deal credit-MC book, 7 501
+        coefficient rows for a 121-row block against 127 spliced, and the whole order-dependence of
+        the wall time with it. The fork barely notices (its objects widen once), which is why the
+        cost hid there."""
         n_tenors = self.tensor.shape[1]
         if i00.numel():
             bounds = (i00.min(), i00.max()) if i10 is None else (
@@ -566,8 +580,12 @@ class Interpolation(object):
         else:
             rows = self.rows or (0, 0)
         if rows != self.rows:
-            g, c = hermite_interpolation_tensor(self.hermite_tenor, self.tensor[rows[0]:rows[1] + 1])
-            self.interp_params = [p.reshape(-1, p.shape[-1]) for p in (g, c)]
+            parts = [self.hermite_rows(*rows)] if self.rows is None else (
+                ([self.hermite_rows(rows[0], self.rows[0] - 1)] if rows[0] < self.rows[0] else []) +
+                [self.interp_params] +
+                ([self.hermite_rows(self.rows[1] + 1, rows[1])] if rows[1] > self.rows[1] else []))
+            self.interp_params = parts[0] if len(parts) == 1 else [
+                torch.cat(p, dim=0) for p in zip(*parts)]
             self.rows, self.row_offset = rows, rows[0] * n_tenors
         return self.interp_params[0], self.interp_params[1], self.row_offset
 

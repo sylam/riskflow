@@ -44,8 +44,8 @@ def snap(v):
     return str(v)
 
 
-def book():
-    """A vanilla equity book discounted off a Hermite-interpolated USD curve."""
+def book(interp='Hermite'):
+    """A vanilla equity book discounted off a USD curve carrying `interp` interpolation."""
     from riskflow import utils
     from riskflow.config import Config
     from riskflow.instruments import construct_instrument
@@ -78,7 +78,7 @@ def book():
     # THE CHANNEL: the factor declares its interpolation here; `construct_factor` maps it onto the
     # factor's own `Interpolation`, `update_tenors` carries the TYPE into the CurveTenor, and
     # `make_curve_tensor` reads it off `curve_component[FACTOR_INDEX_Tenor_Index].type`.
-    cfg.params['Price Factor Interpolation'].append('InterestRate', (), 'Hermite')
+    cfg.params['Price Factor Interpolation'].append('InterestRate', (), interp)
     cfg.params['Valuation Configuration'] = {}
 
     deals = [construct_instrument({
@@ -121,20 +121,35 @@ def measure(label, fn):
             'peak_reserved_MiB': round(torch.cuda.max_memory_reserved() / 2**20, 1)}
 
 
+# `Dynamic_Scenario_Dates` makes scenario dates == mtm dates, so the SPARSE arm gathers 3 scenario
+# rows under heavy time interpolation (alpha non-null everywhere) and the DENSE arm gathers ~157
+# rows with alpha null — the two opposite ends of the row-span/route logic, on the same book.
+ARMS = [(kind, dense) for kind in ('Hermite', 'HermiteRT', 'Linear') for dense in (False, True)]
+
+
 def run(out_path):
     import riskflow as rf
     tally = instrument()
-    bv = measure('Base_Revaluation', lambda: rf.run_baseval(
-        book(), overrides={'MCMC_Simulations': 8192, 'Random_Seed': 5})[1])
-    bv['hermite'] = dict(tally)
-    tally.update(builds=0, rows=0)
-    cmc = measure('Credit_Monte_Carlo', lambda: rf.run_cmc(book(), overrides={
-        'Time_grid': '0d 1w(3y)', 'Batch_Size': 8192, 'Simulation_Batches': 4,
-        'Random_Seed': 5, 'Percentile': '95'})[1]['Results'])
-    cmc['hermite'] = dict(tally)
-    assert bv['hermite']['builds'] and cmc['hermite']['builds'], 'the Hermite branch never ran'
-    torch.save({'bv': bv, 'cmc': cmc}, out_path)
-    for r in (bv, cmc):
+    out, builds = {}, 0
+    for kind, dense in ARMS:
+        if not dense:                                   # base valuation has no scenario grid to vary
+            tally.update(builds=0, rows=0)
+            bv = measure(f'BaseVal/{kind}', lambda: rf.run_baseval(
+                book(kind), overrides={'MCMC_Simulations': 8192, 'Random_Seed': 5})[1])
+            bv['hermite'] = dict(tally)
+            out[f'bv/{kind}'] = bv
+        tally.update(builds=0, rows=0)
+        cmc = measure(f'CMC/{kind}/{"dense" if dense else "sparse"}', lambda: rf.run_cmc(
+            book(kind), overrides={
+                'Time_grid': '0d 1w(3y)', 'Batch_Size': 8192, 'Simulation_Batches': 4,
+                'Random_Seed': 5, 'Percentile': '95',
+                'Dynamic_Scenario_Dates': 'Yes' if dense else 'No'})[1]['Results'])
+        cmc['hermite'] = dict(tally)
+        out[f'cmc/{kind}/{dense}'] = cmc
+        builds += cmc['hermite']['builds'] if kind.startswith('Hermite') else 0
+    assert builds, 'the Hermite branch never ran'
+    torch.save(out, out_path)
+    for r in out.values():
         print(f"{r['label']:22} wall {r['wall_s']:7.2f}s  peak alloc {r['peak_alloc_MiB']:9.1f} MiB"
               f"  reserved {r['peak_reserved_MiB']:9.1f} MiB  hermite {r['hermite']}")
     print('->', out_path)
@@ -187,13 +202,13 @@ def leaves(v):
 def cmp(f1, f2):
     a, b = torch.load(f1, weights_only=False), torch.load(f2, weights_only=False)
     bad = []
-    for k in ('bv', 'cmc'):
+    for k in a:
         walk(a[k]['out'], b[k]['out'], k, bad)
         print(f"{a[k]['label']:22} wall {a[k]['wall_s']:7.2f} -> {b[k]['wall_s']:7.2f}s   "
               f"alloc {a[k]['peak_alloc_MiB']:9.1f} -> {b[k]['peak_alloc_MiB']:9.1f} MiB   "
-              f"reserved {a[k]['peak_reserved_MiB']:9.1f} -> {b[k]['peak_reserved_MiB']:9.1f} MiB\n"
-              f"{'':22} hermite {a[k]['hermite']} -> {b[k]['hermite']}")
-    n = sum(1 for _ in leaves({k: a[k]['out'] for k in ('bv', 'cmc')}))
+              f"reserved {a[k]['peak_reserved_MiB']:9.1f} -> {b[k]['peak_reserved_MiB']:9.1f} MiB   "
+              f"hermite {a[k]['hermite']} -> {b[k]['hermite']}")
+    n = sum(1 for _ in leaves({k: a[k]['out'] for k in a}))
     if bad:
         print(f'MISMATCH ({len(bad)}) over {n} leaves:')
         for m in bad[:40]:

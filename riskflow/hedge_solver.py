@@ -1482,7 +1482,8 @@ class StreamingSolve:
         self.solvers = [DiffSolverV2(bundle, self.runtime) for _ in range(n_seed)]
         for solver in self.solvers:
             solver.warmup(bundle)
-        self.trained_batches = 1
+        # same rule as `step`: a loaded checkpoint fits nothing, so this batch was not a training one
+        self.trained_batches = int(self.solvers[0].loaded is None)
         logging.info(
             "StreamingSolve WARMUP on batch 1: %d outer paths x %d seed(s) — frame LOCKED "
             "(utility_scale=%.6g, z-frame + trust region from this batch)",

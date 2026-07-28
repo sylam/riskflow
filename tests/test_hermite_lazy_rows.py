@@ -91,6 +91,13 @@ def _eager(curve, t):
     return interp
 
 
+def _counted(interp, tally):
+    """`interp`, with the scenario-row count of every coefficient build appended to `tally`."""
+    build = interp.hermite_rows
+    interp.hermite_rows = lambda lo, hi: (tally.append(hi - lo + 1), build(lo, hi))[1]
+    return interp
+
+
 @pytest.mark.parametrize('rows', [
     list(range(0, 41, 7)), list(range(20, 61, 7)), list(range(70, 119, 7)), [83], [0], [118]])
 def test_a_lazily_built_gather_matches_the_full_block(rows):
@@ -128,6 +135,23 @@ def test_a_later_gather_outside_the_built_span_extends_it():
     for rows in ([40], [90, 100], [0, 118]):                       # below, above, everything
         assert torch.equal(_gather(lazy, rows), _gather(eager, rows))
     assert lazy.rows == (0, 118)
+
+
+def test_a_widening_builds_only_the_rows_it_adds():
+    """One `Interpolation` is cached per curve factor and gathered by every deal, so a book priced
+    in ascending maturity widens the span one row at a time. Re-deriving the union each time is
+    quadratic — measured on credit MC, 7501 rows built for a 121-row block. Only the new rows may
+    be built, and the spliced pair must still equal the eager one row for row."""
+    t, curve = _tenor(N_TENORS), _curve(SCEN, N_TENORS, BATCH, seed=11)
+    lazy, eager = Interpolation(curve, hermite_tenor=t), _eager(curve, t)
+    built = []
+    _counted(lazy, built)
+    for row in range(20, 40):                                      # ascending, one row at a time
+        _gather(lazy, [row])
+    _gather(lazy, [5])                                             # then widen DOWNWARDS
+    assert built == [1] * 20 + [15], f'rebuilt the union rather than splicing: {built}'
+    assert lazy.rows == (5, 39)
+    assert torch.equal(_gather(lazy, list(range(5, 40))), _gather(eager, list(range(5, 40))))
 
 
 def test_a_gather_inside_the_built_span_does_not_rebuild():
