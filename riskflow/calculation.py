@@ -45,32 +45,6 @@ from .hedge_runtime import construct_hedge_runtime
 from .hedge_bundle import Bundle, run_hedge_execution, HedgeRuntimeExecutionResult
 from .hedge_solver import StreamingSolve
 
-# Flat-sample cap (outer chunk x Inner_Sub_Batch) per inner-MC fork pass at a 64-row reference;
-# per-job override = Calculation.Inner_MC_Flat_Limit.
-_INNER_MC_FLAT_DEFAULT = 32768
-
-
-def _concat_inner_chunks(chunks, want_raw_samples):
-    """Concatenate per-outer-chunk `_run_inner_mc_chunk` results back to full B_outer.
-    The outer-path axis is dim 0 of every per-chunk tensor; chunk order is outer-path
-    order. Scalars (`t`, `cutoff_idx`) are taken from the first chunk.
-
-    A field the chunks leave empty (`L_T` on a one-step window) is carried through as an
-    explicit None — never dropped: the key set must not depend on how many chunks ran, or a
-    consumer reading it breaks only at the batch size that starts chunking."""
-    out = {'features': torch.cat([c['features'] for c in chunks], dim=0)}
-    if want_raw_samples:
-        first = chunks[0]
-        out['t'], out['cutoff_idx'] = first['t'], first['cutoff_idx']
-        for key in ('L_T', 'market_t', 'market_t1', 'L_t', 'L_t1'):
-            out[key] = (torch.cat([c[key] for c in chunks], dim=0)
-                        if first.get(key) is not None else None)
-        for key in ('F_t1', 'dF_T', 'dF_min'):
-            out[key] = {ref: torch.cat([c[key][ref] for c in chunks], dim=0)
-                        for ref in first[key]}
-    return out
-
-
 class Aggregation(object):
     '''Container class that represents the base Instrument for aggregation'''
     def __init__(self, name):
@@ -1775,11 +1749,35 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         'The nested simulation is configured alongside the outer `Batch_Size`:',
         '`Inner_MC_Enabled` (`Yes`/`No`, required by `solve_hedge`), `Inner_Sub_Batch` (inner draws',
         'per outer path), `Inner_Antithetic` (`Yes` mirrors the Sobol draws as (z, −z) pairs — needs',
-        'an even `Inner_Sub_Batch`), `Inner_Draws` (`sobol` default, or `random` for iid Gaussians),',
-        'and `Inner_MC_Flat_Limit` (default 32768) — the flat-sample cap per fork pass that bounds',
-        'fork peak memory. Raise the last on a bigger GPU for fewer, wider passes; because each pass',
-        'draws its own Sobol stream, changing it changes the draws (statistically, not bitwise,',
-        'equivalent), so it belongs in the job JSON where the rest of the run is reproducible from.',
+        'an even `Inner_Sub_Batch`), and `Inner_Draws` (`sobol` default, or `random` for iid',
+        'Gaussians).',
+        '',
+        'Each fork runs in ONE pass at `Batch_Size x Inner_Sub_Batch` flat samples, so peak memory',
+        'is a function of those two fields and nothing else — there is no cap, no partition and no',
+        'host-dependent knob. A config too wide for the card raises CUDA OOM naming the fork: the',
+        'config is the contract, and results follow the config rather than the machine.',
+        '',
+        '### Recommended operating point (measured, 24 GiB card)',
+        '',
+        'Peak scales LINEARLY in flat samples, at a rate that depends on the world (how many',
+        'factors, how long the grid, how heavy the liability). Measured per flat sample:',
+        '**~118 kB** on the test fixture, **~229 kB** on the production platinum walk-forward world',
+        '(GARCH spot + observed basis + carry + a 31-tenor SOFR curve, 125-step grid). Size against',
+        'YOUR world, not against a remembered number:',
+        '',
+        '| Batch_Size x Inner_Sub_Batch | fixture peak | production peak | s / fit step |',
+        '| --- | --- | --- | --- |',
+        '| 1024 x 64 | 7.4 GiB | 14.3 GiB | 0.74 |',
+        '| **1280 x 64** | **9.3 GiB** | **18.3 GiB** | **0.75** |',
+        '| 1536 x 64 | 11.1 GiB | 22.8 GiB | 0.83 |',
+        '| 2048 x 64 | 14.8 GiB | OOM | 0.99 |',
+        '',
+        '`Batch_Size=1280, Inner_Sub_Batch=64` is the recommended production point: 18.3 GiB of the',
+        '23.6 GiB usable, ~5 GiB of headroom for world variation, and 0.75 s per fit step (1707',
+        'paths/s — 1.3x the throughput of 1024 at the same step cost, since the step is launch- not',
+        'bandwidth-bound below ~1300). 1536 fits but leaves only 0.8 GiB and is not recommended;',
+        '2048 x 64 does NOT fit single-pass on the production world and raises OOM inside the',
+        "liability's cashflow pricing.",
         '',
         '### Streaming batches (`Solver.DiffV2_Streaming_Batches`)',
         '',
@@ -2159,7 +2157,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 else:
                     held_out = bundle
                 # Fresh accumulators for the next batch — this one has been consumed. (The forks
-                # the solver just ran borrowed `shared_mem`; `_run_inner_mc_chunk` hands it back as
+                # the solver just ran borrowed `shared_mem`; `_run_inner_mc_at_t` hands it back as
                 # it found it, so outer generation resumes unaffected.)
                 (factor_tensor_blocks, tradable_blocks, hedge_profile_blocks,
                  privileged_factor_blocks) = _new_blocks()
@@ -2355,18 +2353,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 t, outer_buffer, shared_mem, base_date, tradable_refs,
                 with_grad=True, outer_rows=outer_rows,
                 max_inner_steps=1 if one_step else None)
-        # Grad-slice sizing inputs: cell budget (flat limit at its 64-row calibration
-        # reference, halved — the AAD tape roughly doubles per-cell memory vs no-grad)
-        # + the inner sub-batch. The solver divides by the per-t remaining rows.
-        bundle.inner_mc_cell_budget = (self._inner_mc_flat_limit() * 64) // 2
-        bundle.inner_sub_batch = int(shared_mem.simulation_sub_batch)
-
-    def _inner_mc_flat_limit(self):
-        """Flat-sample budget per inner-MC fork pass — `Calculation.Inner_MC_Flat_Limit`. Sizes both
-        the no-grad outer chunk and (x64/2) the solver's grad-slice cell budget, so one JSON field
-        owns fork peak memory. Raise it on a bigger GPU (fewer chunks = faster); note the chunk
-        partition assigns per-chunk Sobol streams, so changing it changes the draws."""
-        return int(self.params.get('Inner_MC_Flat_Limit', _INNER_MC_FLAT_DEFAULT))
 
     def _run_inner_mc_at_t(self, t, outer_scenario_buffer, shared_mem, base_date,
                            tradable_refs, want_raw_samples=True, with_grad=False,
@@ -2375,9 +2361,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         — a snapshot of the outer `t_Scenario_Buffer` (factor keys plus every per-process aux
         key, batch dim B_outer).
 
-        `outer_rows=(lo, hi)` forks only that contiguous outer-path range — the seam the
-        solver uses to run GRAD forks in sub-slices at large B_outer (per-slice AAD tapes;
-        labels are per-outer-path so slices are independent).
+        `outer_rows=(lo, hi)` forks only that contiguous outer-path range — the row window a
+        caller uses to bound the AAD tape (labels are per-outer-path, so row slices are
+        independent). The solver no longer needs it: its forks are single-pass at Batch_Size.
 
         The DP/MPC backward sweep calls this on demand outside the outer loop (via the
         closure `Bundle.inner_mc`), forking inner MC at the requested `t`.
@@ -2395,13 +2381,13 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         the column block is generic (each process owns its packing via `reveal_state_at`),
         so the DP/MPC solvers consume it without knowing what the factors are.
 
-        M2g: this is a dispatcher — the whole inner MC (generation + pricing) runs in
-        outer-path sub-chunks (`_run_inner_mc_chunk`) of at most `Calculation.Inner_MC_Flat_Limit`
-        flat samples, so peak memory tracks the chunk and B_outer scales freely. Each
-        chunk draws its own Sobol stream (valid quasi-MC per outer path; the inner MC has
-        no cross-outer-path CRN to preserve), so a chunked run is statistically — not
-        bitwise — equivalent to a single pass: the partition is part of the job's contract
-        (hence a JSON field, never an env var — results must follow the config, not the host)."""
+        SINGLE PASS. The whole fork — generation, stuffing, pricing, extraction — runs at
+        `B_outer x Inner_Sub_Batch` flat in one go, so peak memory is a function of two JSON
+        fields (`Batch_Size`, `Inner_Sub_Batch`) and nothing else. A config too wide for the
+        card raises CUDA OOM naming this fork; that is the contract, not a knob. The old
+        outer-path chunk loop is gone with `DiffV2_Streaming_Batches`, which caps fork width at
+        Batch_Size rather than the whole simulation — see the doc attr for the measured
+        operating point."""
         spot_key = self._find_spot_key()
         if outer_rows is not None:
             lo, hi = outer_rows
@@ -2451,60 +2437,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     kept & set(inner_time_grid.base_MTM_dates))
                 inner_time_grid.set_base_date(inner_base_date)
 
-        # Row-aware chunk sizing: the memory of a fork scales with flat samples × inner-grid
-        # ROWS (generation slabs, pricing tensors, and the AAD tape all carry the time axis).
-        # Budgeting on flat alone let deep-t forks (long remaining grids) OOM inside a deal's
-        # `calculate`, whose canonical guard swallows the error into a scalar-0 mtm — the
-        # size-1 reshape crash. Cells = flat × rows, budgeted against the flat limit at a
-        # 64-row reference (the calibration regime of the original limit).
-        n_rows = int(inner_time_grid.scen_time_grid.size)
-        flat_limit = self._inner_mc_flat_limit()
-        # Dual cap: never exceed the flat limit (per-row slabs also OOM on wide-flat/short-row
-        # shapes — measured at width 2520×13 rows), and scale down for long grids (cells).
-        chunk = max(1, min(flat_limit // B_inner,
-                           (flat_limit * 64) // (B_inner * max(1, n_rows))))
-        if chunk >= B_outer:
-            return self._run_inner_mc_chunk(
-                t, cutoff_idx, outer_scenario_buffer, shared_mem, inner_base_date,
-                inner_time_grid, tradable_refs, want_raw_samples, with_grad=with_grad,
-                window_end_idx=window_end_idx)
-        if with_grad:
-            # Chunked grad mode would require gradient accumulation across chunks via
-            # per-chunk .backward()'s; punt on that until a real B_outer needs it.
-            raise NotImplementedError(
-                f'with_grad=True requires single-chunk inner-MC; B_outer={B_outer} > '
-                f'chunk={chunk}. Reduce Batch_Size or raise Calculation.Inner_MC_Flat_Limit.')
-        results = []
-        for lo in range(0, B_outer, chunk):
-            hi = min(lo + chunk, B_outer)
-            outer_buf = {k: v[..., lo:hi] for k, v in outer_scenario_buffer.items()}
-            results.append(self._run_inner_mc_chunk(
-                t, cutoff_idx, outer_buf, shared_mem, inner_base_date,
-                inner_time_grid, tradable_refs, want_raw_samples,
-                window_end_idx=window_end_idx))
-        return _concat_inner_chunks(results, want_raw_samples)
-
-    def _run_inner_mc_chunk(self, t, cutoff_idx, outer_buf, shared_mem, inner_base_date,
-                            inner_time_grid, tradable_refs, want_raw_samples,
-                            with_grad=False, window_end_idx=None):
-        """Inner MC for one outer-path sub-chunk — generation, buffer stuffing, a single
-        pricing pass, extraction — all at `B_outer_chunk × B_inner` flat. Peak memory is
-        the chunk, not the full B_outer; `_run_inner_mc_at_t` loops this and concatenates.
-
-        Two coordinate systems (unchanged): processes generate against the shifted-base
-        `inner_time_grid`; pricers run against the full outer `self.time_grid` with each
-        deal's Time_dep restricted via `copy_restricted`. Buffer stuffing prepends the
-        outer-realized past (broadcast across B_inner) so path-dependent payoffs see the
-        realized fixings.
-
-        `with_grad=True` lifts the no_grad wrapper and reattaches `requires_grad_(True)`
-        on each process's per-path initial state. Used by the differential-label
-        computation in the differential-ML solver — autograd flows from state-at-t through inner sim
-        + deal pricing to terminal utility, giving `∂y_target/∂state_t` for the
-        twin-loss (value + gradient) OLS fit. Default False preserves the value-only path."""
-        spot_key = self._find_spot_key()
-        B_outer = outer_buf[spot_key].shape[-1]
-        B_inner = shared_mem.simulation_sub_batch
+        # Generation, buffer stuffing, a single pricing pass, extraction — all at
+        # `B_outer x B_inner` flat, in ONE pass. Two coordinate systems: processes generate
+        # against the shifted-base `inner_time_grid`; pricers run against the full outer
+        # `self.time_grid` with each deal's Time_dep restricted via `copy_restricted`. Buffer
+        # stuffing prepends the outer-realized past (broadcast across B_inner) so
+        # path-dependent payoffs see the realized fixings.
         B_flat = B_outer * B_inner
 
         grad_ctx = (torch.enable_grad() if with_grad else torch.no_grad())
@@ -2530,7 +2468,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     # Raw per-path init state for this factor's inner-MC precalculate fork. Never was
                     # type-specific: raw CommodityPrice `outer[t,:]`, raw ForwardRate/ForwardPrice/
                     # InterestRate `outer[t,:,:]` all equal `outer[key][t]`.
-                    init_state = outer_buf[key][t]
+                    init_state = outer_scenario_buffer[key][t]
                     if with_grad:
                         # Leaf with grad: differentiates inner-sim + pricing back to state_t.
                         init_state = init_state.detach().clone().requires_grad_(True)
@@ -2545,7 +2483,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     # (regime for the HMM, conditional variance h0 for GARCH). Capability lives on the
                     # process — a no-op dict for factors without a revealed sufficient statistic — so
                     # the forker runs one uniform loop across model worlds (no isinstance branch).
-                    for seed_key, seed_val in proc_inner.inner_fork_seed(key, outer_buf, t).items():
+                    for seed_key, seed_val in proc_inner.inner_fork_seed(key, outer_scenario_buffer, t).items():
                         shared_mem.t_Scenario_Buffer[seed_key] = seed_val
                     simulated = proc_inner.generate(shared_mem)
                     shared_mem.t_Scenario_Buffer[key] = simulated
@@ -2555,7 +2493,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     # opaquely; base/GARCH processes are no-ops (their revealed state is already
                     # published by generate, or detached by design).
                     inner_leaves = proc_inner.reseed_inner_state(
-                        key, simulated, outer_buf, t, shared_mem, self._inner_state_opts, with_grad)
+                        key, simulated, outer_scenario_buffer, t, shared_mem, self._inner_state_opts, with_grad)
                     if with_grad:
                         state_t_leaves.update(inner_leaves)
                     if want_raw_samples:
@@ -2571,7 +2509,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     if key.type in utils.DimensionLessFactors:
                         continue
                     inner_path = shared_mem.t_Scenario_Buffer[key]                  # (T_inner, ..., B, SB)
-                    outer_past = outer_buf[key][:cutoff_idx]                         # (cutoff, ..., B)
+                    outer_past = outer_scenario_buffer[key][:cutoff_idx]                         # (cutoff, ..., B)
                     outer_past_b2 = outer_past.unsqueeze(-1).expand(*outer_past.shape, B_inner)
                     stuffed = torch.cat([outer_past_b2, inner_path], dim=0)          # (T_outer, ..., B, SB)
                     shared_mem.t_Scenario_Buffer[key] = stuffed.reshape(
@@ -2642,7 +2580,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                             continue
                         proc_inner = self.stoch_factors_inner[key]
                         width = 0
-                        for block, _kind in proc_inner.reveal_state_at(t, outer_buf):
+                        for block, _kind in proc_inner.reveal_state_at(t, outer_scenario_buffer):
                             b = block.reshape(-1, B_outer)
                             market_t_parts.append(b)
                             width += b.shape[0]

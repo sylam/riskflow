@@ -320,10 +320,9 @@ class Bundle:
         self.last_settlement_index = None
         self.last_live_mtm_index = 0
         # Inner-MC forks (attached by HedgeMonteCarlo.execute for Execution_Mode='solve_hedge').
+        # Single-pass: peak is a function of Batch_Size x Inner_Sub_Batch, both JSON.
         self.inner_mc = None
         self.inner_mc_grad = None
-        self.inner_mc_cell_budget = 1 << 62
-        self.inner_sub_batch = 1
 
     # ---- construction --------------------------------------------------------
     @classmethod

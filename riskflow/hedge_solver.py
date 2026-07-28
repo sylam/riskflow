@@ -730,48 +730,6 @@ class DiffSolverV2:
         # market state (spot/state) come from the SAME forward — the full Huge–Savine twin
         # loss. ∂Y/∂market_t is the differential constraint that regularizes the market
         # dimension (where a value-only / W-only fit overfits the few outer paths).
-        # Row-aware grad-slice width: the grad fork's tape scales with remaining rows × flat —
-        # except one-step forks, whose tape is 2 rows regardless of t (the 64 floor then just
-        # reproduces the flat cap, giving constant-width slices across the whole sweep).
-        rows_t = max(64, 2 if self.one_step else (self.n_steps + 1 - t))
-        cell_budget = int(self.bundle.inner_mc_cell_budget)
-        inner_sub = int(self.bundle.inner_sub_batch)
-        grad_chunk = max(1, cell_budget // (inner_sub * rows_t))
-        if self.B_outer > grad_chunk:
-            # Large-B mode: the grad fork's AAD tape only fits `grad_chunk` outer paths at a
-            # time, so fork the TRAIN rows in contiguous sub-slices (labels are per-outer-path
-            # — slices are independent; each fork call is single-chunk under the hood).
-            r0, r1, _ = rows.indices(self.B_outer)
-            Y_parts, gW_parts, gm_parts = [], [], []
-            for a in range(r0, r1, grad_chunk):
-                b = min(a + grad_chunk, r1)
-                ig = self.bundle.inner_mc_grad(t, outer_rows=(a, b), one_step=self.one_step)
-                leaves, widths = ig["state_t_leaves"], ig["state_t_leaf_widths"]
-                F_t_c = torch.stack(
-                    [self.tradables_sim[r][t][a:b] for r in self.hedges], dim=-1)
-                F_t1_c = torch.stack([ig["F_t1"][r] for r in self.hedges], dim=-1) * live
-                dF_c = F_t1_c - F_t_c.unsqueeze(1)
-                dL_c = ig["L_t1"] - ig["L_t"]
-                m1_c = ig["market_t1"]
-                W0_c = W0_bank[a - r0:b - r0].clone().requires_grad_(True)
-                q_c = q_star[a - r0:b - r0][:, None, :]
-                W1_c = self._wealth_step(W0_c[:, None], q_c, dF_c, dL_c)
-                n_c, Bi_c, md = m1_c.shape
-                Y_c = self._continuation(
-                    nets, m1_c.reshape(-1, md), W1_c.reshape(-1), t + 1
-                ).reshape(n_c, Bi_c).mean(1)
-                grads_c = torch.autograd.grad(
-                    Y_c.sum(), [W0_c] + list(leaves.values()), allow_unused=True)
-                leaf_grads_c = {k: (g.detach() if g is not None else None)
-                                for k, g in zip(leaves.keys(), grads_c[1:])}
-                Y_parts.append(Y_c.detach())
-                gW_parts.append(grads_c[0].detach())
-                gm_parts.append(self._project_leaf_grads(
-                    leaf_grads_c, widths, slice(None), n_c, md))
-            Y = torch.cat(Y_parts)
-            gW = torch.cat(gW_parts)
-            g_market = torch.cat(gm_parts)
-            return self._fit_from_labels(nets, W0_bank, market0, Y, gW, g_market, t, q_star)
         ig = self.bundle.inner_mc_grad(t, one_step=self.one_step)
         leaves, widths = ig["state_t_leaves"], ig["state_t_leaf_widths"]
         if not getattr(self, "_proj_checked", False):
