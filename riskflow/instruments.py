@@ -488,11 +488,16 @@ class Deal(object):
         return self.settlement_currencies
 
     def leg_descriptors(self, deal_data):
-        """Static (batch-independent) cashflow descriptors: (summed |notional|, latest pay
-        day offset). Reads this deal's own `Factor_dep['Cashflows']`; defaults to
-        (0.0, None) for deals with no cashflow schedule."""
+        """Static (batch-independent) cashflow descriptors: (summed |notional|, latest pay day
+        offset, history requirement in days). Reads this deal's own `Factor_dep['Cashflows']`;
+        defaults to (0.0, None, None) for deals with no cashflow schedule.
+
+        The third element is how far back in days this deal can reference while a period is live,
+        and it is FAIL-SAFE: None means "this deal does not declare a bound", which switches the
+        inner-MC fork's Hermite window off for the whole book rather than guessing one. Only a
+        deal that knows its own reset layout overrides it (see FloatingEnergyDeal)."""
         cf = deal_data.Factor_dep.get('Cashflows')
-        return (cf.total_abs_nominal(), cf.last_pay_day()) if cf is not None else (0.0, None)
+        return (cf.total_abs_nominal(), cf.last_pay_day(), None) if cf is not None else (0.0, None, None)
 
     def refresh_dependencies(self, base_date, time_grid, deal_data):
         """Inner-MC hook: rebase any date-anchored entries in `deal_data.Factor_dep` /
@@ -4853,6 +4858,15 @@ class FRADeal(Deal):
 
 
 class FloatingEnergyDeal(Deal):
+    def leg_descriptors(self, deal_data):
+        """This leg averages a reference price over each period, so its history requirement is the
+        widest reset span in its own schedule — declared here because `make_energy_cashflows`
+        wrote that layout and this class is what reads it back."""
+        cf = deal_data.Factor_dep.get('Cashflows')
+        if cf is None:
+            return (0.0, None, None)
+        return (cf.total_abs_nominal(), cf.last_pay_day(), cf.max_reset_span())
+
     # dependent price factors for this instrument
     factor_fields = {'Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],

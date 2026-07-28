@@ -437,14 +437,16 @@ class Interpolation(object):
                 # the window is a claim about what the caller reads, and a wrong claim must be
                 # loud (a silent wrap is a wrong curve, not a crash).
                 j00 = i00 - self.row_offset
-                if int(j00.min()) < 0:
+                # `numel()` first: a step with no resets in range gathers an EMPTY index set,
+                # and min() on an empty tensor raises for the wrong reason.
+                if j00.numel() and int(j00.min()) < 0:
                     raise IndexError(
                         f'Hermite window starts at flat row {self.row_offset} but a gather asked '
                         f'for {int(i00.min())} — the window does not cover this read.')
                 val = calc_hermite_curve(w2, g[j00,], c[j00,], tensor[i00,], tensor[i01,])
                 if alpha is not None:
                     j10 = i10 - self.row_offset
-                    if int(j10.min()) < 0:
+                    if j10.numel() and int(j10.min()) < 0:
                         raise IndexError(
                             f'Hermite window starts at flat row {self.row_offset} but a gather '
                             f'asked for {int(i10.min())} — the window does not cover this read.')
@@ -904,6 +906,26 @@ class TensorCashFlows(TensorSchedule):
     def last_pay_day(self):
         """Latest payment day (offset in days from base_date)."""
         return float(self.schedule[:, CASHFLOW_INDEX_Pay_Day].max())
+
+    def max_reset_span(self):
+        """How far back in DAYS a live cashflow can reference — the widest reset window in this
+        schedule. Each cashflow's resets are `offsets[i, 0]` entries starting at `offsets[i, 1]`
+        of `Resets` (the layout `make_energy_cashflows` writes), so while a period is live the
+        pricer reads its already-observed fixings and never looks further back than that period's
+        own span. 0.0 when nothing resets — a fixed leg reads no history.
+
+        This is the DECLARED history requirement the inner-MC fork windows its Hermite
+        coefficients by; it is read off the schedule, never inferred from a measured run."""
+        if self.Resets is None:
+            return 0.0
+        days = self.Resets.schedule[:, RESET_INDEX_Reset_Day]
+        span = 0.0
+        for count, offset in zip(self.offsets[:, 0].astype(np.int64),
+                                 self.offsets[:, 1].astype(np.int64)):
+            if count > 1:
+                block = days[offset:offset + count]
+                span = max(span, float(block.max() - block.min()))
+        return span
 
     def known_fx_resets(self, num_scenarios, index=CASHFLOW_INDEX_FXResetValue,
                         filter_index=CASHFLOW_INDEX_FXResetDate):

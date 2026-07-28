@@ -131,3 +131,90 @@ def test_default_state_leaves_the_window_unset():
     assert setters[0][0] == 'calculation.py', setters
     assert 'Interpolation(mod_tenor, [g, c])' in inspect.getsource(utils.make_curve_tensor), \
         'the unwindowed construction must remain the literal default path'
+
+
+# --------------------------------------------------------------------------------------------
+# GATE (a) — the DERIVATION: the window bound comes off the liability's own schedule
+# --------------------------------------------------------------------------------------------
+def _cashflows(periods, resets_per_period, reset_step=1.0, start=0.0):
+    """A TensorCashFlows with `periods` cashflows, each carrying `resets_per_period` resets
+    `reset_step` days apart — the layout `utils.make_energy_cashflows` writes (offsets carry
+    [count, offset, settle])."""
+    import numpy as np
+    from riskflow import utils
+
+    cash, offsets, resets, scen = [], [], [], []
+    day = start
+    for _ in range(periods):
+        first = len(resets)
+        for k in range(resets_per_period):
+            row = [0.0] * 16
+            row[utils.RESET_INDEX_Reset_Day] = day + k * reset_step
+            row[utils.RESET_INDEX_Start_Day] = day + k * reset_step
+            row[utils.RESET_INDEX_End_Day] = day + k * reset_step
+            resets.append(row)
+            scen.append(0)
+        cf = [0.0] * 12
+        cf[utils.CASHFLOW_INDEX_Start_Day] = day
+        cf[utils.CASHFLOW_INDEX_End_Day] = day + (resets_per_period - 1) * reset_step
+        cf[utils.CASHFLOW_INDEX_Pay_Day] = day + (resets_per_period - 1) * reset_step + 5
+        cf[utils.CASHFLOW_INDEX_Nominal] = 100.0
+        cash.append(cf)
+        offsets.append([resets_per_period, first, 0])
+        day += resets_per_period * reset_step + 30.0
+    cf_obj = utils.TensorCashFlows(cash, offsets)
+    cf_obj.set_resets(resets, scen)
+    return cf_obj
+
+
+def test_reset_span_is_the_widest_averaging_window():
+    """The declared requirement is the widest per-period reset span — 21 daily fixings span 20
+    days, and extra periods do not deepen it."""
+    assert _cashflows(1, 21).max_reset_span() == pytest.approx(20.0)
+    assert _cashflows(4, 21).max_reset_span() == pytest.approx(20.0)
+    assert _cashflows(4, 31).max_reset_span() == pytest.approx(30.0)
+
+
+def test_reset_span_takes_the_deepest_period_not_the_last():
+    """A book whose deepest averaging period is not the final one still reports that depth."""
+    deep = _cashflows(1, 61)
+    shallow = _cashflows(3, 5)
+    merged = _cashflows(1, 61)
+    # splice the shallow schedule on after the deep one
+    import numpy as np
+    from riskflow import utils
+    merged.schedule = np.vstack([deep.schedule, shallow.schedule])
+    merged.offsets = np.vstack([deep.offsets,
+                                shallow.offsets + np.array([0, len(deep.Resets.schedule), 0])])
+    merged.set_resets(np.vstack([deep.Resets.schedule, shallow.Resets.schedule]).tolist(),
+                      [0] * (len(deep.Resets.schedule) + len(shallow.Resets.schedule)))
+    assert merged.max_reset_span() == pytest.approx(60.0)
+
+
+def test_no_averaging_declares_zero_history():
+    """A single-fixing (non-averaging) leg reads no history, so its requirement is 0 — a window
+    of just the fork's own rows."""
+    assert _cashflows(6, 1).max_reset_span() == 0.0
+
+
+def test_book_history_is_fail_safe_when_a_leg_does_not_declare():
+    """A leg that returns None (does not know its layout) makes the BOOK's requirement None, which
+    switches the window off entirely rather than sizing it from the legs that did declare."""
+    from riskflow.calculation import DealStructure
+
+    class _Struct(DealStructure):
+        def __init__(self, descriptors):
+            self._d = descriptors
+            self.dependencies, self.sub_structures = [], []
+
+        def aggregate_leg_descriptors(self):
+            total, pay, hist = 0.0, None, 0.0
+            for vol, p, h in self._d:
+                total += vol
+                if p is not None:
+                    pay = p if pay is None else max(pay, p)
+                hist = None if (h is None or hist is None) else max(hist, h)
+            return total, pay, hist
+
+    assert _Struct([(1.0, 10.0, 20.0), (1.0, 12.0, 35.0)]).aggregate_leg_descriptors()[2] == 35.0
+    assert _Struct([(1.0, 10.0, 20.0), (1.0, 12.0, None)]).aggregate_leg_descriptors()[2] is None

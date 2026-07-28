@@ -45,19 +45,11 @@ from .hedge_runtime import construct_hedge_runtime
 from .hedge_bundle import Bundle, run_hedge_execution, HedgeRuntimeExecutionResult
 from .hedge_solver import StreamingSolve
 
-# Rows of realized history an inner-MC fork's Hermite coefficients must cover, above the inner
-# rows it generates. None = NO WINDOW: build the full block, which is what every caller did before
-# the window existed and what every caller does today.
-#
-# Why it ships disabled. The window is a CLAIM about how far back a deal reads, and the curve
-# stack cannot verify it. Measured max read: 34 rows on the fixture (both fork modes) and on the
-# fixture at production shape — but a suite world (test_solve_reveal_width_9_vs_7) and the
-# platinum walk-forward book both read past 64, and a bound safe for all of them (128+) exceeds
-# the ~119-row grid, at which point the window covers everything and saves nothing. So a constant
-# is either unsafe or inert; a real window has to come from the deal's own history requirement
-# (the liability's averaging schedule) rather than a number chosen here. Set an int to enable —
-# a read below the window then raises rather than silently wrapping (utils.Interpolation.eval).
-HERMITE_HISTORY_ROWS = None
+# Safety margin (grid rows) added to the book's DECLARED history requirement when the inner-MC
+# fork windows its Hermite coefficients. The requirement itself is derived per book from the
+# liability's own reset schedule (`TensorCashFlows.max_reset_span` via `leg_descriptors`), never
+# guessed here; this only pads the day->row conversion against a grid whose spacing varies.
+HERMITE_WINDOW_MARGIN_ROWS = 4
 
 class Aggregation(object):
     '''Container class that represents the base Instrument for aggregation'''
@@ -245,15 +237,23 @@ class DealStructure(object):
     def aggregate_leg_descriptors(self):
         """Reduce the per-deal cashflow descriptors over this structure (recursing
         sub_structures the way `resolve_hedge_structure` does): summed |notional| across
-        all legs and the latest pay-day. Legs with no schedule contribute (0.0, None),
-        so non-cashflow deals never poison the max."""
-        total_volume, last_payment_day = 0.0, None
-        for vol, pay in ([dd.Instrument.leg_descriptors(dd) for dd in self.dependencies] +
-                         [sub.aggregate_leg_descriptors() for sub in self.sub_structures]):
+        all legs, the latest pay-day, and the book's history requirement in days. Legs with no
+        schedule contribute (0.0, None, None), so non-cashflow deals never poison the max.
+
+        History is fail-safe rather than max-like: a single leg that does NOT declare a bound
+        (None) makes the whole book's requirement unknown, because a window sized from the legs
+        that did declare would be too tight for the one that did not."""
+        total_volume, last_payment_day, history_days = 0.0, None, 0.0
+        for vol, pay, hist in ([dd.Instrument.leg_descriptors(dd) for dd in self.dependencies] +
+                               [sub.aggregate_leg_descriptors() for sub in self.sub_structures]):
             total_volume += vol
             if pay is not None:
                 last_payment_day = pay if last_payment_day is None else max(last_payment_day, pay)
-        return total_volume, last_payment_day
+            if hist is None or history_days is None:
+                history_days = None
+            else:
+                history_days = max(history_days, hist)
+        return total_volume, last_payment_day, history_days
 
     def tensor_marks(self):
         """Stored per-deal price series keyed by deal Reference, recursing sub_structures
@@ -1900,7 +1900,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         straight from the cashflow schedules — no per-batch leg pass. Returns
         `(total_leg_volume, last_payment_day)`: the summed |notional| across all liability legs
         and the latest payment day (offset in days from base_date). `Bundle.from_batch` maps the
-        payment day onto the (history-prefixed) bundle time grid to recover `last_settlement_index`."""
+        payment day onto the (history-prefixed) bundle time grid to recover `last_settlement_index`.
+        The third descriptor is the book's DECLARED history requirement in days (None = a leg did
+        not declare one), which the inner-MC fork turns into its Hermite coefficient window."""
         return self.liabilities.aggregate_leg_descriptors()
 
     def execute(self, params, job_id=0, num_jobs=1):
@@ -2004,7 +2006,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         (factor_tensor_blocks, tradable_blocks, hedge_profile_blocks,
          privileged_factor_blocks) = _new_blocks()
         # Static liability descriptors (read off the cashflow schedules, batch-independent).
-        total_leg_volume, last_payment_day = self._liability_schedule_scalars()
+        total_leg_volume, last_payment_day, history_days = self._liability_schedule_scalars()
+        self._liability_history_days = history_days
         # get the calendar for business day
         bus_day = self.config.holidays.get(
             self.params['Calendar'], {'businessday': pd.offsets.BDay(1)})['businessday']
@@ -2375,6 +2378,25 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 with_grad=True, outer_rows=outer_rows,
                 max_inner_steps=1 if one_step else None)
 
+    def _hermite_window(self, cutoff_idx, n_inner_rows):
+        """Rows of the curve block this fork's Hermite coefficients must cover: back to the
+        deepest fixing the liability can still reference at `cutoff_idx`, forward across the inner
+        rows it generates. `None` when the book did not declare a history requirement — then no
+        window is applied and the full block is built, exactly as before.
+
+        The bound is the liability's own reset span in DAYS (derived from its schedule, see
+        `TensorCashFlows.max_reset_span`), converted to rows against this grid rather than assumed:
+        grid spacing is not uniform, so the row for `day(cutoff) - span` is looked up, not
+        subtracted. A read below the window raises in `Interpolation.eval` — if this derivation is
+        wrong the run stops rather than silently interpolating off the wrong rows."""
+        history_days = getattr(self, '_liability_history_days', None)
+        if history_days is None:
+            return None
+        grid = self.time_grid.scen_time_grid
+        first_day = grid[cutoff_idx] - history_days
+        lo = int(np.searchsorted(grid, first_day, side='left')) - HERMITE_WINDOW_MARGIN_ROWS
+        return (max(0, lo), cutoff_idx + n_inner_rows)
+
     def _run_inner_mc_at_t(self, t, outer_scenario_buffer, shared_mem, base_date,
                            tradable_refs, want_raw_samples=True, with_grad=False,
                            max_inner_steps=None, outer_rows=None):
@@ -2476,14 +2498,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # while forks only follow forks but corrupts the next outer batch under streaming.
         borrowed_batch, borrowed_fill = shared_mem.simulation_batch, shared_mem.fillvalue
         # Hermite coefficient window (utils.make_curve_tensor): this fork prices a bounded slice
-        # of the grid — the inner rows it just generated, plus the realized history a
-        # path-dependent payoff averages over — while the curve block spans the whole grid.
-        # Measured on three worlds, forks read rows in [t-34, t+10] and touch 0.7% of the block;
-        # HERMITE_HISTORY_ROWS=64 is the bound this claims, and a read below it raises rather
-        # than silently wrapping. Cleared in the finally: only the fork is windowed.
-        window = None if HERMITE_HISTORY_ROWS is None else (
-            cutoff_idx - HERMITE_HISTORY_ROWS,
-            cutoff_idx + int(inner_time_grid.scen_time_grid.size))
+        # of the grid — the inner rows it just generated, plus the realized history the liability
+        # still averages over — while the curve block spans the whole grid. The bound is DERIVED
+        # from the book's own reset schedule (`_hermite_window`), so it travels with the deal
+        # instead of being a constant that is either unsafe or inert. Cleared in the finally:
+        # only the fork is windowed, every other caller builds the full block.
+        window = self._hermite_window(cutoff_idx, int(inner_time_grid.scen_time_grid.size))
         with grad_ctx:
             try:
                 shared_mem.hermite_window = window
