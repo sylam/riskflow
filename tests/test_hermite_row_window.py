@@ -134,87 +134,139 @@ def test_default_state_leaves_the_window_unset():
 
 
 # --------------------------------------------------------------------------------------------
-# GATE (a) — the DERIVATION: the window bound comes off the liability's own schedule
+# GATE (a) — the DERIVATION: the bound comes off the rows the pricer's own selection can reach,
+# over every deal the fork prices (tradables AND liabilities)
 # --------------------------------------------------------------------------------------------
-def _cashflows(periods, resets_per_period, reset_step=1.0, start=0.0):
+def _cashflows(periods, resets_per_period, reset_step=1.0, start=0.0, first_row=10, pay_lag=5.0):
     """A TensorCashFlows with `periods` cashflows, each carrying `resets_per_period` resets
-    `reset_step` days apart — the layout `utils.make_energy_cashflows` writes (offsets carry
-    [count, offset, settle])."""
+    `reset_step` days apart and paying `pay_lag` days after its last fixing — the layout
+    `utils.make_energy_cashflows` writes (offsets carry [count, offset, settle]). Each reset gets
+    its own scenario row, counting up from `first_row`, exactly as `get_scenario_offset` assigns
+    them; that column is what the pricer's gather is indexed by."""
     import numpy as np
     from riskflow import utils
 
     cash, offsets, resets, scen = [], [], [], []
-    day = start
+    day, row = start, first_row
     for _ in range(periods):
         first = len(resets)
         for k in range(resets_per_period):
-            row = [0.0] * 16
-            row[utils.RESET_INDEX_Reset_Day] = day + k * reset_step
-            row[utils.RESET_INDEX_Start_Day] = day + k * reset_step
-            row[utils.RESET_INDEX_End_Day] = day + k * reset_step
-            resets.append(row)
-            scen.append(0)
+            r = [0.0] * 16
+            r[utils.RESET_INDEX_Reset_Day] = day + k * reset_step
+            r[utils.RESET_INDEX_Start_Day] = day + k * reset_step
+            r[utils.RESET_INDEX_End_Day] = day + k * reset_step
+            resets.append(r)
+            scen.append(row)
+            row += 1
         cf = [0.0] * 12
         cf[utils.CASHFLOW_INDEX_Start_Day] = day
         cf[utils.CASHFLOW_INDEX_End_Day] = day + (resets_per_period - 1) * reset_step
-        cf[utils.CASHFLOW_INDEX_Pay_Day] = day + (resets_per_period - 1) * reset_step + 5
+        cf[utils.CASHFLOW_INDEX_Pay_Day] = day + (resets_per_period - 1) * reset_step + pay_lag
         cf[utils.CASHFLOW_INDEX_Nominal] = 100.0
         cash.append(cf)
         offsets.append([resets_per_period, first, 0])
         day += resets_per_period * reset_step + 30.0
+        row += 30
     cf_obj = utils.TensorCashFlows(cash, offsets)
     cf_obj.set_resets(resets, scen)
     return cf_obj
 
 
-def test_reset_span_is_the_widest_averaging_window():
-    """The declared requirement is the widest per-period reset span — 21 daily fixings span 20
-    days, and extra periods do not deepen it."""
-    assert _cashflows(1, 21).max_reset_span() == pytest.approx(20.0)
-    assert _cashflows(4, 21).max_reset_span() == pytest.approx(20.0)
-    assert _cashflows(4, 31).max_reset_span() == pytest.approx(30.0)
+def test_declared_bound_is_the_deepest_row_the_pricer_can_select():
+    """`pv_energy_cashflows` selects `sim_resets` with NO lower bound and gathers each at its own
+    scenario row, so the declared bound is the deepest such row — NOT the widest per-period reset
+    span. A 21-fixing period starting at row 10 declares 10 whatever its span implies, and the
+    settlement lag (pay = last fixing + 5d) is covered because the row is absolute rather than a
+    distance from the cutoff."""
+    assert _cashflows(1, 21, first_row=10).deepest_reset_row() == 10.0
+    assert _cashflows(1, 21, first_row=10, pay_lag=90.0).deepest_reset_row() == 10.0
 
 
-def test_reset_span_takes_the_deepest_period_not_the_last():
-    """A book whose deepest averaging period is not the final one still reports that depth."""
-    deep = _cashflows(1, 61)
-    shallow = _cashflows(3, 5)
-    merged = _cashflows(1, 61)
-    # splice the shallow schedule on after the deep one
+def test_declared_bound_spans_the_whole_elapsed_schedule():
+    """`sim_resets` is computed before `get_cashflow_start_index` is applied, so a multi-period leg
+    re-gathers the fixings of periods that have already PAID. The bound is therefore the FIRST
+    period's first row, not the deepest single period's span."""
+    assert _cashflows(4, 21, first_row=10).deepest_reset_row() == 10.0
+    assert _cashflows(4, 21, first_row=200).deepest_reset_row() == 200.0
+
+
+def test_bullet_sampling_declares_its_single_fixing():
+    """A `ForwardPriceSampleBullet` period carries ONE reset (count == 1). It still sits a
+    settlement lag below the cutoff while the cashflow is unpaid, so it must declare that row —
+    the `count > 1` filter that made it declare "no history" is the bug."""
+    import numpy as np
+    bullet = _cashflows(6, 1, first_row=10)
+    assert bullet.deepest_reset_row() == 10.0
+    assert bullet.deepest_reset_row() != np.inf
+
+
+def test_a_leg_with_no_simulated_resets_declares_no_history():
+    """Nothing simulated (a fixed leg, or a schedule whose fixings are all already known) reads no
+    row below the step it is priced at."""
     import numpy as np
     from riskflow import utils
-    merged.schedule = np.vstack([deep.schedule, shallow.schedule])
-    merged.offsets = np.vstack([deep.offsets,
-                                shallow.offsets + np.array([0, len(deep.Resets.schedule), 0])])
-    merged.set_resets(np.vstack([deep.Resets.schedule, shallow.Resets.schedule]).tolist(),
-                      [0] * (len(deep.Resets.schedule) + len(shallow.Resets.schedule)))
-    assert merged.max_reset_span() == pytest.approx(60.0)
+
+    cf = _cashflows(1, 5)
+    cf.set_resets(cf.Resets.schedule.tolist(), [-1] * len(cf.Resets.schedule))
+    assert cf.deepest_reset_row() == np.inf
+    empty = utils.TensorCashFlows([[0.0] * 12], [[0, 0, 0]])
+    assert empty.deepest_reset_row() == np.inf
 
 
-def test_no_averaging_declares_zero_history():
-    """A single-fixing (non-averaging) leg reads no history, so its requirement is 0 — a window
-    of just the fork's own rows."""
-    assert _cashflows(6, 1).max_reset_span() == 0.0
+def test_book_bound_is_fail_safe_when_a_deal_does_not_declare():
+    """A deal that returns None (does not know what it reads) makes the BOOK's bound None, which
+    switches the window off entirely rather than sizing it from the deals that did declare."""
+    import numpy as np
+    from riskflow.calculation import HedgeMonteCarlo
+
+    class _Struct:
+        def __init__(self, declared):
+            self._d = declared
+
+        def history_declarations(self):
+            return self._d
+
+    def floor(tradables, liabilities):
+        calc = HedgeMonteCarlo.__new__(HedgeMonteCarlo)
+        calc.netting_sets, calc.liabilities = _Struct(tradables), _Struct(liabilities)
+        return calc._hermite_floor_row()
+
+    assert floor({'FUT': np.inf}, {'AVG': 82.0}) == 82.0
+    assert floor({'FUT': np.inf}, {'FIX': np.inf}) == np.inf
+    assert floor({'FUT': None}, {'AVG': 82.0}) is None
+    assert floor({'FUT': np.inf}, {'AVG': None}) is None
 
 
-def test_book_history_is_fail_safe_when_a_leg_does_not_declare():
-    """A leg that returns None (does not know its layout) makes the BOOK's requirement None, which
-    switches the window off entirely rather than sizing it from the legs that did declare."""
-    from riskflow.calculation import DealStructure
+def test_the_bound_covers_the_tradables_not_only_the_liability():
+    """One window is in force while the fork prices BOTH structures, so an averaging TRADABLE that
+    reads deeper than the liability must move the bound. Deriving it from the liability alone is
+    what silently retired such a tradable from the hedge set."""
+    import numpy as np
+    from riskflow.calculation import HedgeMonteCarlo
 
-    class _Struct(DealStructure):
-        def __init__(self, descriptors):
-            self._d = descriptors
-            self.dependencies, self.sub_structures = [], []
+    class _Struct:
+        def __init__(self, declared):
+            self._d = declared
 
-        def aggregate_leg_descriptors(self):
-            total, pay, hist = 0.0, None, 0.0
-            for vol, p, h in self._d:
-                total += vol
-                if p is not None:
-                    pay = p if pay is None else max(pay, p)
-                hist = None if (h is None or hist is None) else max(hist, h)
-            return total, pay, hist
+        def history_declarations(self):
+            return self._d
 
-    assert _Struct([(1.0, 10.0, 20.0), (1.0, 12.0, 35.0)]).aggregate_leg_descriptors()[2] == 35.0
-    assert _Struct([(1.0, 10.0, 20.0), (1.0, 12.0, None)]).aggregate_leg_descriptors()[2] is None
+    calc = HedgeMonteCarlo.__new__(HedgeMonteCarlo)
+    calc.netting_sets = _Struct({'AVG_SWAP': 5.0, 'FUT': np.inf})
+    calc.liabilities = _Struct({'AVG_OFFTAKE': 82.0})
+    calc._hermite_floor = calc._hermite_floor_row()
+    assert calc._hermite_floor == 5.0
+    assert calc._hermite_window(100, 2) == (5, 102)
+
+
+def test_window_is_the_forks_own_rows_when_nothing_reads_history():
+    """Every deal declaring `inf` means no row below the fork's own step is read, so the window
+    starts AT the cutoff — the tightest correct window, not a disabled one."""
+    import numpy as np
+    from riskflow.calculation import HedgeMonteCarlo
+
+    calc = HedgeMonteCarlo.__new__(HedgeMonteCarlo)
+    calc._hermite_floor = np.inf
+    assert calc._hermite_window(100, 2) == (100, 102)
+    calc._hermite_floor = None
+    assert calc._hermite_window(100, 2) is None

@@ -432,6 +432,11 @@ class Deal(object):
     (e.g. a netting set can be a "deal") and calculate dynamic dates for resets.
     """
     documentation = ''
+    # DECLARED: this deal type's pricer gathers no scenario row BELOW the step it is priced at,
+    # so it puts no floor under the inner-MC fork's Hermite window (see `leg_descriptors`).
+    # Default False = undeclared, which is fail-safe: one undeclared deal in the book switches
+    # the window off for the whole book rather than sizing it from the deals that did declare.
+    prices_at_step_only = False
 
     def __init__(self, params, valuation_options):
         # valuation options
@@ -489,15 +494,20 @@ class Deal(object):
 
     def leg_descriptors(self, deal_data):
         """Static (batch-independent) cashflow descriptors: (summed |notional|, latest pay day
-        offset, history requirement in days). Reads this deal's own `Factor_dep['Cashflows']`;
-        defaults to (0.0, None, None) for deals with no cashflow schedule.
+        offset, deepest scenario row this deal's pricer can gather). Reads this deal's own
+        `Factor_dep['Cashflows']`; the first two default to (0.0, None) for deals with no
+        cashflow schedule.
 
-        The third element is how far back in days this deal can reference while a period is live,
-        and it is FAIL-SAFE: None means "this deal does not declare a bound", which switches the
-        inner-MC fork's Hermite window off for the whole book rather than guessing one. Only a
-        deal that knows its own reset layout overrides it (see FloatingEnergyDeal)."""
+        The third element bounds how deep into the curve block this deal reads, and it is
+        FAIL-SAFE: None means "this deal does not declare a bound", which switches the inner-MC
+        fork's Hermite window off for the whole book rather than guessing one. `inf` = declared
+        to read nothing below the step it is priced at (`prices_at_step_only`); a row = the
+        deepest row it can reach, computed off the schedule the pricer selects from (see
+        FloatingEnergyDeal)."""
         cf = deal_data.Factor_dep.get('Cashflows')
-        return (cf.total_abs_nominal(), cf.last_pay_day(), None) if cf is not None else (0.0, None, None)
+        history = np.inf if self.prices_at_step_only else None
+        return (cf.total_abs_nominal(), cf.last_pay_day(), history) if cf is not None \
+            else (0.0, None, history)
 
     def refresh_dependencies(self, base_date, time_grid, deal_data):
         """Inner-MC hook: rebase any date-anchored entries in `deal_data.Factor_dep` /
@@ -516,6 +526,12 @@ class Deal(object):
         except Exception as e:
             logging.critical('Deal {} skipped - {}'.format(
                 deal_data.Instrument.field.get("Reference"), e.args))
+            # The skip is for "this deal cannot price on this grid". A violated curve window or a
+            # CUDA OOM is the framework being wrong, and swallowing it into a scalar-0 mark makes
+            # the deal VANISH from `DealStructure.tensor_marks` — which an inner-MC fork reads as
+            # an expired contract, silently retiring it from the hedge set.
+            if utils.is_fatal_pricing_error(e):
+                raise
             return 0.0 * shared.one
 
     def build_features(self, shared, time_grid, deal_data):
@@ -524,6 +540,10 @@ class Deal(object):
         except Exception as e:
             logging.critical('Deal {} skipped - {}'.format(
                 deal_data.Instrument.field.get("Reference"), e.args))
+            # Same rule as `calculate`: a swallowed leg here drops silently out of the liability
+            # accumulation, where a second leg's mark broadcasts over the gap.
+            if utils.is_fatal_pricing_error(e):
+                raise
             return {}
 
     def generate(self, shared, time_grid, deal_data):
@@ -3631,6 +3651,9 @@ class EquityBarrierOption(Deal):
 
 
 class CommodityForwardDeal(Deal):
+    # every gather in `generate` is at a `deal_time` row: forward curve, commodity zero, discount
+    prices_at_step_only = True
+
     factor_fields = {'Currency': ['FxRate'],
                      'Commodity': ['CommodityPrice'],
                      'Reference_Type': ['ReferencePrice'],
@@ -3719,6 +3742,9 @@ class CommodityForwardDeal(Deal):
 
 
 class CommodityFutureDeal(Deal):
+    # every gather in `generate` is at a `deal_time` row: spot, repo, carry, report FX
+    prices_at_step_only = True
+
     factor_fields = {'Currency': ['FxRate'],
                      'Commodity': ['CommodityPrice'],
                      'Repo_Rate': ['InterestRate'],
@@ -3846,6 +3872,9 @@ class EquityForwardDeal(Deal):
 
 
 class CashAccountDeal(Deal):
+    # `generate` gathers the discount curve at `deal_time` rows and nothing else
+    prices_at_step_only = True
+
     factor_fields = {'Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate']}
 
@@ -4859,13 +4888,14 @@ class FRADeal(Deal):
 
 class FloatingEnergyDeal(Deal):
     def leg_descriptors(self, deal_data):
-        """This leg averages a reference price over each period, so its history requirement is the
-        widest reset span in its own schedule — declared here because `make_energy_cashflows`
-        wrote that layout and this class is what reads it back."""
+        """This leg averages a reference price over each period, so `pv_energy_cashflows` re-reads
+        its already-observed fixings at their own scenario rows for as long as the deal prices —
+        the bound is the deepest of those rows, taken straight off the schedule this class' own
+        `make_energy_cashflows` wrote (see `TensorCashFlows.deepest_reset_row`)."""
         cf = deal_data.Factor_dep.get('Cashflows')
         if cf is None:
-            return (0.0, None, None)
-        return (cf.total_abs_nominal(), cf.last_pay_day(), cf.max_reset_span())
+            return (0.0, None, np.inf)
+        return (cf.total_abs_nominal(), cf.last_pay_day(), cf.deepest_reset_row())
 
     # dependent price factors for this instrument
     factor_fields = {'Currency': ['FxRate'],
@@ -4965,6 +4995,10 @@ class FloatingEnergyDeal(Deal):
 
 
 class FixedEnergyDeal(Deal):
+    # a fixed leg has no resets: `pv_fixed_cashflows` gathers discount/repo/settlement curves at
+    # `deal_time` rows only
+    prices_at_step_only = True
+
     # dependent price factors for this instrument
     factor_fields = {'Currency': ['FxRate'],
                      'Discount_Rate': ['DiscountRate'],

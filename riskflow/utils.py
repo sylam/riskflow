@@ -196,6 +196,24 @@ class InstrumentExpired(Exception):
         self.message = message
 
 
+class CurveWindowError(IndexError):
+    """A curve gather asked for a scenario row outside the window its caller DECLARED
+    (`Interpolation.eval`). Distinguished from an ordinary pricing failure because it means the
+    declaration is wrong, not that this deal cannot price on this grid — see
+    `is_fatal_pricing_error`. Subclasses IndexError so the raise reads the same to any caller
+    that only cares that a gather went out of range."""
+
+
+def is_fatal_pricing_error(e):
+    """Exceptions a deal-level pricing guard must NOT swallow into a scalar-0 mark: a declared
+    window violated, and the machine running out of memory. Both say the FRAMEWORK is wrong
+    rather than the deal, and both produce a silently missing mark if caught — inside an
+    inner-MC fork a missing tradable mark reads as an expired contract and retires the
+    instrument from the hedge set. Everything else keeps the canonical skip."""
+    return isinstance(e, (CurveWindowError, MemoryError, torch.cuda.OutOfMemoryError)) or (
+        isinstance(e, RuntimeError) and 'out of memory' in str(e).lower())
+
+
 def log_exception(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -440,14 +458,14 @@ class Interpolation(object):
                 # `numel()` first: a step with no resets in range gathers an EMPTY index set,
                 # and min() on an empty tensor raises for the wrong reason.
                 if j00.numel() and int(j00.min()) < 0:
-                    raise IndexError(
+                    raise CurveWindowError(
                         f'Hermite window starts at flat row {self.row_offset} but a gather asked '
                         f'for {int(i00.min())} — the window does not cover this read.')
                 val = calc_hermite_curve(w2, g[j00,], c[j00,], tensor[i00,], tensor[i01,])
                 if alpha is not None:
                     j10 = i10 - self.row_offset
                     if j10.numel() and int(j10.min()) < 0:
-                        raise IndexError(
+                        raise CurveWindowError(
                             f'Hermite window starts at flat row {self.row_offset} but a gather '
                             f'asked for {int(i10.min())} — the window does not cover this read.')
                     val_t1 = calc_hermite_curve(w2, g[j10,], c[j10,], tensor[i10,], tensor[i11,])
@@ -907,25 +925,25 @@ class TensorCashFlows(TensorSchedule):
         """Latest payment day (offset in days from base_date)."""
         return float(self.schedule[:, CASHFLOW_INDEX_Pay_Day].max())
 
-    def max_reset_span(self):
-        """How far back in DAYS a live cashflow can reference — the widest reset window in this
-        schedule. Each cashflow's resets are `offsets[i, 0]` entries starting at `offsets[i, 1]`
-        of `Resets` (the layout `make_energy_cashflows` writes), so while a period is live the
-        pricer reads its already-observed fixings and never looks further back than that period's
-        own span. 0.0 when nothing resets — a fixed leg reads no history.
+    def deepest_reset_row(self):
+        """The deepest SCENARIO ROW a reset-driven pricer can gather off this schedule — read
+        from the predicate that selects them rather than from the schedule's intent. The energy
+        pricer takes `sim_resets = schedule[(Scenario > -1) & (Reset_Day <= deal_time.max())]`
+        (`pricing.pv_energy_cashflows`) and gathers every one of them at its own
+        `RESET_INDEX_Scenario` row, which IS the row a curve block is indexed by. That predicate
+        has no lower bound and no cashflow-start filter, so the deepest row is simply the
+        smallest simulated `Scenario` in the whole schedule: the reset->payment settlement lag,
+        the elapsed periods of a multi-period leg and a bullet period's single fixing are all
+        covered by construction. `inf` when nothing is simulated (a fixed or fully-fixed leg
+        reads no row below the step it is priced at).
 
-        This is the DECLARED history requirement the inner-MC fork windows its Hermite
-        coefficients by; it is read off the schedule, never inferred from a measured run."""
+        This is the DECLARED history bound the inner-MC fork windows its Hermite coefficients
+        by; it is read off the schedule, never inferred from a measured run."""
         if self.Resets is None:
-            return 0.0
-        days = self.Resets.schedule[:, RESET_INDEX_Reset_Day]
-        span = 0.0
-        for count, offset in zip(self.offsets[:, 0].astype(np.int64),
-                                 self.offsets[:, 1].astype(np.int64)):
-            if count > 1:
-                block = days[offset:offset + count]
-                span = max(span, float(block.max() - block.min()))
-        return span
+            return np.inf
+        rows = self.Resets.schedule[:, RESET_INDEX_Scenario]
+        rows = rows[rows > -1]
+        return float(rows.min()) if rows.size else np.inf
 
     def known_fx_resets(self, num_scenarios, index=CASHFLOW_INDEX_FXResetValue,
                         filter_index=CASHFLOW_INDEX_FXResetDate):

@@ -80,12 +80,18 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
     the matching offset. Every other caller — base valuation, credit Monte Carlo, the outer hedge
     loop — leaves the window None and builds the full block, byte for byte as before.
 
-    The bound is DERIVED, never guessed: `TensorCashFlows.max_reset_span` reads the widest
-    averaging window out of the liability's own reset schedule, `leg_descriptors` publishes it, and
-    `HedgeMonteCarlo._hermite_window` converts those days into rows against this grid. A leg that
-    does not declare a bound returns None and switches the window off for the whole book. A gather
-    below the window raises rather than silently wrapping to the end of the block; squeezing the
-    derived bound by one row makes it fire, so the derivation is tight rather than lucky.
+    The bound is DERIVED, never guessed, and it is a scenario ROW rather than a span in days:
+    `TensorCashFlows.deepest_reset_row` returns the smallest `RESET_INDEX_Scenario` the energy
+    pricer's own `sim_resets` predicate can select — the column the gather is indexed by — so the
+    reset→payment settlement lag, a multi-period leg's elapsed schedule and a bullet period's
+    single fixing are covered by construction, with no day→row conversion to be off by.
+    `leg_descriptors` publishes it per deal (`prices_at_step_only = True` declares "nothing below
+    my own step"), and `HedgeMonteCarlo._hermite_floor_row` mins it over BOTH structures the fork
+    prices — the tradables and the liabilities, since one window covers both. A deal that does not
+    declare a bound returns None and switches the window off for the whole book, naming itself in
+    the log. A gather below the window raises `utils.CurveWindowError`, which `Deal.calculate`
+    re-raises instead of swallowing into a scalar-0 mark (so does a CUDA OOM) — a swallowed mark
+    vanishes from `tensor_marks`, which a fork reads as an expired contract.
 
     Measured on the production walk-forward book: peak 18.3 -> 8.1 GiB at 1280x64 (trade wall
     125 -> 109 s), and 2048x64 — which OOMs without the window — completes at 12.3 GiB.
@@ -94,7 +100,7 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
     `generate()` must handle both outer (`Z.ndim==2`, `(T,B)`) and inner (`Z.ndim==3`, `(T,B,B2)`) modes, with the per-outer-path initial state broadcast on the **middle** axis in inner mode. This is what lets one process instance serve both loops.
 
 !!! warning "Invariant — inner-MC batch state + fail-loud pricing"
-    `shared_mem.simulation_batch` and `shared_mem.fillvalue` must track the current flat batch during an inner fork (set before `reset_inner` and before the pricing pass) and be restored to `B_outer` afterward — in a `finally`, so a mid-fork raise (CUDA OOM, degenerate pricing) cannot leave the state flat-sized and make the *next* chunk fail on shapes instead of the real cause; `fillvalue` is frozen at construction and used as the empty-cat fallback in energy-leg / cash-settle code. Inner-MC liability pricing must fail loud on a degenerate shape rather than let `Deal.calculate`'s guard swallow an OOM into a scalar-0 mark — inside a fork that silently corrupts the solver's training labels.
+    `shared_mem.simulation_batch` and `shared_mem.fillvalue` must track the current flat batch during an inner fork (set before `reset_inner` and before the pricing pass) and be restored to `B_outer` afterward — in a `finally`, so a mid-fork raise (CUDA OOM, degenerate pricing) cannot leave the state flat-sized and make the *next* chunk fail on shapes instead of the real cause; `fillvalue` is frozen at construction and used as the empty-cat fallback in energy-leg / cash-settle code. Inner-MC pricing must fail loud rather than let `Deal.calculate`'s guard swallow a failure into a scalar-0 mark — inside a fork that silently corrupts the solver's training labels. Both halves are checked: the liability on its flat shape, and every tradable still live in the fork's dependency list on having produced a `tensor_marks` entry (a missing one is indistinguishable from an expired contract, and the solver's `live` mask retires it).
 
 !!! warning "Invariant — `keep_tensor` gates the hedge tradable series"
     `keep_tensor` governs whether `pricing.interpolate` stores `Calc_res['tensor']`; the hedge path sets `Keep_Tensor='Yes'` and harvests those via `tensor_marks`. Removing/altering that store breaks the hedge bundle's tradable series with no error — only missing marks.
