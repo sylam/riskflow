@@ -277,3 +277,67 @@ def test_a_skipped_tradable_leaves_a_loud_hole_in_the_fork():
     finally:
         instruments.CommodityFutureDeal.generate = original
         HedgeMonteCarlo._run_inner_mc_at_t = original_fork
+
+
+# --------------------------------------------------------------------------------------------
+# The fork publishes a SEQUENCE of row blocks, not a joined grid
+# --------------------------------------------------------------------------------------------
+_SOURCE, _INIT = utils.ScenarioSource, utils.Interpolation.__init__
+
+
+def _at_the_read_boundary(hook):
+    """Run with `hook(source)` applied to every block sequence the pricer is handed."""
+    def wrapped(self, tensor, hermite_tenor=None, start=0, fan=1):
+        _INIT(self, hook(tensor) if isinstance(tensor, _SOURCE) else tensor,
+              hermite_tenor, start, fan)
+    return wrapped
+
+
+def _run_with(hook, cfg, name):
+    utils.Interpolation.__init__ = _at_the_read_boundary(hook)
+    try:
+        return _run(cfg, name)
+    finally:
+        utils.Interpolation.__init__ = _INIT
+
+
+def _join(source):
+    """The pre-feature grid: ONE block carrying every row at the flat width, which is what the
+    fork used to stuff with a `cat` of a past expanded across the inner draws."""
+    return source.join()
+
+
+def test_a_fork_reading_deep_history_answers_as_if_the_grid_were_joined():
+    """The case the whole change turns on. A one-step fork windows the DEAL to {t, t+1}, but the
+    liability's past fixings build their own grid off the reset schedule and gather densely over
+    0..t — so the realized past has to be there, it just does not have to be there B_inner times.
+    Solving the deepest configuration both ways must give the same value to the last bit."""
+    cfg = _cfg(t_min=113)
+    hp = cfg['Calc']['Calculation']['Hedging_Problem']
+    hp['Liabilities']['FloatingEnergyDeal'].update(
+        _energy_leg('PLAT_AUG29', '2026-05-01', '2026-08-31', '2026-09-04'))
+    hp['Tradable_Instruments']['CashAccountDeal']['USD_CASH'][
+        'Investment_Horizon'] = TS('2026-09-04')
+    blocked = _run(copy.deepcopy(cfg), 'deep_history_blocks')
+    assert blocked is not None
+    assert blocked == _run_with(_join, cfg, 'deep_history_joined')
+
+
+def test_the_published_source_is_write_once():
+    """A fork builds its block sequence AFTER every process's `generate` has published, and
+    nothing writes into `t_Scenario_Buffer` afterwards. The published value carries only what
+    `make_curve_tensor` does to a buffer value, so a late write fails loud instead of silently
+    materializing the grid the sequence exists to avoid."""
+    seen = []
+    _run_with(lambda source: seen.append(source) or source, _cfg(t_min=113), 'write_once')
+    assert seen, 'no fork published a block sequence'
+    deep = [s for s in seen if len(s.blocks) > 1]
+    assert deep, 'every fork published one block — no fork reached past its cutoff'
+    source = deep[0]
+    past, inner = source.blocks
+    assert source.shape == (past.shape[0] + inner.shape[0],) + tuple(inner.shape[1:])
+    assert inner.shape[-1] % past.shape[-1] == 0, 'the forked block is not a fan of the past'
+    for write in (lambda: source.__iadd__(0.0001), lambda: source.copy_(inner),
+                  lambda: source.__setitem__(0, 0.0)):
+        with pytest.raises((TypeError, AttributeError)):
+            write()

@@ -17,9 +17,12 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 FIX = 'tests/fixtures/policy_test_simulate_only.json'
 OUT = 'artifacts/walk_forward/operating_point.csv'
-# Fork width x inner draws around the 24 GiB card. 2048x64 is today's shipping shape.
+# Fork width x inner draws around the 24 GiB card. The first nine are the historic ladder, kept
+# so rows stay comparable; the last three probe the headroom the block-routed fork opened up —
+# 2048x64 no longer stresses the card, and `Inner_Sub_Batch` is the lever selection quality moves on.
 RUNGS = [(512, 64), (768, 64), (1024, 64), (1280, 64), (1536, 64), (2048, 64),
-         (1024, 96), (1024, 128), (768, 128)]
+         (1024, 96), (1024, 128), (768, 128),
+         (3072, 64), (4096, 64), (1280, 256)]
 N_FIT = 3                      # fit steps per rung: T_Min = T_dec - N_FIT (fixture T_dec=117)
 
 

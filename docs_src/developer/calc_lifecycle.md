@@ -91,6 +91,11 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
     instead of swallowing them into a scalar-0 mark — a swallowed mark vanishes from `tensor_marks`,
     which a fork reads as an expired contract and the solver's `live` mask then retires.
 
+    The pair is built PER BLOCK, so inside a fork the 33 past rows of that 35-row span cost
+    `B_outer` columns, not `B_flat`: at 1280x64 that is 15.9 MiB instead of 1.03 GiB. The block a
+    row belongs to is the only thing that changes; the recursion, the span logic and the row
+    independence gate (`tests/test_hermite_lazy_rows.py`) are the same for one block or two.
+
 !!! warning "Invariant — `Z.ndim` dispatch (outer vs inner MC)"
     `generate()` must handle both outer (`Z.ndim==2`, `(T,B)`) and inner (`Z.ndim==3`, `(T,B,B2)`) modes, with the per-outer-path initial state broadcast on the **middle** axis in inner mode. This is what lets one process instance serve both loops.
 
@@ -102,4 +107,48 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
 
 ## Inner-MC subsystem
 
-`_run_inner_mc_at_t` forks the simulator from each outer-path state at outer step `t`: truncates the grid (`TimeGrid.truncate_to`), optionally windows to `{t,t+1}` (`copy_window`) for the one-step diff-ML bootstrap, and runs ONE pass at `Batch_Size x Inner_Sub_Batch` flat samples (no partition: peak memory is a function of those two JSON fields, and an over-wide config raises CUDA OOM naming the fork). The pass: `reset_inner` (Sobol), per-process `precalculate` from `outer_buf[key][t]`, `inner_fork_seed` / `reseed_inner_state` for the sufficient statistic, generate, then stuffs the outer-realized past (broadcast across `B_inner`) and flattens `(B,B2)→B*B2` for one real pricing pass on restricted `DealStructure`s. It uses the model-agnostic verb protocol so the loop is uniform across model worlds — see [The process protocol](dependency_system.md#the-process-protocol).
+`_run_inner_mc_at_t` forks the simulator from each outer-path state at outer step `t`: truncates the grid (`TimeGrid.truncate_to`), optionally windows to `{t,t+1}` (`copy_window`) for the one-step diff-ML bootstrap, and runs ONE pass at `Batch_Size x Inner_Sub_Batch` flat samples (no partition: peak memory is a function of those two JSON fields, and an over-wide config raises CUDA OOM naming the fork). The pass: `reset_inner` (Sobol), per-process `precalculate` from `outer_buf[key][t]`, `inner_fork_seed` / `reseed_inner_state` for the sufficient statistic, generate, then **publishes each factor's grid as a `ScenarioSource`** — the outer-realized past at `B_outer` followed by the forked rows flattened `(B,B2)→B*B2` — for one real pricing pass on restricted `DealStructure`s. It uses the model-agnostic verb protocol so the loop is uniform across model worlds — see [The process protocol](dependency_system.md#the-process-protocol).
+
+!!! note "A scenario source is a sequence of row blocks; one block is the ordinary case"
+    `utils.ScenarioSource` is a factor's grid as the pricer sees it: contiguous scenario-row
+    blocks under one logical shape, each at its own batch width. Ordinary generation publishes
+    ONE block, the whole grid at the simulation width. A fork publishes TWO. `Interpolation`
+    normalises a bare tensor into the one-block source and reads through the sequence either
+    way: `route` groups a gather's rows by the block that owns each of its two reads (off the
+    numpy scenario indices a `CurveTensor` already holds, so no device sync, once per
+    `CurveTensor` rather than once per gather), each block reads at its own width, and
+    `broadcast` takes that read up to the grid width — the identity for a block that IS the grid.
+    Base valuation, credit Monte Carlo and the outer hedge loop therefore run the same code with
+    no interior cut and both adapters the identity; nothing downstream can tell a forked source
+    from an ordinary one.
+
+    A time-interpolated read reaches `index + 1`, so a row just below a cut reads ACROSS it and
+    names two blocks — classify on where a read ENDS, not where it starts.
+
+    **Refusals, deliberate.** A curve whose factor declares `Near_Interpolation` builds a
+    `SegmentedInterpolation`, whose segments are middle-dim (tenor) slices with their own tenor
+    divisors; `make_curve_tensor` JOINS a multi-block source before building one, so segmented
+    curves give up the saving rather than route untested. `n_batch_dims > 1` gathers all happen
+    inside a process's `generate`, before a fork publishes, so a multi-block source never meets
+    one — it carries no `reshape` and would say so.
+
+    **Invariant — a source is write-once.** It is built after every process's `generate` has
+    published, and nothing writes into `t_Scenario_Buffer` afterwards. It answers only
+    `shape` / `new` / the RT tenor rescale, so a late write fails loud rather than silently
+    materializing the grid it exists to avoid. Its `t_Buffer` key is
+    `(interpolation, factor, LOGICAL shape)` — a source and the grid it joins to hash the same,
+    which is correct because `t_Buffer` is cleared before the fork prices and again in the
+    `finally`, so the two never coexist.
+
+    Measured on the production walk-forward book (trade 202001, garch, seed 7), like for like:
+
+    | | 1280x64 | 2048x64 | wall @1280 | kB per flat sample |
+    | --- | ---: | ---: | ---: | ---: |
+    | joined grid | 6.33 GiB | 10.11 GiB | 116.2 s | 80.62 |
+    | block sequence | **1.09 GiB** | **1.71 GiB** | 105.9 s | **13.23** |
+
+    `peak_alloc = 0.057 GiB + 13.23 kB · B_flat` (two-point fit; the 4096x64 rung measured
+    3.36 GiB against 3.36 predicted). At a 19.6 GiB allocated ceiling that moves max `B_flat`
+    from 254 k to 1.55 M — `Batch_Size` 3 977 → 24 208 at `Inner_Sub_Batch` 64, or
+    `Inner_Sub_Batch` 199 → 1 210 at `Batch_Size` 1280. Every reported value is unchanged
+    (`greedy -100.52`, `V_0 -0.2830735743045807`, `train_u -0.4611`, `churn 187.5`).

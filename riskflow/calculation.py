@@ -2511,16 +2511,21 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                         for block, _kind in proc_inner.reveal_state_at(1, shared_mem.t_Scenario_Buffer):
                             market_t1_parts.append(block.reshape(-1, B_outer, B_inner))
 
-                # Stuff the outer-realized past into each factor buffer + flatten (B,SB)→B*SB.
+                # Publish each factor's grid as the outer-realized past followed by the forked rows
+                # + flatten (B,SB)→B*SB. The past is a slice of the outer snapshot, already
+                # resident at B_outer, and every one of its rows is identical across the B_inner
+                # draws — the `cat` that used to join them wrote it out B_inner times (98% of the
+                # stuffed buffer at 1280x64, dragging a same-shaped slab of Hermite g,c with it).
+                # `ScenarioSource` is the same sequence-of-row-blocks the outer loop publishes with
+                # one block, so the pricer reads both through one mechanism. A fork at t=0 has no
+                # past and publishes one block.
                 for key in self.stoch_factors_inner:
                     if key.type in utils.DimensionLessFactors:
                         continue
                     inner_path = shared_mem.t_Scenario_Buffer[key]                  # (T_inner, ..., B, SB)
-                    outer_past = outer_scenario_buffer[key][:cutoff_idx]                         # (cutoff, ..., B)
-                    outer_past_b2 = outer_past.unsqueeze(-1).expand(*outer_past.shape, B_inner)
-                    stuffed = torch.cat([outer_past_b2, inner_path], dim=0)          # (T_outer, ..., B, SB)
-                    shared_mem.t_Scenario_Buffer[key] = stuffed.reshape(
-                        *stuffed.shape[:-2], B_flat)
+                    past = [outer_scenario_buffer[key][:cutoff_idx]] if cutoff_idx else []
+                    shared_mem.t_Scenario_Buffer[key] = utils.ScenarioSource(
+                        *past, inner_path.reshape(*inner_path.shape[:-2], B_flat))
 
                 # Single-pass pricing — the chunk is sized so B_flat fits the memory budget.
                 shared_mem.t_Buffer.clear()

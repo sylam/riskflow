@@ -9,7 +9,7 @@ riskflow is a **financial virtual machine**. A job is a program; the engine comp
 | compile | `Context.calculate_dependencies` (discover + order factors) + each process's `precalculate` |
 | instructions | `StochasticProcess.generate` (per factor) and `Deal.calculate` / `pricing.*` (per deal) |
 | execute | the per-batch generate loop in `Calculation.execute` |
-| registers / heap | `shared_mem.t_Scenario_Buffer` (simulated paths), `t_Static_Buffer` (static leaves) |
+| registers / heap | `shared_mem.t_Scenario_Buffer` (simulated paths — a tensor, or a `ScenarioSource` sequence of row blocks inside an inner-MC fork), `t_Static_Buffer` (static leaves) |
 | memoized eval cache | `shared_mem.t_Buffer` |
 
 The public surface (`Context`, `load_json`, `run_job`, the three calculation objects, output shape) is documented once in [API Overview](../api_overview.md); this section adds the **internal** view the public page omits.

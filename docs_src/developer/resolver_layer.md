@@ -60,7 +60,7 @@ Each deal's `calc_dependencies` returns a `field_index` dict of these codes; `ad
 ## Pricing consumption
 
 - `calc_time_grid_spot_rate(rate, …)`: spot = **sum** over code elements of the gathered component (stochastic via `gather_scenario_interp`, static via `reshape(1,-1)`), reading `t_*_Buffer[r[FACTOR_INDEX_Offset]]`. Cache key `('spot', tuple(tuple(r[:2]) for r in rate), time_hash)`.
-- `calc_time_grid_curve_rate(code, …, n_batch_dims=1)`: builds a `TensorBlock`; `make_curve_tensor` collapses extra trailing batch axes (inner-MC `(B,B2)→B*B2`) when `n_batch_dims>1`, keeping the interp stack single-trailing-batch.
+- `calc_time_grid_curve_rate(code, …, n_batch_dims=1)`: builds a `TensorBlock`; `make_curve_tensor` collapses extra trailing batch axes (inner-MC `(B,B2)→B*B2`) when `n_batch_dims>1`, keeping the interp stack single-trailing-batch. The buffer value it reads is a tensor or a `ScenarioSource` (a sequence of scenario-row blocks — one block ordinarily, two inside a fork); `Interpolation` normalises the tensor into the one-block source and reads through the sequence either way. `n_batch_dims>1` gathers happen during `generate`, before a fork publishes, so they only ever see one block. See [Calc Lifecycle](calc_lifecycle.md#inner-mc-subsystem).
 - `TensorBlock.gather_weighted_curve`: sums `zip(curve_tensors, code)` (parent curve + basis spreads); the risk-neutral branch keys on `not curve_component[FACTOR_INDEX_Stoch]`.
 
 !!! warning "Invariant — composed value is a sum of gathered components"
@@ -78,6 +78,6 @@ JSON string
   → [construct: stoch/static/all_factors/all_tenors]        (Calc Lifecycle)
   → [resolve: get_* → code [stoch, Factor, subtype, *tenor]] (this page)
   → field_index == Factor_dep
-  → [generate: t_Scenario_Buffer[Factor]]
+  → [generate: t_Scenario_Buffer[Factor] — one row block, or a fork's ScenarioSource sequence]
   → [price: calc_time_grid_*_rate sums components, caches in t_Buffer by (stoch,Factor)]
 ```
