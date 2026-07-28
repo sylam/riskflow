@@ -45,6 +45,20 @@ from .hedge_runtime import construct_hedge_runtime
 from .hedge_bundle import Bundle, run_hedge_execution, HedgeRuntimeExecutionResult
 from .hedge_solver import StreamingSolve
 
+# Rows of realized history an inner-MC fork's Hermite coefficients must cover, above the inner
+# rows it generates. None = NO WINDOW: build the full block, which is what every caller did before
+# the window existed and what every caller does today.
+#
+# Why it ships disabled. The window is a CLAIM about how far back a deal reads, and the curve
+# stack cannot verify it. Measured max read: 34 rows on the fixture (both fork modes) and on the
+# fixture at production shape — but a suite world (test_solve_reveal_width_9_vs_7) and the
+# platinum walk-forward book both read past 64, and a bound safe for all of them (128+) exceeds
+# the ~119-row grid, at which point the window covers everything and saves nothing. So a constant
+# is either unsafe or inert; a real window has to come from the deal's own history requirement
+# (the liability's averaging schedule) rather than a number chosen here. Set an int to enable —
+# a read below the window then raises rather than silently wrapping (utils.Interpolation.eval).
+HERMITE_HISTORY_ROWS = None
+
 class Aggregation(object):
     '''Container class that represents the base Instrument for aggregation'''
     def __init__(self, name):
@@ -2461,8 +2475,18 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         # over an outer-path SLICE would otherwise leave the state slice-sized, which is invisible
         # while forks only follow forks but corrupts the next outer batch under streaming.
         borrowed_batch, borrowed_fill = shared_mem.simulation_batch, shared_mem.fillvalue
+        # Hermite coefficient window (utils.make_curve_tensor): this fork prices a bounded slice
+        # of the grid — the inner rows it just generated, plus the realized history a
+        # path-dependent payoff averages over — while the curve block spans the whole grid.
+        # Measured on three worlds, forks read rows in [t-34, t+10] and touch 0.7% of the block;
+        # HERMITE_HISTORY_ROWS=64 is the bound this claims, and a read below it raises rather
+        # than silently wrapping. Cleared in the finally: only the fork is windowed.
+        window = None if HERMITE_HISTORY_ROWS is None else (
+            cutoff_idx - HERMITE_HISTORY_ROWS,
+            cutoff_idx + int(inner_time_grid.scen_time_grid.size))
         with grad_ctx:
             try:
+                shared_mem.hermite_window = window
                 shared_mem.simulation_batch = B_outer
                 shared_mem.reset_inner(self.num_factors, inner_time_grid,
                                        use_antithetic=self.params.get('Inner_Antithetic', 'No') == 'Yes',
@@ -2626,6 +2650,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 # flat-sized, so the NEXT chunk / t-step failed on shapes instead of the real cause.
                 # Restored to what the fork FOUND, not to this fork's own width: outer generation
                 # resumes on the same state under streaming.
+                shared_mem.hermite_window = None
                 shared_mem.simulation_batch = borrowed_batch
                 shared_mem.fillvalue = borrowed_fill
                 shared_mem.t_Buffer.clear()

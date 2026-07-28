@@ -1,0 +1,17 @@
+curve,t,in_fork,scen,n_tenors,scen_lo,scen_hi,n_scen_used,scen_contiguous,all_tenors,is_product,rows_used,rows_total,frac,window_lo_rel_t,window_hi_rel_t
+"Factor(type='InterestRate', name=('USD-SOFR'",108,True,119,31,82,118,29,False,False,False,39,3689,0.0106,-26,10
+"Factor(type='InterestRate', name=('USD-SOFR'",108,True,119,31,82,118,29,False,False,False,39,3689,0.0106,-26,10
+"Factor(type='InterestRate', name=('USD-SOFR'",109,True,119,31,82,118,29,False,False,False,38,3689,0.0103,-27,9
+"Factor(type='InterestRate', name=('USD-SOFR'",110,True,119,31,82,118,29,False,False,False,37,3689,0.01,-28,8
+"Factor(type='InterestRate', name=('USD-SOFR'",110,True,119,31,82,118,29,False,False,False,37,3689,0.01,-28,8
+"Factor(type='InterestRate', name=('USD-SOFR'",111,True,119,31,82,118,29,False,False,False,36,3689,0.0098,-29,7
+"Factor(type='InterestRate', name=('USD-SOFR'",111,True,119,31,82,118,29,False,False,False,36,3689,0.0098,-29,7
+"Factor(type='InterestRate', name=('USD-SOFR'",112,True,119,31,82,118,29,False,False,False,35,3689,0.0095,-30,6
+"Factor(type='InterestRate', name=('USD-SOFR'",112,True,119,31,82,118,29,False,False,False,35,3689,0.0095,-30,6
+"Factor(type='InterestRate', name=('USD-SOFR'",113,True,119,31,82,118,29,False,False,False,34,3689,0.0092,-31,5
+"Factor(type='InterestRate', name=('USD-SOFR'",114,True,119,31,82,118,28,False,False,False,32,3689,0.0087,-32,4
+"Factor(type='InterestRate', name=('USD-SOFR'",115,True,119,31,82,118,27,False,False,False,30,3689,0.0081,-33,3
+"Factor(type='InterestRate', name=('USD-SOFR'",115,True,119,31,82,118,27,False,False,False,30,3689,0.0081,-33,3
+"Factor(type='InterestRate', name=('USD-SOFR'",116,True,119,31,82,118,26,False,False,False,28,3689,0.0076,-34,2
+"Factor(type='InterestRate', name=('USD-SOFR'",116,True,119,31,82,118,26,False,False,False,28,3689,0.0076,-34,2
+"Factor(type='InterestRate', name=('USD-SOFR'",,False,119,31,0,118,119,True,False,False,510,3689,0.1382,,
