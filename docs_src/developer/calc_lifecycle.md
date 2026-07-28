@@ -81,7 +81,11 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
     rows in advance — the reader names them — so there is no window to violate and no failure mode
     that depends on a prediction holding. Every caller behaves the same way, inner fork or not.
 
-    Measured on the production walk-forward book at 1280x64: mean span 7.25 rows of 63.96 (11.3%),
+    Measured on the production walk-forward book at 1280x64: mean span 7.25 rows of 63.96 (11.3%)
+    across all 375 forks — but the MEAN does not set peak memory. The peak fork (the first grad
+    fork, t=124) spans 35 rows of 126, because the tradables need 2 rows and the liability's
+    past-fixing gathers widen it; size any memory estimate off that fork, not the mean.
+
     peak 15.2 -> 6.3 GiB allocated against an eager full-block build, at identical wall time
     (170.0 s vs 170.3 s). `Deal.calculate` re-raises `is_fatal_pricing_error` classes (CUDA OOM)
     instead of swallowing them into a scalar-0 mark — a swallowed mark vanishes from `tensor_marks`,
