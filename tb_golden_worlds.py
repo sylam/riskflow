@@ -49,7 +49,18 @@ def bundle_snapshot(bundle):
     return out
 
 
-def solve_cfg(one_step):
+# The checkpoint the `eval` world loads. The BASELINE writes it (running `stream`) and BOTH trees
+# then load that one file, so the frozen-eval comparison is about the eval path and not about
+# whether training moved — `stream` is the golden that answers that.
+CKPT = os.environ.get('GOLDEN_CKPT', '/tmp/golden_ckpt.pt')
+
+
+def solve_cfg(world):
+    """`Yes`/`No` set `DiffV2_One_Step_Fork`; `stream` is a training stream; `eval` is a frozen
+    stream of length one. `stream` emits BOTH `Simulation_Batches` and `DiffV2_Streaming_Batches`
+    so one config drives both trees — the pre-deletion engine needs the switch and the post-
+    deletion one ignores an unknown solver key. `eval` emits no switch: pre-deletion that is the
+    one-shot load path, post-deletion it is a stream of one, which is the comparison worth making."""
     cfg = json.load(open(FIX))
     c = cfg['Calc']['Calculation']
     c.update({'Execution_Mode': 'solve_hedge', 'Batch_Size': 48, 'Inner_Sub_Batch': 8,
@@ -58,8 +69,15 @@ def solve_cfg(one_step):
     c['Hedging_Problem']['Solver'] = {
         'Object': 'DiffSolverV2', 'Training_Action_Grid_Levels_Per_Axis': 5,
         'Training_Action_Chunk_Size': 64, 'T_Min': 108, 'DiffV2_Fit_Iters': 5,
-        'DiffV2_OOS_Frac': 0.5, 'DiffV2_One_Step_Fork': one_step,
+        'DiffV2_OOS_Frac': 0.5, 'DiffV2_One_Step_Fork': 'Yes' if world in ('stream', 'eval') else world,
         'Run_Hindsight_Diagnostic': 'Yes', 'Run_Textbook_Benchmark': 'Yes'}
+    if world == 'stream':
+        c['Batch_Size'], c['Simulation_Batches'] = 24, 3
+        c['Hedging_Problem']['Solver'].update(
+            {'DiffV2_Streaming_Batches': 'Yes', 'DiffV2_Save_Value_Fn': CKPT})
+    elif world == 'eval':
+        c['Batch_Size'], c['Simulation_Batches'] = 24, 1
+        c['Hedging_Problem']['Solver']['DiffV2_Load_Value_Fn'] = CKPT
     return cfg
 
 
