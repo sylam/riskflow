@@ -81,7 +81,6 @@ BEST_SOLVER = {
     'DiffV2_Hidden': 32,
     'DiffV2_LR': 0.002,
     'DiffV2_Cost_Aware_Argmax': 'Yes',            # charge repositioning cost at the argmax
-    'DiffV2_One_Step_Fork': 'Yes',                # {t,t+1} fork window (default) — required < inner=64
     'DiffV2_Per_Column_Grad_Norm': 'Yes',         # per-input-column differential normalization
 }
 

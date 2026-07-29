@@ -120,8 +120,7 @@ def _cfg(t_min):
     calc['Hedging_Problem']['Randomize_Initial_State'] = 'Yes'
     calc['Hedging_Problem']['Solver'] = {
         'Object': 'DiffSolverV2', 'Training_Action_Grid_Levels_Per_Axis': 3,
-        'Training_Action_Chunk_Size': 64, 'T_Min': t_min, 'DiffV2_Fit_Iters': 2,
-        'DiffV2_One_Step_Fork': 'Yes'}
+        'Training_Action_Chunk_Size': 64, 'T_Min': t_min, 'DiffV2_Fit_Iters': 2}
     return cfg
 
 

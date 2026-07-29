@@ -24,7 +24,7 @@ FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        'fixtures', 'policy_test_simulate_only.json')
 
 
-def _cfg(inner_antithetic='No', one_step_fork='Yes'):
+def _cfg(inner_antithetic='No'):
     cfg = jsonlib.load(open(FIXTURE))
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = 'solve_hedge'
@@ -41,7 +41,6 @@ def _cfg(inner_antithetic='No', one_step_fork='Yes'):
         'Training_Action_Chunk_Size': 64,
         'T_Min': 100,                       # ~17-step bounded sweep (fast); full depth in build notes
         'DiffV2_Fit_Iters': 30,
-        'DiffV2_One_Step_Fork': one_step_fork,
         # defaults apply implicitly: DiffV2_Weight_Decay=0 (the twin-loss gradient match is
         # the regularizer, not weight decay), DiffV2_Lambda_Grad=1, DiffV2_Hidden=32. This
         # tiny-batch smoke gates "bounded + hedges OOS"; full multi-seed wd=0 robustness is
@@ -50,17 +49,11 @@ def _cfg(inner_antithetic='No', one_step_fork='Yes'):
     return cfg
 
 
-@pytest.mark.parametrize('inner_antithetic,one_step_fork', [
-    ('No', 'Yes'), ('Yes', 'Yes'),
-    # legacy full-horizon forks — statistically-equivalent labels at shallow windows
-    # (the mode still ships as the DiffV2_One_Step_Fork='No' fallback)
-    ('Yes', 'No'),
-])
-def test_diffsolverv2_bounded_and_hedges_oos(inner_antithetic, one_step_fork):
-    """Both inner-draw modes must clear the same gates: plain Sobol and the antithetic
-    fold (Inner_Antithetic='Yes' — mirrored (z, -z) pairs on the inner axis), plus the
-    legacy full-horizon fork mode."""
-    cfg = _cfg(inner_antithetic, one_step_fork)
+@pytest.mark.parametrize('inner_antithetic', ['No', 'Yes'])
+def test_diffsolverv2_bounded_and_hedges_oos(inner_antithetic):
+    """Both inner-draw modes must clear the same gates: plain Sobol and the antithetic fold
+    (Inner_Antithetic='Yes' — mirrored (z, -z) pairs on the inner axis)."""
+    cfg = _cfg(inner_antithetic)
     cx = rf.Context()
     cx.load_json((jsonlib.dumps(cfg), 'diffml_v2_oos.json'))
     _, result = cx.run_job()

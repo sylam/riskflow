@@ -2243,54 +2243,6 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             )
         return spot_keys[0]
 
-    def _calc_inner_features(self, inner_mtm, inner_trade_tensors, tradable_refs, cutoff_idx):
-        """Per-outer-path features from inner-MC outputs: P(L_T<0), E[L_T|loss],
-        Var[L_T|loss], and per-tradable E[F_T-F_t|loss] / E[min_s F_s-F_t|loss].
-        Output `(B_outer, 3 + 2*len(tradable_refs))`. `clamp_min(1)` sentinel: zero-loss
-        paths yield all-zero features; `prob_loss == 0` flags them. Pure function — also
-        reusable as a standalone diagnostic.
-
-        Sign convention: `liability` MTM follows the deal's natural Payer/Receiver sign
-        (net_pnl = pnl_excess + liability). For a Receiver,
-        L > 0 = money flows in = profit; L < 0 = loss. The hedger conditions on the
-        loss tail, so the mask is `L_T < 0`.
-
-        `inner_mtm[-2]` (not [-1]): the time-grid construction appends one extra date
-        past the liability terminal to show the netting set settling to zero ("clean
-        exit"). [-1] is that zero; [-2] is the pre-settlement terminal MTM.
-
-        Tradable tensors are sliced at `cutoff_idx` — the post-gather per-deal tensor
-        covers `[0, expiry]` over the full outer interp, and positions `[0, cutoff_idx)`
-        hold garbage from the post-gather interpolation against a sliced deal_time_grid
-        (legitimately unused — we never read them). The valid future is `[cutoff_idx:]`."""
-        L_T = inner_mtm[-2]                                            # (B_outer, B_inner)
-        loss_mask = (L_T < 0).to(dtype=L_T.dtype)                      # float, same dtype as L_T
-        loss_count = loss_mask.sum(dim=-1).clamp_min(1)
-
-        prob_loss = loss_mask.mean(dim=-1)                             # (B_outer,)
-        expected_loss_given_loss = (L_T * loss_mask).sum(dim=-1) / loss_count
-        centered = (L_T - expected_loss_given_loss.unsqueeze(-1)) * loss_mask
-        variance_loss_given_loss = (centered * centered).sum(dim=-1) / loss_count
-
-        per_contract = []
-        for ref in tradable_refs:
-            td = inner_trade_tensors.get(ref)
-            if td is None:
-                # Tradable expired before this inner-MC fork — no deal, no moves.
-                zero = loss_count.new_zeros(loss_count.shape)           # (B_outer,)
-                per_contract.append(zero)
-                per_contract.append(zero)
-                continue
-            td = td[cutoff_idx:]                                       # (T_inner, B_outer, B_inner)
-            df_terminal = td[-1] - td[0]
-            df_min = td.min(dim=0).values - td[0]
-            per_contract.append((df_terminal * loss_mask).sum(dim=-1) / loss_count)
-            per_contract.append((df_min * loss_mask).sum(dim=-1) / loss_count)
-
-        return torch.stack(
-            [prob_loss, expected_loss_given_loss, variance_loss_given_loss] + per_contract,
-            dim=-1)
-
     def _restricted_struct(self, outer_struct, cutoff_mtm_idx, window_end_idx=None):
         """Build a fresh DealStructure mirroring outer_struct but with each deal's
         Time_dep restricted to events at mtm positions >= cutoff_mtm_idx via
@@ -2319,28 +2271,23 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
     def _attach_inner_mc(self, bundle, outer_buffer, shared_mem, base_date, tradable_refs):
         """Attach the on-demand inner-MC forks to a bundle. The closures let the solver fork
         without a calc handle — they capture `self` (the inner-MC machinery), the outer scenario
-        snapshot they fork FROM, and shared_mem. `one_step=True` windows the fork to {t, t+1}:
-        2-row generation AND a real 2-row pricing pass (exact per-tradable F_t1, exact L_t/L_t1)
-        — the only fields the diff-ML bootstrap reads. Horizon fields (L_T, dF_T, dF_min,
-        features) are only produced on full forks. `outer_rows` lets the solver run the GRAD fork
-        in outer-path sub-slices at large B_outer (per-slice tapes; the single-chunk grad
-        constraint applies per slice — with `one_step=True` the tape covers 2 rows, so the flat
-        cap binds instead of the cells cap and slices get wide).
+        snapshot they fork FROM, and shared_mem. Every fork is windowed to {t, t+1}: 2-row
+        generation AND a real 2-row pricing pass, giving exact per-tradable F_t1 and exact
+        L_t/L_t1 — the only fields the diff-ML bootstrap reads. `outer_rows` lets the solver run
+        the GRAD fork in outer-path sub-slices at large B_outer (per-slice tapes; the tape covers
+        2 rows, so the flat cap binds instead of the cells cap and slices get wide).
 
         One bundle per batch under streaming, so the buffer is passed in rather than read off the
         calc: each bundle forks from ITS OWN batch."""
-        bundle.inner_mc = lambda t, one_step=False: self._run_inner_mc_at_t(
+        bundle.inner_mc = lambda t: self._run_inner_mc_at_t(
+            t, outer_buffer, shared_mem, base_date, tradable_refs)
+        bundle.inner_mc_grad = lambda t, outer_rows=None: self._run_inner_mc_at_t(
             t, outer_buffer, shared_mem, base_date, tradable_refs,
-            max_inner_steps=1 if one_step else None)
-        bundle.inner_mc_grad = lambda t, outer_rows=None, one_step=False: \
-            self._run_inner_mc_at_t(
-                t, outer_buffer, shared_mem, base_date, tradable_refs,
-                with_grad=True, outer_rows=outer_rows,
-                max_inner_steps=1 if one_step else None)
+            with_grad=True, outer_rows=outer_rows)
 
     def _run_inner_mc_at_t(self, t, outer_scenario_buffer, shared_mem, base_date,
                            tradable_refs, want_raw_samples=True, with_grad=False,
-                           max_inner_steps=None, outer_rows=None):
+                           outer_rows=None):
         """Run inner MC at a single outer timestep `t`, forking from `outer_scenario_buffer`
         — a snapshot of the outer `t_Scenario_Buffer` (factor keys plus every per-process aux
         key, batch dim B_outer).
@@ -2354,10 +2301,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         `want_raw_samples=False` returns just `{'features': (B_outer, 3+2*n_tradables)}`.
         `want_raw_samples=True` additionally returns the raw inner samples the solvers need:
-            L_T           (B_outer, B_inner)             liability terminal MTM
             F_t1          {ref: (B_outer, B_inner)}      futures price at outer t+1
-            dF_T          {ref: (B_outer, B_inner)}      F_T - F_t
-            dF_min        {ref: (B_outer, B_inner)}      min_s F_s - F_t over (t, T]
+            L_t, L_t1     (B_outer, B_inner)             liability MTM at outer t and t+1
             market_t1     (B_outer, B_inner, market_dim)  inner market state at outer t+1
             market_t      (B_outer, market_dim)           outer-realised market state at t
             t, cutoff_idx
@@ -2390,7 +2335,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             result = {'features': shared_mem.one.new_zeros(B_outer, n_features)}
             if want_raw_samples:
                 result.update(t=t, cutoff_idx=t, L_T=None, market_t=None, market_t1=None,
-                              F_t1={}, dF_T={}, dF_min={})
+                              F_t1={})
             return result
 
         # In HedgeMonteCarlo scen_time_grid == mtm_time_grid (dynamic_scenario_dates),
@@ -2398,28 +2343,23 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         cutoff_idx = t
         inner_base_date = base_date + pd.Timedelta(days=t_days)
 
-        # `max_inner_steps=1` truncates the inner grid to {t, t+1} AND windows every
-        # deal's Time_dep to those two rows (`copy_window` via `window_end_idx`), so the
-        # pricing chain runs for real on the 2-row grid — exact per-tradable F_t1 and
-        # liability L_t/L_t1 (the only fields the diff-ML bootstrap reads), correct on
-        # mixed strips (each future prices its own basis+carry; the old market-only
-        # short-circuit broadcast SPOT as every F_t1). Restricting the AAD tape to a
-        # single forward step is what keeps its memory bounded — a
-        # full t→T_dec horizon multiplies tape and pricing by the remaining rows for no
-        # use. The scenario buffer only reaches row t+1, and the windowed Time_dep
-        # rebuilds `interp` up to its last kept event, so nothing indexes past it.
-        window_end_idx = None
-        if max_inner_steps is not None:
-            window_end_idx = min(cutoff_idx + max_inner_steps,
-                                 self.time_grid.mtm_time_grid.size - 1)
-            if inner_time_grid.scen_time_grid.size > max_inner_steps + 1:
-                dates_sorted = sorted(inner_time_grid.scenario_dates)[:max_inner_steps + 1]
-                kept = set(dates_sorted)
-                inner_time_grid = utils.TimeGrid(
-                    kept,
-                    kept & set(inner_time_grid.mtm_dates),
-                    kept & set(inner_time_grid.base_MTM_dates))
-                inner_time_grid.set_base_date(inner_base_date)
+        # THE WINDOW. The inner grid is truncated to {t, t+1} and every deal's Time_dep windowed
+        # to those two rows (`copy_window` via `window_end_idx`), so the pricing chain runs for
+        # real on a 2-row grid — exact per-tradable F_t1 and liability L_t/L_t1, which is every
+        # field the diff-ML bootstrap reads, and correct on mixed strips (each future prices its
+        # own basis+carry; the old market-only short-circuit broadcast SPOT as every F_t1).
+        # Restricting the AAD tape to a single forward step is what keeps its memory bounded — a
+        # full t→T_dec horizon multiplies tape and pricing by the remaining rows for no use. The
+        # scenario buffer only reaches row t+1, and the windowed Time_dep rebuilds `interp` up to
+        # its last kept event, so nothing indexes past it.
+        window_end_idx = min(cutoff_idx + 1, self.time_grid.mtm_time_grid.size - 1)
+        if inner_time_grid.scen_time_grid.size > 2:
+            kept = set(sorted(inner_time_grid.scenario_dates)[:2])
+            inner_time_grid = utils.TimeGrid(
+                kept,
+                kept & set(inner_time_grid.mtm_dates),
+                kept & set(inner_time_grid.base_MTM_dates))
+            inner_time_grid.set_base_date(inner_base_date)
 
         # Generation, buffer stuffing, a single pricing pass, extraction — all at
         # `B_outer x B_inner` flat, in ONE pass. Two coordinate systems: processes generate
@@ -2555,31 +2495,25 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     ref: t.reshape(*t.shape[:-1], B_outer, B_inner)
                     for ref, t in inner_netting_sets.tensor_marks().items()
                 }
-                # One-step window: the feature builder and the horizon stats (L_T, dF_T,
-                # dF_min) read terminal rows that a 2-row window doesn't price — emit the
-                # zero placeholder / None / {} instead (the diff-ML bootstrap only reads
-                # the t/t+1 fields below). Consumers of the horizon stats always fork
-                # without a window.
-                one_step = window_end_idx is not None
-                result = {'features': shared_mem.one.new_zeros(B_outer, 3 + 2 * len(tradable_refs))
-                          if one_step else self._calc_inner_features(
-                              inner_mtm, inner_trade_tensors, tradable_refs, cutoff_idx)}
+                # The window prices {t, t+1}, so no terminal row exists to read: `L_T` is None and
+                # the horizon stats are simply not produced. The bootstrap reads only the t/t+1
+                # fields below.
+                result = {'features': shared_mem.one.new_zeros(
+                    B_outer, 3 + 2 * len(tradable_refs))}
 
                 if want_raw_samples:
-                    F_t1, dF_T, dF_min = {}, {}, {}
+                    F_t1 = {}
                     zero_bs = inner_mtm[-2].new_zeros(inner_mtm[-2].shape)   # (B_outer, B_inner)
                     for ref in tradable_refs:
                         td = inner_trade_tensors.get(ref)
                         if td is None:
                             # Tradable expired before this fork — zero moves, no position.
-                            F_t1[ref] = dF_T[ref] = dF_min[ref] = zero_bs
+                            F_t1[ref] = zero_bs
                             continue
                         td = td[cutoff_idx:]                                # (T_inner, B_outer, B_inner)
                         # td has < 2 time points when the tradable's last deal event is at t
                         # (it expires this step) — no t+1 slice; freeze it (dF == 0).
                         F_t1[ref] = (td[1] if td.shape[0] >= 2 else td[-1]).clone()
-                        dF_T[ref] = (td[-1] - td[0]).clone()
-                        dF_min[ref] = (td.min(dim=0).values - td[0]).clone()
                     # Market state — every simulated factor's informative state (sufficient
                     # statistic + price, carry curve, …) concatenated; factor order is the
                     # `stoch_factors_inner` iteration order, identical for market_t/market_t1.
@@ -2609,11 +2543,8 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     L_t1_inner = (mtm_fwd[1] if mtm_fwd.shape[0] >= 2
                                   else mtm_fwd[-1]).clone()                     # outer-t+1 per inner draw
                     result.update(
-                        t=t, cutoff_idx=cutoff_idx,
-                        L_T=None if one_step else inner_mtm[-2].clone(),
-                        L_t=L_t_inner, L_t1=L_t1_inner,
-                        F_t1=F_t1, dF_T={} if one_step else dF_T,
-                        dF_min={} if one_step else dF_min,
+                        t=t, cutoff_idx=cutoff_idx, L_T=None,
+                        L_t=L_t_inner, L_t1=L_t1_inner, F_t1=F_t1,
                         market_t=market_t, market_t1=market_t1)
                     if with_grad:
                         # Pair each leaf with the market_t column width it occupies — the

@@ -93,8 +93,7 @@ def stamp():
 
 
 # ---- config ---------------------------------------------------------------------------------
-def build_cfg(batch, inner, t_min, fit_iters, one_step='Yes', seed=1234,
-              dual_strip=False):
+def build_cfg(batch, inner, t_min, fit_iters, seed=1234, dual_strip=False):
     """The canonical fixture world, overridden in code (fixture is a TEMPLATE, never edited).
     `dual_strip` adds the LME leg via validate_cross_market.add_lme_leg -- OPT-IN because that
     helper still emits CommodityFutureDeal.Implied_Basis, which was removed from the schema."""
@@ -117,7 +116,6 @@ def build_cfg(batch, inner, t_min, fit_iters, one_step='Yes', seed=1234,
         'DiffV2_Fit_Iters': int(fit_iters),
         'DiffV2_Hidden': 32,
         'DiffV2_LR': 0.002,
-        'DiffV2_One_Step_Fork': one_step,
     }
     if dual_strip:
         from validate_cross_market import add_lme_leg
@@ -479,7 +477,7 @@ def cmd_phases(args):
     tag = stamp()
     os.makedirs(OUTDIR, exist_ok=True)
     cfg = build_cfg(args.batch, args.inner, args.t_min, args.fit_iters,
-                    one_step=args.one_step, dual_strip=args.dual_strip)
+                    dual_strip=args.dual_strip)
     fork_flat = args.batch * args.inner                 # one pass, so this IS the fork width
     reset_peak()
     t0 = time.perf_counter()
@@ -499,7 +497,7 @@ def cmd_phases(args):
         w.writerows(probe.rows)
     lines = [f'inner-MC fork phase profile  ({tag})',
              f'world=fixture dual_strip={args.dual_strip} batch={args.batch} inner={args.inner} '
-             f'one_step={args.one_step} t_min={args.t_min} fit_iters={args.fit_iters}',
+             f't_min={args.t_min} fit_iters={args.fit_iters}',
              f'device={"cuda" if CUDA else "cpu"}  wall={wall:.1f}s  peak={peak_gib:.2f} GiB',
              f'fork calls={probe.fork_calls}',
              '', 'NOTE: every marker is cuda.synchronize-bracketed, so absolute wall is',
@@ -565,7 +563,7 @@ def cmd_trace(args):
     tag = stamp()
     os.makedirs(OUTDIR, exist_ok=True)
     cfg = build_cfg(args.batch, args.inner, args.t_min, args.fit_iters,
-                    one_step=args.one_step, dual_strip=args.dual_strip)
+                    dual_strip=args.dual_strip)
     acts = [torch.profiler.ProfilerActivity.CPU]
     if CUDA:
         acts.append(torch.profiler.ProfilerActivity.CUDA)
@@ -617,7 +615,6 @@ def main():
     p.add_argument('--t-min', type=int, default=95, dest='t_min',
                    help='higher = fewer forks (T_dec~117 on the fixture, so 95 => ~22 forks)')
     p.add_argument('--fit-iters', type=int, default=10, dest='fit_iters')
-    p.add_argument('--one-step', default='Yes', choices=['Yes', 'No'], dest='one_step')
     p.add_argument('--dual-strip', action='store_true',
                    help='add the LME leg (validate_cross_market helper still emits the removed '
                         'Implied_Basis field -- verify before using)')

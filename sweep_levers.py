@@ -36,7 +36,7 @@ from validate_cross_market import FIXTURE, add_lme_leg
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message)s')
 
 BASE = dict(levels=5, inner=32, batch=256, iters=60, hidden=32, t_min=60,
-            lr=2.0e-3, cost_aware=0, random_draws=0, save=0, one_step=1,
+            lr=2.0e-3, cost_aware=0, random_draws=0, save=0,
             noise=0.15, percol=0)
 FLOAT_KEYS = ('lr', 'noise')
 BATTERY = [
@@ -74,7 +74,6 @@ def build_cfg(template, p, seed):
         'DiffV2_Hidden': p['hidden'],
         'DiffV2_LR': p['lr'],
         'DiffV2_Cost_Aware_Argmax': 'Yes' if p['cost_aware'] else 'No',
-        'DiffV2_One_Step_Fork': 'Yes' if p['one_step'] else 'No',
         'DiffV2_Bank_Noise_Frac': p['noise'],
         'DiffV2_Per_Column_Grad_Norm': 'Yes' if p['percol'] else 'No',
     }

@@ -458,7 +458,6 @@ class DiffSolverV2:
         '| `DiffV2_Bank_Noise_Frac` | exploration around the per-t replication hedge |',
         '| `DiffV2_Risk_Kappa` | score actions by `mean(C) - kappa * downside-semidev(C)` |',
         '| `DiffV2_Cost_Aware_Argmax` | charge the L1 repositioning cost at the argmax |',
-        '| `DiffV2_One_Step_Fork` | window fork generation AND pricing to `{t, t+1}` |',
         '| `Active_Hedge_Indices` | which hedge axes vary; the rest pin to 0 |',
         '| `Multi_Seed_Count` | independent solvers on the same batches |',
         '',
@@ -509,9 +508,6 @@ class DiffSolverV2:
         # Cost-aware EXECUTION: the verdict rollout charges κ·|q − q_prev| at the argmax
         # (hysteresis); training/selection stay cost-free. Default off = bit-identical.
         self.cost_aware = bool(self.cfg.get("diffv2_cost_aware_argmax", False))
-        # One-step forks: window inner generation+pricing to {t, t+1} (the bootstrap only
-        # reads t/t+1 fields) — fork cost stops scaling with the remaining horizon.
-        self.one_step = bool(self.cfg.get("diffv2_one_step_fork", True))
         # Bank exploration RNG — deterministic, and PERSISTENT across batches so each batch
         # explores a fresh noise draw.
         self.gen = torch.Generator(device=self.device)
@@ -637,7 +633,7 @@ class DiffSolverV2:
           dL   (B_outer, B_inner)           liability mark change t→t+1
           m1   (B_outer, B_inner, market_dim) market state at t+1
         plus the bank-state market at t (B_outer, market_dim)."""
-        inner = self.bundle.inner_mc(t, one_step=self.one_step)
+        inner = self.bundle.inner_mc(t)
         F_t = torch.stack([self.tradables_sim[ref][t] for ref in self.hedges], dim=-1)   # (B_outer, n_hedge)
         F_t1 = torch.stack([inner["F_t1"][ref] for ref in self.hedges], dim=-1)          # (B_outer, B_inner, n_hedge)
         # EXPIRED-CONTRACT GUARD: the framework returns inner F_t1=0 for a tradable that has
@@ -810,7 +806,7 @@ class DiffSolverV2:
         # market state (spot/state) come from the SAME forward — the full Huge–Savine twin
         # loss. ∂Y/∂market_t is the differential constraint that regularizes the market
         # dimension (where a value-only / W-only fit overfits the few outer paths).
-        ig = self.bundle.inner_mc_grad(t, one_step=self.one_step)
+        ig = self.bundle.inner_mc_grad(t)
         leaves, widths = ig["state_t_leaves"], ig["state_t_leaf_widths"]
         if not getattr(self, "_proj_checked", False):
             self._proj_checked = True                  # one-time self-check of the label projection
@@ -1101,10 +1097,6 @@ class DiffSolverV2:
             self.n_hedge, self.active, self.T_dec, self.n_steps,
             self.B_outer, self.levels, self.fit_iters, self.lr, self.contract_size.tolist(),
             self.q_lo.tolist(), self.q_hi.tolist(), self.total_abs_limit)
-        logging.info("DiffSolverV2 inner forks: one_step=%s (window {t, t+1} generation+pricing)"
-                     if self.one_step else
-                     "DiffSolverV2 inner forks: one_step=%s (full remaining-horizon forks)",
-                     self.one_step)
 
         W_bank, _q_bank = self._build_bank(self.gen)
         # Cache the framework inner-MC one-step quantities over the swept range — one

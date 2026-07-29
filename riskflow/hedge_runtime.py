@@ -240,12 +240,6 @@ def _solver_config(solver_config: Optional[Mapping[str, Any]]) -> Optional[Dict[
         # own wealth). Exposes diagnostics['stepper_verdict']. 'No' = only the fast _verdict.
         "diffv2_stepper_rollout":
             solver_config.get("DiffV2_Stepper_Rollout", "No") == "Yes",
-        # One-step inner forks: window fork generation AND pricing to {t, t+1} — the
-        # bootstrap/argmax only read t/t+1 fields (F_t1, L_t, L_t1, market_t1), so the
-        # AAD tape and per-fork pricing stop scaling with the remaining horizon.
-        # 'No' = legacy full-horizon forks (statistically equivalent labels, ~rows/2 x cost).
-        "diffv2_one_step_fork":
-            solver_config.get("DiffV2_One_Step_Fork", "Yes") == "Yes",
         # Twin-loss differential normalization: Huge-Savine's official implementation
         # normalizes greeks PER INPUT COLUMN (lambda_j vector) — validated +0.01-0.017 u
         # on every 8k seed vs the pooled scalar. 'No' = legacy pooled variance (one

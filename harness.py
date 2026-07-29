@@ -41,7 +41,6 @@ SEED = 1234
 INNER_ANTITHETIC = 'Yes'
 INNER_DRAWS = 'sobol'     # 'sobol' | 'random'  (iid randn inner draws)
 COST_AWARE = 'No'         # production: 'Yes' (charge k|dq| at the argmax)
-ONE_STEP = 'Yes'          # production: 'Yes' ({t,t+1} fork window; 'No' = legacy full forks)
 SAVE_CKPT = ''            # production: per-seed path, then ensemble via LOAD_CKPTS
 LOAD_CKPTS = []           # eval-only: list of pruned member checkpoints (ensemble argmax)
 
@@ -66,7 +65,6 @@ def main():
         'T_Min': T_MIN,
         'DiffV2_Fit_Iters': FIT_ITERS,
         'DiffV2_Cost_Aware_Argmax': COST_AWARE,
-        'DiffV2_One_Step_Fork': ONE_STEP,
     }
     if SAVE_CKPT:
         hp['Solver']['DiffV2_Save_Value_Fn'] = SAVE_CKPT

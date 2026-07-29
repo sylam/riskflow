@@ -34,7 +34,7 @@ def _cfg(batches, save=None, load=None):
     calc['Hedging_Problem']['Randomize_Initial_State'] = 'Yes'
     solver = {'Object': 'DiffSolverV2', 'Training_Action_Grid_Levels_Per_Axis': 3,
               'Training_Action_Chunk_Size': 64, 'T_Min': 113, 'DiffV2_Fit_Iters': 2,
-              'DiffV2_One_Step_Fork': 'Yes'}
+              }
     if save:
         solver['DiffV2_Save_Value_Fn'] = save
     if load:

@@ -67,7 +67,7 @@ def rung(batch, inner):
         'Object': 'DiffSolverV2', 'Training_Action_Grid_Levels_Per_Axis': 9,
         'Training_Action_Chunk_Size': 64, 'DiffV2_Fit_Iters': 60, 'DiffV2_Hidden': 32,
         'DiffV2_LR': 0.002, 'DiffV2_Cost_Aware_Argmax': 'Yes',
-        'DiffV2_One_Step_Fork': 'Yes', 'DiffV2_Per_Column_Grad_Norm': 'Yes',
+        'DiffV2_Per_Column_Grad_Norm': 'Yes',
         'T_Min': 117 - N_FIT}                   # fixture T_dec = 117 (measured)
     torch.cuda.reset_peak_memory_stats()
     t = threading.Thread(target=sample, daemon=True); t.start()
