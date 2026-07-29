@@ -357,7 +357,7 @@ def test_a_leaf_knows_nothing_about_blocks():
     assert isinstance(whole, Interpolation)
     for attr in ('blocks', 'cuts', 'first_row', 'batch_index', 'rebase', 'broadcast'):
         assert not hasattr(whole, attr), f'a leaf grew a composite concern: {attr}'
-    assert whole.interp_params == [] and whole.hermite_tenor is None, 'a Linear leaf has no params'
+    assert whole.interp_params == [] and whole.tenor is None, 'a Linear leaf has no params'
     for has_alpha in (False, True):
         assert whole.route(np.array([0, 7, 99]), has_alpha) is None, 'a leaf has nothing to route'
 
@@ -382,7 +382,7 @@ def test_the_hermite_pair_is_built_per_block_at_that_block_s_own_width():
     assert past_leaf.interp_params[0].shape[-1] == B_OUTER, 'past coefficients are flat-width'
     assert forked_leaf.interp_params == [], 'the forked block was built for a gather below it'
     g_full, c_full = hermite_interpolation_tensor(          # the block's own tenor grid, exactly
-        past_leaf.hermite_tenor, past[past_leaf.rows[0]:past_leaf.rows[1] + 1])
+        past_leaf.tenor, past[past_leaf.rows[0]:past_leaf.rows[1] + 1])
     assert torch.equal(past_leaf.interp_params[0], g_full.reshape(-1, B_OUTER))
     assert torch.equal(past_leaf.interp_params[1], c_full.reshape(-1, B_OUTER))
 
@@ -442,7 +442,7 @@ def test_a_segmented_curve_inside_a_fork_composes(alpha):
     # the past block's segments stay at the OUTER width — the whole point of not joining
     assert all(seg.shape[-1] == B_OUTER
                for seg in curve_tensor.interp_obj.strategies[0].segments)
-    assert curve_tensor.interp_obj.strategies[0].segments[0].hermite_tenor is not None
+    assert curve_tensor.interp_obj.strategies[0].segments[0].tenor is not None
     assert torch.equal(split, joined)
 
 

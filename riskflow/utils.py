@@ -472,13 +472,14 @@ class Interpolation(object):
     which is what lets a tenor segment be the same kind of object.
     """
 
-    def __init__(self, tensor, hermite_tenor=None):
+    def __init__(self, tensor, tenor=None):
+        """`tenor` is the grid this interpolation derives its parameters from, or None for a kind
+        that needs none. The parameters are NOT built here: `params` builds them for the scenario
+        rows a gather names."""
         self.tensor = tensor
         self.shape = tuple(tensor.shape)
         self.indexed_tensor = tensor.reshape(-1, tensor.shape[-1])
-        # Hermite only: the tenor grid the coefficient recursion runs over. The g,c pair is NOT
-        # built here — `params` builds it for the scenario rows a gather names.
-        self.hermite_tenor = hermite_tenor
+        self.tenor = tenor
         self.interp_params = []
         self.rows = None            # scenario rows the parameters cover, [lo, hi]
         self.row_offset = 0         # flat row `interp_params` row 0 corresponds to = lo * n_tenors
@@ -491,9 +492,9 @@ class Interpolation(object):
             return cls(tensor)
         t = tensor.new(tenor[:tensor.shape[1]]).reshape(1, -1, 1)
         if kind == 'HermiteRT':
-            return cls(tensor * t, hermite_tenor=t)
+            return cls(tensor * t, t)
         if kind == 'Hermite':
-            return cls(tensor, hermite_tenor=t)
+            return cls(tensor, t)
         if kind == 'LinearRT':
             return cls(tensor * t)
         return cls(tensor)
@@ -505,7 +506,7 @@ class Interpolation(object):
     def build_rows(self, lo, hi):
         """The Hermite pair for scenario rows [lo, hi], flattened to the gather axis."""
         return [p.reshape(-1, p.shape[-1]) for p in
-                hermite_interpolation_tensor(self.hermite_tenor, self.tensor[lo:hi + 1])]
+                hermite_interpolation_tensor(self.tenor, self.tensor[lo:hi + 1])]
 
     def params(self, i00, i10):
         """The g,c pair covering the scenario rows THIS gather indexes, plus the flat offset they

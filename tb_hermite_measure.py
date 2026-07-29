@@ -20,7 +20,7 @@ if os.environ.get('HERMITE_EAGER') == '1':
 
     def full_block(self, i00, i10):
         if self.rows is None:
-            g, c = utils.hermite_interpolation_tensor(self.hermite_tenor, self.tensor)
+            g, c = utils.hermite_interpolation_tensor(self.tenor, self.tensor)
             self.interp_params = [p.reshape(-1, p.shape[-1]) for p in (g, c)]
             self.rows = (0, self.tensor.shape[0] - 1)
         return self.interp_params[0], self.interp_params[1], 0
