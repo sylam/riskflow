@@ -392,24 +392,6 @@ class DateEqualList:
                                for date, value in self.data.items()]) + ']'
 
 
-def same(operand):
-    """The adapter a block that IS the whole grid gets — both of them."""
-    return operand
-
-
-def rebased(offset):
-    """A whole-grid index, in a block's own frame."""
-    return lambda i: None if i is None else i - offset
-
-
-def broadcast_to_grid(fan):
-    """A block narrower than the grid, taken up to the grid's batch width AFTER its read. That puts
-    the same values in the same column order as writing the block out `fan` times into the grid
-    would have, without the copy living in the buffer."""
-    return lambda val: val.unsqueeze(-1).expand(*val.shape, fan).reshape(
-        *val.shape[:-1], val.shape[-1] * fan)
-
-
 def select_rows(operand, pos):
     """Row subset of a per-time-row operand (indices, interp weights, tenors, alpha) for a routed
     group. A leading dim of 1 is broadcasting against the time axis and must be left alone."""
@@ -420,134 +402,98 @@ def select_rows(operand, pos):
 WHOLE_GRID = ((None, 0, 0),)        # the routing of a gather that reads one block, whole
 
 
-class ScenarioSource(object):
-    '''
-    A simulated factor's scenario grid as the pricer sees it: a SEQUENCE of contiguous scenario-row
-    blocks under one logical shape, each at its own batch width. Ordinary generation publishes ONE
-    block — the whole grid at the simulation width. An inner-MC fork publishes TWO: the
-    outer-realized past at B_outer, then the forked rows at B_flat = B_outer x B_inner. Every past
-    row is identical across the B_inner draws, so joining them into a single block (which is what
-    the fork used to do — `cat` of an expanded past) writes the realized past out B_inner times:
-    98% of the stuffed buffer at the production operating point, dragging a same-shaped slab of
-    Hermite g,c with it. `Interpolation` reads through the block sequence instead.
+class ScenarioBlock(object):
+    """One physical scenario tensor and where it sits in the LOGICAL grid.
 
-    A source is write-once and read-only: a fork builds it once every process's `generate` has
-    published, and it carries only the operations `make_curve_tensor` performs on a raw buffer
-    value, so anything else fails loud rather than silently materializing.
-    '''
+    `first_row` is the block's first logical scenario row. `batch_index` maps each logical batch
+    column to the column of THIS block that supplies it — `None` when the block is already at the
+    logical width. An inner-MC fork's realized past holds one outer column per `Inner_Sub_Batch`
+    flat columns, so its map is the flattening the fork itself performed: passing it as data is
+    what stops the two ends having to agree by arithmetic.
+    """
+
+    def __init__(self, tensor, first_row=0, batch_index=None):
+        self.tensor = tensor
+        self.first_row = first_row
+        self.batch_index = batch_index
+        self.n_rows = tensor.shape[0]
+
+    def project(self, val):
+        """A read at this block's width, taken up to the logical grid's.
+
+        Applied to the RESULT of a read, never to the stored tensor: projecting the tensor would
+        materialize the block at the logical width and hand back exactly the memory the block
+        split exists to save. It is a batch-axis gather, so it commutes with the time blend and
+        with `combine` — which is what lets the caller project first and blend after."""
+        return val if self.batch_index is None else val.index_select(-1, self.batch_index)
+
+    def __mul__(self, other):
+        return ScenarioBlock(self.tensor * other, self.first_row, self.batch_index)
+
+
+class ScenarioSource(object):
+    """A factor's scenario grid as the pricer sees it: a SEQUENCE of `ScenarioBlock`s under one
+    logical shape, each at its own batch width.
+
+    Ordinary generation publishes a bare tensor and never builds one of these, so base valuation,
+    credit Monte Carlo and the outer hedge loop never meet this class. An inner-MC fork publishes
+    TWO blocks: the outer-realized past at `Batch_Size`, then the forked rows at
+    `Batch_Size x Inner_Sub_Batch`. Every past row is identical across the inner draws, so joining
+    them into one tensor writes the realized past out `Inner_Sub_Batch` times — 98% of the stuffed
+    buffer at the production operating point, dragging a same-shaped slab of Hermite coefficients
+    with it.
+
+    Write-once and read-only: built after every process's `generate` has published, and carrying
+    only the operations `make_curve_tensor` performs on a raw buffer value, so anything else fails
+    loud rather than silently materializing.
+    """
 
     def __init__(self, *blocks):
         self.blocks = blocks
-        self.cuts = np.cumsum([b.shape[0] for b in blocks[:-1]], dtype=np.int64)
-        self.shape = (sum(b.shape[0] for b in blocks),) + tuple(blocks[-1].shape[1:])
+        self.cuts = np.cumsum([b.n_rows for b in blocks[:-1]], dtype=np.int64)
+        self.shape = (sum(b.n_rows for b in blocks),) + tuple(blocks[-1].tensor.shape[1:])
 
     def new(self, *args, **kwargs):
-        return self.blocks[-1].new(*args, **kwargs)
+        return self.blocks[-1].tensor.new(*args, **kwargs)
 
     def __mul__(self, other):
         # the LinearRT/HermiteRT tenor rescale — elementwise over the tenor axis, so per block
         return ScenarioSource(*[b * other for b in self.blocks])
 
-    def join(self):
-        """One block carrying every row at the grid width, for the reader that cannot route."""
-        width = self.shape[-1]
-        return torch.cat(
-            [b.unsqueeze(-1).expand(*b.shape, width // b.shape[-1]).reshape(*b.shape[:-1], width)
-             for b in self.blocks], dim=0)
-
 
 class Interpolation(object):
-    def __init__(self, tensor, hermite_tenor=None, start=0, fan=1):
-        # A scenario source is a sequence of row blocks (`ScenarioSource`); a bare tensor is the
-        # one-block source. Every read below goes through `blocks` and is put back together by
-        # `routed`, so the single-tensor case — base valuation, credit MC, the outer hedge loop —
-        # is that same mechanism with one block: no interior cut, so routing is the constant
-        # whole-grid group and both index/width adapters are the identity.
-        source = tensor if isinstance(tensor, ScenarioSource) else ScenarioSource(tensor)
-        self.shape, self.cuts = source.shape, source.cuts
-        if len(source.blocks) > 1:
-            self.sub_blocks = tuple(
-                Interpolation(block, hermite_tenor, start=int(first),
-                              fan=self.shape[-1] // block.shape[-1])
-                for block, first in zip(source.blocks, np.concatenate([[0], self.cuts])))
-            self.tensor = self.sub_blocks[-1].tensor
-            self.indexed_tensor = self.sub_blocks[-1].indexed_tensor
-        else:
-            self.sub_blocks = ()                   # a one-block source IS its own block
-            self.tensor = source.blocks[0]
-            self.indexed_tensor = self.tensor.reshape(-1, self.tensor.shape[-1])
-        # `start` is this block's first row in the whole grid, `fan` the grid's batch width over
-        # this block's: `rebase`/`rebase_row` put a whole-grid index into the block's own frame and
-        # `broadcast` puts the block's read back into the grid's width. All three are the identity
-        # for a block that IS the grid, which is why an ordinary gather adds nothing.
-        self.rebase = same if start == 0 else rebased(
-            start * (self.indexed_tensor.shape[0] // self.shape[0]))
-        self.rebase_row = same if start == 0 else rebased(start)
-        self.broadcast = same if fan == 1 else broadcast_to_grid(fan)
+    """Tenor and time interpolation over ONE physical scenario tensor.
+
+    A leaf, and the only class base valuation / credit Monte Carlo / the outer hedge loop ever
+    build. It owns the tensor, its tenor grid, its interpolation kind and — for Hermite — the
+    coefficient pair it builds on demand. It knows nothing about inner MC, block boundaries,
+    logical rows or batch fan-out: the rows reaching it are already in its own frame, and it
+    flattens them against its OWN tenor stride, which is what lets a segment with a different
+    stride be the same kind of object.
+    """
+
+    def __init__(self, tensor, kind='Linear', tnr_min=0.0, tnr_max=0.0, hermite_tenor=None):
+        self.tensor = tensor
+        self.shape = tuple(tensor.shape)
+        self.indexed_tensor = tensor.reshape(-1, tensor.shape[-1])
+        self.kind, self.tnr_min, self.tnr_max = kind, tnr_min, tnr_max
         # Hermite only: the tenor grid the coefficient recursion runs over. The g,c pair is NOT
-        # built here — `hermite_params` builds it for the scenario rows a gather names. None for
-        # every other interpolation kind, which needs no parameters at all.
+        # built here — `hermite_params` builds it for the scenario rows a gather names.
         self.hermite_tenor = hermite_tenor
         self.interp_params = []
         self.rows = None            # scenario rows g,c currently cover, [lo, hi]
         self.row_offset = 0         # flat row `interp_params` row 0 corresponds to = lo * n_tenors
 
-    @property
-    def blocks(self):
-        """This source's row blocks — a one-block source IS its own block. Answered rather than
-        stored: a stored self-reference is a cycle, and a cycle keeps this object's curve tensor
-        and Hermite pair alive past the `t_Buffer.clear()` that should have dropped them."""
-        return self.sub_blocks or (self,)
+    def new(self, *args, **kwargs):
+        return self.tensor.new(*args, **kwargs)
 
     def route(self, index, has_alpha):
-        """Group a gather's rows by the block that owns each of its two reads: `(row positions,
-        block for the t read, block for the t+1 read)`, positions `None` when ONE group covers
-        every row. `cuts` are the source's interior row boundaries, so a one-block source puts
-        every row in one group and the gather reads it whole, as it always did. A time-interpolated
-        read reaches `index + 1`, so a row just below a cut reads ACROSS it and names two blocks —
-        classify on where a read ENDS, not where it starts. Decided from the numpy indices a
-        `CurveTensor` already holds, so it costs no device sync."""
-        if not self.cuts.size:
-            return WHOLE_GRID       # no interior cut: every row is in the one group, whole
-        hi = np.minimum(index + 1, self.shape[0] - 1) if has_alpha else index
-        at_t = np.searchsorted(self.cuts, index, side='right')
-        at_t1 = np.searchsorted(self.cuts, hi, side='right')
-        # an empty gather (a step with no resets in range) names no rows: one group, empty
-        pairs = np.unique(np.stack([at_t, at_t1]), axis=1) if index.size else np.zeros((2, 1), int)
-        if pairs.shape[1] == 1:
-            return ((None, int(pairs[0, 0]), int(pairs[1, 0])),)
-        return tuple((torch.tensor(np.flatnonzero((at_t == t0) & (at_t1 == t1)),
-                                   dtype=torch.int64, device=self.tensor.device), int(t0), int(t1))
-                     for t0, t1 in pairs.T)
-
-    def routed(self, route, n_rows, read):
-        """Run `read` per routed group and put the groups back in the caller's row order. A group
-        covering every row — an ordinary gather's only group — answers directly."""
-        out = None
-        for pos, at_t, at_t1 in route:
-            val = read(pos, at_t, at_t1)
-            if pos is None:
-                return val
-            out = val.new_empty((n_rows,) + tuple(val.shape[1:])) if out is None else out
-            out.index_copy_(0, pos, val)
-        return out
+        """A leaf IS the whole grid, so every row is in one group and the gather reads it whole."""
+        return WHOLE_GRID
 
     def rows_at(self, index):
-        """This BLOCK's whole rows at `index`, taken up to the whole grid's batch width."""
-        return self.broadcast(self.tensor[self.rebase_row(index)])
-
-    def gather_rows(self, index, index_next, alpha, route):
-        """Whole-row gather — the 0D spot path (`CurveTensor.interp_value`). The same block routing
-        as `eval`, on the scenario-row axis rather than the flattened (row, tenor) one. Each read
-        stays inside the expression that consumes it, so neither is held across the other."""
-        def group(pos, at_t, at_t1):
-            if alpha is None:
-                return self.blocks[at_t].rows_at(select_rows(index, pos))
-            a = select_rows(alpha, pos)
-            return self.blocks[at_t].rows_at(select_rows(index, pos)) * (1 - a) + \
-                self.blocks[at_t1].rows_at(select_rows(index_next, pos)) * a
-
-        return self.routed(route, index.shape[0], group)
+        """Whole rows at `index` — the 0D spot path."""
+        return self.tensor[index]
 
     def hermite_rows(self, lo, hi):
         """The g,c pair for scenario rows [lo, hi], flattened to the (row, tenor) gather axis."""
@@ -559,19 +505,16 @@ class Interpolation(object):
         The recursion in `hermite_interpolation_tensor` couples along the TENOR axis only, so a
         scenario row's coefficients depend on that row alone: building a row slice is exact, not
         an approximation. Deferring to the gather is what makes that usable — construction was
-        eager over the whole block while consumption is sparse (measured on the production book:
-        the forks' spans cover 11% of their blocks, mean 7.3 rows of 64) — and the gather states
+        eager over the whole tensor while a fork's consumption is sparse — and the gather states
         the rows it needs, so nothing has to predict them. An empty gather (a step with no resets
         in range) names no rows and keeps what is built.
 
         A widening builds only the rows it ADDS and splices them onto what is there. Re-deriving
         the union instead is quadratic in a reader that walks the grid forward, and ONE
-        `Interpolation` is cached per curve factor and gathered by every deal — so a book priced in
-        ascending maturity widens a row at a time: measured on a 120-deal credit-MC book, 7 501
-        coefficient rows for a 121-row block against 127 spliced, and the whole order-dependence of
-        the wall time with it. The fork barely notices (its objects widen once), which is why the
-        cost hid there."""
-        n_tenors = self.tensor.shape[1]
+        `Interpolation` is cached per curve factor and gathered by every deal — so a book priced
+        in ascending maturity widens a row at a time: measured on a 120-deal credit-MC book,
+        7 501 coefficient rows for a 121-row block against 127 spliced."""
+        n_tenors = self.shape[1]
         if i00.numel():
             bounds = (i00.min(), i00.max()) if i10 is None else (
                 torch.minimum(i00.min(), i10.min()), torch.maximum(i00.max(), i10.max()))
@@ -589,131 +532,257 @@ class Interpolation(object):
             self.rows, self.row_offset = rows, rows[0] * n_tenors
         return self.interp_params[0], self.interp_params[1], self.row_offset
 
-    @staticmethod
-    def calculate_indices(t_index, t_index_next, i1, i2):
-        i00 = t_index + i1
-        i01 = t_index + i2
+    def base_row(self, rows):
+        """Where each scenario row starts in this tensor's flat (row, tenor) frame. Each strategy
+        owns this, because a tenor SEGMENT's stride is its own — which is the whole reason
+        `CurveTensor` hands out rows and not a flat offset. `None` when every row is row 0."""
+        return None if rows is None else rows.reshape(-1, 1) * self.shape[1]
 
-        if t_index_next is not None:
-            i10 = t_index_next + i1
-            i11 = t_index_next + i2
-        else:
-            i10 = None
-            i11 = None
-
-        return i00, i01, i10, i11
-
-    def get_time_index(self, index, alpha):
-        # `shape` is the WHOLE grid — every block's rows, not the last block's — which is what
-        # `index_next`'s clamp and the flat (row, tenor) stride have to be measured against.
-        time_index = index.reshape(-1, 1) * self.shape[1]
-        if alpha is not None:
-            alpha = self.tensor.new(alpha) if isinstance(alpha, np.ndarray) else alpha
-            index_next = (index + 1).clamp(0, self.shape[0] - 1)
-            time_index_next = index_next.reshape(-1, 1) * self.shape[1]
-        else:
-            alpha = None
-            index_next = None
-            time_index_next = None
-        return alpha, index_next, time_index, time_index_next
-
-    def read(self, kind, i0, i1x, span, w2):
-        """This BLOCK's curve value at (i0, i1x), taken up to the whole grid's batch width. `span`
-        names any further rows the same gather reads off this block, so the deferred Hermite g,c
-        cover them in one build."""
-        if kind.startswith("Hermite"):
-            # g,c are built here, for these rows (see `hermite_params`); `ofs` shifts the gather
-            # into them. The curve `tensor` itself is never sliced — only the coefficient pair is.
-            g, c, ofs = self.hermite_params(i0, span)
+    def read_at(self, rows, i1, i2, w2, span=None):
+        """The RAW curve value at one time point — no RT scaling, no tenor selection. `span` names
+        any further rows the same gather reads off this tensor, so the deferred Hermite g,c cover
+        them in one build."""
+        base = self.base_row(rows)
+        i0, i1x = (i1, i2) if base is None else (base + i1, base + i2)
+        if self.kind.startswith('Hermite'):
+            # g,c are built here, for these rows; `ofs` shifts the gather into them. The curve
+            # `tensor` itself is never sliced — only the coefficient pair is.
+            span_base = self.base_row(span)
+            g, c, ofs = self.hermite_params(
+                i0, None if span is None else (i1 if span_base is None else span_base + i1))
             j0 = i0 - ofs if ofs else i0
-            val = calc_hermite_curve(
+            return calc_hermite_curve(
                 w2, g[j0,], c[j0,], self.indexed_tensor[i0,], self.indexed_tensor[i1x,])
-        else:
-            # default to linear
-            val = self.indexed_tensor[i0,] * (1.0 - w2) + self.indexed_tensor[i1x,] * w2
-        return self.broadcast(val)
+        # default to linear
+        return self.indexed_tensor[i0,] * (1.0 - w2) + self.indexed_tensor[i1x,] * w2
 
-    def eval(self, tenor_data, i1, i2, t_index, t_index_next, w2, tnr, alpha=None, time_factor=1.0,
-             route=WHOLE_GRID):
-        # grab the indices
-        i00, i01, i10, i11 = Interpolation.calculate_indices(t_index, t_index_next, i1, i2)
-        kind, tnr_min, tnr_max = tenor_data
+    def combine(self, raw, i2, tnr, time_factor):
+        """Raw read -> curve value: the rate*time scaling this kind asks for. Elementwise in
+        `raw`, so it commutes with the time blend and with a block projection — which is why it
+        runs ONCE, after both, rather than inside either."""
         tenors = tnr.unsqueeze(-1)
         mult = tenors if time_factor else 1.0
-        if kind.endswith('RT'):
-            mult = mult / tenors.clamp(tnr_min, tnr_max)
+        if self.kind.endswith('RT'):
+            mult = mult / tenors.clamp(self.tnr_min, self.tnr_max)
+        return raw * mult
 
-        def group(pos, at_t, at_t1):
-            block, nxt = self.blocks[at_t], self.blocks[at_t1]
-            weight = select_rows(w2, pos)
-            j00, j01 = block.rebase(select_rows(i00, pos)), block.rebase(select_rows(i01, pos))
-            j10, j11 = nxt.rebase(select_rows(i10, pos)), nxt.rebase(select_rows(i11, pos))
-            # one span request when the same block owns both time reads, so g,c build once
-            val = block.read(kind, j00, j01, j10 if nxt is block else None, weight)
-            if alpha is not None:
-                # need to linearly interpolate between 2 time points — the t+1 read is taken
-                # BEFORE either weighting, so no full-width term is held across it
-                val_t1 = nxt.read(kind, j10, j11, None, weight)
-                a = select_rows(alpha, pos)
-                val = (1 - a) * val + a * val_t1
-            return val * select_rows(mult, pos)
-
-        return self.routed(route, i00.shape[0], group)
-
-
-class SegmentedInterpolation(Interpolation):
-    def __init__(self, interpolants, base_tensor):
-        # A segmented curve is always a ONE-block source: `make_curve_tensor` joins a forked source
-        # before it gets here, so `eval` below reads the whole grid and never routes.
-        source = ScenarioSource(base_tensor)
-        self.shape, self.cuts = source.shape, source.cuts
-        self.tensor = base_tensor
-        self.indexed_tensor = base_tensor.reshape(-1, base_tensor.shape[-1])
-        self.sub_blocks = ()
-        self.segments = interpolants
-
-    def get_time_index(self, index, alpha):
-        time_index = [index.reshape(-1, 1) * x.shape[1] for x in self.segments]
+    def eval(self, index, index_next, alpha, i1, i2, w2, tnr, time_factor, route=WHOLE_GRID):
+        raw = self.read_at(index, i1, i2, w2, span=index_next)
         if alpha is not None:
-            alpha = self.tensor.new(alpha) if isinstance(alpha, np.ndarray) else alpha
-            index_next = (index + 1).clamp(0, self.shape[0] - 1)
-            time_index_next = [index_next.reshape(-1, 1) * x.shape[1] for x in self.segments]
-        else:
-            alpha = None
-            index_next = None
-            time_index_next = None
-        return alpha, index_next, time_index, time_index_next
+            # need to linearly interpolate between 2 time points — the t+1 read is taken BEFORE
+            # either weighting, so no full-width term is held across it
+            raw = (1 - alpha) * raw + alpha * self.read_at(index_next, i1, i2, w2)
+        return self.combine(raw, i2, tnr, time_factor)
 
-    def eval(self, tenor_data, i1, i2, t_index, t_index_next, w2, tnr, alpha=None, time_factor=1.0,
-             route=WHOLE_GRID):
-        # evaluate all segments on the full tenor set - more work than we need but simple implementation
-        # list(zip(self.segments, zip(*tenor_data)))
+    def gather_rows(self, index, index_next, alpha, route=WHOLE_GRID):
+        if alpha is None:
+            return self.rows_at(index)
+        return self.rows_at(index) * (1 - alpha) + self.rows_at(index_next) * alpha
 
-        # results = [segment.eval(seg_kind, i1, i2, t_index, t_index_next, w2, tnr, alpha, time_factor)
-        #            for seg_i, (segment, (s, e, seg_kind)) in enumerate(zip(self.segments, tenor_data))]
 
-        # this assumes that there are 2 distinct segments
-        results = []
-        for seg_i, (segment, ((s, e, seg_kind), tnr_min, tnr_max)) in enumerate(zip(self.segments, zip(*tenor_data))):
-            if seg_i==0:
-                mod_i1 = i1.clamp(max=e)
-                mod_i2 = i2.clamp(max=e)
-            else:
-                mod_i1 = (i1 - s).clamp(min=0)
-                mod_i2 = (i2 - s).clamp(min=0)
+class SegmentedInterpolation(object):
+    """A curve whose tenor axis is split at a near index, each side interpolated its own way
+    (`Near_Interpolation`). A SIBLING of `Interpolation`, not a subclass: it composes leaves over
+    TENOR, exactly as `RoutedInterpolation` composes strategies over SCENARIO ROWS, and the two
+    compositions are orthogonal.
 
-            index =  t_index[seg_i]
-            index_next = t_index_next[seg_i] if alpha is not None else None
+    Segments are middle-dim slices with their own tenor divisors, so each owns its own flat
+    stride — which is the whole reason `CurveTensor` hands out scenario ROWS and lets the
+    strategy flatten them.
+    """
 
-            results.append(
-                segment.eval(
-                    (seg_kind, tnr_min, tnr_max),
-                    mod_i1, mod_i2, index, index_next, w2, tnr, alpha, time_factor)
-            )
+    def __init__(self, tensor, spec, curve_tenor, tnr_min, tnr_max):
+        self.tensor = tensor
+        self.shape = tuple(tensor.shape)
+        self.indexed_tensor = tensor.reshape(-1, tensor.shape[-1])
+        self.spec = spec
+        # this only works for 2 segments - checked when the factor is built
+        self.cutoff = spec[0][1]
+        split = curve_tenor[self.cutoff]
+        self.segments = [
+            _leaf(tensor[:, s:e + 1, :], kind, curve_tenor[s:e + 1], lo, hi)
+            for (s, e, kind), (lo, hi) in zip(spec, [(tnr_min, split), (split, tnr_max)])]
 
-        cuttoff = tenor_data[0][0][1]
-        # this only works for 2 segments - we check for this earlier so it should be fine
-        return torch.where((i2<=cuttoff).unsqueeze(-1), results[0], results[1])
+    def new(self, *args, **kwargs):
+        return self.tensor.new(*args, **kwargs)
+
+    def route(self, index, has_alpha):
+        return WHOLE_GRID
+
+    def rows_at(self, index):
+        return self.tensor[index]
+
+    def _seg_tenors(self, seg_i, i1, i2):
+        """`i1, i2` in segment `seg_i`'s own tenor frame."""
+        s, e, _kind = self.spec[seg_i]
+        if seg_i == 0:
+            return i1.clamp(max=e), i2.clamp(max=e)
+        return (i1 - s).clamp(min=0), (i2 - s).clamp(min=0)
+
+    def read_at(self, rows, i1, i2, w2, span=None):
+        """One raw read PER SEGMENT — evaluated on the full tenor set and selected in `combine`.
+        More work than we need, but it keeps every segment a plain leaf."""
+        return [seg.read_at(rows, *self._seg_tenors(k, i1, i2), w2, span=span)
+                for k, seg in enumerate(self.segments)]
+
+    def combine(self, raw, i2, tnr, time_factor):
+        """Each segment's own RT scaling, then the tenor select between them."""
+        vals = [seg.combine(v, self._seg_tenors(k, i2, i2)[1], tnr, time_factor)
+                for k, (seg, v) in enumerate(zip(self.segments, raw))]
+        return torch.where((i2 <= self.cutoff).unsqueeze(-1), vals[0], vals[1])
+
+    def eval(self, index, index_next, alpha, i1, i2, w2, tnr, time_factor, route=WHOLE_GRID):
+        raw = self.read_at(index, i1, i2, w2, span=index_next)
+        if alpha is not None:
+            nxt = self.read_at(index_next, i1, i2, w2)
+            raw = [(1 - alpha) * a + alpha * b for a, b in zip(raw, nxt)]
+        return self.combine(raw, i2, tnr, time_factor)
+
+    def gather_rows(self, index, index_next, alpha, route=WHOLE_GRID):
+        if alpha is None:
+            return self.rows_at(index)
+        return self.rows_at(index) * (1 - alpha) + self.rows_at(index_next) * alpha
+
+
+class RoutedInterpolation(object):
+    """One logical scenario grid over several physical blocks — an inner-MC fork's realized past
+    and its forked rows — each carrying its OWN interpolation strategy, built recursively from the
+    same specification. A segmented curve inside a fork is therefore
+    `RoutedInterpolation(SegmentedInterpolation, SegmentedInterpolation)` and needs no special
+    case here.
+
+    It owns exactly the composite concerns: which block holds a row, rebasing a logical row into
+    that block's frame, projecting a narrow block's read up to the logical batch width, and
+    reassembling the groups in the caller's row order. The strategies stay unaware of all of it.
+    """
+
+    def __init__(self, source, spec, curve_tenor, tnr_min, tnr_max):
+        self.blocks = source.blocks
+        self.shape, self.cuts = source.shape, source.cuts
+        self.strategies = tuple(
+            build_interpolation(b.tensor, spec, curve_tenor, tnr_min, tnr_max)
+            for b in source.blocks)
+        # the last block is the one already at the logical batch width, so it answers the
+        # tensor-shaped questions a leaf answers for itself
+        self.tensor = source.blocks[-1].tensor
+        self.indexed_tensor = self.strategies[-1].indexed_tensor
+
+    def new(self, *args, **kwargs):
+        return self.tensor.new(*args, **kwargs)
+
+    def route(self, index, has_alpha):
+        """Group a gather's rows by the block that owns each of its two reads: `(row positions,
+        block for the t read, block for the t+1 read)`, positions `None` when ONE group covers
+        every row. A time-interpolated read reaches `index + 1`, so a row just below a cut reads
+        ACROSS it and names two blocks — classify on where a read ENDS, not where it starts.
+        Decided from the numpy indices a `CurveTensor` already holds, so it costs no device sync,
+        and once per `CurveTensor` rather than once per gather."""
+        hi = np.minimum(index + 1, self.shape[0] - 1) if has_alpha else index
+        at_t = np.searchsorted(self.cuts, index, side='right')
+        at_t1 = np.searchsorted(self.cuts, hi, side='right')
+        # an empty gather (a step with no resets in range) names no rows: one group, empty
+        pairs = np.unique(np.stack([at_t, at_t1]), axis=1) if index.size else np.zeros((2, 1), int)
+        if pairs.shape[1] == 1:
+            return ((None, int(pairs[0, 0]), int(pairs[1, 0])),)
+        return tuple((torch.tensor(np.flatnonzero((at_t == t0) & (at_t1 == t1)),
+                                   dtype=torch.int64, device=self.tensor.device), int(t0), int(t1))
+                     for t0, t1 in pairs.T)
+
+    def routed(self, route, n_rows, read):
+        """Run `read` per routed group and put the groups back in the caller's row order. A group
+        covering every row answers directly."""
+        out = None
+        for pos, at_t, at_t1 in route:
+            val = read(pos, at_t, at_t1)
+            if pos is None:
+                return val
+            out = val.new_empty((n_rows,) + tuple(val.shape[1:])) if out is None else out
+            out.index_copy_(0, pos, val)
+        return out
+
+    def local(self, rows, block):
+        """Logical scenario rows in `block`'s own frame."""
+        return rows if rows is None or not block.first_row else rows - block.first_row
+
+    def eval(self, index, index_next, alpha, i1, i2, w2, tnr, time_factor, route=WHOLE_GRID):
+        def group(pos, at_t, at_t1):
+            b0, b1 = self.blocks[at_t], self.blocks[at_t1]
+            s0, s1 = self.strategies[at_t], self.strategies[at_t1]
+            rows = self.local(select_rows(index, pos), b0)
+            weight, t1, t2 = (select_rows(x, pos) for x in (w2, i1, i2))
+            nxt = None if index_next is None else self.local(select_rows(index_next, pos), b1)
+            # one span request when the same block owns both time reads, so g,c build once
+            raw = _project(b0, s0.read_at(rows, t1, t2, weight, span=nxt if s1 is s0 else None))
+            if alpha is not None:
+                a = select_rows(alpha, pos)
+                # projection and the time blend are both linear, and `combine` runs after both,
+                # so the routed path is the same arithmetic in the same order as an unrouted one
+                nxt_raw = _project(b1, s1.read_at(nxt, t1, t2, weight))
+                raw = _blend(raw, nxt_raw, a)
+            return s0.combine(raw, t2, select_rows(tnr, pos), time_factor)
+
+        return self.routed(route, (i1 if index is None else index).shape[0], group)
+
+    def gather_rows(self, index, index_next, alpha, route):
+        """Whole-row gather — the 0D spot path. The same block routing as `eval`, on the
+        scenario-row axis rather than the flattened (row, tenor) one."""
+        def group(pos, at_t, at_t1):
+            b0, b1 = self.blocks[at_t], self.blocks[at_t1]
+            if alpha is None:
+                return b0.project(self.strategies[at_t].rows_at(
+                    self.local(select_rows(index, pos), b0)))
+            a = select_rows(alpha, pos)
+            return b0.project(self.strategies[at_t].rows_at(
+                self.local(select_rows(index, pos), b0))) * (1 - a) + \
+                b1.project(self.strategies[at_t1].rows_at(
+                    self.local(select_rows(index_next, pos), b1))) * a
+
+        return self.routed(route, index.shape[0], group)
+
+
+def _project(block, raw):
+    """`block.project` over a strategy's raw read — one tensor, or one per tenor segment."""
+    return [block.project(v) for v in raw] if isinstance(raw, list) else block.project(raw)
+
+
+def _blend(raw, nxt, alpha):
+    """Linear time blend of two raw reads, elementwise over segments when there are any."""
+    if isinstance(raw, list):
+        return [(1 - alpha) * a + alpha * b for a, b in zip(raw, nxt)]
+    return (1 - alpha) * raw + alpha * nxt
+
+
+def _leaf(tensor, kind, curve_tenor, tnr_min, tnr_max):
+    """One physical tensor under one simple interpolation kind. `HermiteRT`/`LinearRT` fold the
+    tenor into the stored values; `Hermite` keeps the tenor grid for the coefficient recursion."""
+    if kind == 'Linear':
+        return Interpolation(tensor, kind, tnr_min, tnr_max)
+    t = tensor.new(curve_tenor[:tensor.shape[1]] if curve_tenor.size != tensor.shape[1]
+                   else curve_tenor).reshape(1, -1, 1)
+    if kind == 'HermiteRT':
+        return Interpolation(tensor * t, kind, tnr_min, tnr_max, hermite_tenor=t)
+    if kind == 'Hermite':
+        return Interpolation(tensor, kind, tnr_min, tnr_max, hermite_tenor=t)
+    if kind == 'LinearRT':
+        return Interpolation(tensor * t, kind, tnr_min, tnr_max)
+    return Interpolation(tensor, kind, tnr_min, tnr_max)
+
+
+def build_interpolation(value, spec, curve_tenor, tnr_min=0.0, tnr_max=0.0):
+    """The one constructor for a curve's interpolation strategy, recursive in the scenario axis.
+
+        bare tensor    + a kind string  -> Interpolation
+        bare tensor    + a segment list -> SegmentedInterpolation
+        ScenarioSource + either         -> RoutedInterpolation, whose per-block children are built
+                                           by this function again
+
+    So a segmented curve inside an inner-MC fork composes rather than special-cases, and the
+    ordinary path builds exactly the leaf it always did."""
+    if isinstance(value, ScenarioSource):
+        return RoutedInterpolation(value, spec, curve_tenor, tnr_min, tnr_max)
+    if isinstance(spec, str):
+        return _leaf(value, spec, curve_tenor, tnr_min, tnr_max)
+    return SegmentedInterpolation(value, spec, curve_tenor, tnr_min, tnr_max)
 
 
 class CurveTenor(object):
@@ -1209,16 +1278,26 @@ class CurveTensor(object):
     Note that the curve tensor is used directly by the tensorblock object
     '''
 
-    def __init__(self, interp_obj: Interpolation, index, alpha, np_index=None):
+    def __init__(self, interp_obj, index, alpha, np_index=None):
         self.interp_obj = interp_obj
         self.np_index = index if isinstance(index, np.ndarray) else np_index
         self.index = torch.tensor(
             index, dtype=torch.int64, device=interp_obj.tensor.device) if isinstance(index, np.ndarray) else index
-        self.alpha, self.index_next, self.time_index, self.time_index_next = self.interp_obj.get_time_index(
-            self.index, alpha)
-        # Which of the source's row blocks owns each row this gather reads — decided off the
-        # CPU-side indices, so it costs no device sync, and once per CurveTensor rather than per
-        # gather. A one-block source answers with its whole-grid group.
+        # SCENARIO ROWS, not a flattened (row, tenor) offset: the strategy owns that flattening
+        # because a tenor SEGMENT has its own stride, and a segment inside an inner-MC fork would
+        # otherwise need a different flat index from the one its sibling block uses.
+        if alpha is not None:
+            self.alpha = self.interp_obj.new(alpha) if isinstance(alpha, np.ndarray) else alpha
+            self.index_next = (self.index + 1).clamp(0, self.interp_obj.shape[0] - 1)
+        else:
+            self.alpha = self.index_next = None
+        # A curve every one of whose rows is row 0 (a static factor, or a stochastic one gathered
+        # only at the base date) skips the flattening add entirely. Decided off the NUMPY indices,
+        # so asking costs no device sync.
+        self.rows = None if not self.np_index.any() and self.alpha is None else self.index
+        # Which of the source's row blocks owns each row this gather reads — also decided off the
+        # CPU-side indices, once per CurveTensor rather than per gather. A leaf answers with its
+        # whole-grid group.
         self.route = self.interp_obj.route(self.np_index, self.alpha is not None)
 
     def interp_value(self):
@@ -1247,25 +1326,13 @@ class CurveTensor(object):
         if point_size > 0:
             # get the points in years
             tenor_points_in_years = tensor.new(curve_component[FACTOR_INDEX_Daycount](points))
-            curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index]
-            i1, i2, a = curve_tenor.get_index(tenor_points_in_years)
-
-            if isinstance(curve_tenor.type, str):
-                # check if time_index is non-zero (valid if this was a stochastic factor)
-                offset = self.time_index if self.time_index.any() else 0
-                tenor_data = (curve_tenor.type, curve_tenor.min, curve_tenor.max)
-
-                return self.interp_obj.eval(
-                    tenor_data, i1, i2, offset, self.time_index_next, a.unsqueeze(dim=-1),
-                    tenor_points_in_years, self.alpha, time_factor=time_factor, route=self.route)
-            else:
-                # check if time_index is non-zero (valid if this was a stochastic factor)
-                split_tenor = curve_tenor.tenor[curve_tenor.type[0][1]]
-                tenor_data = (curve_tenor.type, (curve_tenor.min, split_tenor), (split_tenor, curve_tenor.max))
-
-                return self.interp_obj.eval(
-                    tenor_data, i1, i2, self.time_index, self.time_index_next, a.unsqueeze(dim=-1),
-                    tenor_points_in_years, self.alpha, time_factor=time_factor, route=self.route)
+            i1, i2, a = curve_component[FACTOR_INDEX_Tenor_Index].get_index(tenor_points_in_years)
+            # the interpolation KIND and its tenor bounds were fixed when the strategy was built,
+            # so a query carries only coordinates: which scenario rows, which tenor bracket, and
+            # the weights between them.
+            return self.interp_obj.eval(
+                self.rows, self.index_next, self.alpha, i1, i2, a.unsqueeze(dim=-1),
+                tenor_points_in_years, time_factor, route=self.route)
         else:
             # return a null tensor
             return tensor.new_zeros([time_size, 0, tensor.shape[-1]])
@@ -2777,52 +2844,16 @@ def make_curve_tensor(tensor, curve_component, time_grid, shared, n_batch_dims=1
     # source never reaches here — it carries no `reshape` and would say so.
     if n_batch_dims > 1:
         tensor = tensor.reshape(*tensor.shape[:-n_batch_dims], -1)
-    key_code = (curve_component[FACTOR_INDEX_Tenor_Index].type, curve_component[:2],
-                tuple(tensor.shape))
-
-    def calc_interpolation(code, curve_tenor, sub_tensor):
-        if code != 'Linear':
-            # curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index].tenor
-            if curve_tenor.size != tensor.shape[1]:
-                t = sub_tensor.new(curve_tenor[:tensor.shape[1]]).reshape(1, -1, 1)
-            else:
-                t = sub_tensor.new(curve_tenor).reshape(1, -1, 1)
-
-        if code in ['HermiteRT', 'Hermite']:
-            mod_tenor = sub_tensor
-            if code == 'HermiteRT':
-                mod_tenor = sub_tensor * t
-
-            # DEFERRED POPULATION. g,c are built by the first gather, for the scenario rows that
-            # gather indexes (`Interpolation.hermite_params`). An inner-MC fork reads a bounded
-            # slice around its own step; the outer / base-valuation / credit-MC callers read every
-            # row and get the full block, built on their first read instead of at construction.
-            return Interpolation(mod_tenor, hermite_tenor=t)
-
-        elif code == 'LinearRT':
-            return Interpolation(sub_tensor * t)
-        else:
-            return Interpolation(sub_tensor)
+    curve_tenor = curve_component[FACTOR_INDEX_Tenor_Index]
+    key_code = (curve_tenor.type, curve_component[:2], tuple(tensor.shape))
 
     if key_code not in shared.t_Buffer:
-        interpolation_spec = key_code[0]
-        tenor = curve_component[FACTOR_INDEX_Tenor_Index].tenor
-        if isinstance(interpolation_spec, str):
-            shared.t_Buffer[key_code] = calc_interpolation(interpolation_spec, tenor, tensor)
-        else:
-            # A multi-block source is REFUSED here: a segment is a middle-dim (tenor) slice, which
-            # copies, and each segment carries its own tenor divisor — so routing would have to be
-            # per segment. No in-repo factor declares a split interpolation, so this joins the
-            # blocks rather than ship routing no gate exercises.
-            tensor = tensor.join() if isinstance(tensor, ScenarioSource) else tensor
-            interpolants = []
-            for k, spec in enumerate(interpolation_spec):
-                start_index, end_index, interp_type = spec
-                sub_tenor = tenor[start_index:end_index + 1]
-                sub_values = tensor[:,start_index:end_index + 1,:]
-                interpolants.append(calc_interpolation(spec[2], sub_tenor, sub_values))
-                # interpolants.append(calc_interpolation(spec[2], tenor, tensor))
-            shared.t_Buffer[key_code] = SegmentedInterpolation(interpolants, tensor)
+        # One recursive factory: a bare tensor becomes a leaf (or a tenor-segmented composite of
+        # leaves), a fork's `ScenarioSource` becomes a scenario-routed composite whose per-block
+        # children are built by the same call. Hermite coefficients are DEFERRED inside the leaf —
+        # built by the first gather, for the rows that gather names.
+        shared.t_Buffer[key_code] = build_interpolation(
+            tensor, curve_tenor.type, curve_tenor.tenor, curve_tenor.min, curve_tenor.max)
 
     if time_grid is not None:
         return gather_scenario_interp(shared.t_Buffer[key_code], time_grid, shared)
@@ -2880,7 +2911,9 @@ def calc_time_grid_spot_rate(rate, time_grid, shared):
         for r in rate:
             if r[FACTOR_INDEX_Stoch]:
                 tensor = shared.t_Scenario_Buffer[r[FACTOR_INDEX_Offset]]
-                component = gather_scenario_interp(Interpolation(tensor), time_grid, shared, as_curve_tensor=False)
+                component = gather_scenario_interp(
+                    build_interpolation(tensor, 'Linear', np.zeros(1)),
+                    time_grid, shared, as_curve_tensor=False)
             else:
                 tensor = shared.t_Static_Buffer[r[FACTOR_INDEX_Offset]]
                 component = tensor.reshape(1, -1)

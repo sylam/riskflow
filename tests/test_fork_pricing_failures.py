@@ -283,29 +283,33 @@ def test_a_skipped_tradable_leaves_a_loud_hole_in_the_fork():
 # --------------------------------------------------------------------------------------------
 # The fork publishes a SEQUENCE of row blocks, not a joined grid
 # --------------------------------------------------------------------------------------------
-_SOURCE, _INIT = utils.ScenarioSource, utils.Interpolation.__init__
+_SOURCE, _BUILD = utils.ScenarioSource, utils.build_interpolation
 
 
 def _at_the_read_boundary(hook):
-    """Run with `hook(source)` applied to every block sequence the pricer is handed."""
-    def wrapped(self, tensor, hermite_tenor=None, start=0, fan=1):
-        _INIT(self, hook(tensor) if isinstance(tensor, _SOURCE) else tensor,
-              hermite_tenor, start, fan)
+    """Run with `hook(source)` applied to every block sequence the pricer is handed. The factory
+    is the boundary now: a leaf never sees a source, which is the separation under test."""
+    def wrapped(value, *args, **kwargs):
+        return _BUILD(hook(value) if isinstance(value, _SOURCE) else value, *args, **kwargs)
     return wrapped
 
 
 def _run_with(hook, cfg, name):
-    utils.Interpolation.__init__ = _at_the_read_boundary(hook)
+    utils.build_interpolation = _at_the_read_boundary(hook)
     try:
         return _run(cfg, name)
     finally:
-        utils.Interpolation.__init__ = _INIT
+        utils.build_interpolation = _BUILD
 
 
 def _join(source):
-    """The pre-feature grid: ONE block carrying every row at the flat width, which is what the
-    fork used to stuff with a `cat` of a past expanded across the inner draws."""
-    return source.join()
+    """The pre-feature grid: ONE tensor carrying every row at the flat width, which is what the
+    fork used to stuff with a `cat` of a past expanded across the inner draws. Built HERE rather
+    than asked of the source, which no longer offers it — the join is the thing being replaced."""
+    width = source.shape[-1]
+    return torch.cat(
+        [b.tensor if b.batch_index is None else b.tensor.index_select(-1, b.batch_index)
+         for b in source.blocks], dim=0) if width else None
 
 
 def test_a_fork_reading_deep_history_answers_as_if_the_grid_were_joined():
@@ -336,8 +340,15 @@ def test_the_published_source_is_write_once():
     assert deep, 'every fork published one block — no fork reached past its cutoff'
     source = deep[0]
     past, inner = source.blocks
-    assert source.shape == (past.shape[0] + inner.shape[0],) + tuple(inner.shape[1:])
-    assert inner.shape[-1] % past.shape[-1] == 0, 'the forked block is not a fan of the past'
+    assert source.shape == (past.n_rows + inner.n_rows,) + tuple(inner.tensor.shape[1:])
+    assert past.first_row == 0 and inner.first_row == past.n_rows
+    # the past's batch map is the fork's own flatten, so it must land every logical column on the
+    # outer path that produced it
+    fan = inner.tensor.shape[-1] // past.tensor.shape[-1]
+    assert inner.batch_index is None, 'the forked block is already at the logical width'
+    assert torch.equal(past.batch_index,
+                       torch.arange(inner.tensor.shape[-1],
+                                    device=past.batch_index.device) // fan)
     for write in (lambda: source.__iadd__(0.0001), lambda: source.copy_(inner),
                   lambda: source.__setitem__(0, 0.0)):
         with pytest.raises((TypeError, AttributeError)):

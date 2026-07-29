@@ -125,36 +125,47 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
 
 `_run_inner_mc_at_t` forks the simulator from each outer-path state at outer step `t`: truncates the grid (`TimeGrid.truncate_to`), optionally windows to `{t,t+1}` (`copy_window`) for the one-step diff-ML bootstrap, and runs ONE pass at `Batch_Size x Inner_Sub_Batch` flat samples (no partition: peak memory is a function of those two JSON fields, and an over-wide config raises CUDA OOM naming the fork). The pass: `reset_inner` (Sobol), per-process `precalculate` from `outer_buf[key][t]`, `inner_fork_seed` / `reseed_inner_state` for the sufficient statistic, generate, then **publishes each factor's grid as a `ScenarioSource`** — the outer-realized past at `B_outer` followed by the forked rows flattened `(B,B2)→B*B2` — for one real pricing pass on restricted `DealStructure`s. It uses the model-agnostic verb protocol so the loop is uniform across model worlds — see [The process protocol](dependency_system.md#the-process-protocol).
 
-!!! note "A scenario source is a sequence of row blocks; one block is the ordinary case"
-    `utils.ScenarioSource` is a factor's grid as the pricer sees it: contiguous scenario-row
-    blocks under one logical shape, each at its own batch width. Ordinary generation publishes
-    ONE block, the whole grid at the simulation width. A fork publishes TWO. `Interpolation`
-    normalises a bare tensor into the one-block source and reads through the sequence either
-    way: `route` groups a gather's rows by the block that owns each of its two reads (off the
-    numpy scenario indices a `CurveTensor` already holds, so no device sync, once per
-    `CurveTensor` rather than once per gather), each block reads at its own width, and
-    `broadcast` takes that read up to the grid width — the identity for a block that IS the grid.
-    Base valuation, credit Monte Carlo and the outer hedge loop therefore run the same code with
-    no interior cut and both adapters the identity; nothing downstream can tell a forked source
-    from an ordinary one.
+!!! note "Four objects, one query: rows route by block, tenors route by segment"
+    The curve read splits into a **query**, **logical scenario storage** and **one physical
+    interpolation**, and nothing holds two of those jobs at once.
+
+    - `CurveTensor` — query coordinates. It keeps scenario ROWS (`index`, `index_next`, `alpha`),
+      never a flattened `row * n_tenors` offset, because a tenor segment's stride is its own.
+    - `ScenarioBlock` / `ScenarioSource` — logical storage. A block is one physical tensor plus
+      `first_row` (where it starts in the logical grid) and `batch_index` (which of ITS columns
+      supplies each logical column). A fork publishes two blocks; ordinary generation publishes a
+      bare tensor and no source at all.
+    - `Interpolation` — one physical tensor: its kind, its tenor grid, its Hermite pair. It knows
+      nothing about blocks, logical rows or batch fan-out, and flattens rows against its OWN
+      stride. Base valuation, credit Monte Carlo and the outer hedge loop build only this.
+    - `SegmentedInterpolation` — a SIBLING, not a subclass: composes leaves over the TENOR axis
+      for a `Near_Interpolation` curve.
+    - `RoutedInterpolation` — composes strategies over the SCENARIO axis for a fork.
+
+    `build_interpolation` is the single recursive constructor: bare tensor + kind → leaf; bare
+    tensor + segment list → segmented; `ScenarioSource` + either → routed, whose per-block children
+    it builds by calling itself. So a segmented curve inside a fork is a `RoutedInterpolation` of
+    `SegmentedInterpolation`s and needs no special case — the two compositions are orthogonal.
+
+    **Why a fork publishes blocks.** Every realized-past row is identical across the inner draws,
+    so joining them into one tensor writes the past out `Inner_Sub_Batch` times: 98% of the
+    stuffed buffer at the production operating point, dragging a same-shaped slab of Hermite
+    coefficients with it. Each block interpolates at its OWN width and
+    `ScenarioBlock.project` takes the RESULT up to the logical width — never the stored tensor,
+    which would hand back exactly the memory the split exists to save.
+
+    **Order is load-bearing.** A read is raw (`read_at`), then blended over time, then `combine`d
+    (RT scaling, and the segmented tenor select). `combine` and `project` are both linear, so they
+    commute with the blend — which is what lets the routed path be the same arithmetic in the same
+    order as an unrouted one, and is why the whole thing is bitwise.
 
     A time-interpolated read reaches `index + 1`, so a row just below a cut reads ACROSS it and
-    names two blocks — classify on where a read ENDS, not where it starts.
+    names two blocks — `route` classifies on where a read ENDS, not where it starts.
 
-    **Refusals, deliberate.** A curve whose factor declares `Near_Interpolation` builds a
-    `SegmentedInterpolation`, whose segments are middle-dim (tenor) slices with their own tenor
-    divisors; `make_curve_tensor` JOINS a multi-block source before building one, so segmented
-    curves give up the saving rather than route untested. `n_batch_dims > 1` gathers all happen
-    inside a process's `generate`, before a fork publishes, so a multi-block source never meets
-    one — it carries no `reshape` and would say so.
-
-    **Invariant — a source is write-once.** It is built after every process's `generate` has
-    published, and nothing writes into `t_Scenario_Buffer` afterwards. It answers only
-    `shape` / `new` / the RT tenor rescale, so a late write fails loud rather than silently
-    materializing the grid it exists to avoid. Its `t_Buffer` key is
-    `(interpolation, factor, LOGICAL shape)` — a source and the grid it joins to hash the same,
-    which is correct because `t_Buffer` is cleared before the fork prices and again in the
-    `finally`, so the two never coexist.
+    **Invariant — a source is write-once.** Built after every process's `generate` has published,
+    and nothing writes into `t_Scenario_Buffer` afterwards. It answers only `shape` / `new` / the
+    RT tenor rescale, so a late write fails loud rather than silently materializing the grid it
+    exists to avoid.
 
     Measured on the production walk-forward book (trade 202001, garch, seed 7), like for like:
 
@@ -166,5 +177,4 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
     `peak_alloc = 0.057 GiB + 13.23 kB · B_flat` (two-point fit; the 4096x64 rung measured
     3.36 GiB against 3.36 predicted). At a 19.6 GiB allocated ceiling that moves max `B_flat`
     from 254 k to 1.55 M — `Batch_Size` 3 977 → 24 208 at `Inner_Sub_Batch` 64, or
-    `Inner_Sub_Batch` 199 → 1 210 at `Batch_Size` 1280. Every reported value is unchanged
-    (`greedy -100.52`, `V_0 -0.2830735743045807`, `train_u -0.4611`, `churn 187.5`).
+    `Inner_Sub_Batch` 199 → 1 210 at `Batch_Size` 1280.

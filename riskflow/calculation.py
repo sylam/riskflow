@@ -2496,13 +2496,20 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                 # `ScenarioSource` is the same sequence-of-row-blocks the outer loop publishes with
                 # one block, so the pricer reads both through one mechanism. A fork at t=0 has no
                 # past and publishes one block.
+                # the past holds one OUTER column per B_inner flat columns; this is the map the
+                # flatten below performs, handed over as data rather than re-derived downstream
+                past_columns = torch.arange(
+                    B_flat, device=shared_mem.one.device) // B_inner
                 for key in self.stoch_factors_inner:
                     if key.type in utils.DimensionLessFactors:
                         continue
                     inner_path = shared_mem.t_Scenario_Buffer[key]                  # (T_inner, ..., B, SB)
-                    past = [outer_scenario_buffer[key][:cutoff_idx]] if cutoff_idx else []
+                    past = [utils.ScenarioBlock(outer_scenario_buffer[key][:cutoff_idx],
+                                                batch_index=past_columns)] if cutoff_idx else []
                     shared_mem.t_Scenario_Buffer[key] = utils.ScenarioSource(
-                        *past, inner_path.reshape(*inner_path.shape[:-2], B_flat))
+                        *past, utils.ScenarioBlock(
+                            inner_path.reshape(*inner_path.shape[:-2], B_flat),
+                            first_row=cutoff_idx))
 
                 # Single-pass pricing — the chunk is sized so B_flat fits the memory budget.
                 shared_mem.t_Buffer.clear()

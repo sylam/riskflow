@@ -15,6 +15,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
 import pytest
 import torch
 
@@ -72,20 +73,23 @@ def test_row_independence_holds_in_float32_too():
 SCEN, N_TENORS, BATCH = 119, 31, 6
 
 
+def _hermite(curve, t):
+    return Interpolation(curve, 'Hermite', 0.08, 30.0, hermite_tenor=t)
+
+
 def _gather(interp, rows, alpha=None):
-    """Drive Interpolation.eval the way the pricers do: a set of scenario rows, the standard
-    two-tenor bracket, and a fixed interpolation weight."""
-    idx = torch.tensor(rows, dtype=torch.int64).reshape(-1, 1) * N_TENORS
-    nxt = (torch.tensor(rows, dtype=torch.int64).clamp(max=SCEN - 2) + 1).reshape(-1, 1) * N_TENORS \
-        if alpha is not None else None
+    """Drive the leaf's eval the way the pricers do: a set of scenario ROWS (the leaf flattens
+    them against its own tenor stride), the standard two-tenor bracket, and a fixed weight."""
+    idx = torch.tensor(rows, dtype=torch.int64)
+    nxt = idx.clamp(max=SCEN - 2) + 1 if alpha is not None else None
     w2 = torch.full((len(rows), 1, BATCH), 0.35, dtype=torch.float64)
     tnr = torch.full((len(rows), 1), 5.0, dtype=torch.float64)
-    return interp.eval(('Hermite', 0.08, 30.0), 3, 4, idx, nxt, w2, tnr, alpha=alpha)
+    return interp.eval(idx, nxt, alpha, 3, 4, w2, tnr, 1.0)
 
 
 def _eager(curve, t):
     """The pre-feature reference: an Interpolation whose coefficients cover the whole block."""
-    interp = Interpolation(curve, hermite_tenor=t)
+    interp = _hermite(curve, t)
     interp.hermite_params(torch.tensor([[0], [(SCEN - 1) * N_TENORS]]), None)
     assert interp.rows == (0, SCEN - 1)
     return interp
@@ -102,7 +106,7 @@ def _counted(interp, tally):
     list(range(0, 41, 7)), list(range(20, 61, 7)), list(range(70, 119, 7)), [83], [0], [118]])
 def test_a_lazily_built_gather_matches_the_full_block(rows):
     t, curve = _tenor(N_TENORS), _curve(SCEN, N_TENORS, BATCH, seed=3)
-    lazy = Interpolation(curve, hermite_tenor=t)
+    lazy = _hermite(curve, t)
     assert lazy.interp_params == [] and lazy.rows is None, 'coefficients built before any gather'
     got = _gather(lazy, rows)
     assert lazy.rows == (min(rows), max(rows)), 'built rows are not the rows the gather named'
@@ -115,7 +119,7 @@ def test_the_alpha_branch_covers_the_next_row_too():
     t, curve = _tenor(N_TENORS), _curve(SCEN, N_TENORS, BATCH, seed=11)
     rows = [40, 55, 70]
     alpha = torch.full((len(rows), 1, 1), 0.4, dtype=torch.float64)
-    lazy = Interpolation(curve, hermite_tenor=t)
+    lazy = _hermite(curve, t)
     got = _gather(lazy, rows, alpha=alpha)
     assert lazy.rows == (40, 71)
     assert torch.equal(got, _gather(_eager(curve, t), rows, alpha=alpha))
@@ -129,7 +133,7 @@ def test_a_later_gather_outside_the_built_span_extends_it():
     later, deeper read is the normal case — not an error. It must widen the span and still answer
     with the full-block value. This is what the declared window used to have to predict."""
     t, curve = _tenor(N_TENORS), _curve(SCEN, N_TENORS, BATCH, seed=5)
-    lazy, eager = Interpolation(curve, hermite_tenor=t), _eager(curve, t)
+    lazy, eager = _hermite(curve, t), _eager(curve, t)
     _gather(lazy, [80, 81])
     assert lazy.rows == (80, 81)
     for rows in ([40], [90, 100], [0, 118]):                       # below, above, everything
@@ -143,7 +147,7 @@ def test_a_widening_builds_only_the_rows_it_adds():
     quadratic — measured on credit MC, 7501 rows built for a 121-row block. Only the new rows may
     be built, and the spliced pair must still equal the eager one row for row."""
     t, curve = _tenor(N_TENORS), _curve(SCEN, N_TENORS, BATCH, seed=11)
-    lazy, eager = Interpolation(curve, hermite_tenor=t), _eager(curve, t)
+    lazy, eager = _hermite(curve, t), _eager(curve, t)
     built = []
     _counted(lazy, built)
     for row in range(20, 40):                                      # ascending, one row at a time
@@ -158,7 +162,7 @@ def test_a_gather_inside_the_built_span_does_not_rebuild():
     """The amortisation the design depends on: rows already covered are served from what is built,
     so an object gathered many times pays for its coefficients once."""
     t, curve = _tenor(N_TENORS), _curve(SCEN, N_TENORS, BATCH, seed=7)
-    lazy = Interpolation(curve, hermite_tenor=t)
+    lazy = _hermite(curve, t)
     _gather(lazy, [30, 90])
     built = lazy.interp_params
     for rows in ([30], [60], [90], [31, 89]):
@@ -171,7 +175,7 @@ def test_an_empty_gather_names_no_rows():
     """A step with no resets in range gathers an EMPTY index set. It names no rows, so it must not
     disturb the span (nor take a min over an empty tensor)."""
     t, curve = _tenor(N_TENORS), _curve(SCEN, N_TENORS, BATCH, seed=9)
-    lazy = Interpolation(curve, hermite_tenor=t)
+    lazy = _hermite(curve, t)
     assert _gather(lazy, []).shape == (0, 1, BATCH)
     assert lazy.rows == (0, 0), 'an empty gather should build the degenerate span, not the block'
     _gather(lazy, [50, 60])
@@ -184,7 +188,7 @@ def test_the_full_grid_consumer_builds_the_whole_block():
     """Base valuation, credit Monte Carlo and the outer hedge loop gather every scenario row, so
     they get the whole block — the same coefficients as before, built on their first read."""
     t, curve = _tenor(N_TENORS), _curve(SCEN, N_TENORS, BATCH, seed=13)
-    lazy = Interpolation(curve, hermite_tenor=t)
+    lazy = _hermite(curve, t)
     got = _gather(lazy, list(range(SCEN)))
     assert lazy.rows == (0, SCEN - 1) and lazy.row_offset == 0
     g_full, c_full = hermite_interpolation_tensor(t, curve)
@@ -206,31 +210,27 @@ def test_a_two_segment_curve_defers_per_segment():
     from riskflow.utils import SegmentedInterpolation
     n_tenors, split, batch = 8, 3, 5
     curve = _curve(60, n_tenors, batch, seed=17)
-    tenor = torch.linspace(0.08, 30.0, n_tenors, dtype=torch.float64)
+    tenor = np.linspace(0.08, 30.0, n_tenors)
     spec = ((0, split, 'Hermite'), (split, n_tenors - 1, 'Hermite'))
 
-    def segments():
-        return [Interpolation(curve[:, s:e + 1, :],
-                              hermite_tenor=tenor[s:e + 1].reshape(1, -1, 1)) for s, e, _ in spec]
-
-    lazy, eager = segments(), segments()
-    for seg in eager:                                          # pre-build the whole block
-        seg.hermite_params(torch.tensor([[0], [59 * seg.tensor.shape[1]]]), None)
-
-    rows = [12, 33, 44]
+    rows = torch.tensor([12, 33, 44])
     i1 = torch.tensor([[0], [2], [5]])
-    tenor_data = (spec, (0.08, float(tenor[split])), (float(tenor[split]), 30.0))
     w2 = torch.full((len(rows), 1, batch), 0.35, dtype=torch.float64)
     tnr = torch.full((len(rows), 1), 5.0, dtype=torch.float64)
 
-    def run(segs):
-        obj = SegmentedInterpolation(segs, curve)
-        _a, _n, t_index, t_next = obj.get_time_index(torch.tensor(rows), None)
-        return obj.eval(tenor_data, i1, i1 + 1, t_index, t_next, w2, tnr)
+    def run(eager):
+        obj = SegmentedInterpolation(curve, spec, tenor, 0.08, 30.0)
+        if eager:                                              # pre-build the whole block
+            for seg in obj.segments:
+                seg.hermite_params(torch.tensor([[0], [59 * seg.shape[1]]]), None)
+        return obj, obj.eval(rows, None, None, i1, i1 + 1, w2, tnr, 1.0)
 
-    assert torch.equal(run(lazy), run(eager)), 'segmented lazy build diverged from the full block'
-    assert [s.rows for s in lazy] == [(12, 44), (12, 44)], 'a segment resolved the wrong rows'
-    assert [s.row_offset for s in lazy] == [12 * 4, 12 * 5], 'offset ignores the segment n_tenors'
+    lazy, got = run(False)
+    _eagerly, want = run(True)
+    assert torch.equal(got, want), 'segmented lazy build diverged from the full block'
+    assert [s.rows for s in lazy.segments] == [(12, 44), (12, 44)], 'a segment resolved wrong rows'
+    assert [s.row_offset for s in lazy.segments] == [12 * 4, 12 * 5], \
+        'offset ignores the segment n_tenors'
 
 
 # --------------------------------------------------------------------------------------------
@@ -242,11 +242,10 @@ def test_a_two_segment_curve_defers_per_segment():
 # grid — the tensor the fork used to build with a `cat` of an expanded past — and assert that the
 # one-block source is that mechanism's trivial instance, not a path beside it.
 # --------------------------------------------------------------------------------------------
-import numpy as np
-
 from riskflow import utils
-from riskflow.utils import (CurveTensor, Factor, ScenarioSource, SegmentedInterpolation,
-                            broadcast_to_grid, make_curve_tensor, same)
+from riskflow.utils import (CurveTensor, Factor, Interpolation, RoutedInterpolation,
+                            ScenarioBlock, ScenarioSource, SegmentedInterpolation,
+                            build_interpolation, make_curve_tensor)
 
 CUTOFF, T_INNER, B_OUTER, FAN = 100, 2, 5, 4          # B_flat = B_OUTER * FAN
 
@@ -259,6 +258,24 @@ class Shared:
 
     def __init__(self):
         self.t_Buffer = {}
+
+
+def _past_columns(fan=FAN, width=B_OUTER):
+    """The map a fork hands over: logical flat column -> the outer column that supplies it."""
+    return torch.arange(width * fan) // fan
+
+
+def _source(past, inner, fan=FAN):
+    return ScenarioSource(ScenarioBlock(past, batch_index=_past_columns(fan, past.shape[-1])),
+                          ScenarioBlock(inner, first_row=past.shape[0]))
+
+
+def _join(past, inner, fan=FAN):
+    """The reference the routed answer is measured against: the tensor the fork used to build,
+    a `cat` of the past written out `fan` times. Constructed HERE rather than asked of production
+    code, so the gate cannot be satisfied by the thing it is testing."""
+    wide = past.unsqueeze(-1).expand(*past.shape, fan).reshape(*past.shape[:-1], -1)
+    return torch.cat([wide, inner], dim=0)
 
 
 def _blocks(n_tenors=N_TENORS, seed=21):
@@ -286,7 +303,7 @@ def _component(n_tenors, kind):
 
 def _gathered(source, rows, alpha, kind, n_tenors=N_TENORS, points=(30.0, 400.0, 4000.0)):
     """Drive the WHOLE read path — make_curve_tensor -> CurveTensor (which decides the routing)
-    -> interpolate_curve -> Interpolation.eval — exactly as the pricer does."""
+    -> interpolate_curve -> the strategy's eval — exactly as the pricer does."""
     component = _component(n_tenors, kind)
     curve_tensor = make_curve_tensor(source, component, _time_grid(rows, alpha), Shared())
     query = np.tile(np.array(points), (len(rows), 1))
@@ -312,29 +329,32 @@ def test_a_two_block_gather_equals_the_joined_grid(label, alpha, kind):
     read ACROSS the cut, which is the case the routing has to get right."""
     past, inner = _blocks()
     rows = ROW_SETS[label]
-    source = ScenarioSource(past, inner)
-    split_tensor, split = _gathered(source, rows, alpha, kind)
-    joined_tensor, joined = _gathered(source.join(), rows, alpha, kind)
-    assert len(split_tensor.interp_obj.blocks) == 2, 'the split arm did not route'
-    assert len(joined_tensor.interp_obj.blocks) == 1, 'the joined arm is not one block'
+    split_tensor, split = _gathered(_source(past, inner), rows, alpha, kind)
+    joined_tensor, joined = _gathered(_join(past, inner), rows, alpha, kind)
+    assert isinstance(split_tensor.interp_obj, RoutedInterpolation), 'the split arm did not route'
+    assert isinstance(joined_tensor.interp_obj, Interpolation), 'the joined arm is not a leaf'
     assert split.shape == joined.shape == (len(rows), 3, B_OUTER * FAN)
     assert torch.equal(split, joined), f'{label} / alpha={alpha} / {kind} diverged from the join'
 
 
-def test_a_one_block_source_is_the_same_mechanism_with_one_block():
-    """Nothing downstream can tell an ordinary grid from a forked one: it is the same object with
-    one block, no interior cut, the whole-grid routing, and both adapters the identity."""
-    whole = Interpolation(_curve(CUTOFF + T_INNER, N_TENORS, B_OUTER * FAN))
-    assert whole.blocks == (whole,) and whole.cuts.size == 0
-    assert whole.rebase is same and whole.rebase_row is same and whole.broadcast is same
+def test_a_leaf_knows_nothing_about_blocks():
+    """The separation, asserted directly. An ordinary grid builds a LEAF — no cuts, no routing, no
+    block offsets, no batch map — and a fork builds a composite over leaves that are themselves
+    just as ignorant. Base valuation and credit Monte Carlo only ever get the leaf."""
+    tenor = np.linspace(0.08, 30.0, N_TENORS)
+    whole = build_interpolation(_curve(CUTOFF + T_INNER, N_TENORS, B_OUTER * FAN), 'Linear', tenor)
+    assert isinstance(whole, Interpolation)
+    for attr in ('blocks', 'cuts', 'first_row', 'batch_index', 'rebase', 'broadcast'):
+        assert not hasattr(whole, attr), f'a leaf grew a composite concern: {attr}'
     for has_alpha in (False, True):
         assert whole.route(np.array([0, 7, 99]), has_alpha) == ((None, 0, 0),)
 
     past, inner = _blocks()
-    forked = Interpolation(ScenarioSource(past, inner))
-    assert len(forked.blocks) == 2 and list(forked.cuts) == [CUTOFF]
+    forked = build_interpolation(_source(past, inner), 'Linear', tenor)
+    assert isinstance(forked, RoutedInterpolation)
+    assert all(isinstance(s, Interpolation) for s in forked.strategies)
+    assert list(forked.cuts) == [CUTOFF]
     assert forked.shape == (CUTOFF + T_INNER, N_TENORS, B_OUTER * FAN)
-    assert forked.blocks[0].broadcast is not same and forked.blocks[1].broadcast is same
     # the routing names blocks, never "was this a fork"
     assert forked.route(np.array([0, 5]), False) == ((None, 0, 0),)
     assert forked.route(np.array([CUTOFF, CUTOFF + 1]), False) == ((None, 1, 1),)
@@ -345,15 +365,14 @@ def test_the_hermite_pair_is_built_per_block_at_that_block_s_own_width():
     """The second half of the prize: a past row's coefficients are identical across the forked
     draws, so they are built ONCE per outer path, not once per flat sample."""
     past, inner = _blocks()
-    source = ScenarioSource(past, inner)
-    curve_tensor, _ = _gathered(source, [10, 20, 30], 0.0, 'Hermite')
-    past_block, forked_block = curve_tensor.interp_obj.blocks
-    assert past_block.interp_params[0].shape[-1] == B_OUTER, 'past coefficients are flat-width'
-    assert forked_block.interp_params == [], 'the forked block was built for a gather below it'
+    curve_tensor, _ = _gathered(_source(past, inner), [10, 20, 30], 0.0, 'Hermite')
+    past_leaf, forked_leaf = curve_tensor.interp_obj.strategies
+    assert past_leaf.interp_params[0].shape[-1] == B_OUTER, 'past coefficients are flat-width'
+    assert forked_leaf.interp_params == [], 'the forked block was built for a gather below it'
     g_full, c_full = hermite_interpolation_tensor(          # the block's own tenor grid, exactly
-        past_block.hermite_tenor, past[past_block.rows[0]:past_block.rows[1] + 1])
-    assert torch.equal(past_block.interp_params[0], g_full.reshape(-1, B_OUTER))
-    assert torch.equal(past_block.interp_params[1], c_full.reshape(-1, B_OUTER))
+        past_leaf.hermite_tenor, past[past_leaf.rows[0]:past_leaf.rows[1] + 1])
+    assert torch.equal(past_leaf.interp_params[0], g_full.reshape(-1, B_OUTER))
+    assert torch.equal(past_leaf.interp_params[1], c_full.reshape(-1, B_OUTER))
 
 
 @pytest.mark.parametrize('alpha', [0.0, 0.4])
@@ -363,12 +382,14 @@ def test_the_spot_path_routes_the_same_way(label, alpha):
     other read surface — same routing, on the row axis instead of the flat (row, tenor) one."""
     past = _curve(CUTOFF, 1, B_OUTER, seed=31)[:, 0, :]
     inner = _curve(T_INNER, 1, B_OUTER * FAN, seed=32)[:, 0, :]
-    source = ScenarioSource(past, inner)
     rows = ROW_SETS[label]
     grid = _time_grid(rows, alpha)
-    split = utils.gather_scenario_interp(Interpolation(source), grid, None, as_curve_tensor=False)
+    split = utils.gather_scenario_interp(
+        build_interpolation(_source(past, inner), 'Linear', np.zeros(1)),
+        grid, None, as_curve_tensor=False)
     joined = utils.gather_scenario_interp(
-        Interpolation(source.join()), grid, None, as_curve_tensor=False)
+        build_interpolation(_join(past, inner), 'Linear', np.zeros(1)),
+        grid, None, as_curve_tensor=False)
     assert split.shape == joined.shape == (len(rows), B_OUTER * FAN)
     assert torch.equal(split, joined)
 
@@ -382,10 +403,10 @@ def test_a_gradient_reaches_both_blocks():
     grad forks themselves are bitwise-gated end to end by `tb_golden_worlds.py`."""
     past, inner = _blocks()
     rows, out = [0, 44, CUTOFF - 1, CUTOFF, CUTOFF + 1], {}
-    for name, leaf in (('split', inner.clone().requires_grad_(True)),
-                       ('joined', inner.clone().requires_grad_(True))):
-        source = ScenarioSource(past, leaf)
-        _, val = _gathered(source if name == 'split' else source.join(), rows, 0.4, 'Hermite')
+    for name in ('split', 'joined'):
+        leaf = inner.clone().requires_grad_(True)
+        value = _source(past, leaf) if name == 'split' else _join(past, leaf)
+        _, val = _gathered(value, rows, 0.4, 'Hermite')
         assert val.requires_grad, f'{name}: the tape did not survive the gather'
         val.sum().backward()
         out[name] = leaf.grad
@@ -393,19 +414,23 @@ def test_a_gradient_reaches_both_blocks():
     assert out['split'].abs().max() > 0, 'no gradient reached the forked block at all'
 
 
-def test_a_segmented_curve_joins_its_blocks_rather_than_routing():
-    """REFUSED, deliberately: a segment is a middle-dim slice (a copy) with its own tenor divisor,
-    so routing would have to be per segment, and no in-repo factor declares the split. The answer
-    must still be the joined-grid answer — the saving is given up, not the correctness."""
+@pytest.mark.parametrize('alpha', [0.0, 0.4])
+def test_a_segmented_curve_inside_a_fork_composes(alpha):
+    """Scenario routing and tenor segmentation are ORTHOGONAL, so a `Near_Interpolation` curve in
+    a fork is a RoutedInterpolation of SegmentedInterpolations and needs no special case — the
+    saving is kept rather than given up to a join. Each physical block segments its own tenor axis
+    at its own stride, which is exactly why `CurveTensor` hands out scenario ROWS."""
     n_tenors = 8
     past, inner = _blocks(n_tenors=n_tenors, seed=41)
-    source = ScenarioSource(past, inner)
-    spec = ((0, 3, 'Hermite'), (3, n_tenors - 1, 'Hermite'))
-    rows = [5, 60, CUTOFF, CUTOFF + 1]
-    curve_tensor, split = _gathered(source, rows, 0.4, spec, n_tenors=n_tenors)
-    _, joined = _gathered(source.join(), rows, 0.4, spec, n_tenors=n_tenors)
-    assert isinstance(curve_tensor.interp_obj, SegmentedInterpolation)
-    assert curve_tensor.interp_obj.cuts.size == 0, 'segmented curve kept an interior cut'
+    spec = ((0, 3, 'Hermite'), (3, n_tenors - 1, 'LinearRT'))
+    rows = [5, 60, CUTOFF - 1, CUTOFF, CUTOFF + 1]
+    curve_tensor, split = _gathered(_source(past, inner), rows, alpha, spec, n_tenors=n_tenors)
+    _, joined = _gathered(_join(past, inner), rows, alpha, spec, n_tenors=n_tenors)
+    assert isinstance(curve_tensor.interp_obj, RoutedInterpolation)
+    assert all(isinstance(s, SegmentedInterpolation) for s in curve_tensor.interp_obj.strategies)
+    # the past block's segments stay at the OUTER width — the whole point of not joining
+    assert all(seg.shape[-1] == B_OUTER
+               for seg in curve_tensor.interp_obj.strategies[0].segments)
     assert torch.equal(split, joined)
 
 
@@ -415,21 +440,25 @@ def test_a_source_carries_only_what_the_pricer_does_to_a_buffer_value():
     on a raw buffer value. Anything else, including any attempt to write into it, fails loud rather
     than silently materializing the grid it exists to avoid."""
     past, inner = _blocks()
-    source = ScenarioSource(past, inner)
+    source = _source(past, inner)
     assert source.shape == (CUTOFF + T_INNER, N_TENORS, B_OUTER * FAN)
     scale = torch.linspace(1.0, 2.0, N_TENORS, dtype=torch.float64).reshape(1, -1, 1)
-    assert torch.equal((source * scale).join(), source.join() * scale)
+    scaled = source * scale
+    assert torch.equal(scaled.blocks[0].tensor, past * scale)
+    assert torch.equal(scaled.blocks[1].tensor, inner * scale)
     for write in (lambda: source.__iadd__(1.0), lambda: source + 1.0, lambda: source.reshape(-1),
                   lambda: source.detach(), lambda: source[0]):
         with pytest.raises((TypeError, AttributeError)):
             write()
 
 
-def test_broadcasting_a_block_reproduces_writing_it_out():
-    """`broadcast` is the only place a narrow block widens. It must put the same values in the
-    same column order the fork's `cat` of an expanded past put them in — that identity is what
-    makes the whole change bitwise."""
+def test_projecting_a_block_reproduces_writing_it_out():
+    """`ScenarioBlock.project` is the only place a narrow block widens. It must put the same values
+    in the same column order the fork's `cat` of an expanded past put them in — that identity is
+    what makes the whole change bitwise, and it is now a map carried as DATA rather than a fan
+    inferred from two widths."""
     past = _curve(7, N_TENORS, B_OUTER, seed=51)
     written_out = past.unsqueeze(-1).expand(*past.shape, FAN).reshape(*past.shape[:-1], -1)
-    assert torch.equal(broadcast_to_grid(FAN)(past), written_out)
-    assert torch.equal(ScenarioSource(past).join(), past), 'one block joins to itself'
+    block = ScenarioBlock(past, batch_index=_past_columns())
+    assert torch.equal(block.project(past), written_out)
+    assert torch.equal(ScenarioBlock(past).project(past), past), 'no map = already at width'
