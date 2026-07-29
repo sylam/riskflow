@@ -293,6 +293,34 @@ class Bundle:
     reward. `inner_mc` / `inner_mc_grad` are attached by `HedgeMonteCarlo.execute` in solve_hedge
     mode; they fork the simulator at a decision step and price the {t, t+1} window."""
 
+    documentation = ('Bundle', [
+        'Every time-indexed tensor the solver and the environment read, built ONCE per batch by',
+        '`from_batch` and read-only afterwards. Consumers index it by attribute; nothing recomputes',
+        'it.',
+        '',
+        '- **Tradables** — `tradables` / `tradables_sim`: the per-instrument mark series, harvested',
+        '  from the priced deal tree via `DealStructure.tensor_marks`. An instrument that fails to',
+        '  price is ABSENT rather than zero, and a fork reads absence as an expired contract.',
+        '- **Liability** — `liability_mtm` / `liability_sim`, plus `realized_cashflows`.',
+        '- **Factors** — the simulated factor paths, and `privileged_factors`: whatever each process',
+        '  publishes as market state.',
+        '- **Frame** — `utility_scale` (the objective scale `c`) and `step_annual_vol` (the per-step',
+        '  vol driving state-dependent spreads and IM funding).',
+        '',
+        'The frame is resolved at build time and never recomputed. A per-rollout `c` would silently',
+        'rescale every reward, which is why a loaded checkpoint evaluates in ITS frame rather than',
+        "the evaluation world's.",
+        '',
+        '!!! warning "The history prefix"',
+        '    Time tensors carry `History_Lookback_Business_Days` realized rows in FRONT of the',
+        '    simulated grid, so full-grid indexing is `initial_time_index + t` while the `*_sim`',
+        '    views strip the prefix. Indexing a full-grid tensor by simulation `t` silently reads',
+        '    history.',
+        '',
+        'In `solve_hedge` mode `HedgeMonteCarlo.execute` attaches `inner_mc` / `inner_mc_grad`,',
+        'which fork the simulator at a decision step and price the `{t, t+1}` window on demand.',
+    ])
+
     def __init__(self, base_date=None, business_day=None, num_batches=1):
         self.base_date = base_date
         self.business_day = business_day
@@ -725,6 +753,34 @@ class BundleStepper:
     the bundle's: passing a variant (e.g. one accounting switch flipped) is how the cost
     decomposition isolates each friction on an unchanged world. `mirror_scale=False` keeps the
     runtime's utility scale as the caller set it (see `__init__`)."""
+
+    documentation = ('Bundle', [
+        'The hedging ENVIRONMENT: advance the bundle one day at a time under arbitrary actions,',
+        'with the realized accounting the frictionless wealth law abstracts away — overnight',
+        'financing on cash and margin, per-instrument variation margin and settlement, turnover cost',
+        'with the optional calendar-spread rebate and vol-linked IM funding, rounding to integer',
+        'contracts, and the terminal forced flatten.',
+        '',
+        'Each `step` returns a state dict and the caller chooses the next action. Vectorized over',
+        'the whole batch — every path advances in lockstep, and an action may be a scalar',
+        '(broadcast) or one value per path. `copy.deepcopy` forks a counterfactual branch, and the',
+        'recorded trajectory feeds `write_diagnostic_csvs`.',
+        '',
+        'The JSON that drives it lives under `Evaluator`: position limits,',
+        '`Transaction_Cost_Per_Unit`, `Bid_Offer_Spread_Bps` (a scalar half-spread, or a spec with',
+        '`Per_Instrument` bases and a `Vol_Scale` making the spread vol-dependent), margin funding,',
+        'and the optional `Total_Position_Schedule` corridor on the signed book total.',
+        '',
+        '!!! note "`runtime` is a parameter of the replay"',
+        '    Passing a variant — one accounting switch flipped — replays an UNCHANGED world under',
+        '    different frictions, which is how the cost decomposition isolates each one.',
+        '',
+        '!!! warning "Whose `c` governs the roll"',
+        '    `mirror_scale=True` (the default) re-mirrors the objective scale onto the runtime from',
+        "    the bundle being stepped. A FROZEN-policy rollout passes `False`: the checkpoint's",
+        "    scale is part of the value function's frame, and the argmax must read the same `c` the",
+        '    nets were fitted against.',
+    ])
 
     def __init__(self, bundle, runtime, mirror_scale=True):
         self.bundle = bundle

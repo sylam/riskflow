@@ -78,6 +78,23 @@ class HedgeActionSpace:
         reposition and the comparison-stable corridor stamp, both owned here because the action
         universe owns kappa and the corridor."""
 
+    documentation = ('Solver', [
+        'The action universe, built once from the runtime and shared by every track — the solver,',
+        'the benchmarks and the stepper rollout — so they all optimize over the same positions and',
+        'price the same frictions.',
+        '',
+        '- `grid()` / `axis_levels()` — the target-position grid. Active hedge axes span',
+        '  `[Min_Position, Max_Position]` at `Training_Action_Grid_Levels_Per_Axis` points,',
+        '  inactive axes pin to a single 0, and rows breaching the total-position cap are dropped.',
+        '- `kappa(...)` — the per-hedge turnover cost at a step, off the single',
+        '  `per_contract_kappa` rule the environment and the diagnostic CSVs also use.',
+        '- `initial_q(...)` — the opening book.',
+        '- `turnover_cost(...)` — the L1 charge on a reposition.',
+        '',
+        'One object owning all of this is what makes a benchmark comparable to the solver: they',
+        'cannot disagree about which positions are reachable or what a trade costs.',
+    ])
+
     def __init__(self, runtime, device, vol_sim=None):
         self.runtime = runtime
         self.device = device
@@ -282,6 +299,22 @@ class HindsightDpSolver:
     net-of-cost DIAGNOSTIC, never charged against the V_0 track. Uses the shared
     `HedgeActionSpace`, so it respects `Active_Hedge_Indices` exactly like the greedy grid."""
 
+    documentation = ('Solver', [
+        'A clairvoyant UPPER BOUND, enabled by `Run_Hindsight_Diagnostic`. For each realized path',
+        "it picks, at every step independently, the grid position maximizing that step's realized",
+        'P&L — perfect foresight and free repositioning. No inner MC and no fitted value: the',
+        'realized path is its own one-sample future.',
+        '',
+        'It is a bound, not a policy. With no turnover cost the per-step choices decouple, so the',
+        'dynamic program collapses to a per-step argmax, and the mean value is an upper bound on',
+        'any deployable policy — the reference the solver is measured against. The turnover a real',
+        'execution of that bang-bang trajectory would pay is reported as a net-of-cost diagnostic',
+        'and never charged against the bound.',
+        '',
+        'It shares `HedgeActionSpace`, so it respects `Active_Hedge_Indices` exactly as the greedy',
+        'grid does — a benchmark cannot trade an axis the solver had pinned off.',
+    ])
+
     def __init__(self, bundle, runtime):
         self.bundle = bundle
         self.runtime = runtime
@@ -395,6 +428,56 @@ class DiffSolverV2:
     `test_diffml_spot_grad_fd`). Turnover cost is ignored here (the toy has none) — a
     documented next-increment slot.
     """
+
+    documentation = ('Solver', [
+        'The production solver: a backward dynamic program whose per-step value is fitted by the',
+        "Huge-Savine twin loss (value plus the pathwise wealth gradient), consuming the bundle's",
+        'inner-MC closures. No analytic transition and no Jacobian reconstruction — the framework',
+        'prices every forked scenario through the ordinary deal pricers.',
+        '',
+        '`C_t(market, W) = u(W) + A_t(market, W)`: a bounded utility anchor plus a zero-init',
+        'residual net. Only `A` is learned, and fitting the RESIDUAL is what stops the backward',
+        'recursion running away. The Bellman maximum lives OUTSIDE the fitted value — a discrete',
+        'grid search over target positions — so the net never has to represent an argmax.',
+        '',
+        '### Shape of a run',
+        '',
+        'A solve is a stream (see `StreamingSolve`): `warmup` fits the first batch and LOCKS the',
+        'frame, `step` continues on fresh paths, `finish` reports on the held-out batch. Peak fork',
+        'memory is a function of `Batch_Size x Inner_Sub_Batch` alone, however long the stream is.',
+        '',
+        '### Knobs',
+        '',
+        '| key | meaning |',
+        '| --- | --- |',
+        '| `T_Min` | backward-sweep depth; 0 sweeps to the first decision |',
+        '| `Training_Action_Grid_Levels_Per_Axis` | action-grid resolution per hedge axis |',
+        '| `DiffV2_Fit_Iters`, `DiffV2_LR`, `DiffV2_Hidden` | per-t residual-net optimizer |',
+        '| `DiffV2_Lambda_Grad` | weight on the pathwise-gradient half of the twin loss |',
+        '| `DiffV2_Per_Column_Grad_Norm` | normalize greeks per input column rather than pooled |',
+        '| `DiffV2_Bank_Noise_Frac` | exploration around the per-t replication hedge |',
+        '| `DiffV2_Risk_Kappa` | score actions by `mean(C) - kappa * downside-semidev(C)` |',
+        '| `DiffV2_Cost_Aware_Argmax` | charge the L1 repositioning cost at the argmax |',
+        '| `DiffV2_One_Step_Fork` | window fork generation AND pricing to `{t, t+1}` |',
+        '| `Active_Hedge_Indices` | which hedge axes vary; the rest pin to 0 |',
+        '| `Multi_Seed_Count` | independent solvers on the same batches |',
+        '',
+        '### Persistence',
+        '',
+        '`DiffV2_Save_Value_Fn` writes the fitted nets with their standardization frame, utility',
+        'scale and trust region. `DiffV2_Load_Value_Fn` restores them and fits NOTHING — a frozen',
+        'evaluation. The two are separate runs, and setting both raises rather than silently',
+        'discarding a retrained net. Load accepts a LIST for an ensemble argmax: each member',
+        'evaluated in its own frame, the continuations averaged before the maximum, which reduces',
+        "the winner's curse. Mixing frame provenances inside one ensemble is refused.",
+        '',
+        '!!! warning "The frame is locked at warmup"',
+        '    The utility scale, the market/wealth standardization stats and the per-t trust region',
+        '    are computed on the first batch and frozen. Re-fitting them per batch would make each',
+        "    batch's `C_t` a different function of different inputs, and the recursion would compose",
+        '    mismatched frames. Later batches report how often their fitted targets fall outside the',
+        '    frozen region instead.',
+    ])
 
     def __init__(self, bundle, runtime):
         self.bundle = bundle
@@ -1412,6 +1495,30 @@ class StreamingSolve:
     nothing to fit, so warmup's batch IS the held-out world.
 
     Multi-seed keeps one persistent solver per seed, all fed the same batches in the same order."""
+
+    documentation = ('Solver', [
+        'The solve driver: one bundle per simulation batch, handed over as the calc builds it.',
+        '`warmup` on batch 1 (which constructs the solver(s) and locks the frame), `step` on every',
+        'later batch (fresh paths, same nets, optimizer moments and frame), and `finish` on the',
+        'final batch — never fitted, so it is the held-out world the verdict and the benchmark',
+        'tracks are measured on.',
+        '',
+        'Why this shape: fork width follows `Batch_Size` rather than the whole simulation, and every',
+        'fit step sees paths no earlier step did, so overfitting to one simulated set is not',
+        'structurally possible.',
+        '',
+        '`Simulation_Batches` is the stream length. Trained paths are',
+        '`(Simulation_Batches - 1) x Batch_Size`, and the minimum is 2. Measured on the platinum',
+        'book across four shapes and three seeds, STREAM LENGTH is the lever and batch width is',
+        'not: `4096 x 5` doubles the edge over textbook of `4096 x 2`, while `8192 x 5` buys a',
+        'little more tail for twice the wall, twice the memory and a three-times worse seed spread.',
+        '',
+        '!!! warning "A frozen evaluation is the stream of length one"',
+        '    `DiffV2_Load_Value_Fn` fits nothing, so `Simulation_Batches` must be exactly 1 — that',
+        '    single batch is both the warmup bundle and the held-out world, since frozen nets saw',
+        '    none of it. The contract refuses anything else, so there are no `step` batches to',
+        '    sweep, and `step` refuses to sweep a loaded net regardless.',
+    ])
 
     def __init__(self, runtime):
         self.runtime = runtime
