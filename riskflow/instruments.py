@@ -511,10 +511,10 @@ class Deal(object):
         except Exception as e:
             logging.critical('Deal {} skipped - {}'.format(
                 deal_data.Instrument.field.get("Reference"), e.args))
-            # The skip is for "this deal cannot price on this grid". A violated curve window or a
-            # CUDA OOM is the framework being wrong, and swallowing it into a scalar-0 mark makes
-            # the deal VANISH from `DealStructure.tensor_marks` — which an inner-MC fork reads as
-            # an expired contract, silently retiring it from the hedge set.
+            # The skip is for "this deal cannot price on this grid". Running out of memory is the
+            # FRAMEWORK being wrong, and swallowing it into a scalar-0 mark makes the deal VANISH
+            # from `DealStructure.tensor_marks` — which an inner-MC fork reads as an expired
+            # contract, silently retiring it from the hedge set.
             if utils.is_fatal_pricing_error(e):
                 raise
             return 0.0 * shared.one

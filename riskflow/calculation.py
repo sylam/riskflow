@@ -2286,8 +2286,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             with_grad=True, outer_rows=outer_rows)
 
     def _run_inner_mc_at_t(self, t, outer_scenario_buffer, shared_mem, base_date,
-                           tradable_refs, want_raw_samples=True, with_grad=False,
-                           outer_rows=None):
+                           tradable_refs, with_grad=False, outer_rows=None):
         """Run inner MC at a single outer timestep `t`, forking from `outer_scenario_buffer`
         — a snapshot of the outer `t_Scenario_Buffer` (factor keys plus every per-process aux
         key, batch dim B_outer).
@@ -2299,8 +2298,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         The DP/MPC backward sweep calls this on demand outside the outer loop (via the
         closure `Bundle.inner_mc`), forking inner MC at the requested `t`.
 
-        `want_raw_samples=False` returns just `{'features': (B_outer, 3+2*n_tradables)}`.
-        `want_raw_samples=True` additionally returns the raw inner samples the solvers need:
+        Returns the inner samples the solver bootstraps from:
             F_t1          {ref: (B_outer, B_inner)}      futures price at outer t+1
             L_t, L_t1     (B_outer, B_inner)             liability MTM at outer t and t+1
             market_t1     (B_outer, B_inner, market_dim)  inner market state at outer t+1
@@ -2323,20 +2321,14 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
             outer_scenario_buffer = {k: v[..., lo:hi] for k, v in outer_scenario_buffer.items()}
         B_outer = outer_scenario_buffer[spot_key].shape[-1]
         B_inner = shared_mem.simulation_sub_batch
-        n_features = 3 + 2 * len(tradable_refs)
-
         t_days = int(self.time_grid.scen_time_grid[t])
         inner_time_grid = self.time_grid.truncate_to(base_date, t_days)
 
-        # Terminal / past-end — no inner horizon. Emit zero features; `prob_loss == 0`
-        # flags this downstream. The DP sweep does not call here at terminal (it uses the
-        # closed-form V_T); a caller querying `inner_mc` at or past terminal does, hence the guard.
+        # Terminal / past-end — no inner horizon, so nothing to price. The DP sweep does not call
+        # here at terminal (it uses the closed-form V_T); a caller querying `inner_mc` at or past
+        # terminal does, hence the guard.
         if inner_time_grid.scen_time_grid.size < 2:
-            result = {'features': shared_mem.one.new_zeros(B_outer, n_features)}
-            if want_raw_samples:
-                result.update(t=t, cutoff_idx=t, L_T=None, market_t=None, market_t1=None,
-                              F_t1={})
-            return result
+            return dict(t=t, cutoff_idx=t, L_T=None, market_t=None, market_t1=None, F_t1={})
 
         # In HedgeMonteCarlo scen_time_grid == mtm_time_grid (dynamic_scenario_dates),
         # so the same `t` indexes both the scenario buffer and the mtm grid.
@@ -2420,13 +2412,12 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                         key, simulated, outer_scenario_buffer, t, shared_mem, self._inner_state_opts, with_grad)
                     if with_grad:
                         state_t_leaves.update(inner_leaves)
-                    if want_raw_samples:
-                        # Market state at outer t+1 (inner-time index 1): each factor reveals its
-                        # informative segments (its sufficient statistic + price/curve) from the live
-                        # buffer (factor path + any aux its generate()/reseed just published). The calc
-                        # owns the (factor_flat, B, SB) reshape and concatenates in reveal order.
-                        for block, _kind in proc_inner.reveal_state_at(1, shared_mem.t_Scenario_Buffer):
-                            market_t1_parts.append(block.reshape(-1, B_outer, B_inner))
+                    # Market state at outer t+1 (inner-time index 1): each factor reveals its
+                    # informative segments (its sufficient statistic + price/curve) from the live
+                    # buffer (factor path + any aux its generate()/reseed just published). The calc
+                    # owns the (factor_flat, B, SB) reshape and concatenates in reveal order.
+                    for block, _kind in proc_inner.reveal_state_at(1, shared_mem.t_Scenario_Buffer):
+                        market_t1_parts.append(block.reshape(-1, B_outer, B_inner))
 
                 # Publish each factor's grid as the outer-realized past followed by the forked rows
                 # + flatten (B,SB)→B*SB. The past is a slice of the outer snapshot, already
@@ -2495,65 +2486,61 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     ref: t.reshape(*t.shape[:-1], B_outer, B_inner)
                     for ref, t in inner_netting_sets.tensor_marks().items()
                 }
-                # The window prices {t, t+1}, so no terminal row exists to read: `L_T` is None and
-                # the horizon stats are simply not produced. The bootstrap reads only the t/t+1
-                # fields below.
-                result = {'features': shared_mem.one.new_zeros(
-                    B_outer, 3 + 2 * len(tradable_refs))}
-
-                if want_raw_samples:
-                    F_t1 = {}
-                    zero_bs = inner_mtm[-2].new_zeros(inner_mtm[-2].shape)   # (B_outer, B_inner)
-                    for ref in tradable_refs:
-                        td = inner_trade_tensors.get(ref)
-                        if td is None:
-                            # Tradable expired before this fork — zero moves, no position.
-                            F_t1[ref] = zero_bs
-                            continue
-                        td = td[cutoff_idx:]                                # (T_inner, B_outer, B_inner)
-                        # td has < 2 time points when the tradable's last deal event is at t
-                        # (it expires this step) — no t+1 slice; freeze it (dF == 0).
-                        F_t1[ref] = (td[1] if td.shape[0] >= 2 else td[-1]).clone()
-                    # Market state — every simulated factor's informative state (sufficient
-                    # statistic + price, carry curve, …) concatenated; factor order is the
-                    # `stoch_factors_inner` iteration order, identical for market_t/market_t1.
-                    market_t1 = torch.cat(market_t1_parts, dim=0).permute(1, 2, 0).contiguous()
-                    market_t_parts = []
-                    market_t_widths = []
-                    for key in self.stoch_factors_inner:
-                        if key.type in utils.DimensionLessFactors:
-                            continue
-                        proc_inner = self.stoch_factors_inner[key]
-                        width = 0
-                        for block, _kind in proc_inner.reveal_state_at(t, outer_scenario_buffer):
-                            b = block.reshape(-1, B_outer)
-                            market_t_parts.append(b)
-                            width += b.shape[0]
-                        # Forward the process's differentiable-state-leaf suffixes to the solver's
-                        # label projection, so it maps leaf grads → market columns with no model concept.
-                        market_t_widths.append((key, width, tuple(proc_inner.diff_state_leaves())))
-                    market_t = torch.cat(market_t_parts, dim=0).permute(1, 0).contiguous()
-                    # Exact liability MTM at the fork (outer-t) and outer-t+1, on the inner draws —
-                    # the resolve_hedge_structure marks themselves (same time-indexing as F_t1:
-                    # mtm[cutoff_idx:][0] is outer-t, [1] is outer-t+1). These replace the Jacobian
-                    # linearization of the liability in the diff-ML one-step bootstrap, so the
-                    # bootstrap value marks the liability EXACTLY at each inner draw.
-                    mtm_fwd = inner_mtm[cutoff_idx:]                            # (T_inner, B_outer, B_inner)
-                    L_t_inner = mtm_fwd[0].clone()                             # outer-t (shared across draws)
-                    L_t1_inner = (mtm_fwd[1] if mtm_fwd.shape[0] >= 2
-                                  else mtm_fwd[-1]).clone()                     # outer-t+1 per inner draw
-                    result.update(
-                        t=t, cutoff_idx=cutoff_idx, L_T=None,
-                        L_t=L_t_inner, L_t1=L_t1_inner, F_t1=F_t1,
-                        market_t=market_t, market_t1=market_t1)
-                    if with_grad:
-                        # Pair each leaf with the market_t column width it occupies — the
-                        # differential-label projection in the differential-ML solver needs
-                        # this to write per-leaf gradients into the right deep-state columns
-                        # without re-deriving factor widths (which would silently drift
-                        # if a process's `reveal_state_at` packing changes).
-                        result['state_t_leaves'] = state_t_leaves
-                        result['state_t_leaf_widths'] = market_t_widths
+                # The window prices {t, t+1}, so no terminal row exists to read: `L_T` is None
+                # and the horizon stats are simply not produced.
+                result = {}
+                F_t1 = {}
+                zero_bs = inner_mtm[-2].new_zeros(inner_mtm[-2].shape)   # (B_outer, B_inner)
+                for ref in tradable_refs:
+                    td = inner_trade_tensors.get(ref)
+                    if td is None:
+                        # Tradable expired before this fork — zero moves, no position.
+                        F_t1[ref] = zero_bs
+                        continue
+                    td = td[cutoff_idx:]                                # (T_inner, B_outer, B_inner)
+                    # td has < 2 time points when the tradable's last deal event is at t
+                    # (it expires this step) — no t+1 slice; freeze it (dF == 0).
+                    F_t1[ref] = (td[1] if td.shape[0] >= 2 else td[-1]).clone()
+                # Market state — every simulated factor's informative state (sufficient
+                # statistic + price, carry curve, …) concatenated; factor order is the
+                # `stoch_factors_inner` iteration order, identical for market_t/market_t1.
+                market_t1 = torch.cat(market_t1_parts, dim=0).permute(1, 2, 0).contiguous()
+                market_t_parts = []
+                market_t_widths = []
+                for key in self.stoch_factors_inner:
+                    if key.type in utils.DimensionLessFactors:
+                        continue
+                    proc_inner = self.stoch_factors_inner[key]
+                    width = 0
+                    for block, _kind in proc_inner.reveal_state_at(t, outer_scenario_buffer):
+                        b = block.reshape(-1, B_outer)
+                        market_t_parts.append(b)
+                        width += b.shape[0]
+                    # Forward the process's differentiable-state-leaf suffixes to the solver's
+                    # label projection, so it maps leaf grads → market columns with no model concept.
+                    market_t_widths.append((key, width, tuple(proc_inner.diff_state_leaves())))
+                market_t = torch.cat(market_t_parts, dim=0).permute(1, 0).contiguous()
+                # Exact liability MTM at the fork (outer-t) and outer-t+1, on the inner draws —
+                # the resolve_hedge_structure marks themselves (same time-indexing as F_t1:
+                # mtm[cutoff_idx:][0] is outer-t, [1] is outer-t+1). These replace the Jacobian
+                # linearization of the liability in the diff-ML one-step bootstrap, so the
+                # bootstrap value marks the liability EXACTLY at each inner draw.
+                mtm_fwd = inner_mtm[cutoff_idx:]                            # (T_inner, B_outer, B_inner)
+                L_t_inner = mtm_fwd[0].clone()                             # outer-t (shared across draws)
+                L_t1_inner = (mtm_fwd[1] if mtm_fwd.shape[0] >= 2
+                              else mtm_fwd[-1]).clone()                     # outer-t+1 per inner draw
+                result.update(
+                    t=t, cutoff_idx=cutoff_idx, L_T=None,
+                    L_t=L_t_inner, L_t1=L_t1_inner, F_t1=F_t1,
+                    market_t=market_t, market_t1=market_t1)
+                if with_grad:
+                    # Pair each leaf with the market_t column width it occupies — the
+                    # differential-label projection in the differential-ML solver needs
+                    # this to write per-leaf gradients into the right deep-state columns
+                    # without re-deriving factor widths (which would silently drift
+                    # if a process's `reveal_state_at` packing changes).
+                    result['state_t_leaves'] = state_t_leaves
+                    result['state_t_leaf_widths'] = market_t_widths
             finally:
                 # Restore on ANY exit: the fork borrows `shared_mem`, mutating simulation_batch
                 # (B_outer -> B_flat for pricing) and `fillvalue` in place. Without this a
