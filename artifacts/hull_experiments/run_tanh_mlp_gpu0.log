@@ -1,0 +1,76 @@
+config=tanh_mlp  seeds=[1, 2, 3, 4, 5]  cuda=0
+  overrides:
+    Tail_Saturating_Columns = [9, 10]
+    MLP_Train_Steps_Per_Solve = 200
+    MLP_Final_Init_Scale = 0.001
+  out: artifacts/hull_experiments/20260526_004909_tanh_mlp.csv
+
+[1/5] seed=1 starting at 00:49:11
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.672 at t=73 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.538 at t=72 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.419 at t=71 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.564 at t=70 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.682 at t=67 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.650 at t=66 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.610 at t=65 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.541 at t=64 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.481 at t=63 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.451 at t=62 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.438 at t=61 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.451 at t=60 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.548 at t=59 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.527 at t=58 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.483 at t=57 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.540 at t=56 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.514 at t=55 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.613 at t=54 (<0.7) — linear backbone weak
+  V_0 dp=1.1928 mpc=0.0238 hs=0.9840 tb=0.0311 ladder_ok=False  (37.5 min)
+
+[2/5] seed=2 starting at 01:26:41
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.691 at t=73 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.594 at t=72 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.428 at t=71 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.502 at t=70 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.665 at t=58 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.623 at t=57 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.627 at t=56 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.593 at t=55 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.446 at t=54 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.553 at t=53 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.619 at t=52 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.674 at t=48 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.625 at t=47 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.591 at t=46 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.654 at t=45 (<0.7) — linear backbone weak
+  V_0 dp=2.9791 mpc=0.0238 hs=0.9828 tb=0.0256 ladder_ok=False  (38.6 min)
+
+[3/5] seed=3 starting at 02:05:20
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.676 at t=74 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.545 at t=73 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.349 at t=72 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.363 at t=71 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.605 at t=70 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.560 at t=69 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.489 at t=68 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.375 at t=67 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.413 at t=66 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.677 at t=65 (<0.7) — linear backbone weak
+  V_0 dp=-2.2283 mpc=0.0236 hs=0.9872 tb=0.0369 ladder_ok=False  (38.4 min)
+
+[4/5] seed=4 starting at 02:43:45
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.605 at t=71 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.392 at t=70 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.320 at t=69 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.402 at t=68 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.449 at t=67 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.648 at t=66 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.622 at t=31 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.671 at t=30 (<0.7) — linear backbone weak
+  V_0 dp=2.1129 mpc=0.0237 hs=0.9838 tb=0.0225 ladder_ok=False  (38.5 min)
+
+[5/5] seed=5 starting at 03:22:16
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data

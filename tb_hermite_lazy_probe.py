@@ -60,13 +60,15 @@ def run_fixture(batch, inner):
     c = cfg['Calc']['Calculation']
     if world.startswith('golden'):
         batch, inner = 48, 8
-    c.update({'Execution_Mode': 'solve_hedge', 'Batch_Size': batch, 'Inner_Sub_Batch': inner,
+    # Batch_Size IS the measured axis here, so it is preserved and the stream is the shortest
+    c.update({'Execution_Mode': 'solve_hedge', 'Batch_Size': batch, 'Simulation_Batches': 2,
+              'Inner_Sub_Batch': inner,
               'Inner_MC_Enabled': 'Yes', 'Inner_Antithetic': 'Yes', 'Random_Seed': 7})
     c['Hedging_Problem']['Randomize_Initial_State'] = 'Yes'
     c['Hedging_Problem']['Solver'] = {
         'Object': 'DiffSolverV2', 'Training_Action_Grid_Levels_Per_Axis': 9,
         'Training_Action_Chunk_Size': 64, 'DiffV2_Fit_Iters': 60, 'DiffV2_Hidden': 32,
-        'DiffV2_OOS_Frac': 0.5, 'DiffV2_Cost_Aware_Argmax': 'Yes', 'DiffV2_One_Step_Fork': 'Yes',
+        'DiffV2_Cost_Aware_Argmax': 'Yes', 'DiffV2_One_Step_Fork': 'Yes',
         'DiffV2_Per_Column_Grad_Norm': 'Yes', 'T_Min': 114}
     if world.startswith('golden'):
         c['Hedging_Problem']['Solver'].update({

@@ -1,0 +1,66 @@
+Output: artifacts/daily_runs/20260508_080205_sense_expiry_v2
+
+  lr                   0.0003
+  reward_scale         1e-07
+  naked_penalty        5.0
+  expiry_penalty       1.0
+  expiry_threshold_days 4.0
+  entropy_coef         0.0003
+  value_coef           0.1
+  epochs               30
+  ppo_epochs           4
+  minibatch_size       128
+  batch_size           512
+  seed                 42
+  tag                  sense_expiry_v2
+  timestamp            20260508_080205
+
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+/home/vretiel/miniconda3/lib/python3.10/site-packages/torch/nn/modules/transformer.py:385: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+epoch= 0 interval=1d net_pnl=     -287106 reward=-3650336.25 |trade|=32.10 pol_l=-0.0016 val_l=4.53e+02 ent=9.619 t=29.44s
+epoch= 1 interval=1d net_pnl=     -263284 reward=-3434764.50 |trade|=32.09 pol_l=-0.0021 val_l=4.26e+02 ent=9.613 t=43.78s
+epoch= 2 interval=1d net_pnl=     -273289 reward=-3506601.50 |trade|=32.08 pol_l=-0.0032 val_l=3.93e+02 ent=9.605 t=33.64s
+epoch= 3 interval=1d net_pnl=     -246719 reward=-3224304.00 |trade|=32.05 pol_l=-0.0042 val_l=3.67e+02 ent=9.599 t=29.27s
+epoch= 4 interval=1d net_pnl=     -262123 reward=-3440559.25 |trade|=32.06 pol_l=-0.0046 val_l=3.14e+02 ent=9.585 t=29.06s
+epoch= 5 interval=1d net_pnl=     -282568 reward=-3445079.00 |trade|=32.06 pol_l=-0.0059 val_l=3.11e+02 ent=9.580 t=29.48s
+epoch= 6 interval=1d net_pnl=     -267615 reward=-3400935.00 |trade|=32.07 pol_l=-0.0061 val_l=2.63e+02 ent=9.564 t=29.31s
+epoch= 7 interval=1d net_pnl=     -243409 reward=-3127811.75 |trade|=32.07 pol_l=-0.0063 val_l=2.41e+02 ent=9.553 t=31.29s
+epoch= 8 interval=1d net_pnl=     -232061 reward=-3023628.25 |trade|=32.07 pol_l=-0.0078 val_l=2.11e+02 ent=9.542 t=29.37s
+epoch= 9 interval=1d net_pnl=     -233115 reward=-3073957.00 |trade|=32.05 pol_l=-0.0072 val_l=1.94e+02 ent=9.524 t=29.37s
+epoch=10 interval=1d net_pnl=     -237408 reward=-3069979.75 |trade|=32.05 pol_l=-0.0085 val_l=1.77e+02 ent=9.511 t=29.57s
+epoch=11 interval=1d net_pnl=     -208700 reward=-2919958.00 |trade|=32.05 pol_l=-0.0080 val_l=1.60e+02 ent=9.491 t=29.34s
+epoch=12 interval=1d net_pnl=     -225728 reward=-2987341.00 |trade|=32.05 pol_l=-0.0079 val_l=1.40e+02 ent=9.472 t=31.53s
+epoch=13 interval=1d net_pnl=     -236344 reward=-3052989.50 |trade|=32.04 pol_l=-0.0080 val_l=1.34e+02 ent=9.467 t=39.90s
+epoch=14 interval=1d net_pnl=     -232639 reward=-3008109.00 |trade|=32.04 pol_l=-0.0078 val_l=1.19e+02 ent=9.446 t=33.15s
+epoch=15 interval=1d net_pnl=     -211295 reward=-2854372.50 |trade|=32.02 pol_l=-0.0084 val_l=9.69e+01 ent=9.426 t=37.99s
+epoch=16 interval=1d net_pnl=     -232672 reward=-2905175.50 |trade|=32.03 pol_l=-0.0083 val_l=7.66e+01 ent=9.408 t=49.10s
+epoch=17 interval=1d net_pnl=     -231156 reward=-2933343.50 |trade|=32.01 pol_l=-0.0078 val_l=8.01e+01 ent=9.373 t=30.45s
+epoch=18 interval=1d net_pnl=     -214078 reward=-2857059.00 |trade|=32.02 pol_l=-0.0079 val_l=5.91e+01 ent=9.348 t=55.50s
+epoch=19 interval=1d net_pnl=     -218176 reward=-2835170.25 |trade|=32.02 pol_l=-0.0078 val_l=5.28e+01 ent=9.321 t=35.38s
+epoch=20 interval=1d net_pnl=     -203329 reward=-2749615.50 |trade|=32.02 pol_l=-0.0080 val_l=4.62e+01 ent=9.291 t=32.57s
+epoch=21 interval=1d net_pnl=     -179203 reward=-2532988.75 |trade|=32.03 pol_l=-0.0081 val_l=4.74e+01 ent=9.266 t=31.46s
+epoch=22 interval=1d net_pnl=     -199546 reward=-2689073.75 |trade|=32.01 pol_l=-0.0077 val_l=3.57e+01 ent=9.240 t=30.50s
+epoch=23 interval=1d net_pnl=     -200941 reward=-2746841.00 |trade|=31.99 pol_l=-0.0070 val_l=2.63e+01 ent=9.216 t=36.53s
+epoch=24 interval=1d net_pnl=     -199402 reward=-2671338.00 |trade|=31.99 pol_l=-0.0068 val_l=2.59e+01 ent=9.173 t=30.55s
+epoch=25 interval=1d net_pnl=     -182776 reward=-2526838.50 |trade|=31.97 pol_l=-0.0062 val_l=1.72e+01 ent=9.131 t=29.63s
+epoch=26 interval=1d net_pnl=     -173378 reward=-2495108.75 |trade|=31.97 pol_l=-0.0059 val_l=1.56e+01 ent=9.088 t=34.04s
+epoch=27 interval=1d net_pnl=     -193048 reward=-2596936.25 |trade|=31.97 pol_l=-0.0046 val_l=1.28e+01 ent=9.041 t=30.93s
+epoch=28 interval=1d net_pnl=     -190512 reward=-2558210.50 |trade|=31.96 pol_l=-0.0043 val_l=1.23e+01 ent=9.013 t=29.52s
+epoch=29 interval=1d net_pnl=     -169216 reward=-2422202.75 |trade|=31.95 pol_l=-0.0044 val_l=1.01e+01 ent=8.957 t=30.51s
+
+Training done in 16.9 min
+Saved policy: artifacts/daily_runs/20260508_080205_sense_expiry_v2/trained_policy.json
+
+Running ML rollout (deterministic)...
+Running textbook rollout...
+
+Wrote artifacts/daily_runs/20260508_080205_sense_expiry_v2/ml_paths.csv
+Wrote artifacts/daily_runs/20260508_080205_sense_expiry_v2/textbook_paths.csv
+Wrote artifacts/daily_runs/20260508_080205_sense_expiry_v2/summary.csv
+
+============================================================
+  ML policy net_pnl mean:      $     +92,594
+  Textbook    net_pnl mean:    $     -31,054
+  ML beats textbook by:        $    +123,647
+============================================================

@@ -1,0 +1,10 @@
+=== REVAL48 START 2026-07-25T12:04:14+02:00 | riskflow=/home/vretiel/PycharmProjects/riskflow/riskflow/__init__.py ===
+=== HEAD: 8410ae3 docs nav: Developer section before the JSON Configuration refere ===
+=== phase1 lanes launched: gpu0 pid=24706  gpu1 pid=24707 ===
+=== phase1 done 2026-07-26T04:06:22+02:00: gpu0 rc=0 gpu1 rc=0 ===
+=== completed trades: gpu0=24/24 gpu1=24/24 ===
+=== phase2 done 2026-07-26T04:10:30+02:00: b060 rc=0 b015 rc=0 ===
+reval48_final.csv: 48 trades | greedy mean +28.10 std 87.59 min -154.82 | nohedge mean +11.97 | bound-PASS 48/48
+  band 0.15: n=48 greedy mean +17.05 std 30.15 p5 -22.52 cvar5 -39.90 worst -54.73 | bound-PASS 48/48 | breaches 0
+  band 0.60: n=48 greedy mean +24.66 std 62.34 p5 -76.22 cvar5 -86.81 worst -94.14 | bound-PASS 48/48 | breaches 0
+=== REVAL48 COMPLETE 2026-07-26T04:10:30+02:00 ===

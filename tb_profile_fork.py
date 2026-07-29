@@ -101,7 +101,8 @@ def build_cfg(batch, inner, t_min, fit_iters, one_step='Yes', seed=1234,
     cfg = json.load(open(FIXTURE))
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = 'solve_hedge'
-    calc['Batch_Size'] = int(batch)
+    # Batch_Size IS the measured axis here, so it is preserved and the stream is the shortest
+    calc['Batch_Size'], calc['Simulation_Batches'] = int(batch), 2
     calc['Inner_Sub_Batch'] = int(inner)
     calc['Inner_MC_Enabled'] = 'Yes'
     calc['Inner_Antithetic'] = 'Yes'
@@ -115,7 +116,6 @@ def build_cfg(batch, inner, t_min, fit_iters, one_step='Yes', seed=1234,
         'T_Min': int(t_min),
         'DiffV2_Fit_Iters': int(fit_iters),
         'DiffV2_Hidden': 32,
-        'DiffV2_OOS_Frac': 0.5,
         'DiffV2_LR': 0.002,
         'DiffV2_One_Step_Fork': one_step,
     }

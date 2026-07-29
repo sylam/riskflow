@@ -1,0 +1,79 @@
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+/home/vretiel/miniconda3/lib/python3.10/site-packages/torch/nn/modules/transformer.py:385: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+Sweep dir: artifacts/sweeps/20260511_223727_baseline
+Tag: baseline, seeds=(7,), epochs=60
+Overrides: []
+
+[1/1] seed=7 overrides={}
+epoch= 0 interval=1d net_pnl=     -362436 std=   4055659 worst=   -31589624 reward=     -4.00 |trade|=17.02 pol_l=-0.0073 val_l=1.06e+13 ent=10.824 t=16.23s
+  [val] mean=     -779907 std=   1005461 worst=    -4326140 p5=    -2433945 sortino=    -3213853
+epoch= 1 interval=1d net_pnl=     -327987 std=   2762669 worst=   -18418962 reward=     -3.24 |trade|=17.00 pol_l=-0.0081 val_l=4.00e+12 ent=10.794 t=16.03s
+epoch= 2 interval=1d net_pnl=     -315564 std=   1911036 worst=   -14991464 reward=     -2.75 |trade|=17.07 pol_l=-0.0080 val_l=1.50e+12 ent=10.750 t=16.06s
+epoch= 3 interval=1d net_pnl=     -328381 std=   1500410 worst=   -11819308 reward=     -2.48 |trade|=16.79 pol_l=-0.0073 val_l=6.99e+11 ent=10.702 t=16.08s
+epoch= 4 interval=1d net_pnl=     -272050 std=   1180802 worst=    -6882637 reward=     -2.15 |trade|=16.54 pol_l=-0.0058 val_l=3.72e+11 ent=10.643 t=16.09s
+epoch= 5 interval=1d net_pnl=     -288654 std=    998390 worst=    -9156957 reward=     -2.03 |trade|=16.49 pol_l=-0.0049 val_l=2.32e+11 ent=10.575 t=16.16s
+epoch= 6 interval=1d net_pnl=     -278230 std=    885325 worst=    -5415511 reward=     -1.90 |trade|=16.10 pol_l=-0.0037 val_l=1.62e+11 ent=10.523 t=16.18s
+epoch= 7 interval=1d net_pnl=     -283424 std=    848551 worst=    -4475344 reward=     -1.88 |trade|=15.92 pol_l=-0.0029 val_l=1.27e+11 ent=10.463 t=16.24s
+epoch= 8 interval=1d net_pnl=     -298986 std=    784167 worst=    -3768744 reward=     -1.88 |trade|=15.85 pol_l=-0.0031 val_l=1.08e+11 ent=10.418 t=16.35s
+epoch= 9 interval=1d net_pnl=     -293071 std=    728353 worst=    -3426629 reward=     -1.81 |trade|=15.60 pol_l=-0.0027 val_l=8.65e+10 ent=10.350 t=16.38s
+epoch=10 interval=1d net_pnl=     -269476 std=    702169 worst=    -3538846 reward=     -1.72 |trade|=15.14 pol_l=-0.0026 val_l=7.18e+10 ent=10.299 t=16.33s
+  [val] mean=     -136860 std=    275496 worst=    -1214969 p5=     -549173 sortino=     -686033
+epoch=11 interval=1d net_pnl=     -282833 std=    675805 worst=    -3544552 reward=     -1.73 |trade|=14.93 pol_l=-0.0028 val_l=5.91e+10 ent=10.244 t=16.31s
+epoch=12 interval=1d net_pnl=     -269785 std=    652863 worst=    -3106548 reward=     -1.68 |trade|=14.47 pol_l=-0.0020 val_l=4.82e+10 ent=10.190 t=16.34s
+epoch=13 interval=1d net_pnl=     -278580 std=    642606 worst=    -3114727 reward=     -1.69 |trade|=14.39 pol_l=-0.0026 val_l=4.11e+10 ent=10.128 t=16.31s
+epoch=14 interval=1d net_pnl=     -270294 std=    629252 worst=    -2847348 reward=     -1.66 |trade|=14.07 pol_l=-0.0023 val_l=3.39e+10 ent=10.072 t=16.30s
+epoch=15 interval=1d net_pnl=     -268900 std=    615231 worst=    -3154393 reward=     -1.65 |trade|=13.82 pol_l=-0.0020 val_l=2.89e+10 ent=10.015 t=16.36s
+epoch=16 interval=1d net_pnl=     -258314 std=    604979 worst=    -3357200 reward=     -1.60 |trade|=13.51 pol_l=-0.0021 val_l=2.41e+10 ent=9.949 t=16.30s
+epoch=17 interval=1d net_pnl=     -277207 std=    593993 worst=    -2846959 reward=     -1.65 |trade|=13.32 pol_l=-0.0025 val_l=2.04e+10 ent=9.898 t=16.32s
+epoch=18 interval=1d net_pnl=     -264429 std=    584178 worst=    -2341936 reward=     -1.60 |trade|=13.25 pol_l=-0.0022 val_l=1.71e+10 ent=9.838 t=16.27s
+epoch=19 interval=1d net_pnl=     -256087 std=    577042 worst=    -2233631 reward=     -1.57 |trade|=12.89 pol_l=-0.0021 val_l=1.45e+10 ent=9.794 t=16.26s
+epoch=20 interval=1d net_pnl=     -272648 std=    556293 worst=    -2786183 reward=     -1.59 |trade|=12.53 pol_l=-0.0019 val_l=1.22e+10 ent=9.730 t=16.27s
+  [val] mean=     -215097 std=    412815 worst=    -1291230 p5=     -803471 sortino=    -1018568
+epoch=21 interval=1d net_pnl=     -236868 std=    540966 worst=    -2331408 reward=     -1.47 |trade|=12.21 pol_l=-0.0018 val_l=1.02e+10 ent=9.673 t=16.26s
+epoch=22 interval=1d net_pnl=     -262609 std=    529484 worst=    -2101358 reward=     -1.53 |trade|=11.85 pol_l=-0.0021 val_l=8.93e+09 ent=9.638 t=16.26s
+epoch=23 interval=1d net_pnl=     -243242 std=    541330 worst=    -2352028 reward=     -1.49 |trade|=11.66 pol_l=-0.0016 val_l=7.60e+09 ent=9.577 t=16.26s
+epoch=24 interval=1d net_pnl=     -236499 std=    518235 worst=    -2143934 reward=     -1.45 |trade|=11.47 pol_l=-0.0014 val_l=6.74e+09 ent=9.522 t=16.26s
+epoch=25 interval=1d net_pnl=     -226594 std=    515614 worst=    -2211790 reward=     -1.42 |trade|=11.50 pol_l=-0.0016 val_l=6.11e+09 ent=9.465 t=16.26s
+epoch=26 interval=1d net_pnl=     -237331 std=    514925 worst=    -2400393 reward=     -1.44 |trade|=11.40 pol_l=-0.0013 val_l=5.57e+09 ent=9.423 t=16.25s
+epoch=27 interval=1d net_pnl=     -212885 std=    511897 worst=    -2743294 reward=     -1.37 |trade|=11.14 pol_l=-0.0014 val_l=4.98e+09 ent=9.380 t=16.26s
+epoch=28 interval=1d net_pnl=     -205320 std=    503434 worst=    -2086452 reward=     -1.34 |trade|=10.86 pol_l=-0.0014 val_l=4.49e+09 ent=9.336 t=16.26s
+epoch=29 interval=1d net_pnl=     -195284 std=    506604 worst=    -2026394 reward=     -1.31 |trade|=10.46 pol_l=-0.0013 val_l=3.88e+09 ent=9.277 t=16.34s
+epoch=30 interval=1d net_pnl=     -177176 std=    491975 worst=    -2396926 reward=     -1.25 |trade|=10.14 pol_l=-0.0016 val_l=3.40e+09 ent=9.213 t=16.32s
+  [val] mean=     -133736 std=    435557 worst=    -1500976 p5=     -768891 sortino=     -902627
+epoch=31 interval=1d net_pnl=     -180757 std=    483193 worst=    -1865726 reward=     -1.25 |trade|=9.74 pol_l=-0.0013 val_l=3.06e+09 ent=9.171 t=16.27s
+epoch=32 interval=1d net_pnl=     -172484 std=    468959 worst=    -1798052 reward=     -1.21 |trade|=9.51 pol_l=-0.0013 val_l=2.74e+09 ent=9.118 t=16.25s
+epoch=33 interval=1d net_pnl=     -160695 std=    475112 worst=    -1908166 reward=     -1.18 |trade|=9.23 pol_l=-0.0013 val_l=2.43e+09 ent=9.064 t=16.26s
+epoch=34 interval=1d net_pnl=     -152741 std=    471506 worst=    -2207423 reward=     -1.15 |trade|=8.90 pol_l=-0.0009 val_l=2.13e+09 ent=9.013 t=16.28s
+epoch=35 interval=1d net_pnl=     -154796 std=    467466 worst=    -1916890 reward=     -1.15 |trade|=8.71 pol_l=-0.0015 val_l=1.89e+09 ent=8.962 t=16.27s
+epoch=36 interval=1d net_pnl=     -146971 std=    463640 worst=    -1809575 reward=     -1.13 |trade|=8.48 pol_l=-0.0011 val_l=1.67e+09 ent=8.906 t=16.27s
+epoch=37 interval=1d net_pnl=     -138100 std=    471525 worst=    -1952730 reward=     -1.11 |trade|=8.53 pol_l=-0.0013 val_l=1.46e+09 ent=8.830 t=16.25s
+epoch=38 interval=1d net_pnl=     -137356 std=    459573 worst=    -2252660 reward=     -1.09 |trade|=8.30 pol_l=-0.0013 val_l=1.27e+09 ent=8.760 t=16.25s
+epoch=39 interval=1d net_pnl=     -133002 std=    453133 worst=    -1675346 reward=     -1.07 |trade|=8.09 pol_l=-0.0013 val_l=1.13e+09 ent=8.699 t=16.26s
+epoch=40 interval=1d net_pnl=     -124881 std=    453787 worst=    -1886003 reward=     -1.05 |trade|=7.78 pol_l=-0.0016 val_l=9.66e+08 ent=8.591 t=16.27s
+  [val] mean=       -3357 std=    557664 worst=    -1515292 p5=     -830155 sortino=     -833512
+epoch=41 interval=1d net_pnl=     -131967 std=    461321 worst=    -1895908 reward=     -1.08 |trade|=7.80 pol_l=-0.0011 val_l=8.52e+08 ent=8.530 t=16.30s
+epoch=42 interval=1d net_pnl=     -113380 std=    451929 worst=    -1677663 reward=     -1.02 |trade|=7.50 pol_l=-0.0016 val_l=7.24e+08 ent=8.444 t=16.26s
+epoch=43 interval=1d net_pnl=     -107095 std=    455251 worst=    -1984322 reward=     -1.01 |trade|=7.18 pol_l=-0.0018 val_l=6.30e+08 ent=8.392 t=16.26s
+epoch=44 interval=1d net_pnl=      -98828 std=    456823 worst=    -1636727 reward=     -0.99 |trade|=6.95 pol_l=-0.0016 val_l=5.49e+08 ent=8.334 t=16.27s
+epoch=45 interval=1d net_pnl=      -94332 std=    446162 worst=    -1600465 reward=     -0.96 |trade|=6.81 pol_l=-0.0019 val_l=4.72e+08 ent=8.249 t=16.27s
+epoch=46 interval=1d net_pnl=      -85786 std=    448194 worst=    -1689852 reward=     -0.94 |trade|=6.66 pol_l=-0.0015 val_l=4.11e+08 ent=8.185 t=16.28s
+epoch=47 interval=1d net_pnl=      -83116 std=    446733 worst=    -1571573 reward=     -0.93 |trade|=6.55 pol_l=-0.0019 val_l=3.60e+08 ent=8.114 t=16.28s
+epoch=48 interval=1d net_pnl=      -76686 std=    449142 worst=    -1839150 reward=     -0.91 |trade|=6.32 pol_l=-0.0015 val_l=3.06e+08 ent=8.049 t=16.28s
+epoch=49 interval=1d net_pnl=      -77663 std=    449086 worst=    -2346604 reward=     -0.92 |trade|=6.26 pol_l=-0.0019 val_l=2.69e+08 ent=7.984 t=16.27s
+epoch=50 interval=1d net_pnl=      -72065 std=    435916 worst=    -1701738 reward=     -0.89 |trade|=6.06 pol_l=-0.0020 val_l=2.27e+08 ent=7.919 t=16.27s
+  [val] mean=      +24966 std=    555006 worst=    -1544196 p5=     -792718 sortino=     -767752
+epoch=51 interval=1d net_pnl=      -71027 std=    438193 worst=    -1692762 reward=     -0.89 |trade|=5.94 pol_l=-0.0022 val_l=1.93e+08 ent=7.838 t=16.28s
+epoch=52 interval=1d net_pnl=      -64886 std=    433298 worst=    -1492650 reward=     -0.87 |trade|=5.79 pol_l=-0.0020 val_l=1.62e+08 ent=7.754 t=16.28s
+epoch=53 interval=1d net_pnl=      -55687 std=    439665 worst=    -1887121 reward=     -0.85 |trade|=5.58 pol_l=-0.0020 val_l=1.33e+08 ent=7.673 t=16.26s
+epoch=54 interval=1d net_pnl=      -57358 std=    432303 worst=    -1524956 reward=     -0.84 |trade|=5.43 pol_l=-0.0019 val_l=1.09e+08 ent=7.586 t=16.25s
+epoch=55 interval=1d net_pnl=      -52129 std=    443668 worst=    -1600366 reward=     -0.84 |trade|=5.28 pol_l=-0.0018 val_l=8.82e+07 ent=7.514 t=16.26s
+epoch=56 interval=1d net_pnl=      -44701 std=    440287 worst=    -1741810 reward=     -0.82 |trade|=5.11 pol_l=-0.0003 val_l=7.15e+07 ent=7.468 t=16.28s
+epoch=57 interval=1d net_pnl=      -44761 std=    436264 worst=    -1620870 reward=     -0.81 |trade|=5.08 pol_l=-0.0001 val_l=6.73e+07 ent=7.446 t=16.26s
+epoch=58 interval=1d net_pnl=      -49101 std=    441178 worst=    -1518142 reward=     -0.84 |trade|=5.06 pol_l=-0.0001 val_l=6.45e+07 ent=7.435 t=16.26s
+epoch=59 interval=1d net_pnl=      -41084 std=    436260 worst=    -1366096 reward=     -0.81 |trade|=5.04 pol_l=-0.0002 val_l=6.20e+07 ent=7.420 t=16.28s
+  [val] mean=     +112280 std=    603178 worst=    -1716058 p5=     -762452 sortino=     -650172
+  → mean=$+112,280  p5=$-762,452  sortino=$-650,172  max_total=1  min_per_inst=+0  (17.1 min)
+
+==============================================================================
+Sweep complete. CSV: artifacts/sweeps/20260511_223727_baseline/sweep.csv

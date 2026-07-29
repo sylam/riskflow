@@ -1,0 +1,2 @@
+mean_pnl,worst_pnl,p5_pnl,sortino_metric,no_trade_worst,no_trade_mean,mean_delta_vs_no_trade,worst_delta_vs_no_trade,max_per_inst_pos,min_per_inst_pos,max_total_abs_pos,frac_post_settle,row_tag,row_name,seed,epochs,overrides,elapsed_min
+24025.51953125,-1609056.5,-700800.56875,-676775.04921875,-1925075.75,106156.734375,-82131.21484375,316019.25,1.0,-8.0,18.0,1.0,d5_e3_p2_seed123,d5_e3_p2,123,100,optimizer.Dense_Tracking_Reward_Scale=5.0;optimizer.Entropy_Coef=0.003;objective.Power=2.0,6.491985905150068

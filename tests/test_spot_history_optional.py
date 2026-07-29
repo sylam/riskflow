@@ -26,7 +26,7 @@ def _cfg_without_history():
     cfg = jsonlib.load(open(FIXTURE))
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = 'solve_hedge'
-    calc['Batch_Size'] = 48
+    calc['Batch_Size'], calc['Simulation_Batches'] = 24, 2
     calc['Inner_Sub_Batch'] = 8
     calc['Inner_MC_Enabled'] = 'Yes'
     calc['Random_Seed'] = 1234
@@ -39,7 +39,6 @@ def _cfg_without_history():
         'Training_Action_Chunk_Size': 64,
         'T_Min': 100,
         'DiffV2_Fit_Iters': 5,
-        'DiffV2_OOS_Frac': 0.5,
     }
     return cfg
 

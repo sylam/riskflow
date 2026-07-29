@@ -1,0 +1,181 @@
+Phase 3: 2 configs × 80 epochs    batch=512
+  locked: lr=3e-04    reward_scale=1e-07    naked_penalty=5.0
+
+
+[1/2] winner_replay: entropy_coef=3e-04
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+/home/vretiel/miniconda3/lib/python3.10/site-packages/torch/nn/modules/transformer.py:385: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  warnings.warn(
+epoch= 0 interval=1d net_pnl=     -287106 reward=-3650336.25 |trade|=32.10 pol_l=-0.0017 val_l=2.34e-01 ent=9.619 t=31.39s
+epoch= 1 interval=1d net_pnl=     -247762 reward=-3343827.25 |trade|=32.09 pol_l=-0.0024 val_l=2.04e-01 ent=9.617 t=54.55s
+epoch= 2 interval=1d net_pnl=     -301233 reward=-3724434.50 |trade|=32.11 pol_l=-0.0026 val_l=2.39e-01 ent=9.614 t=29.04s
+epoch= 3 interval=1d net_pnl=     -236803 reward=-3250951.50 |trade|=32.10 pol_l=-0.0033 val_l=2.11e-01 ent=9.610 t=33.65s
+epoch= 4 interval=1d net_pnl=     -217479 reward=-3286058.50 |trade|=32.11 pol_l=-0.0045 val_l=2.24e-01 ent=9.604 t=56.52s
+epoch= 5 interval=1d net_pnl=     -261116 reward=-3352899.50 |trade|=32.14 pol_l=-0.0052 val_l=2.38e-01 ent=9.597 t=31.23s
+epoch= 6 interval=1d net_pnl=     -218514 reward=-3094197.00 |trade|=32.12 pol_l=-0.0064 val_l=1.99e-01 ent=9.590 t=33.15s
+epoch= 7 interval=1d net_pnl=     -181603 reward=-2803709.00 |trade|=32.13 pol_l=-0.0068 val_l=1.72e-01 ent=9.580 t=56.31s
+epoch= 8 interval=1d net_pnl=     -161755 reward=-2676413.50 |trade|=32.13 pol_l=-0.0069 val_l=1.77e-01 ent=9.575 t=29.23s
+epoch= 9 interval=1d net_pnl=     -169136 reward=-2750868.50 |trade|=32.13 pol_l=-0.0080 val_l=1.83e-01 ent=9.571 t=31.16s
+epoch=10 interval=1d net_pnl=     -150976 reward=-2578475.50 |trade|=32.12 pol_l=-0.0075 val_l=1.71e-01 ent=9.567 t=30.85s
+epoch=11 interval=1d net_pnl=     -104041 reward=-2343706.00 |trade|=32.12 pol_l=-0.0081 val_l=1.76e-01 ent=9.557 t=30.04s
+epoch=12 interval=1d net_pnl=     -110012 reward=-2332297.75 |trade|=32.12 pol_l=-0.0084 val_l=1.63e-01 ent=9.542 t=30.15s
+epoch=13 interval=1d net_pnl=     -114549 reward=-2313551.50 |trade|=32.11 pol_l=-0.0077 val_l=1.58e-01 ent=9.535 t=30.10s
+epoch=14 interval=1d net_pnl=      -97412 reward=-2364087.00 |trade|=32.13 pol_l=-0.0086 val_l=1.67e-01 ent=9.520 t=30.19s
+epoch=15 interval=1d net_pnl=      -66287 reward=-2053286.25 |trade|=32.11 pol_l=-0.0083 val_l=1.45e-01 ent=9.509 t=30.13s
+epoch=16 interval=1d net_pnl=      -60940 reward=-1960924.38 |trade|=32.13 pol_l=-0.0087 val_l=1.35e-01 ent=9.498 t=30.10s
+epoch=17 interval=1d net_pnl=      -46147 reward=-1928610.25 |trade|=32.13 pol_l=-0.0088 val_l=1.50e-01 ent=9.483 t=30.07s
+epoch=18 interval=1d net_pnl=      -33632 reward=-1857281.38 |trade|=32.11 pol_l=-0.0095 val_l=1.23e-01 ent=9.481 t=29.90s
+epoch=19 interval=1d net_pnl=      -10305 reward=-1714835.88 |trade|=32.14 pol_l=-0.0096 val_l=1.29e-01 ent=9.470 t=31.98s
+epoch=20 interval=1d net_pnl=        -893 reward=-1611811.00 |trade|=32.12 pol_l=-0.0092 val_l=1.18e-01 ent=9.463 t=31.29s
+epoch=21 interval=1d net_pnl=       -9413 reward=-1665321.75 |trade|=32.11 pol_l=-0.0096 val_l=1.22e-01 ent=9.459 t=30.60s
+epoch=22 interval=1d net_pnl=       +5568 reward=-1547754.12 |trade|=32.11 pol_l=-0.0102 val_l=1.18e-01 ent=9.442 t=30.21s
+epoch=23 interval=1d net_pnl=      +27645 reward=-1477054.50 |trade|=32.11 pol_l=-0.0093 val_l=1.29e-01 ent=9.427 t=30.33s
+epoch=24 interval=1d net_pnl=      +46076 reward=-1433918.50 |trade|=32.11 pol_l=-0.0099 val_l=1.14e-01 ent=9.420 t=40.66s
+epoch=25 interval=1d net_pnl=      +58579 reward=-1296290.62 |trade|=32.11 pol_l=-0.0095 val_l=9.91e-02 ent=9.416 t=29.77s
+epoch=26 interval=1d net_pnl=      +46381 reward=-1399681.88 |trade|=32.11 pol_l=-0.0104 val_l=1.00e-01 ent=9.417 t=29.85s
+epoch=27 interval=1d net_pnl=      +79363 reward=-1162236.00 |trade|=32.10 pol_l=-0.0100 val_l=8.81e-02 ent=9.406 t=30.00s
+epoch=28 interval=1d net_pnl=      +66226 reward=-1326676.50 |trade|=32.11 pol_l=-0.0095 val_l=1.07e-01 ent=9.387 t=31.52s
+epoch=29 interval=1d net_pnl=      +94244 reward=-1168131.50 |trade|=32.09 pol_l=-0.0106 val_l=8.94e-02 ent=9.371 t=29.28s
+epoch=30 interval=1d net_pnl=     +108723 reward=-1154037.25 |trade|=32.10 pol_l=-0.0101 val_l=1.05e-01 ent=9.356 t=29.58s
+epoch=31 interval=1d net_pnl=     +121602 reward=-1077246.50 |trade|=32.11 pol_l=-0.0103 val_l=9.88e-02 ent=9.338 t=29.12s
+epoch=32 interval=1d net_pnl=     +129767 reward=-1000349.31 |trade|=32.09 pol_l=-0.0108 val_l=9.25e-02 ent=9.334 t=29.87s
+epoch=33 interval=1d net_pnl=     +137875 reward=-1027573.62 |trade|=32.09 pol_l=-0.0104 val_l=9.10e-02 ent=9.321 t=30.47s
+epoch=34 interval=1d net_pnl=     +126210 reward=-1101286.62 |trade|=32.06 pol_l=-0.0113 val_l=9.23e-02 ent=9.318 t=29.29s
+epoch=35 interval=1d net_pnl=     +131593 reward=-1030967.88 |trade|=32.06 pol_l=-0.0113 val_l=8.58e-02 ent=9.316 t=30.50s
+epoch=36 interval=1d net_pnl=     +142091 reward=-1052753.75 |trade|=32.08 pol_l=-0.0107 val_l=9.97e-02 ent=9.320 t=29.67s
+epoch=37 interval=1d net_pnl=     +161056 reward=-1018441.44 |trade|=32.09 pol_l=-0.0115 val_l=1.03e-01 ent=9.312 t=30.17s
+epoch=38 interval=1d net_pnl=     +161618 reward=-889338.19 |trade|=32.08 pol_l=-0.0114 val_l=8.82e-02 ent=9.299 t=29.84s
+epoch=39 interval=1d net_pnl=     +175883 reward=-941474.06 |trade|=32.09 pol_l=-0.0117 val_l=8.78e-02 ent=9.286 t=34.12s
+epoch=40 interval=1d net_pnl=     +203633 reward=-753056.50 |trade|=32.08 pol_l=-0.0114 val_l=8.58e-02 ent=9.273 t=35.89s
+epoch=41 interval=1d net_pnl=     +200480 reward=-799949.25 |trade|=32.10 pol_l=-0.0117 val_l=9.01e-02 ent=9.244 t=29.14s
+epoch=42 interval=1d net_pnl=     +202155 reward=-766548.19 |trade|=32.10 pol_l=-0.0126 val_l=7.96e-02 ent=9.226 t=33.07s
+epoch=43 interval=1d net_pnl=     +220256 reward=-721110.06 |trade|=32.09 pol_l=-0.0115 val_l=7.55e-02 ent=9.217 t=31.91s
+epoch=44 interval=1d net_pnl=     +235445 reward=-602634.12 |trade|=32.11 pol_l=-0.0118 val_l=6.26e-02 ent=9.199 t=33.22s
+epoch=45 interval=1d net_pnl=     +254774 reward=-491022.91 |trade|=32.11 pol_l=-0.0118 val_l=5.72e-02 ent=9.175 t=29.32s
+epoch=46 interval=1d net_pnl=     +271225 reward=-587313.69 |trade|=32.12 pol_l=-0.0119 val_l=8.01e-02 ent=9.156 t=29.55s
+epoch=47 interval=1d net_pnl=     +277636 reward=-423088.50 |trade|=32.09 pol_l=-0.0122 val_l=5.16e-02 ent=9.133 t=36.25s
+epoch=48 interval=1d net_pnl=     +300509 reward=-497226.00 |trade|=32.11 pol_l=-0.0125 val_l=6.61e-02 ent=9.130 t=33.95s
+epoch=49 interval=1d net_pnl=     +298150 reward=-345279.38 |trade|=32.10 pol_l=-0.0125 val_l=5.14e-02 ent=9.118 t=32.43s
+epoch=50 interval=1d net_pnl=     +323233 reward=-333370.69 |trade|=32.08 pol_l=-0.0129 val_l=6.16e-02 ent=9.104 t=29.25s
+epoch=51 interval=1d net_pnl=     +305054 reward=-415293.72 |trade|=32.09 pol_l=-0.0125 val_l=5.75e-02 ent=9.090 t=31.35s
+epoch=52 interval=1d net_pnl=     +317723 reward=-348047.16 |trade|=32.07 pol_l=-0.0130 val_l=5.25e-02 ent=9.067 t=29.27s
+epoch=53 interval=1d net_pnl=     +334892 reward=-376364.25 |trade|=32.08 pol_l=-0.0130 val_l=5.66e-02 ent=9.050 t=29.34s
+epoch=54 interval=1d net_pnl=     +360262 reward=-121372.84 |trade|=32.08 pol_l=-0.0118 val_l=3.74e-02 ent=9.035 t=29.71s
+epoch=55 interval=1d net_pnl=     +369937 reward=-226920.81 |trade|=32.06 pol_l=-0.0127 val_l=4.84e-02 ent=9.009 t=31.56s
+epoch=56 interval=1d net_pnl=     +386434 reward=-164517.84 |trade|=32.09 pol_l=-0.0122 val_l=5.54e-02 ent=9.006 t=29.24s
+epoch=57 interval=1d net_pnl=     +405013 reward= -39148.27 |trade|=32.10 pol_l=-0.0123 val_l=3.75e-02 ent=8.984 t=37.66s
+epoch=58 interval=1d net_pnl=     +424056 reward= -52167.18 |trade|=32.09 pol_l=-0.0121 val_l=4.26e-02 ent=8.966 t=31.25s
+epoch=59 interval=1d net_pnl=     +424390 reward= +16815.98 |trade|=32.10 pol_l=-0.0112 val_l=3.86e-02 ent=8.944 t=36.59s
+epoch=60 interval=1d net_pnl=     +410696 reward= -39981.03 |trade|=32.09 pol_l=-0.0122 val_l=3.87e-02 ent=8.934 t=29.15s
+epoch=61 interval=1d net_pnl=     +433350 reward=  +8032.05 |trade|=32.10 pol_l=-0.0116 val_l=3.82e-02 ent=8.925 t=31.20s
+epoch=62 interval=1d net_pnl=     +428874 reward= -16091.87 |trade|=32.12 pol_l=-0.0114 val_l=3.77e-02 ent=8.896 t=30.66s
+epoch=63 interval=1d net_pnl=     +449609 reward= +71165.21 |trade|=32.11 pol_l=-0.0109 val_l=3.52e-02 ent=8.893 t=29.37s
+epoch=64 interval=1d net_pnl=     +442331 reward= +21294.86 |trade|=32.09 pol_l=-0.0116 val_l=3.98e-02 ent=8.874 t=32.85s
+epoch=65 interval=1d net_pnl=     +469492 reward=+138862.52 |trade|=32.10 pol_l=-0.0105 val_l=2.89e-02 ent=8.861 t=29.27s
+epoch=66 interval=1d net_pnl=     +482466 reward=+103546.88 |trade|=32.09 pol_l=-0.0107 val_l=2.83e-02 ent=8.847 t=42.86s
+epoch=67 interval=1d net_pnl=     +491543 reward=+171498.06 |trade|=32.11 pol_l=-0.0101 val_l=2.53e-02 ent=8.835 t=30.47s
+epoch=68 interval=1d net_pnl=     +504004 reward=+132680.33 |trade|=32.11 pol_l=-0.0092 val_l=3.07e-02 ent=8.822 t=30.29s
+epoch=69 interval=1d net_pnl=     +511152 reward=+169386.12 |trade|=32.12 pol_l=-0.0092 val_l=3.30e-02 ent=8.807 t=30.26s
+epoch=70 interval=1d net_pnl=     +511623 reward=+157187.73 |trade|=32.11 pol_l=-0.0092 val_l=3.02e-02 ent=8.793 t=40.03s
+epoch=71 interval=1d net_pnl=     +510015 reward=+166691.83 |trade|=32.12 pol_l=-0.0080 val_l=3.32e-02 ent=8.795 t=29.12s
+epoch=72 interval=1d net_pnl=     +530268 reward=+204329.59 |trade|=32.12 pol_l=-0.0092 val_l=3.27e-02 ent=8.782 t=33.07s
+epoch=73 interval=1d net_pnl=     +539100 reward=+219802.66 |trade|=32.13 pol_l=-0.0074 val_l=2.85e-02 ent=8.773 t=33.84s
+epoch=74 interval=1d net_pnl=     +546718 reward=+216064.39 |trade|=32.11 pol_l=-0.0075 val_l=2.95e-02 ent=8.768 t=29.64s
+epoch=75 interval=1d net_pnl=     +560593 reward=+311955.62 |trade|=32.13 pol_l=-0.0068 val_l=2.51e-02 ent=8.755 t=29.91s
+epoch=76 interval=1d net_pnl=     +552981 reward=+276963.94 |trade|=32.10 pol_l=-0.0066 val_l=3.00e-02 ent=8.738 t=32.07s
+epoch=77 interval=1d net_pnl=     +555772 reward=+219757.16 |trade|=32.11 pol_l=-0.0067 val_l=2.92e-02 ent=8.728 t=42.62s
+epoch=78 interval=1d net_pnl=     +550722 reward=+189404.28 |trade|=32.10 pol_l=-0.0066 val_l=3.16e-02 ent=8.715 t=29.96s
+epoch=79 interval=1d net_pnl=     +590390 reward=+345825.59 |trade|=32.11 pol_l=-0.0056 val_l=2.11e-02 ent=8.705 t=38.97s
+  → final=$    +590,390    best=$    +590,390 (ep 79)    ent=8.70    |trade|=32.1    (43.6 min)
+
+[2/2] tighter_exploration: entropy_coef=1e-04
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+epoch= 0 interval=1d net_pnl=     -287106 reward=-3650336.25 |trade|=32.10 pol_l=-0.0017 val_l=2.34e-01 ent=9.619 t=44.79s
+epoch= 1 interval=1d net_pnl=     -242359 reward=-3295710.50 |trade|=32.10 pol_l=-0.0025 val_l=1.99e-01 ent=9.617 t=31.41s
+epoch= 2 interval=1d net_pnl=     -278620 reward=-3526420.25 |trade|=32.12 pol_l=-0.0027 val_l=2.21e-01 ent=9.613 t=29.10s
+epoch= 3 interval=1d net_pnl=     -262412 reward=-3487616.00 |trade|=32.10 pol_l=-0.0036 val_l=2.33e-01 ent=9.608 t=30.43s
+epoch= 4 interval=1d net_pnl=     -220393 reward=-3186900.25 |trade|=32.10 pol_l=-0.0044 val_l=2.20e-01 ent=9.605 t=29.91s
+epoch= 5 interval=1d net_pnl=     -279790 reward=-3513946.50 |trade|=32.12 pol_l=-0.0051 val_l=2.33e-01 ent=9.600 t=55.97s
+epoch= 6 interval=1d net_pnl=     -239459 reward=-3191017.75 |trade|=32.10 pol_l=-0.0053 val_l=2.14e-01 ent=9.593 t=29.37s
+epoch= 7 interval=1d net_pnl=     -188851 reward=-2870256.50 |trade|=32.09 pol_l=-0.0056 val_l=1.84e-01 ent=9.588 t=34.23s
+epoch= 8 interval=1d net_pnl=     -183183 reward=-2833079.50 |trade|=32.10 pol_l=-0.0066 val_l=1.91e-01 ent=9.586 t=29.22s
+epoch= 9 interval=1d net_pnl=     -167515 reward=-2723902.75 |trade|=32.10 pol_l=-0.0068 val_l=1.71e-01 ent=9.578 t=35.59s
+epoch=10 interval=1d net_pnl=     -185020 reward=-2748608.75 |trade|=32.08 pol_l=-0.0073 val_l=1.90e-01 ent=9.573 t=39.63s
+epoch=11 interval=1d net_pnl=     -145778 reward=-2627256.75 |trade|=32.07 pol_l=-0.0070 val_l=1.90e-01 ent=9.563 t=29.87s
+epoch=12 interval=1d net_pnl=     -120042 reward=-2355429.00 |trade|=32.06 pol_l=-0.0073 val_l=1.59e-01 ent=9.555 t=29.09s
+epoch=13 interval=1d net_pnl=     -128385 reward=-2482505.25 |trade|=32.05 pol_l=-0.0071 val_l=1.65e-01 ent=9.542 t=35.72s
+epoch=14 interval=1d net_pnl=     -129925 reward=-2487067.75 |trade|=32.03 pol_l=-0.0079 val_l=1.60e-01 ent=9.533 t=33.02s
+epoch=15 interval=1d net_pnl=     -105110 reward=-2261877.25 |trade|=32.02 pol_l=-0.0082 val_l=1.52e-01 ent=9.519 t=34.15s
+epoch=16 interval=1d net_pnl=      -88248 reward=-2098584.00 |trade|=32.01 pol_l=-0.0085 val_l=1.44e-01 ent=9.501 t=29.26s
+epoch=17 interval=1d net_pnl=     -103235 reward=-2208853.00 |trade|=32.01 pol_l=-0.0077 val_l=1.65e-01 ent=9.497 t=29.70s
+epoch=18 interval=1d net_pnl=     -101877 reward=-2245712.25 |trade|=32.02 pol_l=-0.0085 val_l=1.67e-01 ent=9.494 t=29.69s
+epoch=19 interval=1d net_pnl=      -61269 reward=-1990433.00 |trade|=32.03 pol_l=-0.0086 val_l=1.42e-01 ent=9.489 t=29.56s
+epoch=20 interval=1d net_pnl=      -59773 reward=-2083711.50 |trade|=32.03 pol_l=-0.0083 val_l=1.51e-01 ent=9.477 t=30.16s
+epoch=21 interval=1d net_pnl=      -49463 reward=-1937270.88 |trade|=32.03 pol_l=-0.0090 val_l=1.35e-01 ent=9.477 t=33.85s
+epoch=22 interval=1d net_pnl=      -44157 reward=-1910861.88 |trade|=32.04 pol_l=-0.0090 val_l=1.36e-01 ent=9.468 t=33.42s
+epoch=23 interval=1d net_pnl=      -25122 reward=-1843025.62 |trade|=32.04 pol_l=-0.0094 val_l=1.39e-01 ent=9.462 t=29.26s
+epoch=24 interval=1d net_pnl=      -19497 reward=-1741611.88 |trade|=32.05 pol_l=-0.0097 val_l=1.31e-01 ent=9.457 t=34.84s
+epoch=25 interval=1d net_pnl=      -18336 reward=-1747581.62 |trade|=32.06 pol_l=-0.0093 val_l=1.31e-01 ent=9.454 t=31.04s
+epoch=26 interval=1d net_pnl=      -22054 reward=-1824655.38 |trade|=32.07 pol_l=-0.0092 val_l=1.37e-01 ent=9.444 t=45.73s
+epoch=27 interval=1d net_pnl=       +7906 reward=-1606094.75 |trade|=32.07 pol_l=-0.0102 val_l=1.01e-01 ent=9.433 t=30.57s
+epoch=28 interval=1d net_pnl=       +5305 reward=-1609648.25 |trade|=32.05 pol_l=-0.0094 val_l=1.15e-01 ent=9.429 t=34.78s
+epoch=29 interval=1d net_pnl=       -8613 reward=-1754147.50 |trade|=32.05 pol_l=-0.0097 val_l=1.19e-01 ent=9.413 t=31.30s
+epoch=30 interval=1d net_pnl=      +21011 reward=-1554471.50 |trade|=32.07 pol_l=-0.0101 val_l=1.14e-01 ent=9.407 t=35.08s
+epoch=31 interval=1d net_pnl=      +53468 reward=-1415449.38 |trade|=32.06 pol_l=-0.0105 val_l=1.16e-01 ent=9.399 t=38.83s
+epoch=32 interval=1d net_pnl=      +38643 reward=-1502165.12 |trade|=32.06 pol_l=-0.0103 val_l=1.11e-01 ent=9.395 t=36.06s
+epoch=33 interval=1d net_pnl=      +18804 reward=-1577890.88 |trade|=32.06 pol_l=-0.0102 val_l=1.28e-01 ent=9.389 t=32.61s
+epoch=34 interval=1d net_pnl=      +76617 reward=-1326322.50 |trade|=32.05 pol_l=-0.0109 val_l=1.15e-01 ent=9.382 t=31.32s
+epoch=35 interval=1d net_pnl=      +74788 reward=-1294124.38 |trade|=32.04 pol_l=-0.0109 val_l=9.80e-02 ent=9.371 t=30.88s
+epoch=36 interval=1d net_pnl=     +103462 reward=-1215668.25 |trade|=32.05 pol_l=-0.0111 val_l=9.51e-02 ent=9.360 t=30.06s
+epoch=37 interval=1d net_pnl=     +106658 reward=-1113095.25 |trade|=32.06 pol_l=-0.0109 val_l=9.49e-02 ent=9.361 t=29.81s
+epoch=38 interval=1d net_pnl=      +77508 reward=-1185277.75 |trade|=32.05 pol_l=-0.0115 val_l=9.05e-02 ent=9.355 t=30.17s
+epoch=39 interval=1d net_pnl=     +121741 reward=-1098740.50 |trade|=32.03 pol_l=-0.0114 val_l=8.90e-02 ent=9.341 t=30.31s
+epoch=40 interval=1d net_pnl=     +117048 reward=-1080086.25 |trade|=32.02 pol_l=-0.0114 val_l=8.80e-02 ent=9.327 t=29.45s
+epoch=41 interval=1d net_pnl=     +123413 reward=-1042235.12 |trade|=32.04 pol_l=-0.0109 val_l=8.01e-02 ent=9.316 t=30.66s
+epoch=42 interval=1d net_pnl=     +128787 reward=-1013434.06 |trade|=32.04 pol_l=-0.0114 val_l=8.57e-02 ent=9.294 t=37.76s
+epoch=43 interval=1d net_pnl=     +141050 reward=-892049.75 |trade|=32.05 pol_l=-0.0117 val_l=7.72e-02 ent=9.285 t=29.88s
+epoch=44 interval=1d net_pnl=     +166321 reward=-837640.00 |trade|=32.06 pol_l=-0.0114 val_l=7.65e-02 ent=9.274 t=33.80s
+epoch=45 interval=1d net_pnl=     +148454 reward=-886741.25 |trade|=32.05 pol_l=-0.0113 val_l=8.29e-02 ent=9.259 t=31.96s
+epoch=46 interval=1d net_pnl=     +193574 reward=-795659.75 |trade|=32.06 pol_l=-0.0124 val_l=7.78e-02 ent=9.246 t=30.87s
+epoch=47 interval=1d net_pnl=     +175562 reward=-837477.31 |trade|=32.03 pol_l=-0.0121 val_l=7.75e-02 ent=9.244 t=30.30s
+epoch=48 interval=1d net_pnl=     +145267 reward=-1001574.50 |trade|=32.04 pol_l=-0.0127 val_l=8.68e-02 ent=9.227 t=30.47s
+epoch=49 interval=1d net_pnl=     +216970 reward=-672550.62 |trade|=32.03 pol_l=-0.0121 val_l=6.64e-02 ent=9.214 t=29.99s
+epoch=50 interval=1d net_pnl=     +200124 reward=-751260.62 |trade|=32.04 pol_l=-0.0122 val_l=7.80e-02 ent=9.208 t=30.03s
+epoch=51 interval=1d net_pnl=     +183628 reward=-785909.25 |trade|=32.02 pol_l=-0.0114 val_l=7.12e-02 ent=9.181 t=29.88s
+epoch=52 interval=1d net_pnl=     +202106 reward=-759322.62 |trade|=32.04 pol_l=-0.0130 val_l=7.39e-02 ent=9.175 t=30.30s
+epoch=53 interval=1d net_pnl=     +205637 reward=-766451.62 |trade|=32.03 pol_l=-0.0121 val_l=7.24e-02 ent=9.163 t=30.28s
+epoch=54 interval=1d net_pnl=     +241584 reward=-627023.56 |trade|=32.05 pol_l=-0.0118 val_l=6.91e-02 ent=9.153 t=29.20s
+epoch=55 interval=1d net_pnl=     +230240 reward=-671478.88 |trade|=32.04 pol_l=-0.0119 val_l=7.26e-02 ent=9.136 t=30.20s
+epoch=56 interval=1d net_pnl=     +260801 reward=-504894.62 |trade|=32.04 pol_l=-0.0123 val_l=5.86e-02 ent=9.127 t=32.77s
+epoch=57 interval=1d net_pnl=     +262762 reward=-444625.25 |trade|=32.04 pol_l=-0.0113 val_l=6.16e-02 ent=9.110 t=31.13s
+epoch=58 interval=1d net_pnl=     +270542 reward=-461276.56 |trade|=32.06 pol_l=-0.0113 val_l=5.36e-02 ent=9.101 t=35.44s
+epoch=59 interval=1d net_pnl=     +286069 reward=-352074.22 |trade|=32.06 pol_l=-0.0120 val_l=4.87e-02 ent=9.085 t=29.47s
+epoch=60 interval=1d net_pnl=     +293233 reward=-343784.09 |trade|=32.06 pol_l=-0.0112 val_l=5.12e-02 ent=9.075 t=33.26s
+epoch=61 interval=1d net_pnl=     +291719 reward=-425247.75 |trade|=32.06 pol_l=-0.0112 val_l=5.58e-02 ent=9.050 t=30.48s
+epoch=62 interval=1d net_pnl=     +306034 reward=-337319.47 |trade|=32.07 pol_l=-0.0110 val_l=5.08e-02 ent=9.041 t=37.13s
+epoch=63 interval=1d net_pnl=     +297045 reward=-318233.56 |trade|=32.05 pol_l=-0.0113 val_l=4.53e-02 ent=9.022 t=34.26s
+epoch=64 interval=1d net_pnl=     +309359 reward=-224409.42 |trade|=32.04 pol_l=-0.0108 val_l=3.96e-02 ent=9.016 t=31.36s
+epoch=65 interval=1d net_pnl=     +352081 reward=-129984.60 |trade|=32.06 pol_l=-0.0108 val_l=3.48e-02 ent=8.997 t=32.34s
+epoch=66 interval=1d net_pnl=     +350387 reward=-171395.38 |trade|=32.05 pol_l=-0.0103 val_l=3.83e-02 ent=8.984 t=31.51s
+epoch=67 interval=1d net_pnl=     +371934 reward=-124753.41 |trade|=32.06 pol_l=-0.0099 val_l=4.17e-02 ent=8.975 t=30.68s
+epoch=68 interval=1d net_pnl=     +357316 reward=-147872.58 |trade|=32.07 pol_l=-0.0090 val_l=3.87e-02 ent=8.954 t=30.15s
+epoch=69 interval=1d net_pnl=     +334468 reward=-278718.50 |trade|=32.06 pol_l=-0.0091 val_l=4.48e-02 ent=8.943 t=30.21s
+epoch=70 interval=1d net_pnl=     +397886 reward= -69604.70 |trade|=32.06 pol_l=-0.0092 val_l=3.40e-02 ent=8.924 t=29.90s
+epoch=71 interval=1d net_pnl=     +396374 reward=-101800.04 |trade|=32.04 pol_l=-0.0088 val_l=3.65e-02 ent=8.907 t=30.06s
+epoch=72 interval=1d net_pnl=     +405261 reward= -38318.45 |trade|=32.05 pol_l=-0.0081 val_l=3.60e-02 ent=8.880 t=56.48s
+epoch=73 interval=1d net_pnl=     +441559 reward= +35182.51 |trade|=32.05 pol_l=-0.0077 val_l=3.33e-02 ent=8.857 t=32.08s
+epoch=74 interval=1d net_pnl=     +459876 reward= +78928.64 |trade|=32.05 pol_l=-0.0072 val_l=3.42e-02 ent=8.833 t=33.09s
+epoch=75 interval=1d net_pnl=     +450422 reward= +38973.01 |trade|=32.05 pol_l=-0.0065 val_l=3.81e-02 ent=8.830 t=29.30s
+epoch=76 interval=1d net_pnl=     +433982 reward= -18948.89 |trade|=32.04 pol_l=-0.0065 val_l=3.65e-02 ent=8.818 t=31.40s
+epoch=77 interval=1d net_pnl=     +433187 reward=  +9377.41 |trade|=32.06 pol_l=-0.0064 val_l=3.47e-02 ent=8.794 t=46.28s
+epoch=78 interval=1d net_pnl=     +426312 reward= -42966.21 |trade|=32.05 pol_l=-0.0065 val_l=3.25e-02 ent=8.780 t=31.90s
+epoch=79 interval=1d net_pnl=     +471631 reward=+108057.40 |trade|=32.05 pol_l=-0.0060 val_l=3.51e-02 ent=8.757 t=34.83s
+  → final=$    +471,631    best=$    +471,631 (ep 79)    ent=8.76    |trade|=32.1    (44.0 min)
+
+
+Total: 87.6 min
+
+=== Phase 3 ranked by final net_pnl ===
+               name  entropy_coef  final_net_pnl  best_net_pnl  best_epoch  pnl_improvement  final_entropy  final_action_abs
+      winner_replay    3.0000e-04     5.9039e+05    5.9039e+05          79       8.7750e+05     8.7049e+00        3.2105e+01
+tighter_exploration    1.0000e-04     4.7163e+05    4.7163e+05          79       7.5874e+05     8.7573e+00        3.2051e+01

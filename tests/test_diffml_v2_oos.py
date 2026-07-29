@@ -5,7 +5,7 @@ Locks the two things the build hinged on:
   • the value stays BOUNDED at depth — `max|Y_boot|` small, V_0 finite/small;
   • the greedy policy HEDGES out-of-sample — on held-out paths it does not underperform
     no-hedge (greedy ≫ textbook OOS at full depth).
-The verdict rolls on paths the value function never saw (`DiffV2_OOS_Frac`), so a policy
+The verdict rolls on the held-out BATCH, which no fit step saw, so a policy
 that merely overfits the fitted paths fails this.
 
 JSON-is-the-contract: every test here goes through load_json + run_job only. The inner-MC fork
@@ -28,7 +28,7 @@ def _cfg(inner_antithetic='No', one_step_fork='Yes'):
     cfg = jsonlib.load(open(FIXTURE))
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = 'solve_hedge'
-    calc['Batch_Size'] = 48                 # 24 train / 24 OOS at the 0.5 split
+    calc['Batch_Size'], calc['Simulation_Batches'] = 24, 2   # 24 fitted, 24 held out
     calc['Inner_Sub_Batch'] = 8
     calc['Inner_MC_Enabled'] = 'Yes'
     calc['Inner_Antithetic'] = inner_antithetic
@@ -41,7 +41,6 @@ def _cfg(inner_antithetic='No', one_step_fork='Yes'):
         'Training_Action_Chunk_Size': 64,
         'T_Min': 100,                       # ~17-step bounded sweep (fast); full depth in build notes
         'DiffV2_Fit_Iters': 30,
-        'DiffV2_OOS_Frac': 0.5,
         'DiffV2_One_Step_Fork': one_step_fork,
         # defaults apply implicitly: DiffV2_Weight_Decay=0 (the twin-loss gradient match is
         # the regularizer, not weight decay), DiffV2_Lambda_Grad=1, DiffV2_Hidden=32. This
@@ -108,7 +107,7 @@ def test_corridor_train_smoke_sign_crossing():
     cfg = jsonlib.load(open(FIXTURE))
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = 'solve_hedge'
-    calc['Batch_Size'] = 48
+    calc['Batch_Size'], calc['Simulation_Batches'] = 24, 2
     calc['Inner_Sub_Batch'] = 8
     calc['Inner_MC_Enabled'] = 'Yes'
     calc['Inner_Antithetic'] = 'Yes'
@@ -127,7 +126,7 @@ def test_corridor_train_smoke_sign_crossing():
     hp['Solver'] = {
         'Object': 'DiffSolverV2', 'Training_Action_Grid_Levels_Per_Axis': 5,
         'Training_Action_Chunk_Size': 64, 'T_Min': 100, 'DiffV2_Fit_Iters': 15,
-        'DiffV2_OOS_Frac': 0.5}
+    }
 
     cx = rf.Context()
     cx.load_json((jsonlib.dumps(cfg), 'corridor_sign_crossing.json'))

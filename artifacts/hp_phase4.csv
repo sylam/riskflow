@@ -1,0 +1,2 @@
+final_net_pnl,best_net_pnl,best_epoch,epoch0_net_pnl,pnl_improvement,final_reward,final_entropy,final_action_abs,wallclock_s,epochs,batch_size
+7.368611e+05,7.393362e+05,148,-2.871059e+05,1.023967e+06,5.851298e+05,8.108788e+00,3.206064e+01,4.849576e+03,150,512

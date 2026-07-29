@@ -219,9 +219,6 @@ def _solver_config(solver_config: Optional[Mapping[str, Any]]) -> Optional[Dict[
         "diffv2_fit_iters": int(solver_config.get("DiffV2_Fit_Iters", 150)),
         "diffv2_lr": float(solver_config.get("DiffV2_LR", 2.0e-3)),
         "diffv2_bank_noise_frac": float(solver_config.get("DiffV2_Bank_Noise_Frac", 0.15)),
-        # Out-of-sample split: fraction of OUTER paths held out from the bank/fit, used ONLY for
-        # the verdict rollout (honest OOS policy eval). 0 = in-sample only.
-        "diffv2_oos_frac": float(solver_config.get("DiffV2_OOS_Frac", 0.5)),
         # Residual-net regularization. The PRINCIPLED regularizer is the twin-loss pathwise-
         # gradient match (diffv2_lambda_grad), applied in STANDARDIZED space; weight decay is an
         # optional crutch for outer-path-starved (tiny-batch) problems.
@@ -238,13 +235,6 @@ def _solver_config(solver_config: Optional[Mapping[str, Any]]) -> Optional[Dict[
         # expected value against the cost of getting there. Training stays cost-free.
         "diffv2_cost_aware_argmax":
             solver_config.get("DiffV2_Cost_Aware_Argmax", "No") == "Yes",
-        # Bundle-per-batch STREAMING: the calc builds a Bundle inside its simulation loop and a
-        # persistent solver warms up on batch 1, steps on each later batch and finishes on the
-        # final (held-out) one. Fork width becomes Batch_Size instead of Batch_Size x
-        # Simulation_Batches, and every fit step sees fresh paths. 'No' (default) = the
-        # generate-all-then-solve path, byte-identical.
-        "diffv2_streaming_batches":
-            solver_config.get("DiffV2_Streaming_Batches", "No") == "Yes",
         # Deployment-faithful backtest: with a frozen policy loaded, roll it day-by-day on the
         # observed path via BundleStepper (real futures accounting; decisions off the stepper's
         # own wealth). Exposes diagnostics['stepper_verdict']. 'No' = only the fast _verdict.
@@ -302,6 +292,10 @@ def construct_hedge_runtime(
     objective_config = hedging_problem.get("Objective")
     solver_config = hedging_problem.get("Solver")
     execution_mode = str(config.get("Execution_Mode", "simulate_only")).lower()
+    if execution_mode not in ("solve_hedge", "simulate_only"):
+        raise ValueError(
+            f"Unknown Execution_Mode {config.get('Execution_Mode')!r}; supported: 'solve_hedge' | "
+            "'simulate_only'.")
 
     # --- instruments: the tradable universe splits into cash accounts and hedge legs ---
     tradables = _flatten_deals(hedging_problem["Tradable_Instruments"])
@@ -352,12 +346,27 @@ def construct_hedge_runtime(
             raise ValueError(
                 "Execution_Mode 'solve_hedge' requires Inner_Sub_Batch >= "
                 f"{min_inner} for Solver.Object={solver_config.get('Object')!r}")
-        if (solver_config.get("DiffV2_Streaming_Batches", "No") == "Yes"
-                and int(config.get("Simulation_Batches", 1)) < 3):
+        if str(solver_config.get("Object", "")).lower() != "diffsolverv2":
             raise ValueError(
-                "Solver.DiffV2_Streaming_Batches='Yes' requires Simulation_Batches >= 3 "
-                f"(warmup + at least one step + the held-out batch); got "
-                f"{config.get('Simulation_Batches')}.")
+                "Execution_Mode 'solve_hedge' requires Solver.Object='DiffSolverV2' (the "
+                f"incremental warmup/step/finish API); got {solver_config.get('Object')!r}. "
+                "HindsightDpSolver remains available as the Run_Hindsight_Diagnostic track.")
+        # A solve is a STREAM: Simulation_Batches - 1 fit batches, then a held-out batch no fit
+        # step saw. Two is the shortest honest stream. A loaded checkpoint fits nothing, so it is
+        # a stream of one — its single batch is the held-out world.
+        n_batches = int(config.get("Simulation_Batches", 1))
+        if solver_config.get("DiffV2_Load_Value_Fn"):
+            if n_batches != 1:
+                raise ValueError(
+                    "Execution_Mode 'solve_hedge' with DiffV2_Load_Value_Fn requires "
+                    "Simulation_Batches == 1: a frozen policy fits nothing, so its one batch IS "
+                    f"the held-out world; got {n_batches}.")
+        elif n_batches < 2:
+            raise ValueError(
+                "Execution_Mode 'solve_hedge' requires Simulation_Batches >= 2 (fit batches, then "
+                f"a held-out batch no fit step saw); got {n_batches}. Simulation_Batches is a path "
+                "MULTIPLIER under 'simulate_only' and a STREAM LENGTH here, and riskflow_batch "
+                "divides it by the job count before this check.")
         if solver_config.get("DiffV2_Load_Value_Fn") and solver_config.get("DiffV2_Save_Value_Fn"):
             raise ValueError(
                 "Solver.DiffV2_Save_Value_Fn is set alongside DiffV2_Load_Value_Fn: a loaded "

@@ -5,8 +5,9 @@ fit by the Huge–Savine twin loss (value + AAD pathwise-gradient), consuming th
 scenario bundle and forking inner MC on demand via `Bundle.inner_mc` / `Bundle.inner_mc_grad`
 (attached by `HedgeMonteCarlo.execute`). `HindsightDpSolver` (clairvoyant oracle, the
 upper-bound track) and `run_textbook_benchmark` (averaging / min-var lower-bound track)
-are kept as benchmarks; `solve_hedge` dispatches the primary solver and assembles the
-comparison table + acceptance ladder.
+are kept as benchmarks. `StreamingSolve` is the driver — one bundle per simulation batch,
+warmup/step/finish — and `assemble_hedge_result` builds the comparison table + acceptance
+ladder.
 """
 
 from __future__ import annotations
@@ -428,12 +429,8 @@ class DiffSolverV2:
         # One-step forks: window inner generation+pricing to {t, t+1} (the bootstrap only
         # reads t/t+1 fields) — fork cost stops scaling with the remaining horizon.
         self.one_step = bool(self.cfg.get("diffv2_one_step_fork", True))
-        # Bundle-per-batch streaming: warmup/step/finish across batches instead of one solve on
-        # one bundle. Everything the frame owns (utility scale, z-frame, trust region) is locked
-        # at warmup; see `_bind`.
-        self.streaming = bool(self.cfg.get("diffv2_streaming_batches", False))
-        # Bank exploration RNG — deterministic, and PERSISTENT across streaming batches so each
-        # batch explores a fresh noise draw (a one-shot solve draws the same stream as before).
+        # Bank exploration RNG — deterministic, and PERSISTENT across batches so each batch
+        # explores a fresh noise draw.
         self.gen = torch.Generator(device=self.device)
         self.gen.manual_seed(0)
         # Per-t Adam optimizers, created at the first fit of t and KEPT: a streaming step
@@ -460,7 +457,7 @@ class DiffSolverV2:
 
     def _bind(self, bundle):
         """Point the solver at a bundle: the history-stripped sim views the sweep indexes by `t`
-        and the friction vol series the action space prices with. A one-shot solve binds once at
+        and the friction vol series the action space prices with. A frozen eval binds once at
         construction; a streaming step re-binds to each fresh batch — which is also where the
         LOCKED utility scale is re-asserted, because every batch resolves its own `c` at build
         time and letting a later one reach the runtime would silently rescale the objective (and
@@ -944,15 +941,11 @@ class DiffSolverV2:
         q_log = {"greedy": [], "t": []}
 
         def roll(policy):
-            # STREAMING passes mirror_scale=False so the stepper leaves the runtime's utility
-            # scale alone: under DiffV2_Load_Value_Fn that scale is the CHECKPOINT's — the value
-            # function's own frame — and the argmax below must read the same `c` the nets were
-            # fitted against. The default (non-streaming) path keeps the historical re-mirror,
-            # which replaces it with this world's `c` and so decides under a different scale than
-            # `_verdict` did; every walk-forward anchor to date was measured through that, so it
-            # stays bit-identical there.
-            stepper = BundleStepper(self.bundle, self.runtime,
-                                    mirror_scale=not self.streaming)
+            # mirror_scale=False: this rollout is only ever reached with a checkpoint loaded, and
+            # that checkpoint's utility scale is the value function's own frame — the argmax below
+            # must read the same `c` the nets were fitted against. Re-mirroring would replace it
+            # with this world's `c` and decide under a different scale than `_verdict` did.
+            stepper = BundleStepper(self.bundle, self.runtime, mirror_scale=False)
             # Seed the cost-aware decision q_prev from the OPENING book (the stepper's own
             # positions already open here too, so its realized first-step turnover is measured
             # from q0). The frozen value is position-free — q0 only shifts first-step cost/P&L.
@@ -1007,13 +1000,6 @@ class DiffSolverV2:
         return out
 
     # ---- driver: warmup (fit + frame lock) -> step (fresh batch) -> finish (verdict) ----
-    def solve(self):
-        """One-shot solve on a single bundle: warm up on it, then finish on it (the
-        `DiffV2_OOS_Frac` row split supplies the held-out verdict rows). Streaming drives the same
-        three phases across batches — see `StreamingSolve`."""
-        self.warmup()
-        return self.finish(self.bundle)
-
     def warmup(self, bundle=None):
         """Fit the value function on the first (or only) bundle and LOCK the frame: the
         standardization stats, the utility scale and the per-t trust region are computed here and
@@ -1043,19 +1029,12 @@ class DiffSolverV2:
         self.sweep_ts = sweep_ts = list(range(self.t_min, self.T_dec))
         self.inner_cache = inner_cache = {t: self._inner_step(t) for t in sweep_ts}
 
-        # OUT-OF-SAMPLE split: hold out a fraction of outer paths from the bank/fit; the
-        # verdict's headline rolls the policy on the HELD-OUT paths so a +EV that's just
-        # overfitting to the fitted paths is exposed (in-sample is reported alongside).
-        # STREAMING ignores it: the held-out BATCH is the out-of-sample world (an independent
-        # draw, not sibling rows of the same call), so every path here trains.
-        oos_frac = 0.0 if self.streaming else float(self.cfg.get("diffv2_oos_frac", 0.5))
-        n_tr = self.B_outer if oos_frac <= 0 else max(1, int(self.B_outer * (1.0 - oos_frac)))
-        train, test = slice(0, n_tr), slice(n_tr, self.B_outer)
-        has_oos = n_tr < self.B_outer
-        self.train, self.test, self.has_oos, self.n_tr = train, test, has_oos, n_tr
+        # Every path in this batch trains: the out-of-sample world is the HELD-OUT BATCH, an
+        # independent draw rather than sibling rows of the same call.
+        self.train = train = slice(None)
 
         # Standardization stats: market/wealth from the TRAIN swept states (no test peeking).
-        M = torch.cat([inner_cache[t][3][train] for t in sweep_ts], 0)                    # (n_swept*n_tr, md)
+        M = torch.cat([inner_cache[t][3][train] for t in sweep_ts], 0)                # (n_swept*B, md)
         self.m_mean, self.m_std = M.mean(0), M.std(0).clamp_min(1e-6)
         Wall = torch.stack([W_bank[t][train] for t in sweep_ts], 0).reshape(-1)
         self.w_mean, self.w_std = Wall.mean(), Wall.std().clamp_min(1e-6)
@@ -1126,17 +1105,15 @@ class DiffSolverV2:
                         "total_position_schedule stamp) but this run sets a Total_Position_Schedule "
                         "— cannot verify the frozen policy was trained in it; roll validity "
                         "unverified.", src)
-                # Frame provenance, same idiom as the corridor guard above: a STREAMING frame is
-                # locked on the warmup batch alone, a fixed-set frame on the whole simulation, so
-                # the two standardize their inputs off different path populations. Loading either
-                # under the other mode still evaluates (the checkpoint's own frame is restored),
-                # but it is worth saying out loud.
-                if bool(ck.get("streaming", False)) != self.streaming:
+                # Frame provenance, same idiom as the corridor guard above: this frame is locked
+                # on the warmup batch, a pre-stream checkpoint's on a whole fixed simulation, so
+                # the two standardize off different path populations. It still evaluates (the
+                # checkpoint's own frame is restored), but it is worth saying out loud.
+                if "streaming" in ck and not ck["streaming"]:
                     logging.warning(
-                        "DiffV2_Load_Value_Fn: %s was fitted with DiffV2_Streaming_Batches=%s but "
-                        "this run is %s — the frozen frame was locked on a different path "
-                        "population; the policy evaluates in ITS frame, not this run's.",
-                        src, bool(ck.get("streaming", False)), self.streaming)
+                        "DiffV2_Load_Value_Fn: %s carries a pre-stream frame, locked on a whole "
+                        "fixed simulation rather than a warmup batch — the policy evaluates in "
+                        "ITS frame, not this run's.", src)
                 drift = ((M.mean(0) - ck["m_mean"]).abs() / ck["m_std"]).max()
                 logging.info(
                     "DiffSolverV2 LOADED value fn from %s (train V_0=%+.6g) | eval-world "
@@ -1199,9 +1176,9 @@ class DiffSolverV2:
         else:
             self._sweep(W_bank)
         # The frame is now locked. Streaming freezes the trust region from here on (later batches
-        # report their breach rate instead of re-fitting it); a one-shot solve never gets here
+        # report their breach rate instead of re-fitting it); a frozen eval never gets here
         # twice, so its regions stay exactly as this sweep fitted them.
-        self._bounds_frozen = self.streaming
+        self._bounds_frozen = True
 
     def _sweep(self, W_bank):
         """One backward pass over the swept range on the CURRENTLY BOUND bundle: fit C_t for
@@ -1275,16 +1252,14 @@ class DiffSolverV2:
             "w_mean": round(float(self.w_mean), 6), "w_std": round(float(self.w_std), 6),
             "a_bounds": ([round(min(b[0] for b in env), 6), round(max(b[1] for b in env), 6)]
                          if env else None),
-            "streaming": self.streaming,
         }
         return hashlib.sha1(json.dumps(frame, sort_keys=True).encode()).hexdigest()
 
     def finish(self, bundle):
         """Verdict, benchmarks-facing headline and the policy artifact. STREAMING passes the
-        HELD-OUT batch — a world no fit step ever saw, so the whole batch is out-of-sample and
-        `DiffV2_OOS_Frac` plays no part; a one-shot solve passes its own bundle back and the row
-        split provides the held-out rows."""
-        if self.streaming and bundle is not self.bundle:
+        HELD-OUT batch — a world no fit step ever saw, so the whole batch is out-of-sample. A
+        frozen eval is the stream of length one: warmup's batch is handed straight back here."""
+        if bundle is not self.bundle:
             self._bind(bundle)
             # The held-out world needs its own forks: the argmax reads E_inner[C_{t+1}] at each
             # swept t, and the cached ones belong to the last TRAINING batch. A stream of length 1
@@ -1293,7 +1268,7 @@ class DiffSolverV2:
             self.inner_cache = {t: self._inner_step(t) for t in self.sweep_ts}
         nets, sweep_ts, inner_cache = self.nets, self.sweep_ts, self.inner_cache
         loaded, rows, worst, root = self.loaded, self.rows, self.worst, self.root
-        train, test, has_oos, n_tr = self.train, self.test, self.has_oos, self.n_tr
+        train = self.train
         md, hidden = self.md, self.hidden
         V_0 = float(root["Y_mean"])
         n_star_0 = root["q_star_mean"]
@@ -1331,7 +1306,6 @@ class DiffSolverV2:
                 "config_hash": self._config_hash(),
                 # Frame provenance: WHICH path population locked the frame this policy reads its
                 # inputs through, and a stamp over the frame itself (loads compare both).
-                "streaming": self.streaming,
                 "frame_stamp": self._frame_stamp(),
                 # Headline echoed so a loaded eval reads it back rather than recomputing.
                 "V_0": V_0, "n_star_0": list(n_star_0), "max_abs_Y_boot": worst,
@@ -1347,27 +1321,10 @@ class DiffSolverV2:
 
         # Downside verdict: greedy policy vs textbook delta hedge vs no hedge. HEADLINE is the
         # OUT-OF-SAMPLE rollout (held-out paths the nets never saw); in-sample reported too.
-        if loaded is not None or self.streaming:
-            # Frozen nets never saw ANY of this run's paths; a streaming finish rolls the HELD-OUT
-            # batch, a world no fit step touched. Either way the whole batch is out-of-sample
-            # (there is no in-sample counterpart on it — the training batches are already gone).
-            verdict = verdict_is = self._verdict(nets, inner_cache, sweep_ts,
-                                                 rows=slice(None))
-            has_oos = True
-        else:
-            verdict = self._verdict(nets, inner_cache, sweep_ts,
-                                    rows=(test if has_oos else train))
-            verdict_is = (self._verdict(nets, inner_cache, sweep_ts, rows=train)
-                          if has_oos else verdict)
-        if has_oos and loaded is None and not self.streaming:
-            # (streaming has no in-sample counterpart on the held-out batch — the training
-            # batches are gone by now, so the IS/OOS gap is not a thing to report)
-            logging.info(
-                "DiffSolverV2 IN-SAMPLE vs OOS u(W_T): greedy IS=%+.5f OOS=%+.5f | "
-                "textbook IS=%+.5f OOS=%+.5f (gap IS−OOS greedy=%+.5f → overfit if large)",
-                verdict_is["greedy"]["u_mean"], verdict["greedy"]["u_mean"],
-                verdict_is["textbook"]["u_mean"], verdict["textbook"]["u_mean"],
-                verdict_is["greedy"]["u_mean"] - verdict["greedy"]["u_mean"])
+        # `finish` always runs on a world no fit step saw: the held-out batch, or — with a
+        # checkpoint loaded — every path, since frozen nets saw none of them. There is no
+        # in-sample counterpart to report a gap against; the training batches are already gone.
+        verdict = self._verdict(nets, inner_cache, sweep_ts, rows=slice(None))
         # Deployment-faithful backtest: when a frozen policy is loaded and stepper rollout is
         # requested, roll it day-by-day on the (observed) path via BundleStepper — real futures
         # accounting + decisions off the stepper's own wealth. This is the trustworthy P&L for a
@@ -1399,9 +1356,7 @@ class DiffSolverV2:
             "  nohedge   %+.5f    %+.4e   %+.4e   %+.4e\n"
             "  → on the OBJECTIVE E[u(W_T)]: beats no-hedge=%s, beats textbook=%s | "
             "tail(CVaR5) competitive w/ textbook=%s",
-            "OUT-OF-SAMPLE" if has_oos else "in-sample", self.t_min,
-            self.B_outer if (loaded is not None or self.streaming) else (
-                self.B_outer - n_tr if has_oos else self.B_outer),
+            "OUT-OF-SAMPLE", self.t_min, self.B_outer,
             g["u_mean"], g["wT_mean"], g["wT_p5"], g["wT_cvar5"],
             tb["u_mean"], tb["wT_mean"], tb["wT_p5"], tb["wT_cvar5"],
             nh["u_mean"], nh["wT_mean"], nh["wT_p5"], nh["wT_cvar5"],
@@ -1430,8 +1385,7 @@ class DiffSolverV2:
                 "value_fn_path": save_path or None,       # where the artifact was persisted (if any)
                 "verdict": verdict,                       # OUT-OF-SAMPLE (held-out paths)
                 "stepper_verdict": stepper_verdict,       # frozen-policy realized-path rollout (real accounting)
-                "verdict_in_sample": verdict_is,
-                "verdict_is_oos": bool(has_oos),
+                "verdict_is_oos": True,        # structural: finish only ever sees unfitted paths
                 "verdict_beats_nohedge_on_utility": bool(beats_nh),
                 "verdict_beats_textbook_on_utility": bool(beats_tb),
                 "verdict_tail_competitive_vs_textbook": bool(tail_vs_tb),
@@ -1443,14 +1397,8 @@ class DiffSolverV2:
 # clairvoyant `HindsightDpSolver` is kept as the upper-bound (oracle) benchmark
 # track. `run_textbook_benchmark` supplies the lower-bound (min-var / averaging)
 # track.
-_SOLVERS: Dict[str, Callable] = {
-    "hindsightdpsolver": HindsightDpSolver,
-    "diffsolverv2": DiffSolverV2,
-}
-
-
 class StreamingSolve:
-    """Bundle-per-batch driver (`Solver.DiffV2_Streaming_Batches='Yes'`).
+    """The solve driver: one `Bundle` per simulation batch, handed over as it is built.
 
     `HedgeMonteCarlo.execute` builds a `Bundle` INSIDE its simulation loop and hands each one
     straight over: `warmup` on batch 1 (which constructs the solver(s) and locks the frame),
@@ -1458,22 +1406,16 @@ class StreamingSolve:
     `finish` on the final batch — never trained on, so it is the held-out world the verdict and
     the benchmark tracks are measured on.
 
-    What this buys: the inner-MC fork width becomes `Batch_Size` instead of
-    `Batch_Size x Simulation_Batches` (peak fork memory divided by the batch count, at unchanged
-    total training paths), and every fit step sees paths no earlier step did, so overfitting to
-    one simulated set stops being structurally possible. What it costs: the data order changes by
-    construction, so a streaming run is NOT comparable bit-for-bit with a fixed-set one — it is a
-    revalidation event, measured against the walk-forward baseline.
+    Why this shape: the inner-MC fork width is `Batch_Size` rather than the whole simulation, and
+    every fit step sees paths no earlier step did, so overfitting to one simulated set is not
+    structurally possible. A frozen-policy evaluation is the degenerate stream of length one —
+    nothing to fit, so warmup's batch IS the held-out world.
 
     Multi-seed keeps one persistent solver per seed, all fed the same batches in the same order."""
 
     def __init__(self, runtime):
         self.runtime = runtime
         self.cfg = runtime["solver"]
-        if self.cfg["object"] != "diffsolverv2":
-            raise ValueError(
-                "Solver.DiffV2_Streaming_Batches='Yes' requires Solver.Object='DiffSolverV2' "
-                f"(the incremental warmup/step/finish API); got {self.cfg['object']!r}.")
         self.solvers = []
         self.trained_batches = 0
 
@@ -1505,40 +1447,18 @@ class StreamingSolve:
         """The held-out batch: verdict + benchmarks + artifact, on paths no fit step saw."""
         logging.info(
             "StreamingSolve FINISH on the held-out batch (%d outer paths) after %d training "
-            "batch(es) — this world was never fitted, so the whole batch is out-of-sample and "
-            "DiffV2_OOS_Frac plays no part", int(held_out.liability_sim.shape[-1]),
-            self.trained_batches)
+            "batch(es) — this world was never fitted, so the whole batch is out-of-sample",
+            int(held_out.liability_sim.shape[-1]), self.trained_batches)
         runs = [solver.finish(held_out) for solver in self.solvers]
         return assemble_hedge_result(runs, held_out, self.runtime)
-
-
-def solve_hedge(bundle, runtime):
-    """Dispatcher for `Execution_Mode='solve_hedge'` (the one-shot path): run the configured
-    `Solver.Object` on the single bundle `Simulation_Batches` accumulated, then assemble the
-    tracks. Multi-seed repeats re-use the cached outer paths but advance the inner-MC Sobol
-    stream. The streaming path (`Solver.DiffV2_Streaming_Batches='Yes'`) does not come through
-    here — `HedgeMonteCarlo.execute` drives `StreamingSolve` batch by batch instead.
-
-    Returns the dict shape `HedgeMonteCarlo.execute` unpacks (`evaluation_output` /
-    `optimizer_diagnostics` / `policy_artifact`)."""
-    solver_cfg = runtime["solver"]
-    obj = solver_cfg["object"]
-    if obj not in _SOLVERS:
-        raise ValueError(
-            f"Unknown Solver Object {obj!r}; available: {sorted(_SOLVERS)}")
-    n_seed = max(1, int(solver_cfg.get("multi_seed_count", 1)))
-    # Primary solver — multi-seed repeats advance the inner-MC Sobol stream.
-    return assemble_hedge_result(
-        [_SOLVERS[obj](bundle, runtime).solve() for _ in range(n_seed)], bundle, runtime)
 
 
 def assemble_hedge_result(primary_runs, bundle, runtime):
     """Assemble the primary solver runs (one per seed) plus the benchmark tracks (hindsight upper
     bound / textbook lower bound, enabled by the `Run_*` flags) into the `comparison` table —
     V_0 mean ± std per track — the acceptance ladder, and the result dict
-    `HedgeMonteCarlo.execute` unpacks. Shared by the one-shot `solve_hedge` and `StreamingSolve`,
-    so both modes report the same shape; under streaming `bundle` is the HELD-OUT batch, which is
-    exactly the world the verdict was rolled on, so the benchmark tracks measure the same paths."""
+    `HedgeMonteCarlo.execute` unpacks. `bundle` is the HELD-OUT batch, which is exactly the world
+    the verdict was rolled on, so the benchmark tracks measure the same paths."""
     solver_cfg = runtime["solver"]
     obj = solver_cfg["object"]
     have_liability = bundle.liability_mtm is not None

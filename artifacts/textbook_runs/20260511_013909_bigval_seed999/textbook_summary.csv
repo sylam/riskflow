@@ -1,0 +1,7 @@
+policy,metric,net_pnl,total_ex_funding
+textbook,mean,-30770.26,-31058.73
+textbook,std,19697.36,19110.96
+textbook,min,-121059.62,-113564.88
+textbook,p5,-62654.61,-61158.75
+textbook,p95,1716.86,1515.14
+textbook,max,64824.44,72340.25

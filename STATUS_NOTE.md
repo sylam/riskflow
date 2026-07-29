@@ -368,7 +368,7 @@ the new fixture — textbook may not dominate there.
 
 | round | runs | wallclock |
 |-------|------|-----------|
-| Phase A/B/C clean (yesterday) | 32 | ~140 min |
+| Phase A/B/C clean (yesterday) | 32 | ~140 min 
 | Round 1 | 6 | ~21 min |
 | Round 2 | 8 | ~28 min |
 | Round 3 | 8 | ~28 min |

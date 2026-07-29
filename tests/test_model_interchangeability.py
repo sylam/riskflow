@@ -38,8 +38,8 @@ def _cfg(market_file, mode):
     cfg['Calc']['MergeMarketData']['MarketDataFile'] = market_file
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = mode
-    calc['Batch_Size'] = 24
-    calc['Simulation_Batches'] = 1
+    calc['Batch_Size'] = 12
+    calc['Simulation_Batches'] = 2
     calc['Random_Seed'] = 1
     if mode == 'simulate_only':
         calc['Hedging_Problem'].pop('Solver', None)

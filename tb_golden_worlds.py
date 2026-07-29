@@ -105,7 +105,7 @@ def run_solve(world, out):
     diag = ev.get('diagnostics') or {}
     keep = {k: snap(diag.get(k)) for k in
             ('V_0', 'n_star_0', 'bounded', 'max_abs_Y_boot', 'market_dim', 'root_t',
-             'action_grid_size', 'per_t', 'verdict', 'verdict_in_sample')}
+             'action_grid_size', 'per_t', 'verdict')}
     keep['comparison'] = snap(ev.get('comparison'))
     keep['ladder'] = snap(ev.get('ladder'))
     keep['actions'] = snap(ev.get('actions'))

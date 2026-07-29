@@ -61,7 +61,8 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message
 
 # ---- validated best configuration -------------------------------------------------------------
 BEST_CALC = {
-    'Batch_Size': 8192,        # outer paths; scale up on a bigger GPU (memory ~ linear in B)
+    'Batch_Size': 8192,        # outer paths PER BATCH; scale up on a bigger GPU (memory ~ linear)
+    'Simulation_Batches': 2,   # stream length: N-1 fit batches, then a held-out one
     'Inner_Sub_Batch': 64,     # inner draws — the selection floor for near-identical hedges
     'Inner_MC_Enabled': 'Yes',
     'Inner_Antithetic': 'Yes', # mirrored (z,-z) inner pairs — halves argmax selection variance
@@ -73,7 +74,6 @@ BEST_SOLVER = {
     'T_Min': 0,                                   # full window from day 0 = a day-1 policy
     'DiffV2_Fit_Iters': 60,
     'DiffV2_Hidden': 32,
-    'DiffV2_OOS_Frac': 0.5,                       # held-out split for the honest verdict
     'DiffV2_LR': 0.002,
     'DiffV2_Cost_Aware_Argmax': 'Yes',            # charge repositioning cost at the argmax
     'DiffV2_One_Step_Fork': 'Yes',                # {t,t+1} fork window (default) — required < inner=64
@@ -81,10 +81,13 @@ BEST_SOLVER = {
 }
 
 
-def apply_config(cfg, *, batch=None, seed=7, save=None, load=None,
+def apply_config(cfg, *, batch=None, batches=None, seed=7, save=None, load=None,
                  stepper_rollout=False, randomize_initial_state=True):
     """Apply the validated best config to a policy JSON (mutated in place) and return it.
 
+    batches              — training stream length: N-1 fit batches of `batch` paths, then a
+                           held-out one. Forced to 1 under `load` — a frozen policy fits nothing,
+                           so its single batch IS the held-out world.
     save                 — checkpoint path to write the fitted value function to (train mode).
     load                 — list of checkpoints to restore and evaluate frozen (eval mode); a
                            list of >1 runs the ensemble argmax.
@@ -99,6 +102,10 @@ def apply_config(cfg, *, batch=None, seed=7, save=None, load=None,
     calc.update(BEST_CALC)
     if batch is not None:
         calc['Batch_Size'] = batch
+    if batches is not None:
+        calc['Simulation_Batches'] = batches
+    if load:
+        calc['Simulation_Batches'] = 1
     calc['Random_Seed'] = seed
     hp = calc['Hedging_Problem']
     hp['Randomize_Initial_State'] = 'Yes' if randomize_initial_state else 'No'
@@ -147,12 +154,15 @@ def main():
     ap.add_argument('--save', help='Checkpoint path (a _s<seed> suffix is added for multi-seed).')
     ap.add_argument('--load', nargs='*', help='Frozen checkpoint(s) to evaluate (>1 = ensemble argmax).')
     ap.add_argument('--seeds', type=int, nargs='+', default=[7], help='Training seed(s) / ensemble members.')
-    ap.add_argument('--batch', type=int, help='Override Batch_Size (scale up on a big GPU).')
+    ap.add_argument('--batch', type=int, help='Override Batch_Size (outer paths PER batch).')
+    ap.add_argument('--batches', type=int,
+                    help='Override Simulation_Batches: N-1 fit batches, then a held-out one.')
     args = ap.parse_args()
     template = json.load(open(args.config))
 
     if args.load:  # ---- EVAL: frozen policy on fresh paths, no training ----
-        cfg = apply_config(copy.deepcopy(template), batch=args.batch, seed=args.seeds[0],
+        cfg = apply_config(copy.deepcopy(template), batch=args.batch, batches=args.batches,
+                           seed=args.seeds[0],
                            load=args.load, randomize_initial_state=False)
         logging.info('=== EVAL frozen %s ===', args.load)
         print_verdict(run(cfg, 'eval'))
@@ -161,7 +171,8 @@ def main():
     multi = len(args.seeds) > 1
     for seed in args.seeds:  # ---- TRAIN: one checkpoint per seed ----
         ckpt = _seeded_ckpt(args.save, seed, multi)
-        cfg = apply_config(copy.deepcopy(template), batch=args.batch, seed=seed, save=ckpt)
+        cfg = apply_config(copy.deepcopy(template), batch=args.batch, batches=args.batches,
+                           seed=seed, save=ckpt)
         logging.info('=== TRAIN seed=%d save=%s ===', seed, ckpt)
         print_verdict(run(cfg, f'train_s{seed}'))
 

@@ -1,0 +1,35 @@
+[08:51:25] START ep_45 overrides=Epochs=45
+[09:04:13] DONE  ep_45
+[09:04:43] START ep_30 overrides=Epochs=30
+[09:13:33] DONE  ep_30
+[09:14:03] START ep_80 overrides=Epochs=80
+[09:36:47] DONE  ep_80
+[09:37:17] START lr_1e-4 overrides=Learning_Rate=1e-4
+[09:54:31] DONE  lr_1e-4
+[09:55:01] START lr_3e-5 overrides=Learning_Rate=3e-5
+[10:12:15] DONE  lr_3e-5
+[10:12:45] START lr_1e-3 overrides=Learning_Rate=1e-3
+[10:29:57] DONE  lr_1e-3
+[10:30:27] START ec_1e-2 overrides=Entropy_Coef=1e-2
+[10:47:43] DONE  ec_1e-2
+[10:48:13] START ec_1e-4 overrides=Entropy_Coef=1e-4
+[11:05:28] DONE  ec_1e-4
+[11:05:58] START vc_0.5 overrides=Value_Coef=0.5
+[11:23:12] DONE  vc_0.5
+[11:23:42] START vc_1.0 overrides=Value_Coef=1.0
+[11:40:55] DONE  vc_1.0
+[11:41:25] START fp_5 overrides=Floor_Penalty=5
+[11:58:40] DONE  fp_5
+[11:59:10] START fp_20 overrides=Floor_Penalty=20
+[12:16:25] DONE  fp_20
+[12:16:55] START sr_2.0 overrides=Surplus_Reward=2.0
+[12:34:11] DONE  sr_2.0
+[12:34:41] START gamma_0.99 overrides=Gamma=0.99
+[12:51:59] DONE  gamma_0.99
+[12:52:29] START ppo_3 overrides=PPO_Epochs=3
+[13:06:08] DONE  ppo_3
+[13:06:38] START ppo_6 overrides=PPO_Epochs=6
+[13:31:10] DONE  ppo_6
+[13:31:40] START clip_0.1 overrides=Clip_Eps=0.1
+[13:48:56] DONE  clip_0.1
+[13:49:26] START grad_0.25 overrides=Max_Grad_Norm=0.25

@@ -1,0 +1,3 @@
+name,entropy_coef,final_net_pnl,best_net_pnl,best_epoch,final_reward,final_entropy,final_action_abs,wallclock_s,epoch0_net_pnl,pnl_improvement
+winner_replay,3.000000e-04,5.903895e+05,5.903895e+05,79,3.458256e+05,8.704885e+00,3.210527e+01,2.613413e+03,-2.871059e+05,8.774954e+05
+tighter_exploration,1.000000e-04,4.716310e+05,4.716310e+05,79,1.080574e+05,8.757277e+00,3.205111e+01,2.641598e+03,-2.871059e+05,7.587370e+05

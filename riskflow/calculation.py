@@ -1778,36 +1778,34 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         '2048 x 64 does NOT fit single-pass on the production world and raises OOM inside the',
         "liability's cashflow pricing.",
         '',
-        '### Streaming batches (`Solver.DiffV2_Streaming_Batches`)',
+        '### A solve is a stream (`Simulation_Batches`)',
         '',
-        'Default `No`: every simulation batch is accumulated into ONE bundle and the solver runs',
-        'once on the whole path set. `Yes` inverts it — a bundle is built per batch inside the',
-        'simulation loop and a persistent solver warms up on batch 1, steps on each later batch,',
-        'and finishes on the final batch, which is never trained on. Consequences worth knowing',
-        'before flipping it:',
+        'A bundle is built per simulation batch inside the simulation loop and handed straight to',
+        'a persistent solver: warmup on batch 1, step on each later batch, finish on the final',
+        'batch, which is never trained on. What follows from that:',
         '',
-        '- Inner-MC fork width follows `Batch_Size` instead of `Batch_Size x Simulation_Batches`,',
-        '  so peak fork memory is divided by the batch count at unchanged total training paths.',
+        '- `Simulation_Batches` is a STREAM LENGTH here and a path MULTIPLIER under',
+        '  `simulate_only`. Trained paths = `(Simulation_Batches - 1) x Batch_Size`; the last',
+        '  batch is the held-out world the verdict and the benchmark tracks are measured on.',
+        '  Minimum 2. `riskflow_batch` divides it by the job count before that check.',
+        '- Inner-MC fork width follows `Batch_Size` alone, so peak fork memory is set by',
+        '  `Batch_Size x Inner_Sub_Batch` however long the stream is.',
         '- Every fit step sees paths no earlier step did, so overfitting to the simulated set is',
-        '  not structurally possible; the data order changes, so results are NOT comparable',
-        '  bit-for-bit with a fixed-set run.',
+        '  not structurally possible.',
         '- The **frame is locked on the warmup batch**: the utility scale `c`, the market/wealth',
         '  standardization stats, and the per-t trust region are computed on batch 1 and frozen.',
         '  Later batches report how often their fitted targets fall outside the frozen region',
         '  (an INFO line per step) rather than re-fitting it.',
-        '- `DiffV2_OOS_Frac` is IGNORED: the held-out final batch is an independent draw and',
-        '  replaces the row split as the out-of-sample world for the verdict and the benchmarks.',
-        '- Requires `Simulation_Batches >= 3` (warmup + at least one step + the held-out batch)',
-        '  and `Solver.Object = "DiffSolverV2"`.',
-        '- Checkpoints stamp `streaming` + a `frame_stamp` (scale, z-frame, trust-region envelope).',
-        '  Loading across provenances warns; an ensemble that MIXES provenances is refused.',
+        '- A loaded checkpoint (`DiffV2_Load_Value_Fn`) is a frozen EVALUATION: it fits nothing,',
+        '  so it is the degenerate stream of length one and `Simulation_Batches` must be 1 — that',
+        '  single batch is the held-out world, since frozen nets saw none of it.',
+        '- Checkpoints carry a `frame_stamp` (scale, z-frame, trust-region envelope); an ensemble',
+        '  that MIXES frame provenances is refused.',
         '',
-        'The walk-forward smoke gate reproduces this mode end to end — `tb_wf_smoke_gate.sh`, trade',
-        '202001 at `--batch 512 --streaming-batches 5 --fit-iters 40`, seed 7 — pinning train_u',
+        'The walk-forward smoke gate reproduces this end to end — `tb_wf_smoke_gate.sh`, trade',
+        '202001 at `--batch 512 --batches 5 --fit-iters 40`, seed 7 — pinning train_u',
         '-0.5006, V_0 -0.1082737073302269, greedy -104.71 $/oz, churn 193.8 and the',
-        'policy-independent nohedge -194.35 / pf_bound 810.1. It REPLACES the retired',
-        'non-streaming anchor (`--batch 2048`, one simulation batch), the shape that no longer fits',
-        'single-pass; git history holds its bit-reproduction.',
+        'policy-independent nohedge -194.35 / pf_bound 810.1.',
         '',
         '### Execution modes',
         '',
@@ -1890,14 +1888,13 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         return self.liabilities.aggregate_leg_descriptors()
 
     def execute(self, params, job_id=0, num_jobs=1):
-        """Simulate the scenario engine over batches, accumulate the tensor bundle
-        (tradable prices, liability MtM, factor paths), then hand it to the configured
-        hedge solver (solve_hedge) or expose it for stepping (simulate_only). Returns a
-        HedgeRuntimeExecutionResult.
+        """Simulate the scenario engine over batches, building the tensor bundle (tradable
+        prices, liability MtM, factor paths). Returns a HedgeRuntimeExecutionResult.
 
-        `Solver.DiffV2_Streaming_Batches='Yes'` inverts the loop: a Bundle per batch, handed to a
-        persistent solver as it is built (warmup / step / finish on a held-out final batch), so
-        the inner-MC forks are only ever `Batch_Size` wide and every fit step sees fresh paths."""
+        `solve_hedge` builds a Bundle PER BATCH and hands it to a persistent solver as it is built
+        (warmup / step / finish on a held-out final batch), so the inner-MC forks are only ever
+        `Batch_Size` wide and every fit step sees fresh paths. `simulate_only` instead accumulates
+        every batch into one bundle and exposes it for stepping."""
         base_date = pd.Timestamp(params['Run_Date'])
         self.input_time_grid = params['Time_Grid']
         params['Simulation_Batches'] = params['Simulation_Batches'] // num_jobs
@@ -1966,19 +1963,16 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         solve_hedge_mode = str(execution_mode).lower() == 'solve_hedge'
         if inner_mc_enabled:
             self.stoch_factors_inner = {k: proc.copy() for k, proc in self.stoch_factors.items()}
-        # STREAMING (Solver.DiffV2_Streaming_Batches='Yes'): build a Bundle per batch INSIDE this
-        # loop and hand it to a persistent solver (warmup on batch 1, step on each later batch,
-        # finish on the held-out last one) instead of accumulating every batch into one bundle and
-        # solving once. The fork width then follows Batch_Size rather than the whole run, and each
-        # fit step sees fresh paths. Default 'No' keeps the accumulate-then-solve path byte-identical.
-        streaming = solve_hedge_mode and bool(
-            (normalized_runtime['solver'] or {}).get('diffv2_streaming_batches'))
-        streaming_solve = StreamingSolve(normalized_runtime) if streaming else None
+        # A SOLVE IS A STREAM: build a Bundle per batch INSIDE this loop and hand it to a
+        # persistent solver — warmup on batch 1, step on each later batch, finish on the held-out
+        # last one. Fork width follows Batch_Size rather than the whole run, and each fit step sees
+        # fresh paths. `simulate_only` instead accumulates every batch into one bundle, for which
+        # Simulation_Batches is a path multiplier rather than a stream length.
+        streaming_solve = StreamingSolve(normalized_runtime) if solve_hedge_mode else None
         held_out = None
-        outer_state_blocks = defaultdict(list) if (solve_hedge_mode and not streaming) else None
 
-        # Per-batch tensor accumulators. The non-streaming path appends every batch and
-        # concatenates once at the end; streaming re-inits them each batch (one block per key).
+        # Per-batch tensor accumulators. `simulate_only` appends every batch and concatenates once
+        # at the end; a solve re-inits them each batch (one block per key).
         def _new_blocks():
             return ({self._factor_bundle_key(key): [] for key in self.stoch_factors},
                     defaultdict(list),
@@ -2103,16 +2097,10 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                         privileged_factor_blocks[(factor_name, attr_name)].append(tensor.detach().clone())
 
             # solve_hedge: snapshot this batch's outer scenario buffer (factor paths + every
-            # per-process aux key each generate() published) for on-demand inner-MC forking. The
-            # non-streaming path accumulates and concatenates after the loop; streaming forks THIS
-            # batch, so it keeps just this batch's snapshot.
-            batch_buffer = None
-            if streaming:
-                batch_buffer = {key: tensor.detach().clone()
-                                for key, tensor in shared_mem.t_Scenario_Buffer.items()}
-            elif outer_state_blocks is not None:
-                for key, tensor in shared_mem.t_Scenario_Buffer.items():
-                    outer_state_blocks[key].append(tensor.detach().clone())
+            # per-process aux key each generate() published) — the forks run against THIS batch.
+            batch_buffer = ({key: tensor.detach().clone()
+                             for key, tensor in shared_mem.t_Scenario_Buffer.items()}
+                            if solve_hedge_mode else None)
 
             _ = self.netting_sets.resolve_structure(shared_mem, self.time_grid)
             # clear hedge cashflows so t_Cashflows after the next call holds only liability cashflows
@@ -2146,7 +2134,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
             shared_mem.t_Buffer.clear()
 
-            if streaming:
+            if solve_hedge_mode:
                 # This batch IS a bundle: build it, attach its own forks, and hand it to the
                 # persistent solver. The last batch is reserved — never fitted — as the held-out
                 # world `finish` measures the verdict and the benchmark tracks on.
@@ -2161,7 +2149,9 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
                     streaming_solve.warmup(bundle)
                 elif run < params['Simulation_Batches'] - 1:
                     streaming_solve.step(bundle)
-                else:
+                # The LAST batch is the held-out world. At Simulation_Batches == 1 — a frozen
+                # policy, which fits nothing — warmup's batch is also that world.
+                if run == params['Simulation_Batches'] - 1:
                     held_out = bundle
                 # Fresh accumulators for the next batch — this one has been consumed. (The forks
                 # the solver just ran borrowed `shared_mem`; `_run_inner_mc_at_t` hands it back as
@@ -2171,42 +2161,29 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
 
         self.calc_stats[execution_label] = time.monotonic() - self.calc_stats[execution_label]
 
-        if outer_state_blocks is not None:
-            # Concatenate per-batch outer scenario snapshots along the batch (last) dim:
-            # spot (T, B), curve (T, n_tenors, B), per-process aux (T, B) all carry B last.
-            self._outer_scenario_buffer = {
-                key: torch.cat(blocks, dim=-1) for key, blocks in outer_state_blocks.items()
-            }
-
-        if streaming:
-            bundle = held_out
-        else:
-            bundle = Bundle.from_batch(
-                base_date,
-                bus_day,
-                shared_mem.one.new_tensor(t_days_arr),
-                tradable_blocks,
-                factor_tensor_blocks,
-                hedge_profile_blocks,
-                params['Simulation_Batches'],
-                self.stoch_factors,
-                normalized_runtime,
-                privileged_factor_blocks=privileged_factor_blocks,
-                total_leg_volume=total_leg_volume,
-                last_payment_day=last_payment_day,
-            )
-        if solve_hedge_mode and not streaming:
-            self._attach_inner_mc(bundle, self._outer_scenario_buffer, shared_mem,
-                                  base_date, tradable_refs)
+        bundle = held_out if solve_hedge_mode else Bundle.from_batch(
+            base_date,
+            bus_day,
+            shared_mem.one.new_tensor(t_days_arr),
+            tradable_blocks,
+            factor_tensor_blocks,
+            hedge_profile_blocks,
+            params['Simulation_Batches'],
+            self.stoch_factors,
+            normalized_runtime,
+            privileged_factor_blocks=privileged_factor_blocks,
+            total_leg_volume=total_leg_volume,
+            last_payment_day=last_payment_day,
+        )
 
         evaluation_summary = None
         optimizer_diagnostics = None
         policy_artifact = None
         runtime_present = False
         runtime_diagnostics = {}
-        # Streaming already ran the solve batch by batch; all that is left is the held-out
-        # verdict + the tracks. Everything else dispatches by Execution_Mode as before.
-        optimization_result = (streaming_solve.finish(held_out) if streaming
+        # A solve already ran batch by batch; all that is left is the held-out verdict + the
+        # tracks. `simulate_only` rolls its accumulated bundle with zero trades.
+        optimization_result = (streaming_solve.finish(held_out) if solve_hedge_mode
                                else run_hedge_execution(bundle, normalized_runtime))
         if optimization_result is not None:
             evaluation_summary = optimization_result['evaluation_output']
@@ -2392,7 +2369,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         `B_outer x Inner_Sub_Batch` flat in one go, so peak memory is a function of two JSON
         fields (`Batch_Size`, `Inner_Sub_Batch`) and nothing else. A config too wide for the
         card raises CUDA OOM naming this fork; that is the contract, not a knob. The old
-        outer-path chunk loop is gone with `DiffV2_Streaming_Batches`, which caps fork width at
+        outer-path chunk loop is gone: the stream caps fork width at
         Batch_Size rather than the whole simulation — see the doc attr for the measured
         operating point."""
         spot_key = self._find_spot_key()

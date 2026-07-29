@@ -1,0 +1,178 @@
+WARNING MarketDataRF_platinum_calibrated Price Factor 'DiscountRate.USD-SOFR' not found in market data
+/home/vretiel/miniconda3/lib/python3.10/site-packages/torch/__init__.py:1125: FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead
+  return isinstance(obj, torch.Tensor)
+inner-MC fork phase profile  (20260726_041551)
+world=fixture dual_strip=False batch=2048 inner=64 one_step=Yes t_min=95 fit_iters=10
+device=cuda  wall=137.1s  peak=4.27 GiB
+fork calls=110  chunk passes=176
+
+NOTE: every marker is cuda.synchronize-bracketed, so absolute wall is
+      inflated -- read the SPLIT. `ladder` gives clean throughput.
+
+--- nograd (82 chunk passes, max chunk peak 4370 MiB) ---
+phase          mean ms   total ms  % time  mean dMiB
+rng               4.04      331.5     0.6      -7.59
+generation      570.80    46805.6    87.5       3.29
+stuffing          1.21       99.1     0.2     473.91
+pricing          74.94     6145.3    11.5     888.96
+extraction        1.31      107.3     0.2   -1346.00
+
+--- grad (76 chunk passes, max chunk peak 2480 MiB) ---
+phase          mean ms   total ms  % time  mean dMiB
+rng               1.62      123.5     0.5       0.79
+generation      305.73    23235.6    89.4       6.90
+stuffing          0.65       49.5     0.2     238.21
+pricing          33.51     2546.7     9.8     451.32
+extraction        0.56       42.5     0.2    -682.84
+
+--- slab census summary (MiB) ---
+  t=95   after_stuffing   named=    450.0  gc_live=    725.7  unattributed=    275.8  allocator_live=    757.8
+  t=95   after_pricing    named=   1215.5  gc_live=   1542.5  unattributed=    327.0  allocator_live=   1574.5
+  t=100  after_stuffing   named=    466.9  gc_live=    925.2  unattributed=    458.3  allocator_live=    957.2
+  t=100  after_pricing    named=   1270.5  gc_live=   1668.7  unattributed=    398.2  allocator_live=   1700.7
+  t=105  after_stuffing   named=    489.4  gc_live=    982.5  unattributed=    493.1  allocator_live=   1014.5
+  t=105  after_pricing    named=   1331.0  gc_live=   1879.1  unattributed=    548.1  allocator_live=   1911.2
+  t=110  after_stuffing   named=    511.9  gc_live=   1038.7  unattributed=    526.8  allocator_live=   1070.7
+  t=110  after_pricing    named=   1392.1  gc_live=   1975.7  unattributed=    583.6  allocator_live=   2007.7
+  t=115  after_stuffing   named=    534.4  gc_live=   1078.1  unattributed=    543.8  allocator_live=   1110.2
+  t=115  after_pricing    named=   1452.1  gc_live=   2044.6  unattributed=    592.5  allocator_live=   2076.6
+
+--- slab census at the PRICING peak, deepest fork t=115 (chunk flat=32768) ---
+bucket                     MiB   kB/flat
+t_Buffer                 917.4     28.67
+UNATTRIBUTED             571.8     17.87
+t_Scenario_Buffer        529.6     16.55
+t_quasi_rng                2.8      0.09
+t_random_numbers           2.0      0.06
+t_Cashflows                0.4      0.01
+TOTAL(gc live)          2044.6     63.89
+
+  by SCALE (only flat-scaled slabs are what chunking bounds):
+    flat        1633.2 MiB     51.04 kB/flat
+    outer        210.0 MiB      6.56 kB/flat
+    other        167.4 MiB      5.23 kB/flat
+    inner         13.2 MiB      0.41 kB/flat
+
+  top 20 individual slabs:
+       453.4 MiB    14.17 kB/flat  [flat ] t_Scenario_Buffer  117x31x32768         InterestRate.USD-SOFR
+       453.4 MiB    14.17 kB/flat  [flat ] t_Buffer           3627x32768           ('Hermite', (True, Factor(type='InterestRate',
+       453.4 MiB    14.17 kB/flat  [flat ] t_Buffer           3627x32768           ('Hermite', (True, Factor(type='InterestRate',
+        86.5 MiB     2.70 kB/flat  [outer] UNATTRIBUTED       119x31x2048          x3
+        80.0 MiB     2.50 kB/flat  [other] UNATTRIBUTED       2048x64x8            x20
+        43.9 MiB     1.37 kB/flat  [flat ] t_Scenario_Buffer  117x3x32768          ForwardRate.PLATINUM_CARRY
+        41.2 MiB     1.29 kB/flat  [flat ] UNATTRIBUTED       110x32768            x3
+        38.2 MiB     1.20 kB/flat  [flat ] UNATTRIBUTED       102x32768            x3
+        37.1 MiB     1.16 kB/flat  [flat ] UNATTRIBUTED       99x32768             x3
+        36.1 MiB     1.13 kB/flat  [outer] UNATTRIBUTED       149x31x2048          x1
+        30.0 MiB     0.94 kB/flat  [other] UNATTRIBUTED       2048x64x3            x20
+        29.2 MiB     0.91 kB/flat  [flat ] UNATTRIBUTED       117x32768            x2
+        28.8 MiB     0.90 kB/flat  [other] UNATTRIBUTED       119x31x512           x1
+        28.8 MiB     0.90 kB/flat  [outer] UNATTRIBUTED       31x2048              x1
+        28.2 MiB     0.88 kB/flat  [flat ] UNATTRIBUTED       113x32768            x2
+        14.9 MiB     0.47 kB/flat  [outer] UNATTRIBUTED       83x23x2048           x1
+        14.9 MiB     0.46 kB/flat  [flat ] UNATTRIBUTED       119x32768            x1
+        14.6 MiB     0.46 kB/flat  [flat ] t_Scenario_Buffer  117x32768            CommodityPrice.PLATINUM_LME
+        14.6 MiB     0.46 kB/flat  [flat ] t_Scenario_Buffer  117x32768            ObservedBasis.PLATINUM_LME.LME_CME
+        12.1 MiB     0.38 kB/flat  [outer] UNATTRIBUTED       119x2048             x13
+
+  SUSPECTS (punchlist H): a 31-tenor USD-SOFR row in t_Scenario_Buffer
+  sized (t+2)x31xflat confirms BOTH the tenor width and the full outer-past
+  re-materialization; a matching t_Buffer curve-interp entry of the same
+  (rows*tenors)xflat extent means pricing re-materializes it a second time.
+
+census csv: /home/vretiel/PycharmProjects/riskflow/artifacts/walk_forward/fork_profile/fork_census_20260726_041551.csv
+
+wrote /home/vretiel/PycharmProjects/riskflow/artifacts/walk_forward/fork_profile/fork_phases_20260726_041551.csv / /home/vretiel/PycharmProjects/riskflow/artifacts/walk_forward/fork_profile/fork_phases_20260726_041551.txt
+WARNING MarketDataRF_platinum_calibrated Price Factor 'DiscountRate.USD-SOFR' not found in market data
+[W726 04:18:21.230769949 CPUAllocator.cpp:245] Memory block of unknown size was allocated before the profiling started, profiler results will not include the deallocation event
+inner-MC fork trace (20260726_041810)  device=cuda
+batch=2048 inner=64 t_min=110 active_forks=3  job wall=90.6s
+kernel time total=29.97s over 1208385 device-op invocations
+IDLE ATTRIBUTION: compare kernel time against the profiled window; look for
+  fork/* record_function spans (phases) and gaps between them in the chrome trace.
+
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                 fork/gen/precalc/InterestRate.USD-SOFR         0.00%       0.000us         0.00%       0.000us       0.000us       14.355s      1021.38%       14.355s        1.196s           0 B           0 B           0 B           0 B            12  
+                                       fork/nograd/t112         0.00%       0.000us         0.00%       0.000us       0.000us        4.900s       348.63%        4.900s        4.900s           0 B           0 B           0 B           0 B             1  
+                                       fork/nograd/t113         0.00%       0.000us         0.00%       0.000us       0.000us        3.802s       270.51%        3.802s        3.802s           0 B           0 B           0 B           0 B             1  
+                                       fork/nograd/t111         0.00%       0.000us         0.00%       0.000us       0.000us        3.199s       227.57%        3.199s        3.199s           0 B           0 B           0 B           0 B             1  
+                           fork/price/resolve_structure         0.00%       0.000us         0.00%       0.000us       0.000us     667.200ms        47.47%     667.200ms      66.720ms           0 B           0 B           0 B           0 B            10  
+                                            aten::copy_         1.20%     189.884ms        11.89%        1.878s      32.727us     287.438ms        20.45%     296.225ms       5.162us      99.89 KB      -1.44 MB         512 B      -5.50 KB         57387  
+                       Memcpy DtoH (Device -> Pageable)         0.00%       0.000us         0.00%       0.000us       0.000us     268.186ms        19.08%     268.186ms       5.587ms           0 B           0 B           0 B           0 B            48  
+                                              aten::mul         5.50%     869.117ms        10.21%        1.612s      11.290us     254.575ms        18.11%     254.596ms       1.783us           0 B         -96 B      27.45 GB      27.45 GB        142763  
+                                              aten::sub         4.90%     773.734ms         9.08%        1.433s      12.198us     210.674ms        14.99%     210.694ms       1.793us           0 B           0 B      15.49 GB      15.49 GB        117510  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     182.152ms        12.96%     182.152ms       1.961us           0 B           0 B           0 B           0 B         92907  
+                                            aten::index         4.77%     753.099ms         8.64%        1.365s      18.332us     165.619ms        11.78%     165.650ms       2.225us           0 B           0 B       1.36 GB       1.36 GB         74448  
+void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000u
+
+wrote /home/vretiel/PycharmProjects/riskflow/artifacts/walk_forward/fork_profile/fork_trace_20260726_041810.json
+wrote /home/vretiel/PycharmProjects/riskflow/artifacts/walk_forward/fork_profile/fork_trace_20260726_041810.txt
+=== rung Inner_MC_Flat_Limit=32768 ===
+WARNING MarketDataRF_platinum_calibrated Price Factor 'DiscountRate.USD-SOFR' not found in market data
+{
+ "flat_limit": 32768,
+ "batch": 8192,
+ "inner": 64,
+ "chunk_outer": 512,
+ "passes_per_nograd_fork": 16,
+ "ok": true,
+ "error": "",
+ "wall_s": 520.8,
+ "peak_GiB": 5.25,
+ "n_fit_steps": 22,
+ "mean_fit_step_s": 13.057,
+ "gpu_util_mean": 29.8,
+ "gpu_util_p50": 25.0,
+ "gpu_util_max": 100.0,
+ "smi_mem_max_MiB": 6400.0,
+ "n_samples": 1817
+}
+=== rung Inner_MC_Flat_Limit=65536 ===
+WARNING MarketDataRF_platinum_calibrated Price Factor 'DiscountRate.USD-SOFR' not found in market data
+{
+ "flat_limit": 65536,
+ "batch": 8192,
+ "inner": 64,
+ "chunk_outer": 1024,
+ "passes_per_nograd_fork": 8,
+ "ok": true,
+ "error": "",
+ "wall_s": 537.7,
+ "peak_GiB": 8.85,
+ "n_fit_steps": 22,
+ "mean_fit_step_s": 13.573,
+ "gpu_util_mean": 29.1,
+ "gpu_util_p50": 23.0,
+ "gpu_util_max": 100.0,
+ "smi_mem_max_MiB": 10500.0,
+ "n_samples": 1877
+}
+=== rung Inner_MC_Flat_Limit=131072 ===
+WARNING MarketDataRF_platinum_calibrated Price Factor 'DiscountRate.USD-SOFR' not found in market data
+{
+ "flat_limit": 131072,
+ "batch": 8192,
+ "inner": 64,
+ "chunk_outer": 2048,
+ "passes_per_nograd_fork": 4,
+ "ok": true,
+ "error": "",
+ "wall_s": 520.5,
+ "peak_GiB": 16.07,
+ "n_fit_steps": 22,
+ "mean_fit_step_s": 13.276,
+ "gpu_util_mean": 30.1,
+ "gpu_util_p50": 24.0,
+ "gpu_util_max": 100.0,
+ "smi_mem_max_MiB": 18720.0,
+ "n_samples": 1816
+}
+
+ladder csv: /home/vretiel/PycharmProjects/riskflow/artifacts/walk_forward/fork_profile/fork_ladder_20260726_042436.csv
+flat_limit,batch,inner,chunk_outer,passes_per_nograd_fork,ok,error,wall_s,peak_GiB,n_fit_steps,mean_fit_step_s,gpu_util_mean,gpu_util_p50,gpu_util_max,smi_mem_max_MiB,n_samples
+32768,8192,64,512,16,True,,520.8,5.25,22,13.057,29.8,25.0,100.0,6400.0,1817
+65536,8192,64,1024,8,True,,537.7,8.85,22,13.573,29.1,23.0,100.0,10500.0,1877
+131072,8192,64,2048,4,True,,520.5,16.07,22,13.276,30.1,24.0,100.0,18720.0,1816
+

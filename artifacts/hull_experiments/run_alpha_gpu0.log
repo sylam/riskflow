@@ -1,0 +1,39 @@
+config=alpha_010  seeds=[1]  cuda=0
+  overrides:
+    Range_Projection_Alpha = 0.01
+  out: artifacts/hull_experiments/20260525_235151_alpha_010.csv
+
+[1/1] seed=1 starting at 23:51:52
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+  V_0 dp=1.0374 mpc=0.0238 hs=0.9840 tb=0.0311 ladder_ok=False  (19.0 min)
+
+==============================================================================
+DP V_0  mean=+1.0374  std=0.0000  CV=0.00%  min=+1.0374  max=+1.0374  n=1
+CSV: artifacts/hull_experiments/20260525_235151_alpha_010.csv
+per-t: artifacts/hull_experiments/20260525_235151_alpha_010_per_t.csv
+config=alpha_050  seeds=[1]  cuda=0
+  overrides:
+    Range_Projection_Alpha = 0.05
+  out: artifacts/hull_experiments/20260526_001055_alpha_050.csv
+
+[1/1] seed=1 starting at 00:10:56
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+  V_0 dp=1.0096 mpc=0.0238 hs=0.9840 tb=0.0311 ladder_ok=False  (18.7 min)
+
+==============================================================================
+DP V_0  mean=+1.0096  std=0.0000  CV=0.00%  min=+1.0096  max=+1.0096  n=1
+CSV: artifacts/hull_experiments/20260526_001055_alpha_050.csv
+per-t: artifacts/hull_experiments/20260526_001055_alpha_050_per_t.csv
+config=alpha_100  seeds=[1]  cuda=0
+  overrides:
+    Range_Projection_Alpha = 0.1
+  out: artifacts/hull_experiments/20260526_002943_alpha_100.csv
+
+[1/1] seed=1 starting at 00:29:44
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+  V_0 dp=0.9845 mpc=0.0238 hs=0.9840 tb=0.0311 ladder_ok=False  (18.8 min)
+
+==============================================================================
+DP V_0  mean=+0.9845  std=0.0000  CV=0.00%  min=+0.9845  max=+0.9845  n=1
+CSV: artifacts/hull_experiments/20260526_002943_alpha_100.csv
+per-t: artifacts/hull_experiments/20260526_002943_alpha_100_per_t.csv

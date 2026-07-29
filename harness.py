@@ -50,7 +50,8 @@ def main():
     cfg = json.load(open(FIXTURE))
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = 'solve_hedge'
-    calc['Batch_Size'] = BATCH
+    # a solve is a stream: fit batches, then a held-out one. (B, 1)+OOS 0.5 -> (B/2, 2)
+    calc['Batch_Size'], calc['Simulation_Batches'] = BATCH // 2, 2
     calc['Inner_Sub_Batch'] = INNER
     calc['Inner_MC_Enabled'] = 'Yes'
     calc['Inner_Antithetic'] = INNER_ANTITHETIC
@@ -64,7 +65,6 @@ def main():
         'Training_Action_Chunk_Size': 64,
         'T_Min': T_MIN,
         'DiffV2_Fit_Iters': FIT_ITERS,
-        'DiffV2_OOS_Frac': 0.5,
         'DiffV2_Cost_Aware_Argmax': COST_AWARE,
         'DiffV2_One_Step_Fork': ONE_STEP,
     }

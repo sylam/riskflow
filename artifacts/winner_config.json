@@ -1,0 +1,18 @@
+{
+  "position_bounds_penalty": 10.0,
+  "reward_scale": 3.0e-8,
+  "entropy_coef": 3.0e-4,
+  "floor_penalty": 50.0,
+  "expiry_penalty": 0.3,
+  "post_deal_trade_penalty": 1.0,
+  "lr": 3.0e-4,
+  "value_coef": 0.1,
+  "ppo_epochs": 4,
+  "minibatch_size": 128,
+  "batch_size": 512,
+  "epochs": 200,
+  "refine_ml_mean": 4484746,
+  "refine_textbook_beat": 4515800,
+  "screen_best_net_pnl_at_20ep": -206800,
+  "notes": "Refine winner from sweep_hp_postbounds (27-cell screen) followed by 80-epoch refine. Bounds=10 outperformed known-good bounds=1.0 by +$1.1M ML mean."
+}

@@ -58,13 +58,15 @@ def rung(batch, inner):
 
     cfg = json.load(open(FIX))
     c = cfg['Calc']['Calculation']
-    c.update({'Execution_Mode': 'solve_hedge', 'Batch_Size': batch, 'Inner_Sub_Batch': inner,
+    # Batch_Size IS the measured axis here, so it is preserved and the stream is the shortest
+    c.update({'Execution_Mode': 'solve_hedge', 'Batch_Size': batch, 'Simulation_Batches': 2,
+              'Inner_Sub_Batch': inner,
               'Inner_MC_Enabled': 'Yes', 'Inner_Antithetic': 'Yes', 'Random_Seed': 7})
     c['Hedging_Problem']['Randomize_Initial_State'] = 'Yes'
     c['Hedging_Problem']['Solver'] = {          # the production recipe (production_solver.BEST_*)
         'Object': 'DiffSolverV2', 'Training_Action_Grid_Levels_Per_Axis': 9,
         'Training_Action_Chunk_Size': 64, 'DiffV2_Fit_Iters': 60, 'DiffV2_Hidden': 32,
-        'DiffV2_LR': 0.002, 'DiffV2_OOS_Frac': 0.5, 'DiffV2_Cost_Aware_Argmax': 'Yes',
+        'DiffV2_LR': 0.002, 'DiffV2_Cost_Aware_Argmax': 'Yes',
         'DiffV2_One_Step_Fork': 'Yes', 'DiffV2_Per_Column_Grad_Norm': 'Yes',
         'T_Min': 117 - N_FIT}                   # fixture T_dec = 117 (measured)
     torch.cuda.reset_peak_memory_stats()

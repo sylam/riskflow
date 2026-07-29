@@ -114,13 +114,14 @@ def _energy_leg(name, start, end, pay):
 def _cfg(t_min):
     cfg = jsonlib.load(open(FIXTURE))
     calc = cfg['Calc']['Calculation']
-    calc.update({'Execution_Mode': 'solve_hedge', 'Batch_Size': 16, 'Inner_Sub_Batch': 4,
+    calc.update({'Execution_Mode': 'solve_hedge', 'Batch_Size': 8, 'Simulation_Batches': 2,
+                 'Inner_Sub_Batch': 4,
                  'Inner_MC_Enabled': 'Yes', 'Random_Seed': 1234})
     calc['Hedging_Problem']['Randomize_Initial_State'] = 'Yes'
     calc['Hedging_Problem']['Solver'] = {
         'Object': 'DiffSolverV2', 'Training_Action_Grid_Levels_Per_Axis': 3,
         'Training_Action_Chunk_Size': 64, 'T_Min': t_min, 'DiffV2_Fit_Iters': 2,
-        'DiffV2_OOS_Frac': 0.5, 'DiffV2_One_Step_Fork': 'Yes'}
+        'DiffV2_One_Step_Fork': 'Yes'}
     return cfg
 
 

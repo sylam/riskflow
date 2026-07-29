@@ -7,7 +7,7 @@
   2. INITIAL INVENTORY — first-step turnover is measured from the OPENING book `q0`
      (normalized `Portfolio_State` positions), not from flat, in the frictionless value
      tracks' net-of-cost diagnostics and in the stepper rollout.
-  3. POLICY ARTIFACT — `DiffSolverV2.solve()` returns ONE `value_fn_artifacts` dict (also the
+  3. POLICY ARTIFACT — a solver run returns ONE `value_fn_artifacts` dict (also the
      bytes `DiffV2_Save_Value_Fn` persists); the in-memory artifact evaluates identically to
      the file checkpoint saved in the same run.
 
@@ -45,7 +45,7 @@ def _cfg(*, batch=48, inner=8, seed=7, positions=None, active=None,
     cfg = jsonlib.load(open(FIXTURE))
     calc = cfg['Calc']['Calculation']
     calc['Execution_Mode'] = 'solve_hedge'
-    calc['Batch_Size'] = batch
+    calc['Batch_Size'], calc['Simulation_Batches'] = batch // 2, 2   # fit batch + held-out batch
     calc['Inner_Sub_Batch'] = inner
     calc['Inner_MC_Enabled'] = 'Yes'
     calc['Inner_Antithetic'] = 'Yes'
@@ -60,7 +60,6 @@ def _cfg(*, batch=48, inner=8, seed=7, positions=None, active=None,
         'Training_Action_Chunk_Size': 64,
         'T_Min': 100,                       # shallow ~16-step sweep (fast)
         'DiffV2_Fit_Iters': 5,
-        'DiffV2_OOS_Frac': 0.5,
     }
     if active is not None:
         solver['Active_Hedge_Indices'] = list(active)
@@ -194,7 +193,9 @@ def test_policy_artifact_contract_and_eval_from_memory(tmp_path):
         rt = dict(train.runtime)
         rt['solver'] = dict(train.runtime['solver'])
         rt['solver']['diffv2_load_value_fn'] = [load_member]
-        return DiffSolverV2(train.bundle, rt).solve().values
+        solver = DiffSolverV2(train.bundle, rt)
+        solver.warmup()                       # a loaded checkpoint restores the frame, fits nothing
+        return solver.finish(solver.bundle).values
 
     v_art = _eval(artifact)                   # in-memory artifact as an ensemble member
     v_file = _eval(ckpt)                      # the loaded file
@@ -224,7 +225,9 @@ def test_corridor_provenance_stamped_and_load_mismatch_fails_loud(tmp_path):
         rt['accounting'] = dict(train.runtime['accounting'])
         rt['accounting']['total_position_schedule'] = sched
         rt['solver']['diffv2_load_value_fn'] = [load_member]
-        return DiffSolverV2(train.bundle, rt).solve().values
+        solver = DiffSolverV2(train.bundle, rt)
+        solver.warmup()                       # a loaded checkpoint restores the frame, fits nothing
+        return solver.finish(solver.bundle).values
 
     same = train.runtime['accounting']['total_position_schedule']   # normalized training corridor
     assert _eval(ckpt, same) == art['V_0'], 'reload in the SAME corridor must echo the trained V_0'
@@ -251,7 +254,9 @@ def test_corridor_free_policy_rolls_in_any_corridor(tmp_path):
     rt['accounting'] = dict(train.runtime['accounting'])
     rt['accounting']['total_position_schedule'] = ((0, -50.0, -20.0),)   # roll inside a corridor
     rt['solver']['diffv2_load_value_fn'] = [ckpt]
-    v = DiffSolverV2(train.bundle, rt).solve().values             # must NOT raise
+    solver = DiffSolverV2(train.bundle, rt)
+    solver.warmup()
+    v = solver.finish(solver.bundle).values                        # must NOT raise
     assert v == train.policy_artifact['V_0']
 
 

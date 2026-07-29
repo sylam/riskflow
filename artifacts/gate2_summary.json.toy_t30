@@ -1,0 +1,86 @@
+{
+  "config": {
+    "T_dec": 30,
+    "T_A": 15,
+    "dt_years": 0.01984126984126984,
+    "S_0": 100.0,
+    "K": 100.0,
+    "mu_per_state": [
+      0.5,
+      -0.5
+    ],
+    "sigma_per_state": [
+      0.15,
+      0.4
+    ],
+    "P_calib": [
+      [
+        0.97,
+        0.03
+      ],
+      [
+        0.1,
+        0.9
+      ]
+    ],
+    "initial_state_probs": [
+      0.5,
+      0.5
+    ],
+    "N_S": 11,
+    "log_S_halfwidth": 0.5,
+    "q_min": -5,
+    "q_max": 5,
+    "N_W": 201,
+    "W_halfwidth": 1800.0,
+    "lambda_turnover": 0.0001,
+    "symlog_c": 100.0
+  },
+  "V_0": 0.9263985015567058,
+  "V_0_per_regime": [
+    0.8912982905948685,
+    0.961498712518543
+  ],
+  "V_0_wide_grid": null,
+  "off_grid": {
+    "total_queries": 21541596120,
+    "frac_below": 0.021146299348592558,
+    "frac_above": 0.020320653008324994,
+    "frac_off_grid": 0.04146695235691755,
+    "observed_w_range": [
+      -2846.5309782181866,
+      3046.4096720862444
+    ],
+    "grid_w_range": [
+      -1700.0,
+      1900.0
+    ]
+  },
+  "initial_policy": {
+    "r=0": {
+      "q_A_idx": 10,
+      "q_B_idx": 10,
+      "q_A_value": 5,
+      "q_B_value": 5
+    },
+    "r=1": {
+      "q_A_idx": 0,
+      "q_B_idx": 0,
+      "q_A_value": -5,
+      "q_B_value": -5
+    }
+  },
+  "static_hold_mean": 0.6051981495252378,
+  "static_hold_se": 0.0010503196506011507,
+  "delta_flat_mean": 0.6930397578681513,
+  "delta_flat_se": 9.595792106674887e-08,
+  "dynamic_alpha": 0.23335874368855447,
+  "wealth_monotonicity_failures": 0,
+  "elapsed_seconds": 914.3184732940281,
+  "pass_off_grid": true,
+  "pass_static_hold": true,
+  "pass_delta_flat": true,
+  "pass_alpha": true,
+  "pass_stability": true,
+  "pass_overall": true
+}

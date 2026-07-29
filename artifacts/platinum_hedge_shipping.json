@@ -6,7 +6,7 @@
    "Base_Date": {
     ".Timestamp": "2025-12-01"
    },
-   "Simulation_Batches": 1,
+   "Simulation_Batches": 2,
    "Batch_Size": 8192,
    "Random_Seed": 1234,
    "Currency": "USD",
@@ -166,7 +166,6 @@
      "T_Min": 0,
      "DiffV2_Fit_Iters": 60,
      "DiffV2_Hidden": 32,
-     "DiffV2_OOS_Frac": 0.5,
      "DiffV2_LR": 0.002,
      "DiffV2_Cost_Aware_Argmax": "Yes",
      "DiffV2_One_Step_Fork": "Yes",

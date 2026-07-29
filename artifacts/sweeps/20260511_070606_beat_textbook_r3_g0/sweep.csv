@@ -1,0 +1,5 @@
+mean_pnl,worst_pnl,p5_pnl,sortino_metric,no_trade_worst,no_trade_mean,mean_delta_vs_no_trade,worst_delta_vs_no_trade,max_per_inst_pos,min_per_inst_pos,max_total_abs_pos,frac_post_settle,row_tag,row_name,seed,epochs,overrides,elapsed_min
+72127.0859375,-1594258.75,-760546.5874999999,-688419.5015624999,-1569304.0,112118.96875,-39991.8828125,-24954.75,2.0,-8.0,18.0,1.0,dense_8_seed42,dense_8,42,100,optimizer.Dense_Tracking_Reward_Scale=8.0,6.472978506050034
+89533.6328125,-1518249.125,-764604.56875,-675070.9359375,-1569304.0,112118.96875,-22585.3359375,51054.875,0.0,-4.0,7.0,1.0,dense_10_seed42,dense_10,42,100,optimizer.Dense_Tracking_Reward_Scale=10.0,6.506222156950026
+99396.09375,-1619988.375,-813687.975,-714291.88125,-1569304.0,112118.96875,-12722.875,-50684.375,2.0,-5.0,7.0,1.0,dense_15_seed42,dense_15,42,100,optimizer.Dense_Tracking_Reward_Scale=15.0,6.509343357916683
+112118.96875,-1569304.0,-777357.4781249999,-665238.5093749999,-1569304.0,112118.96875,0.0,0.0,0.0,0.0,0.0,0.0,dense_20_seed42,dense_20,42,100,optimizer.Dense_Tracking_Reward_Scale=20.0,6.498253610916618

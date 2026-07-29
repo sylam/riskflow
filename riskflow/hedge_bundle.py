@@ -1332,21 +1332,15 @@ class HedgeRuntimeExecutionResult:
 
 
 def run_hedge_execution(bundle, runtime):
-    """Dispatch the hedging run by Execution_Mode. `solve_hedge` runs the differential-ML
-    solver (DiffSolverV2 + benchmark tracks); `simulate_only` rolls the env forward with zero
-    trades and reports the terminal P&L summary (the unhedged baseline) — callers drive an
-    explicit policy on top via `HedgeRuntimeExecutionResult.create_stepper()`."""
-    mode = runtime['execution_mode']
-    if mode == 'solve_hedge':
-        from .hedge_solver import solve_hedge
-        return solve_hedge(bundle, runtime)
-    if mode == 'simulate_only':
-        started = time.perf_counter()
-        stepper = BundleStepper(bundle, runtime)
-        while not stepper.done:
-            stepper.step(None)
-        return {'policy': None, 'policy_artifact': None, 'optimizer_diagnostics': None,
-                'evaluation_output': stepper.evaluation_output(
-                    timing={'evaluation_time_seconds': float(time.perf_counter() - started)})}
-    raise ValueError(
-        f"Unknown Execution_Mode {mode!r}; supported: 'solve_hedge' | 'simulate_only'.")
+    """Roll the env forward with zero trades and report the terminal P&L summary — the unhedged
+    baseline for `Execution_Mode='simulate_only'`. Callers drive an explicit policy on top via
+    `HedgeRuntimeExecutionResult.create_stepper()`. `solve_hedge` does not come through here:
+    `HedgeMonteCarlo.execute` drives `StreamingSolve` a batch at a time, and the mode itself is
+    validated at the JSON boundary in `construct_hedge_runtime`."""
+    started = time.perf_counter()
+    stepper = BundleStepper(bundle, runtime)
+    while not stepper.done:
+        stepper.step(None)
+    return {'policy': None, 'policy_artifact': None, 'optimizer_diagnostics': None,
+            'evaluation_output': stepper.evaluation_output(
+                timing={'evaluation_time_seconds': float(time.perf_counter() - started)})}

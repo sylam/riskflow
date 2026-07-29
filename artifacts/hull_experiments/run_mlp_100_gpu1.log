@@ -1,0 +1,31 @@
+config=mlp_100  seeds=[1, 2, 3, 4, 5]  cuda=1
+  overrides:
+    MLP_Train_Steps_Per_Solve = 100
+    MLP_Final_Init_Scale = 0.001
+  out: artifacts/hull_experiments/20260526_025033_mlp_100.csv
+
+[1/5] seed=1 starting at 02:50:35
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.682 at t=77 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.660 at t=76 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.631 at t=75 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.458 at t=74 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.522 at t=73 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.554 at t=72 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.669 at t=71 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.688 at t=70 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.595 at t=69 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.599 at t=68 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.634 at t=67 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.470 at t=66 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.305 at t=65 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.160 at t=64 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.156 at t=63 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.094 at t=62 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.246 at t=61 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.566 at t=60 (<0.7) — linear backbone weak
+WARNING:PLAT_JUL29:LsmDpSolver: OLS R^2=0.525 at t=59 (<0.7) — linear backbone weak
+  V_0 dp=-1.0205 mpc=0.0238 hs=0.9840 tb=0.0311 ladder_ok=False  (35.6 min)
+
+[2/5] seed=2 starting at 03:26:10
+WARNING:MarketDataRF_platinum_calibrated:Price Factor 'DiscountRate.USD-SOFR' not found in market data

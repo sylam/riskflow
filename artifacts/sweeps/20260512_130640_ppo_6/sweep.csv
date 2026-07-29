@@ -1,0 +1,2 @@
+mean_pnl,worst_pnl,p5_pnl,sortino_metric,n_eval_paths,no_trade_worst,no_trade_mean,mean_delta_vs_no_trade,worst_delta_vs_no_trade,max_per_inst_pos,min_per_inst_pos,max_total_abs_pos,frac_post_settle,override_PPO_Epochs,seed,epochs,tag,elapsed_min
+99051.90625,-1675515.0,-792601.1875,-693549.28125,2048,-1716057.5,112280.5625,-13228.65625,40542.5,3.0,-25.0,25.0,1.0,6,7,60,ppo_6,24.449741998349996
