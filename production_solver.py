@@ -61,8 +61,13 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s %(message
 
 # ---- validated best configuration -------------------------------------------------------------
 BEST_CALC = {
-    'Batch_Size': 8192,        # outer paths PER BATCH; scale up on a bigger GPU (memory ~ linear)
-    'Simulation_Batches': 2,   # stream length: N-1 fit batches, then a held-out one
+    # Measured over 4 (Batch_Size, Simulation_Batches) arms x 3 seeds on the platinum book
+    # (artifacts/shipping_recipe.csv). STREAM LENGTH is the lever, not batch width: 4096x5 doubles
+    # the edge over textbook of 4096x2 (the retired 8192x1 + OOS 0.5 arithmetic) and wins on mean
+    # edge, worst-seed edge and p5. 8192x5 buys more CVaR5 for 2x the wall, 2x the memory and a 3x
+    # worse seed spread -- its worst seed falls below 4096x2's.
+    'Batch_Size': 4096,        # outer paths PER BATCH; the only axis fork memory depends on
+    'Simulation_Batches': 5,   # stream length: 4 fit batches (16384 paths), then a held-out one
     'Inner_Sub_Batch': 64,     # inner draws — the selection floor for near-identical hedges
     'Inner_MC_Enabled': 'Yes',
     'Inner_Antithetic': 'Yes', # mirrored (z,-z) inner pairs — halves argmax selection variance

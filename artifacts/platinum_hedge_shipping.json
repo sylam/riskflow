@@ -6,8 +6,8 @@
    "Base_Date": {
     ".Timestamp": "2025-12-01"
    },
-   "Simulation_Batches": 2,
-   "Batch_Size": 8192,
+   "Simulation_Batches": 5,
+   "Batch_Size": 4096,
    "Random_Seed": 1234,
    "Currency": "USD",
    "Calendar": "Chicago",
