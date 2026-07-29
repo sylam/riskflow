@@ -126,11 +126,10 @@ def _cfg(t_min):
 
 
 def _full_block(self, i00, i10):
-    """The pre-feature `hermite_params`: build g,c for the WHOLE block on the first gather,
-    ignoring the rows it names."""
+    """The pre-feature `params`: build the whole block's parameters on the first gather, ignoring
+    the rows it names."""
     if self.rows is None:
-        g, c = utils.hermite_interpolation_tensor(self.hermite_tenor, self.tensor)
-        self.interp_params = [p.reshape(-1, p.shape[-1]) for p in (g, c)]
+        self.interp_params = self.build_rows(0, self.tensor.shape[0] - 1)
         self.rows = (0, self.tensor.shape[0] - 1)
     return self.interp_params[0], self.interp_params[1], 0
 
@@ -138,9 +137,9 @@ def _full_block(self, i00, i10):
 def _run(cfg, name, lazy=True, forks=None):
     """One JSON-only run. `lazy=False` forces the pre-feature full-block build so the lazily
     built answer can be compared against it."""
-    original = utils.Interpolation.hermite_params
+    original = utils.Interpolation.params
     if not lazy:
-        utils.Interpolation.hermite_params = _full_block
+        utils.Interpolation.params = _full_block
     original_fork = HedgeMonteCarlo._run_inner_mc_at_t
     if forks is not None:
         def record(self, t, *a, **kw):
@@ -155,7 +154,7 @@ def _run(cfg, name, lazy=True, forks=None):
         _, result = cx.run_job()
         return ((result.evaluation_summary or {}).get('diagnostics') or {}).get('V_0')
     finally:
-        utils.Interpolation.hermite_params = original
+        utils.Interpolation.params = original
         HedgeMonteCarlo._run_inner_mc_at_t = original_fork
 
 

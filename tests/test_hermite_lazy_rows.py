@@ -19,7 +19,8 @@ import numpy as np
 import pytest
 import torch
 
-from riskflow.utils import Interpolation, hermite_interpolation_tensor
+from riskflow.utils import (Interpolation, construct_interpolation,
+                            hermite_interpolation_tensor)
 
 
 def _curve(scen, n_tenors, batch, seed=0):
@@ -32,8 +33,17 @@ def _curve(scen, n_tenors, batch, seed=0):
     return (base + drift + noise).to(torch.float64)
 
 
+def _tenor_np(n_tenors):
+    """The factor's tenor grid, as `CurveTenor` carries it."""
+    return np.linspace(0.08, 30.0, n_tenors)
+
+
 def _tenor(n_tenors):
-    return torch.linspace(0.08, 30.0, n_tenors, dtype=torch.float64).reshape(1, -1, 1)
+    """The same grid in the shape `hermite_interpolation_tensor` wants. Derived from the NUMPY
+    tenor, because that is what the interpolation kind builds from — `torch.linspace` and
+    `np.linspace` disagree in the last bits, and a reference built the other way is not the
+    production grid."""
+    return torch.from_numpy(_tenor_np(n_tenors)).reshape(1, -1, 1)
 
 
 # --------------------------------------------------------------------------------------------
@@ -73,8 +83,8 @@ def test_row_independence_holds_in_float32_too():
 SCEN, N_TENORS, BATCH = 119, 31, 6
 
 
-def _hermite(curve, t):
-    return Interpolation(curve, 'Hermite', 0.08, 30.0, hermite_tenor=t)
+def _hermite(curve, _t):
+    return construct_interpolation('Hermite', curve, _tenor_np(curve.shape[1]), 0.08, 30.0)
 
 
 def _gather(interp, rows, alpha=None):
@@ -90,15 +100,15 @@ def _gather(interp, rows, alpha=None):
 def _eager(curve, t):
     """The pre-feature reference: an Interpolation whose coefficients cover the whole block."""
     interp = _hermite(curve, t)
-    interp.hermite_params(torch.tensor([[0], [(SCEN - 1) * N_TENORS]]), None)
+    interp.params(torch.tensor([[0], [(SCEN - 1) * N_TENORS]]), None)
     assert interp.rows == (0, SCEN - 1)
     return interp
 
 
 def _counted(interp, tally):
     """`interp`, with the scenario-row count of every coefficient build appended to `tally`."""
-    build = interp.hermite_rows
-    interp.hermite_rows = lambda lo, hi: (tally.append(hi - lo + 1), build(lo, hi))[1]
+    build = interp.build_rows
+    interp.build_rows = lambda lo, hi: (tally.append(hi - lo + 1), build(lo, hi))[1]
     return interp
 
 
@@ -222,7 +232,7 @@ def test_a_two_segment_curve_defers_per_segment():
         obj = SegmentedInterpolation(curve, spec, tenor, 0.08, 30.0)
         if eager:                                              # pre-build the whole block
             for seg in obj.segments:
-                seg.hermite_params(torch.tensor([[0], [59 * seg.shape[1]]]), None)
+                seg.params(torch.tensor([[0], [59 * seg.shape[1]]]), None)
         return obj, obj.eval(rows, None, None, i1, i1 + 1, w2, tnr, 1.0)
 
     lazy, got = run(False)
@@ -346,6 +356,8 @@ def test_a_leaf_knows_nothing_about_blocks():
     assert isinstance(whole, Interpolation)
     for attr in ('blocks', 'cuts', 'first_row', 'batch_index', 'rebase', 'broadcast'):
         assert not hasattr(whole, attr), f'a leaf grew a composite concern: {attr}'
+    # nor does it know WHICH interpolation it is - that belongs to the kind it was built with
+    assert type(whole.interp).__name__ == 'Linear'
     for has_alpha in (False, True):
         assert whole.route(np.array([0, 7, 99]), has_alpha) == ((None, 0, 0),)
 
@@ -370,7 +382,7 @@ def test_the_hermite_pair_is_built_per_block_at_that_block_s_own_width():
     assert past_leaf.interp_params[0].shape[-1] == B_OUTER, 'past coefficients are flat-width'
     assert forked_leaf.interp_params == [], 'the forked block was built for a gather below it'
     g_full, c_full = hermite_interpolation_tensor(          # the block's own tenor grid, exactly
-        past_leaf.hermite_tenor, past[past_leaf.rows[0]:past_leaf.rows[1] + 1])
+        past_leaf.interp.tenor, past[past_leaf.rows[0]:past_leaf.rows[1] + 1])
     assert torch.equal(past_leaf.interp_params[0], g_full.reshape(-1, B_OUTER))
     assert torch.equal(past_leaf.interp_params[1], c_full.reshape(-1, B_OUTER))
 
