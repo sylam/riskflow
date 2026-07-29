@@ -19,8 +19,7 @@ import numpy as np
 import pytest
 import torch
 
-from riskflow.utils import (Interpolation, construct_interpolation,
-                            hermite_interpolation_tensor)
+from riskflow.utils import Interpolation, hermite_interpolation_tensor
 
 
 def _curve(scen, n_tenors, batch, seed=0):
@@ -84,7 +83,7 @@ SCEN, N_TENORS, BATCH = 119, 31, 6
 
 
 def _hermite(curve, _t):
-    return construct_interpolation('Hermite', curve, _tenor_np(curve.shape[1]), 0.08, 30.0)
+    return Interpolation.build(curve, 'Hermite', _tenor_np(curve.shape[1]))
 
 
 def _gather(interp, rows, alpha=None):
@@ -94,7 +93,7 @@ def _gather(interp, rows, alpha=None):
     nxt = idx.clamp(max=SCEN - 2) + 1 if alpha is not None else None
     w2 = torch.full((len(rows), 1, BATCH), 0.35, dtype=torch.float64)
     tnr = torch.full((len(rows), 1), 5.0, dtype=torch.float64)
-    return interp.eval(idx, nxt, alpha, 3, 4, w2, tnr, 1.0)
+    return interp.eval(('Hermite', 0.08, 30.0), idx, nxt, alpha, 3, 4, w2, tnr, 1.0)
 
 
 def _eager(curve, t):
@@ -227,13 +226,15 @@ def test_a_two_segment_curve_defers_per_segment():
     i1 = torch.tensor([[0], [2], [5]])
     w2 = torch.full((len(rows), 1, batch), 0.35, dtype=torch.float64)
     tnr = torch.full((len(rows), 1), 5.0, dtype=torch.float64)
+    split_tenor = tenor[split]
+    tenor_data = (spec, (0.08, split_tenor), (split_tenor, 30.0))
 
     def run(eager):
-        obj = SegmentedInterpolation(curve, spec, tenor, 0.08, 30.0)
+        obj = SegmentedInterpolation(curve, spec, tenor)
         if eager:                                              # pre-build the whole block
             for seg in obj.segments:
                 seg.params(torch.tensor([[0], [59 * seg.shape[1]]]), None)
-        return obj, obj.eval(rows, None, None, i1, i1 + 1, w2, tnr, 1.0)
+        return obj, obj.eval(tenor_data, rows, None, None, i1, i1 + 1, w2, tnr, 1.0)
 
     lazy, got = run(False)
     _eagerly, want = run(True)
@@ -351,18 +352,17 @@ def test_a_leaf_knows_nothing_about_blocks():
     """The separation, asserted directly. An ordinary grid builds a LEAF — no cuts, no routing, no
     block offsets, no batch map — and a fork builds a composite over leaves that are themselves
     just as ignorant. Base valuation and credit Monte Carlo only ever get the leaf."""
-    tenor = np.linspace(0.08, 30.0, N_TENORS)
-    whole = build_interpolation(_curve(CUTOFF + T_INNER, N_TENORS, B_OUTER * FAN), 'Linear', tenor)
+    tenor = utils.tenor_diff(np.linspace(0.08, 30.0, N_TENORS))
+    whole = build_interpolation(_curve(CUTOFF + T_INNER, N_TENORS, B_OUTER * FAN), tenor)
     assert isinstance(whole, Interpolation)
     for attr in ('blocks', 'cuts', 'first_row', 'batch_index', 'rebase', 'broadcast'):
         assert not hasattr(whole, attr), f'a leaf grew a composite concern: {attr}'
-    # nor does it know WHICH interpolation it is - that belongs to the kind it was built with
-    assert type(whole.interp).__name__ == 'Linear'
+    assert whole.interp_params == [] and whole.hermite_tenor is None, 'a Linear leaf has no params'
     for has_alpha in (False, True):
-        assert whole.route(np.array([0, 7, 99]), has_alpha) == ((None, 0, 0),)
+        assert whole.route(np.array([0, 7, 99]), has_alpha) is None, 'a leaf has nothing to route'
 
     past, inner = _blocks()
-    forked = build_interpolation(_source(past, inner), 'Linear', tenor)
+    forked = build_interpolation(_source(past, inner), tenor)
     assert isinstance(forked, RoutedInterpolation)
     assert all(isinstance(s, Interpolation) for s in forked.strategies)
     assert list(forked.cuts) == [CUTOFF]
@@ -382,7 +382,7 @@ def test_the_hermite_pair_is_built_per_block_at_that_block_s_own_width():
     assert past_leaf.interp_params[0].shape[-1] == B_OUTER, 'past coefficients are flat-width'
     assert forked_leaf.interp_params == [], 'the forked block was built for a gather below it'
     g_full, c_full = hermite_interpolation_tensor(          # the block's own tenor grid, exactly
-        past_leaf.interp.tenor, past[past_leaf.rows[0]:past_leaf.rows[1] + 1])
+        past_leaf.hermite_tenor, past[past_leaf.rows[0]:past_leaf.rows[1] + 1])
     assert torch.equal(past_leaf.interp_params[0], g_full.reshape(-1, B_OUTER))
     assert torch.equal(past_leaf.interp_params[1], c_full.reshape(-1, B_OUTER))
 
@@ -396,12 +396,11 @@ def test_the_spot_path_routes_the_same_way(label, alpha):
     inner = _curve(T_INNER, 1, B_OUTER * FAN, seed=32)[:, 0, :]
     rows = ROW_SETS[label]
     grid = _time_grid(rows, alpha)
+    flat = utils.tenor_diff(np.zeros(1))
     split = utils.gather_scenario_interp(
-        build_interpolation(_source(past, inner), 'Linear', np.zeros(1)),
-        grid, None, as_curve_tensor=False)
+        build_interpolation(_source(past, inner), flat), grid, None, as_curve_tensor=False)
     joined = utils.gather_scenario_interp(
-        build_interpolation(_join(past, inner), 'Linear', np.zeros(1)),
-        grid, None, as_curve_tensor=False)
+        build_interpolation(_join(past, inner), flat), grid, None, as_curve_tensor=False)
     assert split.shape == joined.shape == (len(rows), B_OUTER * FAN)
     assert torch.equal(split, joined)
 
@@ -443,6 +442,7 @@ def test_a_segmented_curve_inside_a_fork_composes(alpha):
     # the past block's segments stay at the OUTER width — the whole point of not joining
     assert all(seg.shape[-1] == B_OUTER
                for seg in curve_tensor.interp_obj.strategies[0].segments)
+    assert curve_tensor.interp_obj.strategies[0].segments[0].hermite_tenor is not None
     assert torch.equal(split, joined)
 
 
