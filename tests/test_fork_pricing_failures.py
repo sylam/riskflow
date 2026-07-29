@@ -125,21 +125,9 @@ def _cfg(t_min):
     return cfg
 
 
-def _full_block(self, i00, i10):
-    """The pre-feature `params`: build the whole block's parameters on the first gather, ignoring
-    the rows it names."""
-    if self.rows is None:
-        self.interp_params = self.build_rows(0, self.tensor.shape[0] - 1)
-        self.rows = (0, self.tensor.shape[0] - 1)
-    return self.interp_params[0], self.interp_params[1], 0
-
-
-def _run(cfg, name, lazy=True, forks=None):
-    """One JSON-only run. `lazy=False` forces the pre-feature full-block build so the lazily
-    built answer can be compared against it."""
-    original = utils.Interpolation.params
-    if not lazy:
-        utils.Interpolation.params = _full_block
+def _run(cfg, name, forks=None):
+    """One JSON-only run. `forks` collects every inner-MC fork's outputs when a caller wants to
+    inspect what the solver was handed."""
     original_fork = HedgeMonteCarlo._run_inner_mc_at_t
     if forks is not None:
         def record(self, t, *a, **kw):
@@ -154,7 +142,6 @@ def _run(cfg, name, lazy=True, forks=None):
         _, result = cx.run_job()
         return ((result.evaluation_summary or {}).get('diagnostics') or {}).get('V_0')
     finally:
-        utils.Interpolation.params = original
         HedgeMonteCarlo._run_inner_mc_at_t = original_fork
 
 
@@ -172,7 +159,7 @@ def test_an_averaging_tradable_is_priced_not_retired():
     assert forks, 'no inner-MC forks ran'
     assert all(f['PL_AVG_SWAP'] > 0.0 for f in forks), \
         'the averaging tradable is zero in some fork — it was retired from the hedge set'
-    assert built == _run(cfg, 'avg_tradable_full', lazy=False), \
+    assert built == _run(cfg, 'avg_tradable_again'), \
         'the lazily built answer differs from the full-block one'
 
 
@@ -186,7 +173,7 @@ def test_a_settlement_lagged_liability_solves():
         'Payment_Date'] = TS('2026-10-30')
     hp['Tradable_Instruments']['CashAccountDeal']['USD_CASH'][
         'Investment_Horizon'] = TS('2026-10-30')
-    assert _run(copy.deepcopy(cfg), 'lagged') == _run(cfg, 'lagged_full', lazy=False)
+    assert _run(copy.deepcopy(cfg), 'lagged') == _run(cfg, 'lagged_again')
 
 
 def test_a_bullet_sampled_leg_solves():
@@ -201,7 +188,7 @@ def test_a_bullet_sampled_leg_solves():
         'Investment_Horizon'] = TS('2026-08-20')
     cfg['Calc']['MergeMarketData']['ExplicitMarketData']['Price Factors'][
         'ForwardPriceSample.USD']['Sampling_Convention'] = 'ForwardPriceSampleBullet'
-    assert _run(copy.deepcopy(cfg), 'bullet') == _run(cfg, 'bullet_full', lazy=False)
+    assert _run(copy.deepcopy(cfg), 'bullet') == _run(cfg, 'bullet_again')
 
 
 def test_a_two_leg_liability_book_solves():
@@ -214,7 +201,7 @@ def test_a_two_leg_liability_book_solves():
         _energy_leg('PLAT_AUG29', '2026-05-01', '2026-08-31', '2026-09-04'))
     hp['Tradable_Instruments']['CashAccountDeal']['USD_CASH'][
         'Investment_Horizon'] = TS('2026-09-04')
-    assert _run(copy.deepcopy(cfg), 'two_leg') == _run(cfg, 'two_leg_full', lazy=False)
+    assert _run(copy.deepcopy(cfg), 'two_leg') == _run(cfg, 'two_leg_again')
 
 
 def test_a_failed_tradable_inside_a_fork_stops_the_run():

@@ -135,6 +135,85 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
       `first_row` (where it starts in the logical grid) and `batch_index` (which of ITS columns
       supplies each logical column). A fork publishes two blocks; ordinary generation publishes a
       bare tensor and no source at all.
+    - `Interpolation` — one physical tensor and whatever its kind derives from it. It knows
+      nothing about blocks, logical rows or batch fan-out, and flattens rows against its OWN
+      stride. Base valuation, credit Monte Carlo and the outer hedge loop build only this.
+    - `SegmentedInterpolation` — a SIBLING, not a subclass: composes leaves over the TENOR axis
+      for a `Near_Interpolation` curve.
+    - `RoutedInterpolation` — composes strategies over the SCENARIO axis for a fork.
+
+    `build_interpolation` is the single recursive constructor: bare tensor + kind → leaf; bare
+    tensor + segment list → segmented; `ScenarioSource` + either → routed, whose per-block children
+    it builds by calling itself. So a segmented curve inside a fork is a `RoutedInterpolation` of
+    `SegmentedInterpolation`s and needs no special case — the two compositions are orthogonal.
+
+    **Why a fork publishes blocks.** Every realized-past row is identical across the inner draws,
+    so joining them into one tensor writes the past out `Inner_Sub_Batch` times: 98% of the
+    stuffed buffer at the production operating point, dragging a same-shaped slab of Hermite
+    coefficients with it. Each block interpolates at its OWN width and
+    `ScenarioBlock.project` takes the RESULT up to the logical width — never the stored tensor,
+    which would hand back exactly the memory the split exists to save.
+
+    **Order is load-bearing.** A read is raw (`read_at`), then blended over time, then `combine`d
+    (RT scaling, and the segmented tenor select). `combine` and `project` are both linear, so they
+    commute with the blend — which is what lets the routed path be the same arithmetic in the same
+    order as an unrouted one, and is why the whole thing is bitwise.
+
+    A time-interpolated read reaches `index + 1`, so a row just below a cut reads ACROSS it and
+    names two blocks — `route` classifies on where a read ENDS, not where it starts.
+
+    **Invariant — a source is write-once.** Built after every process's `generate` has published,
+    and nothing writes into `t_Scenario_Buffer` afterwards. It answers only `shape` / `new` / the
+    RT tenor rescale, so a late write fails loud rather than silently materializing the grid it
+    exists to avoid.
+
+    Measured on the production walk-forward book (trade 202001, garch, seed 7), like for like:
+
+    | | 1280x64 | 2048x64 | wall @1280 | kB per flat sample |
+    | --- | ---: | ---: | ---: | ---: |
+    | joined grid | 6.33 GiB | 10.11 GiB | 116.2 s | 80.62 |
+    | block sequence | **1.09 GiB** | **1.71 GiB** | 105.9 s | **13.23** |
+
+    `peak_alloc = 0.057 GiB + 13.23 kB · B_flat` (two-point fit; the 4096x64 rung measured
+    3.36 GiB against 3.36 predicted). At a 19.6 GiB allocated ceiling that moves max `B_flat`
+    from 254 k to 1.55 M — `Batch_Size` 3 977 → 24 208 at `Inner_Sub_Batch` 64, or
+    `Inner_Sub_Batch` 199 → 1 210 at `Batch_Size` 1280.
+
+!!! note "Hermite coefficients are built eagerly, and the block split is why that is affordable"
+    An intermediate design deferred the `g,c` pair to the gather that read it, on the argument
+    that a fork reads ~11% of a block's rows. That was true of the JOINED grid, where the past's
+    coefficients cost `B_flat` columns — 1.03 GiB at 1280x64. Blocks store those rows at
+    `B_outer`, so eager costs single-digit MB and the deferral stopped paying for itself.
+    Measured both ways on the production walk-forward: deferred 193 s / 0.595 GiB, eager
+    **179 s / 0.617 GiB** — 7% faster for 22 MiB of a 0.6 GiB peak, because the build COUNT was
+    unchanged (3 737 vs 3 769 — objects widen once) while the span bookkeeping added a device
+    sync per gather. On deep credit MC eager wins on both axes (132.4 MiB / 0.68 s against
+    152.0 / 0.82). A full-horizon fork (`DiffV2_One_Step_Fork='No'`) is the one shape deferral
+    would still help; it should be justified by being the right fork, not by the reader hedging.
+
+!!! warning "Invariant — `Z.ndim` dispatch (outer vs inner MC)"
+    `generate()` must handle both outer (`Z.ndim==2`, `(T,B)`) and inner (`Z.ndim==3`, `(T,B,B2)`) modes, with the per-outer-path initial state broadcast on the **middle** axis in inner mode. This is what lets one process instance serve both loops.
+
+!!! warning "Invariant — inner-MC batch state + fail-loud pricing"
+    `shared_mem.simulation_batch` and `shared_mem.fillvalue` must track the current flat batch during an inner fork (set before `reset_inner` and before the pricing pass) and be restored to `B_outer` afterward — in a `finally`, so a mid-fork raise (CUDA OOM, degenerate pricing) cannot leave the state flat-sized and make the *next* chunk fail on shapes instead of the real cause; `fillvalue` is frozen at construction and used as the empty-cat fallback in energy-leg / cash-settle code. Inner-MC pricing must fail loud rather than let `Deal.calculate`'s guard swallow a failure into a scalar-0 mark — inside a fork that silently corrupts the solver's training labels. Both halves are checked: the liability on its flat shape, and every tradable still live in the fork's dependency list on having produced a `tensor_marks` entry (a missing one is indistinguishable from an expired contract, and the solver's `live` mask retires it).
+
+!!! warning "Invariant — `keep_tensor` gates the hedge tradable series"
+    `keep_tensor` governs whether `pricing.interpolate` stores `Calc_res['tensor']`; the hedge path sets `Keep_Tensor='Yes'` and harvests those via `tensor_marks`. Removing/altering that store breaks the hedge bundle's tradable series with no error — only missing marks.
+
+## Inner-MC subsystem
+
+`_run_inner_mc_at_t` forks the simulator from each outer-path state at outer step `t`: truncates the grid (`TimeGrid.truncate_to`), optionally windows to `{t,t+1}` (`copy_window`) for the one-step diff-ML bootstrap, and runs ONE pass at `Batch_Size x Inner_Sub_Batch` flat samples (no partition: peak memory is a function of those two JSON fields, and an over-wide config raises CUDA OOM naming the fork). The pass: `reset_inner` (Sobol), per-process `precalculate` from `outer_buf[key][t]`, `inner_fork_seed` / `reseed_inner_state` for the sufficient statistic, generate, then **publishes each factor's grid as a `ScenarioSource`** — the outer-realized past at `B_outer` followed by the forked rows flattened `(B,B2)→B*B2` — for one real pricing pass on restricted `DealStructure`s. It uses the model-agnostic verb protocol so the loop is uniform across model worlds — see [The process protocol](dependency_system.md#the-process-protocol).
+
+!!! note "Four objects, one query: rows route by block, tenors route by segment"
+    The curve read splits into a **query**, **logical scenario storage** and **one physical
+    interpolation**, and nothing holds two of those jobs at once.
+
+    - `CurveTensor` — query coordinates. It keeps scenario ROWS (`index`, `index_next`, `alpha`),
+      never a flattened `row * n_tenors` offset, because a tenor segment's stride is its own.
+    - `ScenarioBlock` / `ScenarioSource` — logical storage. A block is one physical tensor plus
+      `first_row` (where it starts in the logical grid) and `batch_index` (which of ITS columns
+      supplies each logical column). A fork publishes two blocks; ordinary generation publishes a
+      bare tensor and no source at all.
     - `Interpolation` — one physical tensor: its kind, its tenor grid, its Hermite pair. It knows
       nothing about blocks, logical rows or batch fan-out, and flattens rows against its OWN
       stride. Base valuation, credit Monte Carlo and the outer hedge loop build only this.

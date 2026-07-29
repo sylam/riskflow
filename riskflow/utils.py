@@ -463,99 +463,53 @@ class Interpolation(object):
 
     A leaf, and the only class base valuation / credit Monte Carlo / the outer hedge loop ever
     build. `build` prepares what a given interpolation kind stores — an RT kind folds the tenor
-    into the values once, Hermite keeps the tenor grid its coefficients are derived from — and
-    `eval` looks at the kind and returns just what it needs. Dividend curves are plain here; what
-    makes them different lives in `CurveTenor`.
+    into the values, Hermite derives its coefficient pair — and `eval` looks at the kind and
+    returns just what it needs. Dividend curves are plain here; what makes them different lives
+    in `CurveTenor`.
 
     It knows nothing about inner MC, block boundaries, logical rows or batch fan-out: the rows
     reaching it are already in its own frame, and it flattens them against its OWN tenor stride,
     which is what lets a tenor segment be the same kind of object.
     """
 
-    def __init__(self, tensor, tenor=None):
-        """`tenor` is the grid this interpolation derives its parameters from, or None for a kind
-        that needs none. The parameters are NOT built here: `params` builds them for the scenario
-        rows a gather names."""
+    def __init__(self, tensor, interp_params):
         self.tensor = tensor
         self.shape = tuple(tensor.shape)
         self.indexed_tensor = tensor.reshape(-1, tensor.shape[-1])
-        self.tenor = tenor
-        self.interp_params = []
-        self.rows = None            # scenario rows the parameters cover, [lo, hi]
-        self.row_offset = 0         # flat row `interp_params` row 0 corresponds to = lo * n_tenors
+        self.interp_params = [p.reshape(-1, p.shape[-1]) for p in interp_params]
 
     @classmethod
     def build(cls, tensor, kind, tenor):
-        """What an interpolation of `kind` stores. Rate*time folds the tenor into the values here,
-        once, rather than at every read; Hermite keeps the grid to derive coefficients from."""
+        """What an interpolation of `kind` stores: the values, and whatever it derives from them.
+        Rate*time folds the tenor into the values; Hermite derives its coefficient pair."""
         if kind == 'Linear':
-            return cls(tensor)
+            return cls(tensor, [])
         t = tensor.new(tenor[:tensor.shape[1]]).reshape(1, -1, 1)
-        if kind == 'HermiteRT':
-            return cls(tensor * t, t)
-        if kind == 'Hermite':
-            return cls(tensor, t)
+        if kind in ('Hermite', 'HermiteRT'):
+            values = tensor * t if kind == 'HermiteRT' else tensor
+            return cls(values, hermite_interpolation_tensor(t, values))
         if kind == 'LinearRT':
-            return cls(tensor * t)
-        return cls(tensor)
+            return cls(tensor * t, [])
+        return cls(tensor, [])
 
     def route(self, index, has_alpha):
         """A leaf IS the whole grid — there is nothing to route."""
         return None
 
-    def build_rows(self, lo, hi):
-        """The Hermite pair for scenario rows [lo, hi], flattened to the gather axis."""
-        return [p.reshape(-1, p.shape[-1]) for p in
-                hermite_interpolation_tensor(self.tenor, self.tensor[lo:hi + 1])]
-
-    def params(self, i00, i10):
-        """The g,c pair covering the scenario rows THIS gather indexes, plus the flat offset they
-        start at. Deferring the build to the gather is what makes it affordable — construction was
-        eager over the whole tensor while a fork's consumption is sparse — and the gather states
-        the rows it needs, so nothing has to predict them. An empty gather (a step with no resets
-        in range) names no rows and keeps what is built.
-
-        A widening builds only the rows it ADDS and splices them onto what is there, which is
-        exact because the recursion couples along the TENOR axis only, so a row's coefficients
-        depend on that row alone. Re-deriving the union instead is quadratic in a reader that
-        walks the grid forward, and ONE `Interpolation` is cached per curve factor and gathered by
-        every deal — so a book priced in ascending maturity widens a row at a time: measured on a
-        120-deal credit-MC book, 7 501 rows built for a 121-row block against 127 spliced."""
-        n_tenors = self.shape[1]
-        if i00.numel():
-            bounds = (i00.min(), i00.max()) if i10 is None else (
-                torch.minimum(i00.min(), i10.min()), torch.maximum(i00.max(), i10.max()))
-            lo, hi = [int(b) // n_tenors for b in torch.stack(bounds).tolist()]
-            rows = (lo, hi) if self.rows is None else (min(lo, self.rows[0]), max(hi, self.rows[1]))
-        else:
-            rows = self.rows or (0, 0)
-        if rows != self.rows:
-            parts = [self.build_rows(*rows)] if self.rows is None else (
-                ([self.build_rows(rows[0], self.rows[0] - 1)] if rows[0] < self.rows[0] else []) +
-                [self.interp_params] +
-                ([self.build_rows(self.rows[1] + 1, rows[1])] if rows[1] > self.rows[1] else []))
-            self.interp_params = parts[0] if len(parts) == 1 else [
-                torch.cat(p, dim=0) for p in zip(*parts)]
-            self.rows, self.row_offset = rows, rows[0] * n_tenors
-        return self.interp_params[0], self.interp_params[1], self.row_offset
-
-    def read_at(self, tenor_data, rows, i1, i2, w2, span=None):
+    def read_at(self, tenor_data, rows, i1, i2, w2):
         """The RAW value at one time point — before the rate*time scaling, which `combine` applies
         after any time blend.
 
         Scenario rows are flattened into this tensor's (row, tenor) frame HERE, against its OWN
         stride: a tenor segment's stride is its own, which is the whole reason `CurveTensor` hands
         out rows rather than a flat offset. `rows is None` means every row is row 0 — a static
-        curve, or a stochastic one gathered only at the base date — and skips the add entirely.
-        `span` names any further rows the same gather reads, so Hermite builds once for all."""
+        curve, or a stochastic one gathered only at the base date — and skips the add entirely."""
         base = None if rows is None else rows.reshape(-1, 1) * self.shape[1]
         i0, i1x = (i1, i2) if base is None else (base + i1, base + i2)
         if tenor_data[0].startswith('Hermite'):
-            g, c, ofs = self.params(
-                i0, None if span is None else span.reshape(-1, 1) * self.shape[1] + i1)
-            j0 = i0 - ofs if ofs else i0
+            g, c = self.interp_params
             return calc_hermite_curve(
-                w2, g[j0,], c[j0,], self.indexed_tensor[i0,], self.indexed_tensor[i1x,])
+                w2, g[i0,], c[i0,], self.indexed_tensor[i0,], self.indexed_tensor[i1x,])
         # default to linear
         return self.indexed_tensor[i0,] * (1.0 - w2) + self.indexed_tensor[i1x,] * w2
 
@@ -579,7 +533,7 @@ class Interpolation(object):
         return raw * mult
 
     def eval(self, tenor_data, index, index_next, alpha, i1, i2, w2, tnr, time_factor, route=None):
-        raw = self.read_at(tenor_data, index, i1, i2, w2, span=index_next)
+        raw = self.read_at(tenor_data, index, i1, i2, w2)
         if alpha is not None:
             # the t+1 read is taken BEFORE either weighting, so no full-width term is held across it
             raw = self.blend(raw, self.read_at(tenor_data, index_next, i1, i2, w2), alpha)
@@ -613,6 +567,7 @@ class SegmentedInterpolation(object):
         self.segments = [Interpolation.build(tensor[:, s:e + 1, :], kind, tenor[s:e + 1])
                          for s, e, kind in spec]
 
+
     def route(self, index, has_alpha):
         return None
 
@@ -623,11 +578,11 @@ class SegmentedInterpolation(object):
             return i1.clamp(max=e), i2.clamp(max=e)
         return (i1 - s).clamp(min=0), (i2 - s).clamp(min=0)
 
-    def read_at(self, tenor_data, rows, i1, i2, w2, span=None):
+    def read_at(self, tenor_data, rows, i1, i2, w2):
         """One raw read PER SEGMENT — evaluated on the full tenor set and selected in `combine`.
         More work than we need, but it keeps every segment a plain leaf."""
         return [seg.read_at((seg_spec[2], tnr_min, tnr_max), rows,
-                            *self.seg_tenors(k, i1, i2), w2, span=span)
+                            *self.seg_tenors(k, i1, i2), w2)
                 for k, (seg, (seg_spec, tnr_min, tnr_max))
                 in enumerate(zip(self.segments, zip(*tenor_data)))]
 
@@ -648,7 +603,7 @@ class SegmentedInterpolation(object):
         return torch.where((i2 <= self.cutoff).unsqueeze(-1), vals[0], vals[1])
 
     def eval(self, tenor_data, index, index_next, alpha, i1, i2, w2, tnr, time_factor, route=None):
-        raw = self.read_at(tenor_data, index, i1, i2, w2, span=index_next)
+        raw = self.read_at(tenor_data, index, i1, i2, w2)
         if alpha is not None:
             raw = self.blend(raw, self.read_at(tenor_data, index_next, i1, i2, w2), alpha)
         return self.combine(raw, tenor_data, i2, tnr, time_factor)
@@ -720,10 +675,8 @@ class RoutedInterpolation(object):
             rows = self.local(select_rows(index, pos), b0)
             weight, t1, t2 = (select_rows(x, pos) for x in (w2, i1, i2))
             nxt = None if index_next is None else self.local(select_rows(index_next, pos), b1)
-            # the read is per block, but the SPEC is the curve's — one span request when the same
-            # block owns both time reads, so Hermite builds once
-            raw = s0.project(b0, s0.read_at(tenor_data, rows, t1, t2, weight,
-                                            span=nxt if s1 is s0 else None))
+            # the read is per block, but the SPEC is the curve's
+            raw = s0.project(b0, s0.read_at(tenor_data, rows, t1, t2, weight))
             if alpha is not None:
                 # projection and the time blend are both linear, and `combine` runs after both,
                 # so the routed path is the same arithmetic in the same order as an unrouted one
