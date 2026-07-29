@@ -1284,10 +1284,12 @@ class DiffSolverV2:
         HELD-OUT batch — a world no fit step ever saw, so the whole batch is out-of-sample and
         `DiffV2_OOS_Frac` plays no part; a one-shot solve passes its own bundle back and the row
         split provides the held-out rows."""
-        if self.streaming:
+        if self.streaming and bundle is not self.bundle:
             self._bind(bundle)
             # The held-out world needs its own forks: the argmax reads E_inner[C_{t+1}] at each
-            # swept t, and the cached ones belong to the last TRAINING batch.
+            # swept t, and the cached ones belong to the last TRAINING batch. A stream of length 1
+            # — a frozen eval, where warmup's batch IS the held-out one — is already bound to it,
+            # and re-forking would advance the Sobol stream and move the verdict.
             self.inner_cache = {t: self._inner_step(t) for t in self.sweep_ts}
         nets, sweep_ts, inner_cache = self.nets, self.sweep_ts, self.inner_cache
         loaded, rows, worst, root = self.loaded, self.rows, self.worst, self.root
