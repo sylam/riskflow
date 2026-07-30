@@ -441,7 +441,7 @@ def test_inner_mc_shape_and_middle_axis():
 BASE_HN = pd.Timestamp('2024-06-28')
 
 
-def _dedupe_calc():
+def _dedupe_calc(gradient_variables=None):
     """A Credit_Monte_Carlo whose EquityPrice.EQ is routed to HestonNandiImpliedSpotModel AND is
     referenced by a barrier deal with SpotModel='HestonNandi' (the OSS pricer pulls
     HestonNandiModelParameters.EQ in as a static dependent factor). update_factors builds the factor
@@ -494,9 +494,37 @@ def _dedupe_calc():
     params = {'Run_Date': '2024-06-28', 'Time_grid': '0d 2d(1w) 1m', 'Batch_Size': 64,
               'Simulation_Batches': 1, 'Random_Seed': 1, 'Currency': 'USD', 'MCMC_Simulations': 0,
               'Tenor_Offset': 0.0, 'CVA': {'Gradient': 'Yes'}}         # a Gradient='Yes' dict ⇒ greeks on
+    if gradient_variables is not None:
+        params['Gradient_Variables'] = gradient_variables
     calc.params = params
     shared = calc.update_factors(params, BASE_HN, 0, 1)
     return calc, shared
+
+
+@pytest.mark.parametrize('mode', ['All', 'Factors', 'Implied'])
+def test_gradient_variables_modes_build_a_factor_index(mode):
+    """`Gradient_Variables` selects which leaves the sensitivity engine differentiates. Both
+    non-trivial branches were broken: 'Factors' concatenated the two dicts with `+` (TypeError,
+    so the mode could never have run), and 'All' listed the HN parameter leaves TWICE — they are
+    reachable both as implied factors and as static dependents, which is precisely what the
+    implied-leaf dedupe creates. A duplicated leaf differentiates the same tensor twice and
+    inflates the reported gradient vector."""
+    calc, _ = _dedupe_calc(gradient_variables=mode)
+    assert isinstance(calc.all_var, list) and calc.all_var, f'{mode}: empty all_var'
+    for name, var in calc.all_var:
+        assert isinstance(name, utils.Factor) and isinstance(var, torch.Tensor), f'{mode}: {name!r}'
+    assert calc.gradient_index, f'{mode}: no gradient index built'
+    names = [n for n, _ in calc.all_var]
+    assert len(names) == len(set(names)), f'{mode}: duplicate leaves {len(names)} vs {len(set(names))}'
+    implied = {utils.Factor('HestonNandiModelParameters', ('EQ', p))
+               for p in ('Omega', 'Alpha', 'Beta', 'Gamma_Star', 'H0')}
+    got = set(names)
+    if mode == 'Implied':
+        assert got == implied, 'Implied should differentiate exactly the implied leaves'
+    else:
+        # the HN block is a static dependent too (the pricer pulls it in), so BOTH other modes
+        # carry it — 'All' adds nothing here beyond what the dedupe already shares.
+        assert got >= implied | {utils.Factor('EquityPrice', ('EQ',))}, f'{mode}: missing leaves'
 
 
 def test_dedupe_single_leaf_and_gradient_flow():

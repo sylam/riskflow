@@ -1018,9 +1018,13 @@ class Credit_Monte_Carlo(Calculation):
             if calc_greeks == 'Implied':
                 self.all_var = implied_vars
             elif calc_greeks == 'Factors':
-                self.all_var = self.stoch_var + self.static_var
+                self.all_var = list(self.stoch_var.items()) + list(self.static_var.items())
             else:
-                self.all_var = implied_vars + list(self.stoch_var.items()) + list(self.static_var.items())
+                # A factor that is BOTH a static dependent and a spot process's implied factor is
+                # ONE deduped leaf (the implied-leaf invariant), so it is reachable twice here and
+                # the union must not report it twice.
+                self.all_var = list(dict(
+                    implied_vars + list(self.stoch_var.items()) + list(self.static_var.items())).items())
             self.make_factor_index(self.all_var)
 
         scale_by_survival = (
