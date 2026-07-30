@@ -2981,17 +2981,17 @@ class GARCHSpotModel(StochasticProcess):
         # the sim grid runs in CALENDAR time (Time_Grid "0d 1d(1d)" ⇒ dt=1/365.25, NOT
         # business-day adjusted), so f_t = dt_t/dt_c is the trading-time length of a grid
         # step (≈0.69 on the production grid). generate scales per-step variance by f_t so
-        # the annualized vol and the mean-reversion RATE are grid-invariant. n_sub = round(f)
-        # ≥ 2 (grid ≥ ~1.5 bd/step) falls back to the integer
-        # aggregate-variance bridge; n_sub == 1 uses the exact fractional step.
+        # the annualized vol and the mean-reversion RATE are grid-invariant. A step spanning
+        # more than one calibration step walks its own sub-steps
+        # (utils.garch_correlated_substeps); one sub-step is the exact fractional step.
         self.f = _t(dt_arr / dt_c)                                               # (T,) trading-time step length
-        self.n_sub = np.maximum(1, np.round(dt_arr / dt_c)).astype(int)
+        self.sub_dt = utils.substep_schedule(dt_arr / dt_c)
+        self.n_sub = np.array([len(s) for s in self.sub_dt])
         if np.any(self.n_sub >= 2):
-            # Diagnostic (INFO, not WARN — precalculate reruns on every inner fork): only the
-            # coarse-grid aggregate-variance bridge is an approximation; the fractional step is
-            # exact for n_sub == 1 (incl. the calendar-daily production grid, f≈0.69).
-            logging.info('GARCHSpotModel coarse grid: n_sub up to %d — aggregate-variance bridge '
-                         'active (within-step vol-of-vol approximated).', int(self.n_sub.max()))
+            # Diagnostic (INFO, not WARN — precalculate reruns on every inner fork).
+            logging.info('GARCHSpotModel coarse grid: n_sub up to %d — exact daily sub-stepping, '
+                         'the correlated draw rides the √E[h]-weighted combination.',
+                         int(self.n_sub.max()))
         self._log_lr_var = float(np.log(self.param['Omega'] / (1.0 - self.param['Alpha'] - self.param['Beta'])))
 
         # AAD: keep spot0 on the autograd graph. In log mode h depends only on generated
@@ -2999,19 +2999,22 @@ class GARCHSpotModel(StochasticProcess):
         # recursion. Outer mode passes a (1,) scalar; inner-MC mode a (B,) per-outer-path vector.
         self.spot0 = tensor
 
-    def _simulate_returns(self, eps, h):
+    def _simulate_returns(self, eps, z, h):
         """Shared GARCH recursion (outer/inner) on the FRACTIONAL TRADING CLOCK. `eps` (T, ...)
-        unit-variance standardised-t innovations, `h` (...) the entry variance h_0 (per business
-        day). Returns (ds, log_h), each (T, ...): ds[t] is Δlog S landing at grid point t
-        (ds[0]=0 — the dt=0 anchor), log_h[t] is the revealed variance of the move t→t+1
-        (no-lookahead: a function of eps[1..t] only).
+        unit-variance standardised-t innovations, `z` (T, ...) the raw framework Gaussians they
+        were scaled from (a coarse interval's sub-steps re-derive their own t-innovations from
+        z[t]), `h` (...) the entry variance h_0 (per business day). Returns (ds, log_h), each
+        (T, ...): ds[t] is Δlog S landing at grid point t (ds[0]=0 — the dt=0 anchor), log_h[t]
+        is the revealed variance of the move t→t+1 (no-lookahead: a function of draws ≤ t only).
 
         Per step with trading-time length f_t = dt_t/dt_c:
             r_t = √(h_t·f_t)·ε_t,   h_{t+1} = h_t + f_t·(ω − (1−β)·h_t) + α·r_t².
         This is the standard recursion at f=1, has E-fixed-point ω/(1−α−β) for any f, and a
         per-step mean-reversion factor (1 − f(1−α−β)) so the decay RATE is grid-invariant in
-        real time. n_sub ≥ 2 (grid coarser than ~1.5 bd) uses the integer aggregate-variance
-        bridge instead (deterministic sub-step forward, single aggregate draw).
+        real time. A step spanning more than one calibration step walks the sub-steps that span
+        it instead (utils.garch_correlated_substeps — z[t] rides the √E[h·dt]-weighted
+        combination of the sub-step normals); log_h[t] is then the variance entering the NEXT
+        interval, and that interval's own variance Σ h_j·dt_j is realized, not F_t-measurable.
 
         With Convexity_Correction, the deterministic log-drift also carries −½·Var(r_t) so the
         PRICE (not the log-price) is the Mu-martingale: E[exp(r_t − ½Var(r_t))] = 1 for Gaussian
@@ -3023,51 +3026,48 @@ class GARCHSpotModel(StochasticProcess):
         ds = torch.zeros_like(eps)
         log_h[0] = h.log()
         for t in range(1, eps.shape[0]):
-            h, var_step, r = self._advance_variance(h, t, lambda v: v.sqrt() * eps[t])
+            if self.n_sub[t] <= 1:
+                h, var_step, r = self._advance_variance(h, t, lambda v: v.sqrt() * eps[t])
+            else:
+                h, var_step, r = utils.garch_correlated_substeps(
+                    h, z[t], self.sub_dt[t], self.omega, self.alpha, self.beta, self.nu)
             ds[t] = drift[t] + (r - 0.5 * var_step if self.convexity else r)
             log_h[t] = h.log()
         return ds, log_h
 
     def _advance_variance(self, h, t, innovation):
-        """One fractional-clock GARCH variance step, shared by the forward sim (`_simulate_returns`)
+        """One fractional-clock GARCH variance step (n_sub ≤ 1; a coarse interval routes to
+        utils.garch_correlated_substeps in `_simulate_returns` instead), shared by the forward sim
         and the observed-path replay (`reseed_from_path`) so the forward≡replay invariant is
         STRUCTURAL, not maintained by copying. Computes Var(r_t) for the step, obtains the innovation
         via `innovation(var_step)` — the ONLY thing that differs between the two paths (√Var·ε in the
         forward sim; the realized convexity-undone log-return in replay) — and returns
-        (h_{t+1}, var_step, r). n_sub ≤ 1 is the exact fractional recursion
-        h + f·(ω − (1−β)·h) + α·r²; n_sub ≥ 2 the deterministic aggregate-variance bridge (r does
-        NOT enter the h update there — the sub-steps are forwarded via E[r²]=h)."""
-        omega, alpha, beta = self.omega, self.alpha, self.beta
-        if self.n_sub[t] <= 1:
-            ft = self.f[t]
-            var_step = h * ft                                                    # Var(r_t)
-            r = innovation(var_step)
-            return h + ft * (omega - (1.0 - beta) * h) + alpha * r * r, var_step, r
-        # n_sub≥2: only one Gaussian per grid step — forward h deterministically through the integer
-        # sub-steps and draw the aggregate return with the summed variance. Loses within-step
-        # vol-of-vol (documented approximation).
-        h_j, var_step = h, h
-        for _ in range(1, self.n_sub[t]):
-            h_j = omega + (alpha + beta) * h_j
-            var_step = var_step + h_j
+        (h_{t+1}, var_step, r) off the exact fractional recursion h + f·(ω − (1−β)·h) + α·r²."""
+        ft = self.f[t]
+        var_step = h * ft                                                        # Var(r_t)
         r = innovation(var_step)
-        return omega + (alpha + beta) * h_j, var_step, r
+        return h + ft * (self.omega - (1.0 - self.beta) * h) + self.alpha * r * r, var_step, r
 
     def generate(self, shared_mem):
         # Z is (T, B) outer, (T, B, B2) inner. One framework Gaussian per step; the
         # standardised-t rescale draws its own Gamma (no regime sampling → no quasi_rng).
-        # ε is unit-variance and independent of h, so it precomputes fully vectorised.
+        # ε is unit-variance and independent of h, so it precomputes fully vectorised — but
+        # only the fine steps read it (a coarse interval t-scales its own sub-step normals),
+        # so an all-coarse PFE grid skips the draw rather than allocating a dead (T,B) pair.
         Z = shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon]
         nu = self.nu
-        W = torch.distributions.Gamma(nu / 2.0, 0.5).sample(Z.shape).clamp_min(1.0e-6)
-        eps = Z * torch.sqrt(nu / W) * torch.sqrt((nu - 2.0).clamp_min(1.0e-3) / nu)
+        if (self.n_sub[1:] <= 1).any():                                          # t=0 is the anchor
+            W = torch.distributions.Gamma(nu / 2.0, 0.5).sample(Z.shape).clamp_min(1.0e-6)
+            eps = Z * torch.sqrt(nu / W) * torch.sqrt((nu - 2.0).clamp_min(1.0e-3) / nu)
+        else:
+            eps = Z
 
         if Z.ndim == 2:
             T, B = Z.shape
             # h0: the diff-ML t=0 randomization hook (mirrors regime0_outer); else H0 expanded.
             h0 = shared_mem.t_Scenario_Buffer.get((self.factor_key, 'h0_outer'))
             h = h0 if h0 is not None else torch.zeros_like(Z[0]) + self.h0_default
-            ds, log_h = self._simulate_returns(eps, h)
+            ds, log_h = self._simulate_returns(eps, Z, h)
             s0 = self.spot0.expand(B)                                            # (1,) -> (B,)
             log_path = s0.log().unsqueeze(0) + ds.cumsum(dim=0)                  # (T, B)
         else:
@@ -3075,7 +3075,7 @@ class GARCHSpotModel(StochasticProcess):
             # h0: per-outer-path fork seed (mirrors regime0_inner), expanded across B2; else H0.
             h0 = shared_mem.t_Scenario_Buffer.get((self.factor_key, 'h0_inner'))
             h = h0.view(B, 1).expand(B, B2) if h0 is not None else torch.zeros_like(Z[0]) + self.h0_default
-            ds, log_h = self._simulate_returns(eps, h)
+            ds, log_h = self._simulate_returns(eps, Z, h)
             s0 = self.spot0                                                      # (B,)
             log_path = s0.view(B, 1).log() + ds.cumsum(dim=0)                    # (T, B, B2)
         # Floor the log-path before exp(): a fat-tailed Student-t innovation can drive it below
@@ -3131,6 +3131,11 @@ class GARCHSpotModel(StochasticProcess):
         Convexity coupling: the forward sim writes ds = drift − ½Var(r) + r, so the innovation is
         recovered as r = realized_logret − drift + ½Var(r) with the SAME correction, keeping the
         h recursion identical between forward sim and replay (Var(r)=h·f on the n_sub≤1 clock)."""
+        # Replay is defined only on the daily grid: the intra-interval returns the variance
+        # recursion replays are unobservable at coarser nodes.
+        if np.any(self.n_sub >= 2):
+            raise ValueError('reseed_from_path needs n_sub == 1 everywhere; grid is coarser than '
+                             f'the trading day (n_sub up to {int(self.n_sub.max())})')
         obs = simulated.detach()
         logret = obs.clamp_min(1.0e-30).log()
         drift = self.drift
@@ -3291,9 +3296,14 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
     * THE CLOCK: calibrated per trading day (dt_c = 1/`Steps_Per_Year`) vs a calendar scenario
       grid; f = dt/dt_c. n_sub == 1 (f ≤ 1.5): exact fractional step — return variance h·f,
       variance update BLENDED by f (h ← h + f·(hn_variance_step(h,z) − h)); at f=1 this is
-      exactly hn_variance_step. n_sub ≥ 2 (coarse CVA grids): h forwarded deterministically
-      through the mean recursion E[h_{j+1}] = ω+α+ψ h_j plus ONE aggregate Gaussian draw at the
-      summed variance (documented approximation — loses within-step vol-of-vol).
+      exactly hn_variance_step. Coarse PFE/CVA grids: the interval walks the sub-steps that
+      SPAN it — whole trading days then the fractional remainder — through that same
+      recursion (utils.hn_correlated_substeps), so a node marginal is the exact law of its
+      own elapsed trading time and does not jump with grid spacing. What stays approximate
+      is which linear functional carries the cross-factor correlation: the framework draw is
+      the √E[h·dt]-weighted combination of the sub-step normals, an F_t-measurable choice
+      that leaves every marginal exact but matches a correlated sibling only when it shares
+      this variance profile.
     * Observable state: log h_t (predictable, F_t-measurable — no lookahead) in the `hn_log_h`
       buffer. The 7-verb protocol (privileged_layout / privileged_factors / reveal_state_at /
       revealed_annual_vol / inner_fork_seed / outer_reseed / reseed_from_path) mirrors
@@ -3320,7 +3330,9 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
          'the semi-analytic pricer consumes. The persistence is $\\psi=\\beta+\\alpha\\gamma^{*2}$ and '
          'the stationary per-step variance $\\frac{\\omega+\\alpha}{1-\\psi}$. Simulation runs on the '
          'fractional trading clock $f=dt/dt_c$: exact at $f=1$, variance blended by $f$ for finer '
-         'grids, and an aggregate-variance bridge on grids coarser than the trading day.'])
+         'grids, and on coarser grids the step walks the sub-steps spanning it — whole trading '
+         'days then the fractional remainder — so a node carries the law of its own elapsed '
+         'trading time rather than a rounded number of days.'])
 
     def __init__(self, factor, param, implied_factor=None):
         super().__init__(factor, param)
@@ -3350,12 +3362,13 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
         dt_c = 1.0 / float(self.implied.param.get('Steps_Per_Year', 252.0))
         self.dt_c = dt_c
         self.f = shared.one.new_tensor(dt_arr / dt_c)                             # (T,) trading-time step length
-        self.n_sub = np.maximum(1, np.round(dt_arr / dt_c)).astype(int)
+        self.sub_dt = utils.substep_schedule(dt_arr / dt_c)
+        self.n_sub = np.array([len(s) for s in self.sub_dt])
         if np.any(self.n_sub >= 2):
-            # INFO (precalculate reruns on every inner fork): only the coarse-grid aggregate-variance
-            # bridge is an approximation; the fractional step is exact for n_sub == 1.
-            logging.info('HestonNandiImpliedSpotModel coarse grid: n_sub up to %d — aggregate-variance '
-                         'bridge active (within-step vol-of-vol approximated).', int(self.n_sub.max()))
+            # INFO (precalculate reruns on every inner fork).
+            logging.info('HestonNandiImpliedSpotModel coarse grid: n_sub up to %d — exact daily '
+                         'sub-stepping, the correlated draw rides the √E[h]-weighted combination.',
+                         int(self.n_sub.max()))
 
         # Parameters ride the implied tensors when greeks are on (mirrors CS's numpy-vs-implied_tensor
         # branch); otherwise the calibrated scalars from the implied factor. Either way they are 0-dim
@@ -3370,7 +3383,6 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
         else:
             vals = [shared.one.new_tensor(float(p[k])) for k in utils.HN_PARAM_NAMES]
         self.omega, self.alpha, self.beta, self.gamma, self.h0_default = vals
-        self.psi = self.beta + self.alpha * self.gamma ** 2                       # persistence ψ
         # detached scalar long-run log-variance for the reveal fallback (buffer key absent)
         om, al = float(p['Omega']), float(p['Alpha'])
         be, ga = float(p['Beta']), float(p['Gamma_Star'])
@@ -3436,45 +3448,38 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
         a function of z[1..t] only, no lookahead).
 
         n_sub≤1: exact fractional step — var = h·f_t, and the variance update h ← h + f·(hn step − h)
-        which is EXACTLY hn_variance_step at f=1. n_sub≥2: aggregate-variance bridge — h forwarded
-        deterministically through the sub-steps via E[h]=ω+α+ψ h, single aggregate draw."""
+        which is EXACTLY hn_variance_step at f=1. A step spanning more than one calibration step
+        walks the sub-steps that span it (utils.hn_correlated_substeps — z[t] rides the
+        √E[h·dt]-weighted combination of the sub-step normals)."""
         log_h = torch.empty_like(z)
         ds = torch.zeros_like(z)
         log_h[0] = h.log()
         for t in range(1, z.shape[0]):
-            h, var_step, r = self._advance_variance(h, t, lambda v: z[t])
+            if self.n_sub[t] <= 1:
+                h, var_step, r = self._advance_variance(h, t, lambda v: z[t])
+            else:
+                h, var_step, r = utils.hn_correlated_substeps(
+                    h, z[t], self.sub_dt[t], self.omega, self.alpha, self.beta, self.gamma)
             ds[t] = carry[t] - 0.5 * var_step + r
             log_h[t] = h.log()
         return ds, log_h
 
     def _advance_variance(self, h, t, standard_normal):
-        """One fractional-clock Heston–Nandi variance step, shared by the forward sim
-        (`_simulate_returns`) and the observed-path replay (`reseed_from_path`) so the forward≡replay
-        invariant is STRUCTURAL, not maintained by copying. Computes Var(Δlog S) for the step, obtains
-        the standard normal z via `standard_normal(var_step)` — the ONLY thing that differs between the
-        paths (the drawn z[t] forward; the realized z=(Δlog S − carry + ½·Var)/√Var in replay) — and
-        returns (h_{t+1}, var_step, r) with r = √Var·z. n_sub ≤ 1 blends the exact hn_variance_step by
-        f (EXACT at f=1); n_sub ≥ 2 the deterministic aggregate-variance bridge (z does NOT enter the
-        h update there — the sub-steps are forwarded via E[h_{j+1}]=ω+α+ψ·h_j)."""
-        omega, alpha, beta, gamma, psi = self.omega, self.alpha, self.beta, self.gamma, self.psi
-        if self.n_sub[t] <= 1:
-            ft = self.f[t]
-            var_step = h * ft                                                    # Var(Δlog S) over the step
-            sh = h.sqrt()
-            z = standard_normal(var_step)
-            r = var_step.sqrt() * z
-            # fractional HN variance update: exact hn_variance_step at f=1, blended by f for f<1
-            return h + ft * (utils.hn_variance_step(h, sh, z, omega, alpha, beta, gamma) - h), var_step, r
-        # n_sub≥2: one Gaussian per grid step — forward h deterministically through the integer
-        # sub-steps via the HN mean recursion E[h_{j+1}]=ω+α+ψ h_j and draw the aggregate return
-        # with the summed variance Σ h_j (documented within-step vol-of-vol approximation).
-        h_j, var_step = h, h
-        for _ in range(1, self.n_sub[t]):
-            h_j = omega + alpha + psi * h_j
-            var_step = var_step + h_j
+        """One fractional-clock Heston–Nandi variance step (n_sub ≤ 1; a coarse interval routes to
+        utils.hn_correlated_substeps in `_simulate_returns` instead), shared by the forward sim and
+        the observed-path replay (`reseed_from_path`) so the forward≡replay invariant is STRUCTURAL,
+        not maintained by copying. Computes Var(Δlog S) for the step, obtains the standard normal z
+        via `standard_normal(var_step)` — the ONLY thing that differs between the paths (the drawn
+        z[t] forward; the realized z=(Δlog S − carry + ½·Var)/√Var in replay) — and returns
+        (h_{t+1}, var_step, r) with r = √Var·z."""
+        ft = self.f[t]
+        var_step = h * ft                                                        # Var(Δlog S) over the step
+        sh = h.sqrt()
         z = standard_normal(var_step)
         r = var_step.sqrt() * z
-        return omega + alpha + psi * h_j, var_step, r
+        # fractional HN variance update: exact hn_variance_step at f=1, blended by f for f<1
+        return h + ft * (utils.hn_variance_step(
+            h, sh, z, self.omega, self.alpha, self.beta, self.gamma) - h), var_step, r
 
     def generate(self, shared_mem):
         # One framework Gaussian per step drives the HN z DIRECTLY (no Student-t rescale, no auxiliary
@@ -3544,8 +3549,12 @@ class HestonNandiImpliedSpotModel(StochasticProcess):
         returns of the supplied price path, publishing `hn_log_h` (so reveal returns the right log h
         along the replayed path) and `h0_outer` (terminal h). The innovation is recovered from the
         realized log-return with the SAME carry/convexity the forward sim used, so the h recursion
-        stays lock-step: z = (Δlog S − carry + ½·Var)/√Var, Var = h·f (n_sub≤1). n_sub≥2 sub-steps
-        are deterministic (no z needed)."""
+        stays lock-step: z = (Δlog S − carry + ½·Var)/√Var, Var = h·f."""
+        # Replay is defined only on the daily grid: the intra-interval returns the variance
+        # recursion replays are unobservable at coarser nodes.
+        if np.any(self.n_sub >= 2):
+            raise ValueError('reseed_from_path needs n_sub == 1 everywhere; grid is coarser than '
+                             f'the trading day (n_sub up to {int(self.n_sub.max())})')
         obs = simulated.detach()
         logret = obs.clamp_min(1.0e-30).log()
         carry = self._carry_per_step(shared_mem, obs.shape).detach()

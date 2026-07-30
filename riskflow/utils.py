@@ -2027,6 +2027,105 @@ def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims,
 
 
 # --------------------------------------------------------------------------------------
+# Correlated sub-stepping -- exact within-interval dynamics between coarse scenario nodes
+# --------------------------------------------------------------------------------------
+# A coarse exposure grid (PFE/CVA nodes weeks apart) still owes each factor the dynamics it
+# would have had on the calibration clock: forwarding the variance deterministically and
+# drawing one aggregate Gaussian was measured 29%->2000% wrong on tail probabilities at
+# |z|=2-3 (tb_hn_aggregate_bias.csv) -- precisely the quantiles PFE reads.  Instead the
+# interval walks its own sub-steps, and the framework's correlated draw enters as the
+# sqrt(variance)-weighted combination of the sub-step normals, so cross-factor correlation
+# rides the interval's dominant direction while the orthogonal complement supplies the
+# within-interval vol-of-vol the mean bridge lost.  Freeze h and the aggregate return
+# collapses back to sqrt(sum var)*z_fw -- the old bridge -- so this is its strict refinement.
+
+def substep_schedule(f):
+    """Trading-time lengths spanning each interval of `f` calibration steps: whole steps, then
+    the fractional remainder.  A scenario grid is a CALENDAR object and the recursion is
+    calibrated per trading day, so f is essentially never an integer (f = 252k/365.25 on a
+    k-calendar-day step) -- rounding it to whole days makes node variance a step function of
+    grid spacing, -13% on the framework's own default CVA grid.  len == 1 is the exact
+    fractional step every fine grid already took; longer is a coarse-grid walk.
+    """
+    schedule = []
+    for x in f:
+        whole = int(x)
+        rem = float(x) - whole
+        steps = (1.0,) * whole + ((rem,) if rem > 1e-9 else ())
+        schedule.append(steps or (float(x),))       # dt == 0 (the t=0 anchor) stays one null step
+    return schedule
+
+
+def substep_normals(sqrt_var, z_fw):
+    """n iid N(0,1) sub-step draws Z whose weighted combination REPRODUCES the framework draw:
+    w'Z = z_fw exactly, w = ``sqrt_var`` normalized along the leading (sub-step) axis.
+
+    Z = e + w*(z_fw - w'e) with e fresh iid normals: Cov(Z) = (I - ww') + ww' = I given
+    z_fw ~ N(0,1) independent of e (framework draws are marginally standard; e is drawn here),
+    and w is F_t-measurable so this holds conditionally, per interval.  ``sqrt_var`` is
+    (n, ...batch), ``z_fw`` (...batch).
+
+    The weights decide only WHICH linear functional of the walk carries the cross-factor
+    correlation -- every marginal is invariant to them.  sqrt of the mean-forwarded variance
+    contribution E[h_j]*dt_j is the interval's own return loading, matching a correlated
+    sibling that shares its variance profile (the second GARCH-family factor); a sibling with
+    flat per-day variance would want uniform weights instead.  Neither dominates, so this is
+    a modelling choice, not an exactness claim -- see test_weights_match_the_return_loading.
+    """
+    w = sqrt_var / (sqrt_var ** 2).sum(0, keepdim=True).sqrt()
+    e = torch.randn_like(w)
+    return e + w * (z_fw - (w * e).sum(0))
+
+
+def hn_correlated_substeps(h, z_fw, sub_dt, omega, alpha, beta, gamma_star):
+    """Walk one coarse scenario interval as the `sub_dt` fractional Heston-Nandi steps that
+    span it.  Returns (h_end, var_sum, r_sum): terminal variance, realized integrated variance
+    sum(h_j*dt_j) (the caller's -1/2 convexity drift), and the innovation sum(sqrt(h_j*dt_j)*z_j)
+    -- so the interval return carry - var_sum/2 + r_sum is a price-martingale by iterated
+    expectations, exact at every sub-step.  Each step is the same fractional recursion the fine
+    grid takes (exactly `hn_variance_step` at dt=1), so the two branches agree in the limit.
+    """
+    psi = hn_persistence(alpha, beta, gamma_star)
+    var_bar, mean = [], h
+    for dt in sub_dt:                                        # E[h_{j+1}] = h + dt*(omega+alpha+psi*h - h)
+        var_bar.append(mean * dt)
+        mean = mean + dt * (omega + alpha + psi * mean - mean)
+    z = substep_normals(torch.stack(var_bar).sqrt(), z_fw)
+    var_sum, r_sum = torch.zeros_like(h), torch.zeros_like(h)
+    for j, dt in enumerate(sub_dt):
+        sh = h.sqrt()
+        var_j = h * dt
+        var_sum = var_sum + var_j
+        r_sum = r_sum + var_j.sqrt() * z[j]
+        h = h + dt * (hn_variance_step(h, sh, z[j], omega, alpha, beta, gamma_star) - h)
+    return h, var_sum, r_sum
+
+
+def garch_correlated_substeps(h, z_fw, sub_dt, omega, alpha, beta, nu):
+    """Walk one coarse scenario interval as the `sub_dt` fractional GARCH(1,1)-t steps that span
+    it.  Returns (h_end, var_sum, r_sum) with r_j = sqrt(h_j*dt_j)*eps_j: each eps_j is EXACTLY
+    standardized Student-t, built by t-scaling the conditioned sub-step normals with fresh
+    Gammas -- the same scale mixture GARCHSpotModel.generate uses per step, so the correlated
+    draw rides the Gaussian kernel of the interval.  Same fractional recursion as the fine grid.
+    """
+    var_bar, mean = [], h
+    for dt in sub_dt:                                        # E[h_{j+1}] adds alpha*E[r^2] = alpha*h*dt
+        var_bar.append(mean * dt)
+        mean = mean + dt * (omega - (1.0 - beta) * mean) + alpha * mean * dt
+    z = substep_normals(torch.stack(var_bar).sqrt(), z_fw)
+    W = torch.distributions.Gamma(nu / 2.0, 0.5).sample(z.shape).clamp_min(1.0e-6)
+    eps = z * torch.sqrt(nu / W) * torch.sqrt((nu - 2.0).clamp_min(1.0e-3) / nu)
+    var_sum, r_sum = torch.zeros_like(h), torch.zeros_like(h)
+    for j, dt in enumerate(sub_dt):
+        var_j = h * dt
+        var_sum = var_sum + var_j
+        r = var_j.sqrt() * eps[j]
+        r_sum = r_sum + r
+        h = h + dt * (omega - (1.0 - beta) * h) + alpha * r * r
+    return h, var_sum, r_sum
+
+
+# --------------------------------------------------------------------------------------
 # Black-Scholes reference + HN implied vol (the HN smile/skew diagnostic and the bootstrapper seed)
 # --------------------------------------------------------------------------------------
 # bs_call_np is a thin ADAPTER over the canonical ``black_european_option_price`` (total-variance

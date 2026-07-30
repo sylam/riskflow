@@ -15,8 +15,8 @@ Covered:
   (d) reveal / fork: privileged_layout width, reveal_state_at packing (log_h first / price last),
       inner_fork_seed fidelity (inner h[0] == exp(outer log h_t) EXACTLY), reseed_from_path
       forward/replay consistency, revealed_annual_vol.
-  THE CLOCK: business-daily (f=1, EXACT HN), calendar-daily (f≈0.69) and 2-bd (n_sub=2 bridge)
-      grids; grid-invariant annualized vol (the platinum GARCH trap NOT re-created).
+  THE CLOCK: business-daily (f=1, EXACT HN), calendar-daily (f≈0.69) and 2-bd (n_sub=2 exact
+      sub-step) grids; grid-invariant annualized vol (the platinum GARCH trap NOT re-created).
   DRIFT / MEASURE: the risk-neutral (r-q) drift is read from the underlying's OWN interest-rate and
       dividend curves (E[S_T/S_0] = exp(∫(r-q)) end-to-end).
   DEDUPE: the pricer's static HestonNandiModelParameters leaf and the process's implied leaf are ONE
@@ -178,9 +178,11 @@ def test_nsub_business_and_calendar_daily_grid():
     assert abs(float(p_cal.f[1]) - 252.0 / 365.25) < 1e-9, 'calendar step should be f≈0.69 business days'
 
 
-def test_nsub_two_business_day_bridge_analytic():
-    # dt_arr = [0, 2·dt_c] ⇒ n_sub = [1, 2]; the aggregate variance is h0 + E[h_1] with
-    # E[h_1] = ω + α + ψ·h0 (the HN mean recursion).
+def test_nsub_two_business_day_step_analytic():
+    # dt_arr = [0, 2·dt_c] ⇒ n_sub = [1, 2]; the aggregate variance is E[h_0 + h_1] with
+    # E[h_1] = ω + α + ψ·h0 (the HN mean recursion) — unchanged under exact sub-stepping
+    # (the walk adds the correct within-interval vol-of-vol, an O(α²) variance term here;
+    # the distributional gates live in test_correlated_substeps.py).
     p, sh = _make(2, 200000, tg=_time_grid(2, day_step=2.0), seed=13)
     assert list(p.n_sub) == [1, 2], f'expected n_sub [1,2], got {list(p.n_sub)}'
     spot = p.generate(sh)

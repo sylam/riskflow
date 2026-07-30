@@ -12,7 +12,8 @@ Covers the six committed checks:
      outer conditional one-step mean/variance/kurtosis within MC error.
   5. Fork fidelity: the inner h at the fork start equals the passed h0_inner exactly.
   6. n_sub grid: production business-daily / calendar-daily grids ⇒ n_sub == 1 every step; a
-     synthetic 2-business-day step matches the aggregate-variance approximation analytically.
+     synthetic 2-business-day step matches E[Σ h_j] analytically (the exact sub-step walk's
+     distributional gates live in test_correlated_substeps.py).
 
 Plus registration (construct_process resolves the class by name), the privileged layout / vol and
 GARCHSpotCalibration (dispatched by "Method" out of calibration_config.json — the sole home of the
