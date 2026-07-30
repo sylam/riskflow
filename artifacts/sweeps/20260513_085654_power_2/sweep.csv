@@ -1,2 +1,0 @@
-mean_pnl,worst_pnl,p5_pnl,sortino_metric,n_eval_paths,no_trade_worst,no_trade_mean,mean_delta_vs_no_trade,worst_delta_vs_no_trade,max_per_inst_pos,min_per_inst_pos,max_total_abs_pos,frac_post_settle,override_Batch_Size,override_Simulation_Batches,override_Position_Bounds_Penalty,override_Power,seed,epochs,tag,elapsed_min
-81989.1875,-1059539.25,-489328.6828125,-407339.4953125,2048,-1427447.5,125769.5,-43780.3125,367908.25,2.0,-17.0,38.0,0.9794921875,2048,4,0.05,2.0,42,60,power_2,17.221066380899963

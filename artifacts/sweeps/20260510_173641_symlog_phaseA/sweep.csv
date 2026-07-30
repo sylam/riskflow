@@ -1,2 +1,0 @@
-mean_pnl,worst_pnl,median_pnl,no_trade_worst,no_trade_mean,mean_delta_vs_no_trade,worst_delta_vs_no_trade,max_per_inst_pos,min_per_inst_pos,max_total_abs_pos,frac_post_settle,row_tag,seed,epochs,overrides,elapsed_min
-74053.4296875,-1616316.5,20853.93359375,-1569304.0,112118.96875,-38065.5390625,-47012.5,0.0,-7.0,14.0,1.0,default,42,100,,6.579474529449969

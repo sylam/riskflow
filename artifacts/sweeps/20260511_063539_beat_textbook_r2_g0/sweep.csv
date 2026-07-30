@@ -1,5 +1,0 @@
-mean_pnl,worst_pnl,p5_pnl,sortino_metric,no_trade_worst,no_trade_mean,mean_delta_vs_no_trade,worst_delta_vs_no_trade,max_per_inst_pos,min_per_inst_pos,max_total_abs_pos,frac_post_settle,row_tag,row_name,seed,epochs,overrides,elapsed_min
-70711.375,-1388014.875,-747342.640625,-676631.265625,-1569304.0,112118.96875,-41407.59375,181289.125,2.0,-13.0,23.0,1.0,fp_2_seed42,fp_2,42,100,objective.Floor_Penalty=2.0,6.4642661982499705
-112118.96875,-1569304.0,-777357.4781249999,-665238.5093749999,-1569304.0,112118.96875,0.0,0.0,0.0,0.0,0.0,0.0,fp_5_seed42,fp_5,42,100,objective.Floor_Penalty=5.0,6.486828839583298
-86292.46875,-1559156.125,-811760.759375,-725468.290625,-1569304.0,112118.96875,-25826.5,10147.875,2.0,-2.0,5.0,1.0,dense_0_seed42,dense_0,42,100,optimizer.Dense_Tracking_Reward_Scale=0.0,6.474128847449962
-97712.09375,-1321707.125,-676802.43125,-579090.3375,-1569304.0,112118.96875,-14406.875,247596.875,2.0,-10.0,19.0,1.0,dense_5_seed42,dense_5,42,100,optimizer.Dense_Tracking_Reward_Scale=5.0,6.47652917435001

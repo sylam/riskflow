@@ -1,9 +1,0 @@
-[17:00:38] Waiting for val_lr_3e-5 (PID 72108) to finish...
-[17:35:38] val_lr_3e-5 done; starting follow-up lane
-[17:35:38] START val_lr_1e-4_gamma_0.995 overrides=Learning_Rate=1e-4 Gamma=0.995
-[18:44:51] DONE  val_lr_1e-4_gamma_0.995
-[18:45:21] START val_lr_1e-4_gamma_0.98 overrides=Learning_Rate=1e-4 Gamma=0.98
-[19:54:33] DONE  val_lr_1e-4_gamma_0.98
-[19:55:03] START val_lr_5e-5_gamma_0.99 overrides=Learning_Rate=5e-5 Gamma=0.99
-[21:04:12] DONE  val_lr_5e-5_gamma_0.99
-[21:04:42] FOLLOWUP COMPLETE

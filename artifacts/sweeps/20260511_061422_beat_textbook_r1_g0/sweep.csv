@@ -1,4 +1,0 @@
-mean_pnl,worst_pnl,p5_pnl,sortino_metric,no_trade_worst,no_trade_mean,mean_delta_vs_no_trade,worst_delta_vs_no_trade,max_per_inst_pos,min_per_inst_pos,max_total_abs_pos,frac_post_settle,row_tag,row_name,seed,epochs,overrides,elapsed_min
-117621.0625,-1521360.75,-711751.9624999999,-594130.8999999999,-1569304.0,112118.96875,5502.09375,47943.25,2.0,-12.0,21.0,1.0,baseline_seed42,baseline,42,100,,6.401445601216619
-112118.96875,-1569304.0,-777357.4781249999,-665238.5093749999,-1569304.0,112118.96875,0.0,0.0,0.0,0.0,0.0,0.0,fp_50_seed42,fp_50,42,100,objective.Floor_Penalty=50.0,6.411482800366684
-110022.7890625,-1549344.0,-790227.996875,-680205.2078125,-1569304.0,112118.96875,-2096.1796875,19960.0,1.0,-12.0,24.0,1.0,totlim_100_seed42,totlim_100,42,100,accounting.Total_Position_Abs_Limit=100.0,6.427927051633318

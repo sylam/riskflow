@@ -1,5 +1,0 @@
-mean_pnl,worst_pnl,median_pnl,no_trade_worst,no_trade_mean,mean_delta_vs_no_trade,worst_delta_vs_no_trade,max_per_inst_pos,min_per_inst_pos,max_total_abs_pos,frac_post_settle,row_tag,seed,epochs,overrides,elapsed_min
-99474.0625,-1359633.875,38047.33984375,-1569304.0,112118.96875,-12644.90625,209670.125,2.0,-10.0,25.0,1.0,entropy_coef=0.003,42,100,optimizer.Entropy_Coef=0.003,6.971784476833394
-39335.16796875,-1591862.5,-26360.796875,-1569304.0,112118.96875,-72783.80078125,-22558.5,7.0,-105.0,210.0,1.0,learning_rate=0.001,42,100,optimizer.Learning_Rate=0.001,7.240162532300019
-112118.96875,-1569304.0,48473.955078125,-1569304.0,112118.96875,0.0,0.0,0.0,0.0,0.0,0.0,post_deal_trade_penalty=2,42,100,objective.Post_Deal_Trade_Penalty=2,7.2972479491832924
-67647.359375,-1594277.125,7197.783203125,-1569304.0,112118.96875,-44471.609375,-24973.125,5.0,-6.0,15.0,1.0,post_deal_trade_penalty=5,42,100,objective.Post_Deal_Trade_Penalty=5,7.456988106650048

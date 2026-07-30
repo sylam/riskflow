@@ -1,2 +1,0 @@
-mean_pnl,worst_pnl,median_pnl,no_trade_worst,no_trade_mean,mean_delta_vs_no_trade,worst_delta_vs_no_trade,max_per_inst_pos,min_per_inst_pos,max_total_abs_pos,frac_post_settle,row_tag,seed,epochs,overrides,elapsed_min
-104411.5625,-1574534.5,55456.57421875,-1569304.0,112118.96875,-7707.40625,-5230.5,6.0,-6.0,18.0,1.0,entropy_coef=0.0003,42,100,optimizer.Entropy_Coef=0.0003,6.49323587365

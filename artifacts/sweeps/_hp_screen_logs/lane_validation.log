@@ -1,9 +1,0 @@
-[13:55:16] Waiting for grad_0.25 (PID 44583) to finish...
-[14:06:46] grad_0.25 done; starting validation lane
-[14:06:46] START val_lr_1e-4 overrides=Learning_Rate=1e-4
-[15:16:02] DONE  val_lr_1e-4
-[15:16:32] START val_lr_1e-4_gamma_0.99 overrides=Learning_Rate=1e-4 Gamma=0.99
-[16:25:44] DONE  val_lr_1e-4_gamma_0.99
-[16:26:14] START val_lr_3e-5 overrides=Learning_Rate=3e-5
-[17:35:23] DONE  val_lr_3e-5
-[17:35:53] VALIDATION COMPLETE

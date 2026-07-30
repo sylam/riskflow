@@ -22,6 +22,20 @@ tests/_stepper_out*/
 /artifacts/backtest/
 /artifacts/walk_forward/*/
 /artifacts/.~lock.*
+# Run outputs, not source. d124947 swept 1461 sweep files (1.5 GB) in because these
+# directories had no rule; the curated artifacts/walk_forward top level stays tracked.
+/artifacts/sweeps/
+/artifacts/lab_runs/
+/artifacts/hull_experiments/
+/artifacts/hp_logs/
+/artifacts/textbook_runs/
+/artifacts/hp_*.csv
+/artifacts/*.npz*
+# Trained checkpoints and measurement output. tb_*.py harnesses ARE source; what they
+# print is not (the committed tb_hn_aggregate_bias*.csv study tables are the exception,
+# kept as the reference machinery those gates cite).
+*.pt
+/tb_hn_pfe_stepping.csv
 
 # IDE + notebook noise
 /.idea/
