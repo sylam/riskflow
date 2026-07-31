@@ -422,6 +422,11 @@ class CMC_State(utils.Calculation_State):
         # its keep where a calculation spans many batches. Its presence is therefore the marker
         # for "exposure-based", and pricers read it that way rather than inventing a switch.
         self.t_PreCalc = {}
+        # Discontinuous decisions recorded during the forward pass so their derivative can be
+        # restored before the single reverse sweep. Per BATCH, like t_Buffer — backward() runs
+        # once per batch, so a correction assembled from a previous batch's graph is stale.
+        self.boundary_aad = False
+        self.boundary_events = []
         self.t_cholesky = cholesky
         self.t_random_numbers = None
         self.t_Scenario_Buffer = {}
@@ -503,6 +508,7 @@ class CMC_State(utils.Calculation_State):
 
         # clear the buffers
         self.t_Buffer.clear()
+        self.boundary_events.clear()
 
 
 class CMC_State_Inner(CMC_State):
@@ -1034,12 +1040,18 @@ class Credit_Monte_Carlo(Calculation):
         scale_by_survival = (
             self.params.get('Funding_Valuation_Adjustment', {}).get('Calculate', 'No') == 'Yes')
 
-        return CMC_State(
+        shared_mem = CMC_State(
             self.get_cholesky_decomp(), self.static_var, self.batch_size,
             torch.ones([1, 1], dtype=self.dtype, device=self.device), mcmc_sim, get_fxrate_factor(
                 utils.check_rate_name(reporting_currency), self.static_factors, self.stoch_factors),
             seed, job_id, num_jobs, scale_by_survival, nomodel=self.params.get('NoModel', 'Constant'),
             keep_tensor=self.params.get('Keep_Tensor', 'No') == 'Yes')
+        # Boundary corrections only mean anything when something is being differentiated, so the
+        # switch is inert without greeks - and recording events nobody consumes would just be
+        # memory held across a batch.
+        shared_mem.boundary_aad = (
+                calc_greeks is not None and self.params.get('Boundary_AAD', 'No') == 'Yes')
+        return shared_mem
 
     def report(self, output):
         for result, data in output.items():

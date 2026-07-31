@@ -567,6 +567,38 @@ class Deal(object):
             field_index['Check_Payoff_Type'] = False
 
 
+def scan_collateral_balance(opening, required, recv_band, post_band, call_mask,
+                            start=0, collect_gaps=False):
+    """Walk the collateral balance through the margin calls: hold it until it leaves the band
+    [recv_band, post_band], then reset it to the required amount.
+
+    Returns ``(balance_path, gaps)``. ``gaps`` is empty unless ``collect_gaps``, in which case it
+    carries ``(call_index, receive_gap, post_gap, previous, required)`` per call date, with the
+    gaps retaining their autograd graph.
+
+    ``start`` and ``opening`` let the SAME recursion serve the counterfactual replay: restart at a
+    margin date from a forced balance and walk forward from there.
+
+    The transfer test stays `previous < recv | previous > post` rather than being re-derived from
+    the gaps. `recv - previous > 0` is the same statement in exact arithmetic and NOT the same in
+    floating point, and the forward valuation must not move at all when the boundary machinery is
+    switched on.
+    """
+    path = [opening]
+    gaps = []
+    for index in range(start + 1, required.shape[0]):
+        previous = path[-1]
+        if not call_mask[index]:
+            path.append(previous)
+            continue
+        recv, post = recv_band[index], post_band[index]
+        transfer = (previous < recv) | (previous > post)
+        if collect_gaps:
+            gaps.append((index, recv - previous, previous - post, previous, required[index]))
+        path.append(required[index] * transfer + previous * (~transfer))
+    return torch.stack(path), gaps
+
+
 class NettingCollateralSet(Deal):
     # dependent price factors for this instrument
     factor_fields = {'Agreement_Currency': ['FxRate'],
@@ -1163,24 +1195,23 @@ class NettingCollateralSet(Deal):
             Mr = Bt_new - min_received * fx_St
             Mp = min_posted * fx_St + Bt_new
 
-            if factor_dep['call_mask'].all():
-                # daily collateral
-                Sim_Bt = [Bt[0]]
-                for mr, mp, bt in zip(Mr[1:], Mp[1:], Bt_new[1:]):
-                    mask = ((Sim_Bt[-1] < mr) | (Sim_Bt[-1] > mp))
-                    Sim_Bt.append(bt * mask + Sim_Bt[-1] * (~mask))
-            else:
-                # collateral according to call_mask
-                Sim_Bt = [Bt[0]]
-                Call_mask = factor_dep['call_mask'].astype(bool)
-                for mr, mp, bt, cm in zip(Mr[1:], Mp[1:], Bt_new[1:], Call_mask[1:]):
-                    if cm:
-                        mask = ((Sim_Bt[-1] < mr) | (Sim_Bt[-1] > mp))
-                        Sim_Bt.append(bt * mask + Sim_Bt[-1] * (~mask))
-                    else:
-                        Sim_Bt.append(Sim_Bt[-1])
+            # One recursion for both cases: an all-True call mask IS the daily schedule, so the
+            # two loops this replaces differed only in a test that is always true in one of them.
+            boundary_aad = getattr(shared, 'boundary_aad', False)
+            Bt, mta_gaps = scan_collateral_balance(
+                Bt[0], Bt_new, Mr, Mp, factor_dep['call_mask'].astype(bool),
+                collect_gaps=boundary_aad)
 
-            Bt = torch.stack(Sim_Bt)
+            if boundary_aad:
+                # A minimum transfer amount makes the balance jump, so the decision carries a
+                # derivative that ordinary AAD drops. Record both sides; the correction is
+                # assembled against the CVA objective, which does not exist until later.
+                for index, recv_gap, post_gap, previous, required in mta_gaps:
+                    shared.boundary_events.extend([
+                        utils.MTABoundaryEvent(index, 'receive', recv_gap,
+                                               previous.detach(), required.detach()),
+                        utils.MTABoundaryEvent(index, 'post', post_gap,
+                                               previous.detach(), required.detach())])
 
             # now calculate the collateral account and Net exposure
             report_time = local_time_grid[factor_dep['Te']]

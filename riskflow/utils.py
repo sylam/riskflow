@@ -190,6 +190,24 @@ class DeferredDeal:
     payload: dict
 
 
+@dataclass
+class MTABoundaryEvent:
+    """One margin call's transfer decision, recorded so its derivative can be recovered.
+
+    A minimum transfer amount makes the collateral balance jump discontinuously, so ordinary AAD
+    differentiates the netting set with the decision FROZEN and loses the term that flows through
+    the decision itself. `gap` is the margin by which the decision was made and RETAINS its
+    autograd graph - it is built from the whole netting-set MTM, so its derivative already carries
+    every shared-factor and cross-deal effect. The balances are DETACHED: they seed a
+    counterfactual replay whose result is a coefficient, not a differentiated quantity.
+    """
+    call_index: int
+    side: str                       # 'receive' | 'post'
+    gap: object                     # tensor, graph retained
+    previous_balance: object        # tensor, detached
+    required_balance: object        # tensor, detached
+
+
 # Custom Exceptions
 class InstrumentExpired(Exception):
     def __init__(self, message):
