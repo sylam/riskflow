@@ -2025,65 +2025,6 @@ def hn_log_substep(log_S, h, z, b_step, omega, alpha, beta, gamma_star):
 hn_log_substep = torch.compile(hn_log_substep, dynamic=True)
 
 
-def hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star):
-    """Exact moments of the pair (aggregate log-return X, terminal variance h_end) over
-    ``n_steps`` unmonitored HN days, as AFFINE coefficients in the entry variance h1.
-
-    Returns ``(a, b)``, each a 7-entry 1-D tensor, with every moment recovered as
-    ``a[i] + b[i] * h1``:
-
-        [0 .. 3]  cumulants kappa_1 .. kappa_4 of X
-        [4]       E[h_end]
-        [5]       Var(h_end)
-        [6]       Cov(X, h_end)
-
-    HN is affine, so the joint transform is exp(A + B*h1) and every derivative at the origin
-    splits the same way - which is what makes the sampler O(1) per path: these are SCALARS
-    computed once per interval, then evaluated elementwise.  Taken by autodiff of the A/B
-    recursion rather than hand algebra.
-
-    The carry ``r`` is left out (set to 0): it enters ``hn_ab`` only as ``+phi*r`` per step, so
-    it shifts kappa_1 by ``n_steps*r`` and touches nothing else.  The caller adds it, which lets
-    a per-path carry ride a scalar recursion.
-
-    Derivatives are taken by central finite-difference stencils on ONE vectorised ``hn_ab`` call
-    rather than by nested autograd: ``create_graph`` to fourth order re-walks the n-step graph on
-    every level and measured 816 ms at n=63, 17x the exact walk it exists to replace.  The
-    stencil stays differentiable in the parameters (it is a linear combination of evaluations),
-    so HN greeks still flow.
-
-    TWO step sizes, because the errors pull opposite ways: truncation is O(delta^2) and dominates
-    the low derivatives, while round-off enters kappa_4 as eps/delta^4 and explodes below
-    delta~0.05 (measured: at delta=0.005 kappa_1 is exact to 1.3e-6 but kappa_4 is off by 330x).
-    So kappa_1/kappa_2 and the covariance - which set the drift and the scale, and must be right
-    - use the fine step, and kappa_3/kappa_4 - which only weight Cornish-Fisher correction terms
-    - use the coarse one.
-    """
-    lo, hi = 0.005, 0.2
-    h_scale = hn_stationary_var(omega, alpha, beta, gamma_star)
-    e = 0.05 / h_scale                                          # theta scale: e*h_end ~ 0.05
-    grid = ((0.0, 0.0), (-lo, 0.0), (lo, 0.0),
-            (-2 * hi, 0.0), (-hi, 0.0), (hi, 0.0), (2 * hi, 0.0),
-            (0.0, -e), (0.0, e), (lo, e), (lo, -e), (-lo, e), (-lo, -e))
-    one = torch.ones_like(h_scale)
-    A, B = hn_ab(torch.stack([x * one for x, _ in grid]), n_steps, omega, alpha, beta, gamma_star,
-                 torch.zeros_like(h_scale), unwrap=False,
-                 theta=torch.stack([y * one for _, y in grid]))
-
-    def moments(f):
-        z, ml, pl, m2, m1, p1, p2, tm, tp, pp, pm, mp, mm = f.unbind(0)
-        return torch.stack([
-            (pl - ml) / (2 * lo),                                       # kappa_1
-            (pl - 2 * z + ml) / lo ** 2,                                # kappa_2
-            (p2 - 2 * p1 + 2 * m1 - m2) / (2 * hi ** 3),                # kappa_3
-            (p2 - 4 * p1 + 6 * z - 4 * m1 + m2) / hi ** 4,              # kappa_4
-            (tp - tm) / (2 * e),                                        # E[h_end]
-            (tp - 2 * z + tm) / e ** 2,                                 # Var(h_end)
-            (pp - pm - mp + mm) / (4 * lo * e)])                        # Cov(X, h_end)
-
-    return moments(A), moments(B)
-
-
 def declared_spot(code, name):
     """Pass a resolved spot code through, saying ONCE whether it is simulated.
 
