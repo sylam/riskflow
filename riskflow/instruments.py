@@ -2869,7 +2869,8 @@ class EquityBarrierBinaryOption(Deal):
             'SettleCurrency': self.field['Payoff_Currency'],
             'Discount': get_discount_factor(
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
-            'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+            'Equity': utils.declared_spot(get_equity_rate_factor(
+                field['Equity'], static_offsets, stochastic_offsets), field['Equity']),
             'Equity_Zero': get_equity_zero_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
@@ -2916,9 +2917,7 @@ class EquityBarrierBinaryOption(Deal):
             eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
             eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), dim=1)
 
-        # check that the spot has a defined shape
-        if spot.shape[1] != b.shape[1]:
-            spot = spot.tile(len(deal_time), b.shape[1])
+        spot = utils.spot_on_deal_grid(spot, deal_time, shared)
 
         pv = pricing.pv_discrete_barrier_option(
             shared, time_grid, deal_data, spot, b, tau, isdigital=True)
@@ -3395,7 +3394,8 @@ class EquityOneTouchOption(Deal):
                 field['Payoff_Currency'], static_offsets, stochastic_offsets),
             'Discount': get_discount_factor(
                 field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
-            'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+            'Equity': utils.declared_spot(get_equity_rate_factor(
+                field['Equity'], static_offsets, stochastic_offsets), field['Equity']),
             'Equity_Zero': get_equity_zero_rate_factor(
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Dividend_Yield': get_dividend_rate_factor(
@@ -3434,9 +3434,7 @@ class EquityOneTouchOption(Deal):
             eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
             eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), dim=1)
 
-        # check that the spot has a defined shape
-        if spot.shape[1] != b.shape[1]:
-            spot = spot.tile(len(deal_time), b.shape[1])
+        spot = utils.spot_on_deal_grid(spot, deal_time, shared)
 
         pv = pricing.pv_one_touch_option(
             shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)
@@ -3555,7 +3553,8 @@ class EquityBarrierOption(Deal):
                        'SettleCurrency': self.payoff_ccy,
                        'Discount': get_discount_factor(
                            field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
-                       'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+                       'Equity': utils.declared_spot(get_equity_rate_factor(
+                           field['Equity'], static_offsets, stochastic_offsets), field['Equity']),
                        'Equity_Zero': get_equity_zero_rate_factor(
                            field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Dividend_Yield': get_dividend_rate_factor(
@@ -3619,9 +3618,7 @@ class EquityBarrierOption(Deal):
             eq_zer_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False) -
             eq_div_curve.gather_weighted_curve(shared, tau.reshape(-1, 1), multiply_by_time=False), dim=1)
 
-        # check that the spot has a defined shape
-        if spot.shape[1] != b.shape[1]:
-            spot = spot.tile(len(deal_time), b.shape[1])
+        spot = utils.spot_on_deal_grid(spot, deal_time, shared)
 
         if 'Barrier_Dates' in deal_data.Factor_dep:
             pv = pricing.pv_discrete_barrier_option(
@@ -3909,7 +3906,8 @@ class EquityDeal(Deal):
                  'Equity': utils.check_rate_name(self.field['Equity'])}
 
         field_index = {'Currency': get_fxrate_factor(field['Currency'], static_offsets, stochastic_offsets),
-                       'Equity': get_equity_rate_factor(field['Equity'], static_offsets, stochastic_offsets),
+                       'Equity': utils.declared_spot(get_equity_rate_factor(
+                           field['Equity'], static_offsets, stochastic_offsets), field['Equity']),
                        'Expiry': (self.field['Investment_Horizon'] - base_date).days}
         # TODO - Add more detail for dividend payments etc.
         return field_index
@@ -3918,9 +3916,7 @@ class EquityDeal(Deal):
         factor_dep = deal_data.Factor_dep
         deal_time = time_grid.time_grid[deal_data.Time_dep.deal_time_grid]
         spot = utils.calc_time_grid_spot_rate(factor_dep['Equity'], deal_time, shared)
-        if spot.shape[0] != len(deal_time):
-            logging.warning('Equity {} is not being simulated - holding flat'.format(self.field['Equity']))
-            spot = spot.tile(len(deal_time), shared.simulation_batch)
+        spot = utils.spot_on_deal_grid(spot, deal_time, shared)
         fx_rep = utils.calc_fx_cross(factor_dep['Currency'], shared.Report_Currency, deal_time, shared)
         nominal = (1.0 if self.field.get('Buy_Sell', 'Buy') == 'Buy' else -1.0) * self.field.get('Units', 1.0)
         cash = nominal * spot

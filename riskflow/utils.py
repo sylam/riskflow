@@ -2089,6 +2089,34 @@ def hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star):
     return moments(A), moments(B)
 
 
+def declared_spot(code, name):
+    """Pass a resolved spot code through, saying ONCE whether it is simulated.
+
+    A static spot is held flat across the whole time grid at pricing - legitimate, but it makes
+    the exposure profile a deterministic forward, which is worth knowing before reading the
+    numbers. Said here, in calc_dependencies, because it is a compile-time fact: the code tuple
+    already carries the flag, and the alternative is a warning that repeats every batch.
+    """
+    if not code[0][FACTOR_INDEX_Stoch]:
+        logging.warning('%s is not simulated - spot is held flat across the time grid',
+                        check_tuple_name(code[0][FACTOR_INDEX_Offset]))
+    return code
+
+
+def spot_on_deal_grid(spot, deal_time, shared):
+    """Give ``spot`` the shape every pricer assumes: (len(deal_time), n_scenarios).
+
+    A SIMULATED spot already has it. A static one arrives as a single row and is tiled up.
+    The test is therefore on ROWS - the axis actually being corrected. Testing columns instead
+    (`spot.shape[1] != b.shape[1]`) reads a legitimate broadcast pair - a simulated spot with B
+    columns against a static curve with 1 - as a defect, and then tiles the ROWS by
+    len(deal_time), squaring the grid: 37 dates became 1369 and every barrier deal was silently
+    skipped under credit Monte Carlo.
+    """
+    return spot if spot.shape[0] == len(deal_time) else spot.tile(
+        len(deal_time), shared.simulation_batch)
+
+
 def hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star):
     """:func:`hn_aggregate_moments` memoised in ``shared.t_PreCalc`` on (n_steps, parameters).
 
@@ -2159,7 +2187,10 @@ def hn_table_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antit
     a single valuation walks the interval exactly instead, because one table build costs more
     than the walk it would replace.
     """
-    if not n_steps:
+    # An empty block carries no paths to draw for, and the interval's h range - which the table
+    # is bracketed to - is undefined. The exact walk returns empty from empty by construction;
+    # this has to say so, because min() over nothing raises rather than degenerating.
+    if not n_steps or not h.numel():
         return Sj, h
     omega, alpha, beta, gamma_star = hn_params
     lo, hi = h.min(), h.max()
