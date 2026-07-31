@@ -205,14 +205,23 @@ def test_moment_cache_lives_in_t_precalc():
 
 
 def test_gradients_bypass_the_cache_and_flow():
-    """Under greeks the cache must step aside — a cached graph node raises on a second backward
-    — and the parameters must still receive gradient through the stencil."""
+    """Under greeks the cache must step aside and the parameters must still receive gradient
+    through the stencil. The reason is ATTRIBUTION, not graph lifetime: the key is parameter
+    values, so two underlyings calibrated to identical numbers would collide and the second
+    would be handed moments wired to the first one's leaves. (Reuse across batches is otherwise
+    safe — SensitivitiesEstimator retains the graph and the leaves are minted once per calc.)"""
     sh = _Shared(4)
     p = [t.clone().requires_grad_(True) for t in PARAMS]
-    for _ in range(2):                                   # a second backward is the actual trap
+    for _ in range(2):
         a, b = utils.hn_cached_moments(sh, 21, *p)
-        (a.sum() + b.sum()).backward()
+        (a.sum() + b.sum()).backward(retain_graph=True)   # what SensitivitiesEstimator does
     assert not sh.t_PreCalc, 'differentiable moments must not be cached'
+    # the collision the bypass exists for: same VALUES, different leaves -> distinct gradients
+    q = [t.clone().detach().requires_grad_(True) for t in PARAMS]
+    a_q, b_q = utils.hn_cached_moments(sh, 21, *q)
+    (a_q.sum() + b_q.sum()).backward()
+    assert q[0].grad is not None and not torch.equal(q[0].grad, p[0].grad), \
+        'a second factor with identical parameters got the first one\'s gradient'
     for t, name in zip(p, ('omega', 'alpha', 'beta', 'gamma_star')):
         assert t.grad is not None and torch.isfinite(t.grad).all() and t.grad.abs() > 0, \
             f'no gradient reached {name}'

@@ -2140,9 +2140,13 @@ def hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star):
     and `reset` clears t_Buffer between batches. Not a module-level dict either - that outlives
     the calculation, so a recalibration would leave the superseded tables resident forever.
 
-    Skipped when the parameters carry gradients: a cached graph node raises on the second
-    backward. Greeks pay the recompute, which is the right way round - a stale cached derivative
-    is the worse failure.
+    Skipped when the parameters carry gradients, because the key is parameter VALUES and under
+    AAD that is not enough to identify the entry: two underlyings calibrated to the same numbers
+    collide, and the second one would be handed moments whose graph runs back to the FIRST one's
+    leaves - a silent misattribution of its greeks. (Keying on tensor identity is not the fix
+    either; id() is recycled after GC.) Reuse across batches would otherwise be safe - the leaves
+    are minted once per calculation and SensitivitiesEstimator retains the graph - so what is
+    being avoided is the collision, not a second backward.
     """
     if omega.requires_grad:
         return hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
