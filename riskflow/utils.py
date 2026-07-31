@@ -1865,7 +1865,7 @@ def hn_ann_vol(omega, alpha, beta, gamma_star, steps_per_year=252.0):
     return float(v) ** 0.5 if not torch.is_tensor(v) else v.sqrt()
 
 
-def hn_ab(phi, n_steps, omega, alpha, beta, gamma_star, r, unwrap=True, phi_dim=-1):
+def hn_ab(phi, n_steps, omega, alpha, beta, gamma_star, r, unwrap=True, phi_dim=-1, theta=None):
     """Backward A/B recursion for ``n_steps`` steps.  Returns ``(A, B)``.
 
     ``phi`` : real OR complex tensor.  If complex it is assumed to vary smoothly and ascending
@@ -1873,9 +1873,14 @@ def hn_ab(phi, n_steps, omega, alpha, beta, gamma_star, r, unwrap=True, phi_dim=
     Result satisfies E_t[S_{t+n}^phi] = S_t^phi * exp(A + B * h_{t+1}); i.e. the HN affine log-CF
     of the aggregate log-return is ``A + B * h1`` (the closure handed to the model-agnostic
     inversion primitive :func:`cf_european_probabilities`).
+
+    ``theta`` seeds the recursion at B = theta instead of 0, which makes the result the JOINT
+    transform E_t[exp(phi*R_n + theta*h_{t+n+1})] - same recursion, one different initial
+    condition.  Differentiating in theta is how the terminal variance's moments (and its
+    covariance with the aggregate return) come out exactly; see :func:`hn_aggregate_moments`.
     """
     A = torch.zeros_like(phi)
-    B = torch.zeros_like(phi)
+    B = torch.zeros_like(phi) if theta is None else theta * torch.ones_like(phi)
     lin = phi * (gamma_star - 0.5) - 0.5 * gamma_star ** 2   # <-- the -phi/2 is the LRNVR drift
     half_sq = 0.5 * (phi - gamma_star) ** 2
     phir = phi * r
@@ -2023,6 +2028,179 @@ def hn_log_substep(log_S, h, z, b_step, omega, alpha, beta, gamma_star):
 
 
 hn_log_substep = torch.compile(hn_log_substep, dynamic=True)
+
+
+def hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star):
+    """Exact moments of the pair (aggregate log-return X, terminal variance h_end) over
+    ``n_steps`` unmonitored HN days, as AFFINE coefficients in the entry variance h1.
+
+    Returns ``(a, b)``, each a 7-entry 1-D tensor, with every moment recovered as
+    ``a[i] + b[i] * h1``:
+
+        [0 .. 3]  cumulants kappa_1 .. kappa_4 of X
+        [4]       E[h_end]
+        [5]       Var(h_end)
+        [6]       Cov(X, h_end)
+
+    HN is affine, so the joint transform is exp(A + B*h1) and every derivative at the origin
+    splits the same way - which is what makes the sampler O(1) per path: these are SCALARS
+    computed once per interval, then evaluated elementwise.  Taken by autodiff of the A/B
+    recursion rather than hand algebra.
+
+    The carry ``r`` is left out (set to 0): it enters ``hn_ab`` only as ``+phi*r`` per step, so
+    it shifts kappa_1 by ``n_steps*r`` and touches nothing else.  The caller adds it, which lets
+    a per-path carry ride a scalar recursion.
+
+    Derivatives are taken by central finite-difference stencils on ONE vectorised ``hn_ab`` call
+    rather than by nested autograd: ``create_graph`` to fourth order re-walks the n-step graph on
+    every level and measured 816 ms at n=63, 17x the exact walk it exists to replace.  The
+    stencil stays differentiable in the parameters (it is a linear combination of evaluations),
+    so HN greeks still flow.
+
+    TWO step sizes, because the errors pull opposite ways: truncation is O(delta^2) and dominates
+    the low derivatives, while round-off enters kappa_4 as eps/delta^4 and explodes below
+    delta~0.05 (measured: at delta=0.005 kappa_1 is exact to 1.3e-6 but kappa_4 is off by 330x).
+    So kappa_1/kappa_2 and the covariance - which set the drift and the scale, and must be right
+    - use the fine step, and kappa_3/kappa_4 - which only weight Cornish-Fisher correction terms
+    - use the coarse one.
+    """
+    lo, hi = 0.005, 0.2
+    h_scale = hn_stationary_var(omega, alpha, beta, gamma_star)
+    e = 0.05 / h_scale                                          # theta scale: e*h_end ~ 0.05
+    grid = ((0.0, 0.0), (-lo, 0.0), (lo, 0.0),
+            (-2 * hi, 0.0), (-hi, 0.0), (hi, 0.0), (2 * hi, 0.0),
+            (0.0, -e), (0.0, e), (lo, e), (lo, -e), (-lo, e), (-lo, -e))
+    one = torch.ones_like(h_scale)
+    A, B = hn_ab(torch.stack([x * one for x, _ in grid]), n_steps, omega, alpha, beta, gamma_star,
+                 torch.zeros_like(h_scale), unwrap=False,
+                 theta=torch.stack([y * one for _, y in grid]))
+
+    def moments(f):
+        z, ml, pl, m2, m1, p1, p2, tm, tp, pp, pm, mp, mm = f.unbind(0)
+        return torch.stack([
+            (pl - ml) / (2 * lo),                                       # kappa_1
+            (pl - 2 * z + ml) / lo ** 2,                                # kappa_2
+            (p2 - 2 * p1 + 2 * m1 - m2) / (2 * hi ** 3),                # kappa_3
+            (p2 - 4 * p1 + 6 * z - 4 * m1 + m2) / hi ** 4,              # kappa_4
+            (tp - tm) / (2 * e),                                        # E[h_end]
+            (tp - 2 * z + tm) / e ** 2,                                 # Var(h_end)
+            (pp - pm - mp + mm) / (4 * lo * e)])                        # Cov(X, h_end)
+
+    return moments(A), moments(B)
+
+
+CF_Z = 2.5      # Cornish-Fisher is documented reliable to ~2-2.5 sigma; past that it saturates
+
+
+def cornish_fisher(z, k1, k2, k3, k4):
+    """Cornish-Fisher quantile expansion: a draw with the given first four cumulants, from a
+    standard normal ``z``.  ``k3``/``k4`` are the third/fourth CUMULANTS (not standardised).
+
+    The expansion is a cubic in z and stops being monotone once the skew/kurtosis terms
+    dominate, which folds the tail back on itself and puts mass on the wrong side of a barrier -
+    the one thing an OSS pricer cannot tolerate.  The map's slope is the quadratic
+    ``A z^2 + B z + C``; its minimum over the reliable range is available in closed form, and a
+    path whose minimum is non-positive falls back ENTIRELY to the matched Gaussian.  Deciding
+    per PATH rather than per point matters: dropping the correction pointwise would leave a jump
+    at the switch, which is non-monotone in a different way and biases the mean.
+    """
+    sd = k2.sqrt()
+    g1 = k3 / k2 ** 1.5
+    g2 = k4 / k2 ** 2
+    gg = g1 * g1
+    a = g2 / 8.0 - gg / 6.0
+    b = g1 / 3.0
+    c = 1.0 - g2 / 8.0 + 5.0 * gg / 36.0
+    slope = lambda t: (a * t + b) * t + c
+    # A > 0 opens upward so the vertex is the minimum; otherwise an endpoint is
+    vertex = (-b / torch.where(a.abs() > 1e-300, a, torch.full_like(a, 1e-300)) / 2.0).clamp(-CF_Z, CF_Z)
+    lo = torch.minimum(slope(-torch.as_tensor(CF_Z, dtype=z.dtype, device=z.device)), slope(z.new_tensor(CF_Z)))
+    lo = torch.where(a > 0.0, torch.minimum(lo, slope(vertex)), lo)
+
+    zc = z.clamp(-CF_Z, CF_Z)                        # saturate: past the reliable range the
+    z2 = zc * zc                                     # correction stops growing, slope stays 1
+    corr = (g1 / 6.0) * (z2 - 1.0) + (g2 / 24.0) * (z2 - 3.0) * zc - (gg / 36.0) * (2.0 * z2 - 5.0) * zc
+    return k1 + sd * (z + torch.where(lo > 0.0, corr, torch.zeros_like(corr)))
+
+
+_HN_MOMENT_CACHE = {}
+
+
+def hn_cached_moments(n_steps, omega, alpha, beta, gamma_star):
+    """:func:`hn_aggregate_moments` memoised on (n_steps, parameter values).
+
+    A book prices many fixings against ONE calibration, so the same scalar recursion would
+    otherwise run per fixing - and at base-valuation tensor sizes that fixed cost is what
+    decides whether the O(1) sampler beats the O(n) walk at all.
+
+    Skipped entirely when the parameters carry gradients: the cached tensors would hold graph
+    references and a second backward through them raises. Greeks therefore pay the recompute,
+    which is correct - a stale cached derivative is the worse failure.
+    """
+    if omega.requires_grad:
+        return hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
+    key = (n_steps, omega.item(), alpha.item(), beta.item(), gamma_star.item())
+    if key not in _HN_MOMENT_CACHE:
+        _HN_MOMENT_CACHE[key] = hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
+    return _HN_MOMENT_CACHE[key]
+
+
+def hn_aggregate_draw(h, carry, a, b, z, zh, omega):
+    """The per-path half of the aggregate sampler: the interval's scalar moments evaluated at
+    each path's entry variance, the Cornish-Fisher draw of the aggregate return, and the
+    terminal variance regressed on it.  ``a``/``b`` are the affine coefficients from
+    :func:`hn_aggregate_moments`; ``carry`` is the interval's total cost of carry.
+
+    Split out and fused for the same reason as :func:`hn_log_substep` - ~40 bandwidth-bound
+    elementwise kernels that collapse to one, which is what makes the O(1) sampler actually
+    beat the O(n) walk rather than merely have better asymptotics.
+    """
+    k1 = a[0] + b[0] * h + carry
+    k2 = a[1] + b[1] * h
+    x = cornish_fisher(z, k1, k2, a[2] + b[2] * h, a[3] + b[3] * h)
+    # h_end | X: exact regression slope and residual variance. The floor is the model's own
+    # positivity bound (h_{k+1} >= omega for any draw), not a fudge factor.
+    slope = (a[6] + b[6] * h) / k2
+    resid = ((a[5] + b[5] * h) - slope * slope * k2).clamp_min(0.0)
+    return x, ((a[4] + b[4] * h) + slope * (x - k1) + resid.sqrt() * zh).clamp_min(omega)
+
+
+hn_aggregate_draw = torch.compile(hn_aggregate_draw, dynamic=True)
+
+
+def hn_aggregate_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
+    """O(1) stand-in for :func:`hn_unmonitored_substeps` - same signature, same (Sj, h) contract.
+
+    Nothing observes the interval, so only the JOINT LAW of (aggregate return, terminal variance)
+    is needed, not the path.  Both come from :func:`hn_aggregate_moments` exactly; the aggregate
+    is drawn by Cornish-Fisher on its four cumulants and the terminal variance by its exact
+    regression on the realised aggregate plus a moment-matched residual, so the leverage
+    correlation that carries vol clustering ACROSS the interval survives.
+
+    This is the one APPROXIMATION in the OSS stack (the walk it replaces is exact) and is
+    reached only via the Valuation Configuration switch ``Approximate_Substeps``, default No.
+
+    MEASURED, AND NOT YET FIT FOR BARRIER PRODUCTS.  1.7x end-to-end on monthly fixings, but a
+    down-and-out barrier reprices +134 bp (24 seed-sigma) against the exact walk, and a weekly
+    one +138 bp while running SLOWER than the walk it replaces (n_sub~5 is too short to amortise
+    the fixed cost).  The cause is structural rather than a tuning miss: an OSS barrier lives in
+    the tail, and Cornish-Fisher is only reliable to ~2.5 sigma, so the expansion is saturated
+    exactly where the pricer reads it.  Widening the window does not help - at a realistic skew
+    of -0.6 the cubic folds at z~2.83, and a non-monotone quantile map puts mass on the wrong
+    side of the barrier, which is worse than a biased one.
+    The affine structure does support an exact fix - a per-interval quantile table built by
+    inverting :func:`hn_cdf_logret`, interpolated in (u, h1) - which is where this should go
+    next.  Until then the switch is for the smooth-payoff cases, not the barriers.
+    """
+    if not n_steps:
+        return Sj, h
+    omega, alpha, beta, gamma_star = hn_params
+    a, b = hn_cached_moments(n_steps, omega, alpha, beta, gamma_star)
+    zc = torch.randn([shared.simulation_batch, num_sims], dtype=shared.one.dtype,
+                     device=shared.one.device)
+    z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
+    x, h_end = hn_aggregate_draw(h, n_steps * b_step, a, b, z, torch.randn_like(z), omega)
+    return Sj * x.exp(), h_end
 
 
 def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
