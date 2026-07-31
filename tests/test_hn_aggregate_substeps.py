@@ -150,6 +150,7 @@ class _Shared:
     def __init__(self, batch):
         self.simulation_batch = batch
         self.one = torch.ones(1, dtype=DTYPE)
+        self.t_PreCalc = {}
 
 
 @pytest.mark.parametrize('n', [5, 21])
@@ -189,14 +190,16 @@ def test_zero_steps_is_a_no_op():
 # (f) the cache is transparent and steps aside under gradients
 # ---------------------------------------------------------------------------
 
-def test_moment_cache_is_transparent():
-    utils._HN_MOMENT_CACHE.clear()
-    a1, b1 = utils.hn_cached_moments(21, *PARAMS)
-    assert len(utils._HN_MOMENT_CACHE) == 1
-    a2, b2 = utils.hn_cached_moments(21, *PARAMS)
+def test_moment_cache_lives_in_t_precalc():
+    """t_PreCalc, not t_Buffer: the table is a function of the calibration, not the batch, and
+    reset() clears t_Buffer. Base valuation must have one too — that is where OSS prices."""
+    sh = _Shared(4)
+    a1, b1 = utils.hn_cached_moments(sh, 21, *PARAMS)
+    assert len(sh.t_PreCalc) == 1
+    a2, b2 = utils.hn_cached_moments(sh, 21, *PARAMS)
     assert torch.equal(a1, a2) and torch.equal(b1, b2)
-    a3, _ = utils.hn_cached_moments(22, *PARAMS)
-    assert len(utils._HN_MOMENT_CACHE) == 2 and not torch.equal(a1, a3)
+    a3, _ = utils.hn_cached_moments(sh, 22, *PARAMS)
+    assert len(sh.t_PreCalc) == 2 and not torch.equal(a1, a3)
     direct_a, direct_b = utils.hn_aggregate_moments(21, *PARAMS)
     assert torch.equal(a1, direct_a) and torch.equal(b1, direct_b)
 
@@ -204,12 +207,12 @@ def test_moment_cache_is_transparent():
 def test_gradients_bypass_the_cache_and_flow():
     """Under greeks the cache must step aside — a cached graph node raises on a second backward
     — and the parameters must still receive gradient through the stencil."""
-    utils._HN_MOMENT_CACHE.clear()
+    sh = _Shared(4)
     p = [t.clone().requires_grad_(True) for t in PARAMS]
     for _ in range(2):                                   # a second backward is the actual trap
-        a, b = utils.hn_cached_moments(21, *p)
+        a, b = utils.hn_cached_moments(sh, 21, *p)
         (a.sum() + b.sum()).backward()
-    assert not utils._HN_MOMENT_CACHE, 'differentiable moments must not be cached'
+    assert not sh.t_PreCalc, 'differentiable moments must not be cached'
     for t, name in zip(p, ('omega', 'alpha', 'beta', 'gamma_star')):
         assert t.grad is not None and torch.isfinite(t.grad).all() and t.grad.abs() > 0, \
             f'no gradient reached {name}'

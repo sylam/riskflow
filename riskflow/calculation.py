@@ -417,7 +417,6 @@ class CMC_State(utils.Calculation_State):
         super(CMC_State, self).__init__(
             static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size, keep_tensor=keep_tensor)
         # these are tensors
-        self.t_PreCalc = {}
         self.t_cholesky = cholesky
         self.t_random_numbers = None
         self.t_Scenario_Buffer = {}

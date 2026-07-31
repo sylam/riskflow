@@ -781,6 +781,12 @@ class Calculation_State(object):
                  nomodel: str, simulation_batch: int, keep_tensor: bool):
         # these are tensors
         self.t_Buffer = {}
+        # ...and this is the OTHER memo: t_Buffer is the per-BATCH eval cache and `reset` clears
+        # it, so anything whose validity outlives a batch - a curve interpolation, a
+        # parameter-keyed table - belongs here instead. Lives as long as the calculation, which
+        # is also how long a calibration lives. Base valuation gets one too: the OSS pricers run
+        # under it, and a per-batch/per-calc distinction is not a scenario-engine idea.
+        self.t_PreCalc = {}
         self.t_Static_Buffer = static_buffer
         # storing a unit tensor allows the dtype and device to be encoded in the calculation state
         self.one = unit
@@ -2123,26 +2129,27 @@ def cornish_fisher(z, k1, k2, k3, k4):
     return k1 + sd * (z + torch.where(lo > 0.0, corr, torch.zeros_like(corr)))
 
 
-_HN_MOMENT_CACHE = {}
-
-
-def hn_cached_moments(n_steps, omega, alpha, beta, gamma_star):
-    """:func:`hn_aggregate_moments` memoised on (n_steps, parameter values).
+def hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star):
+    """:func:`hn_aggregate_moments` memoised in ``shared.t_PreCalc`` on (n_steps, parameters).
 
     A book prices many fixings against ONE calibration, so the same scalar recursion would
-    otherwise run per fixing - and at base-valuation tensor sizes that fixed cost is what
-    decides whether the O(1) sampler beats the O(n) walk at all.
+    otherwise run per fixing - and at base-valuation tensor sizes that fixed cost is what decides
+    whether the O(1) sampler beats the O(n) walk at all.
 
-    Skipped entirely when the parameters carry gradients: the cached tensors would hold graph
-    references and a second backward through them raises. Greeks therefore pay the recompute,
-    which is correct - a stale cached derivative is the worse failure.
+    ``t_PreCalc``, not ``t_Buffer``: the table is a function of the calibration, not of the batch,
+    and `reset` clears t_Buffer between batches. Not a module-level dict either - that outlives
+    the calculation, so a recalibration would leave the superseded tables resident forever.
+
+    Skipped when the parameters carry gradients: a cached graph node raises on the second
+    backward. Greeks pay the recompute, which is the right way round - a stale cached derivative
+    is the worse failure.
     """
     if omega.requires_grad:
         return hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
-    key = (n_steps, omega.item(), alpha.item(), beta.item(), gamma_star.item())
-    if key not in _HN_MOMENT_CACHE:
-        _HN_MOMENT_CACHE[key] = hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
-    return _HN_MOMENT_CACHE[key]
+    key = ('hn_moments', n_steps, omega.item(), alpha.item(), beta.item(), gamma_star.item())
+    if key not in shared.t_PreCalc:
+        shared.t_PreCalc[key] = hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
+    return shared.t_PreCalc[key]
 
 
 def hn_aggregate_draw(h, carry, a, b, z, zh, omega):
@@ -2195,7 +2202,7 @@ def hn_aggregate_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, a
     if not n_steps:
         return Sj, h
     omega, alpha, beta, gamma_star = hn_params
-    a, b = hn_cached_moments(n_steps, omega, alpha, beta, gamma_star)
+    a, b = hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star)
     zc = torch.randn([shared.simulation_batch, num_sims], dtype=shared.one.dtype,
                      device=shared.one.device)
     z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
