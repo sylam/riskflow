@@ -2117,6 +2117,13 @@ def spot_on_deal_grid(spot, deal_time, shared):
         len(deal_time), shared.simulation_batch)
 
 
+# Daily steps walked EXACTLY at the end of a tabled interval. The aggregate is tabulated
+# exactly either way; this is what makes the TERMINAL VARIANCE right too, since its
+# conditional law cannot be tabulated in one dimension. Trades speed for a tail that is
+# correct at every quantile rather than at a nominated one.
+HN_EXACT_TAIL_STEPS = 20
+
+
 def hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star):
     """:func:`hn_aggregate_moments` memoised in ``shared.t_PreCalc`` on (n_steps, parameters).
 
@@ -2174,52 +2181,68 @@ def hn_quantile_table(n_steps, omega, alpha, beta, gamma_star, h_grid, n_u=192, 
 
 
 def hn_table_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
-    """O(1) stand-in for :func:`hn_unmonitored_substeps` - same signature, same (Sj, h) contract.
+    """O(1)-ish stand-in for :func:`hn_unmonitored_substeps` - same signature, same (Sj, h)
+    contract, and correct in the TAIL at any quantile rather than at a nominated one.
 
-    Nothing observes the interval, so only the joint law of (aggregate return, terminal variance)
-    is needed, not the path. The aggregate is drawn from the EXACT tabulated inverse CDF, and the
-    terminal variance from its exact regression on the realised aggregate plus a moment-matched
-    residual - so the leverage correlation that carries vol clustering across the interval
-    survives. The interval's h1 bracket comes from the previous interval's exact moments rather
-    than a hardcoded span.
+    Nothing observes the interval, so the aggregate return is drawn straight from the exact
+    tabulated inverse CDF (:func:`hn_quantile_table`) - no moment expansion, no validity ceiling.
 
-    Engaged where the calculation amortises a precalculation (see the dispatch in the pricers);
-    a single valuation walks the interval exactly instead, because one table build costs more
-    than the walk it would replace.
+    The terminal variance is the one thing a table cannot deliver: the pricer needs it JOINTLY
+    with the realised aggregate, because leverage means a path that fell hard carries a high h
+    into the monitored step, and that conditional law is a 2-D inversion rather than the 1-D one
+    a table is. So the END of the interval is WALKED exactly. h_end is then produced by the true
+    recursion - right shape, positive by construction, correctly coupled to its own draws - and
+    the tabled seed's error is damped by psi per walked step rather than reported. Only the
+    aggregate over the earlier steps is taken in one jump.
+
+    That trades some speed for a tail that is right everywhere instead of at a chosen percentile.
+    `HN_EXACT_TAIL_STEPS` is the dial; a coarse grid with fewer steps than it walks entirely and
+    the table is never built.
     """
-    # An empty block carries no paths to draw for, and the interval's h range - which the table
-    # is bracketed to - is undefined. The exact walk returns empty from empty by construction;
-    # this has to say so, because min() over nothing raises rather than degenerating.
     if not n_steps or not h.numel():
         return Sj, h
     omega, alpha, beta, gamma_star = hn_params
-    key = ('hn_qtable', n_steps, omega.item(), alpha.item(), beta.item(), gamma_star.item())
-    if key not in shared.t_PreCalc:
-        # The h grid is derived from the MODEL, not from the realised range of this call: the
-        # entry variance differs at every block and batch, so bracketing it there gives every
-        # call its own key, the cache never hits, and each pays a fresh Fourier inversion -
-        # measured 7x SLOWER than the walk it replaces. Anchored on the stationary variance and
-        # spanning four decades around it, the key is (n, parameters) alone and the table is
-        # built once. omega is the model's own floor on h; the top is far past any realised path.
-        lr = hn_stationary_var(omega, alpha, beta, gamma_star)
-        h_grid = torch.logspace(float(torch.log10(lr)) - 2.0, float(torch.log10(lr)) + 2.0, 64,
-                                dtype=h.dtype, device=h.device)
-        shared.t_PreCalc[key] = (h_grid,) + hn_quantile_table(
-            n_steps, omega, alpha, beta, gamma_star, h_grid)
-    h_grid, z_grid, x_table = shared.t_PreCalc[key]
+    walked = min(n_steps, HN_EXACT_TAIL_STEPS)
+    tabled = n_steps - walked
 
-    zc = torch.randn([shared.simulation_batch, num_sims], dtype=shared.one.dtype,
-                     device=shared.one.device)
-    z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
-    x = interp2d_lookup(z, h, z_grid, h_grid, x_table) + n_steps * b_step
+    if tabled:
+        key = ('hn_qtable', tabled, omega.item(), alpha.item(), beta.item(), gamma_star.item())
+        if key not in shared.t_PreCalc:
+            # The h grid is derived from the MODEL, not from this call's realised range: the entry
+            # variance differs at every block and batch, so bracketing it there gives every call
+            # its own key, the cache never hits, and each pays a fresh Fourier inversion - measured
+            # 7x SLOWER than the walk it replaces. Anchored on the stationary variance and spanning
+            # four decades, the key is (n, parameters) alone and the table is built once.
+            lr = hn_stationary_var(omega, alpha, beta, gamma_star)
+            h_grid = torch.logspace(float(torch.log10(lr)) - 2.0, float(torch.log10(lr)) + 2.0, 64,
+                                    dtype=h.dtype, device=h.device)
+            shared.t_PreCalc[key] = (h_grid,) + hn_quantile_table(
+                tabled, omega, alpha, beta, gamma_star, h_grid)
+        h_grid, z_grid, x_table = shared.t_PreCalc[key]
 
-    a, b = hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star)
-    k1, k2 = a[0] + b[0] * h, a[1] + b[1] * h
-    slope = (a[6] + b[6] * h) / k2
-    resid = ((a[5] + b[5] * h) - slope * slope * k2).clamp_min(0.0)
-    h_end = ((a[4] + b[4] * h) + slope * (x - n_steps * b_step - k1)
+        zc = torch.randn([shared.simulation_batch, num_sims], dtype=shared.one.dtype,
+                         device=shared.one.device)
+        z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
+        log_S = interp2d_lookup(z, h, z_grid, h_grid, x_table) + tabled * b_step
+
+        # h entering the walked tail: its exact regression on the aggregate just drawn plus a
+        # moment-matched residual. The only approximation left, and it is a SEED - the walk below
+        # is what keeps it out of the reported distribution.
+        a, b = hn_cached_moments(shared, tabled, omega, alpha, beta, gamma_star)
+        k1, k2 = a[0] + b[0] * h, a[1] + b[1] * h
+        slope = (a[6] + b[6] * h) / k2
+        resid = ((a[5] + b[5] * h) - slope * slope * k2).clamp_min(0.0)
+        h = ((a[4] + b[4] * h) + slope * (log_S - tabled * b_step - k1)
              + resid.sqrt() * torch.randn_like(z)).clamp_min(omega)
-    return Sj * x.exp(), h_end
+    else:
+        log_S = torch.zeros_like(b_step)
+
+    for _ in range(walked):
+        zc = torch.randn([shared.simulation_batch, num_sims], dtype=shared.one.dtype,
+                         device=shared.one.device)
+        z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
+        log_S, h = hn_log_substep(log_S, h, z, b_step, *hn_params)
+    return Sj * log_S.exp(), h
 
 
 def interp2d_lookup(u, y, u_grid, y_grid, table):
