@@ -2193,12 +2193,16 @@ def hn_table_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antit
     if not n_steps or not h.numel():
         return Sj, h
     omega, alpha, beta, gamma_star = hn_params
-    lo, hi = h.min(), h.max()
-    key = ('hn_qtable', n_steps, float(lo), float(hi), omega.item(), alpha.item(),
-           beta.item(), gamma_star.item())
+    key = ('hn_qtable', n_steps, omega.item(), alpha.item(), beta.item(), gamma_star.item())
     if key not in shared.t_PreCalc:
-        # bracket the realised entry variances, widened so the edges are interpolated not clamped
-        h_grid = torch.logspace(float(torch.log10(lo)) - 0.05, float(torch.log10(hi)) + 0.05, 48,
+        # The h grid is derived from the MODEL, not from the realised range of this call: the
+        # entry variance differs at every block and batch, so bracketing it there gives every
+        # call its own key, the cache never hits, and each pays a fresh Fourier inversion -
+        # measured 7x SLOWER than the walk it replaces. Anchored on the stationary variance and
+        # spanning four decades around it, the key is (n, parameters) alone and the table is
+        # built once. omega is the model's own floor on h; the top is far past any realised path.
+        lr = hn_stationary_var(omega, alpha, beta, gamma_star)
+        h_grid = torch.logspace(float(torch.log10(lr)) - 2.0, float(torch.log10(lr)) + 2.0, 64,
                                 dtype=h.dtype, device=h.device)
         shared.t_PreCalc[key] = (h_grid,) + hn_quantile_table(
             n_steps, omega, alpha, beta, gamma_star, h_grid)

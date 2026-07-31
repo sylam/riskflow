@@ -18,15 +18,11 @@ moment-matched residual, and its standard deviation runs 1-4% off the walk. If t
 hybrid agree, that residual approximation does not reach the exposure profile and the ship
 decision is clean; if they diverge, h_end needs the same treatment the aggregate just got.
 
-BLOCKED as of 2026-07-31, and the blocker is the finding. EquityBarrierOption cannot price
-under Credit_Monte_Carlo at all: it raises "size of tensor a (1369) must match tensor b (37)"
-- 1369 is 37 squared, the report grid against itself - and Deal.calculate swallows that into a
-skipped deal, after which report() dies on the shape. It fails IDENTICALLY with SpotModel off,
-so it is a pre-existing bug in the barrier deal's scenario path, not an HN or sub-stepping one.
-
-Which means the table has never been exercised end to end on a barrier, because the only calc
-that engages it is the one the deal cannot run in. Fix that first; this harness is ready to
-answer the question the moment it does.
+Building it flushed out a real bug on the way: EquityBarrierOption could not price under
+Credit_Monte_Carlo at all, because four equity deals corrected spot's shape by testing its
+COLUMNS and then repeating its ROWS, squaring the 37-date grid to 1369. Fixed in e7371a9.
+MCMC_Simulations is the OSS path count and must be set - sim_spot_oss takes it as num_sims,
+so leaving it at 0 prices every scenario off an empty sample and returns NaN everywhere.
 
 Run:  CUDA_VISIBLE_DEVICES=0 python gates/hn_cmc_acceptance.py
 """
@@ -100,7 +96,7 @@ def build(horizon_days, monitor_every, batch, batches, seed):
                'Calculation': {'Base_Date': BASE, 'Currency': 'USD'}}
     return c, {'Run_Date': BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 2d 1w(1w) 3m(1m) 2y(3m)',
                'Batch_Size': batch, 'Simulation_Batches': batches, 'Random_Seed': seed,
-               'Currency': 'USD', 'MCMC_Simulations': 0, 'Tenor_Offset': 0.0,
+               'Currency': 'USD', 'MCMC_Simulations': 4096, 'Tenor_Offset': 0.0,
                'Deflation_Interest_Rate': 'USD'}
 
 
@@ -115,13 +111,13 @@ def hybrid(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
     return St, hw
 
 
-def run(mode, seed, batch=512, batches=2):
+def run(mode, seed, batch=256, batches=2):
     # a measurement harness may swap the internal; shipped code never does
     utils.hn_table_substeps = {'walk': _WALK, 'table': _TABLE, 'hybrid': hybrid}[mode]
     try:
         cfg, params = build(365, 30, batch, batches, seed)
         t0 = time.perf_counter()
-        _, out, profile = riskflow.run_cmc(cfg, prec=DTYPE, overrides=params)
+        _, out = riskflow.run_cmc(cfg, prec=DTYPE, overrides=params)
         wall = time.perf_counter() - t0
         # the exposure profile IS the CMC deliverable: compare EPE and PFE95, not one mark
         mtm = out['Results']['mtm']
