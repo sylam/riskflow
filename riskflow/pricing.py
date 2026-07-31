@@ -592,7 +592,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                     if isBarrierDate_block[j] > 0:
                         # nj-1 unmonitored daily steps + 1 monitored (OSS truncation at the
                         # CONSTANT barrier, F-measurable over the interval - exact, product unchanged)
-                        Sj, h = hn_substeps(
+                        Sj, h = utils.hn_unmonitored_substeps(
                             Sj, h, b_step, nj[j] - 1, hn_params, shared, num_sims, antithetic=True)
                         sh = torch.sqrt(h)
                         z_max = (torch.log(barrier / Sj) - (b_step - 0.5 * h)) / sh
@@ -608,7 +608,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                         Sj, h = utils.hn_daily_advance(Sj, h, b_step, Z, *hn_params)
                     else:
                         # non-barrier observation date (incl. expiry): full nj unconditional steps
-                        Sj, h = hn_substeps(
+                        Sj, h = utils.hn_unmonitored_substeps(
                             Sj, h, b_step, nj[j], hn_params, shared, num_sims, antithetic=True)
                     continue
 
@@ -694,13 +694,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                 for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
         *hn_params, H0 = (hn_p[k] for k in utils.HN_PARAM_NAMES)  # the four recursion params + H0 (seeds h)
         hn_spy = factor_dep['HN_Steps_Per_Year']
-        # The unmonitored run between fixings is unobserved, so it can be walked exactly or drawn
-        # from its exact tabulated law. Both are exact; the table costs one Fourier inversion up
-        # front and repays it per fixing, so it is worth building only where a calculation
-        # amortises precalculation - which is what owning a t_PreCalc means. Same test in spirit
-        # as `sobol` below, structural rather than a JSON knob.
-        hn_substeps = (utils.hn_table_substeps if hasattr(shared, 't_PreCalc')
-                       else utils.hn_unmonitored_substeps)
+
 
     sobol = False
     if shared.simulation_batch > 16:
@@ -1350,7 +1344,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                         b_step = fwd_carry * dt / n_sub  # per-step cost-of-carry r-q; total = fwd_carry*dt
                         # the first n_sub-1 unmonitored daily steps (shared advance; antithetic to
                         # align with the u<->1-u halves of the truncated final draw below)
-                        Sj, h = hn_substeps(
+                        Sj, h = utils.hn_unmonitored_substeps(
                             Sj, h, b_step, n_sub - 1, hn_params, shared, num_sims, antithetic=True)
                         sh = torch.sqrt(h)
                         fwd_drift = b_step - 0.5 * h  # per-step drift of the FINAL (monitored) daily step
@@ -1468,13 +1462,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                 for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
         *hn_params, H0 = (hn_p[k] for k in utils.HN_PARAM_NAMES)  # the four recursion params + H0 (seeds h)
         hn_spy = factor_dep['HN_Steps_Per_Year']
-        # The unmonitored run between fixings is unobserved, so it can be walked exactly or drawn
-        # from its exact tabulated law. Both are exact; the table costs one Fourier inversion up
-        # front and repays it per fixing, so it is worth building only where a calculation
-        # amortises precalculation - which is what owning a t_PreCalc means. Same test in spirit
-        # as `sobol` below, structural rather than a JSON knob.
-        hn_substeps = (utils.hn_table_substeps if hasattr(shared, 't_PreCalc')
-                       else utils.hn_unmonitored_substeps)
+
 
     # calculate the correct accumulation to date
     acc = shared.one * 0.0
@@ -1644,7 +1632,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                                 # BELOW the autocall threshold K - applies only on the final daily step)
                                 n_sub = max(int(round(float(dt) * hn_spy)), 1)
                                 b_step = forward_carry * dt / n_sub
-                                Sj, h = hn_substeps(
+                                Sj, h = utils.hn_unmonitored_substeps(
                                     Sj, h, b_step, n_sub - 1, hn_params, shared, num_sims, antithetic=False)
                                 sh = torch.sqrt(h)
                                 p = utils.norm_cdf((torch.log(K / Sj) - (b_step - 0.5 * h)) / sh)
@@ -1797,13 +1785,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                 for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
         *hn_params, H0 = (hn_p[k] for k in utils.HN_PARAM_NAMES)  # the four recursion params + H0 (seeds h)
         hn_spy = factor_dep['HN_Steps_Per_Year']
-        # The unmonitored run between fixings is unobserved, so it can be walked exactly or drawn
-        # from its exact tabulated law. Both are exact; the table costs one Fourier inversion up
-        # front and repays it per fixing, so it is worth building only where a calculation
-        # amortises precalculation - which is what owning a t_PreCalc means. Same test in spirit
-        # as `sobol` below, structural rather than a JSON knob.
-        hn_substeps = (utils.hn_table_substeps if hasattr(shared, 't_PreCalc')
-                       else utils.hn_unmonitored_substeps)
+
 
     sobol = False
     # use a quasi random generator if we are simulating a large batch

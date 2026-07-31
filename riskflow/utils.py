@@ -1865,7 +1865,7 @@ def hn_ann_vol(omega, alpha, beta, gamma_star, steps_per_year=252.0):
     return float(v) ** 0.5 if not torch.is_tensor(v) else v.sqrt()
 
 
-def hn_ab(phi, n_steps, omega, alpha, beta, gamma_star, r, unwrap=True, phi_dim=-1, theta=None):
+def hn_ab(phi, n_steps, omega, alpha, beta, gamma_star, r, unwrap=True, phi_dim=-1):
     """Backward A/B recursion for ``n_steps`` steps.  Returns ``(A, B)``.
 
     ``phi`` : real OR complex tensor.  If complex it is assumed to vary smoothly and ascending
@@ -1873,14 +1873,9 @@ def hn_ab(phi, n_steps, omega, alpha, beta, gamma_star, r, unwrap=True, phi_dim=
     Result satisfies E_t[S_{t+n}^phi] = S_t^phi * exp(A + B * h_{t+1}); i.e. the HN affine log-CF
     of the aggregate log-return is ``A + B * h1`` (the closure handed to the model-agnostic
     inversion primitive :func:`cf_european_probabilities`).
-
-    ``theta`` seeds the recursion at B = theta instead of 0, which makes the result the JOINT
-    transform E_t[exp(phi*R_n + theta*h_{t+n+1})] - same recursion, one different initial
-    condition.  Differentiating in theta is how the terminal variance's moments (and its
-    covariance with the aggregate return) come out exactly; see :func:`hn_aggregate_moments`.
     """
     A = torch.zeros_like(phi)
-    B = torch.zeros_like(phi) if theta is None else theta * torch.ones_like(phi)
+    B = torch.zeros_like(phi)
     lin = phi * (gamma_star - 0.5) - 0.5 * gamma_star ** 2   # <-- the -phi/2 is the LRNVR drift
     half_sq = 0.5 * (phi - gamma_star) ** 2
     phir = phi * r
@@ -2115,155 +2110,6 @@ def spot_on_deal_grid(spot, deal_time, shared):
     """
     return spot if spot.shape[0] == len(deal_time) else spot.tile(
         len(deal_time), shared.simulation_batch)
-
-
-# Daily steps walked EXACTLY at the end of a tabled interval. The aggregate is tabulated
-# exactly either way; this is what makes the TERMINAL VARIANCE right too, since its
-# conditional law cannot be tabulated in one dimension. Trades speed for a tail that is
-# correct at every quantile rather than at a nominated one.
-HN_EXACT_TAIL_STEPS = 20
-
-
-def hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star):
-    """:func:`hn_aggregate_moments` memoised in ``shared.t_PreCalc`` on (n_steps, parameters).
-
-    Skipped when the parameters carry gradients, because the key is parameter VALUES and under
-    AAD that is not enough to identify the entry: two underlyings calibrated to the same numbers
-    collide, and the second would be handed moments whose graph runs back to the FIRST one's
-    leaves - a silent misattribution of its greeks. (Keying on tensor identity is not the fix
-    either; id() is recycled after GC.) Reuse across batches is otherwise safe - the leaves are
-    minted once per calculation and SensitivitiesEstimator retains the graph.
-    """
-    if omega.requires_grad:
-        return hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
-    key = ('hn_moments', n_steps, omega.item(), alpha.item(), beta.item(), gamma_star.item())
-    if key not in shared.t_PreCalc:
-        shared.t_PreCalc[key] = hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
-    return shared.t_PreCalc[key]
-
-
-def hn_quantile_table(n_steps, omega, alpha, beta, gamma_star, h_grid, n_u=192, n_sd=7.0):
-    """EXACT inverse of the n-step aggregate return law, tabulated over (u, h1).
-
-    HN is affine, so the law is a one-parameter family in the entry variance h1: tabulating it
-    on a small h1 grid captures the whole family, and a path's draw is then a 2-D lookup.
-    :func:`hn_cdf_logret` gives Q(R_n <= x) EXACTLY by Fourier inversion, so this carries no
-    distributional approximation at all - unlike a moment expansion, it has no validity ceiling
-    in the tail, which is precisely where an OSS barrier reads.
-
-    Built by evaluating F on an x-grid and inverting by interpolation rather than root-finding:
-    one batched CDF call per interval (45-125 ms, near-flat in grid size since the cost is the
-    Fourier integration, not the grid). Returns ``(u_grid, x_table)`` with ``x_table[i, j]`` the
-    return at probability ``u_grid[j]`` for ``h_grid[i]``.
-
-    Float64 Fourier inversion leaves round-off wobble of order 1e-14 where F has saturated to
-    1.0; a cumulative max makes the sequence usable for inversion without touching the body,
-    which is strictly monotone as it stands.
-    """
-    a, b = hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
-    mean = (a[0] + b[0] * h_grid).reshape(-1, 1)
-    sd = (a[1] + b[1] * h_grid).clamp_min(0.0).sqrt().reshape(-1, 1)
-    x = mean + sd * torch.linspace(-n_sd, n_sd, 4 * n_u, dtype=h_grid.dtype,
-                                   device=h_grid.device).reshape(1, -1)
-    F = hn_cdf_logret(x, n_steps, h_grid.reshape(-1, 1), omega, alpha, beta, gamma_star,
-                      torch.zeros_like(omega)).cummax(dim=1).values
-    # Tabulated against z = Phi^-1(u), NOT u: a uniform grid leaves the outer ~1% of draws off
-    # the end of the table, where clamping truncates both tails and costs over a percent of
-    # standard deviation. In z the far tail is near-linear, so the caller's draw is a normal and
-    # anything past the grid extrapolates along the edge segment instead of flattening.
-    z_grid = torch.linspace(-n_sd, n_sd, n_u, dtype=h_grid.dtype, device=h_grid.device)
-    u = norm_cdf(z_grid).expand(F.shape[0], -1).contiguous()
-    j = torch.searchsorted(F.contiguous(), u).clamp(1, F.shape[1] - 1)
-    F0, F1 = F.gather(1, j - 1), F.gather(1, j)
-    x0, x1 = x.gather(1, j - 1), x.gather(1, j)
-    w = ((u - F0) / (F1 - F0).clamp_min(1e-300)).clamp(0.0, 1.0)
-    return z_grid, x0 + w * (x1 - x0)
-
-
-def hn_table_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
-    """O(1)-ish stand-in for :func:`hn_unmonitored_substeps` - same signature, same (Sj, h)
-    contract, and correct in the TAIL at any quantile rather than at a nominated one.
-
-    Nothing observes the interval, so the aggregate return is drawn straight from the exact
-    tabulated inverse CDF (:func:`hn_quantile_table`) - no moment expansion, no validity ceiling.
-
-    The terminal variance is the one thing a table cannot deliver: the pricer needs it JOINTLY
-    with the realised aggregate, because leverage means a path that fell hard carries a high h
-    into the monitored step, and that conditional law is a 2-D inversion rather than the 1-D one
-    a table is. So the END of the interval is WALKED exactly. h_end is then produced by the true
-    recursion - right shape, positive by construction, correctly coupled to its own draws - and
-    the tabled seed's error is damped by psi per walked step rather than reported. Only the
-    aggregate over the earlier steps is taken in one jump.
-
-    That trades some speed for a tail that is right everywhere instead of at a chosen percentile.
-    `HN_EXACT_TAIL_STEPS` is the dial; a coarse grid with fewer steps than it walks entirely and
-    the table is never built.
-    """
-    if not n_steps or not h.numel():
-        return Sj, h
-    omega, alpha, beta, gamma_star = hn_params
-    walked = min(n_steps, HN_EXACT_TAIL_STEPS)
-    tabled = n_steps - walked
-
-    if tabled:
-        key = ('hn_qtable', tabled, omega.item(), alpha.item(), beta.item(), gamma_star.item())
-        if key not in shared.t_PreCalc:
-            # The h grid is derived from the MODEL, not from this call's realised range: the entry
-            # variance differs at every block and batch, so bracketing it there gives every call
-            # its own key, the cache never hits, and each pays a fresh Fourier inversion - measured
-            # 7x SLOWER than the walk it replaces. Anchored on the stationary variance and spanning
-            # four decades, the key is (n, parameters) alone and the table is built once.
-            lr = hn_stationary_var(omega, alpha, beta, gamma_star)
-            h_grid = torch.logspace(float(torch.log10(lr)) - 2.0, float(torch.log10(lr)) + 2.0, 64,
-                                    dtype=h.dtype, device=h.device)
-            shared.t_PreCalc[key] = (h_grid,) + hn_quantile_table(
-                tabled, omega, alpha, beta, gamma_star, h_grid)
-        h_grid, z_grid, x_table = shared.t_PreCalc[key]
-
-        zc = torch.randn([shared.simulation_batch, num_sims], dtype=shared.one.dtype,
-                         device=shared.one.device)
-        z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
-        log_S = interp2d_lookup(z, h, z_grid, h_grid, x_table) + tabled * b_step
-
-        # h entering the walked tail: its exact regression on the aggregate just drawn plus a
-        # moment-matched residual. The only approximation left, and it is a SEED - the walk below
-        # is what keeps it out of the reported distribution.
-        a, b = hn_cached_moments(shared, tabled, omega, alpha, beta, gamma_star)
-        k1, k2 = a[0] + b[0] * h, a[1] + b[1] * h
-        slope = (a[6] + b[6] * h) / k2
-        resid = ((a[5] + b[5] * h) - slope * slope * k2).clamp_min(0.0)
-        h = ((a[4] + b[4] * h) + slope * (log_S - tabled * b_step - k1)
-             + resid.sqrt() * torch.randn_like(z)).clamp_min(omega)
-    else:
-        log_S = torch.zeros_like(b_step)
-
-    for _ in range(walked):
-        zc = torch.randn([shared.simulation_batch, num_sims], dtype=shared.one.dtype,
-                         device=shared.one.device)
-        z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
-        log_S, h = hn_log_substep(log_S, h, z, b_step, *hn_params)
-    return Sj * log_S.exp(), h
-
-
-def interp2d_lookup(u, y, u_grid, y_grid, table):
-    """Bilinear read of ``table[y, u]`` at scattered ``(u, y)``, both grids ascending.
-
-    ``y`` is looked up in LOG space because the grids that need this - conditional variances -
-    are built log-spaced, and is CLAMPED to the grid, which is safe only because the caller
-    brackets it to the realised range. The ``u`` axis EXTRAPOLATES along the edge segment
-    instead: it carries a normal quantile whose far tail is near-linear, and flattening it
-    there would truncate the distribution - which is how a discretised scheme quietly biases
-    its own tail.
-    """
-    ly, lg = y.log(), y_grid.log()
-    i = torch.searchsorted(lg, ly.reshape(-1).contiguous()).clamp(1, lg.numel() - 1).reshape(y.shape)
-    wy = ((ly - lg[i - 1]) / (lg[i] - lg[i - 1])).clamp(0.0, 1.0)
-    j = torch.searchsorted(u_grid, u.reshape(-1).contiguous()).clamp(1, u_grid.numel() - 1).reshape(u.shape)
-    wu = (u - u_grid[j - 1]) / (u_grid[j] - u_grid[j - 1])            # unclamped: extrapolates
-    g = lambda ii, jj: table[ii.reshape(-1), jj.reshape(-1)].reshape(u.shape)
-    lo = g(i - 1, j - 1) + wu * (g(i - 1, j) - g(i - 1, j - 1))
-    hi = g(i, j - 1) + wu * (g(i, j) - g(i, j - 1))
-    return lo + wy * (hi - lo)
 
 
 def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):

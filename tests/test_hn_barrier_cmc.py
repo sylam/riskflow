@@ -6,12 +6,8 @@ shape by testing its COLUMNS and then repeating its ROWS, which is inert at one 
 the grid at 37 (1369 vs 37). `Deal.calculate` swallowed the resulting RuntimeError into a
 skipped deal, so a barrier in an exposure calculation silently produced nothing.
 
-It is also the only path where the tabulated interval draw engages at all — the pricers select
-it on the calc owning a `t_PreCalc`, which base valuation does not — so without this file the
-whole table ships untested end to end.
-
-Kept deliberately small; the full three-way accuracy comparison against the exact walk, with
-seed-noise scaling, lives in gates/hn_cmc_acceptance.py.
+Kept deliberately small — it exists to prove a barrier still prices across an exposure grid,
+which is the one thing base valuation structurally cannot check.
 """
 import os
 import sys
@@ -101,37 +97,3 @@ def test_barrier_prices_across_the_exposure_grid(hn):
     assert (mtm.values > 0).any(), 'a bought down-and-out barrier should carry positive exposure'
     # monotone decay is not guaranteed, but the profile must not be constant across time
     assert mtm.values.std(axis=1).min() > 0.0, 'no dispersion across paths at some date'
-
-
-def test_the_table_engages_only_where_precalc_lives():
-    """The dispatch contract: the tabulated draw is selected by the calc owning a t_PreCalc, so a
-    scenario run builds tables and a single valuation does not."""
-    calls = {'table': 0}
-    orig = utils.hn_table_substeps
-
-    def counted(*args, **kw):
-        calls['table'] += 1
-        return orig(*args, **kw)
-
-    utils.hn_table_substeps = counted
-    try:
-        _profile(True)
-    finally:
-        utils.hn_table_substeps = orig
-    assert calls['table'] > 0, 'credit Monte Carlo did not engage the tabulated draw'
-
-
-def test_table_and_walk_agree_on_the_profile():
-    """Both are exact in law, so the profiles must agree to Monte Carlo error. Compared on the
-    mean exposure, whose scale is set by the paths themselves rather than a hardcoded tolerance."""
-    orig = utils.hn_table_substeps
-    utils.hn_table_substeps = utils.hn_unmonitored_substeps
-    try:
-        walk = _profile(True)
-    finally:
-        utils.hn_table_substeps = orig
-    table = _profile(True)
-    epe_w = np.maximum(walk.values, 0.0).mean()
-    epe_t = np.maximum(table.values, 0.0).mean()
-    se = np.maximum(walk.values, 0.0).std() / np.sqrt(walk.values.size)
-    assert abs(epe_t - epe_w) < 8.0 * se, f'EPE {epe_t:.3f} vs walk {epe_w:.3f} ({se:.3f} se)'
