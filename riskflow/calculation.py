@@ -417,6 +417,11 @@ class CMC_State(utils.Calculation_State):
         super(CMC_State, self).__init__(
             static_buffer, one, mcmc_sims, report_currency, nomodel, batch_size, keep_tensor=keep_tensor)
         # these are tensors
+        # The precalc memo is deliberately NOT on Calculation_State: t_Buffer is the per-batch
+        # eval cache that `reset` clears, and this is the per-CALCULATION one — which only earns
+        # its keep where a calculation spans many batches. Its presence is therefore the marker
+        # for "exposure-based", and pricers read it that way rather than inventing a switch.
+        self.t_PreCalc = {}
         self.t_cholesky = cholesky
         self.t_random_numbers = None
         self.t_Scenario_Buffer = {}

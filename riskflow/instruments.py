@@ -2896,7 +2896,6 @@ class EquityBarrierBinaryOption(Deal):
         if hn is not None:
             field_index['HN_Params'] = hn
             field_index['HN_Steps_Per_Year'] = self.options.get('Steps_Per_Year', 252.0)
-            field_index['HN_Approximate_Substeps'] = self.options.get('Approximate_Substeps', 'No') == 'Yes'
 
         return field_index
 
@@ -3238,7 +3237,6 @@ class QEDI_CustomAutoCallSwap(Deal):
         if hn is not None:
             field_index['HN_Params'] = hn
             field_index['HN_Steps_Per_Year'] = self.options.get('Steps_Per_Year', 252.0)
-            field_index['HN_Approximate_Substeps'] = self.options.get('Approximate_Substeps', 'No') == 'Yes'
 
         return field_index
 
@@ -3600,7 +3598,6 @@ class EquityBarrierOption(Deal):
         if hn is not None:
             field_index['HN_Params'] = hn
             field_index['HN_Steps_Per_Year'] = self.options.get('Steps_Per_Year', 252.0)
-            field_index['HN_Approximate_Substeps'] = self.options.get('Approximate_Substeps', 'No') == 'Yes'
 
         return field_index
 
@@ -4490,7 +4487,6 @@ class FXTARFOptionDeal(Deal):
             field_index['HN_Params'] = hn
             # HN is calibrated on a per-DAY clock; a weekly/monthly fixing spans this many daily sub-steps
             field_index['HN_Steps_Per_Year'] = self.options.get('Steps_Per_Year', 252.0)
-            field_index['HN_Approximate_Substeps'] = self.options.get('Approximate_Substeps', 'No') == 'Yes'
 
         # needed for reporting
         return field_index

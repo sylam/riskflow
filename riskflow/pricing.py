@@ -694,9 +694,12 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                 for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
         *hn_params, H0 = (hn_p[k] for k in utils.HN_PARAM_NAMES)  # the four recursion params + H0 (seeds h)
         hn_spy = factor_dep['HN_Steps_Per_Year']
-        # the unmonitored run between fixings is unobserved, so it can be walked exactly or
-        # sampled from its aggregate law - same signature, same (Sj, h) contract.
-        hn_substeps = (utils.hn_aggregate_substeps if factor_dep['HN_Approximate_Substeps']
+        # The unmonitored run between fixings is unobserved, so it can be walked exactly or drawn
+        # from its exact tabulated law. Both are exact; the table costs one Fourier inversion up
+        # front and repays it per fixing, so it is worth building only where a calculation
+        # amortises precalculation - which is what owning a t_PreCalc means. Same test in spirit
+        # as `sobol` below, structural rather than a JSON knob.
+        hn_substeps = (utils.hn_table_substeps if hasattr(shared, 't_PreCalc')
                        else utils.hn_unmonitored_substeps)
 
     sobol = False
@@ -1465,9 +1468,12 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                 for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
         *hn_params, H0 = (hn_p[k] for k in utils.HN_PARAM_NAMES)  # the four recursion params + H0 (seeds h)
         hn_spy = factor_dep['HN_Steps_Per_Year']
-        # the unmonitored run between fixings is unobserved, so it can be walked exactly or
-        # sampled from its aggregate law - same signature, same (Sj, h) contract.
-        hn_substeps = (utils.hn_aggregate_substeps if factor_dep['HN_Approximate_Substeps']
+        # The unmonitored run between fixings is unobserved, so it can be walked exactly or drawn
+        # from its exact tabulated law. Both are exact; the table costs one Fourier inversion up
+        # front and repays it per fixing, so it is worth building only where a calculation
+        # amortises precalculation - which is what owning a t_PreCalc means. Same test in spirit
+        # as `sobol` below, structural rather than a JSON knob.
+        hn_substeps = (utils.hn_table_substeps if hasattr(shared, 't_PreCalc')
                        else utils.hn_unmonitored_substeps)
 
     # calculate the correct accumulation to date
@@ -1791,9 +1797,12 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                 for x in factor_dep['HN_Params'][0][utils.FACTOR_INDEX_Offset]}
         *hn_params, H0 = (hn_p[k] for k in utils.HN_PARAM_NAMES)  # the four recursion params + H0 (seeds h)
         hn_spy = factor_dep['HN_Steps_Per_Year']
-        # the unmonitored run between fixings is unobserved, so it can be walked exactly or
-        # sampled from its aggregate law - same signature, same (Sj, h) contract.
-        hn_substeps = (utils.hn_aggregate_substeps if factor_dep['HN_Approximate_Substeps']
+        # The unmonitored run between fixings is unobserved, so it can be walked exactly or drawn
+        # from its exact tabulated law. Both are exact; the table costs one Fourier inversion up
+        # front and repays it per fixing, so it is worth building only where a calculation
+        # amortises precalculation - which is what owning a t_PreCalc means. Same test in spirit
+        # as `sobol` below, structural rather than a JSON knob.
+        hn_substeps = (utils.hn_table_substeps if hasattr(shared, 't_PreCalc')
                        else utils.hn_unmonitored_substeps)
 
     sobol = False

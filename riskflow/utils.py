@@ -781,12 +781,6 @@ class Calculation_State(object):
                  nomodel: str, simulation_batch: int, keep_tensor: bool):
         # these are tensors
         self.t_Buffer = {}
-        # ...and this is the OTHER memo: t_Buffer is the per-BATCH eval cache and `reset` clears
-        # it, so anything whose validity outlives a batch - a curve interpolation, a
-        # parameter-keyed table - belongs here instead. Lives as long as the calculation, which
-        # is also how long a calibration lives. Base valuation gets one too: the OSS pricers run
-        # under it, and a per-batch/per-calc distinction is not a scenario-engine idea.
-        self.t_PreCalc = {}
         self.t_Static_Buffer = static_buffer
         # storing a unit tensor allows the dtype and device to be encoded in the calculation state
         self.one = unit
@@ -2095,58 +2089,15 @@ def hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star):
     return moments(A), moments(B)
 
 
-CF_Z = 2.5      # Cornish-Fisher is documented reliable to ~2-2.5 sigma; past that it saturates
-
-
-def cornish_fisher(z, k1, k2, k3, k4):
-    """Cornish-Fisher quantile expansion: a draw with the given first four cumulants, from a
-    standard normal ``z``.  ``k3``/``k4`` are the third/fourth CUMULANTS (not standardised).
-
-    The expansion is a cubic in z and stops being monotone once the skew/kurtosis terms
-    dominate, which folds the tail back on itself and puts mass on the wrong side of a barrier -
-    the one thing an OSS pricer cannot tolerate.  The map's slope is the quadratic
-    ``A z^2 + B z + C``; its minimum over the reliable range is available in closed form, and a
-    path whose minimum is non-positive falls back ENTIRELY to the matched Gaussian.  Deciding
-    per PATH rather than per point matters: dropping the correction pointwise would leave a jump
-    at the switch, which is non-monotone in a different way and biases the mean.
-    """
-    sd = k2.sqrt()
-    g1 = k3 / k2 ** 1.5
-    g2 = k4 / k2 ** 2
-    gg = g1 * g1
-    a = g2 / 8.0 - gg / 6.0
-    b = g1 / 3.0
-    c = 1.0 - g2 / 8.0 + 5.0 * gg / 36.0
-    slope = lambda t: (a * t + b) * t + c
-    # A > 0 opens upward so the vertex is the minimum; otherwise an endpoint is
-    vertex = (-b / torch.where(a.abs() > 1e-300, a, torch.full_like(a, 1e-300)) / 2.0).clamp(-CF_Z, CF_Z)
-    lo = torch.minimum(slope(-torch.as_tensor(CF_Z, dtype=z.dtype, device=z.device)), slope(z.new_tensor(CF_Z)))
-    lo = torch.where(a > 0.0, torch.minimum(lo, slope(vertex)), lo)
-
-    zc = z.clamp(-CF_Z, CF_Z)                        # saturate: past the reliable range the
-    z2 = zc * zc                                     # correction stops growing, slope stays 1
-    corr = (g1 / 6.0) * (z2 - 1.0) + (g2 / 24.0) * (z2 - 3.0) * zc - (gg / 36.0) * (2.0 * z2 - 5.0) * zc
-    return k1 + sd * (z + torch.where(lo > 0.0, corr, torch.zeros_like(corr)))
-
-
 def hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star):
     """:func:`hn_aggregate_moments` memoised in ``shared.t_PreCalc`` on (n_steps, parameters).
 
-    A book prices many fixings against ONE calibration, so the same scalar recursion would
-    otherwise run per fixing - and at base-valuation tensor sizes that fixed cost is what decides
-    whether the O(1) sampler beats the O(n) walk at all.
-
-    ``t_PreCalc``, not ``t_Buffer``: the table is a function of the calibration, not of the batch,
-    and `reset` clears t_Buffer between batches. Not a module-level dict either - that outlives
-    the calculation, so a recalibration would leave the superseded tables resident forever.
-
     Skipped when the parameters carry gradients, because the key is parameter VALUES and under
     AAD that is not enough to identify the entry: two underlyings calibrated to the same numbers
-    collide, and the second one would be handed moments whose graph runs back to the FIRST one's
+    collide, and the second would be handed moments whose graph runs back to the FIRST one's
     leaves - a silent misattribution of its greeks. (Keying on tensor identity is not the fix
-    either; id() is recycled after GC.) Reuse across batches would otherwise be safe - the leaves
-    are minted once per calculation and SensitivitiesEstimator retains the graph - so what is
-    being avoided is the collision, not a second backward.
+    either; id() is recycled after GC.) Reuse across batches is otherwise safe - the leaves are
+    minted once per calculation and SensitivitiesEstimator retains the graph.
     """
     if omega.requires_grad:
         return hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
@@ -2156,62 +2107,105 @@ def hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star):
     return shared.t_PreCalc[key]
 
 
-def hn_aggregate_draw(h, carry, a, b, z, zh, omega):
-    """The per-path half of the aggregate sampler: the interval's scalar moments evaluated at
-    each path's entry variance, the Cornish-Fisher draw of the aggregate return, and the
-    terminal variance regressed on it.  ``a``/``b`` are the affine coefficients from
-    :func:`hn_aggregate_moments`; ``carry`` is the interval's total cost of carry.
+def hn_quantile_table(n_steps, omega, alpha, beta, gamma_star, h_grid, n_u=192, n_sd=7.0):
+    """EXACT inverse of the n-step aggregate return law, tabulated over (u, h1).
 
-    Split out and fused for the same reason as :func:`hn_log_substep` - ~40 bandwidth-bound
-    elementwise kernels that collapse to one, which is what makes the O(1) sampler actually
-    beat the O(n) walk rather than merely have better asymptotics.
+    HN is affine, so the law is a one-parameter family in the entry variance h1: tabulating it
+    on a small h1 grid captures the whole family, and a path's draw is then a 2-D lookup.
+    :func:`hn_cdf_logret` gives Q(R_n <= x) EXACTLY by Fourier inversion, so this carries no
+    distributional approximation at all - unlike a moment expansion, it has no validity ceiling
+    in the tail, which is precisely where an OSS barrier reads.
+
+    Built by evaluating F on an x-grid and inverting by interpolation rather than root-finding:
+    one batched CDF call per interval (45-125 ms, near-flat in grid size since the cost is the
+    Fourier integration, not the grid). Returns ``(u_grid, x_table)`` with ``x_table[i, j]`` the
+    return at probability ``u_grid[j]`` for ``h_grid[i]``.
+
+    Float64 Fourier inversion leaves round-off wobble of order 1e-14 where F has saturated to
+    1.0; a cumulative max makes the sequence usable for inversion without touching the body,
+    which is strictly monotone as it stands.
     """
-    k1 = a[0] + b[0] * h + carry
-    k2 = a[1] + b[1] * h
-    x = cornish_fisher(z, k1, k2, a[2] + b[2] * h, a[3] + b[3] * h)
-    # h_end | X: exact regression slope and residual variance. The floor is the model's own
-    # positivity bound (h_{k+1} >= omega for any draw), not a fudge factor.
-    slope = (a[6] + b[6] * h) / k2
-    resid = ((a[5] + b[5] * h) - slope * slope * k2).clamp_min(0.0)
-    return x, ((a[4] + b[4] * h) + slope * (x - k1) + resid.sqrt() * zh).clamp_min(omega)
+    a, b = hn_aggregate_moments(n_steps, omega, alpha, beta, gamma_star)
+    mean = (a[0] + b[0] * h_grid).reshape(-1, 1)
+    sd = (a[1] + b[1] * h_grid).clamp_min(0.0).sqrt().reshape(-1, 1)
+    x = mean + sd * torch.linspace(-n_sd, n_sd, 4 * n_u, dtype=h_grid.dtype,
+                                   device=h_grid.device).reshape(1, -1)
+    F = hn_cdf_logret(x, n_steps, h_grid.reshape(-1, 1), omega, alpha, beta, gamma_star,
+                      torch.zeros_like(omega)).cummax(dim=1).values
+    # Tabulated against z = Phi^-1(u), NOT u: a uniform grid leaves the outer ~1% of draws off
+    # the end of the table, where clamping truncates both tails and costs over a percent of
+    # standard deviation. In z the far tail is near-linear, so the caller's draw is a normal and
+    # anything past the grid extrapolates along the edge segment instead of flattening.
+    z_grid = torch.linspace(-n_sd, n_sd, n_u, dtype=h_grid.dtype, device=h_grid.device)
+    u = norm_cdf(z_grid).expand(F.shape[0], -1).contiguous()
+    j = torch.searchsorted(F.contiguous(), u).clamp(1, F.shape[1] - 1)
+    F0, F1 = F.gather(1, j - 1), F.gather(1, j)
+    x0, x1 = x.gather(1, j - 1), x.gather(1, j)
+    w = ((u - F0) / (F1 - F0).clamp_min(1e-300)).clamp(0.0, 1.0)
+    return z_grid, x0 + w * (x1 - x0)
 
 
-hn_aggregate_draw = torch.compile(hn_aggregate_draw, dynamic=True)
-
-
-def hn_aggregate_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
+def hn_table_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
     """O(1) stand-in for :func:`hn_unmonitored_substeps` - same signature, same (Sj, h) contract.
 
-    Nothing observes the interval, so only the JOINT LAW of (aggregate return, terminal variance)
-    is needed, not the path.  Both come from :func:`hn_aggregate_moments` exactly; the aggregate
-    is drawn by Cornish-Fisher on its four cumulants and the terminal variance by its exact
-    regression on the realised aggregate plus a moment-matched residual, so the leverage
-    correlation that carries vol clustering ACROSS the interval survives.
+    Nothing observes the interval, so only the joint law of (aggregate return, terminal variance)
+    is needed, not the path. The aggregate is drawn from the EXACT tabulated inverse CDF, and the
+    terminal variance from its exact regression on the realised aggregate plus a moment-matched
+    residual - so the leverage correlation that carries vol clustering across the interval
+    survives. The interval's h1 bracket comes from the previous interval's exact moments rather
+    than a hardcoded span.
 
-    This is the one APPROXIMATION in the OSS stack (the walk it replaces is exact) and is
-    reached only via the Valuation Configuration switch ``Approximate_Substeps``, default No.
-
-    MEASURED, AND NOT YET FIT FOR BARRIER PRODUCTS.  1.7x end-to-end on monthly fixings, but a
-    down-and-out barrier reprices +134 bp (24 seed-sigma) against the exact walk, and a weekly
-    one +138 bp while running SLOWER than the walk it replaces (n_sub~5 is too short to amortise
-    the fixed cost).  The cause is structural rather than a tuning miss: an OSS barrier lives in
-    the tail, and Cornish-Fisher is only reliable to ~2.5 sigma, so the expansion is saturated
-    exactly where the pricer reads it.  Widening the window does not help - at a realistic skew
-    of -0.6 the cubic folds at z~2.83, and a non-monotone quantile map puts mass on the wrong
-    side of the barrier, which is worse than a biased one.
-    The affine structure does support an exact fix - a per-interval quantile table built by
-    inverting :func:`hn_cdf_logret`, interpolated in (u, h1) - which is where this should go
-    next.  Until then the switch is for the smooth-payoff cases, not the barriers.
+    Engaged where the calculation amortises a precalculation (see the dispatch in the pricers);
+    a single valuation walks the interval exactly instead, because one table build costs more
+    than the walk it would replace.
     """
     if not n_steps:
         return Sj, h
     omega, alpha, beta, gamma_star = hn_params
-    a, b = hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star)
+    lo, hi = h.min(), h.max()
+    key = ('hn_qtable', n_steps, float(lo), float(hi), omega.item(), alpha.item(),
+           beta.item(), gamma_star.item())
+    if key not in shared.t_PreCalc:
+        # bracket the realised entry variances, widened so the edges are interpolated not clamped
+        h_grid = torch.logspace(float(torch.log10(lo)) - 0.05, float(torch.log10(hi)) + 0.05, 48,
+                                dtype=h.dtype, device=h.device)
+        shared.t_PreCalc[key] = (h_grid,) + hn_quantile_table(
+            n_steps, omega, alpha, beta, gamma_star, h_grid)
+    h_grid, z_grid, x_table = shared.t_PreCalc[key]
+
     zc = torch.randn([shared.simulation_batch, num_sims], dtype=shared.one.dtype,
                      device=shared.one.device)
     z = torch.cat([zc, -zc], dim=-1) if antithetic else zc
-    x, h_end = hn_aggregate_draw(h, n_steps * b_step, a, b, z, torch.randn_like(z), omega)
+    x = interp2d_lookup(z, h, z_grid, h_grid, x_table) + n_steps * b_step
+
+    a, b = hn_cached_moments(shared, n_steps, omega, alpha, beta, gamma_star)
+    k1, k2 = a[0] + b[0] * h, a[1] + b[1] * h
+    slope = (a[6] + b[6] * h) / k2
+    resid = ((a[5] + b[5] * h) - slope * slope * k2).clamp_min(0.0)
+    h_end = ((a[4] + b[4] * h) + slope * (x - n_steps * b_step - k1)
+             + resid.sqrt() * torch.randn_like(z)).clamp_min(omega)
     return Sj * x.exp(), h_end
+
+
+def interp2d_lookup(u, y, u_grid, y_grid, table):
+    """Bilinear read of ``table[y, u]`` at scattered ``(u, y)``, both grids ascending.
+
+    ``y`` is looked up in LOG space because the grids that need this - conditional variances -
+    are built log-spaced, and is CLAMPED to the grid, which is safe only because the caller
+    brackets it to the realised range. The ``u`` axis EXTRAPOLATES along the edge segment
+    instead: it carries a normal quantile whose far tail is near-linear, and flattening it
+    there would truncate the distribution - which is how a discretised scheme quietly biases
+    its own tail.
+    """
+    ly, lg = y.log(), y_grid.log()
+    i = torch.searchsorted(lg, ly.reshape(-1).contiguous()).clamp(1, lg.numel() - 1).reshape(y.shape)
+    wy = ((ly - lg[i - 1]) / (lg[i] - lg[i - 1])).clamp(0.0, 1.0)
+    j = torch.searchsorted(u_grid, u.reshape(-1).contiguous()).clamp(1, u_grid.numel() - 1).reshape(u.shape)
+    wu = (u - u_grid[j - 1]) / (u_grid[j] - u_grid[j - 1])            # unclamped: extrapolates
+    g = lambda ii, jj: table[ii.reshape(-1), jj.reshape(-1)].reshape(u.shape)
+    lo = g(i - 1, j - 1) + wu * (g(i - 1, j) - g(i - 1, j - 1))
+    hi = g(i, j - 1) + wu * (g(i, j) - g(i, j - 1))
+    return lo + wy * (hi - lo)
 
 
 def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):

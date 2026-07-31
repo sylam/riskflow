@@ -1,23 +1,24 @@
-"""The `Approximate_Substeps` valuation switch: sampling the unmonitored OSS run from its
-aggregate law instead of walking it (utils.hn_aggregate_moments / cornish_fisher /
-hn_aggregate_draw / hn_aggregate_substeps, dispatched in the three OSS pricers).
+"""Drawing the unmonitored OSS run from its EXACT tabulated law instead of walking it
+(utils.hn_aggregate_moments / hn_quantile_table / interp2d_lookup / hn_table_substeps).
 
-Nothing observes the spot between fixings, so only the JOINT law of (aggregate return, terminal
-variance) is needed. HN is affine, so that law's moments are exact and are SCALARS per interval;
-the draw is then O(1) per path instead of O(n_sub) bandwidth-bound tensor steps.
-
-This is the one APPROXIMATION in the OSS stack — everything else is exact — so the gates are
-built around that:
+Nothing observes the spot between fixings, so only the joint law of (aggregate return, terminal
+variance) is needed. HN is affine, so that law is a one-parameter family in the entry variance:
+tabulating the exact Fourier-inverted CDF over (u, h1) captures the whole family, and a path's
+draw becomes a 2-D lookup — O(1) instead of O(n_sub) bandwidth-bound tensor steps, with NO
+distributional approximation and so no validity ceiling in the tail where a barrier reads.
 
   (a) the moments are EXACT: cumulants match the independent autodiff reference in
       tests/hn_reference.py, and the terminal-variance moments match brute-force MC.
   (b) the affine split is real: a + b*h1 reproduces the reference at several h1.
-  (c) Cornish-Fisher stays MONOTONE in z — a folded quantile map would put mass on the wrong
-      side of a barrier, which is exactly what an OSS pricer cannot tolerate.
-  (d) the sampler reproduces the exact walk's distribution within MC error.
-  (e) the switch DEFAULTS OFF and off is bit-identical to before it existed.
-  (f) the moment cache is transparent (same numbers cached or not) and is bypassed under
-      gradients, where a cached graph node would raise on a second backward.
+  (c) the table inverts the CDF: reading it at u returns the x where F(x) == u, and it is
+      monotone in u — a folded quantile map would put mass on the wrong side of a barrier.
+  (d) the drawn interval reproduces the exact walk's distribution, tails included.
+  (e) the lookup is exact on its own grid nodes and bilinear off them.
+  (f) the moment cache is transparent and is bypassed under gradients, where a value-keyed
+      entry would misattribute one factor's greeks to another.
+
+The table is engaged structurally — only where the calculation owns a t_PreCalc, i.e. is
+exposure-based and amortises a precalculation. A single valuation walks the interval exactly.
 """
 import os
 import sys
@@ -102,51 +103,61 @@ def test_moments_are_affine_in_h1():
 
 
 # ---------------------------------------------------------------------------
-# (c) Cornish-Fisher must stay monotone
+# (c)/(e) the table really is the inverse CDF, and the lookup reads it faithfully
 # ---------------------------------------------------------------------------
 
-def test_cornish_fisher_is_monotone_and_matches_moments():
-    """A folded quantile map puts probability mass on the wrong side of a barrier. The clamp
-    keeps the map monotone even where the skew/kurtosis correction would dominate."""
-    z = torch.linspace(-6.0, 6.0, 20001, dtype=DTYPE)
-    for g1, g2 in ((0.0, 0.0), (-0.9, 1.2), (-4.0, 20.0), (3.0, -1.0)):   # last two are extreme
-        k2 = torch.tensor(4.0e-3, dtype=DTYPE)
-        x = utils.cornish_fisher(z, torch.tensor(-2.0e-3, dtype=DTYPE), k2,
-                                 torch.tensor(g1, dtype=DTYPE) * k2 ** 1.5,
-                                 torch.tensor(g2, dtype=DTYPE) * k2 ** 2)
-        assert (x[1:] - x[:-1] >= 0).all(), f'non-monotone at skew={g1}, exkurt={g2}'
-    # with no skew/kurtosis it is exactly the Gaussian quantile
-    k1, k2 = torch.tensor(0.1, dtype=DTYPE), torch.tensor(0.25, dtype=DTYPE)
+@pytest.mark.parametrize('n', [5, 21, 63])
+def test_table_inverts_the_exact_cdf(n):
+    """Reading the table at probability u must return the x with F(x) == u, where F is the
+    Fourier-inverted CDF itself. This is the whole claim: no moment expansion, no tail ceiling."""
+    h_grid = torch.logspace(-0.5, 0.5, 12, dtype=DTYPE) * H0_STAT
+    z_grid, x_table = utils.hn_quantile_table(n, *PARAMS, h_grid)
+    assert (x_table[:, 1:] >= x_table[:, :-1]).all(), 'quantile table not monotone in z'
     zero = torch.zeros((), dtype=DTYPE)
-    assert torch.allclose(utils.cornish_fisher(z, k1, k2, zero, zero), k1 + k2.sqrt() * z)
+    for i in (0, 6, 11):
+        for j in (2, len(z_grid) // 2, len(z_grid) - 3):
+            want = float(utils.norm_cdf(z_grid[j]))
+            back = float(utils.hn_cdf_logret(x_table[i, j], n, h_grid[i], *PARAMS, zero))
+            assert abs(back - want) < 2e-4, f'n={n} h[{i}] u={want:.4f}: F(Q(u)) = {back:.6f}'
 
 
-def test_cornish_fisher_delivers_the_requested_moments():
-    torch.manual_seed(0)
-    z = torch.randn(4_000_000, dtype=DTYPE)
-    k1, k2 = torch.tensor(-0.02, dtype=DTYPE), torch.tensor(9.0e-4, dtype=DTYPE)
-    g1 = -0.6
-    x = utils.cornish_fisher(z, k1, k2, torch.tensor(g1, dtype=DTYPE) * k2 ** 1.5,
-                             torch.zeros((), dtype=DTYPE))
-    # E[correction] is zero only for UNCLAMPED z, and unclamped is exactly what folds; saturating
-    # past CF_Z therefore leaves a small mean shift. It is bounded well inside a percent of a
-    # standard deviation — pinned here so a regression that widens it is caught.
-    sd = float(k2) ** 0.5
-    assert abs(x.mean().item() - float(k1)) < 0.005 * sd, 'saturation bias grew'
-    assert abs(x.var().item() / float(k2) - 1.0) < 0.02
-    # Saturation costs skew as well as mean: the tail it truncates is the tail that carries the
-    # third moment, so ~82% of the requested skew survives. It cannot be bought back by widening
-    # CF_Z — at this skew the cubic genuinely folds at z~2.83, so a wider window would trip the
-    # per-path monotonicity guard and lose the correction ENTIRELY. Most of the skew beats none.
-    skew = (((x - x.mean()) / x.std()) ** 3).mean().item()
-    assert g1 * 0.7 > skew > g1 * 1.05, f'skew {skew:.3f} out of band for requested {g1}'
+def test_table_covers_the_tail_a_moment_expansion_cannot():
+    """The reason this replaced Cornish-Fisher: at 1% and 99% the table is still the exact CDF,
+    where a 4-moment expansion is past its validity range and had to be saturated."""
+    n = 63
+    h_grid = torch.logspace(-0.3, 0.3, 8, dtype=DTYPE) * H0_STAT
+    z_grid, x_table = utils.hn_quantile_table(n, *PARAMS, h_grid)
+    zero = torch.zeros((), dtype=DTYPE)
+    for target in (0.01, 0.99):
+        j = int(torch.argmin((utils.norm_cdf(z_grid) - target).abs()))
+        want = float(utils.norm_cdf(z_grid[j]))
+        back = float(utils.hn_cdf_logret(x_table[4, j], n, h_grid[4], *PARAMS, zero))
+        assert abs(back - want) < 2e-4, f'tail u={target}: F(Q(u)) = {back:.6f}'
+
+
+def test_interp2d_lookup_is_exact_on_nodes():
+    y_grid = torch.logspace(-1.0, 1.0, 9, dtype=DTYPE)
+    u_grid = torch.linspace(0.05, 0.95, 11, dtype=DTYPE)
+    table = (torch.arange(9, dtype=DTYPE).reshape(-1, 1) * 10.0
+             + torch.arange(11, dtype=DTYPE).reshape(1, -1))
+    yy, uu = torch.meshgrid(y_grid[1:], u_grid[1:], indexing='ij')
+    got = utils.interp2d_lookup(uu, yy, u_grid, y_grid, table)
+    assert torch.allclose(got, table[1:, 1:]), 'lookup is not exact on its own grid nodes'
+    # and interpolates, not steps, in between
+    mid_u = 0.5 * (u_grid[3] + u_grid[4])
+    mid = utils.interp2d_lookup(mid_u.reshape(1, 1), y_grid[5].reshape(1, 1), u_grid, y_grid, table)
+    assert abs(float(mid) - 0.5 * float(table[5, 3] + table[5, 4])) < 1e-12
 
 
 # ---------------------------------------------------------------------------
-# (d) the sampler reproduces the exact walk
+# (d) the drawn interval reproduces the exact walk
 # ---------------------------------------------------------------------------
 
 class _Shared:
+    """The pricer-side contract the substep functions read: batch width, a unit tensor carrying
+    dtype/device, and the per-calculation precalc memo whose PRESENCE is what marks a calculation
+    as one that amortises a table."""
+
     def __init__(self, batch):
         self.simulation_batch = batch
         self.one = torch.ones(1, dtype=DTYPE)
@@ -154,7 +165,9 @@ class _Shared:
 
 
 @pytest.mark.parametrize('n', [5, 21])
-def test_sampler_matches_the_exact_walk(n):
+def test_table_draw_matches_the_exact_walk(n):
+    """The daily walk is the oracle. Both are Monte Carlo, so the body is compared on MC error
+    and the tails on an absolute band — the tails are the point of the table."""
     B, S = 64, 8192
     shared = _Shared(B)
     Sj = torch.full((B, 2 * S), 100.0, dtype=DTYPE)
@@ -163,17 +176,17 @@ def test_sampler_matches_the_exact_walk(n):
     torch.manual_seed(1)
     Se, he = utils.hn_unmonitored_substeps(Sj, h, b_step, n, PARAMS, shared, S, True)
     torch.manual_seed(2)
-    Sa, ha = utils.hn_aggregate_substeps(Sj, h, b_step, n, PARAMS, shared, S, True)
-    xe, xa = (Se / 100.0).log().flatten(), (Sa / 100.0).log().flatten()
+    St, ht = utils.hn_table_substeps(Sj, h, b_step, n, PARAMS, shared, S, True)
+    xe, xt = (Se / 100.0).log().flatten(), (St / 100.0).log().flatten()
     se = xe.std().item() / np.sqrt(xe.numel())
-    assert abs(xa.mean().item() - xe.mean().item()) < 6.0 * se
-    assert abs(xa.std().item() / xe.std().item() - 1.0) < 0.01
-    for p in (0.01, 0.25, 0.5, 0.75, 0.99):
+    assert abs(xt.mean().item() - xe.mean().item()) < 6.0 * se
+    assert abs(xt.std().item() / xe.std().item() - 1.0) < 0.01
+    for p in (0.01, 0.05, 0.5, 0.95, 0.99):
         qe = torch.quantile(xe[:1_000_000].float(), p).item()
-        qa = torch.quantile(xa[:1_000_000].float(), p).item()
-        assert abs(qa - qe) < 0.01 * xe.std().item() + 2.0e-3, f'q{p}: {qa:.5f} vs {qe:.5f}'
-    assert abs(ha.mean().item() / he.mean().item() - 1.0) < 0.02, 'terminal variance level off'
-    assert (ha > 0).all(), 'terminal variance must stay positive'
+        qt = torch.quantile(xt[:1_000_000].float(), p).item()
+        assert abs(qt - qe) < 0.02 * xe.std().item(), f'q{p}: {qt:.5f} vs {qe:.5f}'
+    assert (ht > 0).all(), 'terminal variance must stay positive'
+    assert abs(ht.mean().item() / he.mean().item() - 1.0) < 0.02, 'terminal variance level off'
 
 
 def test_zero_steps_is_a_no_op():
@@ -181,7 +194,7 @@ def test_zero_steps_is_a_no_op():
     Sj = torch.full((4, 8), 100.0, dtype=DTYPE)
     h = torch.full((4, 8), H0_STAT, dtype=DTYPE)
     b = torch.zeros((4, 1), dtype=DTYPE)
-    for fn in (utils.hn_unmonitored_substeps, utils.hn_aggregate_substeps):
+    for fn in (utils.hn_unmonitored_substeps, utils.hn_table_substeps):
         S2, h2 = fn(Sj, h, b, 0, PARAMS, shared, 4, True)
         assert S2 is Sj and h2 is h, f'{fn.__name__} touched the state on an empty walk'
 
@@ -191,8 +204,8 @@ def test_zero_steps_is_a_no_op():
 # ---------------------------------------------------------------------------
 
 def test_moment_cache_lives_in_t_precalc():
-    """t_PreCalc, not t_Buffer: the table is a function of the calibration, not the batch, and
-    reset() clears t_Buffer. Base valuation must have one too — that is where OSS prices."""
+    """t_PreCalc, not t_Buffer: these are functions of the calibration, not of the batch, and
+    reset() clears t_Buffer every batch. Owning one is also the marker the pricers dispatch on."""
     sh = _Shared(4)
     a1, b1 = utils.hn_cached_moments(sh, 21, *PARAMS)
     assert len(sh.t_PreCalc) == 1
