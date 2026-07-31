@@ -5,7 +5,7 @@ HestonNandiImpliedSpotModel._simulate_returns).
 A scenario grid step spanning more than one calibration step walks the sub-steps that span it —
 whole trading days, then the fractional remainder — through the same recursion the fine grid
 takes. This replaced a deterministic-h aggregate-variance bridge over round(f) whole days, which
-was wrong twice over: 29%→2000% off on tail probabilities at |z|=2–3 (tb_hn_aggregate_bias.csv),
+was wrong twice over: 29%→2000% off on tail probabilities at |z|=2–3 (gates/hn_aggregate_bias.csv),
 and carrying round(f) days of variance instead of f (−13% on the framework's own default CVA
 grid, since a calendar grid never yields an integer f).
 

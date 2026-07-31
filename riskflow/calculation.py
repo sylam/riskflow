@@ -1806,7 +1806,7 @@ class HedgeMonteCarlo(Credit_Monte_Carlo):
         '- Checkpoints carry a `frame_stamp` (scale, z-frame, trust-region envelope); an ensemble',
         '  that MIXES frame provenances is refused.',
         '',
-        'The walk-forward smoke gate reproduces this end to end — `tb_wf_smoke_gate.sh`, trade',
+        'The walk-forward smoke gate reproduces this end to end — `gates/wf_smoke_gate.sh`, trade',
         '202001 at `--batch 512 --batches 5 --fit-iters 40`, seed 7 — pinning train_u',
         '-0.5006, V_0 -0.1082737073302269, greedy -104.71 $/oz, churn 193.8 and the',
         'policy-independent nohedge -194.35 / pf_bound 810.1.',

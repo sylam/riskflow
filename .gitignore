@@ -35,8 +35,15 @@ tests/_stepper_out*/
 # print is not (the committed tb_hn_aggregate_bias*.csv study tables are the exception,
 # kept as the reference machinery those gates cite).
 *.pt
-/tb_hn_pfe_stepping.csv
+/gates/*.csv
 
 # IDE + notebook noise
 /.idea/
 .ipynb_checkpoints/
+/artifacts/*.csv
+/artifacts/walk_forward/
+/artifacts/hp_phase*.json
+/artifacts/*.png
+/lf2_forensics.csv
+/artifacts/*.log
+/artifacts/*.toy_t30

@@ -2057,7 +2057,7 @@ def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims,
 # A coarse exposure grid (PFE/CVA nodes weeks apart) still owes each factor the dynamics it
 # would have had on the calibration clock: forwarding the variance deterministically and
 # drawing one aggregate Gaussian was measured 29%->2000% wrong on tail probabilities at
-# |z|=2-3 (tb_hn_aggregate_bias.csv) -- precisely the quantiles PFE reads.  Instead the
+# |z|=2-3 (gates/hn_aggregate_bias.csv) -- precisely the quantiles PFE reads.  Instead the
 # interval walks its own sub-steps, and the framework's correlated draw enters as the
 # sqrt(variance)-weighted combination of the sub-step normals, so cross-factor correlation
 # rides the interval's dominant direction while the orthogonal complement supplies the

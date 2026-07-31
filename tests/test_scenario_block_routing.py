@@ -195,7 +195,7 @@ def test_a_gradient_reaches_both_blocks():
     be the one the joined grid gives. The FORWARD is bitwise (above); the backward is compared to a
     tolerance because the joined arm sums through two extra graph nodes (the expand and the cat) in
     a different order, which no production path does — the fork reads the blocks directly, and the
-    grad forks themselves are bitwise-gated end to end by `tb_golden_worlds.py`."""
+    grad forks themselves are bitwise-gated end to end by `gates/golden_worlds.py`."""
     past, inner = _blocks()
     rows, out = [0, 44, CUTOFF - 1, CUTOFF, CUTOFF + 1], {}
     for name in ('split', 'joined'):

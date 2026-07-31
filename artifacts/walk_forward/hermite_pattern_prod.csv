@@ -1,7 +1,0 @@
-curve,t,in_fork,scen,n_tenors,scen_lo,scen_hi,n_scen_used,scen_contiguous,all_tenors,is_product,rows_used,rows_total,frac,window_lo_rel_t,window_hi_rel_t
-"Factor(type='InterestRate', name=('USD-SOFR'",114,True,116,31,82,115,25,False,False,False,27,3596,0.0075,-32,1
-"Factor(type='InterestRate', name=('USD-SOFR'",115,True,117,31,82,116,25,False,False,False,27,3627,0.0074,-33,1
-"Factor(type='InterestRate', name=('USD-SOFR'",115,True,117,31,82,116,25,False,False,False,27,3627,0.0074,-33,1
-"Factor(type='InterestRate', name=('USD-SOFR'",116,True,118,31,82,117,25,False,False,False,27,3658,0.0074,-34,1
-"Factor(type='InterestRate', name=('USD-SOFR'",116,True,118,31,82,117,25,False,False,False,27,3658,0.0074,-34,1
-"Factor(type='InterestRate', name=('USD-SOFR'",,False,119,31,0,118,119,True,False,False,510,3689,0.1382,,
