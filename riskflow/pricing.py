@@ -774,16 +774,22 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         t_block = discount_block.time_grid
         sample_index_t = start_index[index]
 
-        # Build a per-row hit mask [N_mtm, batch].
-        # Scenarios that were already hit before this block are True for all rows.
-        # Within this block, a scenario that first crosses at row k is True for rows k, k+1, ...
-        # (cumsum along dim=0 counts crossings accumulated from row 0 upward).
-        if any(BarrierDates[obs_i] > 0 for obs_i in range(prev_sample_idx, sample_index_t)):
-            crossed = (spot_block > barrier) if eta == BARRIER_UP else (spot_block < barrier)
-            row_barrier_hit = barrier_hit.unsqueeze(0) | crossed.int().cumsum(dim=0).bool()
-            barrier_hit = row_barrier_hit[-1]   # carry forward into next block
-        else:
-            row_barrier_hit = barrier_hit.unsqueeze(0).expand(len(t_block), -1)
+        # Per-row hit mask [N_mtm, batch] - the state carried IN, which is every scenario hit at a
+        # STRICTLY EARLIER observation. The current observation is not folded in here: this block's
+        # last row IS its observation date, and sim_spot_oss prices that date as its own first
+        # (zero-length) step, so adding it would count the same crossing twice.
+        #
+        # The barrier is observed only on its own dates. The previous form cumsum-tested EVERY mtm
+        # row of the block, so on the repo's own fixture it monitored 37 rows against 12 barrier
+        # dates and knocked scenarios out on dates the deal never observes - and it monitored expiry
+        # too, which BarrierDates flags -1. It also missed the FIRST barrier date entirely, because
+        # range(prev_sample_idx, sample_index_t) is empty for block 0 and lags one block thereafter,
+        # testing block i's rows because block i-1's observation had fired.
+        row_barrier_hit = barrier_hit.unsqueeze(0).expand(len(t_block), -1)
+        if BarrierDates[sample_index_t] > 0:
+            crossed = ((spot_block[-1] > barrier) if eta == BARRIER_UP else
+                       (spot_block[-1] < barrier))
+            barrier_hit = barrier_hit | crossed   # carry forward into the next block
         prev_sample_idx = sample_index_t
 
         tenor_block = factor_dep['Expiry'] - t_block[:, utils.TIME_GRID_MTM]

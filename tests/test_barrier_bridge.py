@@ -226,3 +226,38 @@ def test_aad_delta_matches_bump_and_reprice(deal, label):
                rungs=(2e-4, 5e-4, 1e-3, 2e-3))
     assert r.agrees(tol=0.02), (
         f'{label}: a channel through which spot moves the value is not being differentiated\n{r}')
+
+
+MONTHLY_BARRIER = [[BASE + pd.Timedelta(days=d), 90.0] for d in range(30, 366, 30)]
+
+
+def test_discrete_barrier_is_observed_only_on_its_own_dates():
+    """A DISCRETELY monitored barrier is observed on the dates its terms name, and nowhere else.
+
+    pv_discrete_barrier_option latched the crossing with a cumsum over every MTM row of each block,
+    so on this fixture it monitored 37 reporting rows against 12 barrier dates - knocking scenarios
+    out on dates the deal never observes, monitoring expiry although BarrierDates flags it -1, and
+    (because the guard tested samples passed BEFORE the block) missing the first barrier date
+    entirely while lagging one block thereafter.
+
+    With r = q = 0 the value is a martingale, so the profile mean must equal the inception value.
+    Inception is unaffected by the defect - no scenario has hit yet, and the OSS handles all twelve
+    future observations analytically - which is what makes it a valid reference for the rest of the
+    profile. Against an independent 2m-path simulation observing exactly those twelve dates
+    (V_0 = 8.4844 +- 0.0118) inception prices to -0.02%.
+
+    Measured: the defect drove the profile to -2.79% and its worst row to -4.88%; the corrected
+    form sits at -0.02%. 1% is headroom over a measured 0.18% worst case across three seeds."""
+    c = _cfg()
+    c.deals['Deals']['Children'] = [{'Instrument': construct_instrument(
+        dict(BARRIER_DEAL, Barrier_Dates=MONTHLY_BARRIER), {})}]
+    _, out = riskflow.run_cmc(c, prec=DTYPE, overrides={
+        'Run_Date': BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 2d 1w(1w) 3m(1m)',
+        'Batch_Size': 4096, 'Simulation_Batches': 1, 'Random_Seed': 1, 'Currency': 'USD',
+        'Tenor_Offset': 0.0, 'MCMC_Simulations': 256, 'Deflation_Interest_Rate': 'USD'})
+    v = out['Results']['mtm'].values.mean(axis=1)
+    assert len(v) > 12, 'the grid must be FINER than the barrier schedule or nothing is being tested'
+    assert abs(v.mean() - v[0]) / v[0] < 0.01, (
+        f'profile mean {v.mean():.4f} vs inception {v[0]:.4f} '
+        f'({(v.mean() - v[0]) / v[0]:+.2%}) - the barrier is being observed on the wrong dates\n'
+        f'{np.round(v, 3)}')
