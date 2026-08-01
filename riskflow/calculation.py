@@ -1514,13 +1514,17 @@ class Credit_Monte_Carlo(Calculation):
                     # graph does not carry. The correction is worth exactly zero in the forward
                     # pass, so tensors['cva'] - the REPORTED number - is untouched; only the
                     # scalar being differentiated gains a term.
+                    # Bandwidth 0.01: the estimate converges monotonically as it shrinks and is
+                    # still stable across seeds there, where 0.05 upward is visibly biased. It
+                    # needs enough paths for the near-boundary band to be populated - measured at
+                    # 32768 - so a thin run should widen it and expect bias rather than noise.
                     cva_for_aad = tensors['cva']
                     if shared_mem.boundary_sets:
                         correction = mta_boundary_correction(
                             shared_mem,
                             lambda mtm: cva_per_scenario(
                                 torch.relu(mtm * fx_report * Dt_T) / fx_report[0], prob, recovery),
-                            float(params.get('Boundary_AAD_Bandwidth', 0.15)))
+                            float(params.get('Boundary_AAD_Bandwidth', 0.01)))
                         if correction is not None:
                             cva_for_aad = cva_for_aad + correction
                     sensitivity = SensitivitiesEstimator(
