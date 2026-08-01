@@ -195,6 +195,21 @@ class StochasticProcess(object):
         Default None."""
         return None
 
+    @property
+    def bridge_interval_variance(self):
+        """Log-variance of THIS factor over each scenario interval, (T, 1) or None.
+
+        A barrier is monitored continuously but the scenario grid only observes the spot at its
+        own dates, so whether a path crossed in between is a conditional probability rather than
+        an observation - and a Brownian bridge needs the variance of the interval it spans.
+
+        It must come from the SIMULATION model, not from a pricing implied vol: the latter is the
+        vol for the option's remaining life, which is a different quantity that happens to have
+        the same units. Processes without a lognormal interval law return None, and the caller
+        falls back to observing endpoints, which is what the engine did everywhere before.
+        """
+        return None
+
     def reveal_state_at(self, t, buffer):
         """Ordered market-state segments `[(block, reveal_kind), ...]` this factor exposes to
         the value function at scenario-time index `t` — the informative deep-state the DP/MPC
@@ -306,9 +321,16 @@ class GBMAssetPriceModel(StochasticProcess):
         # store params in tensors
         self.drift = tensor.new((self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1))
         self.vol = tensor.new((np.sqrt(var)).reshape(-1, 1))
+        self.interval_log_variance = self.vol * self.vol
 
         # store a reference to the current tensor
         self.spot = tensor
+
+    @property
+    def bridge_interval_variance(self):
+        """Lognormal by construction, so the bridge applies exactly between grid points."""
+        return self.interval_log_variance
+
 
     def theoretical_mean_std(self, t):
         mu = self.factor.current_value() * np.exp(self.param['Drift'] * t)

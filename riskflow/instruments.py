@@ -3614,6 +3614,9 @@ class EquityBarrierOption(Deal):
                            field['Discount_Rate'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Equity': utils.declared_spot(get_equity_rate_factor(
                            field['Equity'], static_offsets, stochastic_offsets), field['Equity']),
+                       # names the factor the barrier is monitored ON, so the pricer can ask what
+                       # the simulation did between grid dates rather than only at them
+                       'Barrier_Underlying': utils.Factor('EquityPrice', field['Equity']),
                        'Equity_Zero': get_equity_zero_rate_factor(
                            field['Equity'], static_offsets, stochastic_offsets, all_tenors, all_factors),
                        'Dividend_Yield': get_dividend_rate_factor(
