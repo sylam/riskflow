@@ -636,6 +636,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
 
             P = shared.one.new_zeros(shared.simulation_batch, 2 * num_sims)
             L = shared.one.new_ones(shared.simulation_batch, 2 * num_sims)
+            surv_payoff = None
             # initialise Sj by broadcasting spot into [batch, 2*num_sims]
             Sj = s.reshape(-1, 1) + P
 
@@ -668,6 +669,36 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                 r_j = r[j].reshape(-1, 1)      # [batch, 1]
                 sig_j = sigma[j].reshape(-1, 1) # [batch, 1]
 
+                if isdigital and j == N_fix - 1:
+                    # A digital's terminal step is INTEGRATED, not sampled. An indicator on the
+                    # drawn spot has zero derivative almost everywhere, so the density term that is
+                    # most of a digital's delta and vega never reaches the tape: measured 10.5% low
+                    # on a knock-out digital's delta and 14.7% high on its vega, and once the
+                    # barrier is out of reach the reported delta and vega are EXACTLY zero, with
+                    # the equity and vol factors absent from the greeks report rather than showing
+                    # zero. The survival legs below are already integrated this way - this is the
+                    # same idiom one step later, and it also drops the last step's sampling noise.
+                    z_pay = (torch.log(strike / Sj) - r_j) / sig_j
+                    lo, hi = (z_pay, None) if phi == OPTION_CALL else (None, z_pay)
+                    if isBarrierDate_block[j] > 0:
+                        z_max = (torch.log(barrier / Sj) - r_j) / sig_j
+                        if eta == BARRIER_UP:
+                            p = utils.norm_cdf(z_max)
+                            hi = z_max if hi is None else torch.minimum(hi, z_max)
+                        else:
+                            p = 1.0 - utils.norm_cdf(z_max)
+                            lo = z_max if lo is None else torch.maximum(lo, z_max)
+                        if direction == BARRIER_OUT:
+                            P = P + (1.0 - p) * L * rebate_per_unit * D[j].reshape(-1, 1)
+                    # joint P(pays AND survives this fixing); survival is inside it, so it weights
+                    # the L carried IN, while L itself still advances for the parity rebate leg
+                    joint = ((utils.norm_cdf(hi) if hi is not None else 1.0) -
+                             (utils.norm_cdf(lo) if lo is not None else 0.0)).clamp(min=0.0)
+                    surv_payoff = L * joint
+                    if isBarrierDate_block[j] > 0:
+                        L = p * L
+                    continue
+
                 if isBarrierDate_block[j] > 0:
                     # z_max: the standard-normal threshold at which spot = H
                     # GBM: log(S_j/S_{j-1}) = r_j + sig_j * Z  (r_j already includes -0.5*var term)
@@ -693,20 +724,23 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
 
                 Sj = Sj * torch.exp(r_j + sig_j * Z)
 
-            # terminal payoff on paths that survived all barrier dates
-            if isdigital:
-                payoff = (phi * (Sj - strike) > 0).to(D_T.dtype)
-            else:
-                payoff = torch.relu(phi * (Sj - strike))
+            # terminal payoff on paths that survived all barrier dates. surv_payoff is already
+            # L-weighted when the last step was integrated rather than sampled (digitals under GBM);
+            # the HN branch always samples, its per-path conditional variance having no scalar
+            # closed form to integrate against, so an HN digital keeps the indicator.
+            if surv_payoff is None:
+                payoff = ((phi * (Sj - strike) > 0).to(D_T.dtype) if isdigital
+                          else torch.relu(phi * (Sj - strike)))
+                surv_payoff = L * payoff
 
             if direction == BARRIER_OUT:
                 # survivors receive the vanilla payoff at expiry
-                P = P + L * payoff * D_T
+                P = P + surv_payoff * D_T
             else:
                 # BARRIER_IN via in-out parity: KI = Vanilla - KO_pure + rebate * E[survival]
                 # Individual paths can go negative (P is a control-variate estimator, not a
                 # per-path price), but the option value is always ≥ 0, so clamp the mean.
-                P = vanilla_pv - L * D_T * (payoff - rebate_per_unit)
+                P = vanilla_pv - D_T * (surv_payoff - L * rebate_per_unit)
 
             mcmc.append(P.mean(dim=1).clamp(min=0.0))
 

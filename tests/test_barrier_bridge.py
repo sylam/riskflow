@@ -93,7 +93,7 @@ def _profile(grid, seed=1, batch=8192, deal=None):
     return out['Results']['mtm']
 
 
-def _cva(spot, deal, gradient):
+def _cva(spot, deal, gradient, batch=4096, mcmc=None):
     """CVA, and its AAD gradient when asked for. A counterparty is what gives the barrier a
     sensitivity worth measuring: the exposure profile is where the touch state accumulates, which
     base valuation - one deal-time row, no interval, no history - structurally cannot show."""
@@ -103,9 +103,10 @@ def _cva(spot, deal, gradient):
         'Recovery_Rate': 0.4, 'Curve': utils.Curve([], [[0.0, 0.0], [10.0, 0.4]])}
     c.deals['Deals']['Children'] = [{'Instrument': construct_instrument(deal, {})}]
     _, out = riskflow.run_cmc(c, prec=DTYPE, overrides={
-        'Run_Date': BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 3m(3m)', 'Batch_Size': 4096,
+        'Run_Date': BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 3m(3m)', 'Batch_Size': batch,
         'Simulation_Batches': 1, 'Random_Seed': 1, 'Currency': 'USD', 'Tenor_Offset': 0.0,
         'Deflation_Interest_Rate': 'USD', 'Gradient_Variables': 'Factors',
+        **({'MCMC_Simulations': mcmc} if mcmc else {}),
         'Credit_Valuation_Adjustment': {
             'Calculate': 'Yes', 'Counterparty': 'CPTY', 'Deflate_Stochastically': 'No',
             'Stochastic_Hazard_Rates': 'No', 'Gradient': 'Yes' if gradient else 'No'}})
@@ -296,3 +297,56 @@ def test_discrete_barrier_rebate_is_paid_and_is_absolute_cash():
     assert (p5x - p0x) == pytest.approx(p5 - p0, rel=1e-9), (
         f'a cash rebate must not scale with Units: adds {p5 - p0:.4f} at Units=1 but '
         f'{p5x - p0x:.4f} at Units=2')
+
+
+def _digital(H, btype='Down_And_Out'):
+    return {'Object': 'EquityBarrierBinaryOption', 'Reference': 'DIG1', 'Currency': 'USD',
+            'Payoff_Currency': 'USD', 'Equity': 'EQ', 'Dividends': 'EQ', 'Discount_Rate': 'USD',
+            'Equity_Volatility': 'EQ', 'Buy_Sell': 'Buy', 'Option_Type': 'Call',
+            'Strike_Price': 100.0, 'Expiry_Date': BASE + pd.Timedelta(days=365),
+            'Cash_Payoff': 100.0, 'Barrier_Type': btype, 'Barrier_Price': H,
+            'Settlement_Date': BASE + pd.Timedelta(days=365),
+            'Barrier_Dates': [[BASE + pd.Timedelta(days=d), H] for d in range(30, 366, 30)]}
+
+
+def test_digital_terminal_step_is_integrated_not_sampled():
+    """A digital's payoff was an indicator on the DRAWN terminal spot, whose derivative is zero
+    almost everywhere - so the density term that is most of a digital's delta and vega never
+    reached the tape at all.
+
+    The barrier is put out of reach so the outer already-hit latch never fires and this isolates
+    the terminal step. Before the fix AAD reported EXACTLY zero here, and the equity, vol and
+    dividend factors were absent from the greeks report rather than showing zero rows - a silent
+    total loss of sensitivity. Now: 0.00% against bump-and-reprice at 0.01% flatness.
+
+    NOTE the same deal WITH a live barrier still disagrees (33.7% at 9.96% flatness). That residual
+    is the outer barrier_hit latch in pv_discrete_barrier_option, a genuine jump in the value
+    function needing the boundary-flux machinery, not this terminal step - which is exactly why
+    this gate uses an unreachable barrier."""
+    deal = _digital(1e-6)
+    # the OSS forks an inner Monte Carlo per outer path, so the outer batch stays small here
+    kw = dict(batch=1024, mcmc=256)
+    aad = _cva(SPOT, deal, gradient=True, **kw)
+    assert abs(aad) > 1e-6, 'a digital must have a spot delta'
+    r = ladder(price=lambda s: _cva(s, deal, False, **kw), aad=aad, base=SPOT,
+               rungs=(5e-4, 1e-3, 2e-3, 5e-3))
+    assert r.agrees(tol=0.02), f'digital terminal step is not being integrated\n{r}'
+
+
+def test_digital_reports_its_equity_and_vol_factors():
+    """The failure mode was not a wrong number but a MISSING one: with a zero gradient the factor's
+    .grad is None and pricing.report_grad drops it, so the risk report simply had no equity row."""
+    c = _cfg()
+    c.params['Price Factors']['SurvivalProb.CPTY'] = {
+        'Recovery_Rate': 0.4, 'Curve': utils.Curve([], [[0.0, 0.0], [10.0, 0.4]])}
+    c.deals['Deals']['Children'] = [{'Instrument': construct_instrument(_digital(1e-6), {})}]
+    _, out = riskflow.run_cmc(c, prec=DTYPE, overrides={
+        'Run_Date': BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 3m(3m)', 'Batch_Size': 256,
+        'Simulation_Batches': 1, 'Random_Seed': 1, 'Currency': 'USD', 'Tenor_Offset': 0.0,
+        'MCMC_Simulations': 128, 'Deflation_Interest_Rate': 'USD', 'Gradient_Variables': 'Factors',
+        'Credit_Valuation_Adjustment': {
+            'Calculate': 'Yes', 'Counterparty': 'CPTY', 'Deflate_Stochastically': 'No',
+            'Stochastic_Hazard_Rates': 'No', 'Gradient': 'Yes'}})
+    factors = {str(i[0]).split('.')[0] for i in out['Results']['grad_cva']['Gradient'].index}
+    for needed in ('EquityPrice', 'EquityPriceVol'):
+        assert needed in factors, f'{needed} missing from the greeks report; got {sorted(factors)}'
