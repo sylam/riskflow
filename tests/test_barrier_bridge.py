@@ -261,3 +261,38 @@ def test_discrete_barrier_is_observed_only_on_its_own_dates():
         f'profile mean {v.mean():.4f} vs inception {v[0]:.4f} '
         f'({(v.mean() - v[0]) / v[0]:+.2%}) - the barrier is being observed on the wrong dates\n'
         f'{np.round(v, 3)}')
+
+
+def _rebate_run(rebate, units):
+    c = _cfg()
+    c.deals['Deals']['Children'] = [{'Instrument': construct_instrument(dict(
+        BARRIER_DEAL, Barrier_Price=95.0, Cash_Rebate=rebate, Units=units,
+        Barrier_Dates=[[BASE + pd.Timedelta(days=d), 95.0] for d in range(30, 366, 30)]), {})}]
+    _, out = riskflow.run_cmc(c, prec=DTYPE, overrides={
+        'Run_Date': BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 1m(1m)', 'Batch_Size': 2048,
+        'Simulation_Batches': 1, 'Random_Seed': 1, 'Currency': 'USD', 'Tenor_Offset': 0.0,
+        'MCMC_Simulations': 256, 'Generate_Cashflows': 'Yes', 'Deflation_Interest_Rate': 'USD'})
+    cf = out['Results']['cashflows']
+    return (out['Results']['mtm'].values.mean(axis=1)[0],
+            sum(float(np.nansum(v.values)) for v in cf.values()))
+
+
+def test_discrete_barrier_rebate_is_paid_and_is_absolute_cash():
+    """Two defects in one field. The knock-out rebate was PRICED - sim_spot_oss accrues it, and it
+    is in the mtm of the row that knocks out - but never settled: hit_value is zero from the next
+    row on and the single cash_settle fires on the last row only, so the total settled cash was
+    bit-identical to the same deal with no rebate at all.
+
+    And it was scaled wrongly. pv_barrier_option reads Cash_Rebate as ABSOLUTE cash - it hands the
+    closed form cash_rebate/nominal and multiplies back - while everything sim_spot_oss returns is
+    scaled by nominal, so the same field on the same deal class meant Units times more cash under
+    discrete monitoring than under continuous. Doubling Units must not double a cash rebate."""
+    p0, c0 = _rebate_run(0.0, 1.0)
+    p5, c5 = _rebate_run(5.0, 1.0)
+    assert c5 - c0 > 0.0, 'the rebate is priced into the mtm but never settled'
+
+    p0x, _ = _rebate_run(0.0, 2.0)
+    p5x, _ = _rebate_run(5.0, 2.0)
+    assert (p5x - p0x) == pytest.approx(p5 - p0, rel=1e-9), (
+        f'a cash rebate must not scale with Units: adds {p5 - p0:.4f} at Units=1 but '
+        f'{p5x - p0x:.4f} at Units=2')

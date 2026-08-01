@@ -712,7 +712,10 @@ mapping = {
             'EquityOptionDeal.Fields': ['Settlement_Style', 'Option_On_Forward', 'Option_Style', 'Units',
                                         'Forward_Price_Date', 'Payoff_Type'],
             'EquityBinaryOption.Fields': ['Cash_Payoff', 'Settlement_Date'],
-            'EquityBarrierBinaryOption.Fields': ['Barrier_Dates', 'Cash_Payoff', 'Barrier_Type', 'Settlement_Date'],
+            # Barrier_Price is read with a hard key by pricing.pv_discrete_barrier_option, so a deal
+            # authored to this schema was silently skipped rather than priced
+            'EquityBarrierBinaryOption.Fields': ['Barrier_Dates', 'Cash_Payoff', 'Barrier_Type',
+                                                 'Barrier_Price', 'Settlement_Date'],
             'EquityDiscreteExplicitAsianOption.Fields': ['Is_Digital', 'Units', 'Sampling_Data', 'Payoff_Type'],
             'FloorDeal.Fields': ['Reset_Type', 'Penultimate_Coupon_Date', 'Index_Day_Count', 'Buy_Sell',
                                  'Index_Frequency', 'Payment_Calendars', 'Discount_Rate', 'Forecast_Rate',

@@ -656,7 +656,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                             p = 1.0 - utils.norm_cdf(z_max)
                             Z = utils.norm_icdf(torch.clamp((1.0 - p) + u[j] * p, eps, 1.0 - eps))
                         if direction == BARRIER_OUT:
-                            P = P + (1.0 - p) * L * cash_rebate * D[j].reshape(-1, 1)
+                            P = P + (1.0 - p) * L * rebate_per_unit * D[j].reshape(-1, 1)
                         L = p * L
                         Sj, h = utils.hn_daily_advance(Sj, h, b_step, Z, *hn_params)
                     else:
@@ -684,7 +684,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
 
                     if direction == BARRIER_OUT:
                         # paths hitting the barrier pay the cash rebate at this fixing
-                        P = P + (1.0 - p) * L * cash_rebate * D[j].reshape(-1, 1)
+                        P = P + (1.0 - p) * L * rebate_per_unit * D[j].reshape(-1, 1)
 
                     L = p * L
                 else:
@@ -706,7 +706,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                 # BARRIER_IN via in-out parity: KI = Vanilla - KO_pure + rebate * E[survival]
                 # Individual paths can go negative (P is a control-variate estimator, not a
                 # per-path price), but the option value is always ≥ 0, so clamp the mean.
-                P = vanilla_pv - L * D_T * (payoff - cash_rebate)
+                P = vanilla_pv - L * D_T * (payoff - rebate_per_unit)
 
             mcmc.append(P.mean(dim=1).clamp(min=0.0))
 
@@ -735,6 +735,12 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
 
     nominal = factor_dep['Buy_Sell'] * (
         deal_data.Instrument.field['Cash_Payoff'] if isdigital else deal_data.Instrument.field['Units'])
+
+    # Cash_Rebate is an ABSOLUTE cash amount, which is how pv_barrier_option reads it - it hands the
+    # closed form cash_rebate/nominal and multiplies the result back by nominal. Everything
+    # sim_spot_oss returns is scaled by nominal too, so the rebate has to go in per-unit or the same
+    # field means Units times more cash here than it does there, for the same deal class.
+    rebate_per_unit = cash_rebate / nominal
 
     # opt-in Heston-Nandi spot model (SpotModel='HestonNandi'): the five GARCH scalars ride the
     # AAD graph out of t_Static_Buffer (identical resolution to the TARF). When absent, sim_spot_oss
@@ -767,6 +773,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
     # Once set, KO scenarios are worth 0 and KI scenarios are worth the vanilla European.
     barrier_hit = shared.one.new_zeros(shared.simulation_batch, dtype=torch.bool)
     prev_sample_idx = 0
+    row_ofs = 0
 
     for index, (discount_block, spot_block, moneyness_block, rem_exp) in enumerate(
             utils.split_counts([discount, spot, moneyness, expiry_years], counts, shared)):
@@ -786,9 +793,20 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         # range(prev_sample_idx, sample_index_t) is empty for block 0 and lags one block thereafter,
         # testing block i's rows because block i-1's observation had fired.
         row_barrier_hit = barrier_hit.unsqueeze(0).expand(len(t_block), -1)
+        row_ofs += len(t_block)
         if BarrierDates[sample_index_t] > 0:
             crossed = ((spot_block[-1] > barrier) if eta == BARRIER_UP else
                        (spot_block[-1] < barrier))
+            if cash_rebate and direction == BARRIER_OUT:
+                # The rebate falls due AT the knock-out. sim_spot_oss already puts it in the mtm of
+                # that row - its zero-length first step gives p=0 for a crossed path, leaving
+                # (1-p)*L*rebate - but nothing settled it, and from the next row on hit_value is
+                # zero, so the cash was priced and then paid nowhere. Settle the increment here,
+                # the same way pv_barrier_option does at each date.
+                newly_hit = (crossed & ~barrier_hit).to(spot_block.dtype)
+                cash_settle(shared, factor_dep['SettleCurrency'],
+                            deal_data.Time_dep.deal_time_grid[row_ofs - 1],
+                            nominal * rebate_per_unit * newly_hit)
             barrier_hit = barrier_hit | crossed   # carry forward into the next block
         prev_sample_idx = sample_index_t
 
