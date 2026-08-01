@@ -16,6 +16,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,7 @@ import riskflow
 from riskflow import utils
 from riskflow.config import Config
 from riskflow.instruments import construct_instrument
+from crn_ladder import ladder
 
 BASE = pd.Timestamp('2024-06-28')
 DTYPE = torch.float64
@@ -214,14 +216,13 @@ def test_aad_delta_matches_bump_and_reprice(deal, label):
 
     An INDICATOR has zero derivative almost everywhere, so the knock-out channel contributed
     nothing and AAD reported the wrong number while looking perfectly well-behaved: measured 9-19%
-    off for the barrier and 31-44% off for the one-touch, with no plateau across the bump ladder
-    because bumping flips discrete touch states. Carrying survival as a probability closes it to
-    0.00%. 2% is headroom over that, and an order of magnitude inside the defect."""
+    off for the barrier and 31-44% off for the one-touch, and - the discriminating signal - the
+    ladder SCATTERED instead of converging, because shrinking the bump changes how many paths sit
+    on the far side of the jump rather than refining a limit. Carrying survival as a probability
+    gives 0.00% disagreement at 0.00% flatness."""
     aad = _cva(SPOT, deal, gradient=True)
     assert abs(aad) > 1e-6, 'a barrier with a live knock-out should have a spot delta'
-    for rel in (5e-4, 1e-3):
-        h = SPOT * rel
-        crn = (_cva(SPOT + h, deal, False) - _cva(SPOT - h, deal, False)) / (2.0 * h)
-        assert crn == pytest.approx(aad, rel=0.02), (
-            f'{label}: AAD {aad:+.5f} vs bump-and-reprice {crn:+.5f} at {rel:.0e} - '
-            f'a channel through which spot moves the value is not being differentiated')
+    r = ladder(price=lambda s: _cva(s, deal, False), aad=aad, base=SPOT,
+               rungs=(2e-4, 5e-4, 1e-3, 2e-3))
+    assert r.agrees(tol=0.02), (
+        f'{label}: a channel through which spot moves the value is not being differentiated\n{r}')
