@@ -1206,12 +1206,14 @@ class NettingCollateralSet(Deal):
                 # A minimum transfer amount makes the balance jump, so the decision carries a
                 # derivative that ordinary AAD drops. Record both sides; the correction is
                 # assembled against the CVA objective, which does not exist until later.
+                mta_events = []
                 for index, recv_gap, post_gap, previous, required in mta_gaps:
-                    shared.boundary_events.extend([
+                    mta_events.extend([
                         utils.MTABoundaryEvent(index, 'receive', recv_gap,
                                                previous.detach(), required.detach()),
                         utils.MTABoundaryEvent(index, 'post', post_gap,
                                                previous.detach(), required.detach())])
+                boundary_balance = Bt.detach()
 
             # now calculate the collateral account and Net exposure
             report_time = local_time_grid[factor_dep['Te']]
@@ -1287,6 +1289,32 @@ class NettingCollateralSet(Deal):
                     shared, report_time[:, utils.TIME_GRID_MTM].reshape(1, -1), multiply_by_time=False)
                                                ), dim=0)
                 net_accum = net_accum * St_T
+
+            if boundary_aad:
+                # The balance reaches the exposure ONLY through min_Bt, so a counterfactual needs
+                # nothing re-priced - just this arithmetic replayed on a different balance path.
+                # Everything captured here is balance-independent and detached: the replay
+                # produces a COEFFICIENT (the objective jump), not a differentiated quantity.
+                b_Vte, b_C, b_Ste = Vte.detach(), C_ts_te.detach(), Ste.detach()
+                b_fx, b_surv = fx_base.detach(), St_T.detach() if surv else None
+                b_pad = time_grid.report_index.size - net_accum.shape[0]
+
+                def replay_net_mtm(balance_path, base_i=base_i, delta_T=delta_T):
+                    running = balance_path[base_i]
+                    step = np.zeros_like(delta_T)
+                    for i in range(delta_T.max() if delta_T.size else 0):
+                        step[delta_T > i] = i + 1
+                        running = torch.min(running, balance_path[base_i + step])
+                    running = F.pad(running, [0, 0, 0, 1])
+                    out = (b_Vte + b_C - running * b_Ste) / b_fx
+                    if b_surv is not None:
+                        out = out * b_surv
+                    return F.pad(out, [0, 0, 0, b_pad]) if b_pad else out
+
+                shared.boundary_sets.append(utils.MTABoundarySet(
+                    events=mta_events, replay=replay_net_mtm, balance=boundary_balance,
+                    required=Bt_new.detach(), recv_band=Mr.detach(), post_band=Mp.detach(),
+                    call_mask=factor_dep['call_mask'].astype(bool)))
 
             # Store results - with appropriate padding
             padding = time_grid.report_index.size - net_accum.shape[0]

@@ -36,7 +36,8 @@ from .riskfactors import construct_factor
 # import the stochastic processes
 from .stochasticprocess import construct_process
 # import the currency/curve lookup factors 
-from .instruments import (get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor)
+from .instruments import (get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor,
+                          scan_collateral_balance)
 # import the hessian function
 from .pricing import SensitivitiesEstimator
 # import the documentation and utils modules
@@ -411,6 +412,49 @@ class Calculation(object):
                 self.all_factors, self.all_tenors, self.time_grid, self.config.holidays, self.calc_stats)
 
 
+def cva_per_scenario(pv_exposure, prob, recovery):
+    """CVA as a PER-SCENARIO vector, whose mean is the reported CVA.
+
+    Pulled out of Credit_Monte_Carlo.execute so a counterfactual netting-set MTM can be scored on
+    the same objective without re-deriving it. The reduction order is load-bearing: the reported
+    number is a MEAN over paths of a SUM over time, so any boundary correction assembled against
+    it must also be a mean over paths or it is silently scaled by the path count - silently,
+    because such a correction has zero forward value and only the gradients would be wrong.
+    """
+    return ((1.0 - recovery) * 0.5 * (pv_exposure[1:] + pv_exposure[:-1]) * prob).sum(axis=0)
+
+
+def mta_boundary_correction(shared, objective, bandwidth):
+    """Total boundary correction for every recorded MTA transfer decision.
+
+    `objective` scores a netting-set MTM into a per-scenario CVA vector. For each margin call the
+    counterfactual is the SAME collateral recursion restarted from a forced opening balance -
+    transfer, then hold - so nothing is re-simulated, re-priced or bumped: the expensive gross-MTM
+    cube is already there and only the cheap balance scan is replayed.
+
+    The receive and post sides of one call share a jump. D = 1 means "a transfer happened" for
+    both, so J(D=1) - J(D=0) is the same quantity; only the gap differs. Computing it once halves
+    the replays.
+    """
+    corrections = []
+    for bset in shared.boundary_sets:
+        jumps = {}
+        for event in bset.events:
+            if event.call_index not in jumps:
+                with torch.no_grad():
+                    prefix = bset.balance[:event.call_index]
+                    branches = []
+                    for opening in (event.required_balance, event.previous_balance):
+                        suffix, _ = scan_collateral_balance(
+                            opening, bset.required, bset.recv_band, bset.post_band,
+                            bset.call_mask, start=event.call_index)
+                        branches.append(objective(bset.replay(torch.cat([prefix, suffix], dim=0))))
+                    jumps[event.call_index] = branches[0] - branches[1]
+            corrections.append(pricing.stochastic_boundary_correction(
+                event.gap, jumps[event.call_index], bandwidth))
+    return torch.stack(corrections).sum() if corrections else None
+
+
 class CMC_State(utils.Calculation_State):
     def __init__(self, cholesky, static_buffer, batch_size, one, mcmc_sims, report_currency,
                  seed, job_id, num_jobs, scale_survival=False, nomodel='Constant', keep_tensor=False):
@@ -426,7 +470,7 @@ class CMC_State(utils.Calculation_State):
         # restored before the single reverse sweep. Per BATCH, like t_Buffer — backward() runs
         # once per batch, so a correction assembled from a previous batch's graph is stale.
         self.boundary_aad = False
-        self.boundary_events = []
+        self.boundary_sets = []
         self.t_cholesky = cholesky
         self.t_random_numbers = None
         self.t_Scenario_Buffer = {}
@@ -508,7 +552,7 @@ class CMC_State(utils.Calculation_State):
 
         # clear the buffers
         self.t_Buffer.clear()
-        self.boundary_events.clear()
+        self.boundary_sets.clear()
 
 
 class CMC_State_Inner(CMC_State):
@@ -1437,6 +1481,10 @@ class Credit_Monte_Carlo(Calculation):
                         shared_mem, mtm_grid.reshape(1, -1), multiply_by_time=False)), dim=0)
 
                 prob = St_T[:-1] - St_T[1:]
+                # Left in its original grouping deliberately: a per-path vector cannot be
+                # reduced back to `mean over paths of a sum over time` in the same float order,
+                # and the reported number must not move by even an ULP. cva_per_scenario is the
+                # same quantity for the COUNTERFACTUALS, where only internal consistency matters.
                 tensors['cva'] = (1.0 - recovery) * (
                         0.5 * (pv_exposure[1:] + pv_exposure[:-1]) * prob).mean(axis=1).sum()
 
@@ -1462,8 +1510,21 @@ class Credit_Monte_Carlo(Calculation):
 
                     # calculate all the derivatives of cva
                     hessian = params['Credit_Valuation_Adjustment'].get('Hessian', 'No') == 'Yes'
+                    # A hard transfer decision contributes a derivative that the frozen-decision
+                    # graph does not carry. The correction is worth exactly zero in the forward
+                    # pass, so tensors['cva'] - the REPORTED number - is untouched; only the
+                    # scalar being differentiated gains a term.
+                    cva_for_aad = tensors['cva']
+                    if shared_mem.boundary_sets:
+                        correction = mta_boundary_correction(
+                            shared_mem,
+                            lambda mtm: cva_per_scenario(
+                                torch.relu(mtm * fx_report * Dt_T) / fx_report[0], prob, recovery),
+                            float(params.get('Boundary_AAD_Bandwidth', 0.15)))
+                        if correction is not None:
+                            cva_for_aad = cva_for_aad + correction
                     sensitivity = SensitivitiesEstimator(
-                        tensors['cva'], self.all_var, create_graph=hessian)
+                        cva_for_aad, self.all_var, create_graph=hessian)
 
                     if final_run:
                         output['grad_cva'] = sensitivity.report_grad()

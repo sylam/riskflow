@@ -191,6 +191,24 @@ class DeferredDeal:
 
 
 @dataclass
+class MTABoundarySet:
+    """One netting set's transfer decisions, plus what is needed to price their counterfactuals.
+
+    `replay` maps an alternative balance path to the netting-set MTM exactly as reported - it is
+    built inside post_process, so the formula stays in one place and captures only the pieces that
+    do not depend on the balance. The scan inputs are the same ones the forward walk used, so a
+    counterfactual restarts the SAME recursion at a margin date with a forced opening balance.
+    """
+    events: list
+    replay: object                  # callable: balance path -> netting-set MTM
+    balance: object                 # the realised path, detached; the prefix a replay keeps
+    required: object
+    recv_band: object
+    post_band: object
+    call_mask: object
+
+
+@dataclass
 class MTABoundaryEvent:
     """One margin call's transfer decision, recorded so its derivative can be recovered.
 

@@ -16,6 +16,8 @@
 # along with RiskFlow.  If not, see <http://www.gnu.org/licenses/>.
 ########################################################################
 
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -73,6 +75,39 @@ def calc_moneyness(strike, spot, forward, deal_data, use_forward=False, invert_m
         # regular 2d vol surface assumed to be sticky_moneyness - need to handle other moneyness rules (TODO!)
         forward_or_spot = forward if use_forward else spot
         return strike / forward_or_spot if invert_moneyness else forward_or_spot / strike
+
+
+def gaussian_dirac_weights(gap, bandwidth):
+    """A smoothed Dirac mass at gap == 0, for weighting the paths that sit near a hard decision.
+
+    The width is a FRACTION of the gap's own dispersion, so one bandwidth setting means the same
+    thing across netting sets, currencies and margin schedules rather than being a raw amount.
+    Everything here is detached - these are weights on an estimator, not part of the valuation.
+    """
+    detached = gap.detach()
+    width = bandwidth * detached.std().clamp_min(torch.finfo(gap.dtype).eps)
+    z = detached / width
+    return torch.exp(-0.5 * z * z) / (math.sqrt(2.0 * math.pi) * width)
+
+
+def stochastic_boundary_correction(gap, objective_jump, bandwidth):
+    """A term worth EXACTLY ZERO in the forward pass that carries the missing boundary derivative
+    into the backward one.
+
+    Ordinary AAD differentiates an expectation containing 1{gap > 0} with the decision frozen,
+    dropping f_G(0) * E[jump * dgap/dtheta | gap = 0]. `gap - gap.detach()` is numerically zero
+    with derivative one, so adding this to the scalar handed to backward() reports an unchanged
+    number and still propagates the missing term through `gap` to every factor at once - no bump,
+    no second valuation, cost independent of how many factors there are.
+
+    `objective_jump` is a COEFFICIENT and stays detached: its own pathwise derivatives are already
+    in the ordinary AAD value, and differentiating the counterfactual would count them twice.
+
+    The mean matches how CVA is reduced over paths; a sum here would scale the correction by the
+    path count, and nothing in the forward numbers would show it.
+    """
+    coefficient = (gaussian_dirac_weights(gap, bandwidth) * objective_jump.detach()).detach()
+    return torch.mean((gap - gap.detach()) * coefficient)
 
 
 class SensitivitiesEstimator(object):

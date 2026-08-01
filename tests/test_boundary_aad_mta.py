@@ -29,6 +29,7 @@ import torch
 import riskflow
 from riskflow import utils
 from riskflow.config import Config
+from riskflow import calculation
 from riskflow.instruments import construct_instrument, scan_collateral_balance
 
 BASE = pd.Timestamp('2024-06-28')
@@ -211,3 +212,96 @@ def test_events_are_registered_only_when_the_switch_is_on():
                 f'boundary_aad={boundary_aad}: collected {tally.get("gaps", 0)} gaps'
     finally:
         instruments.scan_collateral_balance = original
+
+
+def test_cva_per_scenario_reproduces_the_reported_cva():
+    """The counterfactual objective must be the same quantity the engine reports. It is not
+    BITWISE equal — summing over time before averaging over paths reverses the reduction order —
+    so the reported number keeps its original grouping and this pins the two together."""
+    torch.manual_seed(0)
+    pv = torch.rand(120, 256, dtype=DTYPE) * 1e7
+    prob = torch.rand(119, 1, dtype=DTYPE) * 1e-3
+    recovery = 0.4
+    reported = (1.0 - recovery) * (0.5 * (pv[1:] + pv[:-1]) * prob).mean(axis=1).sum()
+    per_path = calculation.cva_per_scenario(pv, prob, recovery)
+    assert per_path.shape == (256,), f'expected a per-path vector, got {tuple(per_path.shape)}'
+    assert abs(per_path.mean() - reported) < 1e-12 * abs(reported), 'objective drifted from CVA'
+
+
+def _run_capturing_shared(min_transfer, seed=1):
+    """Grab the shared state so the replay context can be inspected after the run. boundary_sets
+    are cleared per batch, so with one batch the last batch's context survives."""
+    from riskflow.calculation import Credit_Monte_Carlo
+    original = Credit_Monte_Carlo._init_shared_mem
+    grabbed = {}
+
+    def capture(self, *args, **kwargs):
+        shared = original(self, *args, **kwargs)
+        grabbed['shared'] = shared
+        return shared
+
+    Credit_Monte_Carlo._init_shared_mem = capture
+    try:
+        _, out = riskflow.run_cmc(_cfg(min_transfer), prec=DTYPE,
+                                  overrides=_params(True, seed=seed))
+    finally:
+        Credit_Monte_Carlo._init_shared_mem = original
+    return out, grabbed['shared']
+
+
+def test_replay_reproduces_the_reported_mtm():
+    """The counterfactual is only meaningful if the replay is the SAME arithmetic the forward pass
+    ran. Handed the balance path that actually occurred, it must return the reported netting-set
+    MTM — anything else means the closure captured the wrong pieces, and every jump built on it
+    would be wrong in a way no forward number could reveal."""
+    out, shared = _run_capturing_shared(2_000_000.0)
+    assert shared.boundary_sets, 'no boundary context was recorded'
+    bset = shared.boundary_sets[0]
+    replayed = bset.replay(bset.balance)
+    reported = torch.as_tensor(out['Results']['mtm'].values, dtype=replayed.dtype,
+                               device=replayed.device)
+    assert replayed.shape == reported.shape, f'{tuple(replayed.shape)} vs {tuple(reported.shape)}'
+    scale = reported.abs().max().clamp_min(1.0)
+    assert (replayed - reported).abs().max() < 1e-9 * scale, \
+        f'replay differs from the reported MTM by {(replayed - reported).abs().max():.3e}'
+
+
+def test_replay_from_a_forced_balance_changes_the_mtm():
+    """A forced transfer must actually move the exposure, or the jump is zero and the correction
+    cannot be tested. Guards against a replay that silently ignores its opening balance."""
+    _, shared = _run_capturing_shared(2_000_000.0)
+    bset = shared.boundary_sets[0]
+    event = bset.events[len(bset.events) // 2]
+    with torch.no_grad():
+        suffix, _ = scan_collateral_balance(
+            event.required_balance, bset.required, bset.recv_band, bset.post_band,
+            bset.call_mask, start=event.call_index)
+        forced = torch.cat([bset.balance[:event.call_index], suffix], dim=0)
+    assert forced.shape == bset.balance.shape
+    assert not torch.equal(forced, bset.balance), 'forcing a transfer changed nothing'
+    assert not torch.equal(bset.replay(forced), bset.replay(bset.balance)), \
+        'a different balance path produced an identical MTM'
+
+
+def test_correction_moves_gradients_but_not_the_forward():
+    """The whole point, in one gate. Switching boundary AAD on must leave every reported number
+    exactly where it was and must change the gradients — a correction that moved the forward would
+    be a bug, and one that left gradients alone would be doing nothing."""
+    off = _run(2_000_000.0, boundary_aad=False)['Results']
+    on = _run(2_000_000.0, boundary_aad=True)['Results']
+    assert np.array_equal(off['mtm'].values, on['mtm'].values), 'forward exposure moved'
+
+    g_off, g_on = off['grad_cva'], on['grad_cva']
+    assert set(g_off) == set(g_on), 'the gradient vector changed shape'
+    delta = (g_on['Gradient'] - g_off['Gradient']).abs()
+    assert (delta > 0).any(), 'boundary correction left every gradient untouched — it is inert'
+
+    # The correction reaches a factor only through the decision GAP, which is built from the
+    # portfolio MTM. The counterparty's own survival curve is not in that gap, so its sensitivity
+    # must be untouched to the bit — this is what says the term is landing where it should rather
+    # than smearing across the whole vector.
+    survival = [i for i in g_off.index if 'SurvivalProb' in str(i[0])]
+    assert survival, 'fixture lost its survival factor'
+    for row in survival:
+        assert g_on['Gradient'][row] == g_off['Gradient'][row], \
+            f'{row}: survival sensitivity moved, but it is not in the transfer decision'
