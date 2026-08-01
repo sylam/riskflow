@@ -195,6 +195,27 @@ def get_fxrate_factor(fieldname, static_offsets, stochastic_offsets):
     return calc_factor_code_chain('FxRate', 'ObservedBasis', fieldname, static_offsets, stochastic_offsets)
 
 
+def get_fx_barrier_underlying(field, stochastic_offsets):
+    """The single factor whose simulated log-variance governs crossings between grid dates, or None.
+
+    An FX barrier is monitored on a CROSS (`utils.calc_fx_cross` of the underlying leg over the
+    quote leg), whose log-variance is v_u + v_c - 2*rho*sqrt(v_u*v_c). `t_Bridge_Variance_Rate` is
+    keyed per factor and the pricer asks for exactly one, so no single entry can express that. It
+    is exact only when the quote leg contributes nothing - a static leg, v_c = 0, leaving the
+    underlying leg's own variance - and when neither leg is a basis chain, since a chain's head
+    factor is not the whole story either.
+
+    Returning None where that does not hold is the point. Naming the underlying leg regardless
+    would hand the bridge an UNDERSTATED variance, which understates crossings - worse than not
+    bridging at all, because it looks like it is working.
+    """
+    if len(field['Currency']) > 1 or len(field['Underlying_Currency']) > 1:
+        return None
+    if stochastic_offsets.get(utils.Factor('FxRate', field['Currency'])) is not None:
+        return None
+    return utils.Factor('FxRate', field['Underlying_Currency'])
+
+
 def get_fxrate_spot(fieldname, static_offsets, stochastic_offsets, all_factors):
     """Read the spot of the FX rate price factor"""
     return calc_factor_value(
@@ -4218,6 +4239,7 @@ class FXOneTouchOption(Deal):
                 field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Volatility': get_fx_vol_factor(
                 field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Barrier_Underlying': get_fx_barrier_underlying(field, stochastic_offsets),
             'Expiry': (self.field['Expiry_Date'] - base_date).days,
             'Invert_Moneyness': 1 if field['Currency'][0] == field['FX_Volatility'][0] else 0,
             'Barrier_Monitoring': 0.5826 * np.sqrt(
@@ -4314,6 +4336,7 @@ class FXBarrierOption(Deal):
                 field['Underlying_Currency'], static_offsets, stochastic_offsets, all_tenors, all_factors),
             'Volatility': get_fx_vol_factor(
                 field['FX_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Barrier_Underlying': get_fx_barrier_underlying(field, stochastic_offsets),
             'Barrier_Monitoring': 0.5826 * np.sqrt(
                 (base_date + self.field['Barrier_Monitoring_Frequency'] - base_date).days / 365.0),
             'Expiry': (self.field['Expiry_Date'] - base_date).days,
