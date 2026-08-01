@@ -471,11 +471,11 @@ class CMC_State(utils.Calculation_State):
         # once per batch, so a correction assembled from a previous batch's graph is stale.
         self.boundary_aad = False
         self.boundary_sets = []
-        # Per-factor log-variance of each scenario interval, published once the processes are
-        # precalculated. A barrier is monitored continuously while the grid only observes its own
-        # dates, so a crossing in between is a conditional probability needing the interval it
+        # Per-factor annualized log-variance RATE, published once the processes are precalculated.
+        # A barrier is monitored continuously while a deal grid only observes its own dates, so a
+        # crossing in between is a conditional probability needing the variance of the interval it
         # spans - and it must be the SIMULATION variance, not a pricing implied vol.
-        self.t_Bridge_Variance = {}
+        self.t_Bridge_Variance_Rate = {}
         self.t_cholesky = cholesky
         self.t_random_numbers = None
         self.t_Scenario_Buffer = {}
@@ -959,12 +959,11 @@ class Credit_Monte_Carlo(Calculation):
                     self.stoch_var[key], shared_mem, self.process_ofs[key], implied_tensor=implied_tensor)
                 if not value.params_ok:
                     logging.warning('Stochastic factor {} has been modified'.format(utils.check_scope_name(key)))
-                # Published after precalculate because the interval variance is a function of the
-                # time grid. Processes without a lognormal interval law return None and simply do
-                # not appear, which is what a pricer treats as "observe the endpoints".
-                interval_variance = value.bridge_interval_variance
-                if interval_variance is not None:
-                    shared_mem.t_Bridge_Variance[key] = interval_variance
+                # Processes without a lognormal interval law return None and simply do not
+                # appear, which is what a pricer treats as "observe the endpoints".
+                variance_rate = value.bridge_variance_rate
+                if variance_rate is not None:
+                    shared_mem.t_Bridge_Variance_Rate[key] = variance_rate
 
         # now check if any of the stochastic processes depend on other processes
         for key, value in self.stoch_factors.items():

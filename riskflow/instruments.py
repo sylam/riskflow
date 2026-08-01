@@ -3461,6 +3461,7 @@ class EquityOneTouchOption(Deal):
                 field['Equity'], static_offsets, stochastic_offsets, all_tenors),
             'Volatility': get_equity_price_vol_factor(
                 field['Equity_Volatility'], static_offsets, stochastic_offsets, all_tenors),
+            'Barrier_Underlying': utils.Factor('EquityPrice', field['Equity']),
             'Expiry': (self.field['Expiry_Date'] - base_date).days}
 
         if self.field.get('Barrier_Dates', []):

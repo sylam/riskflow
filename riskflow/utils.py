@@ -2089,6 +2089,36 @@ def spot_on_deal_grid(spot, deal_time, shared):
         len(deal_time), shared.simulation_batch)
 
 
+def barrier_touched(prev_touched, prev_spot, s_t, barrier, variance, up):
+    """Running PROBABILITY that the path has touched ``barrier`` at or before now.
+
+    An endpoint test only asks whether the spot sits beyond the barrier ON a grid date, so a path
+    that crossed and came back in between is recorded as never having touched - while the closed
+    forms being applied to that state assume CONTINUOUS monitoring. An endpoint already beyond the
+    barrier is a certain touch, and with both endpoints inside the Brownian-bridge crossing
+    probability is exact for a lognormal step.
+
+    ``variance`` is the SIMULATION log-variance spanning the interval - the rate published by
+    `StochasticProcess.bridge_variance_rate` times the elapsed years. Falsy observes endpoints
+    only, which covers all three cases that must: the first date on any grid, a process with no
+    lognormal interval law, and two coincident dates (whose zero would otherwise put a 0/0 in the
+    discarded branch of the `where`, and that branch's gradient is nan even when its value is
+    thrown away).
+    """
+    beyond = ((s_t > barrier) if up else (s_t < barrier)).to(s_t.dtype)
+    if not variance:
+        return (prev_touched + beyond).clip(max=1.0)
+
+    if up:
+        d0, d1 = torch.log(barrier / prev_spot), torch.log(barrier / s_t)
+    else:
+        d0, d1 = torch.log(prev_spot / barrier), torch.log(s_t / barrier)
+    crossed = torch.where((d0 > 0) & (d1 > 0),
+                          torch.exp((-2.0 * d0 * d1 / variance).clamp(max=0.0)),
+                          torch.ones_like(s_t))
+    return prev_touched + (1.0 - prev_touched) * torch.maximum(beyond, crossed)
+
+
 def hn_unmonitored_substeps(Sj, h, b_step, n_steps, hn_params, shared, num_sims, antithetic):
     """Advance (Sj, h) through ``n_steps`` UNCONDITIONAL (unmonitored) daily HN steps. These carry
     no barrier - the OSS truncation applies only on the monitored final step (done by the caller).

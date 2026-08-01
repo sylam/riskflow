@@ -196,17 +196,25 @@ class StochasticProcess(object):
         return None
 
     @property
-    def bridge_interval_variance(self):
-        """Log-variance of THIS factor over each scenario interval, (T, 1) or None.
+    def bridge_variance_rate(self):
+        """Annualized log-variance rate of THIS factor as a scalar, or None.
 
-        A barrier is monitored continuously but the scenario grid only observes the spot at its
+        A barrier is monitored continuously but a deal's time grid only observes the spot at its
         own dates, so whether a path crossed in between is a conditional probability rather than
         an observation - and a Brownian bridge needs the variance of the interval it spans.
 
+        A RATE against elapsed time rather than a per-interval array, because a deal's grid and
+        the scenario grid are different arrays (`deal_time_grid` indexes `mtm_time_grid`, while a
+        process discretises `scen_time_grid`); an array would have to be indexed by one and is
+        reached with the other. Elapsed time is common to both, so a rate cannot be misindexed.
+        This is exact where the vol is constant; a process whose interval variance is not
+        proportional to elapsed time should return None until it is given a form that can express
+        that, rather than a rate that silently means something else.
+
         It must come from the SIMULATION model, not from a pricing implied vol: the latter is the
         vol for the option's remaining life, which is a different quantity that happens to have
-        the same units. Processes without a lognormal interval law return None, and the caller
-        falls back to observing endpoints, which is what the engine did everywhere before.
+        the same units. Processes returning None fall back to observing endpoints, which is what
+        the engine did everywhere before.
         """
         return None
 
@@ -321,15 +329,14 @@ class GBMAssetPriceModel(StochasticProcess):
         # store params in tensors
         self.drift = tensor.new((self.param['Drift'] * dt - 0.5 * var).reshape(-1, 1))
         self.vol = tensor.new((np.sqrt(var)).reshape(-1, 1))
-        self.interval_log_variance = self.vol * self.vol
 
         # store a reference to the current tensor
         self.spot = tensor
 
     @property
-    def bridge_interval_variance(self):
-        """Lognormal by construction, so the bridge applies exactly between grid points."""
-        return self.interval_log_variance
+    def bridge_variance_rate(self):
+        """Lognormal with a constant vol, so the bridge applies exactly between any two dates."""
+        return float(self.param['Vol']) ** 2
 
 
     def theoretical_mean_std(self, t):
