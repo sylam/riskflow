@@ -77,17 +77,35 @@ def calc_moneyness(strike, spot, forward, deal_data, use_forward=False, invert_m
         return strike / forward_or_spot if invert_moneyness else forward_or_spot / strike
 
 
-def gaussian_dirac_weights(gap, bandwidth):
-    """A smoothed Dirac mass at gap == 0, for weighting the paths that sit near a hard decision.
+def boundary_weights(gap, bandwidth):
+    """Density at the boundary and local-linear regression weights, estimated SEPARATELY.
 
-    The width is a FRACTION of the gap's own dispersion, so one bandwidth setting means the same
-    thing across netting sets, currencies and margin schedules rather than being a raw amount.
-    Everything here is detached - these are weights on an estimator, not part of the valuation.
+    The term to recover is ``f_G(0) * E[jump * dG/dtheta | G = 0]``. Folding both halves into one
+    kernel - weighting each path by a smoothed Dirac and averaging - is a local-CONSTANT estimator,
+    whose bias is O(bandwidth) with an f'/f term rather than O(bandwidth^2). Measured on this book
+    that bias never settles: the correction tracked the bandwidth from -70k to -235k with no
+    plateau, and stayed put across a 16x change in path count, so it was estimator bias and not
+    Monte Carlo noise.
+
+    Local-linear weights cancel that first-order term, so the estimate should hold still over a
+    range of bandwidths - which is the only acceptance criterion worth having here, since no
+    single bandwidth can be argued for on its own.
+
+    Returns ``(density_at_zero, weights)`` with the weights summing to one, so the caller
+    multiplies rather than averages.
     """
-    detached = gap.detach()
-    width = bandwidth * detached.std().clamp_min(torch.finfo(gap.dtype).eps)
-    z = detached / width
-    return torch.exp(-0.5 * z * z) / (math.sqrt(2.0 * math.pi) * width)
+    g = gap.detach()
+    width = bandwidth * g.std().clamp_min(torch.finfo(g.dtype).eps)
+    k = torch.exp(-0.5 * (g / width) ** 2)
+    s0, s1, s2 = k.sum(), (k * g).sum(), (k * g * g).sum()
+    # degenerate when almost nothing sits near the boundary; the density is then ~0 anyway, and
+    # this stops a near-singular solve turning that into a large arbitrary number
+    denominator = s2 * s0 - s1 * s1
+    usable = denominator.abs() > 1e-30 * (s0 * s2).abs().clamp_min(1e-300)
+    weights = torch.where(usable, k * (s2 - g * s1) / torch.where(
+        usable, denominator, torch.ones_like(denominator)), torch.zeros_like(k))
+    density = s0 / (g.numel() * math.sqrt(2.0 * math.pi) * width)
+    return density, weights
 
 
 def stochastic_boundary_correction(gap, objective_jump, bandwidth):
@@ -95,19 +113,19 @@ def stochastic_boundary_correction(gap, objective_jump, bandwidth):
     into the backward one.
 
     Ordinary AAD differentiates an expectation containing 1{gap > 0} with the decision frozen,
-    dropping f_G(0) * E[jump * dgap/dtheta | gap = 0]. `gap - gap.detach()` is numerically zero
+    dropping ``f_G(0) * E[jump * dG/dtheta | G = 0]``. ``gap - gap.detach()`` is numerically zero
     with derivative one, so adding this to the scalar handed to backward() reports an unchanged
-    number and still propagates the missing term through `gap` to every factor at once - no bump,
-    no second valuation, cost independent of how many factors there are.
+    number and still propagates the missing term through ``gap`` to every factor at once - no
+    bump, no second valuation, cost independent of how many factors there are.
 
-    `objective_jump` is a COEFFICIENT and stays detached: its own pathwise derivatives are already
-    in the ordinary AAD value, and differentiating the counterfactual would count them twice.
+    ``objective_jump`` is a COEFFICIENT and stays detached: its own pathwise derivatives are
+    already in the ordinary AAD value, and differentiating the counterfactual would count them
+    twice.
 
-    The mean matches how CVA is reduced over paths; a sum here would scale the correction by the
-    path count, and nothing in the forward numbers would show it.
+    Summed, not averaged: the local-linear weights already carry the 1/N through the density.
     """
-    coefficient = (gaussian_dirac_weights(gap, bandwidth) * objective_jump.detach()).detach()
-    return torch.mean((gap - gap.detach()) * coefficient)
+    density, weights = boundary_weights(gap, bandwidth)
+    return ((gap - gap.detach()) * (density * weights * objective_jump).detach()).sum()
 
 
 class SensitivitiesEstimator(object):
