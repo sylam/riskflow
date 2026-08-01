@@ -942,6 +942,11 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
 
             payoff = buy_or_sell * nominal * barrierOption(
                 sig, exp, cash_rebate / nominal, b_t, r_t, s_t, barrier_t)
+        elif direction == BARRIER_OUT and expiry[index] == 0.0:
+            # the closed form divides by sqrt(expiry), so it cannot be asked for the value AT
+            # expiry - where a surviving knock-out is worth exactly its intrinsic. The knock-IN
+            # branch already carries its own expiry case and reaches here worth only its rebate.
+            payoff = buy_or_sell * nominal * torch.relu(phi * (f_t - strike))
         else:
             payoff = 0.0
 
