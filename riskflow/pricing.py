@@ -971,7 +971,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
 
     # work out what we're pricing
 
-    eta = BARRIER_DOWN if 'Down' in deal_data.Instrument.field['Barrier_Type'] else BARRIER_UP
+    eta = BARRIER_DOWN if 'Down' in deal_data.Instrument.field['Barrier_Type_One'] else BARRIER_UP
     buy_or_sell = 1.0 if deal_data.Instrument.field['Buy_Sell'] == 'Buy' else -1.0
     barrier = deal_data.Instrument.field['Barrier_Price']
 
@@ -1030,14 +1030,14 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
             log_vol = torch.log(barrier_t / s_t) / raw_sig
             barrovert = log_vol / root_tau
 
-            if deal_data.Instrument.field['Payment_Timing'] == 'Expiry':
+            if deal_data.Instrument.field['Option_Payment_Timing'] == 'Expiry':
                 muroot = mu * root_tau
                 d1 = muroot - barrovert
                 d2 = -muroot - barrovert
                 payoff = torch.exp(-r_t * exp) * 0.5 * (
                         torch.erfc(eta_scale * d1) + torch.exp(2.0 * mu * log_vol) * torch.erfc(eta_scale * d2))
 
-            elif deal_data.Instrument.field['Payment_Timing'] == 'Touch':
+            elif deal_data.Instrument.field['Option_Payment_Timing'] == 'Touch':
                 lamb = torch.sqrt(smooth_relu(mu * mu + 2.0 * r_t))
                 lambroot = lamb * root_tau
                 d1 = lambroot - barrovert
@@ -1047,19 +1047,26 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
         else:
             payoff = 0.0
 
+        # value still contingent on a touch that has not happened yet
         one_touch_part = (1.0 - touched) * buy_or_sell * nominal * payoff
 
         # settle cashflows (The potential rebate)
-        if deal_data.Instrument.field['Payment_Timing'] == 'Touch':
+        if deal_data.Instrument.field['Option_Payment_Timing'] == 'Touch':
+            # paid AT the touch, so it settles here and leaves the deal - already-touched paths
+            # carry nothing forward, which is why only the increment appears
             rebate_part = buy_or_sell * nominal * (touched - prev_touched)
             if rebate_part.any():
                 cash_settle(shared, payoff_currency, cash_index, rebate_part)
-        elif deal_data.Instrument.field['Payment_Timing'] == 'Expiry' and expiry[index] == 0.0:
+        elif expiry[index] == 0.0:
             rebate_part = buy_or_sell * nominal * touched
             if rebate_part.any():
                 cash_settle(shared, payoff_currency, cash_index, rebate_part)
         else:
-            rebate_part = 0.0
+            # Paid at EXPIRY if ever touched, so between the touch and expiry the path holds a
+            # CERTAIN claim on the nominal - worth its discounted value, not nothing. Carrying
+            # zero here reported a touched one-touch as worthless for the rest of its life and
+            # then jumped it to the nominal on the last date.
+            rebate_part = touched * buy_or_sell * nominal * torch.exp(-r_t * exp)
 
         mtm_list.append(rebate_part + one_touch_part)
         prev_touched = touched

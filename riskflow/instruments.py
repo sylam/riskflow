@@ -3410,7 +3410,7 @@ class EquityOneTouchOption(Deal):
 
     def add_grid_dates(self, parser, base_date, grid):
         # only if the payoff is american (Touch) should we add potential payoff dates
-        if self.field['Payment_Timing'] == 'Touch':
+        if self.field['Option_Payment_Timing'] == 'Touch':
             if isinstance(grid, str):
                 grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
                 self.reval_dates.update(grid_dates)
@@ -3426,7 +3426,7 @@ class EquityOneTouchOption(Deal):
     def add_reval_date_offset(self, offset, relative_to_settlement=True):
         # don't add any extra reval dates if this is a touch option
         if relative_to_settlement:
-            if self.field['Payment_Timing'] != 'Touch':
+            if self.field['Option_Payment_Timing'] != 'Touch':
                 for curr, fixings in self.settlement_currencies.items():
                     new_dates = [x + pd.DateOffset(days=offset) for x in fixings]
                     self.reval_dates.update(new_dates)
@@ -4175,7 +4175,7 @@ class FXOneTouchOption(Deal):
 
     def add_grid_dates(self, parser, base_date, grid):
         # only if the payoff is american (Touch) should we add potential payoff dates
-        if self.field['Payment_Timing'] == 'Touch':
+        if self.field['Option_Payment_Timing'] == 'Touch':
             if isinstance(grid, str):
                 grid_dates = parser(base_date, self.field['Expiry_Date'], grid)
                 self.reval_dates.update(grid_dates)
@@ -4191,7 +4191,7 @@ class FXOneTouchOption(Deal):
     def add_reval_date_offset(self, offset, relative_to_settlement=True):
         # don't add any extra reval dates if this is a touch option
         if relative_to_settlement:
-            if self.field['Payment_Timing'] != 'Touch':
+            if self.field['Option_Payment_Timing'] != 'Touch':
                 for curr, fixings in self.settlement_currencies.items():
                     new_dates = [x + pd.DateOffset(days=offset) for x in fixings]
                     self.reval_dates.update(new_dates)
