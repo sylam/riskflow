@@ -100,22 +100,24 @@ def _cfg(min_transfer, collateralised=True):
     return c
 
 
-def _params(boundary_aad, seed=1, batch=256, batches=1):
+def _params(gradient, seed=1, batch=256, batches=1):
     p = {'Run_Date': BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 1m(3m) 2y(3m)',
          'Batch_Size': batch, 'Simulation_Batches': batches, 'Random_Seed': seed,
          'Currency': 'USD', 'MCMC_Simulations': 0, 'Tenor_Offset': 0.0,
          'Deflation_Interest_Rate': 'USD', 'Gradient_Variables': 'Factors',
          'Credit_Valuation_Adjustment': {
              'Calculate': 'Yes', 'Counterparty': 'CPTY', 'Deflate_Stochastically': 'No',
-             'Stochastic_Hazard_Rates': 'No', 'Gradient': 'Yes'}}
-    if boundary_aad:
-        p['Boundary_AAD'] = 'Yes'
+             'Stochastic_Hazard_Rates': 'No',
+             'Gradient': 'Yes' if gradient else 'No'}}
     return p
 
 
-def _run(min_transfer, boundary_aad, seed=1):
+def _run(min_transfer, gradient, seed=1):
+    """Asking for sensitivities is what turns the boundary machinery on - there is no separate
+    setting, because a term worth exactly zero in the forward pass has nothing a user would want
+    to disable."""
     _, out = riskflow.run_cmc(_cfg(min_transfer), prec=DTYPE,
-                              overrides=_params(boundary_aad, seed=seed))
+                              overrides=_params(gradient, seed=seed))
     return out
 
 
@@ -169,30 +171,28 @@ def test_gaps_agree_with_the_transfer_decision():
 # ---------------------------------------------------------------------------
 
 def test_mta_is_economically_live():
-    """The fixture is only a test of anything if the MTA actually suppresses transfers. A zero
-    MTA transfers at every call; a large one does not, and the CVAs must differ."""
-    loose = _run(0.0, boundary_aad=False)['Results']['grad_cva']
-    tight = _run(2_000_000.0, boundary_aad=False)['Results']['grad_cva']
-    assert loose is not None and tight is not None
-    same = all(np.allclose(loose[k], tight[k]) for k in loose if k in tight)
-    assert not same, 'MTA is not binding — the boundary term would be trivially zero'
+    """The fixture only tests anything if the MTA actually suppresses transfers. A zero MTA
+    transfers at every call and a large one does not, so the exposure profiles must differ."""
+    loose = _run(0.0, gradient=False)['Results']['mtm'].values
+    tight = _run(2_000_000.0, gradient=False)['Results']['mtm'].values
+    assert not np.allclose(loose, tight), \
+        'MTA is not binding — the boundary term would be trivially zero'
 
 
 @pytest.mark.parametrize('min_transfer', [0.0, 2_000_000.0])
-def test_forward_cva_is_bit_identical_with_the_switch_on(min_transfer):
-    """THE gate for the whole build. The correction's forward value is exactly zero by
-    construction, so switching boundary AAD on may not move any reported number at all — not
-    within a tolerance, bitwise."""
-    off = _run(min_transfer, boundary_aad=False)['Results']
-    on = _run(min_transfer, boundary_aad=True)['Results']
-    assert set(off) == set(on)
-    a, b = off['mtm'].values, on['mtm'].values
-    assert np.array_equal(a, b), f'exposure profile moved: max |d| {np.abs(a - b).max():.3e}'
+def test_asking_for_sensitivities_does_not_move_the_exposure(min_transfer):
+    """THE gate for the whole build, and the property that matters operationally: requesting risk
+    must not change the numbers being reported. The correction is worth exactly zero forward by
+    construction, so the profile has to be identical bitwise, not within a tolerance."""
+    off = _run(min_transfer, gradient=False)['Results']['mtm'].values
+    on = _run(min_transfer, gradient=True)['Results']['mtm'].values
+    assert np.array_equal(off, on), f'exposure moved: max |d| {np.abs(off - on).max():.3e}'
 
 
-def test_events_are_registered_only_when_the_switch_is_on():
-    """Keeps the bit-identity gates from passing vacuously: if the netting set were skipped, or
-    the switch never reached the scan, 'unchanged forward' would be true and meaningless."""
+def test_events_are_registered_only_when_sensitivities_are_wanted():
+    """Keeps the bit-identity gate from passing vacuously: if the netting set were skipped, or the
+    scan never learned that greeks were wanted, 'unchanged forward' would be true and
+    meaningless."""
     import riskflow.instruments as instruments
     original = instruments.scan_collateral_balance
     tally = {}
@@ -204,12 +204,12 @@ def test_events_are_registered_only_when_the_switch_is_on():
 
     instruments.scan_collateral_balance = counted
     try:
-        for boundary_aad, expected in ((False, False), (True, True)):
+        for gradient, expected in ((False, False), (True, True)):
             tally.clear()
-            out = _run(2_000_000.0, boundary_aad=boundary_aad)
+            out = _run(2_000_000.0, gradient=gradient)
             assert out['Results']['mtm'].shape[0] > 1, 'netting set did not price'
             assert bool(tally.get('gaps')) is expected, \
-                f'boundary_aad={boundary_aad}: collected {tally.get("gaps", 0)} gaps'
+                f'gradient={gradient}: collected {tally.get("gaps", 0)} gaps'
     finally:
         instruments.scan_collateral_balance = original
 
@@ -284,11 +284,16 @@ def test_replay_from_a_forced_balance_changes_the_mtm():
 
 
 def test_correction_moves_gradients_but_not_the_forward():
-    """The whole point, in one gate. Switching boundary AAD on must leave every reported number
-    exactly where it was and must change the gradients — a correction that moved the forward would
-    be a bug, and one that left gradients alone would be doing nothing."""
-    off = _run(2_000_000.0, boundary_aad=False)['Results']
-    on = _run(2_000_000.0, boundary_aad=True)['Results']
+    """There is no longer a setting that yields greeks WITHOUT the correction, so the uncorrected
+    gradient is obtained by suppressing the term itself. A correction that moved the forward would
+    be a bug; one that left gradients alone would be doing nothing."""
+    original = calculation.mta_boundary_correction
+    calculation.mta_boundary_correction = lambda *a, **kw: None
+    try:
+        off = _run(2_000_000.0, gradient=True)['Results']
+    finally:
+        calculation.mta_boundary_correction = original
+    on = _run(2_000_000.0, gradient=True)['Results']
     assert np.array_equal(off['mtm'].values, on['mtm'].values), 'forward exposure moved'
 
     g_off, g_on = off['grad_cva'], on['grad_cva']

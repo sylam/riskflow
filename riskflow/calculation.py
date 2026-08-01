@@ -1090,11 +1090,11 @@ class Credit_Monte_Carlo(Calculation):
                 utils.check_rate_name(reporting_currency), self.static_factors, self.stoch_factors),
             seed, job_id, num_jobs, scale_by_survival, nomodel=self.params.get('NoModel', 'Constant'),
             keep_tensor=self.params.get('Keep_Tensor', 'No') == 'Yes')
-        # Boundary corrections only mean anything when something is being differentiated, so the
-        # switch is inert without greeks - and recording events nobody consumes would just be
-        # memory held across a batch.
-        shared_mem.boundary_aad = (
-                calc_greeks is not None and self.params.get('Boundary_AAD', 'No') == 'Yes')
+        # No JSON switch: wanting sensitivities IS the switch. The correction is worth exactly
+        # zero in the forward pass, so it can only ever change a derivative - there is nothing a
+        # user could sensibly turn off, and recording events nobody differentiates would just be
+        # memory held across a batch. Without greeks this runs as it always did.
+        shared_mem.boundary_aad = calc_greeks is not None
         return shared_mem
 
     def report(self, output):
