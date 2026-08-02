@@ -209,29 +209,34 @@ class MTABoundarySet:
 
 
 @dataclass
-class BarrierBoundarySet:
-    """One discretely-monitored barrier deal's crossing decisions, and what a counterfactual needs.
+class PricerBoundarySet:
+    """One deal's LATCHING decisions taken on simulated state, and what a counterfactual needs.
 
-    A crossing is observed, so the value jump is real - a knocked-out deal IS worth nothing - and
-    the estimate is not what is wrong. What ordinary AAD drops is the FLUX: as a factor moves,
-    scenarios cross the barrier, and the indicator that records the crossing has zero derivative
-    almost everywhere.
+    Two pricers register this shape and they are the same defect. A discretely monitored barrier
+    latches "has crossed" at each observation date; a physically settled swaption latches "was
+    exercised" once, at expiry, and carries it over every later row. Either way the decision is
+    OBSERVED, so the value jump is real - a knocked-out deal IS worth nothing, an exercised
+    swaption DOES hold the swap - and the estimate is not what is wrong. What ordinary AAD drops
+    is the FLUX: as a factor moves, scenarios cross the trigger, and the indicator that records
+    the crossing has zero derivative almost everywhere.
 
-    The counterfactual is cheaper here than for a margin call, because flipping the decision does
-    not change the SPOT - only the state. "Had it not crossed at observation k, would it have
-    crossed later?" is answered by the crossing flags ALREADY computed, so nothing is re-simulated
-    or re-priced. Both branch values are likewise already in hand: `alive` and `dead` are the two
-    sides of the `torch.where` the pricer already evaluates.
+    The counterfactual is cheap because flipping the decision does not change the SIMULATION -
+    only the state read off it. "Had it not fired at decision k, what would the deal be worth?" is
+    answered by flags and branch values ALREADY computed, so nothing is re-simulated, re-priced or
+    re-drawn: `untriggered` and `triggered` are the two sides of the selection the pricer already
+    evaluates.
 
-    `gaps` retain their graph - they are log(spot/barrier) at each observation and carry every
-    factor that moved the spot there. Everything else is DETACHED: it seeds a counterfactual whose
-    result is a coefficient, not a differentiated quantity.
+    `gaps` retain their graph - log(spot/barrier) at each barrier observation, the underlying swap
+    value at a swaption's expiry - and carry every factor that moved the scenario there. A gap is
+    signed so that gap > 0 means the trigger FIRED, matching a jump of J(fired) - J(did not).
+    Everything else is DETACHED: it seeds a counterfactual whose result is a coefficient, not a
+    differentiated quantity.
     """
-    gaps: list                      # per observation, tensors, graph retained
-    crossed: list                   # per observation, detached bool (B,)
-    obs_before: object              # (T,) int: observations strictly before each row, MTM grid
-    alive: object                   # (T, B) detached, MTM grid: value if it has not been hit
-    dead: object                    # (T, B) detached, MTM grid: value once it has been hit
+    gaps: list                      # per decision, tensors, graph retained
+    fired: list                     # per decision, detached bool (B,)
+    obs_before: object              # (T,) int: decisions strictly before each row, MTM grid
+    untriggered: object             # (T, B) detached, MTM grid: value while the trigger has not fired
+    triggered: object               # (T, B) detached, MTM grid: value once it has
     report_index: object            # MTM grid -> report grid, for the additive (uncollateralised)
                                     # route; the collateral chain wants the MTM grid untouched
 
@@ -272,7 +277,7 @@ class BarrierBoundarySet:
 
 
 @dataclass
-class PricerBoundarySet:
+class EventBoundarySet:
     """Triggers a pricer read off the REPORTING ROW's own state, and both values they choose between.
 
     An autocall observed on its coupon date is decided by the scenario spot itself - not by an

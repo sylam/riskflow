@@ -1596,11 +1596,11 @@ class Credit_Monte_Carlo(Calculation):
                         objective = lambda mtm: cva_per_scenario(
                             torch.relu(mtm * fx_report * Dt_T) / fx_report[0], prob, recovery)
                         bandwidth = float(params.get('Boundary_AAD_Bandwidth', 0.01))
-                        # A margin call and a barrier crossing are the same defect - a decision
-                        # taken on simulated state whose derivative the frozen-decision graph
-                        # drops - and they share the estimator. They differ only in how the
-                        # counterfactual MTM is produced, so they are assembled separately and
-                        # summed into the same scalar.
+                        # A margin call, a barrier crossing and a swaption's exercise are the
+                        # same defect - a decision taken on simulated state whose derivative the
+                        # frozen-decision graph drops - and they share the estimator. They differ
+                        # only in how the counterfactual MTM is produced, so they are assembled
+                        # separately and summed into the same scalar.
                         for correction in (mta_boundary_correction(shared_mem, objective, bandwidth),
                                            pricer_boundary_correction(
                                                shared_mem, objective, tensors['mtm'], bandwidth)):

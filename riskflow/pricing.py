@@ -246,6 +246,25 @@ def greeks(shared, deal_data, mtm):
         deal_data.Calc_res['Greeks_Second'] = greeks_calc.report_hessian(allow_unused=True)
 
 
+def interp_to_mtm_grid(mtm, shared, time_grid, deal_data, interpolate_grid=True):
+    """Deal grid -> MTM grid: the purely LINEAR half of `interpolate`, with no result stashing.
+
+    A boundary counterfactual has to put its branch values on exactly the grid the reported value
+    landed on. Reproducing the gather and the pad at the call site is how they drift apart, and a
+    delta misaligned by a row is invisible in a forward pass worth exactly zero - it would only
+    show up as a wrong gradient. So both go through this rather than through two copies of it.
+    """
+    if interpolate_grid and deal_data.Time_dep.interp.size > deal_data.Time_dep.deal_time_grid.size:
+        # interpolate it
+        mtm = utils.gather_interp_matrix(mtm, deal_data.Time_dep, shared)
+
+    if mtm.shape != (1, 1) and mtm.shape[0] < time_grid.mtm_time_grid.size:
+        # pad it with zeros and return
+        return F.pad(mtm, [0, 0, 0, time_grid.mtm_time_grid.size - deal_data.Time_dep.interp.size])
+    else:
+        return mtm
+
+
 def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
     if interpolate_grid and deal_data.Time_dep.interp.size > deal_data.Time_dep.deal_time_grid.size:
         # interpolate it
@@ -258,11 +277,8 @@ def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
         if shared.keep_tensor:
             deal_data.Calc_res['tensor'] = mtm
 
-    if mtm.shape != (1, 1) and mtm.shape[0] < time_grid.mtm_time_grid.size:
-        # pad it with zeros and return
-        return F.pad(mtm, [0, 0, 0, time_grid.mtm_time_grid.size - deal_data.Time_dep.interp.size])
-    else:
-        return mtm
+    # the gather is already done - only the pad is left
+    return interp_to_mtm_grid(mtm, shared, time_grid, deal_data, interpolate_grid=False)
 
 
 def getbarrierpayoff(direction, eta, phi, strike, H):
@@ -946,10 +962,10 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         pad = time_grid.mtm_time_grid.size - sum(len(x) for x in b_alive)
         alive, dead = (F.pad(torch.cat(x, dim=0), [0, 0, 0, pad]) if pad else torch.cat(x, dim=0)
                        for x in (b_alive, b_dead))
-        shared.boundary_sets.append(utils.BarrierBoundarySet(
-            gaps=b_gaps, crossed=b_crossed,
+        shared.boundary_sets.append(utils.PricerBoundarySet(
+            gaps=b_gaps, fired=b_crossed,
             obs_before=np.array(b_obs_before + [len(b_gaps)] * pad),
-            alive=alive, dead=dead, report_index=time_grid.report_index))
+            untriggered=alive, triggered=dead, report_index=time_grid.report_index))
 
     # barrier options settle once at expiry
     cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], mtm_list[-1][-1])
@@ -2120,7 +2136,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         # rides along so the additive route can map to the reporting grid at the point of use.
         pad = time_grid.mtm_time_grid.size - mtm.shape[0]
         rows, gaps, fired, survived = zip(*b_events)
-        shared.boundary_sets.append(utils.PricerBoundarySet(
+        shared.boundary_sets.append(utils.EventBoundarySet(
             gaps=list(gaps), rows=list(rows),
             fired=[nominal * x for x in fired], survived=[nominal * x for x in survived],
             reported=F.pad(mtm.detach(), [0, 0, 0, pad]) if pad else mtm.detach(),

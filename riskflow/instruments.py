@@ -2698,8 +2698,13 @@ class SwaptionDeal(Deal):
             Ut_swap = delta * mn_swap * F_swap
 
             if Ut_swap.shape[0]:
-                Ut_mask = Ut_swap * (Ut_swap[0] >= 0)
+                exercised = Ut_swap[0] >= 0
+                Ut_mask = Ut_swap * exercised
                 mtm = FX_rep * torch.cat([value, buysell * Ut_mask], dim=0)
+                if getattr(shared, 'boundary_aad', False) and time_grid.report_index is not None:
+                    self.register_exercise_boundary(
+                        shared, time_grid, deal_data, FX_rep, value,
+                        buysell * Ut_swap, Ut_swap[0], exercised)
             else:
                 mtm = FX_rep * value
 
@@ -2708,6 +2713,38 @@ class SwaptionDeal(Deal):
 
         # interpolate the Theo price
         return pricing.interpolate(mtm, shared, time_grid, deal_data)
+
+    @staticmethod
+    def register_exercise_boundary(shared, time_grid, deal_data, fx_rep, option, swap, gap, exercised):
+        """Record the frozen exercise decision so its derivative can be restored.
+
+        Physical settlement is genuinely path dependent - the holder either owns the swap for the
+        rest of its life or owns nothing - so the jump is real product economics and must not be
+        smoothed. What ordinary AAD drops is the FLUX of scenarios across `Ut_swap[0] = 0`: the
+        indicator broadcast over every later row has zero derivative almost everywhere.
+
+        Cheaper than a barrier, let alone a margin call. The gap IS `Ut_swap[0]` - already
+        differentiable, already carrying every factor that moved the forward swap rate - and both
+        branches are the two sides of the mask the pricer just evaluated, so nothing is
+        re-simulated, re-priced, or (the constraint that rules out most alternatives) re-drawn.
+
+        Registered as a single-decision PricerBoundarySet, the same shape a discrete barrier uses:
+        `triggered` holds the swap, `untriggered` lets the option lapse, and the pre-expiry rows
+        are identical in both, so the counterfactual delta is nonzero only where the decision
+        bites. Both branches go through the deal's own grid map, so `obs_before` needs no row
+        labels - the decision is a property of the SCENARIO, resolved for every row alike.
+        """
+        def to_mtm_grid(post_expiry):
+            return pricing.interp_to_mtm_grid(
+                fx_rep * torch.cat([option, post_expiry], dim=0),
+                shared, time_grid, deal_data).detach()
+
+        triggered = to_mtm_grid(swap)
+        shared.boundary_sets.append(utils.PricerBoundarySet(
+            gaps=[gap], fired=[exercised.detach()],
+            obs_before=np.ones(triggered.shape[0], dtype=np.int64),
+            triggered=triggered, untriggered=to_mtm_grid(torch.zeros_like(swap)),
+            report_index=time_grid.report_index))
 
     def generate(self, shared, time_grid, deal_data):
         # Should just call the pricing function here - copy the pricing code for post_process,
