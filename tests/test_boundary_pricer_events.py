@@ -182,3 +182,24 @@ def test_fva_gradient_carries_the_boundary_term_too():
     aad = _fva(bb.SPOT, gradient=True)
     r = ladder(price=lambda s: _fva(s, False), aad=aad, base=bb.SPOT, rungs=(5e-4, 1e-3, 2e-3))
     assert r.agrees(tol=0.02), f'the fva gradient is missing its boundary term\n{r}'
+
+
+def test_the_correction_generalises_to_the_other_barrier_direction():
+    """The gap must be signed so gap > 0 means CROSSED, and that sign flips with the barrier
+    direction - a DOWN barrier is crossed from above, an UP barrier from below. Getting it backwards
+    still converges, it just pulls the wrong way, so a second direction has to be measured rather
+    than reasoned about.
+
+    Up-and-IN is the variant with material exposure: it knocks in as the call goes into the money.
+    Its mirror images are deliberately NOT gated - an up-and-OUT call is knocked out exactly when it
+    becomes valuable, and a down-and-in call knocks in deep out of the money, so both carry a CVA
+    delta near -0.0003 where the CRN oracle itself stops converging (measured flatness 28% and 82%).
+    A gate there would be pinning Monte Carlo noise."""
+    H = 110.0
+    deal = dict(bb.BARRIER_DEAL, Barrier_Type='Up_And_In', Barrier_Price=H,
+                Barrier_Dates=[[bb.BASE + pd.Timedelta(days=d), H] for d in range(30, 366, 30)])
+    kw = dict(batch=1024, mcmc=256)
+    aad = _run(deal, gradient=True, **kw)[2]
+    r = ladder(price=lambda s: _run(deal, spot=s, **kw)[1], aad=aad, base=bb.SPOT,
+               rungs=(5e-4, 1e-3, 2e-3))
+    assert r.agrees(tol=0.02), f'up-barrier gap sign or counterfactual is wrong\n{r}'
