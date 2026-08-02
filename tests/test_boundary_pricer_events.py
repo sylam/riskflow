@@ -203,3 +203,37 @@ def test_the_correction_generalises_to_the_other_barrier_direction():
     r = ladder(price=lambda s: _run(deal, spot=s, **kw)[1], aad=aad, base=bb.SPOT,
                rungs=(5e-4, 1e-3, 2e-3))
     assert r.agrees(tol=0.02), f'up-barrier gap sign or counterfactual is wrong\n{r}'
+
+
+def test_the_correction_covers_heston_nandi_barriers():
+    """instruments.py refuses the CONTINUOUS barrier variant for SpotModel='HestonNandi', so every
+    HN barrier deal routes through the discrete pricer and its already-hit latch - the audit put
+    that at 100% of them. The registration sits in the shared pricer, which should cover HN, but
+    'should' is not a measurement: HN takes a different branch through sim_spot_oss, and its
+    hit_value for a knock-out is zeros rather than a closed form.
+
+    Measured 0.23% against bump-and-reprice at 0.77% flatness, on a CVA delta of 1.46 - large enough
+    that the oracle resolves it cleanly, unlike the mirror-image barrier variants."""
+    import test_hn_barrier_cmc as hb
+
+    def run(spot, gradient):
+        c = hb._cfg(True)
+        c.params['Price Factors']['EquityPrice.EQ']['Spot'] = spot
+        c.params['Price Factors']['SurvivalProb.CPTY'] = {
+            'Recovery_Rate': 0.4, 'Curve': utils.Curve([], [[0.0, 0.0], [10.0, 0.4]])}
+        _, out = riskflow.run_cmc(c, prec=hb.DTYPE, overrides={
+            'Run_Date': hb.BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 3m(3m)', 'Batch_Size': 512,
+            'Simulation_Batches': 1, 'Random_Seed': 1, 'Currency': 'USD', 'Tenor_Offset': 0.0,
+            'MCMC_Simulations': 256, 'Deflation_Interest_Rate': 'USD',
+            'Gradient_Variables': 'Factors',
+            'Credit_Valuation_Adjustment': {
+                'Calculate': 'Yes', 'Counterparty': 'CPTY', 'Deflate_Stochastically': 'No',
+                'Stochastic_Hazard_Rates': 'No', 'Gradient': 'Yes' if gradient else 'No'}})
+        if not gradient:
+            return float(out['Results']['cva'])
+        g = out['Results']['grad_cva']['Gradient']
+        return float(g.loc[[i for i in g.index if 'EquityPrice' in str(i[0])][0]])
+
+    aad = run(100.0, True)
+    r = ladder(price=lambda s: run(s, False), aad=aad, base=100.0, rungs=(5e-4, 1e-3, 2e-3))
+    assert r.agrees(tol=0.02), f'the HN barrier path is not carrying the boundary term\n{r}'
