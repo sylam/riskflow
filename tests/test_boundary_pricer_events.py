@@ -143,3 +143,42 @@ def test_collateralised_barrier_latch_gradient_matches_bump_and_reprice():
     r = ladder(price=lambda s: _run(DISCRETE_BARRIER, spot=s, **kw)[1],
                aad=aad, base=bb.SPOT, rungs=(5e-4, 1e-3, 2e-3))
     assert r.agrees(tol=0.05), f'{r}'
+
+
+def _fva(spot, gradient, batch=1024, mcmc=192):
+    """FVA and its equity-spot gradient. A funding SPREAD is what makes it non-zero - with the cost,
+    benefit and risk-free curves all equal the adjustment is identically zero and measures nothing."""
+    c = bb._cfg()
+    c.params['Price Factors']['EquityPrice.EQ']['Spot'] = spot
+    c.params['Price Factors']['SurvivalProb.CPTY'] = {
+        'Recovery_Rate': 0.4, 'Curve': utils.Curve([], [[0.0, 0.0], [10.0, 0.4]])}
+    c.params['Price Factors']['InterestRate.FUND'] = {
+        'Currency': 'USD', 'Day_Count': 'ACT_365', 'Sub_Type': None,
+        'Curve': utils.Curve([], [[0.0, 0.02], [10.0, 0.02]])}
+    c.params['Price Factors']['DiscountRate.FUND'] = {'Interest_Rate': 'FUND'}
+    c.deals['Deals']['Children'] = [{'Instrument': construct_instrument(DISCRETE_BARRIER, {})}]
+    _, out = riskflow.run_cmc(c, prec=bb.DTYPE, overrides={
+        'Run_Date': bb.BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 3m(3m)', 'Batch_Size': batch,
+        'Simulation_Batches': 1, 'Random_Seed': 1, 'Currency': 'USD', 'Tenor_Offset': 0.0,
+        'MCMC_Simulations': mcmc, 'Deflation_Interest_Rate': 'USD', 'Gradient_Variables': 'Factors',
+        'Funding_Valuation_Adjustment': {
+            'Calculate': 'Yes', 'Funding_Cost_Interest_Curve': 'FUND',
+            'Funding_Benefit_Interest_Curve': 'FUND', 'Risk_Free_Curve': 'USD',
+            'Counterparty': 'CPTY', 'Gradient': 'Yes' if gradient else 'No'}})
+    if not gradient:
+        return float(out['Results']['fva'])
+    g = out['Results']['grad_fva']['Gradient']
+    return float(g.loc[[i for i in g.index if 'EquityPrice' in str(i[0])][0]])
+
+
+def test_fva_gradient_carries_the_boundary_term_too():
+    """FVA reads the same exposure as CVA, so it drops the same boundary terms - and it is the path
+    that matters in production, because the shipped batch job DELETES the CVA section, so a
+    correction assembled only over there could never fire for it.
+
+    Measured on this fixture: 3.86% off uncorrected, 0.65% with the correction, the CRN ladder clean
+    at 1.27% flatness both times - so the movement is the correction and not the oracle wandering."""
+    assert _fva(bb.SPOT, False) > 0.0, 'no funding spread - the adjustment is identically zero'
+    aad = _fva(bb.SPOT, gradient=True)
+    r = ladder(price=lambda s: _fva(s, False), aad=aad, base=bb.SPOT, rungs=(5e-4, 1e-3, 2e-3))
+    assert r.agrees(tol=0.02), f'the fva gradient is missing its boundary term\n{r}'
