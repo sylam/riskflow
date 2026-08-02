@@ -241,37 +241,37 @@ class PricerBoundarySet:
                                     # route; the collateral chain wants the MTM grid untouched
 
     def branch_deltas(self):
-        """Per crossing, the deal-mtm delta with that crossing forced ON and forced OFF.
+        """Per decision, the deal-mtm delta with that decision forced ON and forced OFF.
 
         BOTH branches for EVERY scenario, not "what happened" against one alternative. The
-        estimator wants E[jump | gap = 0], and near the boundary the scenarios that did not cross
+        estimator wants E[jump | gap = 0], and near the boundary the scenarios that did not fire
         are exactly as numerous as those that did - scoring the former as a zero jump because their
         reported value already equals their own branch HALVES the conditional expectation.
         Measured: it recovered a third of the gap that way and closes it computing both.
 
-        Removing one observation from the crossing history and re-deriving the value from the two
+        Forcing one decision either way and re-deriving the value from the two
         branches the pricer already evaluated re-simulates and re-prices nothing.
         """
         with torch.no_grad():
-            # hit state after each observation count, and the value that state reports
-            prefix = [torch.zeros_like(self.crossed[0])]
-            for flag in self.crossed:
+            # latched state after each decision, and the value that state reports
+            prefix = [torch.zeros_like(self.fired[0])]
+            for flag in self.fired:
                 prefix.append(prefix[-1] | flag)
             reported = torch.where(
-                torch.stack(prefix)[self.obs_before], self.dead, self.alive)
+                torch.stack(prefix)[self.obs_before], self.triggered, self.untriggered)
         for k, gap in enumerate(self.gaps):
             with torch.no_grad():
                 on, off = [], []
-                run_on = run_off = torch.zeros_like(self.crossed[0])
+                run_on = run_off = torch.zeros_like(self.fired[0])
                 on.append(run_on)
                 off.append(run_off)
-                for j, flag in enumerate(self.crossed):
+                for j, flag in enumerate(self.fired):
                     run_on = run_on | (torch.ones_like(flag) if j == k else flag)
                     run_off = run_off | (torch.zeros_like(flag) if j == k else flag)
                     on.append(run_on)
                     off.append(run_off)
                 deltas = tuple(
-                    torch.where(torch.stack(state)[self.obs_before], self.dead, self.alive) - reported
+                    torch.where(torch.stack(state)[self.obs_before], self.triggered, self.untriggered) - reported
                     for state in (on, off))
             yield (gap,) + deltas
 
