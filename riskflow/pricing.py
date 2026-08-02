@@ -149,7 +149,12 @@ class SensitivitiesEstimator(object):
         self.P = len(self.flat_grad)
 
     def report_grad(self):
-        return {utils.check_scope_name(factor): tensor.cpu().detach().numpy() for factor, tensor in self.grad.items()}
+        # np.array COPIES. .numpy() on a CPU tensor returns a VIEW of the live .grad buffer, which
+        # torch keeps accumulating into - so a second backward() through the same leaves silently
+        # rewrites a report already handed out. On CUDA .cpu() copies and hides it; on the default
+        # device it does not, and the two disagree.
+        return {utils.check_scope_name(factor): np.array(tensor.cpu().detach())
+                for factor, tensor in self.grad.items()}
 
     def report_hessian(self, allow_unused=False):
         h_op = self.get_H_op(allow_unused)

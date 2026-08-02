@@ -56,3 +56,25 @@ def test_absolute_rungs_for_inputs_that_can_be_zero():
     f'(0)=1."""
     r = ladder(price=np.sin, aad=1.0, base=0.0, rungs=(1e-3, 2e-3, 5e-3), absolute=True)
     assert r.agrees(), str(r)
+
+
+def test_report_grad_hands_out_a_copy_not_a_live_view():
+    """`.numpy()` on a CPU tensor returns a VIEW of the live .grad buffer, and torch keeps
+    ACCUMULATING into that buffer - so a report already handed to the caller silently rewrites
+    itself when the next measure's backward runs. riskflow builds three estimators per batch
+    (collva, fva, cva) over the same leaves, so this is reachable rather than theoretical.
+
+    On CUDA `.cpu()` copies and hides it; on the default device it does not, so the two disagree.
+    Verified pre-fix: a report of 3.0 read back as 8.0 after a second, unrelated backward."""
+    import torch
+    from riskflow.pricing import SensitivitiesEstimator
+    from riskflow import utils
+
+    x = torch.tensor([2.0], requires_grad=True, dtype=torch.float64)
+    params = [(utils.Factor('Leaf', ('X',)), x)]
+    first = SensitivitiesEstimator((3.0 * x).sum(), params).report_grad()
+    SensitivitiesEstimator((5.0 * x).sum(), params).report_grad()
+
+    assert float(x.grad) == 8.0, 'expected torch to have accumulated 3 + 5 into the leaf'
+    assert [v.tolist() for v in first.values()] == [[3.0]], (
+        f'the first report changed when a later backward ran: {[v.tolist() for v in first.values()]}')
