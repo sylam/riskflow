@@ -209,6 +209,32 @@ class MTABoundarySet:
 
 
 @dataclass
+class BarrierBoundarySet:
+    """One discretely-monitored barrier deal's crossing decisions, and what a counterfactual needs.
+
+    A crossing is observed, so the value jump is real - a knocked-out deal IS worth nothing - and
+    the estimate is not what is wrong. What ordinary AAD drops is the FLUX: as a factor moves,
+    scenarios cross the barrier, and the indicator that records the crossing has zero derivative
+    almost everywhere.
+
+    The counterfactual is cheaper here than for a margin call, because flipping the decision does
+    not change the SPOT - only the state. "Had it not crossed at observation k, would it have
+    crossed later?" is answered by the crossing flags ALREADY computed, so nothing is re-simulated
+    or re-priced. Both branch values are likewise already in hand: `alive` and `dead` are the two
+    sides of the `torch.where` the pricer already evaluates.
+
+    `gaps` retain their graph - they are log(spot/barrier) at each observation and carry every
+    factor that moved the spot there. Everything else is DETACHED: it seeds a counterfactual whose
+    result is a coefficient, not a differentiated quantity.
+    """
+    gaps: list                      # per observation, tensors, graph retained
+    crossed: list                   # per observation, detached bool (B,)
+    obs_before: object              # (T,) int: observations strictly before each reported row
+    alive: object                   # (T, B) detached: the deal's value if it has not been hit
+    dead: object                    # (T, B) detached: the deal's value once it has been hit
+
+
+@dataclass
 class MTABoundaryEvent:
     """One margin call's transfer decision, recorded so its derivative can be recovered.
 

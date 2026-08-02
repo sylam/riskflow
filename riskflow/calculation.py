@@ -438,6 +438,8 @@ def mta_boundary_correction(shared, objective, bandwidth):
     """
     corrections = []
     for bset in shared.boundary_sets:
+        if not isinstance(bset, utils.MTABoundarySet):
+            continue
         jumps = {}
         for event in bset.events:
             if event.call_index not in jumps:
@@ -452,6 +454,64 @@ def mta_boundary_correction(shared, objective, bandwidth):
                     jumps[event.call_index] = branches[0] - branches[1]
             corrections.append(pricing.stochastic_boundary_correction(
                 event.gap, jumps[event.call_index], bandwidth))
+    return torch.stack(corrections).sum() if corrections else None
+
+
+def barrier_boundary_correction(shared, objective, reported_mtm, bandwidth):
+    """Total boundary correction for every recorded barrier crossing decision.
+
+    `objective` scores a netting-set MTM into a per-scenario vector, exactly as for a margin call.
+    The counterfactual differs only in how the alternative MTM is produced: removing observation k
+    from the crossing history and re-deriving the deal's value from the two branches the pricer
+    already evaluated. Nothing is re-simulated, re-priced or bumped.
+
+    The deal's contribution is added to the reported netting MTM, which is exact where the netting
+    set passes it through additively. A collateralised set does not - its balance responds to the
+    MTM - so those are refused at registration rather than silently approximated here.
+    """
+    if getattr(shared, 'collateralised_netting', False):
+        # The delta below is added to the netting-set MTM, which is exact only where the set passes
+        # a deal's value through additively. A collateralised set does not - its balance responds
+        # to the MTM, so the delta reaches the net through Vte AND through the collateral scan.
+        # That path is not routed yet, and a correction that is silently the wrong size is worse
+        # than none: it would look like the defect had been fixed.
+        logging.info('Boundary correction skipped: a collateralised netting set is present and the '
+                     'gross-to-net counterfactual is not routed through the collateral scan yet')
+        return None
+    corrections = []
+    for bset in shared.boundary_sets:
+        if not isinstance(bset, utils.BarrierBoundarySet):
+            continue
+        with torch.no_grad():
+            # hit state after each observation count, and the same with observation k removed
+            prefix = [torch.zeros_like(bset.crossed[0])]
+            for flag in bset.crossed:
+                prefix.append(prefix[-1] | flag)
+            actual = torch.stack(prefix)[bset.obs_before]              # (T, B) bool
+            reported_deal = torch.where(actual, bset.dead, bset.alive)
+        for k, gap in enumerate(bset.gaps):
+            with torch.no_grad():
+                # BOTH branches for EVERY scenario, not "what happened" against one alternative.
+                # The estimator wants E[jump | gap = 0], and near the boundary the scenarios that
+                # did not cross are exactly as numerous as those that did - scoring the former as
+                # a zero jump because their reported value already equals their own branch halves
+                # the conditional expectation. Measured: it recovered a third of the gap that way
+                # and closes it computing both.
+                on, off = [], []
+                run_on = run_off = torch.zeros_like(bset.crossed[0])
+                on.append(run_on)
+                off.append(run_off)
+                for j, flag in enumerate(bset.crossed):
+                    run_on = run_on | (torch.ones_like(flag) if j == k else flag)
+                    run_off = run_off | (torch.zeros_like(flag) if j == k else flag)
+                    on.append(run_on)
+                    off.append(run_off)
+                jumps = []
+                for state in (on, off):
+                    branch = torch.where(torch.stack(state)[bset.obs_before], bset.dead, bset.alive)
+                    jumps.append(objective(reported_mtm + (branch - reported_deal)))
+                jump = jumps[0] - jumps[1]      # J(crossed) - J(did not)
+            corrections.append(pricing.stochastic_boundary_correction(gap, jump, bandwidth))
     return torch.stack(corrections).sum() if corrections else None
 
 
@@ -471,6 +531,7 @@ class CMC_State(utils.Calculation_State):
         # once per batch, so a correction assembled from a previous batch's graph is stale.
         self.boundary_aad = False
         self.boundary_sets = []
+        self.collateralised_netting = False
         # Per-factor annualized log-variance RATE, published once the processes are precalculated.
         # A barrier is monitored continuously while a deal grid only observes its own dates, so a
         # crossing in between is a conditional probability needing the variance of the interval it
@@ -558,6 +619,7 @@ class CMC_State(utils.Calculation_State):
         # clear the buffers
         self.t_Buffer.clear()
         self.boundary_sets.clear()
+        self.collateralised_netting = False
 
 
 class CMC_State_Inner(CMC_State):
@@ -1530,13 +1592,19 @@ class Credit_Monte_Carlo(Calculation):
                     # 32768 - so a thin run should widen it and expect bias rather than noise.
                     cva_for_aad = tensors['cva']
                     if shared_mem.boundary_sets:
-                        correction = mta_boundary_correction(
-                            shared_mem,
-                            lambda mtm: cva_per_scenario(
-                                torch.relu(mtm * fx_report * Dt_T) / fx_report[0], prob, recovery),
-                            float(params.get('Boundary_AAD_Bandwidth', 0.01)))
-                        if correction is not None:
-                            cva_for_aad = cva_for_aad + correction
+                        objective = lambda mtm: cva_per_scenario(
+                            torch.relu(mtm * fx_report * Dt_T) / fx_report[0], prob, recovery)
+                        bandwidth = float(params.get('Boundary_AAD_Bandwidth', 0.01))
+                        # A margin call and a barrier crossing are the same defect - a decision
+                        # taken on simulated state whose derivative the frozen-decision graph
+                        # drops - and they share the estimator. They differ only in how the
+                        # counterfactual MTM is produced, so they are assembled separately and
+                        # summed into the same scalar.
+                        for correction in (mta_boundary_correction(shared_mem, objective, bandwidth),
+                                           barrier_boundary_correction(
+                                               shared_mem, objective, tensors['mtm'], bandwidth)):
+                            if correction is not None:
+                                cva_for_aad = cva_for_aad + correction
                     sensitivity = SensitivitiesEstimator(
                         cva_for_aad, self.all_var, create_graph=hessian)
 

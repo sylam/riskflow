@@ -808,6 +808,11 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
     barrier_hit = shared.one.new_zeros(shared.simulation_batch, dtype=torch.bool)
     prev_sample_idx = 0
     row_ofs = 0
+    # A crossing is OBSERVED, so its value jump is real and must not be smoothed; what ordinary AAD
+    # drops is the flux of scenarios across the barrier. Recording the decision costs nothing when
+    # sensitivities are not wanted, so it is gated rather than always on.
+    boundary_aad = getattr(shared, 'boundary_aad', False)
+    b_gaps, b_crossed, b_obs_before, b_alive, b_dead = [], [], [], [], []
 
     for index, (discount_block, spot_block, moneyness_block, rem_exp) in enumerate(
             utils.split_counts([discount, spot, moneyness, expiry_years], counts, shared)):
@@ -828,9 +833,20 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         # testing block i's rows because block i-1's observation had fired.
         row_barrier_hit = barrier_hit.unsqueeze(0).expand(len(t_block), -1)
         row_ofs += len(t_block)
+        if boundary_aad:
+            # how many observations have already resolved for every row of this block
+            b_obs_before.extend([len(b_gaps)] * len(t_block))
         if BarrierDates[sample_index_t] > 0:
             crossed = ((spot_block[-1] > barrier) if eta == BARRIER_UP else
                        (spot_block[-1] < barrier))
+            if boundary_aad:
+                # The margin by which the decision was made, graph retained - it carries every
+                # factor that moved the spot to the barrier. Signed so that gap > 0 means CROSSED,
+                # matching the jump below, which is J(crossed) - J(did not): a down barrier is
+                # crossed from ABOVE, so its gap is log(barrier/spot).
+                b_gaps.append(torch.log(spot_block[-1] / barrier) * (
+                    -1.0 if eta == BARRIER_DOWN else 1.0))
+                b_crossed.append(crossed.detach())
             if cash_rebate and direction == BARRIER_OUT:
                 # The rebate falls due AT the knock-out. sim_spot_oss already puts it in the mtm of
                 # that row - its zero-length first step gives p=0 for a crossed path, leaving
@@ -872,8 +888,10 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         some_hit = row_barrier_hit.any()
 
         # Compute the vanilla European value for already-hit scenarios (KI) or zeros (KO).
-        # Only needed when at least one row/scenario has hit the barrier.
-        if some_hit:
+        # Only needed when at least one row/scenario has hit the barrier - or when a counterfactual
+        # will want it. It is a closed form drawing no random numbers, so computing it for the
+        # boundary correction cannot shift the OSS stream and cannot move the reported value.
+        if some_hit or boundary_aad:
             if direction == BARRIER_IN:
                 var_per_step = (vols * vols).unsqueeze(1) * sample_ts.unsqueeze(2)  # [N_block, N_fix, batch]
                 total_log_fwd = (drifts + 0.5 * var_per_step).sum(dim=1)            # [N_block, batch]
@@ -902,11 +920,34 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
             theo_cashflow = torch.where(row_barrier_hit, hit_value, oss_result)
         else:
             # No scenario has hit yet — run OSS unconditionally
-            theo_cashflow = nominal * sim_spot_oss(
+            oss_result = nominal * sim_spot_oss(
                 spot_block, vols, sample_ts, drifts, discount_rates,
                 sample_index_t, sobol=sobol, num_sims=shared.MCMC_sims)
+            theo_cashflow = oss_result
+
+        if boundary_aad:
+            b_dead.append(hit_value.detach())
+            # Where EVERY scenario has already resolved the OSS is skipped, and running it here
+            # would draw random numbers and move the reported value. Those blocks therefore carry
+            # no counterfactual - which is also where the kernel weight is negligible, every
+            # scenario being far past the barrier rather than near it.
+            b_alive.append((hit_value if all_hit else oss_result).detach())
 
         mtm_list.append(theo_cashflow)
+
+    if boundary_aad and b_gaps and getattr(time_grid, 'report_index', None) is not None:
+        # The correction adds this delta to the NETTING-SET mtm, which lives on the report grid,
+        # while these rows are the deal's own on the mtm grid. report_index is that mapping - the
+        # same one the reported exposure is built through - so applying it here means the assembly
+        # never has to know anything about grids.
+        pad = time_grid.mtm_time_grid.size - sum(len(x) for x in b_alive)
+        alive, dead = (F.pad(torch.cat(x, dim=0), [0, 0, 0, pad]) if pad else torch.cat(x, dim=0)
+                       for x in (b_alive, b_dead))
+        obs_before = np.array(b_obs_before + [len(b_gaps)] * pad)
+        shared.boundary_sets.append(utils.BarrierBoundarySet(
+            gaps=b_gaps, crossed=b_crossed,
+            obs_before=obs_before[time_grid.report_index],
+            alive=alive[time_grid.report_index], dead=dead[time_grid.report_index]))
 
     # barrier options settle once at expiry
     cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], mtm_list[-1][-1])

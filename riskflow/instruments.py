@@ -1312,6 +1312,10 @@ class NettingCollateralSet(Deal):
                 net_accum = net_accum * St_T
 
             if boundary_aad:
+                # A pricer-event counterfactual adds a delta to the netting MTM, which is exact
+                # only where a deal's value passes through additively. This branch is where it does
+                # not - the balance responds to the MTM - so flag it and let that correction refuse.
+                shared.collateralised_netting = True
                 # The balance reaches the exposure ONLY through min_Bt, so a counterfactual needs
                 # nothing re-priced - just this arithmetic replayed on a different balance path.
                 # Everything captured here is balance-independent and detached: the replay
