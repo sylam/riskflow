@@ -235,6 +235,76 @@ class BarrierBoundarySet:
     report_index: object            # MTM grid -> report grid, for the additive (uncollateralised)
                                     # route; the collateral chain wants the MTM grid untouched
 
+    def branch_deltas(self):
+        """Per crossing, the deal-mtm delta with that crossing forced ON and forced OFF.
+
+        BOTH branches for EVERY scenario, not "what happened" against one alternative. The
+        estimator wants E[jump | gap = 0], and near the boundary the scenarios that did not cross
+        are exactly as numerous as those that did - scoring the former as a zero jump because their
+        reported value already equals their own branch HALVES the conditional expectation.
+        Measured: it recovered a third of the gap that way and closes it computing both.
+
+        Removing one observation from the crossing history and re-deriving the value from the two
+        branches the pricer already evaluated re-simulates and re-prices nothing.
+        """
+        with torch.no_grad():
+            # hit state after each observation count, and the value that state reports
+            prefix = [torch.zeros_like(self.crossed[0])]
+            for flag in self.crossed:
+                prefix.append(prefix[-1] | flag)
+            reported = torch.where(
+                torch.stack(prefix)[self.obs_before], self.dead, self.alive)
+        for k, gap in enumerate(self.gaps):
+            with torch.no_grad():
+                on, off = [], []
+                run_on = run_off = torch.zeros_like(self.crossed[0])
+                on.append(run_on)
+                off.append(run_off)
+                for j, flag in enumerate(self.crossed):
+                    run_on = run_on | (torch.ones_like(flag) if j == k else flag)
+                    run_off = run_off | (torch.zeros_like(flag) if j == k else flag)
+                    on.append(run_on)
+                    off.append(run_off)
+                deltas = tuple(
+                    torch.where(torch.stack(state)[self.obs_before], self.dead, self.alive) - reported
+                    for state in (on, off))
+            yield (gap,) + deltas
+
+
+@dataclass
+class PricerBoundarySet:
+    """Triggers a pricer read off the REPORTING ROW's own state, and both values they choose between.
+
+    An autocall observed on its coupon date is decided by the scenario spot itself - not by an
+    inner draw - so the trigger fires per scenario, and the value jump lands entirely on that one
+    row: the row's own inner Monte Carlo prices the remainder of the deal from there, and the
+    knock-out latch it sets is read by no later row (a fixing date is the LAST row of its block,
+    and the latch does not survive into the next).
+
+    Both branches come out of ONE forward pass. Firing zeroes the survival weight, so every later
+    term of that row is zero and the fired branch is closed form; the surviving branch is the same
+    loop carried alongside on an untouched weight. The weight never feeds back into the spot, so
+    the two share every state advance and neither draws a random number - which is what keeps the
+    reported value where it was.
+    """
+    gaps: list                      # per event, (B,) tensor, graph retained; gap > 0 means FIRED
+    rows: list                      # per event, int: the MTM-grid row the jump lands on
+    fired: list                     # per event, (B,) detached: that row's mtm had the trigger fired
+    survived: list                  # per event, (B,) detached: ... had it not
+    reported: object                # (T, B) detached, MTM grid: the deal mtm as reported
+    report_index: object            # MTM grid -> report grid, as for BarrierBoundarySet
+
+    def branch_deltas(self):
+        """Per decision, the deal-mtm delta with the trigger forced ON and forced OFF."""
+        for gap, row, on, off in zip(self.gaps, self.rows, self.fired, self.survived):
+            with torch.no_grad():
+                deltas = []
+                for branch in (on, off):
+                    delta = torch.zeros_like(self.reported)
+                    delta[row] = branch - self.reported[row]
+                    deltas.append(delta)
+            yield (gap,) + tuple(deltas)
+
 
 @dataclass
 class MTABoundaryEvent:

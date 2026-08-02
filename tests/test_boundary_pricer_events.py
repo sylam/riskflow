@@ -36,9 +36,38 @@ import test_barrier_bridge as bb
 MONTHLY = [[bb.BASE + pd.Timedelta(days=d), 90.0] for d in range(30, 366, 30)]
 DISCRETE_BARRIER = dict(bb.BARRIER_DEAL, Barrier_Dates=MONTHLY)
 
+QUARTERLY = [bb.BASE + pd.Timedelta(days=d) for d in (91, 182, 273, 365)]
 
-def _run(deal, spot=bb.SPOT, gradient=False, batch=512, mcmc=128, collateralised=False,
-         batches=1):
+
+def _autocall(threshold, barrier=0.0):
+    """A quarterly autocall. Every coupon fixing lands on a reporting row - which is not a choice:
+    a deal's own dates are folded into the grid - and an ALIGNED fixing is exactly the hard case.
+    It is decided by the scenario's own spot, before any inner draw has advanced it, so the pricer
+    takes the indicator branch; every FUTURE fixing is a survival probability through norm_cdf and
+    was differentiable all along. `Barrier` is a ratio of the strike."""
+    return {
+        'Object': 'QEDI_CustomAutoCallSwap', 'Reference': 'AC1', 'Currency': 'USD',
+        'Payoff_Currency': 'USD', 'Equity': 'EQ', 'Dividends': 'EQ', 'Discount_Rate': 'USD',
+        'Equity_Volatility': 'EQ', 'Buy_Sell': 'Buy', 'Option_Type': 'Call',
+        'Strike_Price': 100.0, 'Expiry_Date': QUARTERLY[-1], 'Units': 1.0,
+        'Settlement_Style': 'Cash', 'Option_On_Forward': 'No', 'Option_Style': 'European',
+        'Barrier': barrier, 'Payoff_Type': None,
+        'Price_Fixing': [[d, 0.0] for d in QUARTERLY],
+        'Autocall_Coupons': [[d, 0.05] for d in QUARTERLY],
+        'Autocall_Thresholds': [[d, threshold] for d in QUARTERLY],
+        'Barrier_Dates': [[d, barrier] for d in QUARTERLY] if barrier else [],
+        'Autocall_Floating': []}
+
+
+AUTOCALL = _autocall(1.02)
+# Both of this deal's indicators saturated: a threshold at 5x spot is reached by no path in a year
+# at 25% vol, and a put barrier at 2x the strike is breached by every one. The branches are still
+# taken - the registration still runs - but no scenario sits near either boundary, so there is no
+# flux to recover and ordinary AAD is already the derivative of the reported value.
+AUTOCALL_NO_TRIGGER = _autocall(5.0, barrier=2.0)
+
+
+def _run(deal, spot=bb.SPOT, gradient=False, batch=512, mcmc=128, collateralised=False, batches=1):
     """One CMC run returning (netting mtm, cva, equity-spot gradient or None)."""
     c = bb._cfg()
     c.params['Price Factors']['EquityPrice.EQ']['Spot'] = spot
@@ -92,6 +121,72 @@ def test_asking_for_sensitivities_does_not_move_the_barrier_exposure(collaterali
     assert np.array_equal(mtm_off, mtm_on), 'exposure moved when sensitivities were requested'
     assert cva_off == cva_on, f'cva moved: {cva_off!r} -> {cva_on!r}'
     assert grad is not None and abs(grad) > 0.0, 'no equity gradient was reported at all'
+
+
+@pytest.mark.parametrize('collateralised', [False, True], ids=['uncollateralised', 'collateralised'])
+def test_asking_for_sensitivities_does_not_move_the_autocall_exposure(collateralised):
+    """The autocall records both branches of its coupon trigger from ONE forward pass, and the
+    branch it did not take is carried on a second accumulator rather than a second simulation.
+    That is what makes this checkable: a re-run would have consumed the random stream the reported
+    value was built from, and the exposure would drift. BIT-identical, not approximately."""
+    mtm_off, cva_off, _ = _run(AUTOCALL, collateralised=collateralised)
+    mtm_on, cva_on, grad = _run(AUTOCALL, gradient=True, collateralised=collateralised)
+    assert np.array_equal(mtm_off, mtm_on), 'exposure moved when sensitivities were requested'
+    assert cva_off == cva_on, f'cva moved: {cva_off!r} -> {cva_on!r}'
+    assert grad is not None and abs(grad) > 0.0, 'no equity gradient was reported at all'
+
+
+def test_the_autocall_trigger_is_what_the_residual_is():
+    """Attribution, so the fix is aimed at the right thing. With no scenario anywhere near either
+    of this deal's indicators the registration still runs and still costs nothing, and the
+    uncorrected gradient already agrees with bump-and-reprice."""
+    kw = dict(batch=1024, mcmc=256, batches=16)
+    aad = _run(AUTOCALL_NO_TRIGGER, gradient=True, **kw)[2]
+    r = ladder(price=lambda s: _run(AUTOCALL_NO_TRIGGER, spot=s, **kw)[1], aad=aad, base=bb.SPOT,
+               rungs=(5e-4, 1e-3, 2e-3))
+    assert r.agrees(tol=0.02), f'an unreachable trigger should already agree\n{r}'
+
+
+def test_autocall_coupon_digital_gradient_matches_bump_and_reprice():
+    """The aligned coupon digital in pv_MC_AutoCallSwap. An autocall observed on its coupon date
+    really has redeemed, so the jump is product economics and must NOT be smoothed away - what has
+    to reach the tape is the flux of scenarios across the threshold.
+
+    Uncorrected this reads 54% LOW (AAD +1.489e-05 against an oracle of +2.287e-05 at 65536 paths,
+    where the ladder is flat to 0.9%). Corrected it lands within 0.02%-0.74% over bandwidths from
+    0.005 to 0.2, a 40x range: the estimate holds still, which is the only acceptance worth having
+    when no single bandwidth can be argued for. Measured at 39%-65% low and closed to under 2% at
+    thresholds 0.95, 1.02 and 1.15 on two seeds."""
+    kw = dict(batch=1024, mcmc=256, batches=16)
+    aad = _run(AUTOCALL, gradient=True, **kw)[2]
+    r = ladder(price=lambda s: _run(AUTOCALL, spot=s, **kw)[1], aad=aad, base=bb.SPOT,
+               rungs=(5e-4, 1e-3, 2e-3))
+    assert r.agrees(tol=0.05), f'{r}'
+
+
+@pytest.mark.xfail(strict=True, reason='the MTM counterfactual is right (0.82% with cash_settle '
+                                       'stubbed out) but an autocall SETTLES its coupon when it '
+                                       'fires, and that cash reaches a collateralised net through '
+                                       'C_ts_te, which gross_to_net does not carry')
+def test_collateralised_autocall_gradient_matches_bump_and_reprice():
+    """The same trigger with collateral in the way, and the one thing this port did NOT close.
+
+    A gross-mtm delta reaches the net through Vte and through the balance the collateral scan
+    derives from it, and `gross_to_net` runs that whole chain - which works: stub `cash_settle` out
+    and the corrected gradient lands 0.82% from the oracle on a ladder flat to 1.15% (uncorrected
+    +8.2e-08 against +3.69e-06, so the correction is supplying essentially all of it).
+
+    Shipped, it reads 92% low: +5.31e-06 corrected, +2.31e-06 uncorrected, oracle +1.018e-05. The
+    missing channel is CASH. Firing pays the coupon, `cash_settle` books it, and a collateralised
+    exposure reads that ledger through C_ts_te - so the counterfactual has to move the settled cash
+    as well as the mtm, and `gross_to_net` takes only an mtm delta. Left failing deliberately: the
+    number is not noise (flatness 1.68%) and a tolerance widened until a test passes measures
+    nothing."""
+    kw = dict(batch=1024, mcmc=256, batches=16, collateralised=True)
+    aad = _run(AUTOCALL, gradient=True, **kw)[2]
+    r = ladder(price=lambda s: _run(AUTOCALL, spot=s, **kw)[1], aad=aad, base=bb.SPOT,
+               rungs=(5e-4, 1e-3, 2e-3))
+    assert r.agrees(tol=0.05), f'{r}'
 
 
 def test_the_barrier_latch_is_what_the_residual_is():

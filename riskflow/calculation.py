@@ -457,13 +457,15 @@ def mta_boundary_correction(shared, objective, bandwidth):
     return torch.stack(corrections).sum() if corrections else None
 
 
-def barrier_boundary_correction(shared, objective, reported_mtm, bandwidth):
-    """Total boundary correction for every recorded barrier crossing decision.
+def pricer_boundary_correction(shared, objective, reported_mtm, bandwidth):
+    """Total boundary correction for every recorded PRICER decision - a barrier crossing, an
+    autocall trigger, any observed event whose value jump is real.
 
     `objective` scores a netting-set MTM into a per-scenario vector, exactly as for a margin call.
-    The counterfactual differs only in how the alternative MTM is produced: removing observation k
-    from the crossing history and re-deriving the deal's value from the two branches the pricer
-    already evaluated. Nothing is re-simulated, re-priced or bumped.
+    The counterfactual differs only in how the alternative MTM is produced, and that part belongs
+    to the deal: each set yields the deal-mtm delta under the trigger forced on and forced off,
+    derived from branches the pricer already evaluated. Nothing is re-simulated, re-priced or
+    bumped, so this end of it is the same arithmetic whatever the event was.
 
     The deal's contribution is added to the reported netting MTM, which is exact where the netting
     set passes it through additively. A collateralised set does not - its balance responds to the
@@ -481,41 +483,16 @@ def barrier_boundary_correction(shared, objective, reported_mtm, bandwidth):
         return None
     corrections = []
     for bset in shared.boundary_sets:
-        if not isinstance(bset, utils.BarrierBoundarySet):
-            continue
-        with torch.no_grad():
-            # hit state after each observation count, and the same with observation k removed
-            prefix = [torch.zeros_like(bset.crossed[0])]
-            for flag in bset.crossed:
-                prefix.append(prefix[-1] | flag)
-            actual = torch.stack(prefix)[bset.obs_before]              # (T, B) bool
-            reported_deal = torch.where(actual, bset.dead, bset.alive)
-        for k, gap in enumerate(bset.gaps):
+        if not hasattr(bset, 'branch_deltas'):
+            continue                            # a margin call replays a balance, not an mtm delta
+        for gap, on, off in bset.branch_deltas():
             with torch.no_grad():
-                # BOTH branches for EVERY scenario, not "what happened" against one alternative.
-                # The estimator wants E[jump | gap = 0], and near the boundary the scenarios that
-                # did not cross are exactly as numerous as those that did - scoring the former as
-                # a zero jump because their reported value already equals their own branch halves
-                # the conditional expectation. Measured: it recovered a third of the gap that way
-                # and closes it computing both.
-                on, off = [], []
-                run_on = run_off = torch.zeros_like(bset.crossed[0])
-                on.append(run_on)
-                off.append(run_off)
-                for j, flag in enumerate(bset.crossed):
-                    run_on = run_on | (torch.ones_like(flag) if j == k else flag)
-                    run_off = run_off | (torch.zeros_like(flag) if j == k else flag)
-                    on.append(run_on)
-                    off.append(run_off)
-                jumps = []
-                for state in (on, off):
-                    branch = torch.where(torch.stack(state)[bset.obs_before], bset.dead, bset.alive)
-                    delta = branch - reported_deal
-                    jumps.append(objective(
-                        gross_to_net(delta) if gross_to_net is not None
-                        else reported_mtm + delta[bset.report_index]))
-                jump = jumps[0] - jumps[1]      # J(crossed) - J(did not)
-            corrections.append(pricing.stochastic_boundary_correction(gap, jump, bandwidth))
+                jump = [objective(gross_to_net(delta) if gross_to_net is not None
+                                  else reported_mtm + delta[bset.report_index])
+                        for delta in (on, off)]
+            # J(fired) - J(did not), matching gap > 0 meaning the trigger fired
+            corrections.append(
+                pricing.stochastic_boundary_correction(gap, jump[0] - jump[1], bandwidth))
     return torch.stack(corrections).sum() if corrections else None
 
 
@@ -1527,7 +1504,7 @@ class Credit_Monte_Carlo(Calculation):
                         bandwidth = float(params.get('Boundary_AAD_Bandwidth', 0.01))
                         for correction in (
                                 mta_boundary_correction(shared_mem, fva_per_scenario, bandwidth),
-                                barrier_boundary_correction(
+                                pricer_boundary_correction(
                                     shared_mem, fva_per_scenario, tensors['mtm'], bandwidth)):
                             if correction is not None:
                                 fva_for_aad = fva_for_aad + correction
@@ -1625,7 +1602,7 @@ class Credit_Monte_Carlo(Calculation):
                         # counterfactual MTM is produced, so they are assembled separately and
                         # summed into the same scalar.
                         for correction in (mta_boundary_correction(shared_mem, objective, bandwidth),
-                                           barrier_boundary_correction(
+                                           pricer_boundary_correction(
                                                shared_mem, objective, tensors['mtm'], bandwidth)):
                             if correction is not None:
                                 cva_for_aad = cva_for_aad + correction

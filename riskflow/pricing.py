@@ -1789,6 +1789,11 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
                 P = torch.zeros((shared.simulation_batch, num_sims), dtype=shared.one.dtype, device=shared.one.device)
                 L = torch.ones((shared.simulation_batch, num_sims), dtype=shared.one.dtype, device=shared.one.device)
+                # The counterfactual world for this row's OBSERVED autocall - the same accumulation
+                # on a survival weight the trigger never touched. It does not exist until the
+                # trigger is met, which is at most once per row (a fixing lands on the last row of
+                # its block, and its first coupon is the only one that can be time-aligned).
+                P_cf = L_cf = None
                 # which simulations are still alive?
                 q = terminationDate != -1
                 # update the Live matrix
@@ -1804,6 +1809,8 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
                     if FloatingDate > 0:
                         P = P + L * fx * -FloatingDate * D[j]
+                        if P_cf is not None:
+                            P_cf = P_cf + L_cf * fx * -FloatingDate * D[j]
 
                     if coup > 0:
                         K = thresh * strike
@@ -1831,6 +1838,25 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                             if tau == 0.0:
                                 terminationDate = torch.where((terminationDate == -1) & (p == 0), reduced_samples, terminationDate)
 
+                        if P_cf is not None:
+                            # every LATER coupon is the same smooth p in both worlds - the weight
+                            # never feeds back into Sj, so the fork is one extra accumulator rather
+                            # than a second simulation
+                            P_cf = P_cf + fx * (1 - p) * L_cf * coup * D[j]
+                            L_cf = p * L_cf
+                        elif boundary_aad and dt <= 0:
+                            # The autocall is OBSERVED here: dt == 0 means the fixing date IS this
+                            # reporting row, so Sj is the scenario's own spot, not an inner draw,
+                            # and no smoothing can be justified - the note really has redeemed.
+                            # What the tape drops is the flux of scenarios across the threshold.
+                            # gap > 0 means the trigger FIRED (spot at or above K, so p == 0),
+                            # matching jump = J(fired) - J(did not). Firing zeroes the weight, so
+                            # every later term of this row vanishes and the fired branch is exactly
+                            # this coupon; the surviving branch forks here with the weight intact.
+                            b_events.append([row_ofs + len(mcmc), torch.log(Sj / K).squeeze(dim=1),
+                                             (P + fx * L * coup * D[j]).mean(axis=1).detach(), None])
+                            P_cf, L_cf = P, L
+
                         P = P + fx * (1 - p) * L * coup * D[j]
                         L = p * L
 
@@ -1855,12 +1881,16 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
                     if barrier > 0:
                         breach = torch.where(Sj <= putBarrier, 1.0, 0.0)
                         P = P + L * D[j] * fx * breach * (rebate - (1.0 - Sj / strike))
+                        if P_cf is not None:
+                            P_cf = P_cf + L_cf * D[j] * fx * breach * (rebate - (1.0 - Sj / strike))
 
                     if tau == 0.0:
                         cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(
                             time_grid.mtm_time_grid, t[utils.TIME_GRID_MTM]), P.mean(axis=1))
 
                 mcmc.append(P.mean(axis=1))
+                if P_cf is not None:
+                    b_events[-1][3] = P_cf.mean(axis=1).detach()
         else:
             isFixingDate = FixingDates[offset:]
             dt = times.unsqueeze(axis=2)
@@ -1980,6 +2010,12 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         sobol = True
         shared.reset_qrg()
 
+    # An autocall taken on the reporting row's own spot is a real redemption, so the value is not
+    # what is wrong; what ordinary AAD drops is the flux of scenarios across the threshold.
+    # Recording it costs nothing when sensitivities are not wanted, so it is gated rather than on.
+    boundary_aad = getattr(shared, 'boundary_aad', False)
+    b_events, row_ofs = [], 0
+
     for index, (forward_block, discount_block, spot_block, moneyness_block) in enumerate(
             utils.split_counts([forward, discount, spot, moneyness], counts, shared)):
 
@@ -2067,6 +2103,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         else:
             theo_cashflow = torch.zeros_like(drifts)
         theo_price = nominal * theo_cashflow
+        row_ofs += theo_price.shape[0]
         # theo_price = (theo_cashflow * discount_rates).sum(axis=1)
         # # settle potential cashflows
         # cash_settle(shared, factor_dep['SettleCurrency'], np.searchsorted(
@@ -2077,6 +2114,17 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
 
     # mtm in reporting currency
     mtm = torch.cat(mtm_list, dim=0)
+
+    if b_events and getattr(time_grid, 'report_index', None) is not None:
+        # Rows stay on the MTM grid, which is what the collateral chain consumes; report_index
+        # rides along so the additive route can map to the reporting grid at the point of use.
+        pad = time_grid.mtm_time_grid.size - mtm.shape[0]
+        rows, gaps, fired, survived = zip(*b_events)
+        shared.boundary_sets.append(utils.PricerBoundarySet(
+            gaps=list(gaps), rows=list(rows),
+            fired=[nominal * x for x in fired], survived=[nominal * x for x in survived],
+            reported=F.pad(mtm.detach(), [0, 0, 0, pad]) if pad else mtm.detach(),
+            report_index=time_grid.report_index))
 
     return mtm
 
