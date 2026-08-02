@@ -936,18 +936,15 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         mtm_list.append(theo_cashflow)
 
     if boundary_aad and b_gaps and getattr(time_grid, 'report_index', None) is not None:
-        # The correction adds this delta to the NETTING-SET mtm, which lives on the report grid,
-        # while these rows are the deal's own on the mtm grid. report_index is that mapping - the
-        # same one the reported exposure is built through - so applying it here means the assembly
-        # never has to know anything about grids.
+        # Rows stay on the MTM grid, which is what the collateral chain consumes; report_index
+        # rides along so the additive route can map to the reporting grid at the point of use.
         pad = time_grid.mtm_time_grid.size - sum(len(x) for x in b_alive)
         alive, dead = (F.pad(torch.cat(x, dim=0), [0, 0, 0, pad]) if pad else torch.cat(x, dim=0)
                        for x in (b_alive, b_dead))
-        obs_before = np.array(b_obs_before + [len(b_gaps)] * pad)
         shared.boundary_sets.append(utils.BarrierBoundarySet(
             gaps=b_gaps, crossed=b_crossed,
-            obs_before=obs_before[time_grid.report_index],
-            alive=alive[time_grid.report_index], dead=dead[time_grid.report_index]))
+            obs_before=np.array(b_obs_before + [len(b_gaps)] * pad),
+            alive=alive, dead=dead, report_index=time_grid.report_index))
 
     # barrier options settle once at expiry
     cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], mtm_list[-1][-1])

@@ -1199,6 +1199,9 @@ class NettingCollateralSet(Deal):
             min_posted = self.field['Credit_Support_Amounts']['Minimum_Posted'].value()
 
             Vt = local_accum * fx_base
+            # fx_base is REBOUND further down onto the Te grid; a gross counterfactual needs the
+            # local-grid one that Vt itself was built with, so keep it while it still means that.
+            fx_base_local = fx_base
 
             if self.options['Exclude_Paid_Today']:
                 mtm_today_adj = torch.cat([Cf_Rec[0].reshape(1, -1), Cf_Rec[1:] - Cf_Rec[:-1]], dim=0) - \
@@ -1324,14 +1327,19 @@ class NettingCollateralSet(Deal):
                 b_fx, b_surv = fx_base.detach(), St_T.detach() if surv else None
                 b_pad = time_grid.report_index.size - net_accum.shape[0]
 
-                def replay_net_mtm(balance_path, base_i=base_i, delta_T=delta_T):
+                def replay_net_mtm(balance_path, vte=None, base_i=base_i, delta_T=delta_T):
+                    """Balance path (and optionally a different Vte) -> the net mtm as reported.
+
+                    `vte` defaults to what was reported, which is the margin-call case: only the
+                    balance varies. A pricer counterfactual moves the GROSS as well, and the gross
+                    reaches the net through exactly this one term."""
                     running = balance_path[base_i]
                     step = np.zeros_like(delta_T)
                     for i in range(delta_T.max() if delta_T.size else 0):
                         step[delta_T > i] = i + 1
                         running = torch.min(running, balance_path[base_i + step])
                     running = F.pad(running, [0, 0, 0, 1])
-                    out = (b_Vte + b_C - running * b_Ste) / b_fx
+                    out = ((b_Vte if vte is None else vte) + b_C - running * b_Ste) / b_fx
                     if b_surv is not None:
                         out = out * b_surv
                     return F.pad(out, [0, 0, 0, b_pad]) if b_pad else out
@@ -1340,6 +1348,34 @@ class NettingCollateralSet(Deal):
                     events=mta_events, replay=replay_net_mtm, balance=boundary_balance,
                     required=Bt_new.detach(), recv_band=Mr.detach(), post_band=Mp.detach(),
                     call_mask=factor_dep['call_mask'].astype(bool)))
+
+                # A PRICER event moves the gross, not the balance, and the gross reaches the net
+                # two ways: through Vte, and through the balance the collateral scan derives from
+                # it. So a counterfactual has to redo that whole chain - At, the required balance,
+                # the bands, the scan - and only then the arithmetic above. Everything captured is
+                # detached and gross-independent; the delta arrives on the local grid.
+                g_fx, g_fx_local = fx_base.detach(), fx_base_local.detach()
+                g_St, g_fxSt = St.detach(), (fx_agreement / St).detach()
+                g_H, g_G, g_IA = H.detach(), G.detach(), (
+                    factor_dep['Independent_Amount'] * fx_agreement).detach()
+                g_Vt, g_B0, g_Te = Vt.detach(), Bt[0].detach(), factor_dep['Te']
+                g_mask = factor_dep['call_mask'].astype(bool)
+
+                def net_from_gross(delta, base_i=base_i, delta_T=delta_T):
+                    """Push a GROSS-mtm delta all the way to the net, collateral response included.
+
+                    The delta arrives on the MTM grid; this set runs on its own local prefix of it."""
+                    delta = delta[:g_Vt.shape[0]]
+                    Vt_cf = g_Vt + delta * g_fx_local
+                    At_cf = g_IA + (Vt_cf - g_H) * (Vt_cf > g_H) + (Vt_cf - g_G) * (Vt_cf < g_G)
+                    req = At_cf / g_St
+                    balance, _ = scan_collateral_balance(
+                        g_B0, req, req - min_received * g_fxSt, min_posted * g_fxSt + req, g_mask)
+                    # g_fx is ALREADY the Te-grid fx (fx_base is rebound onto report_time), so
+                    # only the gross-side terms take the Te index here
+                    return replay_net_mtm(balance, vte=g_Vt[g_Te] + delta[g_Te] * g_fx)
+
+                shared.gross_to_net = net_from_gross
 
             # Store results - with appropriate padding
             padding = time_grid.report_index.size - net_accum.shape[0]

@@ -123,13 +123,21 @@ def test_discrete_barrier_latch_gradient_matches_bump_and_reprice():
     assert r.agrees(tol=0.05), f'{r}'
 
 
-@pytest.mark.xfail(strict=True, reason='the gross-to-net counterfactual is not routed through the '
-                                       'collateral scan yet, so the correction REFUSES rather than '
-                                       'approximating - see barrier_boundary_correction')
+@pytest.mark.xfail(strict=True, reason='route is BUILT and converging - AAD +0.000904 vs CRN '
+                                       '+0.000963, flatness 5.25% - but 6.48% at the path count '
+                                       'this GPU allows, against a 5% bar. Not loosened to pass: '
+                                       'confirm at higher paths, do not tune the tolerance')
 def test_collateralised_barrier_latch_gradient_matches_bump_and_reprice():
     """The same defect with collateral in the way, which is the harder half: a gross-mtm delta
     reaches the net through Vte AND through the balance the collateral scan produces, so a fix
-    that only handles the additive path will pass the test above and fail this one."""
+    that only handles the additive path will pass the test above and fail this one - which is
+    exactly what happened, and what sent the gross-to-net chain into post_process.
+
+    It now runs that chain and converges (flatness 5.25%), landing 6.48% from the oracle where the
+    bar is 5%. The exposure here is almost entirely collateralised away, so the number is ~16x
+    smaller than the uncollateralised one and correspondingly noisier, and this GPU will not hold
+    enough paths to separate residual bias from Monte Carlo error. Left failing deliberately: a
+    tolerance widened until a test passes measures nothing."""
     kw = dict(batch=1024, mcmc=256, collateralised=True)
     aad = _run(DISCRETE_BARRIER, gradient=True, **kw)[2]
     r = ladder(price=lambda s: _run(DISCRETE_BARRIER, spot=s, **kw)[1],

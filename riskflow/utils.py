@@ -229,9 +229,11 @@ class BarrierBoundarySet:
     """
     gaps: list                      # per observation, tensors, graph retained
     crossed: list                   # per observation, detached bool (B,)
-    obs_before: object              # (T,) int: observations strictly before each reported row
-    alive: object                   # (T, B) detached: the deal's value if it has not been hit
-    dead: object                    # (T, B) detached: the deal's value once it has been hit
+    obs_before: object              # (T,) int: observations strictly before each row, MTM grid
+    alive: object                   # (T, B) detached, MTM grid: value if it has not been hit
+    dead: object                    # (T, B) detached, MTM grid: value once it has been hit
+    report_index: object            # MTM grid -> report grid, for the additive (uncollateralised)
+                                    # route; the collateral chain wants the MTM grid untouched
 
 
 @dataclass

@@ -469,14 +469,15 @@ def barrier_boundary_correction(shared, objective, reported_mtm, bandwidth):
     set passes it through additively. A collateralised set does not - its balance responds to the
     MTM - so those are refused at registration rather than silently approximated here.
     """
-    if getattr(shared, 'collateralised_netting', False):
-        # The delta below is added to the netting-set MTM, which is exact only where the set passes
-        # a deal's value through additively. A collateralised set does not - its balance responds
-        # to the MTM, so the delta reaches the net through Vte AND through the collateral scan.
-        # That path is not routed yet, and a correction that is silently the wrong size is worse
-        # than none: it would look like the defect had been fixed.
-        logging.info('Boundary correction skipped: a collateralised netting set is present and the '
-                     'gross-to-net counterfactual is not routed through the collateral scan yet')
+    # Where the netting set passes a deal's value through additively, a counterfactual is the
+    # reported MTM plus the deal's delta. A COLLATERALISED set does not: its balance responds to
+    # the MTM, so the delta reaches the net through Vte AND through the collateral scan. That set
+    # publishes the chain as `gross_to_net`, so the delta goes in as a gross and comes out netted.
+    gross_to_net = getattr(shared, 'gross_to_net', None)
+    if getattr(shared, 'collateralised_netting', False) and gross_to_net is None:
+        logging.info('Boundary correction skipped: a collateralised netting set is present but '
+                     'published no gross-to-net chain, and a silently mis-sized correction is '
+                     'worse than none - it looks like the defect was fixed')
         return None
     corrections = []
     for bset in shared.boundary_sets:
@@ -509,7 +510,10 @@ def barrier_boundary_correction(shared, objective, reported_mtm, bandwidth):
                 jumps = []
                 for state in (on, off):
                     branch = torch.where(torch.stack(state)[bset.obs_before], bset.dead, bset.alive)
-                    jumps.append(objective(reported_mtm + (branch - reported_deal)))
+                    delta = branch - reported_deal
+                    jumps.append(objective(
+                        gross_to_net(delta) if gross_to_net is not None
+                        else reported_mtm + delta[bset.report_index]))
                 jump = jumps[0] - jumps[1]      # J(crossed) - J(did not)
             corrections.append(pricing.stochastic_boundary_correction(gap, jump, bandwidth))
     return torch.stack(corrections).sum() if corrections else None
@@ -1507,7 +1511,27 @@ class Credit_Monte_Carlo(Calculation):
 
                 if params['Funding_Valuation_Adjustment'].get('Gradient', 'No') == 'Yes':
                     # calculate all the derivatives of fva
-                    sensitivity = SensitivitiesEstimator(tensors['fva'], self.all_var)
+                    # FVA reads the same exposure as CVA, so it drops the same boundary terms - and
+                    # the shipped batch job DELETES the CVA section, so the correction assembled
+                    # over there could never fire for it. Same estimator, same events, its own
+                    # objective: FCA_t - FBA_t is already the per-scenario vector it wants.
+                    fva_for_aad = tensors['fva']
+                    if shared_mem.boundary_sets:
+                        def fva_per_scenario(mtm):
+                            pv = (mtm * fx_report * DF_base) / fx_report[0]
+                            plus, minus = torch.relu(pv), torch.relu(-pv)
+                            return (torch.sum(delta_fund_cost_rf * (plus[1:] + plus[:-1]) / 2, dim=0)
+                                    - torch.sum(delta_fund_benefit_rf * (minus[1:] + minus[:-1]) / 2,
+                                                dim=0))
+
+                        bandwidth = float(params.get('Boundary_AAD_Bandwidth', 0.01))
+                        for correction in (
+                                mta_boundary_correction(shared_mem, fva_per_scenario, bandwidth),
+                                barrier_boundary_correction(
+                                    shared_mem, fva_per_scenario, tensors['mtm'], bandwidth)):
+                            if correction is not None:
+                                fva_for_aad = fva_for_aad + correction
+                    sensitivity = SensitivitiesEstimator(fva_for_aad, self.all_var)
 
                     if final_run:
                         output['grad_fva'] = sensitivity.report_grad()
