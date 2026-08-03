@@ -2745,7 +2745,7 @@ class SwaptionDeal(Deal):
             obs_before=np.ones(triggered.shape[0], dtype=np.int64),
             triggered=triggered,
             untriggered=torch.cat([option, torch.zeros_like(swap)], dim=0).detach(),
-            to_mtm=pricing.deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep),
+            to_mtm=pricing.deal_to_mtm_grid(time_grid, deal_data, fx_rep),
             report_index=time_grid.report_index))
 
     def generate(self, shared, time_grid, deal_data):

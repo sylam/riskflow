@@ -253,7 +253,7 @@ def greeks(shared, deal_data, mtm):
         deal_data.Calc_res['Greeks_Second'] = greeks_calc.report_hessian(allow_unused=True)
 
 
-def interp_to_mtm_grid(mtm, shared, time_grid, deal_data, interpolate_grid=True):
+def interp_to_mtm_grid(mtm, time_grid, deal_data, interpolate_grid=True):
     """Deal grid -> MTM grid: the purely LINEAR half of `interpolate`, with no result stashing.
 
     A boundary counterfactual has to put its branch values on exactly the grid the reported value
@@ -263,7 +263,7 @@ def interp_to_mtm_grid(mtm, shared, time_grid, deal_data, interpolate_grid=True)
     """
     if interpolate_grid and deal_data.Time_dep.interp.size > deal_data.Time_dep.deal_time_grid.size:
         # interpolate it
-        mtm = utils.gather_interp_matrix(mtm, deal_data.Time_dep, shared)
+        mtm = utils.gather_interp_matrix(mtm, deal_data.Time_dep)
 
     if mtm.shape != (1, 1) and mtm.shape[0] < time_grid.mtm_time_grid.size:
         # pad it with zeros and return
@@ -272,7 +272,7 @@ def interp_to_mtm_grid(mtm, shared, time_grid, deal_data, interpolate_grid=True)
         return mtm
 
 
-def deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep):
+def deal_to_mtm_grid(time_grid, deal_data, fx_rep):
     """The map from a pricer's own output to the MTM-grid rows the deal reports it on, detached.
 
     Everything `Deal.generate` and `Deal.calculate` do to a theo price and nothing else: scale
@@ -283,15 +283,28 @@ def deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep):
     simulated (T, B) cross, and a branch registered without it is a delta in the wrong currency
     whose own flux never reaches the tape. It multiplies on the pricer grid, BEFORE the
     interpolation, because that is the order the reported mtm was built in.
+
+    Two things this closure must NOT hold, both found by measurement rather than by reading.
+
+    `fx_rep` is detached AT CAPTURE, not merely on the way out: a boundary set outlives the pricing
+    call, so a closure over a live cross pins that deal's whole autograd graph until the batch's
+    backward pass. The rule that jumps stay detached is a memory contract as well as a correctness
+    one - the branch values are coefficients.
+
+    And it does not take `shared`. It has no use for it (`interp_to_mtm_grid` never did either),
+    and holding it makes a REFERENCE CYCLE: shared -> boundary_sets -> this closure -> shared, which
+    refcounting cannot break, so the calculation state and everything reachable from it survives
+    the run and waits on the cyclic collector. Measured together: 19.6 GB still resident after one
+    collateralised barrier run where the same run held 32 MiB before, and the next run OOMed.
     """
-    return lambda profile: interp_to_mtm_grid(
-        profile * fx_rep, shared, time_grid, deal_data).detach()
+    scale = fx_rep.detach()
+    return lambda profile: interp_to_mtm_grid(profile * scale, time_grid, deal_data).detach()
 
 
 def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
     if interpolate_grid and deal_data.Time_dep.interp.size > deal_data.Time_dep.deal_time_grid.size:
         # interpolate it
-        mtm = utils.gather_interp_matrix(mtm, deal_data.Time_dep, shared)
+        mtm = utils.gather_interp_matrix(mtm, deal_data.Time_dep)
 
     # check if we want to store the mtm value for this instrument
     if deal_data.Calc_res is not None:
@@ -301,7 +314,7 @@ def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
             deal_data.Calc_res['tensor'] = mtm
 
     # the gather is already done - only the pad is left
-    return interp_to_mtm_grid(mtm, shared, time_grid, deal_data, interpolate_grid=False)
+    return interp_to_mtm_grid(mtm, time_grid, deal_data, interpolate_grid=False)
 
 
 def getbarrierpayoff(direction, eta, phi, strike, H):
@@ -995,7 +1008,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b, tau, fx_re
         shared.boundary_sets.append(utils.LatchedBoundarySet(
             gaps=b_gaps, fired=b_crossed, obs_before=np.array(b_obs_before),
             untriggered=torch.cat(b_alive, dim=0), triggered=torch.cat(b_dead, dim=0),
-            to_mtm=deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep),
+            to_mtm=deal_to_mtm_grid(time_grid, deal_data, fx_rep),
             report_index=time_grid.report_index))
 
     # barrier options settle once at expiry
@@ -1833,7 +1846,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot, fx_rep):
     mtm = torch.cat(mtm_list, dim=0)
 
     if boundary_aad and getattr(time_grid, 'report_index', None) is not None:
-        to_mtm = deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep)
+        to_mtm = deal_to_mtm_grid(time_grid, deal_data, fx_rep)
         if b_gaps:
             # Redemption: `triggered` is worth zero for every row the decision reaches, and
             # `untriggered` is the SAME loop run on a weight that was never zeroed.
@@ -2275,7 +2288,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness, fx_rep):
         shared.boundary_sets.append(utils.RowBoundarySet(
             gaps=list(gaps), rows=list(rows),
             fired=[nominal * x for x in fired], survived=[nominal * x for x in survived],
-            reported=mtm.detach(), to_mtm=deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep),
+            reported=mtm.detach(), to_mtm=deal_to_mtm_grid(time_grid, deal_data, fx_rep),
             report_index=time_grid.report_index))
 
     return mtm

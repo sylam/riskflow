@@ -2725,7 +2725,7 @@ def interpolate_tensor(t, tenor, rate_tensor):
 
 
 
-def gather_interp_matrix(mtm, deal_time_dep, shared):
+def gather_interp_matrix(mtm, deal_time_dep):
     if deal_time_dep.alpha.any():
         if deal_time_dep.t_alpha is None:
             deal_time_dep.t_alpha = mtm.new(deal_time_dep.alpha)

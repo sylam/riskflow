@@ -256,6 +256,52 @@ def test_the_autocall_row_delta_lands_where_the_reported_value_did(report_curren
             f'the coupon date itself (day {deal_dates[row]:.0f}) carries none of its own jump')
 
 
+def test_a_registration_does_not_hold_the_calculation_state():
+    """A boundary set outlives the pricing call - it is held until the batch's backward pass - so
+    what its grid map closes over is a memory contract, and no reported number can show you when
+    it is wrong.
+
+    Closing over `shared` makes a cycle: shared -> boundary_sets -> the closure -> shared.
+    Refcounting cannot break it, so the calculation state and everything reachable from it
+    survives the run and waits on the cyclic collector. MEASURED on the collateralised barrier at
+    batch 1024: 19.6 GB still resident after ONE run where the same run had held 32 MiB before,
+    and the next run OOMed. The suite only ever saw it as some other test failing, in whichever
+    file happened to run last, which is why it is gated at the cause and not at a byte count.
+
+    `interp_to_mtm_grid` never used `shared` either, so the fix removed a parameter rather than
+    working around one."""
+    seen = _spy_registration('BARR1', deal=DISCRETE_BARRIER, batch=256, mcmc=64,
+                             collateralised=True)
+    bset, = seen['sets']
+    held = [cell.cell_contents for cell in (bset.to_mtm.__closure__ or ())]
+    assert held, 'the grid map closes over nothing at all - this is not reading the real map'
+    assert not any(isinstance(x, utils.Calculation_State) for x in held), (
+        'the grid map closes over the calculation state, which is a reference CYCLE through '
+        'shared.boundary_sets - the whole calculation survives the run')
+    for name in ('untriggered', 'triggered'):
+        assert not getattr(bset, name).requires_grad, f'{name} carries a graph'
+
+
+def test_the_grid_map_detaches_the_fx_cross_it_captures():
+    """The other half, and a unit test because no fixture in this file can reach it: `fx_rep` is a
+    SIMULATED (T, B) cross only when the payoff and reporting currencies differ AND the fx factor
+    is stochastic; everywhere here it resolves to a static rate, which carries no graph, so an
+    integration gate cannot tell a detached capture from a live one. It could not - the mutant
+    that keeps the graph survived the EUR-reported fixture.
+
+    Live, it would pin the deal's whole tape for as long as the set exists. Branch values are
+    coefficients: the rule that they stay detached is a memory contract as much as a correctness
+    one, and `.detach()` on the way OUT of the map is too late for the thing it captured."""
+    import riskflow.pricing as pricing
+    cross = torch.ones(3, 2, dtype=bb.DTYPE, requires_grad=True)
+    to_mtm = pricing.deal_to_mtm_grid(None, None, cross)
+    captured = [c.cell_contents for c in to_mtm.__closure__ if torch.is_tensor(c.cell_contents)]
+    assert captured, 'the map captured no tensor at all, so the fx cross went somewhere else'
+    assert not any(t.requires_grad for t in captured), (
+        'the grid map captured the fx cross with its graph attached, pinning the deal tape for '
+        'the life of the registration')
+
+
 def test_the_netting_set_a_registration_sits_under_is_the_one_that_scores_it():
     """`boundary_sets` accumulates from every deal in every netting set, so a single slot on
     `shared` cannot say which set a given registration belonged to. It was one slot: an
