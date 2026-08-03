@@ -402,3 +402,26 @@ def test_a_barrier_date_on_expiry_settles_its_rebate_once():
     assert at_expiry < 1.5 * earlier, (
         f'rebate settled twice: {at_expiry:.2f} against {earlier:.2f} for a barrier date 35 days '
         f'earlier - a single count differs only by the extra knock-out probability')
+
+
+@pytest.mark.parametrize('freq_days,label', [(0, 'continuous'), (30, 'monthly'), (7, 'weekly')])
+def test_the_bridge_honours_the_monitoring_frequency(freq_days, label):
+    """A discretely monitored barrier is priced by a CONTINUOUS closed form against a barrier
+    shifted away from the live region (Broadie-Glasserman-Kou). The bridge was handed the RAW
+    barrier while the formula three lines later priced the shifted one, so the path state monitored
+    continuously a barrier the product observes monthly, and the two disagreed about the same deal.
+
+    With r = q = 0 the value is a martingale at ANY monitoring frequency. Measured before the fix:
+    monthly monitoring decayed -11.58% over the profile; continuous was unaffected, which is why
+    the original gate - written at the default 0d - could not see it.
+
+        continuous  +0.82%      monthly  -0.07%      weekly  +0.46%
+
+    Inception rises with coarser monitoring (8.485 monthly against 7.176 continuous) because fewer
+    observations means fewer chances to knock out - a second reason a frequency-blind gate is weak."""
+    deal = dict(BARRIER_DEAL, Barrier_Monitoring_Frequency=pd.DateOffset(days=freq_days))
+    v = _profile('0d 1m(1m)', deal=deal).values.mean(axis=1)
+    drift = np.abs(v - v[0]).max() / v[0]
+    assert drift < 0.05, (
+        f'{label}: profile drifts {drift:.1%} from inception {v[0]:.4f} - the bridge and the '
+        f'closed form are testing different barriers\n{np.round(v, 3)}')

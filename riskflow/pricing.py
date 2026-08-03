@@ -1042,16 +1042,23 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
         # barrier options are very sensitive to vols - so we clamp them to 5%
         sig = raw_sig.clamp(min=0.05)
 
-        touched = utils.barrier_touched(prev_touched, prev_spot, s_t, barrier,
+        # Broadie-Glasserman-Kou: a DISCRETELY monitored barrier is priced by a continuous formula
+        # against a barrier shifted AWAY from the live region, by the monitoring interval's vol. The
+        # shift direction is the barrier TYPE, not where the spot happens to sit - the old
+        # `2*(barrier > s_t) - 1` evaluates to exactly this on the surviving support, and the
+        # surviving support is all that is ever weighted, so dropping the indicator is inert.
+        barrier_t = barrier * torch.exp(
+            (1.0 if eta == BARRIER_UP else -1.0) * sig * factor_dep['Barrier_Monitoring']
+        ) if factor_dep['Barrier_Monitoring'] else barrier
+
+        # The bridge has to test the SAME barrier the closed form prices against. Handed the raw
+        # one it monitored continuously a barrier the product observes monthly, and the two
+        # disagreed: the profile decayed 11.6% where it must be a martingale.
+        touched = utils.barrier_touched(prev_touched, prev_spot, s_t, barrier_t,
                                         interval_variance[index], eta == BARRIER_UP)
         prev_spot = s_t
 
         if (1 - touched).any() and expiry[index] > 0:
-            if factor_dep['Barrier_Monitoring']:
-                barrier_t = barrier * torch.exp(
-                    (2.0 * (barrier > s_t) - 1.0) * sig * factor_dep['Barrier_Monitoring'])
-            else:
-                barrier_t = barrier
 
             payoff = buy_or_sell * nominal * barrierOption(
                 sig, exp, cash_rebate / nominal, b_t, r_t, s_t, barrier_t)
@@ -1140,16 +1147,17 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
     for index, (raw_sig, exp, b_t, r_t, s_t, cash_index) in enumerate(zip(
             sigma, expiry_years, b, r, spot, deal_data.Time_dep.deal_time_grid)):
 
-        touched = utils.barrier_touched(prev_touched, prev_spot, s_t, barrier,
+        # the same monitoring-adjusted barrier the closed form below prices against - see
+        # pv_barrier_option for why the shift direction is the barrier type and not the spot's side
+        barrier_t = barrier * torch.exp(
+            (1.0 if eta == BARRIER_UP else -1.0) * raw_sig * factor_dep['Barrier_Monitoring']
+        ) if factor_dep['Barrier_Monitoring'] else barrier
+
+        touched = utils.barrier_touched(prev_touched, prev_spot, s_t, barrier_t,
                                         interval_variance[index], eta == BARRIER_UP)
         prev_spot = s_t
 
         if (1 - touched).any() and expiry[index] > 0:
-            if factor_dep['Barrier_Monitoring']:
-                barrier_t = barrier * torch.exp(
-                    (2.0 * (barrier > s_t) - 1.0) * raw_sig * factor_dep['Barrier_Monitoring'])
-            else:
-                barrier_t = barrier
 
             root_tau = torch.sqrt(exp)
             mu = b_t / raw_sig - 0.5 * raw_sig
