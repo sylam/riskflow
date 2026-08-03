@@ -788,14 +788,17 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
     strike = deal_data.Instrument.field['Strike_Price']
     cash_rebate = deal_data.Instrument.field.get('Cash_Rebate', 0.0)
 
-    nominal = factor_dep['Buy_Sell'] * (
-        deal_data.Instrument.field['Cash_Payoff'] if isdigital else deal_data.Instrument.field['Units'])
+    size = deal_data.Instrument.field['Cash_Payoff'] if isdigital else deal_data.Instrument.field['Units']
+    nominal = factor_dep['Buy_Sell'] * size
 
     # Cash_Rebate is an ABSOLUTE cash amount, which is how pv_barrier_option reads it - it hands the
     # closed form cash_rebate/nominal and multiplies the result back by nominal. Everything
-    # sim_spot_oss returns is scaled by nominal too, so the rebate has to go in per-unit or the same
-    # field means Units times more cash here than it does there, for the same deal class.
-    rebate_per_unit = cash_rebate / nominal
+    # sim_spot_oss returns is scaled by nominal too, so the rebate has to go in per-unit.
+    # Divide by the UNSIGNED size, not by nominal: nominal already carries Buy_Sell (which is NOT
+    # true in pv_barrier_option, where buy_or_sell is a separate factor), so dividing by it cancels
+    # the direction and every rebate leg comes back as +cash_rebate whichever way the deal is done.
+    # A sold knock-out then books the rebate it must PAY as a receipt.
+    rebate_per_unit = cash_rebate / size
 
     # opt-in Heston-Nandi spot model (SpotModel='HestonNandi'): the five GARCH scalars ride the
     # AAD graph out of t_Static_Buffer (identical resolution to the TARF). When absent, sim_spot_oss
@@ -874,10 +877,16 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
                 # (1-p)*L*rebate - but nothing settled it, and from the next row on hit_value is
                 # zero, so the cash was priced and then paid nowhere. Settle the increment here,
                 # the same way pv_barrier_option does at each date.
-                newly_hit = (crossed & ~barrier_hit).to(spot_block.dtype)
-                cash_settle(shared, factor_dep['SettleCurrency'],
-                            deal_data.Time_dep.deal_time_grid[row_ofs - 1],
-                            nominal * rebate_per_unit * newly_hit)
+                # ... except on the TERMINAL row, which the single settle after the loop already
+                # pays in full as part of mtm_list[-1][-1] - the rebate is in that mtm because
+                # sim_spot_oss accrued it. pv_barrier_option guards the same double count with
+                # `expiry[index] > 0.0`; a deal whose last barrier date IS expiry hits it, and
+                # instruments.py unions Expiry_Date into the observation dates, so that is common.
+                if row_ofs < len(deal_data.Time_dep.deal_time_grid):
+                    newly_hit = (crossed & ~barrier_hit).to(spot_block.dtype)
+                    cash_settle(shared, factor_dep['SettleCurrency'],
+                                deal_data.Time_dep.deal_time_grid[row_ofs - 1],
+                                nominal * rebate_per_unit * newly_hit)
             barrier_hit = barrier_hit | crossed   # carry forward into the next block
         prev_sample_idx = sample_index_t
 

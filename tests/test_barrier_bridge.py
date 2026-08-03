@@ -350,3 +350,55 @@ def test_digital_reports_its_equity_and_vol_factors():
     factors = {str(i[0]).split('.')[0] for i in out['Results']['grad_cva']['Gradient'].index}
     for needed in ('EquityPrice', 'EquityPriceVol'):
         assert needed in factors, f'{needed} missing from the greeks report; got {sorted(factors)}'
+
+
+def _settled(deal_overrides, batch=512):
+    c = _cfg()
+    c.deals['Deals']['Children'] = [{'Instrument': construct_instrument(
+        dict(BARRIER_DEAL, **deal_overrides), {})}]
+    _, out = riskflow.run_cmc(c, prec=DTYPE, overrides={
+        'Run_Date': BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 1m(1m)', 'Batch_Size': batch,
+        'Simulation_Batches': 1, 'Random_Seed': 1, 'Currency': 'USD', 'Tenor_Offset': 0.0,
+        'MCMC_Simulations': 128, 'Generate_Cashflows': 'Yes', 'Deflation_Interest_Rate': 'USD'})
+    cf = out['Results']['cashflows']
+    return (out['Results']['mtm'].values.mean(axis=1)[0],
+            sum(float(np.nansum(v.values)) for v in cf.values()))
+
+
+def test_a_sold_knock_out_pays_its_rebate_rather_than_receiving_it():
+    """`nominal` in the discrete pricer ALREADY carries Buy_Sell, unlike pv_barrier_option where
+    buy_or_sell is a separate factor. Dividing the rebate by it therefore cancelled the direction,
+    and every rebate leg came back as +cash_rebate whichever way the deal was done - a seller who
+    must PAY on knock-out booked it as a receipt, in the reported price and in the settled cash.
+
+    Buy and Sell must be exact mirror images. The original rebate gate only ever ran Buy, which is
+    why this survived it."""
+    kw = dict(Barrier_Price=95.0,
+              Barrier_Dates=[[BASE + pd.Timedelta(days=d), 95.0] for d in range(30, 361, 30)])
+    buy = np.subtract(_settled(dict(kw, Buy_Sell='Buy', Cash_Rebate=5.0)),
+                      _settled(dict(kw, Buy_Sell='Buy', Cash_Rebate=0.0)))
+    sell = np.subtract(_settled(dict(kw, Buy_Sell='Sell', Cash_Rebate=5.0)),
+                       _settled(dict(kw, Buy_Sell='Sell', Cash_Rebate=0.0)))
+    assert buy[0] > 0.0 and buy[1] > 0.0, 'a bought knock-out receives its rebate'
+    assert sell[0] == pytest.approx(-buy[0], rel=1e-9), (
+        f'rebate does not flip with direction: buy {buy[0]:+.4f} vs sell {sell[0]:+.4f}')
+    assert sell[1] == pytest.approx(-buy[1], rel=1e-9), (
+        f'settled rebate cash does not flip: buy {buy[1]:+.2f} vs sell {sell[1]:+.2f}')
+
+
+def test_a_barrier_date_on_expiry_settles_its_rebate_once():
+    """The per-observation settle fires on every barrier date, and the single settle after the loop
+    pays the whole terminal row - which already contains that rebate, because sim_spot_oss accrued
+    it. A deal whose last barrier date IS expiry therefore paid twice, and instruments.py unions
+    Expiry_Date into the observation dates, so that is the common case rather than a corner.
+
+    pv_barrier_option guards the identical double count with `expiry[index] > 0.0`. Strike is put
+    out of reach here so the rebate is the only cash in the run."""
+    expiry = BASE + pd.Timedelta(days=365)
+    at_expiry = _settled({'Barrier_Price': 95.0, 'Cash_Rebate': 5.0, 'Strike_Price': 1e6,
+                          'Barrier_Dates': [[expiry, 95.0]]})[1]
+    earlier = _settled({'Barrier_Price': 95.0, 'Cash_Rebate': 5.0, 'Strike_Price': 1e6,
+                        'Barrier_Dates': [[BASE + pd.Timedelta(days=330), 95.0]]})[1]
+    assert at_expiry < 1.5 * earlier, (
+        f'rebate settled twice: {at_expiry:.2f} against {earlier:.2f} for a barrier date 35 days '
+        f'earlier - a single count differs only by the extra knock-out probability')
