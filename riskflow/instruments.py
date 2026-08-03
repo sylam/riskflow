@@ -1371,9 +1371,15 @@ class NettingCollateralSet(Deal):
                     req = At_cf / g_St
                     balance, _ = scan_collateral_balance(
                         g_B0, req, req - min_received * g_fxSt, min_posted * g_fxSt + req, g_mask)
-                    # g_fx is ALREADY the Te-grid fx (fx_base is rebound onto report_time), so
-                    # only the gross-side terms take the Te index here
-                    return replay_net_mtm(balance, vte=g_Vt[g_Te] + delta[g_Te] * g_fx)
+                    # Build Vte from the REPORTED b_Vte, not by re-indexing g_Vt: under
+                    # Exclude_Paid_Today the two carry DIFFERENT cashflow adjustments (a local-grid
+                    # one at :1206, a Te-grid one at :1248), so re-deriving it silently rebases the
+                    # counterfactual - measured at ~100x the signal it is meant to carry, with no
+                    # value gate able to see it because the reported mtm is unchanged either way.
+                    # From b_Vte, gross_to_net(0) == the reported net BY CONSTRUCTION.
+                    # g_fx is already the Te-grid fx (fx_base is rebound onto report_time), so only
+                    # the delta takes the Te index here.
+                    return replay_net_mtm(balance, vte=b_Vte + delta[g_Te] * g_fx)
 
                 shared.gross_to_net = net_from_gross
 

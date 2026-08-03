@@ -67,7 +67,8 @@ AUTOCALL = _autocall(1.02)
 AUTOCALL_NO_TRIGGER = _autocall(5.0, barrier=2.0)
 
 
-def _run(deal, spot=bb.SPOT, gradient=False, batch=512, mcmc=128, collateralised=False, batches=1):
+def _run(deal, spot=bb.SPOT, gradient=False, batch=512, mcmc=128, collateralised=False,
+         batches=1, exclude_paid_today=False):
     """One CMC run returning (netting mtm, cva, equity-spot gradient or None)."""
     c = bb._cfg()
     c.params['Price Factors']['EquityPrice.EQ']['Spot'] = spot
@@ -85,14 +86,18 @@ def _run(deal, spot=bb.SPOT, gradient=False, batch=512, mcmc=128, collateralised
                 'Independent_Amount': utils.CreditSupportList([[0.0, 0.0]]),
                 'Minimum_Received': utils.CreditSupportList([[0.0, 0.0]]),
                 'Minimum_Posted': utils.CreditSupportList([[0.0, 0.0]])}}
+        # Exclude_Paid_Today lives in the VALUATION CONFIGURATION - NettingCollateralSet reads it
+        # from valuation_options, so putting it on the deal dict is silently ignored
         c.deals['Deals']['Children'] = [
-            {'Instrument': construct_instrument(netting, {}), 'Children': [child]}]
+            {'Instrument': construct_instrument(
+                netting, {'NettingCollateralSet': {'Exclude_Paid_Today': exclude_paid_today}}),
+             'Children': [child]}]
     else:
         c.deals['Deals']['Children'] = [child]
     _, out = riskflow.run_cmc(c, prec=bb.DTYPE, overrides={
         'Run_Date': bb.BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 3m(3m)', 'Batch_Size': batch,
         'Simulation_Batches': batches, 'Random_Seed': 1, 'Currency': 'USD', 'Tenor_Offset': 0.0,
-        'MCMC_Simulations': mcmc, 'Deflation_Interest_Rate': 'USD',
+        'MCMC_Simulations': mcmc, 'Deflation_Interest_Rate': 'USD', 'Generate_Cashflows': 'Yes',
         'Gradient_Variables': 'Factors',
         'Credit_Valuation_Adjustment': {
             'Calculate': 'Yes', 'Counterparty': 'CPTY', 'Deflate_Stochastically': 'No',
@@ -346,3 +351,48 @@ def test_the_correction_scales_correctly_across_simulation_batches():
     r = ladder(price=lambda s: _run(DISCRETE_BARRIER, spot=s, batches=2, **kw)[1],
                aad=aad, base=bb.SPOT, rungs=(1e-3, 2e-3))
     assert r.agrees(tol=0.03), f'the correction does not survive multiple batches\n{r}'
+
+
+@pytest.mark.parametrize('exclude_paid_today', [False, True], ids=['plain', 'exclude_paid_today'])
+def test_a_zero_gross_delta_reproduces_the_reported_net(exclude_paid_today):
+    """The invariant the collateral counterfactual rests on, which nothing asserted.
+
+    `gross_to_net` pushes a gross-mtm delta through At -> required balance -> bands -> scan -> the
+    netting arithmetic. Feed it ZERO and it must return the netting set's reported net EXACTLY - if
+    it does not, every correction is measured against a rebased baseline and is the wrong size while
+    still converging and still looking bandwidth-stable.
+
+    It did not. `Vte` was re-derived as `g_Vt[Te]` rather than taken from the reported `b_Vte`, and
+    under Exclude_Paid_Today the two carry DIFFERENT cashflow adjustments - a local-grid one and a
+    Te-grid one. Measured with the mutation restored: max|diff| 120.51 against a reported |mean| of
+    2.61, a 46x rebasing. Taking b_Vte makes the invariant true by construction.
+
+    Both settings are gated because the defect is INVISIBLE at the default: with the option off the
+    two forms coincide exactly, and no value gate can see it either way - the reported mtm is
+    unchanged, which is what let it hide. Note Exclude_Paid_Today is read from the VALUATION
+    CONFIGURATION, not the deal's fields; setting it on the netting dict is silently ignored and
+    makes this test vacuous."""
+    import riskflow.calculation as C
+    seen = {}
+    original = C.pricer_boundary_correction
+
+    def probe(shared, objective, reported_mtm, bandwidth):
+        chain = getattr(shared, 'gross_to_net', None)
+        bset = next((x for x in shared.boundary_sets if isinstance(x, utils.BoundarySet)), None)
+        if chain is not None and bset is not None:
+            with torch.no_grad():
+                seen['diff'] = float((chain(torch.zeros_like(bset.untriggered))
+                                      - reported_mtm).abs().max())
+        return original(shared, objective, reported_mtm, bandwidth)
+
+    C.pricer_boundary_correction = probe
+    try:
+        _run(dict(DISCRETE_BARRIER, Cash_Rebate=5.0), gradient=True, collateralised=True,
+             batch=256, mcmc=64, exclude_paid_today=exclude_paid_today)
+    finally:
+        C.pricer_boundary_correction = original
+
+    assert 'diff' in seen, 'the collateral chain never ran - the fixture is not exercising it'
+    assert seen['diff'] == 0.0, (
+        f'a zero gross delta moved the net by {seen["diff"]:.4e}: the counterfactual is rebased, '
+        f'so every correction against it is mis-sized')
