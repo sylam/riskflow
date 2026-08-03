@@ -67,36 +67,70 @@ AUTOCALL = _autocall(1.02)
 AUTOCALL_NO_TRIGGER = _autocall(5.0, barrier=2.0)
 
 
+NETTING = {
+    'Object': 'NettingCollateralSet', 'Netted': 'True', 'Agreement_Currency': 'USD',
+    'Funding_Rate': 'USD', 'Balance_Currency': 'USD', 'Liquidation_Period': 10.0,
+    'Settlement_Period': 0.0,
+    'Credit_Support_Amounts': {
+        'Received_Threshold': utils.CreditSupportList([[0.0, 0.0]]),
+        'Posted_Threshold': utils.CreditSupportList([[0.0, 0.0]]),
+        'Independent_Amount': utils.CreditSupportList([[0.0, 0.0]]),
+        'Minimum_Received': utils.CreditSupportList([[0.0, 0.0]]),
+        'Minimum_Posted': utils.CreditSupportList([[0.0, 0.0]])}}
+
+# A deal that contributes an mtm date NOBODY else has. The barrier's own reval dates are the 3m
+# reporting grid plus its monitoring dates, so with it alone the deal grid IS the mtm grid and the
+# interpolation `Deal.calculate` performs is the identity - the state in which a branch registered
+# on the deal grid and padded at the tail happens to be right. Day 137 is the parameter the defect
+# lives in: it makes `gather_interp_matrix` insert a row in the MIDDLE.
+INTERPOLATING_DEAL = {
+    'Object': 'EquityForwardDeal', 'Reference': 'FWD1', 'Currency': 'USD', 'Equity': 'EQ',
+    'Discount_Rate': 'USD', 'Payoff_Currency': 'USD', 'Buy_Sell': 'Buy', 'Units': 1.0,
+    'Forward_Price': 100.0, 'Maturity_Date': bb.BASE + pd.Timedelta(days=137)}
+
+
+def _foreign_report_currency(c, ccy='EUR'):
+    """Report in `ccy` while every deal still pays USD, so `fx_rep` is a simulated (T, B) cross
+    rather than `shared.one`. Nothing else about the portfolio changes."""
+    c.params['Price Factors']['FxRate.' + ccy] = {
+        'Domestic_Currency': None, 'Interest_Rate': ccy, 'Priority': 1, 'Spot': 1.25}
+    c.params['Price Factors']['FxRate.USD']['Domestic_Currency'] = ccy
+    c.params['Price Factors']['InterestRate.' + ccy] = {
+        'Currency': ccy, 'Day_Count': 'ACT_365', 'Sub_Type': None,
+        'Curve': utils.Curve([], [[0.0, 0.0], [5.0, 0.0]])}
+    c.params['Price Factors']['DiscountRate.' + ccy] = {'Interest_Rate': ccy}
+    c.params['Price Models']['GBMAssetPriceModel.USD'] = {'Vol': 0.12, 'Drift': 0.0}
+    c.params['Model Configuration'].append('FxRate', (), 'GBMAssetPriceModel')
+    return ccy
+
+
 def _run(deal, spot=bb.SPOT, gradient=False, batch=512, mcmc=128, collateralised=False,
-         batches=1, exclude_paid_today=False):
+         batches=1, exclude_paid_today=False, extra_deals=(), report_currency='USD',
+         children=None):
     """One CMC run returning (netting mtm, cva, equity-spot gradient or None)."""
     c = bb._cfg()
     c.params['Price Factors']['EquityPrice.EQ']['Spot'] = spot
     c.params['Price Factors']['SurvivalProb.CPTY'] = {
         'Recovery_Rate': 0.4, 'Curve': utils.Curve([], [[0.0, 0.0], [10.0, 0.4]])}
-    child = {'Instrument': construct_instrument(deal, {})}
-    if collateralised:
-        netting = {
-            'Object': 'NettingCollateralSet', 'Reference': 'NS1', 'Netted': 'True',
-            'Collateralized': 'True', 'Agreement_Currency': 'USD', 'Funding_Rate': 'USD',
-            'Balance_Currency': 'USD', 'Liquidation_Period': 10.0, 'Settlement_Period': 0.0,
-            'Credit_Support_Amounts': {
-                'Received_Threshold': utils.CreditSupportList([[0.0, 0.0]]),
-                'Posted_Threshold': utils.CreditSupportList([[0.0, 0.0]]),
-                'Independent_Amount': utils.CreditSupportList([[0.0, 0.0]]),
-                'Minimum_Received': utils.CreditSupportList([[0.0, 0.0]]),
-                'Minimum_Posted': utils.CreditSupportList([[0.0, 0.0]])}}
+    if report_currency != 'USD':
+        _foreign_report_currency(c, report_currency)
+    kids = [{'Instrument': construct_instrument(d, {})} for d in (deal,) + tuple(extra_deals)]
+    if children is not None:
+        c.deals['Deals']['Children'] = children(c)
+    elif collateralised:
         # Exclude_Paid_Today lives in the VALUATION CONFIGURATION - NettingCollateralSet reads it
         # from valuation_options, so putting it on the deal dict is silently ignored
         c.deals['Deals']['Children'] = [
             {'Instrument': construct_instrument(
-                netting, {'NettingCollateralSet': {'Exclude_Paid_Today': exclude_paid_today}}),
-             'Children': [child]}]
+                dict(NETTING, Reference='NS1', Collateralized='True'),
+                {'NettingCollateralSet': {'Exclude_Paid_Today': exclude_paid_today}}),
+             'Children': kids}]
     else:
-        c.deals['Deals']['Children'] = [child]
+        c.deals['Deals']['Children'] = kids
     _, out = riskflow.run_cmc(c, prec=bb.DTYPE, overrides={
         'Run_Date': bb.BASE.strftime('%Y-%m-%d'), 'Time_grid': '0d 3m(3m)', 'Batch_Size': batch,
-        'Simulation_Batches': batches, 'Random_Seed': 1, 'Currency': 'USD', 'Tenor_Offset': 0.0,
+        'Simulation_Batches': batches, 'Random_Seed': 1, 'Currency': report_currency,
+        'Tenor_Offset': 0.0,
         'MCMC_Simulations': mcmc, 'Deflation_Interest_Rate': 'USD', 'Generate_Cashflows': 'Yes',
         'Gradient_Variables': 'Factors',
         'Credit_Valuation_Adjustment': {
@@ -109,6 +143,164 @@ def _run(deal, spot=bb.SPOT, gradient=False, batch=512, mcmc=128, collateralised
         g = out['Results']['grad_cva']['Gradient']
         grad = float(g.loc[[i for i in g.index if 'EquityPrice' in str(i[0])][0]])
     return out['Results']['mtm'].values, float(out['Results']['cva']), grad
+
+
+def _spy_registration(reference, **run_kw):
+    """Run, and return the deal's OWN reported profile alongside the sets registered for it.
+
+    `pricing.interpolate` is the last thing `Deal.calculate` does, so its return value IS what the
+    deal contributes to the netting MTM - already gathered onto the MTM grid and already padded.
+    That makes it the only honest thing to compare a branch against: the netting mtm is a SUM, so
+    once a second deal is on the grid it stops being this deal's value at all."""
+    import riskflow.pricing as pricing
+    original = pricing.interpolate
+    seen = {}
+
+    def spy(mtm, shared, time_grid, deal_data, interpolate_grid=True):
+        result = original(mtm, shared, time_grid, deal_data, interpolate_grid)
+        if deal_data.Instrument.field.get('Reference') == reference:
+            seen['reported'] = result.detach()
+            seen['sets'] = [x for x in shared.boundary_sets if isinstance(x, utils.BoundarySet)]
+            seen['mtm_dates'] = time_grid.mtm_time_grid
+            seen['deal_dates'] = time_grid.time_grid[
+                deal_data.Time_dep.deal_time_grid][:, utils.TIME_GRID_MTM]
+        return result
+
+    pricing.interpolate = spy
+    try:
+        _run(gradient=True, **run_kw)
+    finally:
+        pricing.interpolate = original
+    return seen
+
+
+def _latched_reported(bset):
+    """The value the registration says was reported: the latch state after every recorded decision,
+    selecting between the branches, through the deal's own map. This is verbatim what
+    `LatchedBoundarySet.branch_deltas` computes as its baseline."""
+    prefix = [torch.zeros_like(bset.fired[0])]
+    for flag in bset.fired:
+        prefix.append(prefix[-1] | flag)
+    return bset.to_mtm(torch.where(
+        torch.stack(prefix)[bset.obs_before], bset.triggered, bset.untriggered))
+
+
+# ------------------------------------------------- the branch has to land where the value landed
+
+@pytest.mark.parametrize('report_currency', ['USD', 'EUR'])
+@pytest.mark.parametrize('interpolated', [False, True])
+def test_the_registered_barrier_branches_reproduce_the_reported_value(interpolated,
+                                                                      report_currency):
+    """The branches, selected by the recorded flags, must be the deal's reported profile EXACTLY.
+
+    Both defects this pins are invisible in a forward pass - a boundary correction is worth zero
+    there - so only a gradient moves, and only by a factor that reads as Monte Carlo error.
+
+    GRID. The pricer builds its profile over `deal_time_grid`; `Deal.calculate` puts it on the MTM
+    grid with `gather_interp_matrix`, which INSERTS rows in the middle wherever another deal
+    contributes an mtm date inside this deal's life. Padding the tail instead lands deal row i on
+    mtm row i, which is the same row only while no such date exists - hence the `interpolated`
+    parameter, and hence a fixture with a second deal in it. Measured on this one: mtm grid
+    [0 30 60 90 92 120 137 150 180 183 210 240 270 273 300 330 360 365], the barrier's own rows
+    everything but 137, so every branch value from day 150 on sat one row early and the expiry row
+    was left as the zero pad.
+
+    UNITS. `fx_rep` is `shared.one` only when the payoff and reporting currencies match; otherwise
+    it is a simulated (T, B) cross, so a branch registered without it is a delta in the wrong
+    currency AND leaves the fx factor's own flux off the tape. Measured: the branch was exactly
+    0.8x the reported value, the USD/EUR spot.
+
+    torch.equal, not allclose: both are exact identities."""
+    seen = _spy_registration(
+        'BARR1', deal=DISCRETE_BARRIER, batch=256, mcmc=64, report_currency=report_currency,
+        extra_deals=(INTERPOLATING_DEAL,) if interpolated else ())
+    bset, = seen['sets']
+    selected = _latched_reported(bset)
+    assert torch.equal(selected, seen['reported']), (
+        'the registered branches do not reconstruct the reported deal value - the counterfactual '
+        'is being scored on the wrong grid or in the wrong currency; max |d| '
+        f'{float((selected - seen["reported"]).abs().max()):.6g} against a reported |mean| of '
+        f'{float(seen["reported"].abs().mean()):.6g}')
+
+
+@pytest.mark.parametrize('report_currency', ['USD', 'EUR'])
+def test_the_autocall_row_delta_lands_where_the_reported_value_did(report_currency):
+    """The same defect on the ROW-local shape, where it presents differently: an autocall's jump is
+    a single row, so a mis-mapped row index puts the whole jump on the WRONG DATE rather than
+    rescaling it - and on an interpolated grid the jump has to SPLIT across the two mtm rows its
+    deal row sits between, which no integer row index can express at all.
+
+    The oracle is the deal's OWN reported profile, captured independently of the registration.
+    Comparing a delta against another use of the same map proves nothing: both move together, and
+    a first attempt at this test passed the padding mutant for exactly that reason."""
+    seen = _spy_registration('AC1', deal=AUTOCALL, batch=256, mcmc=64,
+                             report_currency=report_currency,
+                             extra_deals=(INTERPOLATING_DEAL,))
+    bset, = seen['sets']
+    assert torch.equal(bset.to_mtm(bset.reported), seen['reported']), (
+        'the registered baseline is not the deal value that was reported - every delta measured '
+        'against it is on the wrong grid or in the wrong currency; max |d| '
+        f'{float((bset.to_mtm(bset.reported) - seen["reported"]).abs().max()):.6g}')
+    # The jump for a decision recorded on pricer row r belongs on the DATE that row falls on, and
+    # on the mtm rows either side of it that interpolate through it - never anywhere else. Dates,
+    # not indices: an index equal to the registered one is what the padding form produced, and it
+    # was the wrong date. `assert bset.rows` because a fixture where nothing fires gates nothing.
+    assert bset.rows, 'no autocall decision was recorded - this fixture cannot see the defect'
+    mtm_dates, deal_dates = seen['mtm_dates'], seen['deal_dates']
+    for (gap, on, off), row in zip(bset.branch_deltas(), bset.rows):
+        hit = mtm_dates[(on - off).abs().sum(dim=1).gt(0).cpu().numpy()]
+        assert len(hit) and hit.min() < deal_dates[row] + 1 and hit.max() > deal_dates[row] - 1, (
+            f'the jump recorded on pricer row {row} (day {deal_dates[row]:.0f}) landed on mtm days '
+            f'{hit.tolist()} - it is on the wrong date, not merely the wrong index')
+        assert deal_dates[row] in hit, (
+            f'the coupon date itself (day {deal_dates[row]:.0f}) carries none of its own jump')
+
+
+def test_the_netting_set_a_registration_sits_under_is_the_one_that_scores_it():
+    """`boundary_sets` accumulates from every deal in every netting set, so a single slot on
+    `shared` cannot say which set a given registration belonged to. It was one slot: an
+    UNCOLLATERALISED set's barrier was pushed through a collateralised set's gross-to-net chain,
+    and with two collateralised sets the last one to run spoke for both.
+
+    Both failure modes need a portfolio with more than one netting set in it, which is why no
+    single-set fixture could see either. Measured on this one: before, one chain object served all
+    three registrations; after, the uncollateralised set's barrier carries None and the two
+    collateralised sets carry two DIFFERENT chains."""
+    def portfolio(c):
+        def netting(ref, collateralised, barrier_ref):
+            return {'Instrument': construct_instrument(
+                dict(NETTING, Reference=ref, Collateralized=collateralised), {}),
+                'Children': [{'Instrument': construct_instrument(
+                    dict(DISCRETE_BARRIER, Reference=barrier_ref), {})}]}
+        return [netting('NS_UNCOL', 'False', 'B_UNCOL'),
+                netting('NS_COL_A', 'True', 'B_COL_A'),
+                netting('NS_COL_B', 'True', 'B_COL_B')]
+
+    import riskflow.calculation as C
+    seen = {}
+    original = C.pricer_boundary_correction
+
+    def probe(shared, objective, reported_mtm, bandwidth):
+        seen['chains'] = [x.net_from_gross for x in shared.boundary_sets
+                          if isinstance(x, utils.BoundarySet)]
+        return original(shared, objective, reported_mtm, bandwidth)
+
+    C.pricer_boundary_correction = probe
+    try:
+        _run(DISCRETE_BARRIER, gradient=True, batch=256, mcmc=64, children=portfolio)
+    finally:
+        C.pricer_boundary_correction = original
+
+    chains = seen.get('chains')
+    assert chains is not None and len(chains) == 3, f'expected three registrations, got {chains}'
+    uncollateralised, col_a, col_b = chains
+    assert uncollateralised is None, (
+        'a barrier in an UNCOLLATERALISED netting set was handed a gross-to-net chain, so its '
+        'delta is scored through a collateral scan that never touched it')
+    assert col_a is not None and col_b is not None, 'a collateralised set published no chain'
+    assert col_a is not col_b, (
+        'both collateralised sets are scored through the SAME chain - the last one to run is '
+        'speaking for the other one as well')
 
 
 # ---------------------------------------------------------------- safety, must pass now and after
@@ -377,12 +569,14 @@ def test_a_zero_gross_delta_reproduces_the_reported_net(exclude_paid_today):
     original = C.pricer_boundary_correction
 
     def probe(shared, objective, reported_mtm, bandwidth):
-        chain = getattr(shared, 'gross_to_net', None)
         bset = next((x for x in shared.boundary_sets if isinstance(x, utils.BoundarySet)), None)
-        if chain is not None and bset is not None:
+        if bset is not None and bset.net_from_gross is not None:
             with torch.no_grad():
-                seen['diff'] = float((chain(torch.zeros_like(bset.untriggered))
-                                      - reported_mtm).abs().max())
+                # a zero delta on the MTM grid - which is the grid the chain consumes, and which
+                # only `to_mtm` knows how to reach from the pricer's own rows
+                seen['diff'] = float(
+                    (bset.net_from_gross(bset.to_mtm(torch.zeros_like(bset.untriggered)))
+                     - reported_mtm).abs().max())
         return original(shared, objective, reported_mtm, bandwidth)
 
     C.pricer_boundary_correction = probe

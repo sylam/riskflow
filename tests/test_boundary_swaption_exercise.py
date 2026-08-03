@@ -258,9 +258,12 @@ def test_the_registered_branches_reproduce_the_reported_value():
     """The two branches, selected by the recorded flag, must be the deal's reported profile EXACTLY.
 
     One comparison pins three things that are individually easy to get wrong and individually
-    silent: UNITS (the counterfactual is scored against a netting MTM in reporting currency, so the
-    branches carry fx_rep), GRID (they go through the same interpolate-and-pad the reported value
+    silent: UNITS (the counterfactual is scored against a netting MTM in reporting currency, so
+    `to_mtm` carries fx_rep), GRID (it goes through the same interpolate-and-pad the reported value
     did, so a row cannot slip), and SIGN (which branch is `triggered`).
+
+    The selection happens on the PRICER grid and `to_mtm` runs on the result, which is the order
+    `branch_deltas` uses - so this reads the registration exactly as the correction will.
 
     Silent because a boundary correction is worth exactly zero in the forward pass - none of these
     would move a reported number, only a gradient, and only by a factor that looks like ordinary
@@ -284,7 +287,7 @@ def test_the_registered_branches_reproduce_the_reported_value():
 
     bset, = seen['sets']
     reported = seen['reported'].detach()
-    selected = torch.where(bset.fired[0], bset.triggered, bset.untriggered)
+    selected = bset.to_mtm(torch.where(bset.fired[0], bset.triggered, bset.untriggered))
     assert torch.equal(selected, reported), (
         'the registered branches do not reconstruct the reported deal value - the counterfactual '
         f'is being scored in the wrong units, on the wrong grid, or with the branches swapped; '

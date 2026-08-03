@@ -1315,10 +1315,6 @@ class NettingCollateralSet(Deal):
                 net_accum = net_accum * St_T
 
             if boundary_aad:
-                # A pricer-event counterfactual adds a delta to the netting MTM, which is exact
-                # only where a deal's value passes through additively. This branch is where it does
-                # not - the balance responds to the MTM - so flag it and let that correction refuse.
-                shared.collateralised_netting = True
                 # The balance reaches the exposure ONLY through min_Bt, so a counterfactual needs
                 # nothing re-priced - just this arithmetic replayed on a different balance path.
                 # Everything captured here is balance-independent and detached: the replay
@@ -1381,6 +1377,9 @@ class NettingCollateralSet(Deal):
                     # the delta takes the Te index here.
                     return replay_net_mtm(balance, vte=b_Vte + delta[g_Te] * g_fx)
 
+                # Published, not applied. `resolve_structure` hands it to the registrations made
+                # beneath THIS netting set and drops it again - a slot that survived the call
+                # would reach every other set's deals too.
                 shared.gross_to_net = net_from_gross
 
             # Store results - with appropriate padding
@@ -2734,22 +2733,19 @@ class SwaptionDeal(Deal):
         branches are the two sides of the mask the pricer just evaluated, so nothing is
         re-simulated, re-priced, or (the constraint that rules out most alternatives) re-drawn.
 
-        Registered as a single-decision PricerBoundarySet, the same shape a discrete barrier uses:
+        Registered as a single-decision LatchedBoundarySet, the same shape a discrete barrier uses:
         `triggered` holds the swap, `untriggered` lets the option lapse, and the pre-expiry rows
         are identical in both, so the counterfactual delta is nonzero only where the decision
         bites. Both branches go through the deal's own grid map, so `obs_before` needs no row
         labels - the decision is a property of the SCENARIO, resolved for every row alike.
         """
-        def to_mtm_grid(post_expiry):
-            return pricing.interp_to_mtm_grid(
-                fx_rep * torch.cat([option, post_expiry], dim=0),
-                shared, time_grid, deal_data).detach()
-
-        triggered = to_mtm_grid(swap)
+        triggered = torch.cat([option, swap], dim=0).detach()
         shared.boundary_sets.append(utils.LatchedBoundarySet(
             gaps=[gap], fired=[exercised.detach()],
             obs_before=np.ones(triggered.shape[0], dtype=np.int64),
-            triggered=triggered, untriggered=to_mtm_grid(torch.zeros_like(swap)),
+            triggered=triggered,
+            untriggered=torch.cat([option, torch.zeros_like(swap)], dim=0).detach(),
+            to_mtm=pricing.deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep),
             report_index=time_grid.report_index))
 
     def generate(self, shared, time_grid, deal_data):
@@ -3083,7 +3079,7 @@ class EquityBarrierBinaryOption(Deal):
         spot = utils.spot_on_deal_grid(spot, deal_time, shared)
 
         pv = pricing.pv_discrete_barrier_option(
-            shared, time_grid, deal_data, spot, b, tau, isdigital=True)
+            shared, time_grid, deal_data, spot, b, tau, fx_rep, isdigital=True)
 
         mtm = pv * fx_rep
 
@@ -3416,7 +3412,7 @@ class QEDI_CustomAutoCallSwap(Deal):
 
         if spot.shape[0] == deal_time.shape[0]:
             mtm = pricing.pv_MC_AutoCallSwap(
-                shared, time_grid, deal_data, spot, moneyness) * fx_rep
+                shared, time_grid, deal_data, spot, moneyness, fx_rep) * fx_rep
         else:
             logging.error('AutoCall not priced due to missing equity model for {}'.format(self.field['Equity']))
             mtm = spot.new_zeros(deal_time.shape[0], shared.simulation_batch)
@@ -3789,7 +3785,7 @@ class EquityBarrierOption(Deal):
 
         if 'Barrier_Dates' in deal_data.Factor_dep:
             pv = pricing.pv_discrete_barrier_option(
-                shared, time_grid, deal_data, spot, b, tau, isdigital=False)
+                shared, time_grid, deal_data, spot, b, tau, fx_rep, isdigital=False)
         else:
             pv = pricing.pv_barrier_option(
                 shared, time_grid, deal_data, nominal, spot, b, tau, payoff_currency)

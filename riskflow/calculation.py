@@ -151,6 +151,10 @@ class DealStructure(object):
         """
 
         accum = 0.0 * shared.one
+        # Anything registered from here on is a decision taken BENEATH this structure, so the tail
+        # past this mark is exactly what its post_process gets to speak for. It cannot be found
+        # any later: post_process runs only once the children have been priced.
+        mark = len(shared.boundary_sets) if getattr(shared, 'boundary_aad', False) else None
 
         if self.sub_structures:
             # process sub structures
@@ -192,6 +196,9 @@ class DealStructure(object):
                 raise
             except Exception as e:
                 logging.critical('Deal skipped - {}'.format(e.args))
+            finally:
+                if mark is not None:
+                    utils.claim_boundary_sets(shared, mark)
 
         return accum
 
@@ -467,27 +474,20 @@ def pricer_boundary_correction(shared, objective, reported_mtm, bandwidth):
     derived from branches the pricer already evaluated. Nothing is re-simulated, re-priced or
     bumped, so this end of it is the same arithmetic whatever the event was.
 
-    The deal's contribution is added to the reported netting MTM, which is exact where the netting
-    set passes it through additively. A collateralised set does not - its balance responds to the
-    MTM - so those are refused at registration rather than silently approximated here.
+    Where the netting set passes a deal's value through additively, a counterfactual is the
+    reported MTM plus the deal's delta. A COLLATERALISED set does not: its balance responds to the
+    MTM, so the delta reaches the net through Vte AND through the collateral scan. That set
+    publishes the chain and it is stamped ON the registration, because `boundary_sets` accumulates
+    across every netting set and one slot cannot say which of them a given deal sat in.
     """
-    # Where the netting set passes a deal's value through additively, a counterfactual is the
-    # reported MTM plus the deal's delta. A COLLATERALISED set does not: its balance responds to
-    # the MTM, so the delta reaches the net through Vte AND through the collateral scan. That set
-    # publishes the chain as `gross_to_net`, so the delta goes in as a gross and comes out netted.
-    gross_to_net = getattr(shared, 'gross_to_net', None)
-    if getattr(shared, 'collateralised_netting', False) and gross_to_net is None:
-        logging.info('Boundary correction skipped: a collateralised netting set is present but '
-                     'published no gross-to-net chain, and a silently mis-sized correction is '
-                     'worse than none - it looks like the defect was fixed')
-        return None
     corrections = []
     for bset in shared.boundary_sets:
         if not isinstance(bset, utils.BoundarySet):
             continue                            # a margin call replays a balance, not an mtm delta
+        chain = bset.net_from_gross
         for gap, on, off in bset.branch_deltas():
             with torch.no_grad():
-                jump = [objective(gross_to_net(delta) if gross_to_net is not None
+                jump = [objective(chain(delta) if chain is not None
                                   else reported_mtm + delta[bset.report_index])
                         for delta in (on, off)]
             # J(fired) - J(did not), matching gap > 0 meaning the trigger fired
@@ -512,7 +512,6 @@ class CMC_State(utils.Calculation_State):
         # once per batch, so a correction assembled from a previous batch's graph is stale.
         self.boundary_aad = False
         self.boundary_sets = []
-        self.collateralised_netting = False
         # Per-factor annualized log-variance RATE, published once the processes are precalculated.
         # A barrier is monitored continuously while a deal grid only observes its own dates, so a
         # crossing in between is a conditional probability needing the variance of the interval it
@@ -600,7 +599,6 @@ class CMC_State(utils.Calculation_State):
         # clear the buffers
         self.t_Buffer.clear()
         self.boundary_sets.clear()
-        self.collateralised_netting = False
 
 
 class CMC_State_Inner(CMC_State):

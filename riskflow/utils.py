@@ -227,10 +227,27 @@ class BoundarySet:
     that decision forced ON and forced OFF. Both branches, for EVERY scenario - near the boundary
     the scenarios that did not fire are exactly as numerous as those that did, and scoring the
     former as a zero jump halves the conditional expectation.
+
+    Branch values are registered on the PRICER's own grid, in the pricer's own currency, and
+    `to_mtm` is the deal's own map onto the MTM grid. A pricer builds its profile over
+    `deal_time_grid`, and the deal then scales it by `fx_rep` and INTERPOLATES - which inserts rows
+    in the middle wherever another deal contributes an mtm date inside this deal's life. Padding
+    the tail instead lands row i of the deal on row i of the MTM grid, which is the same row only
+    while no such date exists. Both halves are invisible in a forward pass worth exactly zero.
     """
     gaps: list                      # per decision, tensors, graph retained
     report_index: object            # MTM grid -> report grid, for the additive (uncollateralised)
                                     # route; the collateral chain wants the MTM grid untouched
+    to_mtm: object                  # callable: pricer-grid profile -> MTM-grid rows, detached
+                                    # (pricing.deal_to_mtm_grid - fx into reporting, then interp)
+
+    # The netting set this registration sits beneath stamps its own gross-to-net chain here, and
+    # None - the class default, and what an ADDITIVE set leaves alone - means the counterfactual
+    # is the reported MTM plus the delta. It has to ride on the SET: `boundary_sets` accumulates
+    # from every deal in every netting set, so one slot on `shared` pushes an uncollateralised
+    # set's deal through a collateralised set's chain, and lets the last collateralised set of
+    # several speak for all of them.
+    net_from_gross = None
 
     def branch_deltas(self):
         raise NotImplementedError
@@ -261,9 +278,9 @@ class LatchedBoundarySet(BoundarySet):
     differentiated quantity.
     """
     fired: list                     # per decision, detached bool (B,)
-    obs_before: object              # (T,) int: decisions strictly before each row, MTM grid
-    untriggered: object             # (T, B) detached, MTM grid: value while the trigger has not fired
-    triggered: object               # (T, B) detached, MTM grid: value once it has
+    obs_before: object              # (T,) int: decisions strictly before each row, PRICER grid
+    untriggered: object             # (T, B) detached, PRICER grid: value while it has not fired
+    triggered: object               # (T, B) detached, PRICER grid: value once it has
 
     def branch_deltas(self):
         """Per decision, the deal-mtm delta with that decision forced ON and forced OFF.
@@ -276,14 +293,20 @@ class LatchedBoundarySet(BoundarySet):
 
         Forcing one decision either way and re-deriving the value from the two
         branches the pricer already evaluated re-simulates and re-prices nothing.
+
+        The selection happens on the PRICER grid and `to_mtm` is applied to the whole branch
+        profile afterwards, not to the two branches separately. Both orders agree wherever a deal
+        row is an mtm row; they differ on an INTERPOLATED row, whose reported value blends a row
+        before a decision with a row after it. Selecting first and interpolating the result
+        reproduces that blend exactly, because the deal's map is linear.
         """
         with torch.no_grad():
             # latched state after each decision, and the value that state reports
             prefix = [torch.zeros_like(self.fired[0])]
             for flag in self.fired:
                 prefix.append(prefix[-1] | flag)
-            reported = torch.where(
-                torch.stack(prefix)[self.obs_before], self.triggered, self.untriggered)
+            reported = self.to_mtm(torch.where(
+                torch.stack(prefix)[self.obs_before], self.triggered, self.untriggered))
         for k, gap in enumerate(self.gaps):
             with torch.no_grad():
                 on, off = [], []
@@ -296,7 +319,8 @@ class LatchedBoundarySet(BoundarySet):
                     on.append(run_on)
                     off.append(run_off)
                 deltas = tuple(
-                    torch.where(torch.stack(state)[self.obs_before], self.triggered, self.untriggered) - reported
+                    self.to_mtm(torch.where(torch.stack(state)[self.obs_before],
+                                            self.triggered, self.untriggered)) - reported
                     for state in (on, off))
             yield (gap,) + deltas
 
@@ -317,21 +341,46 @@ class RowBoundarySet(BoundarySet):
     the two share every state advance and neither draws a random number - which is what keeps the
     reported value where it was.
     """
-    rows: list                      # per event, int: the MTM-grid row the jump lands on
-    fired: list                     # per event, (B,) detached: that row's mtm had the trigger fired
+    rows: list                      # per event, int: the PRICER-grid row the jump lands on
+    fired: list                     # per event, (B,) detached: that row's value had it fired
     survived: list                  # per event, (B,) detached: ... had it not
-    reported: object                # (T, B) detached, MTM grid: the deal mtm as reported
+    reported: object                # (T, B) detached, PRICER grid: the value as reported
 
     def branch_deltas(self):
-        """Per decision, the deal-mtm delta with the trigger forced ON and forced OFF."""
+        """Per decision, the deal-mtm delta with the trigger forced ON and forced OFF.
+
+        The delta is built on the PRICER grid - one row, the rest zero - and mapped afterwards.
+        A row index means nothing on the MTM grid until that map has run: interpolation inserts
+        rows, so deal row i is mtm row i only until another deal contributes a date inside this
+        one's life. Mapping the DELTA rather than the row is also what spreads the jump correctly
+        over the two mtm rows an interpolated deal row sits between."""
         for gap, row, on, off in zip(self.gaps, self.rows, self.fired, self.survived):
             with torch.no_grad():
                 deltas = []
                 for branch in (on, off):
                     delta = torch.zeros_like(self.reported)
                     delta[row] = branch - self.reported[row]
-                    deltas.append(delta)
+                    deltas.append(self.to_mtm(delta))
             yield (gap,) + tuple(deltas)
+
+
+def claim_boundary_sets(shared, mark):
+    """Hand a netting set's gross-to-net chain to the registrations made beneath it.
+
+    `post_process` runs only after its children are priced, so everything the netting set is
+    answerable for is the TAIL of `boundary_sets` added since its structure was entered - which is
+    why the mark is taken there rather than here.
+
+    Only a set that PUBLISHES a chain claims. An uncollateralised netting set passes a deal's
+    value through additively and has nothing to say about it; a swaption's post_process is not a
+    netting set at all; both must leave the registration for whatever sits above them. Where an
+    inner collateralised set already stamped one, it is the closer of the two and keeps it.
+    """
+    chain = shared.__dict__.pop('gross_to_net', None)
+    if chain is not None:
+        for bset in shared.boundary_sets[mark:]:
+            if isinstance(bset, BoundarySet) and bset.net_from_gross is None:
+                bset.net_from_gross = chain
 
 
 @dataclass

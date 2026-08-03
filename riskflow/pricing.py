@@ -265,6 +265,22 @@ def interp_to_mtm_grid(mtm, shared, time_grid, deal_data, interpolate_grid=True)
         return mtm
 
 
+def deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep):
+    """The map from a pricer's own output to the MTM-grid rows the deal reports it on, detached.
+
+    Everything `Deal.generate` and `Deal.calculate` do to a theo price and nothing else: scale
+    into the reporting currency, then interpolate. A boundary branch is an alternative value for
+    the SAME deal, so it has to travel the same two steps - and both were being skipped.
+
+    `fx_rep` is `shared.one` only when the payoff and reporting currencies match; otherwise it is a
+    simulated (T, B) cross, and a branch registered without it is a delta in the wrong currency
+    whose own flux never reaches the tape. It multiplies on the pricer grid, BEFORE the
+    interpolation, because that is the order the reported mtm was built in.
+    """
+    return lambda profile: interp_to_mtm_grid(
+        profile * fx_rep, shared, time_grid, deal_data).detach()
+
+
 def interpolate(mtm, shared, time_grid, deal_data, interpolate_grid=True):
     if interpolate_grid and deal_data.Time_dep.interp.size > deal_data.Time_dep.deal_time_grid.size:
         # interpolate it
@@ -551,8 +567,8 @@ def smooth_heaviside_down(x, k, eps=0.01):
                        torch.where(x > k + eps, torch.zeros_like(x), 0.5 + (k - x) / (2.0 * eps)))
 
 
-def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
-                               tau, invert_moneyness=False, use_forwards=False, isdigital=False):
+def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b, tau, fx_rep,
+                               invert_moneyness=False, use_forwards=False, isdigital=False):
     """
     One-step survival (OSS) variant of pv_discrete_barrier_option.
 
@@ -966,15 +982,14 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         mtm_list.append(theo_cashflow)
 
     if boundary_aad and b_gaps and getattr(time_grid, 'report_index', None) is not None:
-        # Rows stay on the MTM grid, which is what the collateral chain consumes; report_index
-        # rides along so the additive route can map to the reporting grid at the point of use.
-        pad = time_grid.mtm_time_grid.size - sum(len(x) for x in b_alive)
-        alive, dead = (F.pad(torch.cat(x, dim=0), [0, 0, 0, pad]) if pad else torch.cat(x, dim=0)
-                       for x in (b_alive, b_dead))
+        # Branches stay on THIS pricer's grid and in its own currency; `to_mtm` is the deal's own
+        # map onto the MTM grid, which the collateral chain consumes. report_index rides along so
+        # the additive route can go on to the reporting grid at the point of use.
         shared.boundary_sets.append(utils.LatchedBoundarySet(
-            gaps=b_gaps, fired=b_crossed,
-            obs_before=np.array(b_obs_before + [len(b_gaps)] * pad),
-            untriggered=alive, triggered=dead, report_index=time_grid.report_index))
+            gaps=b_gaps, fired=b_crossed, obs_before=np.array(b_obs_before),
+            untriggered=torch.cat(b_alive, dim=0), triggered=torch.cat(b_dead, dim=0),
+            to_mtm=deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep),
+            report_index=time_grid.report_index))
 
     # barrier options settle once at expiry
     cash_settle(shared, factor_dep['SettleCurrency'], deal_data.Time_dep.deal_time_grid[-1], mtm_list[-1][-1])
@@ -1732,7 +1747,7 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
     return mtm
 
 
-def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
+def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness, fx_rep):
     def sim_autocall(S, isBarrierDate, isFixingDate, isFloatDate, floating, threshold, coupon, terminationDate):
         avg = 0.0
         averageCounter = 0.0
@@ -2149,14 +2164,14 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
     mtm = torch.cat(mtm_list, dim=0)
 
     if b_events and getattr(time_grid, 'report_index', None) is not None:
-        # Rows stay on the MTM grid, which is what the collateral chain consumes; report_index
-        # rides along so the additive route can map to the reporting grid at the point of use.
-        pad = time_grid.mtm_time_grid.size - mtm.shape[0]
+        # Branches stay on THIS pricer's grid and in its own currency; `to_mtm` is the deal's own
+        # map onto the MTM grid, which the collateral chain consumes. report_index rides along so
+        # the additive route can go on to the reporting grid at the point of use.
         rows, gaps, fired, survived = zip(*b_events)
         shared.boundary_sets.append(utils.RowBoundarySet(
             gaps=list(gaps), rows=list(rows),
             fired=[nominal * x for x in fired], survived=[nominal * x for x in survived],
-            reported=F.pad(mtm.detach(), [0, 0, 0, pad]) if pad else mtm.detach(),
+            reported=mtm.detach(), to_mtm=deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep),
             report_index=time_grid.report_index))
 
     return mtm
