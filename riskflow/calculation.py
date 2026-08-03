@@ -484,15 +484,17 @@ def pricer_boundary_correction(shared, objective, reported_mtm, bandwidth):
     for bset in shared.boundary_sets:
         if not isinstance(bset, utils.BoundarySet):
             continue                            # a margin call replays a balance, not an mtm delta
-        chain = bset.net_from_gross
-        for gap, on, off in bset.branch_deltas():
-            with torch.no_grad():
-                jump = [objective(chain(delta) if chain is not None
-                                  else reported_mtm + delta[bset.report_index])
-                        for delta in (on, off)]
-            # J(fired) - J(did not), matching gap > 0 meaning the trigger fired
-            corrections.append(
-                pricing.stochastic_boundary_correction(gap, jump[0] - jump[1], bandwidth))
+
+        def score(delta, chain=bset.net_from_gross, report_index=bset.report_index):
+            """A deal-mtm delta on the MTM grid -> the per-scenario objective it produces."""
+            return objective(chain(delta) if chain is not None
+                             else reported_mtm + delta[report_index])
+
+        # J(fired) - J(did not), matching gap > 0 meaning the trigger fired. How that is arrived
+        # at belongs to the set: a whole-scenario decision differences the objective across its
+        # jump, one taken inside a pricer's inner MC differentiates it.
+        for gap, jump in bset.objective_jumps(score):
+            corrections.append(pricing.stochastic_boundary_correction(gap, jump, bandwidth))
     return torch.stack(corrections).sum() if corrections else None
 
 
@@ -1664,6 +1666,13 @@ class Base_Reval_State(utils.Calculation_State):
             static_buffer, one, mcmc_sims, report_currency, nomodel, 1, False)
         self.calc_greeks = calc_greeks
         self.gamma = gamma
+        # Same contract as CMC_State: a decision taken on simulated state is recorded during the
+        # forward pass so its derivative can be restored before the reverse sweep. Base valuation
+        # has one date and one scenario, but a Monte Carlo pricer still runs a full INNER
+        # simulation underneath it - which is where a TARF's knock-in is decided - so the defect
+        # and the estimator are the same ones, only the objective is simpler.
+        self.boundary_aad = calc_greeks is not None
+        self.boundary_sets = []
 
     @staticmethod
     def save_results(output, tensors):
@@ -1749,6 +1758,10 @@ class Base_Revaluation(Calculation):
         self.time_grid = utils.TimeGrid({base_date}, {base_date}, {base_date})
         self.base_date = base_date
         self.time_grid.set_base_date(base_date)
+        # The one date IS the reporting date. Exposure calculations get this from finalize_struct;
+        # here nothing else needs it, but a boundary registration reads report_index to know the
+        # grid its counterfactual has to land on, and treats its absence as "not reportable".
+        self.time_grid.set_report_dates(base_date, {base_date})
 
     def __init_shared_mem(self, reporting_currency, mcmc_sim, calc_greeks, random_seed):
         # fix the seed if we need to price mc instruments
@@ -1877,6 +1890,15 @@ class Base_Revaluation(Calculation):
         if shared_mem.calc_greeks is not None:
             # record the cuda execution stats
             self.calc_stats['Greek_Execution_Time'] = time.monotonic()
+            if shared_mem.boundary_sets:
+                # The portfolio value IS the objective, so the per-scenario vector is the value
+                # itself - one scenario, whose mean is the reported number. Worth exactly zero in
+                # the forward pass, so `mtm` here is untouched and only the tape gains a term.
+                correction = pricer_boundary_correction(
+                    shared_mem, lambda value: value.sum(axis=0), mtm,
+                    float(params.get('Boundary_AAD_Bandwidth', 0.01)))
+                if correction is not None:
+                    mtm = mtm + correction
             pricing.greeks(shared_mem, ns_obj, mtm)
             self.calc_stats['Greek_Execution_Time'] = time.monotonic() - self.calc_stats['Greek_Execution_Time']
 

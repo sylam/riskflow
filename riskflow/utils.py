@@ -252,6 +252,28 @@ class BoundarySet:
     def branch_deltas(self):
         raise NotImplementedError
 
+    def objective_jumps(self, score):
+        """Per decision, the gap and the change in the OBJECTIVE that decision produces.
+
+        `score` maps an MTM-grid deal-mtm delta to the per-scenario objective of the counterfactual
+        - the netting arithmetic, the collateral chain where there is one, the CVA or FVA
+        reduction. What a set owes it is the deal's own half: which alternative values the decision
+        chooses between, and where on the grid they land.
+
+        This default is the WHOLE-SCENARIO form the two `branch_deltas` shapes share. The decision
+        moves one scenario's reported value by a FINITE amount, so the objective's response to it
+        is a difference across that amount, and nothing smaller would be the right question.
+
+        The yield is OUTSIDE the no_grad block on purpose. `no_grad` is a thread-local flag, and a
+        generator suspended inside one leaves it set in whoever resumes it - so yielding from in
+        there would hand the caller a gap whose `gap - gap.detach()` carries no graph, and the
+        correction would silently become the zero it is already worth in the forward pass.
+        """
+        for gap, on, off in self.branch_deltas():
+            with torch.no_grad():
+                jump = score(on) - score(off)
+            yield gap, jump
+
 
 @dataclass
 class LatchedBoundarySet(BoundarySet):
@@ -362,6 +384,55 @@ class RowBoundarySet(BoundarySet):
                     delta[row] = branch - self.reported[row]
                     deltas.append(self.to_mtm(delta))
             yield (gap,) + tuple(deltas)
+
+
+@dataclass
+class InnerBoundarySet(BoundarySet):
+    """Triggers taken INSIDE a pricer's own Monte Carlo - one decision per inner path.
+
+    A TARF's knock-in is read off `Sj`, a draw of the pricer's inner simulation, so the decision is
+    per (scenario, inner path) and the reported row is the MEAN over those paths. That is what
+    makes this a third shape rather than a variant of the other two, and the reason is worth being
+    precise about, because getting it wrong still converges.
+
+    The other two move ONE SCENARIO's reported value by a finite amount - a knocked-out barrier IS
+    worth nothing - and a finite difference of the objective across that amount is exactly right.
+    An inner path moves the reported row by 1/n of itself. The objective's response to a
+    perturbation that small is its DERIVATIVE; a difference taken over a jump the reported value
+    never takes measures the objective's curvature instead, and CVA's `relu` has plenty of it.
+
+    So a set of this shape carries the per-inner-path jump and lets the estimator supply the rest:
+    `objective_jumps` differentiates `score` ONCE at the reported value and multiplies. The jump is
+    the UNDIVIDED change to the row's own accumulator, not the 1/n change to its mean, because the
+    kernel's density already divides by the pooled sample size B*n - which is also why the gaps go
+    in as one (B, n) tensor rather than n separate decisions: they are n draws of ONE decision
+    variable, and pooling them is what makes the local-linear fit resolvable at all.
+
+    Requires the objective to be SEPARABLE per scenario, which every exposure measure here is: the
+    sensitivity is read off a single backward pass over `score(...).sum()`, and that is the
+    per-scenario derivative only because scenario b's objective depends on column b alone.
+    """
+    rows: list                      # per event, int: the PRICER-grid row the jump lands on
+    jumps: list                     # per event, (B, n_inner) detached: the change in that row's
+                                    # own accumulator if THAT inner path's trigger flips,
+                                    # J(fired) - J(did not), undivided by n
+    reported: object                # (T, B) detached, PRICER grid: the value as reported
+
+    def objective_jumps(self, score):
+        for gap, row, jump in zip(self.gaps, self.rows, self.jumps):
+            with torch.enable_grad():
+                # d(objective)/d(this pricer row), by the chain rule through the deal's own map.
+                # The map is linear, so the image of a unit row IS its column of the Jacobian, and
+                # one backward pass through `score` supplies the other half. No bump, nothing
+                # re-priced, and no random number drawn.
+                unit = torch.zeros_like(self.reported)
+                unit[row] = 1.0
+                weight = self.to_mtm(unit)
+                probe = torch.zeros_like(weight).requires_grad_(True)
+                sensitivity, = torch.autograd.grad(score(probe).sum(), probe)
+            # outside the block: `enable_grad` is thread-local too, and a generator suspended
+            # inside one hands the caller a context it never asked for
+            yield gap, (sensitivity * weight).sum(dim=0).unsqueeze(1) * jump
 
 
 def claim_boundary_sets(shared, mark):

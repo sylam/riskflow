@@ -95,7 +95,14 @@ def boundary_weights(gap, bandwidth):
     multiplies rather than averages.
     """
     g = gap.detach()
-    width = bandwidth * g.std().clamp_min(torch.finfo(g.dtype).eps)
+    # ONE sample has no spread for a kernel to be scaled by, and torch.std returns NaN there rather
+    # than raising - which propagates into the scalar handed to backward() and is invisible while
+    # the degenerate gap happens to carry no graph (0 * NaN is NaN forward but reaches nothing).
+    # Zero width is the right degenerate answer: the kernel admits nothing, the local-linear solve
+    # is refused, and the correction is exactly zero - which is what one scenario means here.
+    # Reached by base valuation, whose whole simulation is the pricer's own inner Monte Carlo.
+    spread = g.std() if g.numel() > 1 else torch.zeros_like(g.reshape(-1)[:1].squeeze())
+    width = bandwidth * spread.clamp_min(torch.finfo(g.dtype).eps)
     k = torch.exp(-0.5 * (g / width) ** 2)
     s0, s1, s2 = k.sum(), (k * g).sum(), (k * g * g).sum()
     # degenerate when almost nothing sits near the boundary; the density is then ~0 anyway, and
@@ -1439,7 +1446,7 @@ def pv_european_option(shared, time_grid, deal_data, nominal, moneyness, forward
     return value * discount_rates
 
 
-def pv_MC_Tarf(shared, time_grid, deal_data, spot):
+def pv_MC_Tarf(shared, time_grid, deal_data, spot, fx_rep):
     """
     One-step survival Monte Carlo for TARF (autograd-friendly).
     - Analytic KO-in-step: adds (1 - p_survive) * remaining_target at each fixing
@@ -1461,12 +1468,15 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
     """
 
     # --- Accumulated target from past observed fixings --------------------------
-    def calc_accum_value(targetValue, accumulated, s, k, C, inverted):
+    def accrued(s, k, C, inverted):
         if inverted:
             iv = (1.0 / s - 1.0 / k) * C * (-1.0)
         else:
             iv = (s - k) * C
-        return (accumulated + F.relu(iv).reshape(-1,1)).clamp(max=targetValue)
+        return F.relu(iv).reshape(-1, 1)
+
+    def calc_accum_value(targetValue, accumulated, s, k, C, inverted):
+        return (accumulated + accrued(s, k, C, inverted)).clamp(max=targetValue)
 
     def bs_call_put_fwd(F, K, sdt, D):
         """
@@ -1526,7 +1536,16 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
             remaining_target = targetValue-prev_accum
             # which simulations are still alive?
             q = remaining_target == 0.0
-            # update the Live matrix
+            # The TARF has redeemed on a path whose accrual has reached the target, so the jump to
+            # zero is real product economics - but `q` is an exact float equality that fires on a
+            # POSITIVE-MEASURE set (calc_accum_value clamps AT targetValue), so it is a knock-out
+            # decision like any other and ordinary AAD drops its flux. The counterfactual is the
+            # SAME loop on a weight that was never zeroed: the weight feeds nothing back into the
+            # spot, the truncation or the remaining target, so one extra accumulator answers "had
+            # it not quite filled" exactly, with no re-simulation and no random number drawn.
+            # It IS the left limit: everything the remaining target enters is continuous at 0.
+            L_alive = L if not boundary_aad else torch.ones_like(L)
+            P_alive = P
             L = torch.where(q, torch.zeros_like(L), L)
             # Update the remaining targets
             R = (remaining_target * factor_dep['Notional1']).expand_as(P)
@@ -1600,6 +1619,8 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                     # ---- Analytic KO-in-step contribution -------------------------------------
                     # KO pays the *remaining target* this step, discounted at the j-th discount point
                     P = P + (1.0 - p) * L * R * Dj
+                    if boundary_aad:
+                        P_alive = P_alive + (1.0 - p) * L_alive * R * Dj
                     if hn:
                         # HN increment + h-recursion on the truncated final draw (shared advance;
                         # leverage-asymmetric because Z is survival-truncated - see hn_daily_advance)
@@ -1631,11 +1652,36 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                 cf_step = L * p * (cf_itm - cf_otm)  # signed
                 # add discounted PV to P
                 P = P + Dj * cf_step
+                if boundary_aad:
+                    P_alive = P_alive + Dj * L_alive * p * (cf_itm - cf_otm)
+                    if barrier > 0.0:
+                        # The knock-in is decided by Sj, a draw of THIS pricer's inner simulation,
+                        # so it is one decision per inner path and the jump it carries is the OTM
+                        # leg switching on for that path alone: J(knocked in) - J(did not) is
+                        # -Dj * L * p * relu(-intr) * N_otm, everything else being shared. Signed
+                        # so gap > 0 means KNOCKED IN, and taken in log space so a bandwidth means
+                        # the same thing here as at a barrier observation.
+                        #
+                        # At a fixing this row has ALREADY OBSERVED (dt <= 0) Sj is a past reset
+                        # rather than an inner draw, so the decision is one per SCENARIO and the
+                        # gap is constant along the inner axis - which `expand_as` says explicitly.
+                        # That is not an approximation: the pooled kernel over B*n samples of which
+                        # only B are distinct reproduces the whole-scenario estimator exactly,
+                        # because the 1/n in the weights cancels the n copies of each jump. Under
+                        # CMC every fixing date IS a reporting row (a deal's own dates are folded
+                        # into the grid), so skipping this case leaves one decision per fixing
+                        # unregistered - measured at 5.50% of the CVA delta on the fixture below.
+                        jump = (-buy_sell * Dj * L * p * F.relu(-intr) * N_otm).detach()
+                        b_inner.append([
+                            row_ofs + len(mcmc),
+                            (callOrPut * torch.log(barrier / Sj)).expand_as(jump), jump])
                 # ---- Update remaining target R on survivors ------------------------------
                 accr = cf_itm  # = F.relu(intr) * N_itm, correct for both standard and inverted
                 R = torch.where(itm_mask, R - accr, R)  # survival construction ensures no overshoot
                 # ---- Update survival weight ----------------------------------------------
                 L = p * L
+                if boundary_aad:
+                    L_alive = p * L_alive
                 # (Optional) settlement at tau==0
                 if j == 0 and tau[0]==0:
                     cash_settle(
@@ -1644,6 +1690,8 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
                         cf_step.mean(axis=1))
             # End-of-block: push mean PV over sims
             mcmc.append(P.mean(axis=1))
+            if boundary_aad:
+                alive.append(P_alive.mean(axis=1))
 
         return torch.stack(mcmc)
 
@@ -1685,6 +1733,14 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
     strike = factor_dep['Strike_Price']
     invertedTarget = deal_data.Instrument.field['InvertedTarget']
     callOrPut = factor_dep['Option_Type']
+    buy_sell = factor_dep['Buy_Sell']
+
+    # Two decisions in here are taken on simulated state and jump: the target filling (the deal has
+    # redeemed and is worth nothing thereafter) and the OTM leg knocking in. Both jumps are real
+    # product economics, so neither may be smoothed; what ordinary AAD drops is the flux of paths
+    # across them. Recording costs nothing when sensitivities are not wanted, hence the gate.
+    boundary_aad = getattr(shared, 'boundary_aad', False)
+    b_gaps, b_fired, b_obs_before, b_inner, alive, row_ofs = [], [], [], [], [], 0
 
     # opt-in Heston-Nandi spot model: the (Omega, Alpha, Beta, Gamma_Star, H0) scalars ride the AAD
     # graph out of t_Static_Buffer, unpacked exactly like the SVI wing params (utils.py:2052). When
@@ -1708,6 +1764,17 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
     for sample_val in next_samples:
         accumulation.append(calc_accum_value(
             targetValue, accumulation[-1], sample_val, strike, callOrPut, invertedTarget))
+
+    # The UNCLAMPED accrual, which is the same series with the min taken off: every step's clamp is
+    # at targetValue and the increments are non-negative, so accumulation[k] == min(raw[k], target)
+    # exactly. The clamp is also what kills the derivative AT the decision - past it the reported
+    # accrual is a constant - so a gap built from `accumulation` would carry no graph on the very
+    # paths that made the decision. raw[k] - target is the same test, signed the same way, and it
+    # carries every factor that moved the fixings there.
+    if boundary_aad:
+        raw = [acc]
+        for sample_val in next_samples:
+            raw.append(raw[-1] + accrued(sample_val, strike, callOrPut, invertedTarget))
 
     sobol = False
     # use a quasi random generator if we are simulating a large batch
@@ -1736,14 +1803,51 @@ def pv_MC_Tarf(shared, time_grid, deal_data, spot):
             np.hstack([fixing_block[:, 0, np.newaxis], np.diff(fixing_block, axis=1)]))
         discount_rates = utils.calc_discount_rate(discount_block, settlement, shared)
 
-        theo_price = factor_dep['Buy_Sell'] * sim_spot_tarf(
+        theo_price = buy_sell * sim_spot_tarf(
             spot_block, sample_ts, drifts, accumulation[settle_index_local], discount_rates,
             t_block, fixing_block, settlement, sobol=sobol, num_sims=shared.MCMC_sims)
 
+        if boundary_aad:
+            # One redemption decision per block: `q` is read off this block's accrual, so it is
+            # the same test for every row the block covers, and a later block's accrual can only
+            # be larger - the flags latch, which is what makes this the LATCHED shape.
+            #
+            # `expand` because block 0's accrual is the HISTORIC one, a single number rather than a
+            # per-scenario tensor. That decision is registered like any other rather than skipped:
+            # it carries no graph, so the local-linear fit degenerates and it contributes exactly
+            # zero, while skipping it would leave the latch reconstruction wrong on a deal whose
+            # target had already filled before the base date.
+            # In target units, and deliberately not rescaled to be dimensionless the way a barrier
+            # gap is: `boundary_weights` sets its kernel width to bandwidth * gap.std(), so the
+            # whole estimator is invariant to the gap's scale. Measured - dividing through by the
+            # target left every digit of the correction unchanged.
+            b_gaps.append((raw[settle_index_local] - targetValue).squeeze(dim=1).expand(
+                shared.simulation_batch))
+            b_fired.append((targetValue - accumulation[settle_index_local] == 0.0).squeeze(
+                dim=1).expand(shared.simulation_batch).detach())
+            b_obs_before.extend([len(b_gaps)] * theo_price.shape[0])
+        row_ofs += theo_price.shape[0]
         mtm_list.append(theo_price)
 
     # Reporting currency MTM
     mtm = torch.cat(mtm_list, dim=0)
+
+    if boundary_aad and getattr(time_grid, 'report_index', None) is not None:
+        to_mtm = deal_to_mtm_grid(shared, time_grid, deal_data, fx_rep)
+        if b_gaps:
+            # Redemption: `triggered` is worth zero for every row the decision reaches, and
+            # `untriggered` is the SAME loop run on a weight that was never zeroed.
+            untriggered = buy_sell * torch.stack(alive, dim=0).detach()
+            shared.boundary_sets.append(utils.LatchedBoundarySet(
+                gaps=b_gaps, fired=b_fired, obs_before=np.array(b_obs_before),
+                untriggered=untriggered, triggered=torch.zeros_like(untriggered),
+                to_mtm=to_mtm, report_index=time_grid.report_index))
+        if b_inner:
+            rows, gaps, jumps = zip(*b_inner)
+            shared.boundary_sets.append(utils.InnerBoundarySet(
+                gaps=list(gaps), rows=list(rows), jumps=list(jumps), reported=mtm.detach(),
+                to_mtm=to_mtm, report_index=time_grid.report_index))
+
     return mtm
 
 

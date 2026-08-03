@@ -416,21 +416,22 @@ def test_discrete_barrier_latch_gradient_matches_bump_and_reprice():
     assert r.agrees(tol=0.05), f'{r}'
 
 
-@pytest.mark.xfail(strict=True, reason='route is BUILT and converging - AAD +0.000904 vs CRN '
-                                       '+0.000963, flatness 5.25% - but 6.48% at the path count '
-                                       'this GPU allows, against a 5% bar. Not loosened to pass: '
-                                       'confirm at higher paths, do not tune the tolerance')
 def test_collateralised_barrier_latch_gradient_matches_bump_and_reprice():
     """The same defect with collateral in the way, which is the harder half: a gross-mtm delta
     reaches the net through Vte AND through the balance the collateral scan produces, so a fix
     that only handles the additive path will pass the test above and fail this one - which is
     exactly what happened, and what sent the gross-to-net chain into post_process.
 
-    It now runs that chain and converges (flatness 5.25%), landing 6.48% from the oracle where the
-    bar is 5%. The exposure here is almost entirely collateralised away, so the number is ~16x
-    smaller than the uncollateralised one and correspondingly noisier, and this GPU will not hold
-    enough paths to separate residual bias from Monte Carlo error. Left failing deliberately: a
-    tolerance widened until a test passes measures nothing."""
+    This was an xfail at 6.48%, blamed on path count. It was not path count. A COLLATERALISED
+    netting set puts its own margin-call schedule on the mtm grid - measured here, 86 mtm rows
+    against the barrier's own 51, with 81 interpolated - so this is the fixture in the repo where
+    the branch profile was WORST mis-mapped, and the uncollateralised one above (17 rows, 17 deal
+    rows, no interpolation) could not see it. Putting the branches through the deal's own grid map
+    moved the AAD from +0.000904075 to +0.000941522 against an unchanged oracle of +0.000962679:
+    6.48% to 2.25%, on a ladder whose three CRN readings are bit-identical between the two runs.
+
+    Still the noisiest of these gates - the exposure is almost entirely collateralised away, so the
+    number is ~16x smaller than the uncollateralised one and the ladder's flatness is 5.25%."""
     kw = dict(batch=1024, mcmc=256, collateralised=True)
     aad = _run(DISCRETE_BARRIER, gradient=True, **kw)[2]
     r = ladder(price=lambda s: _run(DISCRETE_BARRIER, spot=s, **kw)[1],

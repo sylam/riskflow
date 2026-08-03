@@ -4663,7 +4663,7 @@ class FXTARFOptionDeal(Deal):
             deal_data.Factor_dep['Currency'][0], deal_time, shared)
 
         mtm = pricing.pv_MC_Tarf(
-            shared, time_grid, deal_data, spot) * FX_rep
+            shared, time_grid, deal_data, spot, FX_rep) * FX_rep
 
         return mtm
 

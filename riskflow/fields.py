@@ -725,10 +725,14 @@ mapping = {
                                  'Index_Publication_Calendars', 'Payment_Interval', 'Reset_Frequency', 'Amortisation',
                                  'Discount_Rate_Volatility', 'Currency', 'Forecast_Rate_Volatility', 'Index_Offset',
                                  'Principal'],
+            # Barrier (the OTM leg's knock-in) is read with a hard key by pricing.pv_MC_Tarf, so a
+            # deal authored to this schema could never switch the leg on - it worked only because
+            # instruments.py:440 keeps the whole params dict unfiltered. Same defect and same fix
+            # as Barrier_Price on EquityBarrierBinaryOption below; the widget already existed.
             'FXTARFOptionDeal.Fields': ['Currency', 'Underlying_Currency', 'Discount_Rate', 'Buy_Sell', 'Expiry_Date',
                                         'Underlying_Amount', 'Option_Type', 'Strike_Price', 'Settlement_Style',
                                         'Option_Style', 'FX_Volatility', 'InvertedTarget', 'LeverageNotional',
-                                        'TargetAdjustment', 'TargetLevel', 'TARF_ExpiryDates'],
+                                        'TargetAdjustment', 'TargetLevel', 'TARF_ExpiryDates', 'Barrier'],
             'FXOptionDeal.Fields': ['Underlying_Amount', 'Settlement_Style', 'Strike_Price', 'Underlying_Currency',
                                     'Buy_Sell', 'Option_Type', 'Option_Style', 'Expiry_Date', 'FX_Volatility',
                                     'Forward_Price_Date', 'Discount_Rate', 'Option_On_Forward', 'Currency'],
