@@ -483,7 +483,7 @@ def pricer_boundary_correction(shared, objective, reported_mtm, bandwidth):
         return None
     corrections = []
     for bset in shared.boundary_sets:
-        if not hasattr(bset, 'branch_deltas'):
+        if not isinstance(bset, utils.BoundarySet):
             continue                            # a margin call replays a balance, not an mtm delta
         for gap, on, off in bset.branch_deltas():
             with torch.no_grad():

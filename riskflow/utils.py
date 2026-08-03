@@ -209,7 +209,35 @@ class MTABoundarySet:
 
 
 @dataclass
-class PricerBoundarySet:
+class BoundarySet:
+    """One deal's decisions taken on SIMULATED state, and what a counterfactual needs of them.
+
+    The value jump at such a decision is real - a knocked-out deal IS worth nothing, an exercised
+    swaption DOES hold the swap - so the estimate is not what is wrong. What ordinary AAD drops is
+    the FLUX: as a factor moves, scenarios cross the trigger, and the indicator recording it has
+    zero derivative almost everywhere.
+
+    Subclasses differ in ONE thing: how far a decision reaches. A latched one is read by every
+    later row; a row-local one lands on its own row and no other. That is the whole reason there
+    are two, and it is why they cannot share a field layout - the latch shares two whole-profile
+    branches across all its decisions, while a row-local one carries a pair of values per decision.
+
+    What they DO share is the contract this base declares: `branch_deltas` yields, per decision,
+    the gap (graph retained, signed so gap > 0 means the trigger FIRED) and the deal-mtm delta with
+    that decision forced ON and forced OFF. Both branches, for EVERY scenario - near the boundary
+    the scenarios that did not fire are exactly as numerous as those that did, and scoring the
+    former as a zero jump halves the conditional expectation.
+    """
+    gaps: list                      # per decision, tensors, graph retained
+    report_index: object            # MTM grid -> report grid, for the additive (uncollateralised)
+                                    # route; the collateral chain wants the MTM grid untouched
+
+    def branch_deltas(self):
+        raise NotImplementedError
+
+
+@dataclass
+class LatchedBoundarySet(BoundarySet):
     """One deal's LATCHING decisions taken on simulated state, and what a counterfactual needs.
 
     Two pricers register this shape and they are the same defect. A discretely monitored barrier
@@ -232,13 +260,10 @@ class PricerBoundarySet:
     Everything else is DETACHED: it seeds a counterfactual whose result is a coefficient, not a
     differentiated quantity.
     """
-    gaps: list                      # per decision, tensors, graph retained
     fired: list                     # per decision, detached bool (B,)
     obs_before: object              # (T,) int: decisions strictly before each row, MTM grid
     untriggered: object             # (T, B) detached, MTM grid: value while the trigger has not fired
     triggered: object               # (T, B) detached, MTM grid: value once it has
-    report_index: object            # MTM grid -> report grid, for the additive (uncollateralised)
-                                    # route; the collateral chain wants the MTM grid untouched
 
     def branch_deltas(self):
         """Per decision, the deal-mtm delta with that decision forced ON and forced OFF.
@@ -277,7 +302,7 @@ class PricerBoundarySet:
 
 
 @dataclass
-class EventBoundarySet:
+class RowBoundarySet(BoundarySet):
     """Triggers a pricer read off the REPORTING ROW's own state, and both values they choose between.
 
     An autocall observed on its coupon date is decided by the scenario spot itself - not by an
@@ -292,12 +317,10 @@ class EventBoundarySet:
     the two share every state advance and neither draws a random number - which is what keeps the
     reported value where it was.
     """
-    gaps: list                      # per event, (B,) tensor, graph retained; gap > 0 means FIRED
     rows: list                      # per event, int: the MTM-grid row the jump lands on
     fired: list                     # per event, (B,) detached: that row's mtm had the trigger fired
     survived: list                  # per event, (B,) detached: ... had it not
     reported: object                # (T, B) detached, MTM grid: the deal mtm as reported
-    report_index: object            # MTM grid -> report grid, as for BarrierBoundarySet
 
     def branch_deltas(self):
         """Per decision, the deal-mtm delta with the trigger forced ON and forced OFF."""

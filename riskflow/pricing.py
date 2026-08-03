@@ -962,7 +962,7 @@ def pv_discrete_barrier_option(shared, time_grid, deal_data, spot, b,
         pad = time_grid.mtm_time_grid.size - sum(len(x) for x in b_alive)
         alive, dead = (F.pad(torch.cat(x, dim=0), [0, 0, 0, pad]) if pad else torch.cat(x, dim=0)
                        for x in (b_alive, b_dead))
-        shared.boundary_sets.append(utils.PricerBoundarySet(
+        shared.boundary_sets.append(utils.LatchedBoundarySet(
             gaps=b_gaps, fired=b_crossed,
             obs_before=np.array(b_obs_before + [len(b_gaps)] * pad),
             untriggered=alive, triggered=dead, report_index=time_grid.report_index))
@@ -2136,7 +2136,7 @@ def pv_MC_AutoCallSwap(shared, time_grid, deal_data, spot, moneyness):
         # rides along so the additive route can map to the reporting grid at the point of use.
         pad = time_grid.mtm_time_grid.size - mtm.shape[0]
         rows, gaps, fired, survived = zip(*b_events)
-        shared.boundary_sets.append(utils.EventBoundarySet(
+        shared.boundary_sets.append(utils.RowBoundarySet(
             gaps=list(gaps), rows=list(rows),
             fired=[nominal * x for x in fired], survived=[nominal * x for x in survived],
             reported=F.pad(mtm.detach(), [0, 0, 0, pad]) if pad else mtm.detach(),

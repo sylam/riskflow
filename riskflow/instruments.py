@@ -2740,7 +2740,7 @@ class SwaptionDeal(Deal):
                 shared, time_grid, deal_data).detach()
 
         triggered = to_mtm_grid(swap)
-        shared.boundary_sets.append(utils.PricerBoundarySet(
+        shared.boundary_sets.append(utils.LatchedBoundarySet(
             gaps=[gap], fired=[exercised.detach()],
             obs_before=np.ones(triggered.shape[0], dtype=np.int64),
             triggered=triggered, untriggered=to_mtm_grid(torch.zeros_like(swap)),
