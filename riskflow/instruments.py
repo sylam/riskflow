@@ -1204,8 +1204,11 @@ class NettingCollateralSet(Deal):
             fx_base_local = fx_base
 
             if self.options['Exclude_Paid_Today']:
+                # each leg differenced against ITSELF - the paid increment was being taken against
+                # the RECEIVED cumulative, which is not an increment of anything and flips the sign
+                # on every row where a payment lands. The Te-grid twin below has always been right.
                 mtm_today_adj = torch.cat([Cf_Rec[0].reshape(1, -1), Cf_Rec[1:] - Cf_Rec[:-1]], dim=0) - \
-                                torch.cat([Cf_Pay[0].reshape(1, -1), Cf_Pay[1:] - Cf_Rec[:-1]], dim=0)
+                                torch.cat([Cf_Pay[0].reshape(1, -1), Cf_Pay[1:] - Cf_Pay[:-1]], dim=0)
                 Vt -= mtm_today_adj
 
             At = factor_dep['Independent_Amount'] * fx_agreement + (Vt - H) * (Vt > H) + (Vt - G) * (Vt < G)
