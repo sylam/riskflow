@@ -2381,6 +2381,18 @@ def spot_on_deal_grid(spot, deal_time, shared):
         len(deal_time), shared.simulation_batch)
 
 
+def bridge_interval_variance(shared, factor_dep, deal_time):
+    """Per-row SIMULATION log-variance spanning each step of a deal's own time axis, for the bridge.
+
+    Elapsed time comes off the DEAL's axis: its dates need not be adjacent, or even start, on the
+    scenario grid the rate was published against. The leading zero leaves the first date observing
+    endpoints, as it must, and a factor with no published rate leaves every date so.
+    """
+    rate = getattr(shared, 't_Bridge_Variance_Rate', {}).get(factor_dep.get('Barrier_Underlying'))
+    days = deal_time[:, TIME_GRID_MTM]
+    return (rate or 0.0) / DAYS_IN_YEAR * np.diff(days, prepend=days[0])
+
+
 def barrier_touched(prev_touched, prev_spot, s_t, barrier, variance, up):
     """Running PROBABILITY that the path has touched ``barrier`` at or before now.
 

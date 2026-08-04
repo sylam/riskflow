@@ -1063,12 +1063,7 @@ def pv_barrier_option(shared, time_grid, deal_data, nominal, spot, b,
     # as still alive. `touched` already WEIGHTS both branches below, so it carries a probability
     # with no further change - which is what makes the deal value the correct expectation instead
     # of one draw, and what makes it differentiable where an indicator was not.
-    # Elapsed time comes off the deal's OWN axis: its dates need not be adjacent, or even start,
-    # on the scenario grid the rate was published against. The leading zero leaves the first date
-    # observing endpoints, as it must, and a factor with no published rate leaves every date so.
-    variance_rate = getattr(shared, 't_Bridge_Variance_Rate', {}).get(factor_dep.get('Barrier_Underlying'))
-    days = deal_time[:, utils.TIME_GRID_MTM]
-    interval_variance = (variance_rate or 0.0) / utils.DAYS_IN_YEAR * np.diff(days, prepend=days[0])
+    interval_variance = utils.bridge_interval_variance(shared, factor_dep, deal_time)
     prev_spot = None
 
     for index, (raw_sig, exp, b_t, r_t, s_t, f_t, cash_index) in enumerate(zip(
@@ -1171,12 +1166,7 @@ def pv_one_touch_option(shared, time_grid, deal_data, nominal, spot, b,
     eta_scale = 0.7071067811865476 * eta
     # Same continuous-vs-observed mismatch as pv_barrier_option, but this payoff pays ON touch,
     # so missing a crossing UNDERSTATES it rather than overstating survival.
-    # Elapsed time comes off the deal's OWN axis: its dates need not be adjacent, or even start,
-    # on the scenario grid the rate was published against. The leading zero leaves the first date
-    # observing endpoints, as it must, and a factor with no published rate leaves every date so.
-    variance_rate = getattr(shared, 't_Bridge_Variance_Rate', {}).get(factor_dep.get('Barrier_Underlying'))
-    days = deal_time[:, utils.TIME_GRID_MTM]
-    interval_variance = (variance_rate or 0.0) / utils.DAYS_IN_YEAR * np.diff(days, prepend=days[0])
+    interval_variance = utils.bridge_interval_variance(shared, factor_dep, deal_time)
     prev_spot = None
 
     for index, (raw_sig, exp, b_t, r_t, s_t, cash_index) in enumerate(zip(
