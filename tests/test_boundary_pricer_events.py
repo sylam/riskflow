@@ -744,35 +744,46 @@ def test_a_zero_gross_delta_reproduces_the_reported_net(exclude_paid_today):
         f'so every correction against it is mis-sized')
 
 
-@pytest.mark.xfail(strict=True, reason='UNEXPLAINED: AAD +6.96948e-06 vs CRN +7.78252e-06, 11.67% '
-                                       'at 0.87% flatness - the oracle resolves it, so this is a '
-                                       'real residual on a two-set portfolio with a LIVE exposure '
-                                       'and a binding MTA. Not diagnosed; do not merge past it '
-                                       'without an explanation.')
+LONG_ADDING_EXPOSURE = dict(DOMINATING_SHORT, Reference='LONG1', Buy_Sell='Buy', Units=50.0,
+                            Forward_Price=50.0)
+
+
 def test_two_netting_sets_with_a_live_exposure_agree_with_bump_and_reprice():
     """The companion to the zero-CVA gate above, and the reason it needs one.
 
     That gate builds a portfolio out of the money in EVERY scenario, so its CVA is exactly zero and
-    any sensitivity must be too - which is elegant, needs no tolerance, and catches the mis-scoping
-    it was written for. But it only catches that DIRECTION: mutating `portfolio_delta` to add the
-    set's LEVEL to the portfolio rather than its CHANGE leaves the portfolio still <= 0, so the relu
-    still returns zero and the mutant SURVIVES. Verified - it did.
+    any sensitivity must be too - elegant, no tolerance, and it catches the mis-scoping it was
+    written for. But only that DIRECTION: mutating `portfolio_delta` to add the set's LEVEL rather
+    than its CHANGE leaves the portfolio still <= 0, the relu still returns zero, and the mutant
+    SURVIVES the whole suite. Verified - it did.
 
-    So here the short is small enough that the portfolio is IN the money and the CVA is non-zero.
-    Now any mis-scoping moves a real number, and the oracle can say so.
-    """
-    small_short = dict(DOMINATING_SHORT, Units=0.1)
+    So the second set here ADDS exposure instead of cancelling it, putting the portfolio
+    comfortably in the money where a wrong delta has to move a real number.
 
-    def build(c):
-        return _collateralised_barrier(c) + [
-            {'Instrument': construct_instrument(
-                dict(NETTING, Reference='NS_SHORT', Collateralized='False'), {}),
-             'Children': [{'Instrument': construct_instrument(small_short, {})}]}]
-
-    kw = dict(batch=1024, mcmc=192, children=build)
+    Sizing it the other way does not work, and the failure is worth recording. A collateralised set
+    with a BINDING MTA has near-zero exposure by design - that is what collateral is - so shrinking
+    the offsetting short until the CVA is merely positive parks the portfolio ON the relu boundary,
+    where the gradient is a difference of cancelling terms and NEITHER estimator resolves it: the
+    AAD read +1.44e-05, +6.97e-06 and -5.77e-05 across path counts, changing SIGN, while the CRN
+    ladder stayed flat enough (0.87%) to look trustworthy. Flatness measures the ORACLE's spread
+    only; it says nothing about the AAD's own noise, which is why a flat ladder beside an unstable
+    AAD is not evidence of a residual."""
+    kw = dict(batch=1024, mcmc=128, children=lambda c: _collateralised_barrier(c) + [
+        {'Instrument': construct_instrument(
+            dict(NETTING, Reference='NS_LONG', Collateralized='False'), {}),
+         'Children': [{'Instrument': construct_instrument(LONG_ADDING_EXPOSURE, {})}]}])
     cva = _run(DISCRETE_BARRIER, **kw)[1]
-    assert cva > 0.0, 'the portfolio must be IN the money or this measures nothing'
+    assert cva > 0.5, f'the portfolio must be COMFORTABLY in the money; cva={cva:.4f}'
     aad = _run(DISCRETE_BARRIER, gradient=True, **kw)[2]
     r = ladder(price=lambda s: _run(DISCRETE_BARRIER, spot=s, **kw)[1], aad=aad, base=bb.SPOT,
                rungs=(5e-4, 1e-3, 2e-3))
     assert r.agrees(tol=0.05), f'two netting sets, live exposure - scoping is wrong\n{r}'
+
+    # HONEST LIMIT, stated so nobody mistakes this for a mutation-level gate on the scoping. Both
+    # this and the zero-CVA gate above measure the END-TO-END gradient, and the boundary term is a
+    # small fraction of it - dCVA/dSpot is ~1.19 here - so scoring the correction at the set rather
+    # than the portfolio moves the total by well under this tolerance and the mutant SURVIVES both.
+    # The scoping itself is verified by measuring THAT TERM directly against a CRN ladder on a
+    # two-set portfolio (mis-scoped -15.3%, fixed +1.3%), which is what 0a6ee69's message records.
+    # A gate that isolates it needs a portfolio where the correction DOMINATES the smooth
+    # sensitivity, which is not a portfolio anyone runs.
