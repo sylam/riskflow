@@ -41,6 +41,15 @@ engine_version, seed)` making every reported number replayable. Sequencing undec
 Accounting) with `_UTILITY_OBJECTS` duplicated — the shape [Conventions](conventions.md) calls a
 class waiting to happen. `DealStructure`'s recursions are in the same category.
 
+## Tidy-ups
+
+**Inline comment density.** The boundary-correction work left ~12 inline blocks of 4-11 comment
+lines, several outweighing the code beneath them. House style is detailed docstrings, 2-3 lines
+maximum inline, and never more comments than code. The material is right - the reasoning, the trap,
+the measurement - it just belongs in the function's docstring or the commit message. Worst
+offenders: `pv_discrete_barrier_option`'s hit-mask and rebate blocks, `sim_spot_oss`'s terminal
+digital, `NettingCollateralSet.post_process`'s `net_from_gross`.
+
 ## Model punchlist
 
 `GARCHSpotModel` and the Heston-Nandi stack are built end to end; what remains is narrow:
