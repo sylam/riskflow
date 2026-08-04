@@ -9,7 +9,10 @@ GPU's via [CUDA](https://developer.nvidia.com/cuda-zone).
 * Fast prototyping and interactive scripting of new instruments in Python
 * Theoretical documentation for the pricing and simulation of financial derivatives
 * Monte Carlo simulation of a portfolio of trades through time allowing fast $XVA$ calculations
-* Automatic Derivatives for sensitivities calculation via pytorch
+* Automatic Derivatives for sensitivities calculation via pytorch, including the boundary terms a
+  path-dependent decision contributes - a barrier crossing or an autocall trigger moves the value
+  discontinuously, and the flux of scenarios across the trigger is carried into the tape rather than
+  dropped
 
 ## Motivation
 
@@ -39,3 +42,8 @@ refinement. In addition to adding more assets/pricing functions, there is also t
 - Incorporating Wrong way risk during the Monte Carlo simulation
 - Better Calibration of risk neutral price models from market data
 - Better handling of RFR's and OIS curves
+- Sensitivities to market *quotes* rather than to calibrated factors, by carrying the calibration
+  Jacobian through bootstrapping
+
+Engineering work the codebase owes itself - designed, deferred or known-broken - is tracked
+separately in the [Developer Roadmap](developer/roadmap.md).

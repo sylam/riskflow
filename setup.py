@@ -26,6 +26,9 @@ setup(
                       'python-markdown-math>=0.6', 'sortedcontainers>2.0'],
     extras_require={
         'interactive': ['jupyter'],
+        # GARCHSpotModel's calibration only; the import is lazy, so the rest of the library
+        # installs and runs without it
+        'garch': ['arch>=6.0'],
     },
     entry_points={
         'console_scripts': [

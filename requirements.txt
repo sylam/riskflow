@@ -6,3 +6,5 @@ pyparsing>=2.4.7
 setuptools>=49.6.0
 matplotlib>=3.0.0
 sortedcontainers>=2.0.0
+# GARCHSpotModel calibration only - lazily imported, so not needed to install or run
+# arch>=6.0

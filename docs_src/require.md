@@ -28,7 +28,12 @@ work but have not been tested.
 
 [pyparsing](https://github.com/pyparsing/pyparsing)
 
-- Required for simple parsing of time grids.
+- Required for simple parsing of time grids. Not declared directly: it arrives as a dependency of
+  matplotlib, which `setup.py` installs.
+
+[sortedcontainers](https://grantjenks.com/docs/sortedcontainers/)>2.0
+
+- Required for the ordered tenor/expiry maps a volatility surface is built from.
 
 ## Optional requirements
 
@@ -39,6 +44,11 @@ work but have not been tested.
 [Matplotlib](https://matplotlib.org/)>=3.0.0
 
 - Needed for generating plots of risk factors and simulated paths
+
+[arch](https://arch.readthedocs.io/)>=6.0
+
+- Only needed to CALIBRATE `GARCHSpotModel`. The import is lazy, so the library installs and
+  simulates without it; `pip install riskflow[garch]` adds it.
 
 [mkdocs](http://www.mkdocs.org/)>=0.16
 
