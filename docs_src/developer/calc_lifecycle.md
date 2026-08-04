@@ -160,3 +160,59 @@ Constructs the factor objects, mints the AAD leaves, and builds the processes. K
     and that switch is retired: a fork prices exactly `{t, t+1}`, which is every field the
     bootstrap reads. A wider fork should be justified by being the right fork, not by the reader
     hedging against one nobody measured.
+
+## Boundary corrections — the sensitivity subsystem
+
+Some deals take a decision on **simulated state**: a barrier crosses, an autocall triggers, a
+swaption exercises, a collateral transfer clears its minimum. The value jump at such a decision is
+real — a knocked-out deal *is* worth nothing — so the price is right. What ordinary AAD drops is the
+**flux**: as a factor moves, scenarios cross the trigger, and the indicator recording that crossing
+has zero derivative almost everywhere. The number is correct and the greek is wrong, which no price
+gate can detect.
+
+`pricing.stochastic_boundary_correction(gap, jump, bandwidth)` injects the missing term. It is worth
+**exactly zero in the forward pass** — `gap - gap.detach()` is numerically zero with derivative one
+— so adding it to the scalar handed to `backward()` reports an unchanged number and still
+propagates the term through `gap` to every factor at once. No bump, no second valuation, cost
+independent of the factor count.
+
+It has its own lifecycle, and it straddles the phases above:
+
+- **During pricing**, a deal that takes such a decision appends a `utils.BoundarySet` to
+  `shared.boundary_sets`. `gap` retains its graph and is signed so `gap > 0` means the trigger
+  FIRED; everything else is detached, because a counterfactual yields a *coefficient*, not a
+  differentiated quantity.
+- **In `NettingCollateralSet.post_process`**, the set stamps its own gross→net chain onto the
+  registrations made beneath it. It has to ride on the set: `boundary_sets` accumulates across every
+  netting set, so one slot on `shared` would push an uncollateralised set's deal through a
+  collateralised set's collateral scan.
+- **At the objective** — CVA, FVA or base valuation — `calculation.boundary_correction` walks the
+  registrations, and each converts its own decisions into **portfolio** deltas.
+
+!!! warning "Invariant — a counterfactual is scored on the PORTFOLIO"
+    The objective is applied to `resolve_structure`'s root sum over *every* netting set, so a
+    counterfactual must be `reported_mtm + this registration's change`, never a single set's own
+    net level. With exactly one netting set the two coincide — which is what makes the error
+    invisible to a single-set fixture, and it is worst precisely where the machinery is aimed,
+    because a collateralised set's post-collateral net sits at the relu kink by construction.
+
+Three `BoundarySet` subclasses exist, and they differ in **how far a decision reaches** — which is
+why one class with a mode flag would be the wrong shape:
+
+| subclass | reach | carries |
+| --- | --- | --- |
+| `LatchedBoundarySet` | read by every row from the decision onward (barrier, swaption) | two whole-profile branches, shared across decisions |
+| `RowBoundarySet` | lands on its own row and no other (autocall coupon) | a pair of `(B,)` values per decision |
+| `InnerBoundarySet` | a decision inside a pricer's inner MC | the objective's *derivative*, not a difference — one inner path moves the row by `1/n`, a jump the value never takes |
+
+There is **no JSON switch**: `shared_mem.boundary_aad = calc_greeks is not None`. Wanting
+sensitivities *is* the switch, and registration is gated on it so the cost is zero when greeks are
+off. Branch values register on the **pricer's** grid in the **pricer's** currency; `to_mtm` is the
+deal's own map (`pricing.deal_to_mtm_grid` — fx into reporting, then interpolate), because the deal
+grid, the MTM grid and the report grid are three different axes and interpolation inserts rows in
+the middle.
+
+Acceptance is AAD against a common-random-numbers bump ladder (`tests/crn_ladder.py`), which reports
+agreement **and flatness** separately. Agreement at one bump size proves nothing; a ladder that
+scatters with `h` is differencing across a jump. Note flatness measures the *oracle's* spread only —
+a flat ladder beside an AAD that moves with the path count is not evidence of a residual.
