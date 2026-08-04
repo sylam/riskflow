@@ -43,7 +43,9 @@ Before adding any helper, **search `utils.py` and the package for an existing eq
 
 ## Change scope {#change-scope}
 
-`credit_monte_carlo` and `base_valuation` are **do-not-touch** — the CVA/FVA/CollVA/IM block inside `Credit_Monte_Carlo.execute` in particular. The `HedgeMonteCarlo` / solver stack is free to redesign. Reuse pre-processed deal data (`field_index['Cashflows']` etc.) inside `Deal` methods rather than re-walking `self.field`.
+`credit_monte_carlo` and `base_valuation` are **do-not-touch** — the CVA/FVA/CollVA/IM block inside `Credit_Monte_Carlo.execute` in particular. They are the production valuation paths and everything downstream reconciles against the numbers they report. The `HedgeMonteCarlo` / solver stack is free to redesign. Reuse pre-processed deal data (`field_index['Cashflows']` etc.) inside `Deal` methods rather than re-walking `self.field`.
+
+The one thing that *is* wired into that block is [boundary-correction assembly](calc_lifecycle.md#boundary-corrections-the-sensitivity-subsystem), and the terms on which it got there are the terms for anything else: it changes what is handed to `backward()` and **nothing** about what is reported. The correction is worth exactly zero in the forward pass by construction, and that is gated bit-identically — `np.array_equal` on the exposure and `==` on the scalar, with sensitivities on versus off. A change that cannot make that guarantee does not belong here.
 
 ## No overengineering
 
