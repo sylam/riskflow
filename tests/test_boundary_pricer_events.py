@@ -742,3 +742,37 @@ def test_a_zero_gross_delta_reproduces_the_reported_net(exclude_paid_today):
     assert seen['diff'] == 0.0, (
         f'a zero gross delta moved the net by {seen["diff"]:.4e}: the counterfactual is rebased, '
         f'so every correction against it is mis-sized')
+
+
+@pytest.mark.xfail(strict=True, reason='UNEXPLAINED: AAD +6.96948e-06 vs CRN +7.78252e-06, 11.67% '
+                                       'at 0.87% flatness - the oracle resolves it, so this is a '
+                                       'real residual on a two-set portfolio with a LIVE exposure '
+                                       'and a binding MTA. Not diagnosed; do not merge past it '
+                                       'without an explanation.')
+def test_two_netting_sets_with_a_live_exposure_agree_with_bump_and_reprice():
+    """The companion to the zero-CVA gate above, and the reason it needs one.
+
+    That gate builds a portfolio out of the money in EVERY scenario, so its CVA is exactly zero and
+    any sensitivity must be too - which is elegant, needs no tolerance, and catches the mis-scoping
+    it was written for. But it only catches that DIRECTION: mutating `portfolio_delta` to add the
+    set's LEVEL to the portfolio rather than its CHANGE leaves the portfolio still <= 0, so the relu
+    still returns zero and the mutant SURVIVES. Verified - it did.
+
+    So here the short is small enough that the portfolio is IN the money and the CVA is non-zero.
+    Now any mis-scoping moves a real number, and the oracle can say so.
+    """
+    small_short = dict(DOMINATING_SHORT, Units=0.1)
+
+    def build(c):
+        return _collateralised_barrier(c) + [
+            {'Instrument': construct_instrument(
+                dict(NETTING, Reference='NS_SHORT', Collateralized='False'), {}),
+             'Children': [{'Instrument': construct_instrument(small_short, {})}]}]
+
+    kw = dict(batch=1024, mcmc=192, children=build)
+    cva = _run(DISCRETE_BARRIER, **kw)[1]
+    assert cva > 0.0, 'the portfolio must be IN the money or this measures nothing'
+    aad = _run(DISCRETE_BARRIER, gradient=True, **kw)[2]
+    r = ladder(price=lambda s: _run(DISCRETE_BARRIER, spot=s, **kw)[1], aad=aad, base=bb.SPOT,
+               rungs=(5e-4, 1e-3, 2e-3))
+    assert r.agrees(tol=0.05), f'two netting sets, live exposure - scoping is wrong\n{r}'
