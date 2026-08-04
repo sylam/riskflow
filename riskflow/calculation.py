@@ -485,10 +485,26 @@ def pricer_boundary_correction(shared, objective, reported_mtm, bandwidth):
         if not isinstance(bset, utils.BoundarySet):
             continue                            # a margin call replays a balance, not an mtm delta
 
+        # The chain returns this SET's net LEVEL; the objective consumes the ROOT SUM over every
+        # netting set. So the counterfactual is the reported portfolio plus the set's CHANGE, and
+        # that change is the chain at this delta less the chain at zero - true whatever the set's
+        # own arithmetic is. Cached on first use rather than precomputed, so it costs one balance
+        # scan per registration and needs no assumption about a delta's shape.
+        base = {}
+
         def score(delta, chain=bset.net_from_gross, report_index=bset.report_index):
-            """A deal-mtm delta on the MTM grid -> the per-scenario objective it produces."""
-            return objective(chain(delta) if chain is not None
-                             else reported_mtm + delta[report_index])
+            """A deal-mtm delta on the MTM grid -> the per-scenario objective it produces.
+
+            Always the reported PORTFOLIO plus this set's change, never a set's own level: the
+            objective is applied to the root sum over every netting set, and a collateralised set's
+            post-collateral net sits at the relu kink by construction, which is where scoring it in
+            isolation goes furthest wrong.
+            """
+            if chain is None:
+                return objective(reported_mtm + delta[report_index])
+            if 'zero' not in base:
+                base['zero'] = chain(torch.zeros_like(delta))
+            return objective(reported_mtm + (chain(delta) - base['zero']))
 
         # J(fired) - J(did not), matching gap > 0 meaning the trigger fired. How that is arrived
         # at belongs to the set: a whole-scenario decision differences the objective across its

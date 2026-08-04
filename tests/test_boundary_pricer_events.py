@@ -597,9 +597,12 @@ def test_a_zero_gross_delta_reproduces_the_reported_net(exclude_paid_today):
     """The invariant the collateral counterfactual rests on, which nothing asserted.
 
     `gross_to_net` pushes a gross-mtm delta through At -> required balance -> bands -> scan -> the
-    netting arithmetic. Feed it ZERO and it must return the netting set's reported net EXACTLY - if
-    it does not, every correction is measured against a rebased baseline and is the wrong size while
-    still converging and still looking bandwidth-stable.
+    netting arithmetic. Feed it ZERO and it must reproduce the set's own reported net EXACTLY - if
+    it does not, every correction is measured against a rebased baseline and is the wrong size
+    while still converging and still looking bandwidth-stable. (What the ASSEMBLER then does with
+    that level is a separate question, and the answer is that it subtracts this same zero-delta
+    baseline and adds the difference to the reported PORTFOLIO - see
+    test_a_collateralised_set_is_scored_on_the_portfolio_not_on_itself.)
 
     It did not. `Vte` was re-derived as `g_Vt[Te]` rather than taken from the reported `b_Vte`, and
     under Exclude_Paid_Today the two carry DIFFERENT cashflow adjustments - a local-grid one and a
