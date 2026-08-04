@@ -194,18 +194,45 @@ class DeferredDeal:
 class MTABoundarySet:
     """One netting set's transfer decisions, plus what is needed to price their counterfactuals.
 
-    `replay` maps an alternative balance path to the netting-set MTM exactly as reported - it is
-    built inside post_process, so the formula stays in one place and captures only the pieces that
-    do not depend on the balance. The scan inputs are the same ones the forward walk used, so a
-    counterfactual restarts the SAME recursion at a margin date with a forced opening balance.
+    `replay` maps an alternative balance path to the netting-set MTM exactly as reported, and
+    `rescan` restarts the forward walk's OWN recursion at a margin date from a forced opening
+    balance. Both are built inside post_process, so the formulae stay in one place and capture only
+    the pieces that do not depend on the balance.
     """
     events: list
     replay: object                  # callable: balance path -> netting-set MTM
     balance: object                 # the realised path, detached; the prefix a replay keeps
-    required: object
-    recv_band: object
-    post_band: object
-    call_mask: object
+    rescan: object                  # callable: (opening, start) -> the balance path from there on
+
+    def objective_jumps(self, score):
+        """Per margin call, the gap and the change in the OBJECTIVE its transfer decision produces.
+
+        The counterfactual is the SAME collateral recursion restarted from a forced opening balance
+        - transfer, then hold - so nothing is re-simulated, re-priced or bumped: the expensive
+        gross-MTM cube is already there and only the cheap balance scan is replayed.
+
+        What a replay yields is this SET's net and `score` consumes a change to the PORTFOLIO, so
+        the realised balance's own replay is the baseline - one extra scan per set, not per event.
+
+        The receive and post sides of one call share a jump. D = 1 means "a transfer happened" for
+        both, so J(D=1) - J(D=0) is the same quantity; only the gap differs. Computing it once
+        halves the replays.
+        """
+        with torch.no_grad():
+            reported = self.replay(self.balance)
+        jumps = {}
+        for event in self.events:
+            if event.call_index not in jumps:
+                with torch.no_grad():
+                    prefix = self.balance[:event.call_index]
+                    transferred, held = [
+                        score(self.replay(torch.cat(
+                            [prefix, self.rescan(opening, event.call_index)], dim=0)) - reported)
+                        for opening in (event.required_balance, event.previous_balance)]
+                    jumps[event.call_index] = transferred - held
+            # outside the block: `no_grad` is thread-local, and a generator suspended inside one
+            # leaves it set in whoever resumes it - handing the caller a gap that carries no graph
+            yield event.gap, jumps[event.call_index]
 
 
 @dataclass
@@ -248,17 +275,36 @@ class BoundarySet:
     # set's deal through a collateralised set's chain, and lets the last collateralised set of
     # several speak for all of them.
     net_from_gross = None
+    # What the chain returns at a zero delta - this set's own level, the baseline a change is
+    # measured from. Cached on first use rather than precomputed: it costs one balance scan per
+    # registration and needs no assumption about a delta's shape.
+    net_at_zero = None
 
     def branch_deltas(self):
         raise NotImplementedError
 
+    def portfolio_delta(self, delta):
+        """This registration's deal-mtm delta as a change to the reported PORTFOLIO.
+
+        The chain returns this SET's net LEVEL while the objective consumes the root sum over every
+        netting set, so what the portfolio gains is the chain at this delta LESS the chain at zero -
+        true whatever the set's own arithmetic is, rather than depending on identifying which
+        tensor is its baseline. An additive set publishes no chain and only has to reach the report
+        grid.
+        """
+        if self.net_from_gross is None:
+            return delta[self.report_index]
+        if self.net_at_zero is None:
+            self.net_at_zero = self.net_from_gross(torch.zeros_like(delta))
+        return self.net_from_gross(delta) - self.net_at_zero
+
     def objective_jumps(self, score):
         """Per decision, the gap and the change in the OBJECTIVE that decision produces.
 
-        `score` maps an MTM-grid deal-mtm delta to the per-scenario objective of the counterfactual
-        - the netting arithmetic, the collateral chain where there is one, the CVA or FVA
-        reduction. What a set owes it is the deal's own half: which alternative values the decision
-        chooses between, and where on the grid they land.
+        `score` maps a change to the reported portfolio to the per-scenario objective of the
+        counterfactual - the CVA or FVA reduction. What a set owes it is its own half: which
+        alternative values the decision chooses between, where on the grid they land, and the
+        netting arithmetic that carries them from there to the portfolio.
 
         This default is the WHOLE-SCENARIO form the two `branch_deltas` shapes share. The decision
         moves one scenario's reported value by a FINITE amount, so the objective's response to it
@@ -271,7 +317,7 @@ class BoundarySet:
         """
         for gap, on, off in self.branch_deltas():
             with torch.no_grad():
-                jump = score(on) - score(off)
+                jump = score(self.portfolio_delta(on)) - score(self.portfolio_delta(off))
             yield gap, jump
 
 
@@ -429,7 +475,7 @@ class InnerBoundarySet(BoundarySet):
                 unit[row] = 1.0
                 weight = self.to_mtm(unit)
                 probe = torch.zeros_like(weight).requires_grad_(True)
-                sensitivity, = torch.autograd.grad(score(probe).sum(), probe)
+                sensitivity, = torch.autograd.grad(score(self.portfolio_delta(probe)).sum(), probe)
             # outside the block: `enable_grad` is thread-local too, and a generator suspended
             # inside one hands the caller a context it never asked for
             yield gap, (sensitivity * weight).sum(dim=0).unsqueeze(1) * jump

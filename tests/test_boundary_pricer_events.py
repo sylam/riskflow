@@ -141,7 +141,10 @@ def _run(deal, spot=bb.SPOT, gradient=False, batch=512, mcmc=128, collateralised
     grad = None
     if gradient:
         g = out['Results']['grad_cva']['Gradient']
-        grad = float(g.loc[[i for i in g.index if 'EquityPrice' in str(i[0])][0]])
+        # `gradients_as_df` reports only the non-zero entries, so an absent factor is a zero
+        # sensitivity - which is a reading in its own right, not a missing one
+        rows = [i for i in g.index if 'EquityPrice' in str(i[0])]
+        grad = float(g.loc[rows[0]]) if rows else 0.0
     return out['Results']['mtm'].values, float(out['Results']['cva']), grad
 
 
@@ -324,18 +327,18 @@ def test_the_netting_set_a_registration_sits_under_is_the_one_that_scores_it():
 
     import riskflow.calculation as C
     seen = {}
-    original = C.pricer_boundary_correction
+    original = C.boundary_correction
 
     def probe(shared, objective, reported_mtm, bandwidth):
         seen['chains'] = [x.net_from_gross for x in shared.boundary_sets
                           if isinstance(x, utils.BoundarySet)]
         return original(shared, objective, reported_mtm, bandwidth)
 
-    C.pricer_boundary_correction = probe
+    C.boundary_correction = probe
     try:
         _run(DISCRETE_BARRIER, gradient=True, batch=256, mcmc=64, children=portfolio)
     finally:
-        C.pricer_boundary_correction = original
+        C.boundary_correction = original
 
     chains = seen.get('chains')
     assert chains is not None and len(chains) == 3, f'expected three registrations, got {chains}'
@@ -347,6 +350,105 @@ def test_the_netting_set_a_registration_sits_under_is_the_one_that_scores_it():
     assert col_a is not col_b, (
         'both collateralised sets are scored through the SAME chain - the last one to run is '
         'speaking for the other one as well')
+
+
+MTA_LIVE = 2.0          # agreement currency, against a barrier worth ~5: transfers get suppressed
+
+# Negative in EVERY scenario at EVERY reporting date, by construction: a sold forward struck at
+# ~zero is -(S - K) per unit, and 100 of them swamp anything one barrier can be worth, a call being
+# bounded by the spot itself. So the PORTFOLIO is out of the money wherever the collateralised set
+# on its own is not.
+DOMINATING_SHORT = {
+    'Object': 'EquityForwardDeal', 'Reference': 'SHORT1', 'Currency': 'USD', 'Equity': 'EQ',
+    'Discount_Rate': 'USD', 'Payoff_Currency': 'USD', 'Buy_Sell': 'Sell', 'Units': 100.0,
+    'Forward_Price': 1.0, 'Maturity_Date': bb.BASE + pd.Timedelta(days=365)}
+
+
+def _collateralised_barrier(c):
+    """The barrier inside a collateralised set whose MTA BINDS - so the balance holds instead of
+    resetting, and the transfer decision is a discontinuity of its own alongside the barrier's."""
+    return [{'Instrument': construct_instrument(dict(
+        NETTING, Reference='NS_COL', Collateralized='True', Credit_Support_Amounts=dict(
+            NETTING['Credit_Support_Amounts'],
+            Minimum_Received=utils.CreditSupportList([[0.0, MTA_LIVE]]),
+            Minimum_Posted=utils.CreditSupportList([[0.0, MTA_LIVE]]))), {}),
+        'Children': [{'Instrument': construct_instrument(DISCRETE_BARRIER, {})}]}]
+
+
+def _with_a_second_netting_set(c):
+    """The same set, plus a SECOND one holding the dominating short. Nothing else moves: the short
+    matures on the barrier's own expiry and needs no factor the barrier does not already use, so
+    the grid, the draws and the first set's own numbers are what they were."""
+    return _collateralised_barrier(c) + [
+        {'Instrument': construct_instrument(
+            dict(NETTING, Reference='NS_SHORT', Collateralized='False'), {}),
+         'Children': [{'Instrument': construct_instrument(DOMINATING_SHORT, {})}]}]
+
+
+def test_a_netting_set_is_scored_on_the_portfolio_not_on_itself():
+    """Both routes at once, on the only portfolio shape that can see either: TWO netting sets.
+
+    The objective is applied by Credit_Monte_Carlo to `resolve_structure`'s root sum over every
+    netting set. A counterfactual scored on one SET's own net is therefore the wrong quantity, and
+    with exactly one set in the portfolio the two coincide - which is every other fixture here, and
+    why the suite could not see it. The MTA route scored `objective(replay(...))`, the set's own
+    level; the collateral chain returned the same thing until 01b038c.
+
+    Here the second set makes them disagree as far as they can. The portfolio is out of the money
+    in every scenario, so its CVA is EXACTLY zero and so is every sensitivity of it - there is no
+    exposure for a barrier crossing or a margin call to move. Scored on the collateralised set
+    alone, both decisions land on a positive exposure and report a delta to a CVA that does not
+    exist. Measured on this fixture, against a true zero: the MTA route mis-scoped reads
+    dCVA/dSpot +3.83e-04, the pricer route mis-scoped (the pre-01b038c chain scoring) +2.42e-04,
+    the two together +6.24e-04, and with the boundary term suppressed entirely 0.0 - so this reads
+    the correction and nothing else. No tolerance is needed and none is used.
+
+    The one-set companion run is the parameter this varies: the SAME registrations, the same draws,
+    the second set removed, and a gradient that is legitimately non-zero."""
+    import riskflow.calculation as C
+    seen = {}
+    original = C.boundary_correction
+
+    def probe(shared, objective, reported_mtm, bandwidth):
+        mta = [x for x in shared.boundary_sets if isinstance(x, utils.MTABoundarySet)]
+        seen['events'] = sum(len(x.events) for x in mta)
+        seen['gaps'] = sum(len(x.gaps) for x in shared.boundary_sets
+                           if isinstance(x, utils.BoundarySet))
+        # a call where BOTH gaps are non-positive is one where the MTA suppressed the transfer
+        by_call = {}
+        for event in mta[0].events:
+            by_call.setdefault(event.call_index, []).append(event.gap <= 0)
+        seen['suppressed'] = any(bool((a & b).any()) for a, b in by_call.values())
+        seen['set_max'] = max(float(x.replay(x.balance).max()) for x in mta)
+        seen['portfolio_max'] = float(reported_mtm.detach().max())
+        return original(shared, objective, reported_mtm, bandwidth)
+
+    C.boundary_correction = probe
+    try:
+        _, cva, grad = _run(DISCRETE_BARRIER, gradient=True, batch=256, mcmc=64,
+                            children=_with_a_second_netting_set)
+    finally:
+        C.boundary_correction = original
+
+    assert seen.get('events') and seen['gaps'], (
+        f'only one route registered anything ({seen}) - this fixture gates half of what it claims')
+    assert seen['suppressed'], 'the MTA never suppressed a transfer, so it is not a live decision'
+    assert seen['portfolio_max'] <= 0.0, (
+        f'the portfolio is in the money somewhere (max {seen["portfolio_max"]:.6g}), so a non-zero '
+        f'gradient below would be legitimate and this gate reads nothing')
+    assert seen['set_max'] > 0.0, (
+        'the collateralised set is out of the money on its own too, so scoring it in isolation '
+        'would give the same answer and the defect has no room to show')
+    assert cva == 0.0, f'a portfolio worth nothing to the counterparty has cva {cva!r}'
+    assert grad == 0.0, (
+        f'dCVA/dSpot is {grad!r} on a portfolio whose CVA is identically zero: a boundary '
+        f'counterfactual is being scored on one netting set instead of on the portfolio')
+
+    _, solo_cva, solo_grad = _run(DISCRETE_BARRIER, gradient=True, batch=256, mcmc=64,
+                                  children=_collateralised_barrier)
+    assert solo_cva > 0.0 and abs(solo_grad) > 0.0, (
+        f'the same set ALONE reports cva {solo_cva!r} and gradient {solo_grad!r} - with nothing '
+        f'for the second set to hide, the fixture must be live, or the gate above is vacuous')
 
 
 # ---------------------------------------------------------------- safety, must pass now and after
@@ -599,10 +701,10 @@ def test_a_zero_gross_delta_reproduces_the_reported_net(exclude_paid_today):
     `gross_to_net` pushes a gross-mtm delta through At -> required balance -> bands -> scan -> the
     netting arithmetic. Feed it ZERO and it must reproduce the set's own reported net EXACTLY - if
     it does not, every correction is measured against a rebased baseline and is the wrong size
-    while still converging and still looking bandwidth-stable. (What the ASSEMBLER then does with
-    that level is a separate question, and the answer is that it subtracts this same zero-delta
-    baseline and adds the difference to the reported PORTFOLIO - see
-    test_a_collateralised_set_is_scored_on_the_portfolio_not_on_itself.)
+    while still converging and still looking bandwidth-stable. (What the SET then does with that
+    level is a separate question, and the answer is `portfolio_delta`: it subtracts this same
+    zero-delta baseline and hands the assembler the difference, which goes on the reported
+    PORTFOLIO - see test_a_netting_set_is_scored_on_the_portfolio_not_on_itself.)
 
     It did not. `Vte` was re-derived as `g_Vt[Te]` rather than taken from the reported `b_Vte`, and
     under Exclude_Paid_Today the two carry DIFFERENT cashflow adjustments - a local-grid one and a
@@ -616,7 +718,7 @@ def test_a_zero_gross_delta_reproduces_the_reported_net(exclude_paid_today):
     makes this test vacuous."""
     import riskflow.calculation as C
     seen = {}
-    original = C.pricer_boundary_correction
+    original = C.boundary_correction
 
     def probe(shared, objective, reported_mtm, bandwidth):
         bset = next((x for x in shared.boundary_sets if isinstance(x, utils.BoundarySet)), None)
@@ -629,12 +731,12 @@ def test_a_zero_gross_delta_reproduces_the_reported_net(exclude_paid_today):
                      - reported_mtm).abs().max())
         return original(shared, objective, reported_mtm, bandwidth)
 
-    C.pricer_boundary_correction = probe
+    C.boundary_correction = probe
     try:
         _run(dict(DISCRETE_BARRIER, Cash_Rebate=5.0), gradient=True, collateralised=True,
              batch=256, mcmc=64, exclude_paid_today=exclude_paid_today)
     finally:
-        C.pricer_boundary_correction = original
+        C.boundary_correction = original
 
     assert 'diff' in seen, 'the collateral chain never ran - the fixture is not exercising it'
     assert seen['diff'] == 0.0, (

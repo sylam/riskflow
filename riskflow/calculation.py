@@ -36,8 +36,7 @@ from .riskfactors import construct_factor
 # import the stochastic processes
 from .stochasticprocess import construct_process
 # import the currency/curve lookup factors 
-from .instruments import (get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor,
-                          scan_collateral_balance)
+from .instruments import get_fxrate_factor, get_recovery_rate, get_interest_factor, get_survival_factor
 # import the hessian function
 from .pricing import SensitivitiesEstimator
 # import the documentation and utils modules
@@ -431,86 +430,27 @@ def cva_per_scenario(pv_exposure, prob, recovery):
     return ((1.0 - recovery) * 0.5 * (pv_exposure[1:] + pv_exposure[:-1]) * prob).sum(axis=0)
 
 
-def mta_boundary_correction(shared, objective, bandwidth):
-    """Total boundary correction for every recorded MTA transfer decision.
+def boundary_correction(shared, objective, reported_mtm, bandwidth):
+    """Total boundary correction for every recorded decision - a margin call's transfer, a barrier
+    crossing, an autocall trigger, any observed event whose value jump is real.
 
-    `objective` scores a netting-set MTM into a per-scenario CVA vector. For each margin call the
-    counterfactual is the SAME collateral recursion restarted from a forced opening balance -
-    transfer, then hold - so nothing is re-simulated, re-priced or bumped: the expensive gross-MTM
-    cube is already there and only the cheap balance scan is replayed.
+    They are one defect: a decision taken on simulated state whose derivative the frozen-decision
+    graph drops. They differ only in how the counterfactual is produced - a replayed balance scan,
+    branches the pricer already evaluated - and that half belongs to the set that recorded it,
+    along with the netting arithmetic that carries its decision out to the portfolio.
 
-    The receive and post sides of one call share a jump. D = 1 means "a transfer happened" for
-    both, so J(D=1) - J(D=0) is the same quantity; only the gap differs. Computing it once halves
-    the replays.
+    This half is `score`: the reported PORTFOLIO plus a change to it. Never a set's own level,
+    because the objective is applied to `resolve_structure`'s root sum over every netting set, and
+    a collateralised set's post-collateral net sits at the relu kink by construction - which is
+    where scoring it in isolation goes furthest wrong. `gap > 0` means the trigger fired, matching
+    a jump of J(fired) - J(did not).
     """
-    corrections = []
-    for bset in shared.boundary_sets:
-        if not isinstance(bset, utils.MTABoundarySet):
-            continue
-        jumps = {}
-        for event in bset.events:
-            if event.call_index not in jumps:
-                with torch.no_grad():
-                    prefix = bset.balance[:event.call_index]
-                    branches = []
-                    for opening in (event.required_balance, event.previous_balance):
-                        suffix, _ = scan_collateral_balance(
-                            opening, bset.required, bset.recv_band, bset.post_band,
-                            bset.call_mask, start=event.call_index)
-                        branches.append(objective(bset.replay(torch.cat([prefix, suffix], dim=0))))
-                    jumps[event.call_index] = branches[0] - branches[1]
-            corrections.append(pricing.stochastic_boundary_correction(
-                event.gap, jumps[event.call_index], bandwidth))
-    return torch.stack(corrections).sum() if corrections else None
+    def score(delta):
+        return objective(reported_mtm + delta)
 
-
-def pricer_boundary_correction(shared, objective, reported_mtm, bandwidth):
-    """Total boundary correction for every recorded PRICER decision - a barrier crossing, an
-    autocall trigger, any observed event whose value jump is real.
-
-    `objective` scores a netting-set MTM into a per-scenario vector, exactly as for a margin call.
-    The counterfactual differs only in how the alternative MTM is produced, and that part belongs
-    to the deal: each set yields the deal-mtm delta under the trigger forced on and forced off,
-    derived from branches the pricer already evaluated. Nothing is re-simulated, re-priced or
-    bumped, so this end of it is the same arithmetic whatever the event was.
-
-    Where the netting set passes a deal's value through additively, a counterfactual is the
-    reported MTM plus the deal's delta. A COLLATERALISED set does not: its balance responds to the
-    MTM, so the delta reaches the net through Vte AND through the collateral scan. That set
-    publishes the chain and it is stamped ON the registration, because `boundary_sets` accumulates
-    across every netting set and one slot cannot say which of them a given deal sat in.
-    """
-    corrections = []
-    for bset in shared.boundary_sets:
-        if not isinstance(bset, utils.BoundarySet):
-            continue                            # a margin call replays a balance, not an mtm delta
-
-        # The chain returns this SET's net LEVEL; the objective consumes the ROOT SUM over every
-        # netting set. So the counterfactual is the reported portfolio plus the set's CHANGE, and
-        # that change is the chain at this delta less the chain at zero - true whatever the set's
-        # own arithmetic is. Cached on first use rather than precomputed, so it costs one balance
-        # scan per registration and needs no assumption about a delta's shape.
-        base = {}
-
-        def score(delta, chain=bset.net_from_gross, report_index=bset.report_index):
-            """A deal-mtm delta on the MTM grid -> the per-scenario objective it produces.
-
-            Always the reported PORTFOLIO plus this set's change, never a set's own level: the
-            objective is applied to the root sum over every netting set, and a collateralised set's
-            post-collateral net sits at the relu kink by construction, which is where scoring it in
-            isolation goes furthest wrong.
-            """
-            if chain is None:
-                return objective(reported_mtm + delta[report_index])
-            if 'zero' not in base:
-                base['zero'] = chain(torch.zeros_like(delta))
-            return objective(reported_mtm + (chain(delta) - base['zero']))
-
-        # J(fired) - J(did not), matching gap > 0 meaning the trigger fired. How that is arrived
-        # at belongs to the set: a whole-scenario decision differences the objective across its
-        # jump, one taken inside a pricer's inner MC differentiates it.
-        for gap, jump in bset.objective_jumps(score):
-            corrections.append(pricing.stochastic_boundary_correction(gap, jump, bandwidth))
+    corrections = [pricing.stochastic_boundary_correction(gap, jump, bandwidth)
+                   for bset in shared.boundary_sets
+                   for gap, jump in bset.objective_jumps(score)]
     return torch.stack(corrections).sum() if corrections else None
 
 
@@ -1517,13 +1457,11 @@ class Credit_Monte_Carlo(Calculation):
                                     - torch.sum(delta_fund_benefit_rf * (minus[1:] + minus[:-1]) / 2,
                                                 dim=0))
 
-                        bandwidth = float(params.get('Boundary_AAD_Bandwidth', 0.01))
-                        for correction in (
-                                mta_boundary_correction(shared_mem, fva_per_scenario, bandwidth),
-                                pricer_boundary_correction(
-                                    shared_mem, fva_per_scenario, tensors['mtm'], bandwidth)):
-                            if correction is not None:
-                                fva_for_aad = fva_for_aad + correction
+                        correction = boundary_correction(
+                            shared_mem, fva_per_scenario, tensors['mtm'],
+                            float(params.get('Boundary_AAD_Bandwidth', 0.01)))
+                        if correction is not None:
+                            fva_for_aad = fva_for_aad + correction
                     sensitivity = SensitivitiesEstimator(fva_for_aad, self.all_var)
 
                     if final_run:
@@ -1611,17 +1549,11 @@ class Credit_Monte_Carlo(Calculation):
                     if shared_mem.boundary_sets:
                         objective = lambda mtm: cva_per_scenario(
                             torch.relu(mtm * fx_report * Dt_T) / fx_report[0], prob, recovery)
-                        bandwidth = float(params.get('Boundary_AAD_Bandwidth', 0.01))
-                        # A margin call, a barrier crossing and a swaption's exercise are the
-                        # same defect - a decision taken on simulated state whose derivative the
-                        # frozen-decision graph drops - and they share the estimator. They differ
-                        # only in how the counterfactual MTM is produced, so they are assembled
-                        # separately and summed into the same scalar.
-                        for correction in (mta_boundary_correction(shared_mem, objective, bandwidth),
-                                           pricer_boundary_correction(
-                                               shared_mem, objective, tensors['mtm'], bandwidth)):
-                            if correction is not None:
-                                cva_for_aad = cva_for_aad + correction
+                        correction = boundary_correction(
+                            shared_mem, objective, tensors['mtm'],
+                            float(params.get('Boundary_AAD_Bandwidth', 0.01)))
+                        if correction is not None:
+                            cva_for_aad = cva_for_aad + correction
                     sensitivity = SensitivitiesEstimator(
                         cva_for_aad, self.all_var, create_graph=hessian)
 
@@ -1910,7 +1842,7 @@ class Base_Revaluation(Calculation):
                 # The portfolio value IS the objective, so the per-scenario vector is the value
                 # itself - one scenario, whose mean is the reported number. Worth exactly zero in
                 # the forward pass, so `mtm` here is untouched and only the tape gains a term.
-                correction = pricer_boundary_correction(
+                correction = boundary_correction(
                     shared_mem, lambda value: value.sum(axis=0), mtm,
                     float(params.get('Boundary_AAD_Bandwidth', 0.01)))
                 if correction is not None:

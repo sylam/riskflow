@@ -273,10 +273,8 @@ def test_replay_from_a_forced_balance_changes_the_mtm():
     bset = shared.boundary_sets[0]
     event = bset.events[len(bset.events) // 2]
     with torch.no_grad():
-        suffix, _ = scan_collateral_balance(
-            event.required_balance, bset.required, bset.recv_band, bset.post_band,
-            bset.call_mask, start=event.call_index)
-        forced = torch.cat([bset.balance[:event.call_index], suffix], dim=0)
+        forced = torch.cat([bset.balance[:event.call_index],
+                            bset.rescan(event.required_balance, event.call_index)], dim=0)
     assert forced.shape == bset.balance.shape
     assert not torch.equal(forced, bset.balance), 'forcing a transfer changed nothing'
     assert not torch.equal(bset.replay(forced), bset.replay(bset.balance)), \
@@ -285,14 +283,15 @@ def test_replay_from_a_forced_balance_changes_the_mtm():
 
 def test_correction_moves_gradients_but_not_the_forward():
     """There is no longer a setting that yields greeks WITHOUT the correction, so the uncorrected
-    gradient is obtained by suppressing the term itself. A correction that moved the forward would
-    be a bug; one that left gradients alone would be doing nothing."""
-    original = calculation.mta_boundary_correction
-    calculation.mta_boundary_correction = lambda *a, **kw: None
+    gradient is obtained by suppressing the term itself - at the SET, since the assembler no longer
+    distinguishes a margin call from a barrier. A correction that moved the forward would be a bug;
+    one that left gradients alone would be doing nothing."""
+    original = utils.MTABoundarySet.objective_jumps
+    utils.MTABoundarySet.objective_jumps = lambda self, score: iter(())
     try:
         off = _run(2_000_000.0, gradient=True)['Results']
     finally:
-        calculation.mta_boundary_correction = original
+        utils.MTABoundarySet.objective_jumps = original
     on = _run(2_000_000.0, gradient=True)['Results']
     assert np.array_equal(off['mtm'].values, on['mtm'].values), 'forward exposure moved'
 

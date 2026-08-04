@@ -1340,10 +1340,15 @@ class NettingCollateralSet(Deal):
                         out = out * b_surv
                     return F.pad(out, [0, 0, 0, b_pad]) if b_pad else out
 
+                def rescan(opening, start, req=Bt_new.detach(), recv=Mr.detach(),
+                           post=Mp.detach(), mask=factor_dep['call_mask'].astype(bool)):
+                    """The forward walk's own recursion, restarted at a margin date from a forced
+                    opening balance - which is the whole of a transfer counterfactual."""
+                    return scan_collateral_balance(opening, req, recv, post, mask, start=start)[0]
+
                 shared.boundary_sets.append(utils.MTABoundarySet(
-                    events=mta_events, replay=replay_net_mtm, balance=boundary_balance,
-                    required=Bt_new.detach(), recv_band=Mr.detach(), post_band=Mp.detach(),
-                    call_mask=factor_dep['call_mask'].astype(bool)))
+                    events=mta_events, replay=replay_net_mtm,
+                    balance=boundary_balance, rescan=rescan))
 
                 # A PRICER event moves the gross, not the balance, and the gross reaches the net
                 # two ways: through Vte, and through the balance the collateral scan derives from
